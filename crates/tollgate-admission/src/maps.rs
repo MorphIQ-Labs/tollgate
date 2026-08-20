@@ -13,7 +13,9 @@ use jiff::Timestamp;
 
 use tollgate_core::{AccountSnapshot, Generation};
 
-use crate::state::{AccountAdmissionState, LeaseSlot, MapEntry, Principal, SnapshotMap};
+use crate::state::{
+    AccountAdmissionState, AccountLimiters, LeaseSlot, MapEntry, Principal, SnapshotMap,
+};
 
 fn installed_generation(entry: &MapEntry) -> Option<Generation> {
     match entry {
@@ -37,6 +39,7 @@ fn supersedes(existing: Option<&MapEntry>, new_generation: Generation) -> bool {
 /// review's caution about moka cloning values on retrieval).
 pub struct MokaSnapshotMap {
     cache: moka::sync::Cache<Principal, MapEntry>,
+    limiters: AccountLimiters,
 }
 
 impl MokaSnapshotMap {
@@ -44,6 +47,7 @@ impl MokaSnapshotMap {
     pub fn new(max_capacity: u64) -> Self {
         MokaSnapshotMap {
             cache: moka::sync::Cache::new(max_capacity),
+            limiters: AccountLimiters::default(),
         }
     }
 }
@@ -55,19 +59,19 @@ impl SnapshotMap for MokaSnapshotMap {
 
     fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>) {
         let generation = snapshot.generation;
+        // The account-shared limiter, fetched outside the per-key closure.
+        let limiter = self
+            .limiters
+            .limiter_for(snapshot.account_id, &snapshot.limits);
         // and_compute_with gives us an atomic read-modify-write per key, which
         // is what makes generation monotonicity hold under concurrent pushes.
         self.cache.entry(principal).and_compute_with(|existing| {
             let existing = existing.map(|e| e.into_value());
             if supersedes(existing.as_ref(), generation) {
-                let previous = match &existing {
-                    Some(MapEntry::Present(state)) => Some(&**state),
-                    _ => None,
-                };
                 moka::ops::compute::Op::Put(MapEntry::Present(AccountAdmissionState::new(
                     Arc::clone(&snapshot),
                     Arc::clone(&lease),
-                    previous,
+                    Arc::clone(&limiter),
                 )))
             } else {
                 moka::ops::compute::Op::Nop
@@ -90,6 +94,7 @@ impl SnapshotMap for MokaSnapshotMap {
 #[derive(Default)]
 pub struct ArcSwapSnapshotMap {
     map: ArcSwap<HashMap<Principal, MapEntry>>,
+    limiters: AccountLimiters,
 }
 
 impl ArcSwapSnapshotMap {
@@ -114,18 +119,17 @@ impl SnapshotMap for ArcSwapSnapshotMap {
     }
 
     fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>) {
+        let limiter = self
+            .limiters
+            .limiter_for(snapshot.account_id, &snapshot.limits);
         self.rcu(|map| {
             if supersedes(map.get(&principal), snapshot.generation) {
-                let previous = match map.get(&principal) {
-                    Some(MapEntry::Present(state)) => Some(&**state),
-                    _ => None,
-                };
                 map.insert(
                     principal,
                     MapEntry::Present(AccountAdmissionState::new(
                         Arc::clone(&snapshot),
                         Arc::clone(&lease),
-                        previous,
+                        Arc::clone(&limiter),
                     )),
                 );
             }
@@ -214,6 +218,27 @@ mod tests {
     #[test]
     fn arc_swap_map_contract() {
         exercises_map(ArcSwapSnapshotMap::new());
+    }
+
+    /// Review finding #4: the advertised limit is an *account* limit — every
+    /// principal of an account shares one limiter, so extra API keys cannot
+    /// multiply the allowance.
+    #[test]
+    fn principals_of_one_account_share_the_limiter() {
+        let map = ArcSwapSnapshotMap::new();
+        map.install(Principal(1), snapshot(1), LeaseSlot::empty());
+        map.install(Principal(2), snapshot(1), LeaseSlot::empty());
+        let (a, b) = match (
+            map.get(&Principal(1)).unwrap(),
+            map.get(&Principal(2)).unwrap(),
+        ) {
+            (MapEntry::Present(a), MapEntry::Present(b)) => (a, b),
+            _ => unreachable!(),
+        };
+        assert!(
+            Arc::ptr_eq(&a.limiter, &b.limiter),
+            "two principals of one account must draw from one bucket"
+        );
     }
 
     /// Rate-limiter state carries over when limits are unchanged and resets

@@ -58,24 +58,15 @@ pub struct AccountAdmissionState {
 }
 
 impl AccountAdmissionState {
-    /// Compile the runtime state for a snapshot. `previous` is the state this
-    /// one replaces, if any: when the rate parameters are unchanged the old
-    /// limiter (and its consumed-token state) is carried over, so republishing
-    /// a snapshot does not hand the account a fresh burst allowance.
+    /// Compile the runtime state for a snapshot. The limiter comes from the
+    /// map's per-account registry, never per principal — see
+    /// [`AccountLimiters`].
     #[must_use]
     pub fn new(
         snapshot: Arc<AccountSnapshot>,
         lease: Arc<LeaseSlot>,
-        previous: Option<&AccountAdmissionState>,
+        limiter: Arc<AccountRateLimiter>,
     ) -> Arc<Self> {
-        let limiter = match previous {
-            Some(prev) if rate_params(&prev.snapshot.limits) == rate_params(&snapshot.limits) => {
-                Arc::clone(&prev.limiter)
-            }
-            // Changed limits (or first install): swap in a new limiter — the
-            // `Quota` inside a governor limiter is immutable by design.
-            _ => Arc::new(build_limiter(&snapshot.limits)),
-        };
         Arc::new(AccountAdmissionState {
             snapshot,
             limiter,
@@ -86,6 +77,50 @@ impl AccountAdmissionState {
 
 fn rate_params(limits: &ResolvedLimits) -> (u64, u64) {
     (limits.rate_units_per_second, limits.rate_burst_units)
+}
+
+/// Per-account limiter registry owned by each snapshot map.
+///
+/// The advertised limits are *account* limits: every principal (API key) of
+/// an account must draw from one bucket, or N keys would multiply the
+/// account's allowance N-fold (review finding #4). Reinstalling snapshots
+/// with unchanged rate parameters keeps the existing limiter — and its
+/// consumed-token state — while a genuine limit change swaps in a fresh
+/// limiter for the whole account (governor's `Quota` is immutable by
+/// design).
+///
+/// Scope note: this registry is per admission-engine instance, so the limit
+/// is enforced *per service instance*, not aggregated across a fleet —
+/// consistent with every other local mechanism here (leases aggregate spend
+/// globally; rate limits do not). Entries live as long as the map: bounded
+/// by account count.
+#[derive(Default)]
+pub(crate) struct AccountLimiters {
+    inner: std::sync::Mutex<
+        std::collections::HashMap<tollgate_core::AccountId, ((u64, u64), Arc<AccountRateLimiter>)>,
+    >,
+}
+
+impl AccountLimiters {
+    /// Fetch the account's shared limiter, building or swapping it when the
+    /// snapshot's rate parameters differ from the installed ones. Called at
+    /// control-plane frequency only.
+    pub(crate) fn limiter_for(
+        &self,
+        account: tollgate_core::AccountId,
+        limits: &ResolvedLimits,
+    ) -> Arc<AccountRateLimiter> {
+        let params = rate_params(limits);
+        let mut inner = self.inner.lock().expect("limiter registry poisoned");
+        match inner.get(&account) {
+            Some((installed, limiter)) if *installed == params => Arc::clone(limiter),
+            _ => {
+                let limiter = Arc::new(build_limiter(limits));
+                inner.insert(account, (params, Arc::clone(&limiter)));
+                limiter
+            }
+        }
+    }
 }
 
 fn build_limiter(limits: &ResolvedLimits) -> AccountRateLimiter {
