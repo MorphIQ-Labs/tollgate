@@ -410,77 +410,182 @@ impl UsageSink for PostgresStore {
         events: &[UsageEvent],
         _now: Timestamp,
     ) -> Result<IngestReport, StoreError> {
+        // One transaction per *batch* (review finding #8): leases are locked
+        // in a single sorted ANY() query (sorted to keep concurrent batches
+        // deadlock-free), duplicates are detected with one lookup, events are
+        // classified in memory against the locked rows, and the accepted set
+        // lands via one bulk insert plus grouped per-lease/per-account
+        // updates. Classification in application code preserves the partial
+        // acceptance contract without savepoints.
         let mut report = IngestReport::default();
-        // One transaction per event: a rejected event must not roll back its
-        // batch siblings, and batches are small.
+        if events.is_empty() {
+            return Ok(report);
+        }
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+
+        // Lock every referenced lease, in stable order.
+        let mut lease_ids: Vec<Vec<u8>> = events
+            .iter()
+            .map(|e| id_bytes(e.lease_id.0))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        lease_ids.sort();
+        struct LeaseRow {
+            account_id: Vec<u8>,
+            fence: i64,
+            granted: i64,
+            used: i64,
+            used_delta: i64,
+            credited: i64,
+            settled: bool,
+        }
+        let rows = sqlx::query(
+            "SELECT lease_id, account_id, fencing_token, granted, used, credited, state
+             FROM tollgate_leases WHERE lease_id = ANY($1) ORDER BY lease_id FOR UPDATE",
+        )
+        .bind(&lease_ids)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(storage)?;
+        let mut leases: std::collections::HashMap<Vec<u8>, LeaseRow> = rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<Vec<u8>, _>(0),
+                    LeaseRow {
+                        account_id: r.get(1),
+                        fence: r.get(2),
+                        granted: r.get(3),
+                        used: r.get(4),
+                        used_delta: 0,
+                        credited: r.get(5),
+                        settled: r.get::<i16, _>(6) != STATE_ACTIVE,
+                    },
+                )
+            })
+            .collect();
+
+        // Existing request ids in one lookup.
+        let request_ids: Vec<Vec<u8>> = events.iter().map(|e| id_bytes(e.request_id.0)).collect();
+        let mut seen: std::collections::HashSet<Vec<u8>> =
+            sqlx::query("SELECT request_id FROM tollgate_usage_events WHERE request_id = ANY($1)")
+                .bind(&request_ids)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(storage)?
+                .into_iter()
+                .map(|r| r.get::<Vec<u8>, _>(0))
+                .collect();
+
+        // Classify in memory against the locked rows (identical rules to
+        // MemoryStore: fencing triple, then the conservation fit that also
+        // converts a released lease's provisional loss into billed usage).
+        struct Accepted<'a> {
+            event: &'a UsageEvent,
+            settled: bool,
+        }
+        let mut accepted: Vec<Accepted<'_>> = Vec::with_capacity(events.len());
         for event in events {
-            let mut tx = self.pool.begin().await.map_err(storage)?;
-            let Some((account_id, fence, granted, used, credited, _expires, state)) =
-                lock_lease(&mut tx, event.lease_id).await.map_err(storage)?
-            else {
+            let rid = id_bytes(event.request_id.0);
+            if seen.contains(&rid) {
+                report.duplicate += 1;
+                continue;
+            }
+            let Some(lease) = leases.get_mut(&id_bytes(event.lease_id.0)) else {
                 report.rejected += 1;
                 continue;
             };
-            if u64::try_from(fence).unwrap_or(0) != event.fencing_token.0
-                || id_from(&account_id) != event.account_id.0
+            if u64::try_from(lease.fence).unwrap_or(0) != event.fencing_token.0
+                || id_from(&lease.account_id) != event.account_id.0
             {
                 report.rejected += 1;
                 continue;
             }
-            // Duplicate?
-            let inserted = sqlx::query(
+            let units = to_i64(event.units, "units")?;
+            if units > lease.granted - lease.used - lease.used_delta - lease.credited {
+                report.rejected += 1;
+                continue;
+            }
+            lease.used_delta += units;
+            seen.insert(rid);
+            accepted.push(Accepted {
+                event,
+                settled: lease.settled,
+            });
+            report.accepted += 1;
+        }
+
+        if !accepted.is_empty() {
+            // Bulk insert the accepted events.
+            let (mut rid, mut acct, mut lease, mut fence, mut units, mut at) = (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            );
+            for a in &accepted {
+                rid.push(id_bytes(a.event.request_id.0));
+                acct.push(id_bytes(a.event.account_id.0));
+                lease.push(id_bytes(a.event.lease_id.0));
+                fence.push(i64::try_from(a.event.fencing_token.0).unwrap_or(0));
+                units.push(to_i64(a.event.units, "units")?);
+                at.push(ts_micros(a.event.occurred_at));
+            }
+            sqlx::query(
                 "INSERT INTO tollgate_usage_events
                  (request_id, account_id, lease_id, fencing_token, units, occurred_at_us)
-                 VALUES ($1, $2, $3, $4, $5, $6)
-                 ON CONFLICT (request_id) DO NOTHING",
+                 SELECT * FROM UNNEST($1::bytea[], $2::bytea[], $3::bytea[], $4::bigint[], $5::bigint[], $6::bigint[])",
             )
-            .bind(id_bytes(event.request_id.0))
-            .bind(id_bytes(event.account_id.0))
-            .bind(id_bytes(event.lease_id.0))
-            .bind(i64::try_from(event.fencing_token.0).unwrap_or(0))
-            .bind(to_i64(event.units, "units")?)
-            .bind(ts_micros(event.occurred_at))
+            .bind(&rid)
+            .bind(&acct)
+            .bind(&lease)
+            .bind(&fence)
+            .bind(&units)
+            .bind(&at)
             .execute(&mut *tx)
             .await
             .map_err(storage)?;
-            if inserted.rows_affected() == 0 {
-                report.duplicate += 1;
-                tx.commit().await.map_err(storage)?;
-                continue;
+
+            // Grouped per-lease and per-account aggregate updates.
+            let mut account_deltas: std::collections::HashMap<Vec<u8>, (i64, i64)> =
+                std::collections::HashMap::new();
+            for a in &accepted {
+                let units = to_i64(a.event.units, "units")?;
+                let entry = account_deltas
+                    .entry(id_bytes(a.event.account_id.0))
+                    .or_insert((0, 0));
+                entry.0 += units;
+                if a.settled {
+                    entry.1 += units;
+                }
             }
-            // Conservation fit: units ≤ granted - used - credited (identical
-            // to MemoryStore: converts a settled lease's provisional loss
-            // back into billed usage; expired leases never fit).
-            let units = to_i64(event.units, "units")?;
-            if units > granted - used - credited {
-                report.rejected += 1;
-                // Rolls back the event insert too.
-                tx.rollback().await.map_err(storage)?;
-                continue;
+            for (lease_id, row) in leases.iter().filter(|(_, r)| r.used_delta > 0) {
+                sqlx::query("UPDATE tollgate_leases SET used = used + $2 WHERE lease_id = $1")
+                    .bind(lease_id)
+                    .bind(row.used_delta)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(storage)?;
             }
-            sqlx::query("UPDATE tollgate_leases SET used = used + $2 WHERE lease_id = $1")
-                .bind(id_bytes(event.lease_id.0))
-                .bind(units)
+            for (account_id, (usage_delta, loss_delta)) in &account_deltas {
+                sqlx::query(
+                    "UPDATE tollgate_accounts
+                     SET usage_recorded = usage_recorded + $2,
+                         settlement_loss = settlement_loss - $3
+                     WHERE account_id = $1",
+                )
+                .bind(account_id)
+                .bind(usage_delta)
+                .bind(loss_delta)
                 .execute(&mut *tx)
                 .await
                 .map_err(storage)?;
-            let was_settled = credited > 0 || state != STATE_ACTIVE;
-            let loss_delta = if was_settled { units } else { 0 };
-            sqlx::query(
-                "UPDATE tollgate_accounts
-                 SET usage_recorded = usage_recorded + $2,
-                     settlement_loss = settlement_loss - $3
-                 WHERE account_id = $1",
-            )
-            .bind(&account_id)
-            .bind(units)
-            .bind(loss_delta)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
-            tx.commit().await.map_err(storage)?;
-            report.accepted += 1;
+            }
         }
+        tx.commit().await.map_err(storage)?;
         Ok(report)
     }
 }

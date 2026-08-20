@@ -240,6 +240,12 @@ async fn usage_replay_is_idempotent() {
     let replay = store.ingest(&batch, t(11)).await.unwrap();
     assert_eq!((replay.accepted, replay.duplicate), (0, 2));
     assert_eq!(store.usage_recorded(ACCOUNT).await.unwrap(), CostUnits(120));
+
+    // A duplicate *within* one batch is also caught, once.
+    let with_dup = [usage(&lease, 3, 10, 12), usage(&lease, 3, 10, 12)];
+    let report = store.ingest(&with_dup, t(12)).await.unwrap();
+    assert_eq!((report.accepted, report.duplicate), (1, 1));
+    assert_eq!(store.usage_recorded(ACCOUNT).await.unwrap(), CostUnits(130));
     assert_conserved(&store).await;
 }
 
