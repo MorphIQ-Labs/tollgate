@@ -1,0 +1,18 @@
+# Dev/test Postgres for the quota-store-postgres correctness suite.
+#
+#   docker compose up -d
+#   QUOTA_PG_URL=postgres://quota:quota@127.0.0.1:5433/quota cargo test -p quota-store-postgres
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: quota
+      POSTGRES_PASSWORD: quota
+      POSTGRES_DB: quota
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quota"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
