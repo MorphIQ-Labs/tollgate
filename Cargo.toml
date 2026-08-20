@@ -11,6 +11,7 @@ members = [
     "crates/quota-server",
     "crates/quota-store",
     "crates/quota-store-postgres",
+    "examples/pricing-api",
 ]
 
 [workspace.package]

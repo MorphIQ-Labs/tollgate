@@ -1,0 +1,35 @@
+[package]
+name = "pricing-api"
+description = "Example concrete web service built on the quota-service stack: HMAC-verified API keys, one-call admission, commit-at-execution-start charging, and batched usage accounting around a toy pricing kernel."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+quota-core = { path = "../../crates/quota-core" }
+quota-admission = { path = "../../crates/quota-admission" }
+quota-client = { path = "../../crates/quota-client" }
+quota-store = { path = "../../crates/quota-store" }
+axum = { workspace = true }
+hmac = { workspace = true }
+jiff = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+
+[[bin]]
+name = "pricing-api"
+path = "src/main.rs"
+
+[[bin]]
+name = "load_gate"
+path = "src/bin/load_gate.rs"
