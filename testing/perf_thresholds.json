@@ -20,6 +20,26 @@
       "id": "lease/reserve_cancel",
       "target_ns": 30.0,
       "threshold_ns": 80.0
+    },
+    {
+      "id": "admission/snapshot_lookup_arc_swap",
+      "target_ns": 25.0,
+      "threshold_ns": 60.0
+    },
+    {
+      "id": "admission/snapshot_lookup_moka",
+      "target_ns": 100.0,
+      "threshold_ns": 250.0
+    },
+    {
+      "id": "admission/full_check",
+      "target_ns": 110.0,
+      "threshold_ns": 250.0
+    },
+    {
+      "id": "admission/full_check_contended_8",
+      "target_ns": 4000.0,
+      "threshold_ns": 10000.0
     }
   ]
 }

@@ -16,11 +16,13 @@ REPORT="reports/perf_gate_report.json"
 
 # Wipe only the groups this gate owns, so unrelated criterion output (if any)
 # cannot satisfy the checker.
-rm -rf "$CRITERION_ROOT/cost_table" "$CRITERION_ROOT/snapshot" "$CRITERION_ROOT/lease"
+rm -rf "$CRITERION_ROOT/cost_table" "$CRITERION_ROOT/snapshot" "$CRITERION_ROOT/lease" \
+       "$CRITERION_ROOT/admission"
 mkdir -p "$(dirname "$MARKER")"
 touch "$MARKER"
 
 cargo bench --locked -p quota-core --bench core_hot_path
+cargo bench --locked -p quota-admission --bench admission_hot_path
 
 exec cargo run --locked -p quota-perf-gate --bin check_benchmark_thresholds -- \
     testing/perf_thresholds.json "$CRITERION_ROOT" "$REPORT" "$MARKER"

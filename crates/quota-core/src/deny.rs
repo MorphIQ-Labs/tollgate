@@ -26,9 +26,21 @@ pub enum DenyReason {
     SnapshotExpired,
     /// The operation requires permission bits the snapshot does not grant.
     MissingPermission,
+    /// The request's item count exceeds the account's resolved batch cap.
+    RequestTooLarge {
+        /// The account's `max_items_per_request` at the time of refusal.
+        max_items: u64,
+    },
+    /// The operation is not priced in the account's cost table. Unpriced work
+    /// cannot be charged, so it cannot be admitted.
+    UnpricedOperation,
     /// The account's local rate limiter has no capacity for this request's
     /// weight.
     RateLimited,
+    /// No lease is currently installed for the account — the instance has not
+    /// yet acquired one (cold start) or lost it. Fail closed; the background
+    /// refill task is responsible for recovery.
+    LeaseUnavailable,
     /// The local lease's validity window has lapsed and refill has not yet
     /// replaced it.
     LeaseExpired,
@@ -53,7 +65,12 @@ impl fmt::Display for DenyReason {
             DenyReason::AccountClosed => f.write_str("account closed"),
             DenyReason::SnapshotExpired => f.write_str("account snapshot expired"),
             DenyReason::MissingPermission => f.write_str("missing permission"),
+            DenyReason::RequestTooLarge { max_items } => {
+                write!(f, "request exceeds batch cap ({max_items} items)")
+            }
+            DenyReason::UnpricedOperation => f.write_str("operation is not priced"),
             DenyReason::RateLimited => f.write_str("rate limited"),
+            DenyReason::LeaseUnavailable => f.write_str("no quota lease available"),
             DenyReason::LeaseExpired => f.write_str("quota lease expired"),
             DenyReason::LeaseExhausted { remaining } => {
                 write!(f, "quota lease exhausted ({remaining} units remaining)")
