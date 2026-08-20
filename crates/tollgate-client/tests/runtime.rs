@@ -2,7 +2,7 @@
 //! #6, #8, #9's client half).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
@@ -28,7 +28,8 @@ fn store(balance: u64) -> Arc<MemoryStore> {
         min_grant: CostUnits(1),
         max_ttl: SignedDuration::from_secs(3_600),
         reclaim_grace: SignedDuration::ZERO,
-    });
+    })
+    .unwrap();
     store.create_account(AccountConfig {
         account_id: ACCOUNT,
         initial_balance: CostUnits(balance),
@@ -59,7 +60,8 @@ async fn refill_installs_lease_on_cold_start() {
     let store = store(10_000);
     let slot = LeaseSlot::empty();
     let clock = Arc::new(ManualClock::new(t(0)));
-    let manager = LeaseManager::spawn(store.clone(), Arc::clone(&slot), clock, manager_config());
+    let manager =
+        LeaseManager::spawn(store.clone(), Arc::clone(&slot), clock, manager_config()).unwrap();
 
     settle().await;
     let lease = slot.load().expect("lease installed");
@@ -68,11 +70,44 @@ async fn refill_installs_lease_on_cold_start() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn adaptive_tail_grant_does_not_rotate_while_unspent() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    store.create_account(AccountConfig {
+        account_id: ACCOUNT,
+        initial_balance: CostUnits(50),
+        active: true,
+    });
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let slot = LeaseSlot::empty();
+    let manager = LeaseManager::spawn(
+        store.clone(),
+        Arc::clone(&slot),
+        clock,
+        LeaseManagerConfig {
+            target_grant: CostUnits(500),
+            low_water: CostUnits(100),
+            ..manager_config()
+        },
+    )
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    let first = slot.load().unwrap();
+    assert_eq!(first.grant().units, CostUnits(25));
+    let lease_id = first.grant().lease_id;
+    drop(first);
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(slot.load().unwrap().grant().lease_id, lease_id);
+    manager.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn rotation_at_low_water_installs_fresh_lease() {
     let store = store(10_000);
     let slot = LeaseSlot::empty();
     let clock = Arc::new(ManualClock::new(t(0)));
-    let manager = LeaseManager::spawn(store.clone(), Arc::clone(&slot), clock, manager_config());
+    let manager =
+        LeaseManager::spawn(store.clone(), Arc::clone(&slot), clock, manager_config()).unwrap();
     settle().await;
 
     let first = slot.load().unwrap();
@@ -112,7 +147,8 @@ async fn expired_slot_fails_closed_then_recovers() {
         Arc::clone(&slot),
         Arc::clone(&clock) as Arc<dyn Clock>,
         manager_config(),
-    );
+    )
+    .unwrap();
     settle().await;
     assert!(slot.load().is_some());
 
@@ -145,11 +181,60 @@ async fn expired_slot_fails_closed_then_recovers() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn usability_window_rollover_returns_unspent_capacity() {
+    let store = MemoryStore::new(GrantPolicy {
+        shrink_divisor: 1,
+        min_grant: CostUnits(1),
+        max_ttl: SignedDuration::from_secs(3_600),
+        reclaim_grace: SignedDuration::from_secs(30),
+    })
+    .unwrap();
+    store.create_account(AccountConfig {
+        account_id: ACCOUNT,
+        initial_balance: CostUnits(1_000),
+        active: true,
+    });
+    let slot = LeaseSlot::empty();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let mut config = manager_config();
+    config.expiry_safety_margin = SignedDuration::from_secs(5);
+    let manager = LeaseManager::spawn(
+        store.clone(),
+        Arc::clone(&slot),
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        config,
+    )
+    .unwrap();
+    settle().await;
+    let first = slot.load().unwrap().grant().lease_id;
+
+    clock.set(t(55));
+    settle().await;
+    let replacement = slot.load().expect("capacity should rotate during grace");
+    assert_ne!(replacement.grant().lease_id, first);
+    assert_eq!(replacement.remaining(), CostUnits(1_000));
+    manager.shutdown().await;
+}
+
+#[test]
+fn invalid_lease_manager_durations_are_rejected() {
+    let mut config = manager_config();
+    config.expiry_safety_margin = SignedDuration::from_secs(-1);
+    assert!(config.validate().is_err());
+
+    let mut config = manager_config();
+    config.poll_interval = std::time::Duration::ZERO;
+    assert!(config.validate().is_err());
+}
+
+#[tokio::test(start_paused = true)]
 async fn shutdown_releases_unspent_units() {
     let store = store(10_000);
     let slot = LeaseSlot::empty();
     let clock = Arc::new(ManualClock::new(t(0)));
-    let manager = LeaseManager::spawn(store.clone(), Arc::clone(&slot), clock, manager_config());
+    let manager =
+        LeaseManager::spawn(store.clone(), Arc::clone(&slot), clock, manager_config()).unwrap();
+    let health = manager.health();
     settle().await;
     slot.load()
         .unwrap()
@@ -157,6 +242,8 @@ async fn shutdown_releases_unspent_units() {
         .unwrap();
 
     manager.shutdown().await;
+    assert!(!*health.borrow());
+    assert!(health.has_changed().is_err());
     assert!(slot.load().is_none());
     // 10_000 - 1_000 grant + 700 released = 9_700; the 300 spent stay out
     // (settlement loss until usage lands — callers flush first in real use).
@@ -239,6 +326,65 @@ async fn full_queue_sheds_before_admission() {
 struct FlakySink {
     inner: Arc<MemoryStore>,
     failures_left: AtomicU32,
+}
+
+struct BatchCappedSink {
+    cap: usize,
+    largest: AtomicUsize,
+}
+
+#[async_trait]
+impl UsageSink for BatchCappedSink {
+    async fn ingest(
+        &self,
+        events: &[UsageEvent],
+        _now: Timestamp,
+    ) -> Result<IngestReport, StoreError> {
+        self.largest.fetch_max(events.len(), Ordering::AcqRel);
+        if events.len() > self.cap {
+            return Err(StoreError("batch exceeds sink limit".into()));
+        }
+        Ok(IngestReport {
+            accepted: events.len() as u64,
+            ..IngestReport::default()
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_flushes_in_configured_batch_sizes() {
+    let sink = Arc::new(BatchCappedSink {
+        cap: 2,
+        largest: AtomicUsize::new(0),
+    });
+    let grant = tollgate_core::LeaseGrant {
+        lease_id: tollgate_core::LeaseId(1),
+        account_id: ACCOUNT,
+        fencing_token: tollgate_core::FencingToken(1),
+        units: CostUnits(100),
+        expires_at: t(100),
+    };
+    let (recorder, writer) = UsageWriter::spawn(
+        Arc::clone(&sink) as Arc<dyn UsageSink>,
+        Arc::new(ManualClock::new(t(0))),
+        UsageWriterConfig {
+            queue_capacity: 8,
+            max_batch: 2,
+            flush_interval: std::time::Duration::from_secs(60),
+            retry_backoff: std::time::Duration::from_millis(1),
+        },
+    );
+    for request in 0..6 {
+        recorder
+            .try_reserve()
+            .unwrap()
+            .record(event(request, 1, &grant));
+    }
+
+    let stats = writer.shutdown().await;
+    assert_eq!(stats.accepted, 6);
+    assert_eq!(stats.lost, 0);
+    assert_eq!(sink.largest.load(Ordering::Acquire), 2);
 }
 
 #[async_trait]

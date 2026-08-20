@@ -22,6 +22,10 @@ async fn main() -> std::io::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
+    if reclaim_secs == 0 {
+        eprintln!("TOLLGATE_RECLAIM_INTERVAL_SECS must be positive");
+        std::process::exit(2);
+    }
     let backend = std::env::var("TOLLGATE_STORE").unwrap_or_else(|_| "memory".to_string());
 
     if !bind.starts_with("127.") && !bind.starts_with("localhost") && !bind.starts_with("[::1]") {
@@ -45,7 +49,8 @@ async fn main() -> std::io::Result<()> {
             serve(
                 listener,
                 ServerState {
-                    store: MemoryStore::new(GrantPolicy::default()),
+                    store: MemoryStore::new(GrantPolicy::default())
+                        .expect("default grant policy is valid"),
                     clock: Arc::new(SystemClock),
                 },
                 reclaim,

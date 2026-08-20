@@ -43,6 +43,19 @@ fn full_grant_policy() -> GrantPolicy {
     }
 }
 
+#[tokio::test]
+async fn invalid_grant_policy_is_rejected_before_connecting() {
+    let policy = GrantPolicy {
+        reclaim_grace: SignedDuration::from_secs(-1),
+        ..GrantPolicy::default()
+    };
+    assert!(
+        PostgresStore::connect("postgres://invalid", policy)
+            .await
+            .is_err()
+    );
+}
+
 /// Connect (or skip), truncate, create the standard account.
 async fn store_with_balance(policy: GrantPolicy, balance: u64) -> Option<Arc<PostgresStore>> {
     let Ok(url) = std::env::var("TOLLGATE_PG_URL") else {
@@ -64,6 +77,22 @@ async fn store_with_balance(policy: GrantPolicy, balance: u64) -> Option<Arc<Pos
     .await
     .unwrap();
     Some(store)
+}
+
+#[tokio::test]
+async fn nonpositive_lease_ttl_is_rejected_without_debiting() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    assert_eq!(
+        store
+            .acquire(ACCOUNT, CostUnits(10), SignedDuration::ZERO, t(0))
+            .await
+            .unwrap_err(),
+        AllocateError::InvalidTtl
+    );
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(100));
 }
 
 fn usage(lease: &tollgate_core::LeaseGrant, request: u128, units: u64, at: i64) -> UsageEvent {
@@ -247,6 +276,80 @@ async fn usage_replay_is_idempotent() {
     assert_eq!((report.accepted, report.duplicate), (1, 1));
     assert_eq!(store.usage_recorded(ACCOUNT).await.unwrap(), CostUnits(130));
     assert_conserved(&store).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_multi_account_batches_use_stable_lock_order() {
+    const OTHER: AccountId = AccountId(2);
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    AdminStore::create_account(
+        &*store,
+        AccountConfig {
+            account_id: OTHER,
+            initial_balance: CostUnits(1_000),
+            active: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    let a1 = store
+        .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap();
+    let a2 = store
+        .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap();
+    let b1 = store
+        .acquire(OTHER, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap();
+    let b2 = store
+        .acquire(OTHER, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+    let left = tokio::spawn({
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        async move {
+            for i in 0..64u128 {
+                barrier.wait().await;
+                store
+                    .ingest(
+                        &[usage(&a1, 10_000 + i, 1, 1), usage(&b1, 20_000 + i, 1, 1)],
+                        t(1),
+                    )
+                    .await?;
+            }
+            Ok::<(), tollgate_store::StoreError>(())
+        }
+    });
+    let right = tokio::spawn({
+        let store = Arc::clone(&store);
+        async move {
+            for i in 0..64u128 {
+                barrier.wait().await;
+                store
+                    .ingest(
+                        &[usage(&b2, 30_000 + i, 1, 1), usage(&a2, 40_000 + i, 1, 1)],
+                        t(1),
+                    )
+                    .await?;
+            }
+            Ok::<(), tollgate_store::StoreError>(())
+        }
+    });
+
+    left.await.unwrap().unwrap();
+    right.await.unwrap().unwrap();
+    assert_eq!(store.usage_recorded(ACCOUNT).await.unwrap(), CostUnits(128));
+    assert_eq!(store.usage_recorded(OTHER).await.unwrap(), CostUnits(128));
 }
 
 #[tokio::test]
@@ -469,4 +572,27 @@ async fn snapshot_publish_fetch_and_generation_monotonicity() {
 
     store.remove_snapshot(principal).await.unwrap();
     assert!(store.snapshot(principal).await.unwrap().is_none());
+
+    // The deleted row is a generation-3 tombstone, so a delayed older
+    // publication cannot resurrect it.
+    store
+        .publish_snapshot(principal, snapshot(2))
+        .await
+        .unwrap();
+    assert!(store.snapshot(principal).await.unwrap().is_none());
+    store
+        .publish_snapshot(principal, snapshot(4))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.snapshot(principal).await.unwrap().unwrap().generation,
+        Generation(4)
+    );
+
+    assert!(
+        store
+            .publish_snapshot(principal, snapshot(i64::MAX as u64 + 1))
+            .await
+            .is_err()
+    );
 }

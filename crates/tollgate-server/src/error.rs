@@ -42,6 +42,7 @@ impl From<AllocateError> for ApiError {
             AllocateError::UnknownAccount => (StatusCode::NOT_FOUND, "unknown-account"),
             AllocateError::AccountInactive => (StatusCode::CONFLICT, "account-inactive"),
             AllocateError::InsufficientBalance => (StatusCode::CONFLICT, "insufficient-balance"),
+            AllocateError::InvalidTtl => (StatusCode::UNPROCESSABLE_ENTITY, "invalid-ttl"),
             AllocateError::UnknownLease => (StatusCode::NOT_FOUND, "unknown-lease"),
             AllocateError::Fenced => (StatusCode::CONFLICT, "fenced"),
             AllocateError::LeaseNotActive => (StatusCode::CONFLICT, "lease-not-active"),

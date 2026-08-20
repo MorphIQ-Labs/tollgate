@@ -21,7 +21,7 @@ fn t(secs: i64) -> Timestamp {
 }
 
 fn state() -> (Arc<MemoryStore>, axum::Router) {
-    let store = MemoryStore::new(GrantPolicy::default());
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
     let router = router(ServerState {
         store: Arc::clone(&store),
         clock: Arc::new(ManualClock::new(t(0))),
@@ -109,6 +109,23 @@ async fn problem_codes_are_stable() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(problem["code"], "unknown-account");
+
+    // Invalid durations fail before any balance is debited.
+    store.create_account(AccountConfig {
+        account_id: AccountId(8),
+        initial_balance: CostUnits(100),
+        active: true,
+    });
+    let (status, problem) = call(
+        &router,
+        "POST",
+        "/v1/leases/acquire",
+        Some(json!({"account_id": 8, "requested": 10, "ttl_seconds": 0})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(problem["code"], "invalid-ttl");
+    assert_eq!(store.balance(AccountId(8)), CostUnits(100));
 
     // Fencing violation.
     store.create_account(AccountConfig {

@@ -23,12 +23,14 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, CostUnits, FencingToken, LeaseGrant, LeaseId, Principal, UsageEvent,
+    AccountId, AccountSnapshot, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId,
+    Principal, UsageEvent,
 };
 
 use crate::traits::{
-    AdminStore, AllocateError, CreateAccountError, GrantPolicy, IngestReport, LeaseAllocator,
-    ReclaimedLease, SnapshotPush, SnapshotSource, StoreError, StoreHealth, UsageSink,
+    AdminStore, AllocateError, CreateAccountError, GrantPolicy, GrantPolicyError, IngestReport,
+    LeaseAllocator, ReclaimedLease, SnapshotPush, SnapshotSource, StoreError, StoreHealth,
+    UsageSink,
 };
 
 /// Admin-side inputs when creating an account.
@@ -75,11 +77,17 @@ struct AccountRecord {
     settlement_loss: CostUnits,
 }
 
+#[derive(Debug)]
+struct SnapshotRecord {
+    generation: Generation,
+    snapshot: Option<Arc<AccountSnapshot>>,
+}
+
 #[derive(Default)]
 struct Inner {
     accounts: HashMap<AccountId, AccountRecord>,
     leases: HashMap<LeaseId, LeaseRecord>,
-    snapshots: HashMap<Principal, Arc<AccountSnapshot>>,
+    snapshots: HashMap<Principal, SnapshotRecord>,
     usage: HashMap<tollgate_core::RequestId, UsageEvent>,
     next_lease_id: u128,
 }
@@ -122,14 +130,14 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
-    #[must_use]
-    pub fn new(policy: GrantPolicy) -> Arc<Self> {
+    pub fn new(policy: GrantPolicy) -> Result<Arc<Self>, GrantPolicyError> {
+        policy.validate()?;
         let (push, _) = broadcast::channel(256);
-        Arc::new(MemoryStore {
+        Ok(Arc::new(MemoryStore {
             inner: Mutex::new(Inner::default()),
             policy,
             push,
-        })
+        }))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -206,17 +214,39 @@ impl MemoryStore {
             {
                 return;
             }
-            inner.snapshots.insert(principal, Arc::clone(&snapshot));
+            inner.snapshots.insert(
+                principal,
+                SnapshotRecord {
+                    generation: snapshot.generation,
+                    snapshot: Some(Arc::clone(&snapshot)),
+                },
+            );
         }
         // No receivers is fine: pull via `snapshot()` still observes it.
         let _ = self.push.send(SnapshotPush {
             principal,
-            snapshot,
+            generation: Some(snapshot.generation),
+            snapshot: Some(snapshot),
         });
     }
 
     pub fn remove_snapshot(&self, principal: Principal) {
-        self.lock().snapshots.remove(&principal);
+        let generation = {
+            let mut inner = self.lock();
+            let Some(record) = inner.snapshots.get_mut(&principal) else {
+                return;
+            };
+            if record.snapshot.is_none() {
+                return;
+            }
+            record.snapshot = None;
+            record.generation
+        };
+        let _ = self.push.send(SnapshotPush {
+            principal,
+            snapshot: None,
+            generation: Some(generation),
+        });
     }
 
     // ---- reconciliation / test surface -------------------------------
@@ -277,8 +307,25 @@ impl LeaseAllocator for MemoryStore {
         ttl: SignedDuration,
         now: Timestamp,
     ) -> Result<LeaseGrant, AllocateError> {
+        if ttl <= SignedDuration::ZERO {
+            return Err(AllocateError::InvalidTtl);
+        }
         let policy = self.policy;
+        let ttl = if ttl > policy.max_ttl {
+            policy.max_ttl
+        } else {
+            ttl
+        };
+        // Compute every fallible value before mutating the in-memory ledger;
+        // an overflow must not debit balance without creating a lease.
+        let expires_at = now
+            .checked_add(ttl)
+            .map_err(|e| AllocateError::Storage(StoreError(format!("ttl overflow: {e}"))))?;
         let mut inner = self.lock();
+        let next_lease_id = inner
+            .next_lease_id
+            .checked_add(1)
+            .ok_or_else(|| AllocateError::Storage(StoreError("lease id overflow".into())))?;
         let record = inner
             .accounts
             .get_mut(&account)
@@ -289,23 +336,19 @@ impl LeaseAllocator for MemoryStore {
         let granted = policy
             .grant(requested, record.balance)
             .ok_or(AllocateError::InsufficientBalance)?;
+        let next_fence = record
+            .next_fence
+            .checked_add(1)
+            .ok_or_else(|| AllocateError::Storage(StoreError("fencing token overflow".into())))?;
         record.balance = record
             .balance
             .checked_sub(granted)
             .expect("grant never exceeds balance");
         let fencing_token = FencingToken(record.next_fence);
-        record.next_fence += 1;
+        record.next_fence = next_fence;
 
-        let ttl = if ttl > policy.max_ttl {
-            policy.max_ttl
-        } else {
-            ttl
-        };
-        inner.next_lease_id += 1;
-        let lease_id = LeaseId(inner.next_lease_id);
-        let expires_at = now
-            .checked_add(ttl)
-            .map_err(|e| AllocateError::Storage(StoreError(format!("ttl overflow: {e}"))))?;
+        inner.next_lease_id = next_lease_id;
+        let lease_id = LeaseId(next_lease_id);
         inner.leases.insert(
             lease_id,
             LeaseRecord {
@@ -351,7 +394,7 @@ impl LeaseAllocator for MemoryStore {
         let release_deadline = lease
             .expires_at
             .checked_add(self.policy.reclaim_grace)
-            .unwrap_or(lease.expires_at);
+            .unwrap_or(Timestamp::MAX);
         if lease.state != LeaseState::Active || now >= release_deadline {
             return Err(AllocateError::LeaseNotActive);
         }
@@ -396,7 +439,7 @@ impl LeaseAllocator for MemoryStore {
                 let reclaim_at = l
                     .expires_at
                     .checked_add(self.policy.reclaim_grace)
-                    .unwrap_or(l.expires_at);
+                    .unwrap_or(Timestamp::MAX);
                 l.state == LeaseState::Active && now >= reclaim_at
             })
             .map(|(id, _)| *id)
@@ -476,7 +519,11 @@ impl SnapshotSource for MemoryStore {
         &self,
         principal: Principal,
     ) -> Result<Option<Arc<AccountSnapshot>>, StoreError> {
-        Ok(self.lock().snapshots.get(&principal).cloned())
+        Ok(self
+            .lock()
+            .snapshots
+            .get(&principal)
+            .and_then(|record| record.snapshot.clone()))
     }
 
     fn subscribe(&self) -> broadcast::Receiver<SnapshotPush> {

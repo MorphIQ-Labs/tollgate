@@ -73,12 +73,19 @@ impl LocalLease {
         low_water: CostUnits,
         margin: jiff::SignedDuration,
     ) -> Self {
-        let usable_until = grant
-            .expires_at
-            .checked_sub(margin)
-            // A margin longer than the lease's life fails closed: never
-            // usable, settled by refill/reclaim.
-            .unwrap_or(Timestamp::MIN);
+        let usable_until = if margin < jiff::SignedDuration::ZERO {
+            // A negative margin would extend local use past allocator expiry
+            // and invert the fencing protocol. Fail closed even if a caller
+            // bypasses the validated LeaseManager configuration.
+            Timestamp::MIN
+        } else {
+            grant
+                .expires_at
+                .checked_sub(margin)
+                // A margin longer than the lease's life fails closed: never
+                // usable, settled by refill/reclaim.
+                .unwrap_or(Timestamp::MIN)
+        };
         LocalLease {
             remaining: AtomicU64::new(grant.units.get()),
             low_water: low_water.get(),
@@ -211,6 +218,26 @@ mod tests {
         assert!(!l.needs_refill());
         l.try_debit(CostUnits(75), t(0)).unwrap();
         assert!(l.needs_refill());
+    }
+
+    #[test]
+    fn negative_safety_margin_fails_closed() {
+        let grant = LeaseGrant {
+            lease_id: LeaseId(8),
+            account_id: AccountId(1),
+            fencing_token: FencingToken(4),
+            units: CostUnits(10),
+            expires_at: t(100),
+        };
+        let l = LocalLease::with_safety_margin(
+            grant,
+            CostUnits::ZERO,
+            jiff::SignedDuration::from_secs(-10),
+        );
+        assert_eq!(
+            l.try_debit(CostUnits(1), t(99)),
+            Err(DenyReason::LeaseExpired)
+        );
     }
 
     #[test]

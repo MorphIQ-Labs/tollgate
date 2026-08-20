@@ -27,6 +27,7 @@ pub mod wire;
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use memory::{AccountConfig, MemoryStore};
 pub use traits::{
-    AdminStore, AllocateError, CreateAccountError, GrantPolicy, IngestReport, LeaseAllocator,
-    ReclaimedLease, SnapshotPush, SnapshotSource, StoreError, StoreHealth, UsageSink,
+    AdminStore, AllocateError, CreateAccountError, GrantPolicy, GrantPolicyError, IngestReport,
+    LeaseAllocator, ReclaimedLease, SnapshotPush, SnapshotSource, StoreError, StoreHealth,
+    UsageSink,
 };

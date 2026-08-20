@@ -41,15 +41,26 @@ until it has one.
 
 8. **Accounting backpressure sheds.** When the usage queue is full, new work is
    refused with zero units charged. Usage events are never silently dropped
-   and enqueue never blocks unboundedly. *Tests:* client writer overflow tests.
+   and enqueue never blocks unboundedly. Shutdown flushes in configured-size
+   batches; any event still undeliverable after the bounded final retries is
+   counted in `WriterStats::lost`. *Tests:* client writer overflow tests,
+   `shutdown_flushes_in_configured_batch_sizes`,
+   `shutdown_during_outage_terminates_and_reports_loss`.
 
 9. **Crash leak is bounded by TTL.** A crashed lease holder strands its unspent
    units only until the lease TTL expires, after which the allocator reclaims
    them. *Tests:* `expired_lease_units_reclaimed` (store suites).
 
-10. **Not ready until admissible.** An instance reports ready only after its
-    snapshot set has loaded; fail-closed correctness must not masquerade as
-    availability. *Tests:* server/client readiness tests.
+10. **Ready means currently admissible.** An instance reports ready only while
+    every tracked principal has a fresh positive or negative resolution, its
+    lease remains inside the local usability window, and its snapshot and
+    refill/accounting tasks are alive. Readiness falls again on exhaustion,
+    expiry, or task exit;
+    fail-closed correctness must not masquerade as availability. *Tests:*
+    `initial_load_gates_readiness_and_installs`,
+    `readiness_falls_when_snapshot_expires_during_outage`,
+    `readiness_falls_if_refresh_hangs_across_snapshot_expiry`,
+    `readiness_falls_when_background_planes_stop`.
 
 11. **Checked arithmetic only.** Cost and lease arithmetic never wraps; any
     overflow is an explicit error that denies (fail closed), never a wrap to a
@@ -75,6 +86,26 @@ until it has one.
     account is a surfaced `AlreadyExists` in every backend — never an
     overwrite, never a silent no-op. *Tests:*
     `recreate_account_is_refused_and_nondestructive` (both store suites).
+
+15. **Authorization generations never move backward.** Positive snapshots and
+    revocation tombstones retain the highest generation observed. A delayed
+    positive at or below a tombstone cannot resurrect a principal, and a
+    delayed older tombstone cannot revoke a newer positive snapshot. The
+    source stores tombstones durably so the rule survives instance restarts.
+    *Tests:* both snapshot-map contract tests,
+    `revocation_reaches_instances_via_refresh`,
+    `snapshot_publish_fetch_and_push`, and
+    `snapshot_publish_fetch_and_generation_monotonicity`.
+
+16. **Unsafe timing configuration never starts.** Nonpositive lease TTLs,
+    polling/refresh/reclaim intervals, negative safety margins or reclaim
+    grace, and internally inconsistent lease thresholds are rejected before
+    allocation or task startup. *Tests:*
+    `nonpositive_lease_ttl_is_rejected_without_debiting` (both stores),
+    `invalid_lease_manager_durations_are_rejected`,
+    `invalid_snapshot_manager_intervals_are_rejected`,
+    `invalid_grant_policy_is_rejected`, and
+    `zero_reclaim_interval_is_rejected`.
 
 Ledger roles (context for 1 and 7): leases **bound** spend; usage events **are**
 the billing record; reconciliation compares the two and steady-state drift is

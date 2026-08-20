@@ -7,7 +7,8 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, CostUnits, FencingToken, LeaseGrant, LeaseId, Principal, UsageEvent,
+    AccountId, AccountSnapshot, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId,
+    Principal, UsageEvent,
 };
 
 /// Backend failure unrelated to domain rules (connection lost, transaction
@@ -34,6 +35,8 @@ pub enum AllocateError {
     /// should keep polling, because usage settlement or a top-up can restore
     /// balance.
     InsufficientBalance,
+    /// A lease must have a strictly positive lifetime.
+    InvalidTtl,
     UnknownLease,
     /// The fencing token does not match the lease — a stale or partitioned
     /// holder (INVARIANTS.md #4).
@@ -54,6 +57,7 @@ impl std::fmt::Display for AllocateError {
             AllocateError::UnknownAccount => f.write_str("unknown account"),
             AllocateError::AccountInactive => f.write_str("account inactive"),
             AllocateError::InsufficientBalance => f.write_str("insufficient balance"),
+            AllocateError::InvalidTtl => f.write_str("lease TTL must be positive"),
             AllocateError::UnknownLease => f.write_str("unknown lease"),
             AllocateError::Fenced => f.write_str("fencing token mismatch"),
             AllocateError::LeaseNotActive => f.write_str("lease not active"),
@@ -87,6 +91,20 @@ pub struct GrantPolicy {
     pub reclaim_grace: SignedDuration,
 }
 
+/// Invalid allocator policy. Duration signs are part of the lease safety
+/// protocol, so invalid values are rejected at backend construction rather
+/// than normalized into a potentially unsafe policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrantPolicyError(pub &'static str);
+
+impl std::fmt::Display for GrantPolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for GrantPolicyError {}
+
 impl Default for GrantPolicy {
     fn default() -> Self {
         GrantPolicy {
@@ -99,14 +117,38 @@ impl Default for GrantPolicy {
 }
 
 impl GrantPolicy {
+    pub fn validate(&self) -> Result<(), GrantPolicyError> {
+        if self.shrink_divisor == 0 {
+            return Err(GrantPolicyError("shrink_divisor must be positive"));
+        }
+        if self.min_grant.is_zero() {
+            return Err(GrantPolicyError("min_grant must be positive"));
+        }
+        if self.max_ttl <= SignedDuration::ZERO {
+            return Err(GrantPolicyError("max_ttl must be positive"));
+        }
+        if self.reclaim_grace < SignedDuration::ZERO {
+            return Err(GrantPolicyError("reclaim_grace must not be negative"));
+        }
+        Ok(())
+    }
+
     /// The units a request for `requested` receives from `balance`, or `None`
     /// when the balance cannot fund any grant.
     #[must_use]
     pub fn grant(&self, requested: CostUnits, balance: CostUnits) -> Option<CostUnits> {
-        if balance.is_zero() {
+        // Constructors reject these policy/request states, but `grant` is a
+        // public pure helper too. Keep direct use fail-closed instead of
+        // panicking on a zero divisor or manufacturing a unit for a zero
+        // request.
+        if requested.is_zero()
+            || balance.is_zero()
+            || self.shrink_divisor == 0
+            || self.min_grant.is_zero()
+        {
             return None;
         }
-        let cap = (balance.get() / self.shrink_divisor.max(1)).max(self.min_grant.get());
+        let cap = (balance.get() / self.shrink_divisor).max(self.min_grant.get());
         Some(CostUnits(
             requested.get().min(cap).min(balance.get()).max(1),
         ))
@@ -160,7 +202,11 @@ pub trait LeaseAllocator: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct SnapshotPush {
     pub principal: Principal,
-    pub snapshot: Arc<AccountSnapshot>,
+    /// `Some` publishes a snapshot; `None` is a revocation tombstone.
+    pub snapshot: Option<Arc<AccountSnapshot>>,
+    /// Source-side generation watermark. Revocations retain the generation
+    /// they removed so delayed positive pushes cannot resurrect them.
+    pub generation: Option<Generation>,
 }
 
 /// Where compiled snapshots come from.

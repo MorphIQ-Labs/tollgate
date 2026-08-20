@@ -85,7 +85,8 @@ fn spawn_instance(store: &Arc<MemoryStore>, clock: &Arc<ManualClock>) -> Instanc
             expiry_safety_margin: SignedDuration::ZERO,
             poll_interval: std::time::Duration::from_millis(5),
         },
-    );
+    )
+    .unwrap();
     let (recorder, writer) = UsageWriter::spawn(
         store.clone(),
         Arc::clone(clock) as _,
@@ -155,7 +156,7 @@ fn hammer(instance: &mut Instance, burst: usize) -> usize {
 
 #[tokio::test(start_paused = true)]
 async fn two_instances_never_overspend_one_account() {
-    let store = MemoryStore::new(GrantPolicy::default());
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
     store.create_account(AccountConfig {
         account_id: ACCOUNT,
         initial_balance: CostUnits(DEPOSIT),

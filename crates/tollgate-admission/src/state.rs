@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 use jiff::Timestamp;
 
-use tollgate_core::{AccountSnapshot, LocalLease, ResolvedLimits};
+use tollgate_core::{AccountSnapshot, Generation, LocalLease, ResolvedLimits};
 
 pub use tollgate_core::Principal;
 
@@ -33,10 +33,22 @@ impl LeaseSlot {
         self.0.store(Some(lease));
     }
 
+    /// Install `lease`, returning the previously installed lease if one was
+    /// present. The refill plane uses this to retain every superseded grant
+    /// until it can be released safely.
+    pub fn replace(&self, lease: Arc<LocalLease>) -> Option<Arc<LocalLease>> {
+        self.0.swap(Some(lease))
+    }
+
     /// Drop the current lease (server told us we are fenced out, or shutdown
     /// returned it). Subsequent requests deny until a new lease arrives.
     pub fn clear(&self) {
         self.0.store(None);
+    }
+
+    /// Remove and return the current lease in one atomic operation.
+    pub fn take(&self) -> Option<Arc<LocalLease>> {
+        self.0.swap(None)
     }
 
     #[must_use]
@@ -45,7 +57,52 @@ impl LeaseSlot {
     }
 }
 
-pub(crate) type AccountRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+type AccountRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+
+/// Stable per-account indirection shared by every principal. Governor quotas
+/// are immutable, so a policy update swaps the inner limiter while all
+/// existing principal states keep pointing at this same object.
+#[derive(Debug)]
+pub(crate) struct AccountLimiter {
+    current: ArcSwap<AccountRateLimiter>,
+    config: std::sync::Mutex<(Generation, (u64, u64))>,
+}
+
+impl AccountLimiter {
+    fn new(generation: Generation, limits: &ResolvedLimits) -> Self {
+        Self {
+            current: ArcSwap::from_pointee(build_limiter(limits)),
+            config: std::sync::Mutex::new((generation, rate_params(limits))),
+        }
+    }
+
+    fn update(&self, generation: Generation, limits: &ResolvedLimits) {
+        let params = rate_params(limits);
+        let mut installed = self.config.lock().expect("limiter config poisoned");
+        if generation <= installed.0 {
+            return;
+        }
+        if params != installed.1 {
+            self.current.store(Arc::new(build_limiter(limits)));
+        }
+        *installed = (generation, params);
+    }
+
+    pub(crate) fn check_n(
+        &self,
+        n: std::num::NonZeroU32,
+    ) -> Result<
+        Result<(), governor::NotUntil<governor::clock::QuantaInstant>>,
+        governor::InsufficientCapacity,
+    > {
+        self.current.load().check_n(n)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current(&self) -> Arc<AccountRateLimiter> {
+        self.current.load_full()
+    }
+}
 
 /// Everything the request path needs for one principal, resolved to a single
 /// `Arc`: the compiled snapshot, the account's weighted rate limiter, and the
@@ -53,7 +110,7 @@ pub(crate) type AccountRateLimiter = RateLimiter<NotKeyed, InMemoryState, Defaul
 #[derive(Debug)]
 pub struct AccountAdmissionState {
     pub snapshot: Arc<AccountSnapshot>,
-    pub(crate) limiter: Arc<AccountRateLimiter>,
+    pub(crate) limiter: Arc<AccountLimiter>,
     pub lease: Arc<LeaseSlot>,
 }
 
@@ -62,10 +119,10 @@ impl AccountAdmissionState {
     /// map's per-account registry, never per principal — see
     /// [`AccountLimiters`].
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         snapshot: Arc<AccountSnapshot>,
         lease: Arc<LeaseSlot>,
-        limiter: Arc<AccountRateLimiter>,
+        limiter: Arc<AccountLimiter>,
     ) -> Arc<Self> {
         Arc::new(AccountAdmissionState {
             snapshot,
@@ -94,11 +151,11 @@ fn rate_params(limits: &ResolvedLimits) -> (u64, u64) {
 /// consistent with every other local mechanism here (leases aggregate spend
 /// globally; rate limits do not). Entries live as long as the map: bounded
 /// by account count.
-type LimiterEntry = ((u64, u64), Arc<AccountRateLimiter>);
-
 #[derive(Default)]
 pub(crate) struct AccountLimiters {
-    inner: std::sync::Mutex<std::collections::HashMap<tollgate_core::AccountId, LimiterEntry>>,
+    inner: std::sync::Mutex<
+        std::collections::HashMap<tollgate_core::AccountId, std::sync::Weak<AccountLimiter>>,
+    >,
 }
 
 impl AccountLimiters {
@@ -108,18 +165,20 @@ impl AccountLimiters {
     pub(crate) fn limiter_for(
         &self,
         account: tollgate_core::AccountId,
+        generation: Generation,
         limits: &ResolvedLimits,
-    ) -> Arc<AccountRateLimiter> {
-        let params = rate_params(limits);
+    ) -> Arc<AccountLimiter> {
         let mut inner = self.inner.lock().expect("limiter registry poisoned");
-        match inner.get(&account) {
-            Some((installed, limiter)) if *installed == params => Arc::clone(limiter),
-            _ => {
-                let limiter = Arc::new(build_limiter(limits));
-                inner.insert(account, (params, Arc::clone(&limiter)));
-                limiter
-            }
+        // The registry must not defeat a bounded snapshot cache: entries with
+        // no remaining principal state are discarded at control-plane time.
+        inner.retain(|_, limiter| limiter.strong_count() > 0);
+        if let Some(limiter) = inner.get(&account).and_then(std::sync::Weak::upgrade) {
+            limiter.update(generation, limits);
+            return limiter;
         }
+        let limiter = Arc::new(AccountLimiter::new(generation, limits));
+        inner.insert(account, Arc::downgrade(&limiter));
+        limiter
     }
 }
 
@@ -146,7 +205,29 @@ pub enum MapEntry {
     /// The control plane recently confirmed this principal unknown; deny
     /// without consulting anything else until `until` passes. This is the
     /// negative cache that stops manufactured misses from becoming work.
-    NegativeUntil(Timestamp),
+    NegativeUntil {
+        until: Timestamp,
+        /// Highest positive/removal generation observed before this
+        /// tombstone. A delayed push at or below it cannot resurrect a
+        /// revoked principal.
+        generation: Option<Generation>,
+    },
+}
+
+/// One control-plane mutation. Mixed positive and negative batches let a
+/// copy-on-write map apply an entire refresh with one clone.
+#[derive(Debug, Clone)]
+pub enum SnapshotUpdate {
+    Present {
+        principal: Principal,
+        snapshot: Arc<AccountSnapshot>,
+        lease: Arc<LeaseSlot>,
+    },
+    Negative {
+        principal: Principal,
+        until: Timestamp,
+        generation: Option<Generation>,
+    },
 }
 
 /// The pluggable snapshot map. Implementations must make `get` lock-free (or
@@ -166,7 +247,19 @@ pub trait SnapshotMap: Send + Sync {
     /// Record a confirmed-unknown principal until `until`.
     fn install_negative(&self, principal: Principal, until: Timestamp);
 
-    /// Remove a principal outright (key revoked).
+    /// Install a negative result carrying an optional source-side generation
+    /// watermark. Implementations also preserve any generation already held
+    /// locally.
+    fn install_negative_at_generation(
+        &self,
+        principal: Principal,
+        until: Timestamp,
+        generation: Option<Generation>,
+    );
+
+    /// Evict a principal outright. Revocations must use
+    /// [`SnapshotMap::install_negative_at_generation`] so their generation
+    /// watermark survives reordered control-plane messages.
     fn remove(&self, principal: &Principal);
 
     /// Install a batch in one logical write. The default loops over
@@ -175,8 +268,32 @@ pub trait SnapshotMap: Send + Sync {
     /// per entry (review finding #9 — loading N principals individually is
     /// O(N²) on a whole-map-clone structure).
     fn install_many(&self, entries: Vec<(Principal, Arc<AccountSnapshot>, Arc<LeaseSlot>)>) {
-        for (principal, snapshot, lease) in entries {
-            self.install(principal, snapshot, lease);
+        self.apply_many(
+            entries
+                .into_iter()
+                .map(|(principal, snapshot, lease)| SnapshotUpdate::Present {
+                    principal,
+                    snapshot,
+                    lease,
+                })
+                .collect(),
+        );
+    }
+
+    fn apply_many(&self, updates: Vec<SnapshotUpdate>) {
+        for update in updates {
+            match update {
+                SnapshotUpdate::Present {
+                    principal,
+                    snapshot,
+                    lease,
+                } => self.install(principal, snapshot, lease),
+                SnapshotUpdate::Negative {
+                    principal,
+                    until,
+                    generation,
+                } => self.install_negative_at_generation(principal, until, generation),
+            }
         }
     }
 }
@@ -196,11 +313,24 @@ impl<T: SnapshotMap + ?Sized> SnapshotMap for Arc<T> {
         (**self).install_negative(principal, until);
     }
 
+    fn install_negative_at_generation(
+        &self,
+        principal: Principal,
+        until: Timestamp,
+        generation: Option<Generation>,
+    ) {
+        (**self).install_negative_at_generation(principal, until, generation);
+    }
+
     fn remove(&self, principal: &Principal) {
         (**self).remove(principal);
     }
 
     fn install_many(&self, entries: Vec<(Principal, Arc<AccountSnapshot>, Arc<LeaseSlot>)>) {
         (**self).install_many(entries);
+    }
+
+    fn apply_many(&self, updates: Vec<SnapshotUpdate>) {
+        (**self).apply_many(updates);
     }
 }

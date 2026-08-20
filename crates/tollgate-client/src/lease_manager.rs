@@ -54,9 +54,51 @@ pub struct LeaseManagerConfig {
     pub poll_interval: std::time::Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseManagerConfigError(pub &'static str);
+
+impl std::fmt::Display for LeaseManagerConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for LeaseManagerConfigError {}
+
+impl LeaseManagerConfig {
+    pub fn validate(&self) -> Result<(), LeaseManagerConfigError> {
+        if self.target_grant.is_zero() {
+            return Err(LeaseManagerConfigError("target_grant must be positive"));
+        }
+        if self.low_water >= self.target_grant {
+            return Err(LeaseManagerConfigError(
+                "low_water must be below target_grant",
+            ));
+        }
+        if self.lease_ttl <= SignedDuration::ZERO {
+            return Err(LeaseManagerConfigError("lease_ttl must be positive"));
+        }
+        if self.expiry_safety_margin < SignedDuration::ZERO {
+            return Err(LeaseManagerConfigError(
+                "expiry_safety_margin must not be negative",
+            ));
+        }
+        if self.expiry_safety_margin >= self.lease_ttl {
+            return Err(LeaseManagerConfigError(
+                "expiry_safety_margin must be shorter than lease_ttl",
+            ));
+        }
+        if self.poll_interval.is_zero() {
+            return Err(LeaseManagerConfigError("poll_interval must be positive"));
+        }
+        Ok(())
+    }
+}
+
 /// Handle to the refill task.
 pub struct LeaseManager {
     shutdown: watch::Sender<bool>,
+    health: watch::Receiver<bool>,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -66,13 +108,27 @@ impl LeaseManager {
         slot: Arc<LeaseSlot>,
         clock: Arc<dyn Clock>,
         config: LeaseManagerConfig,
-    ) -> Self {
+    ) -> Result<Self, LeaseManagerConfigError> {
+        config.validate()?;
         let (shutdown, shutdown_rx) = watch::channel(false);
-        let handle = tokio::spawn(run(allocator, slot, clock, config, shutdown_rx));
-        LeaseManager {
+        let (health_tx, health) = watch::channel(true);
+        let handle = tokio::spawn(async move {
+            run(allocator, slot, clock, config, shutdown_rx).await;
+            let _ = health_tx.send(false);
+        });
+        Ok(LeaseManager {
             shutdown,
+            health,
             handle: Some(handle),
-        }
+        })
+    }
+
+    /// True while the refill task is alive. Channel closure also means the
+    /// task exited (including panic/abort), so readiness probes should check
+    /// both the current value and `Receiver::has_changed().is_ok()`.
+    #[must_use]
+    pub fn health(&self) -> watch::Receiver<bool> {
+        self.health.clone()
     }
 
     /// Signal the task, wait for it to release the current lease and exit.
@@ -127,9 +183,14 @@ async fn run(
         let needs_acquire = match slot.load() {
             None => true,
             Some(lease) if now >= lease.usable_until() => {
-                // Expired: fail closed immediately rather than letting the
-                // request path keep hitting LeaseExpired on a dead lease.
-                slot.clear();
+                // Close the slot, but retain the grant: while it is still in
+                // the allocator's grace window its unspent capacity can be
+                // released and immediately reused. Reservations that loaded
+                // it before `take` keep an Arc and delay release safely.
+                if let Some(old) = slot.take() {
+                    parked.push(old);
+                }
+                release_quiesced(&allocator, &mut parked, &clock).await;
                 true
             }
             Some(lease) => lease.needs_refill(),
@@ -144,15 +205,24 @@ async fn run(
         {
             Ok(grant) => {
                 // Rotation: install the fresh lease and park the superseded
-                // one until it quiesces (module docs).
-                if let Some(old) = slot.load() {
+                // one until it quiesces (module docs). Adaptive allocation
+                // may return less than target_grant; cap low-water below the
+                // actual grant so a fresh tail grant does not immediately
+                // rotate without serving any work.
+                let low_water = CostUnits(
+                    config
+                        .low_water
+                        .get()
+                        .min(grant.units.get().saturating_sub(1)),
+                );
+                let fresh = Arc::new(LocalLease::with_safety_margin(
+                    grant,
+                    low_water,
+                    config.expiry_safety_margin,
+                ));
+                if let Some(old) = slot.replace(fresh) {
                     parked.push(old);
                 }
-                slot.install(Arc::new(LocalLease::with_safety_margin(
-                    grant,
-                    config.low_water,
-                    config.expiry_safety_margin,
-                )));
             }
             Err(_) => {
                 // Denied or backend down: nothing to install. The slot keeps
@@ -165,8 +235,7 @@ async fn run(
     // Graceful shutdown: return what's left of the current and parked
     // leases. Callers flushed usage and stopped admitting first, so every
     // lease has quiesced and `remaining` is exactly granted - used.
-    if let Some(lease) = slot.load() {
-        slot.clear();
+    if let Some(lease) = slot.take() {
         parked.push(lease);
     }
     for lease in parked {

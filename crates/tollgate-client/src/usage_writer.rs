@@ -61,6 +61,12 @@ impl UsageRecorder {
             Err(_) => Err(DenyReason::AccountingBackpressure),
         }
     }
+
+    /// Whether the writer task has exited and can no longer accept events.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
 }
 
 /// One reserved accounting slot. Send the committed request's event with
@@ -251,27 +257,37 @@ async fn final_flush(
     mut stats: WriterStats,
 ) -> WriterStats {
     const FINAL_FLUSH_ATTEMPTS: u32 = 3;
-    while let Ok(event) = rx.try_recv() {
-        batch.push(event);
-    }
-    if batch.is_empty() {
-        return stats;
-    }
-    for attempt in 1..=FINAL_FLUSH_ATTEMPTS {
-        match sink.ingest(batch, clock.now()).await {
-            Ok(report) => {
-                stats.accepted += report.accepted;
-                stats.duplicate += report.duplicate;
-                stats.rejected += report.rejected;
-                batch.clear();
-                return stats;
-            }
-            Err(_) if attempt < FINAL_FLUSH_ATTEMPTS => {
-                tokio::time::sleep(config.retry_backoff).await;
-            }
-            Err(_) => {}
+    let max_batch = config.max_batch.max(1);
+    loop {
+        while batch.len() < max_batch {
+            let Ok(event) = rx.try_recv() else {
+                break;
+            };
+            batch.push(event);
         }
+        if batch.is_empty() {
+            return stats;
+        }
+
+        let mut delivered = false;
+        for attempt in 1..=FINAL_FLUSH_ATTEMPTS {
+            match sink.ingest(batch, clock.now()).await {
+                Ok(report) => {
+                    stats.accepted += report.accepted;
+                    stats.duplicate += report.duplicate;
+                    stats.rejected += report.rejected;
+                    delivered = true;
+                    break;
+                }
+                Err(_) if attempt < FINAL_FLUSH_ATTEMPTS => {
+                    tokio::time::sleep(config.retry_backoff).await;
+                }
+                Err(_) => {}
+            }
+        }
+        if !delivered {
+            stats.lost += batch.len() as u64;
+        }
+        batch.clear();
     }
-    stats.lost += batch.len() as u64;
-    stats
 }

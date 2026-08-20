@@ -29,7 +29,7 @@ Contract: [`INVARIANTS.md`](INVARIANTS.md). Architecture and findings:
 ## Quickstart
 
 ```sh
-cargo test --workspace                     # correctness (58+ tests, no infra needed)
+cargo test --workspace                     # correctness (Postgres DB cases are env-gated)
 ./scripts/check_perf_thresholds.sh         # hot-path microbench gate
 ./scripts/check_load_thresholds.sh         # loopback overhead gate (production profile)
 
@@ -50,8 +50,8 @@ cargo run -p tollgate-server
 ## The numbers that matter (laptop, provisional)
 
 Full admission — lookup, status, permissions, quote, rate token, lease
-debit — costs **~104 ns** uncontended; end-to-end loopback overhead of the
-whole stack (HMAC verification included) is **×1.09** over a no-admission
+debit — costs **~112 ns** uncontended; end-to-end loopback overhead of the
+whole stack (HMAC verification included) is **×1.05** over a no-admission
 baseline. One lease acquire funds thousands of requests; two instances
 draining one account over HTTP finish with **zero drift** between admission's
 committed units and the billing ledger. Gate manifests live in `testing/`;
@@ -63,6 +63,10 @@ recalibrate on a controlled host before treating thresholds as the contract.
   an argument). Everything slow is a background plane.
 - Fail closed: unknown, stale, exhausted, or backpressured states deny with
   zero units charged — there is no slower fallback path.
+- Snapshot revocations are durable, generation-ordered tombstones; delayed
+  control-plane messages cannot resurrect an older authorization state.
+- Readiness is continuous, covering snapshot freshness/task health, lease
+  usability, and accounting-writer health rather than only initial loading.
 - Leases bound spend; usage events are the billing truth; per-account
   conservation (`deposited == balance + active grants + settled usage +
   loss`) is asserted exactly in every backend's suite.

@@ -81,6 +81,7 @@ fn problem_to_allocate(problem: Problem) -> AllocateError {
         "unknown-account" => AllocateError::UnknownAccount,
         "account-inactive" => AllocateError::AccountInactive,
         "insufficient-balance" => AllocateError::InsufficientBalance,
+        "invalid-ttl" => AllocateError::InvalidTtl,
         "unknown-lease" => AllocateError::UnknownLease,
         "fenced" => AllocateError::Fenced,
         "lease-not-active" => AllocateError::LeaseNotActive,

@@ -63,7 +63,7 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
         //    retry resolution (it observes the map, not this return value).
         let state = match self.map.get(&request.principal) {
             Some(MapEntry::Present(state)) => state,
-            Some(MapEntry::NegativeUntil(_)) | None => {
+            Some(MapEntry::NegativeUntil { .. }) | None => {
                 return Err(DenyReason::UnknownPrincipal);
             }
         };

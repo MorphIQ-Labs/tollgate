@@ -150,8 +150,10 @@ struct AppState {
     engine: AdmissionEngine<Arc<ArcSwapSnapshotMap>>,
     recorder: Option<UsageRecorder>,
     slot: Arc<LeaseSlot>,
-    /// Snapshot-manager readiness: true once every tracked principal is
-    /// resolved (INVARIANTS.md #10).
+    /// Refill-task health; channel closure exposes panic or abort.
+    lease_manager_health: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Snapshot-manager readiness: true while every tracked principal has a
+    /// fresh resolution; channel closure also exposes task failure.
     snapshots_ready: Option<tokio::sync::watch::Receiver<bool>>,
     /// `false` builds the no-admission baseline the load gate compares
     /// against: same transport, same kernel, zero quota machinery.
@@ -176,7 +178,13 @@ impl AppRuntime {
             republisher.abort();
         }
         if let Some(writer) = self.writer {
-            let _ = writer.shutdown().await;
+            let stats = writer.shutdown().await;
+            if stats.lost > 0 || stats.rejected > 0 {
+                eprintln!(
+                    "usage-writer shutdown: {} rejected, {} lost",
+                    stats.rejected, stats.lost
+                );
+            }
         }
         if let Some(manager) = self.manager {
             manager.shutdown().await;
@@ -193,7 +201,7 @@ pub const DEMO_ACCOUNT: AccountId = AccountId(1);
 /// Build the service. `deposit` funds the demo account; `admission_enabled:
 /// false` is the load-gate baseline.
 pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRuntime) {
-    let store = MemoryStore::new(GrantPolicy::default());
+    let store = MemoryStore::new(GrantPolicy::default()).expect("default grant policy is valid");
     store.create_account(AccountConfig {
         account_id: DEMO_ACCOUNT,
         initial_balance: CostUnits(deposit),
@@ -245,76 +253,82 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
     let slots = SlotRegistry::new();
     let slot = slots.slot(DEMO_ACCOUNT);
 
-    let (manager, recorder, writer, snapshots, republisher, snapshots_ready) = if admission_enabled
-    {
-        let snapshots = SnapshotManager::spawn(
-            store.clone(),
-            map,
-            Arc::clone(&slots),
-            clock.clone(),
-            SnapshotManagerConfig {
-                principals: vec![principal],
-                refresh_interval: std::time::Duration::from_secs(30),
-                negative_ttl: SignedDuration::from_secs(60),
-                retry_backoff: std::time::Duration::from_millis(200),
-            },
-        );
-        let snapshots_ready = snapshots.ready();
-        let republisher = tokio::spawn({
-            let store = store.clone();
-            let compile_snapshot = compile_snapshot.clone();
-            async move {
-                let mut generation = 1u64;
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                tick.tick().await; // immediate first tick — gen 1 published above
-                loop {
-                    tick.tick().await;
-                    generation += 1;
-                    store.publish_snapshot(principal, compile_snapshot(generation));
+    let (manager, recorder, writer, snapshots, republisher, snapshots_ready, lease_manager_health) =
+        if admission_enabled {
+            let snapshots = SnapshotManager::spawn(
+                store.clone(),
+                map,
+                Arc::clone(&slots),
+                clock.clone(),
+                SnapshotManagerConfig {
+                    principals: vec![principal],
+                    refresh_interval: std::time::Duration::from_secs(30),
+                    negative_ttl: SignedDuration::from_secs(60),
+                    retry_backoff: std::time::Duration::from_millis(200),
+                    max_concurrent_fetches: 16,
+                },
+            )
+            .expect("snapshot-manager configuration is valid");
+            let snapshots_ready = snapshots.ready();
+            let republisher = tokio::spawn({
+                let store = store.clone();
+                let compile_snapshot = compile_snapshot.clone();
+                async move {
+                    let mut generation = 1u64;
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    tick.tick().await; // immediate first tick — gen 1 published above
+                    loop {
+                        tick.tick().await;
+                        generation += 1;
+                        store.publish_snapshot(principal, compile_snapshot(generation));
+                    }
                 }
-            }
-        });
-        let manager = LeaseManager::spawn(
-            store.clone(),
-            Arc::clone(&slot),
-            clock.clone(),
-            LeaseManagerConfig {
-                account: DEMO_ACCOUNT,
-                target_grant: CostUnits((deposit / 4).clamp(1_000, 1_000_000)),
-                low_water: CostUnits((deposit / 16).clamp(250, 250_000)),
-                lease_ttl: SignedDuration::from_secs(60),
-                expiry_safety_margin: SignedDuration::from_secs(2),
-                poll_interval: std::time::Duration::from_millis(20),
-            },
-        );
-        let (recorder, writer) = UsageWriter::spawn(
-            store.clone(),
-            clock,
-            UsageWriterConfig {
-                queue_capacity: 4_096,
-                max_batch: 256,
-                flush_interval: std::time::Duration::from_millis(25),
-                retry_backoff: std::time::Duration::from_millis(50),
-            },
-        );
-        (
-            Some(manager),
-            Some(recorder),
-            Some(writer),
-            Some(snapshots),
-            Some(republisher),
-            Some(snapshots_ready),
-        )
-    } else {
-        (None, None, None, None, None, None)
-    };
+            });
+            let manager = LeaseManager::spawn(
+                store.clone(),
+                Arc::clone(&slot),
+                clock.clone(),
+                LeaseManagerConfig {
+                    account: DEMO_ACCOUNT,
+                    target_grant: CostUnits((deposit / 4).clamp(1_000, 1_000_000)),
+                    low_water: CostUnits((deposit / 16).clamp(250, 250_000)),
+                    lease_ttl: SignedDuration::from_secs(60),
+                    expiry_safety_margin: SignedDuration::from_secs(2),
+                    poll_interval: std::time::Duration::from_millis(20),
+                },
+            )
+            .expect("lease-manager configuration is valid");
+            let lease_manager_health = manager.health();
+            let (recorder, writer) = UsageWriter::spawn(
+                store.clone(),
+                clock,
+                UsageWriterConfig {
+                    queue_capacity: 4_096,
+                    max_batch: 256,
+                    flush_interval: std::time::Duration::from_millis(25),
+                    retry_backoff: std::time::Duration::from_millis(50),
+                },
+            );
+            (
+                Some(manager),
+                Some(recorder),
+                Some(writer),
+                Some(snapshots),
+                Some(republisher),
+                Some(snapshots_ready),
+                Some(lease_manager_health),
+            )
+        } else {
+            (None, None, None, None, None, None, None)
+        };
 
     let state = Arc::new(AppState {
         auth,
         engine,
         recorder,
         slot,
+        lease_manager_health,
         snapshots_ready,
         admission_enabled,
     });
@@ -337,14 +351,31 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
 }
 
 /// INVARIANTS.md #10: fail-closed correctness must not masquerade as
-/// availability — not ready until the lease slot is stocked.
+/// availability. Snapshot freshness/task health, lease usability, and the
+/// accounting writer must all be healthy.
 async fn readyz(State(state): State<Arc<AppState>>) -> StatusCode {
     let snapshots_ready = state
         .snapshots_ready
         .as_ref()
-        .map(|r| *r.borrow())
+        .map(|receiver| receiver.has_changed().is_ok() && *receiver.borrow())
         .unwrap_or(true);
-    if !state.admission_enabled || (snapshots_ready && state.slot.load().is_some()) {
+    let now = Timestamp::now();
+    let lease_ready = state
+        .slot
+        .load()
+        .is_some_and(|lease| now < lease.usable_until() && !lease.remaining().is_zero());
+    let lease_manager_ready = state
+        .lease_manager_health
+        .as_ref()
+        .map(|receiver| receiver.has_changed().is_ok() && *receiver.borrow())
+        .unwrap_or(true);
+    let writer_ready = state
+        .recorder
+        .as_ref()
+        .is_none_or(|recorder| !recorder.is_closed());
+    if !state.admission_enabled
+        || (snapshots_ready && lease_ready && lease_manager_ready && writer_ready)
+    {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE

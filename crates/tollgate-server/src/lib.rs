@@ -102,6 +102,12 @@ pub async fn serve<S: Backend>(
     reclaim_interval: std::time::Duration,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    if reclaim_interval.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "reclaim_interval must be positive",
+        ));
+    }
     let sweep_store = Arc::clone(&state.store);
     let sweep_clock = Arc::clone(&state.clock);
     let sweeper = tokio::spawn(async move {

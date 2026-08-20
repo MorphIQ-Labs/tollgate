@@ -27,6 +27,24 @@ const PRINCIPAL: Principal = Principal(7);
 const DEPOSIT: u64 = 5_000;
 const COST_PER_REQUEST: u64 = 51;
 
+#[tokio::test]
+async fn zero_reclaim_interval_is_rejected() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let error = serve(
+        listener,
+        ServerState {
+            store,
+            clock: Arc::new(SystemClock),
+        },
+        std::time::Duration::ZERO,
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
 #[derive(Clone, Copy)]
 struct PriceOp;
 impl OpIndex for PriceOp {
@@ -60,7 +78,7 @@ fn snapshot() -> Arc<AccountSnapshot> {
 async fn full_stack_over_loopback_http() {
     // Server side: memory backend, system clock, real listener on an
     // ephemeral port.
-    let store = MemoryStore::new(GrantPolicy::default());
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
     store.create_account(AccountConfig {
         account_id: ACCOUNT,
         initial_balance: CostUnits(DEPOSIT),
@@ -109,7 +127,8 @@ async fn full_stack_over_loopback_http() {
             expiry_safety_margin: SignedDuration::from_secs(2),
             poll_interval: std::time::Duration::from_millis(10),
         },
-    );
+    )
+    .unwrap();
     let (recorder, writer) = UsageWriter::spawn(
         http.clone(),
         clock,

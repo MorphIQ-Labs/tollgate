@@ -29,7 +29,8 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, CostUnits, FencingToken, LeaseGrant, LeaseId, Principal, UsageEvent,
+    AccountId, AccountSnapshot, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId,
+    Principal, UsageEvent,
 };
 use tollgate_store::memory::Conservation;
 use tollgate_store::{
@@ -75,6 +76,7 @@ fn alloc_storage(e: sqlx::Error) -> AllocateError {
 pub struct PostgresStore {
     pool: PgPool,
     policy: GrantPolicy,
+    reclaim_grace_us: i64,
     push: broadcast::Sender<SnapshotPush>,
 }
 
@@ -82,6 +84,11 @@ impl PostgresStore {
     /// Connect and run pending migrations (versioned under ./migrations,
     /// tracked by sqlx's _sqlx_migrations table — review finding #11).
     pub async fn connect(url: &str, policy: GrantPolicy) -> Result<Arc<Self>, StoreError> {
+        policy
+            .validate()
+            .map_err(|e| StoreError(format!("invalid grant policy: {e}")))?;
+        let reclaim_grace_us = i64::try_from(policy.reclaim_grace.as_micros())
+            .map_err(|_| StoreError("reclaim_grace exceeds PostgreSQL timestamp range".into()))?;
         let pool = PgPoolOptions::new()
             .max_connections(16)
             .connect(url)
@@ -92,7 +99,12 @@ impl PostgresStore {
             .await
             .map_err(|e| StoreError(format!("migrate: {e}")))?;
         let (push, _) = broadcast::channel(256);
-        Ok(Arc::new(PostgresStore { pool, policy, push }))
+        Ok(Arc::new(PostgresStore {
+            pool,
+            policy,
+            reclaim_grace_us,
+            push,
+        }))
     }
 
     /// Test/reset helper: drop all quota rows (not the schema).
@@ -202,6 +214,9 @@ impl LeaseAllocator for PostgresStore {
         ttl: SignedDuration,
         now: Timestamp,
     ) -> Result<LeaseGrant, AllocateError> {
+        if ttl <= SignedDuration::ZERO {
+            return Err(AllocateError::InvalidTtl);
+        }
         let mut tx = self.pool.begin().await.map_err(alloc_storage)?;
         let row = sqlx::query(
             "SELECT balance, active, next_fence FROM tollgate_accounts
@@ -285,8 +300,7 @@ impl LeaseAllocator for PostgresStore {
         }
         // Releases are accepted through the grace window (see GrantPolicy::
         // reclaim_grace) — only a settled or grace-exhausted lease refuses.
-        let release_deadline_us =
-            expires_at_us.saturating_add(self.policy.reclaim_grace.as_micros() as i64);
+        let release_deadline_us = expires_at_us.saturating_add(self.reclaim_grace_us);
         if state != STATE_ACTIVE || ts_micros(now) >= release_deadline_us {
             return Err(AllocateError::LeaseNotActive);
         }
@@ -324,13 +338,12 @@ impl LeaseAllocator for PostgresStore {
         let mut tx = self.pool.begin().await.map_err(storage)?;
         // Reclaim only once the grace window past expiry has fully lapsed:
         // expires_at + grace <= now  ⟺  expires_at_us <= now_us - grace_us.
-        let threshold_us =
-            ts_micros(now).saturating_sub(self.policy.reclaim_grace.as_micros() as i64);
+        let threshold_us = ts_micros(now).saturating_sub(self.reclaim_grace_us);
         // SKIP LOCKED: concurrent sweeps cooperate instead of deadlocking.
         let rows = sqlx::query(
             "SELECT lease_id, account_id, granted, used FROM tollgate_leases
              WHERE state = 0 AND expires_at_us <= $1
-             FOR UPDATE SKIP LOCKED",
+             ORDER BY account_id, lease_id FOR UPDATE SKIP LOCKED",
         )
         .bind(threshold_us)
         .fetch_all(&mut *tx)
@@ -413,7 +426,7 @@ impl UsageSink for PostgresStore {
         .fetch_all(&mut *tx)
         .await
         .map_err(storage)?;
-        let mut leases: std::collections::HashMap<Vec<u8>, LeaseRow> = rows
+        let mut leases: std::collections::BTreeMap<Vec<u8>, LeaseRow> = rows
             .into_iter()
             .map(|r| {
                 (
@@ -515,8 +528,11 @@ impl UsageSink for PostgresStore {
             .map_err(storage)?;
 
             // Grouped per-lease and per-account aggregate updates.
-            let mut account_deltas: std::collections::HashMap<Vec<u8>, (i64, i64)> =
-                std::collections::HashMap::new();
+            // BTreeMap gives every transaction the same account-row lock
+            // order. Sorted lease locks alone are insufficient when two
+            // batches touch disjoint leases belonging to the same accounts.
+            let mut account_deltas: std::collections::BTreeMap<Vec<u8>, (i64, i64)> =
+                std::collections::BTreeMap::new();
             for a in &accepted {
                 let units = to_i64(a.event.units, "units")?;
                 let entry = account_deltas
@@ -561,11 +577,13 @@ impl SnapshotSource for PostgresStore {
         &self,
         principal: Principal,
     ) -> Result<Option<Arc<AccountSnapshot>>, StoreError> {
-        let row = sqlx::query("SELECT snapshot FROM tollgate_snapshots WHERE principal = $1")
-            .bind(id_bytes(principal.0))
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(storage)?;
+        let row = sqlx::query(
+            "SELECT snapshot FROM tollgate_snapshots WHERE principal = $1 AND deleted = FALSE",
+        )
+        .bind(id_bytes(principal.0))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage)?;
         match row {
             Some(row) => {
                 let value: serde_json::Value = row.get(0);
@@ -649,34 +667,53 @@ impl AdminStore for PostgresStore {
         principal: Principal,
         snapshot: Arc<AccountSnapshot>,
     ) -> Result<(), StoreError> {
+        let generation = i64::try_from(snapshot.generation.0).map_err(|_| {
+            StoreError("snapshot generation exceeds PostgreSQL BIGINT range".into())
+        })?;
         let value = serde_json::to_value(&*snapshot)
             .map_err(|e| StoreError(format!("snapshot encode: {e}")))?;
-        sqlx::query(
-            "INSERT INTO tollgate_snapshots (principal, generation, snapshot)
-             VALUES ($1, $2, $3)
+        let result = sqlx::query(
+            "INSERT INTO tollgate_snapshots (principal, generation, snapshot, deleted)
+             VALUES ($1, $2, $3, FALSE)
              ON CONFLICT (principal) DO UPDATE
-             SET generation = EXCLUDED.generation, snapshot = EXCLUDED.snapshot
+             SET generation = EXCLUDED.generation, snapshot = EXCLUDED.snapshot, deleted = FALSE
              WHERE tollgate_snapshots.generation < EXCLUDED.generation",
         )
         .bind(id_bytes(principal.0))
-        .bind(i64::try_from(snapshot.generation.0).unwrap_or(i64::MAX))
+        .bind(generation)
         .bind(value)
         .execute(&self.pool)
         .await
         .map_err(storage)?;
-        let _ = self.push.send(SnapshotPush {
-            principal,
-            snapshot,
-        });
+        if result.rows_affected() > 0 {
+            let _ = self.push.send(SnapshotPush {
+                principal,
+                generation: Some(snapshot.generation),
+                snapshot: Some(snapshot),
+            });
+        }
         Ok(())
     }
 
     async fn remove_snapshot(&self, principal: Principal) -> Result<(), StoreError> {
-        sqlx::query("DELETE FROM tollgate_snapshots WHERE principal = $1")
-            .bind(id_bytes(principal.0))
-            .execute(&self.pool)
-            .await
-            .map_err(storage)?;
+        let row = sqlx::query(
+            "UPDATE tollgate_snapshots SET deleted = TRUE
+             WHERE principal = $1 AND deleted = FALSE RETURNING generation",
+        )
+        .bind(id_bytes(principal.0))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage)?;
+        if let Some(row) = row {
+            let generation = u64::try_from(row.get::<i64, _>(0))
+                .map(Generation)
+                .map_err(|_| StoreError("stored snapshot generation is negative".into()))?;
+            let _ = self.push.send(SnapshotPush {
+                principal,
+                snapshot: None,
+                generation: Some(generation),
+            });
+        }
         Ok(())
     }
 }

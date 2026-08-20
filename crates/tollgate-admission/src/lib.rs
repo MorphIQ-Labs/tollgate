@@ -24,4 +24,6 @@ pub mod state;
 
 pub use engine::{AdmissionEngine, AdmissionRequest, Admitted};
 pub use maps::{ArcSwapSnapshotMap, MokaSnapshotMap};
-pub use state::{AccountAdmissionState, LeaseSlot, MapEntry, Principal, SnapshotMap};
+pub use state::{
+    AccountAdmissionState, LeaseSlot, MapEntry, Principal, SnapshotMap, SnapshotUpdate,
+};

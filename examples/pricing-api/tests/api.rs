@@ -162,3 +162,11 @@ async fn not_ready_until_lease_arrives() {
     assert_eq!(ready(&router).await, StatusCode::OK);
     runtime.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readiness_falls_when_background_planes_stop() {
+    let (router, runtime) = build_app(100_000, true);
+    wait_ready(&router).await;
+    runtime.shutdown().await;
+    assert_eq!(ready(&router).await, StatusCode::SERVICE_UNAVAILABLE);
+}

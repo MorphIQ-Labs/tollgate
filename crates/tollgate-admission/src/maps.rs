@@ -15,23 +15,48 @@ use tollgate_core::{AccountSnapshot, Generation};
 
 use crate::state::{
     AccountAdmissionState, AccountLimiters, LeaseSlot, MapEntry, Principal, SnapshotMap,
+    SnapshotUpdate,
 };
 
 fn installed_generation(entry: &MapEntry) -> Option<Generation> {
     match entry {
         MapEntry::Present(state) => Some(state.snapshot.generation),
-        MapEntry::NegativeUntil(_) => None,
+        MapEntry::NegativeUntil { generation, .. } => *generation,
     }
 }
 
 /// Should `new` replace `existing`? Present entries only ever move forward by
-/// generation; a negative entry is always replaceable by a real snapshot,
-/// and a negative may replace a present entry only via `install_negative`
-/// (which models explicit revocation-to-unknown, not reordering).
+/// generation. Versioned negative entries are tombstones: only a strictly
+/// newer positive snapshot may replace them.
 fn supersedes(existing: Option<&MapEntry>, new_generation: Generation) -> bool {
     match existing.and_then(installed_generation) {
         Some(current) => new_generation > current,
         None => true,
+    }
+}
+
+fn tombstone(
+    existing: Option<&MapEntry>,
+    until: Timestamp,
+    generation: Option<Generation>,
+) -> MapEntry {
+    let installed = existing.and_then(installed_generation);
+    // A delayed removal must not revoke a snapshot that is known to be
+    // newer. Equal is intentional: removing generation N creates the
+    // generation-N tombstone that only N+1 may supersede.
+    if matches!((installed, generation), (Some(current), Some(incoming)) if incoming < current) {
+        return existing
+            .cloned()
+            .expect("installed generation came from an entry");
+    }
+    MapEntry::NegativeUntil {
+        until,
+        generation: match (installed, generation) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        },
     }
 }
 
@@ -60,9 +85,9 @@ impl SnapshotMap for MokaSnapshotMap {
     fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>) {
         let generation = snapshot.generation;
         // The account-shared limiter, fetched outside the per-key closure.
-        let limiter = self
-            .limiters
-            .limiter_for(snapshot.account_id, &snapshot.limits);
+        let limiter =
+            self.limiters
+                .limiter_for(snapshot.account_id, snapshot.generation, &snapshot.limits);
         // and_compute_with gives us an atomic read-modify-write per key, which
         // is what makes generation monotonicity hold under concurrent pushes.
         self.cache.entry(principal).and_compute_with(|existing| {
@@ -80,7 +105,19 @@ impl SnapshotMap for MokaSnapshotMap {
     }
 
     fn install_negative(&self, principal: Principal, until: Timestamp) {
-        self.cache.insert(principal, MapEntry::NegativeUntil(until));
+        self.install_negative_at_generation(principal, until, None);
+    }
+
+    fn install_negative_at_generation(
+        &self,
+        principal: Principal,
+        until: Timestamp,
+        generation: Option<Generation>,
+    ) {
+        self.cache.entry(principal).and_compute_with(|existing| {
+            let existing = existing.map(|e| e.into_value());
+            moka::ops::compute::Op::Put(tombstone(existing.as_ref(), until, generation))
+        });
     }
 
     fn remove(&self, principal: &Principal) {
@@ -119,9 +156,9 @@ impl SnapshotMap for ArcSwapSnapshotMap {
     }
 
     fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>) {
-        let limiter = self
-            .limiters
-            .limiter_for(snapshot.account_id, &snapshot.limits);
+        let limiter =
+            self.limiters
+                .limiter_for(snapshot.account_id, snapshot.generation, &snapshot.limits);
         self.rcu(|map| {
             if supersedes(map.get(&principal), snapshot.generation) {
                 map.insert(
@@ -137,8 +174,18 @@ impl SnapshotMap for ArcSwapSnapshotMap {
     }
 
     fn install_negative(&self, principal: Principal, until: Timestamp) {
+        self.install_negative_at_generation(principal, until, None);
+    }
+
+    fn install_negative_at_generation(
+        &self,
+        principal: Principal,
+        until: Timestamp,
+        generation: Option<Generation>,
+    ) {
         self.rcu(|map| {
-            map.insert(principal, MapEntry::NegativeUntil(until));
+            let negative = tombstone(map.get(&principal), until, generation);
+            map.insert(principal, negative);
         });
     }
 
@@ -154,9 +201,11 @@ impl SnapshotMap for ArcSwapSnapshotMap {
         let prepared: Vec<_> = entries
             .into_iter()
             .map(|(principal, snapshot, lease)| {
-                let limiter = self
-                    .limiters
-                    .limiter_for(snapshot.account_id, &snapshot.limits);
+                let limiter = self.limiters.limiter_for(
+                    snapshot.account_id,
+                    snapshot.generation,
+                    &snapshot.limits,
+                );
                 (principal, snapshot, lease, limiter)
             })
             .collect();
@@ -171,6 +220,84 @@ impl SnapshotMap for ArcSwapSnapshotMap {
                             Arc::clone(limiter),
                         )),
                     );
+                }
+            }
+        });
+    }
+
+    fn apply_many(&self, updates: Vec<SnapshotUpdate>) {
+        enum Prepared {
+            Present {
+                principal: Principal,
+                snapshot: Arc<AccountSnapshot>,
+                lease: Arc<LeaseSlot>,
+                limiter: Arc<crate::state::AccountLimiter>,
+            },
+            Negative {
+                principal: Principal,
+                until: Timestamp,
+                generation: Option<Generation>,
+            },
+        }
+        let prepared: Vec<_> = updates
+            .into_iter()
+            .map(|update| match update {
+                SnapshotUpdate::Present {
+                    principal,
+                    snapshot,
+                    lease,
+                } => {
+                    let limiter = self.limiters.limiter_for(
+                        snapshot.account_id,
+                        snapshot.generation,
+                        &snapshot.limits,
+                    );
+                    Prepared::Present {
+                        principal,
+                        snapshot,
+                        lease,
+                        limiter,
+                    }
+                }
+                SnapshotUpdate::Negative {
+                    principal,
+                    until,
+                    generation,
+                } => Prepared::Negative {
+                    principal,
+                    until,
+                    generation,
+                },
+            })
+            .collect();
+        self.rcu(|map| {
+            for update in &prepared {
+                match update {
+                    Prepared::Present {
+                        principal,
+                        snapshot,
+                        lease,
+                        limiter,
+                    } => {
+                        if supersedes(map.get(principal), snapshot.generation) {
+                            map.insert(
+                                *principal,
+                                MapEntry::Present(AccountAdmissionState::new(
+                                    Arc::clone(snapshot),
+                                    Arc::clone(lease),
+                                    Arc::clone(limiter),
+                                )),
+                            );
+                        }
+                    }
+                    Prepared::Negative {
+                        principal,
+                        until,
+                        generation,
+                    } => {
+                        let negative = tombstone(map.get(principal), *until, *generation);
+                        map.insert(*principal, negative);
+                    }
                 }
             }
         });
@@ -208,7 +335,7 @@ mod tests {
     fn generation_of(map: &impl SnapshotMap, p: &Principal) -> Option<u64> {
         match map.get(p)? {
             MapEntry::Present(state) => Some(state.snapshot.generation.0),
-            MapEntry::NegativeUntil(_) => None,
+            MapEntry::NegativeUntil { .. } => None,
         }
     }
 
@@ -230,9 +357,20 @@ mod tests {
 
         // Negative entries replace and are replaced by real snapshots.
         map.install_negative(p, t(100));
-        assert!(matches!(map.get(&p), Some(MapEntry::NegativeUntil(_))));
+        assert!(matches!(map.get(&p), Some(MapEntry::NegativeUntil { .. })));
+        // The negative retained generation 6: a delayed generation-1 push
+        // cannot resurrect the revoked principal.
         map.install(p, snapshot(1), LeaseSlot::empty());
-        assert_eq!(generation_of(&map, &p), Some(1));
+        assert!(matches!(map.get(&p), Some(MapEntry::NegativeUntil { .. })));
+        map.install(p, snapshot(7), LeaseSlot::empty());
+        assert_eq!(generation_of(&map, &p), Some(7));
+
+        // The symmetric reorder is safe too: an old removal cannot revoke a
+        // snapshot that has already advanced beyond it.
+        map.install_negative_at_generation(p, t(200), Some(Generation(6)));
+        assert_eq!(generation_of(&map, &p), Some(7));
+        map.install_negative_at_generation(p, t(200), Some(Generation(7)));
+        assert!(matches!(map.get(&p), Some(MapEntry::NegativeUntil { .. })));
 
         map.remove(&p);
         assert!(map.get(&p).is_none());
@@ -301,6 +439,7 @@ mod tests {
             _ => unreachable!(),
         };
         assert!(Arc::ptr_eq(&first.limiter, &second.limiter));
+        let before_update = second.limiter.current();
 
         let mut changed = (*snapshot(3)).clone();
         changed.limits.rate_units_per_second = 2_000;
@@ -309,6 +448,51 @@ mod tests {
             MapEntry::Present(s) => s,
             _ => unreachable!(),
         };
-        assert!(!Arc::ptr_eq(&second.limiter, &third.limiter));
+        assert!(Arc::ptr_eq(&second.limiter, &third.limiter));
+        assert!(!Arc::ptr_eq(&before_update, &third.limiter.current()));
+    }
+
+    #[test]
+    fn limit_change_updates_every_principal_of_the_account() {
+        let map = ArcSwapSnapshotMap::new();
+        map.install(Principal(1), snapshot(1), LeaseSlot::empty());
+        map.install(Principal(2), snapshot(1), LeaseSlot::empty());
+        let before = match map.get(&Principal(2)).unwrap() {
+            MapEntry::Present(state) => state.limiter.current(),
+            _ => unreachable!(),
+        };
+
+        let mut changed = (*snapshot(2)).clone();
+        changed.limits.rate_units_per_second = 2_000;
+        map.install(Principal(1), Arc::new(changed), LeaseSlot::empty());
+
+        let (a, b) = match (
+            map.get(&Principal(1)).unwrap(),
+            map.get(&Principal(2)).unwrap(),
+        ) {
+            (MapEntry::Present(a), MapEntry::Present(b)) => (a, b),
+            _ => unreachable!(),
+        };
+        assert!(Arc::ptr_eq(&a.limiter, &b.limiter));
+        assert!(!Arc::ptr_eq(&before, &b.limiter.current()));
+    }
+
+    #[test]
+    fn stale_snapshot_cannot_roll_back_shared_limiter() {
+        let map = ArcSwapSnapshotMap::new();
+        let mut current = (*snapshot(5)).clone();
+        current.limits.rate_units_per_second = 2_000;
+        map.install(Principal(1), Arc::new(current), LeaseSlot::empty());
+        let installed = match map.get(&Principal(1)).unwrap() {
+            MapEntry::Present(state) => state.limiter.current(),
+            _ => unreachable!(),
+        };
+
+        map.install(Principal(1), snapshot(3), LeaseSlot::empty());
+        let after_stale = match map.get(&Principal(1)).unwrap() {
+            MapEntry::Present(state) => state.limiter.current(),
+            _ => unreachable!(),
+        };
+        assert!(Arc::ptr_eq(&installed, &after_stale));
     }
 }

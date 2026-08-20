@@ -34,14 +34,60 @@ fn full_grant_policy() -> GrantPolicy {
     }
 }
 
+#[test]
+fn invalid_grant_policy_is_rejected() {
+    let policy = GrantPolicy {
+        reclaim_grace: SignedDuration::from_secs(-1),
+        ..GrantPolicy::default()
+    };
+    assert!(MemoryStore::new(policy).is_err());
+
+    let policy = GrantPolicy {
+        max_ttl: SignedDuration::ZERO,
+        ..GrantPolicy::default()
+    };
+    assert!(MemoryStore::new(policy).is_err());
+
+    let invalid = GrantPolicy {
+        shrink_divisor: 0,
+        ..GrantPolicy::default()
+    };
+    assert_eq!(invalid.grant(CostUnits(10), CostUnits(100)), None);
+    assert_eq!(
+        GrantPolicy::default().grant(CostUnits::ZERO, CostUnits(100)),
+        None
+    );
+}
+
 fn store_with_balance(policy: GrantPolicy, balance: u64) -> Arc<MemoryStore> {
-    let store = MemoryStore::new(policy);
+    let store = MemoryStore::new(policy).unwrap();
     store.create_account(AccountConfig {
         account_id: ACCOUNT,
         initial_balance: CostUnits(balance),
         active: true,
     });
     store
+}
+
+#[tokio::test]
+async fn nonpositive_lease_ttl_is_rejected_without_debiting() {
+    let store = store_with_balance(full_grant_policy(), 100);
+    assert_eq!(
+        store
+            .acquire(ACCOUNT, CostUnits(10), SignedDuration::ZERO, t(0))
+            .await
+            .unwrap_err(),
+        AllocateError::InvalidTtl
+    );
+    assert_eq!(store.balance(ACCOUNT), CostUnits(100));
+
+    assert!(
+        store
+            .acquire(ACCOUNT, CostUnits(10), TTL, Timestamp::MAX)
+            .await
+            .is_err()
+    );
+    assert_eq!(store.balance(ACCOUNT), CostUnits(100));
 }
 
 fn usage(lease: &tollgate_core::LeaseGrant, request: u128, units: u64, at: i64) -> UsageEvent {
@@ -433,7 +479,7 @@ async fn snapshot_publish_fetch_and_push() {
     assert_eq!(fetched.generation, Generation(3));
     let pushed = updates.recv().await.unwrap();
     assert_eq!(pushed.principal, principal);
-    assert_eq!(pushed.snapshot.generation, Generation(3));
+    assert_eq!(pushed.snapshot.unwrap().generation, Generation(3));
 
     // Generation monotonicity (backend parity with Postgres — review
     // finding #5): a replayed older publish neither replaces the row nor
@@ -450,5 +496,33 @@ async fn snapshot_publish_fetch_and_push() {
     assert!(
         updates.try_recv().is_err(),
         "a discarded rollback must not be pushed"
+    );
+
+    // Revocation retains generation 3 as a tombstone. A delayed generation-2
+    // publication cannot recreate the principal; generation 4 can.
+    store.remove_snapshot(principal);
+    let removed = updates.recv().await.unwrap();
+    assert!(removed.snapshot.is_none());
+    assert_eq!(removed.generation, Some(Generation(3)));
+    store.publish_snapshot(
+        principal,
+        Arc::new(AccountSnapshot {
+            generation: Generation(2),
+            ..(*snapshot).clone()
+        }),
+    );
+    assert!(store.snapshot(principal).await.unwrap().is_none());
+    assert!(updates.try_recv().is_err());
+
+    store.publish_snapshot(
+        principal,
+        Arc::new(AccountSnapshot {
+            generation: Generation(4),
+            ..(*snapshot).clone()
+        }),
+    );
+    assert_eq!(
+        store.snapshot(principal).await.unwrap().unwrap().generation,
+        Generation(4)
     );
 }
