@@ -94,11 +94,11 @@ fn rate_params(limits: &ResolvedLimits) -> (u64, u64) {
 /// consistent with every other local mechanism here (leases aggregate spend
 /// globally; rate limits do not). Entries live as long as the map: bounded
 /// by account count.
+type LimiterEntry = ((u64, u64), Arc<AccountRateLimiter>);
+
 #[derive(Default)]
 pub(crate) struct AccountLimiters {
-    inner: std::sync::Mutex<
-        std::collections::HashMap<tollgate_core::AccountId, ((u64, u64), Arc<AccountRateLimiter>)>,
-    >,
+    inner: std::sync::Mutex<std::collections::HashMap<tollgate_core::AccountId, LimiterEntry>>,
 }
 
 impl AccountLimiters {

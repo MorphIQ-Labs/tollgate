@@ -20,6 +20,7 @@ tokio = { workspace = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+uuid = { version = "1", features = ["v4"] }
 
 [features]
 # HTTP transport implementing the store traits against a tollgate-server —

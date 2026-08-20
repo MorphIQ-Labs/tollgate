@@ -22,7 +22,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::Json;
 use axum::extract::State;
@@ -35,9 +34,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
-use tollgate_admission::{
-    AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot, SnapshotMap,
-};
+use tollgate_admission::{AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot};
 use tollgate_client::{
     ChargeGuard, Clock, LeaseManager, LeaseManagerConfig, SlotRegistry, SnapshotManager,
     SnapshotManagerConfig, SystemClock, UsageRecorder, UsageWriter, UsageWriterConfig,
@@ -156,7 +153,6 @@ struct AppState {
     /// Snapshot-manager readiness: true once every tracked principal is
     /// resolved (INVARIANTS.md #10).
     snapshots_ready: Option<tokio::sync::watch::Receiver<bool>>,
-    request_seq: AtomicU64,
     /// `false` builds the no-admission baseline the load gate compares
     /// against: same transport, same kernel, zero quota machinery.
     admission_enabled: bool,
@@ -320,7 +316,6 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
         recorder,
         slot,
         snapshots_ready,
-        request_seq: AtomicU64::new(1),
         admission_enabled,
     });
 
@@ -446,9 +441,11 @@ async fn price(
     //    billing event to the reserved permit *now* — a panic or task abort
     //    during the kernel still emits the event on drop, so a spent lease
     //    is never unbilled (review finding #3).
-    let request_id = RequestId(u128::from(
-        state.request_seq.fetch_add(1, Ordering::Relaxed),
-    ));
+    // Random 128-bit ids: idempotency keys are global, so ids must be
+    // collision-free across instances and restarts — a process-local counter
+    // would make a second instance's legitimate usage read as duplicates
+    // (review finding #6).
+    let request_id = RequestId(uuid::Uuid::new_v4().as_u128());
     let (_charge, units) =
         match ChargeGuard::commit(&admitted.reservation, permit, request_id, Timestamp::now()) {
             Ok(committed) => committed,

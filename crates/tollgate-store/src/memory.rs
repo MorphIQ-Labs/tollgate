@@ -27,8 +27,8 @@ use tollgate_core::{
 };
 
 use crate::traits::{
-    AdminStore, AllocateError, GrantPolicy, IngestReport, LeaseAllocator, ReclaimedLease,
-    SnapshotPush, SnapshotSource, StoreError, UsageSink,
+    AdminStore, AllocateError, CreateAccountError, GrantPolicy, IngestReport, LeaseAllocator,
+    ReclaimedLease, SnapshotPush, SnapshotSource, StoreError, UsageSink,
 };
 
 /// Admin-side inputs when creating an account.
@@ -140,8 +140,22 @@ impl MemoryStore {
 
     // ---- admin / control-plane surface -------------------------------
 
+    /// Test/bootstrap convenience: create a fresh account, panicking on a
+    /// duplicate. Production paths use [`AdminStore::create_account`].
     pub fn create_account(&self, config: AccountConfig) {
-        self.lock().accounts.insert(
+        self.try_create_account(config)
+            .expect("account already exists");
+    }
+
+    /// Create an account. Never destructive: an existing account (with its
+    /// balance, ledger totals, fencing sequence, and leases) is left
+    /// untouched and the caller told (review finding #7).
+    pub fn try_create_account(&self, config: AccountConfig) -> Result<(), CreateAccountError> {
+        let mut inner = self.lock();
+        if inner.accounts.contains_key(&config.account_id) {
+            return Err(CreateAccountError::AlreadyExists);
+        }
+        inner.accounts.insert(
             config.account_id,
             AccountRecord {
                 balance: config.initial_balance,
@@ -152,6 +166,7 @@ impl MemoryStore {
                 settlement_loss: CostUnits::ZERO,
             },
         );
+        Ok(())
     }
 
     /// Add balance to an existing account (top-up).
@@ -415,9 +430,8 @@ impl LeaseAllocator for MemoryStore {
 
 #[async_trait]
 impl AdminStore for MemoryStore {
-    async fn create_account(&self, config: AccountConfig) -> Result<(), StoreError> {
-        MemoryStore::create_account(self, config);
-        Ok(())
+    async fn create_account(&self, config: AccountConfig) -> Result<(), CreateAccountError> {
+        MemoryStore::try_create_account(self, config)
     }
 
     async fn deposit(&self, account: AccountId, units: CostUnits) -> Result<(), AllocateError> {

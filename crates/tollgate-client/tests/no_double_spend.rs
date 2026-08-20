@@ -106,7 +106,10 @@ fn spawn_instance(store: &Arc<MemoryStore>, clock: &Arc<ManualClock>) -> Instanc
 }
 
 /// Attempt up to `burst` requests on one instance; returns how many committed.
-fn hammer(instance: &mut Instance, request_seq: &mut u128, burst: usize) -> usize {
+/// Request ids come from each instance's own random generator — no shared
+/// sequence (review finding #6): global idempotency must hold across
+/// independently generated ids, and the duplicate count proves it.
+fn hammer(instance: &mut Instance, burst: usize) -> usize {
     let mut committed = 0;
     for _ in 0..burst {
         // INVARIANTS.md #8 ordering: accounting capacity is reserved before
@@ -129,10 +132,9 @@ fn hammer(instance: &mut Instance, request_seq: &mut u128, burst: usize) -> usiz
                     .reservation
                     .commit_at_execution_start(t(0))
                     .unwrap();
-                *request_seq += 1;
                 let event = admitted
                     .reservation
-                    .usage_event(RequestId(*request_seq), t(0))
+                    .usage_event(RequestId(uuid::Uuid::new_v4().as_u128()), t(0))
                     .expect("committed reservation yields an event");
                 permit.record(event);
                 instance.committed += admitted.quote.total.get();
@@ -165,15 +167,13 @@ async fn two_instances_never_overspend_one_account() {
         spawn_instance(&store, &clock),
         spawn_instance(&store, &clock),
     ];
-    let mut request_seq = 0u128;
-
     // Rounds of interleaved spending; between rounds the paused runtime
     // auto-advances so managers refill and writers flush.
     let mut quiet_rounds = 0;
     for _ in 0..500 {
         let mut round_commits = 0;
         for instance in &mut instances {
-            round_commits += hammer(instance, &mut request_seq, 10);
+            round_commits += hammer(instance, 10);
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
@@ -206,6 +206,8 @@ async fn two_instances_never_overspend_one_account() {
     let stats_b = b.writer.shutdown().await;
     assert_eq!(stats_a.lost + stats_b.lost, 0);
     assert_eq!(stats_a.rejected + stats_b.rejected, 0);
+    // Independent generators must never collide into duplicates.
+    assert_eq!(stats_a.duplicate + stats_b.duplicate, 0);
     a.manager.shutdown().await;
     b.manager.shutdown().await;
 

@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use tollgate_store::wire::Problem;
-use tollgate_store::{AllocateError, StoreError};
+use tollgate_store::{AllocateError, CreateAccountError, StoreError};
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -52,6 +52,19 @@ impl From<AllocateError> for ApiError {
             status,
             code,
             title: e.to_string(),
+        }
+    }
+}
+
+impl From<CreateAccountError> for ApiError {
+    fn from(e: CreateAccountError) -> Self {
+        match e {
+            CreateAccountError::AlreadyExists => ApiError {
+                status: StatusCode::CONFLICT,
+                code: "account-exists",
+                title: "account already exists".to_string(),
+            },
+            CreateAccountError::Storage(inner) => ApiError::from(inner),
         }
     }
 }

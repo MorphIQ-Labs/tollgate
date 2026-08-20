@@ -12,8 +12,8 @@ use tollgate_core::{
     PermissionBits, Principal, RequestId, ResolvedLimits, UsageEvent,
 };
 use tollgate_store::{
-    AccountConfig, AllocateError, GrantPolicy, LeaseAllocator, MemoryStore, SnapshotSource,
-    UsageSink,
+    AccountConfig, AdminStore, AllocateError, CreateAccountError, GrantPolicy, LeaseAllocator,
+    MemoryStore, SnapshotSource, UsageSink,
 };
 
 fn t(secs: i64) -> Timestamp {
@@ -349,6 +349,42 @@ async fn straggler_usage_after_release_is_billed() {
         .await
         .unwrap();
     assert_eq!(report.rejected, 1);
+}
+
+/// Review finding #7: recreating an account is refused and touches nothing —
+/// balance, ledger totals, and the fencing sequence survive intact.
+#[tokio::test]
+async fn recreate_account_is_refused_and_nondestructive() {
+    let store = store_with_balance(full_grant_policy(), 1_000);
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        AdminStore::create_account(
+            &*store,
+            AccountConfig {
+                account_id: ACCOUNT,
+                initial_balance: CostUnits(5),
+                active: true,
+            },
+        )
+        .await
+        .unwrap_err(),
+        CreateAccountError::AlreadyExists
+    );
+
+    assert_eq!(store.balance(ACCOUNT), CostUnits(600));
+    let replacement = store
+        .acquire(ACCOUNT, CostUnits(100), TTL, t(1))
+        .await
+        .unwrap();
+    assert!(
+        replacement.fencing_token > lease.fencing_token,
+        "fencing sequence must survive a refused recreate"
+    );
+    assert_conserved(&store);
 }
 
 #[tokio::test]

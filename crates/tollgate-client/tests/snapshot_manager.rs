@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use jiff::{SignedDuration, Timestamp};
 
-use tollgate_admission::{AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, SnapshotMap};
+use tollgate_admission::{AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap};
 use tollgate_client::{ManualClock, SlotRegistry, SnapshotManager, SnapshotManagerConfig};
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, FencingToken,
@@ -52,7 +52,6 @@ fn snapshot(generation: u64, permissions: PermissionBits) -> Arc<AccountSnapshot
 }
 
 struct Fixture {
-    store: Arc<MemoryStore>,
     engine: AdmissionEngine<Arc<ArcSwapSnapshotMap>>,
     slots: Arc<SlotRegistry>,
     manager: SnapshotManager,
@@ -75,7 +74,6 @@ fn fixture(store: Arc<MemoryStore>) -> Fixture {
         },
     );
     Fixture {
-        store,
         engine,
         slots,
         manager,

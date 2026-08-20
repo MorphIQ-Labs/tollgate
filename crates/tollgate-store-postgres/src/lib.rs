@@ -33,8 +33,8 @@ use tollgate_core::{
 };
 use tollgate_store::memory::Conservation;
 use tollgate_store::{
-    AccountConfig, AdminStore, AllocateError, GrantPolicy, IngestReport, LeaseAllocator,
-    ReclaimedLease, SnapshotPush, SnapshotSource, StoreError, UsageSink,
+    AccountConfig, AdminStore, AllocateError, CreateAccountError, GrantPolicy, IngestReport,
+    LeaseAllocator, ReclaimedLease, SnapshotPush, SnapshotSource, StoreError, UsageSink,
 };
 
 const STATE_ACTIVE: i16 = 0;
@@ -514,19 +514,22 @@ impl SnapshotSource for PostgresStore {
 
 #[async_trait]
 impl AdminStore for PostgresStore {
-    async fn create_account(&self, config: AccountConfig) -> Result<(), StoreError> {
-        sqlx::query(
+    async fn create_account(&self, config: AccountConfig) -> Result<(), CreateAccountError> {
+        let result = sqlx::query(
             "INSERT INTO tollgate_accounts
              (account_id, balance, deposited, active, next_fence, usage_recorded, settlement_loss)
              VALUES ($1, $2, $2, $3, 1, 0, 0)
              ON CONFLICT (account_id) DO NOTHING",
         )
         .bind(id_bytes(config.account_id.0))
-        .bind(to_i64(config.initial_balance, "balance")?)
+        .bind(to_i64(config.initial_balance, "balance").map_err(CreateAccountError::Storage)?)
         .bind(config.active)
         .execute(&self.pool)
         .await
-        .map_err(storage)?;
+        .map_err(|e| CreateAccountError::Storage(storage(e)))?;
+        if result.rows_affected() == 0 {
+            return Err(CreateAccountError::AlreadyExists);
+        }
         Ok(())
     }
 

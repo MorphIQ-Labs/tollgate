@@ -165,6 +165,18 @@ async fn admin_snapshot_roundtrip_and_probes() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
+    // Recreating an existing account is a surfaced conflict, never a silent
+    // overwrite or no-op (review finding #7).
+    let (status, problem) = call(
+        &router,
+        "POST",
+        "/v1/admin/accounts",
+        Some(json!({"account_id": 1, "initial_balance": 999, "active": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(problem["code"], "account-exists");
+
     let snapshot = json!({
         "account_id": 1,
         "key_id": null,

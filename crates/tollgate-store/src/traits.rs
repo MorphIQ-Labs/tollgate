@@ -179,12 +179,38 @@ pub trait SnapshotSource: Send + Sync {
     fn subscribe(&self) -> broadcast::Receiver<SnapshotPush>;
 }
 
+/// Refusals from account creation (review finding #7): creation is never
+/// destructive and never silently idempotent — recreating an existing
+/// account is a surfaced error in every backend, because an overwrite would
+/// reset balances/fencing under live leases and a silent no-op would hide
+/// operator mistakes. Resetting an account is a deliberate, separate
+/// workflow, not a create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateAccountError {
+    AlreadyExists,
+    Storage(StoreError),
+}
+
+impl std::fmt::Display for CreateAccountError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CreateAccountError::AlreadyExists => f.write_str("account already exists"),
+            CreateAccountError::Storage(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for CreateAccountError {}
+
 /// Administrative writes: the control plane's mutation surface. Kept apart
 /// from the data-plane traits so a read-only replica can implement those
 /// without this.
 #[async_trait]
 pub trait AdminStore: Send + Sync {
-    async fn create_account(&self, config: crate::memory::AccountConfig) -> Result<(), StoreError>;
+    async fn create_account(
+        &self,
+        config: crate::memory::AccountConfig,
+    ) -> Result<(), CreateAccountError>;
     async fn deposit(&self, account: AccountId, units: CostUnits) -> Result<(), AllocateError>;
     async fn set_active(&self, account: AccountId, active: bool) -> Result<(), AllocateError>;
     async fn publish_snapshot(

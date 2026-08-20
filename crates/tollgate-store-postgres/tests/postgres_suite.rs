@@ -20,8 +20,8 @@ use tollgate_core::{
     PermissionBits, Principal, RequestId, ResolvedLimits, UsageEvent,
 };
 use tollgate_store::{
-    AccountConfig, AdminStore, AllocateError, GrantPolicy, LeaseAllocator, SnapshotSource,
-    UsageSink,
+    AccountConfig, AdminStore, AllocateError, CreateAccountError, GrantPolicy, LeaseAllocator,
+    SnapshotSource, UsageSink,
 };
 use tollgate_store_postgres::PostgresStore;
 
@@ -366,6 +366,41 @@ async fn straggler_usage_after_release_is_billed() {
         .await
         .unwrap();
     assert_eq!(report.rejected, 1);
+}
+
+/// Review finding #7 (mirrors the memory suite).
+#[tokio::test]
+async fn recreate_account_is_refused_and_nondestructive() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        AdminStore::create_account(
+            &*store,
+            AccountConfig {
+                account_id: ACCOUNT,
+                initial_balance: CostUnits(5),
+                active: true,
+            },
+        )
+        .await
+        .unwrap_err(),
+        CreateAccountError::AlreadyExists
+    );
+
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(600));
+    let replacement = store
+        .acquire(ACCOUNT, CostUnits(100), TTL, t(1))
+        .await
+        .unwrap();
+    assert!(replacement.fencing_token > lease.fencing_token);
+    assert_conserved(&store).await;
 }
 
 #[tokio::test]
