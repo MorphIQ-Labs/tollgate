@@ -1,0 +1,27 @@
+[package]
+name = "quota-core"
+description = "Zero-I/O, clock-free domain layer for quota admission and accounting: cost tables, account snapshots, fenced local leases, and the reservation state machine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+# Deliberately minimal, mirroring the consumer's policy crate: the hot-path crate must
+# never grow an I/O, async, or clock dependency. Time enters as arguments.
+[dependencies]
+jiff = { workspace = true }
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+serde = ["dep:serde", "jiff/serde"]
+
+[[bench]]
+name = "core_hot_path"
+harness = false

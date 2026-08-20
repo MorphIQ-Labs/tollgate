@@ -1,0 +1,4 @@
+# Pinned here rather than in a CI image tag, so local builds and CI agree.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,25 @@
+{
+  "_comment": "target_ns is aspirational; threshold_ns fails the gate. Values are provisional laptop bounds — recalibrate on the controlled host before treating them as the contract.",
+  "benchmarks": [
+    {
+      "id": "cost_table/quote",
+      "target_ns": 10.0,
+      "threshold_ns": 25.0
+    },
+    {
+      "id": "snapshot/admit",
+      "target_ns": 10.0,
+      "threshold_ns": 25.0
+    },
+    {
+      "id": "lease/reserve_commit",
+      "target_ns": 30.0,
+      "threshold_ns": 80.0
+    },
+    {
+      "id": "lease/reserve_cancel",
+      "target_ns": 30.0,
+      "threshold_ns": 80.0
+    }
+  ]
+}

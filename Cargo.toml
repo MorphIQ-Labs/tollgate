@@ -1,0 +1,48 @@
+# Virtual workspace manifest. Every member inherits version/edition/license from
+# [workspace.package] and stays `publish = false`: like ferro-risk, distribution
+# is by git tag, and publication is a deliberate decision, not automation's.
+[workspace]
+resolver = "3"
+members = [
+    "crates/quota-core",
+    "crates/quota-perf-gate",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+authors = ["MorphIQ Labs"]
+repository = "https://git.example.com/stephen/quota-service-poc"
+
+[workspace.dependencies]
+# Time: jiff, not chrono/time — matches ferro-risk. The core crate takes
+# timestamps as arguments and never reads a clock itself.
+jiff = "0.2"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+
+# Dev/bench
+criterion = "0.5"
+proptest = "1.7"
+
+# Later members (admission/store/server/client) — declared centrally so every
+# crate resolves the same versions.
+arc-swap = "1"
+moka = { version = "0.12", features = ["sync"] }
+governor = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
+axum = "0.8"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "uuid", "json"] }
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+
+# Deployment profile for load-gate runs and production builds; kept separate so
+# Criterion benches retain the default calibrated release codegen policy.
+[profile.production]
+inherits = "release"
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = "symbols"
