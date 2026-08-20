@@ -4,13 +4,13 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/quota-admission",
-    "crates/quota-client",
-    "crates/quota-core",
-    "crates/quota-perf-gate",
-    "crates/quota-server",
-    "crates/quota-store",
-    "crates/quota-store-postgres",
+    "crates/tollgate-admission",
+    "crates/tollgate-client",
+    "crates/tollgate-core",
+    "crates/tollgate-perf-gate",
+    "crates/tollgate-server",
+    "crates/tollgate-store",
+    "crates/tollgate-store-postgres",
     "examples/pricing-api",
 ]
 

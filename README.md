@@ -1,4 +1,4 @@
-# quota-service
+# tollgate
 
 Abstract quota admission and usage accounting for latency-critical web
 services: centrally allocated, **fenced quota leases** spent by **local atomic
@@ -14,13 +14,13 @@ permission bits — never plan names, FCUs, or SQL.
 
 | Crate | Role |
 |---|---|
-| `crates/quota-core` | Zero-I/O, clock-free hot path: `CostUnits` (checked), `CostTable` (direct-indexed), `AccountSnapshot`, `LocalLease` (fenced, CAS), `Reservation` (pending → committed-at-execution-start \| released) |
-| `crates/quota-admission` | One-call pipeline: snapshot map (arc-swap and moka candidates) → permissions → quote → weighted `governor` rate token → lease reservation |
-| `crates/quota-store` | `LeaseAllocator` / `SnapshotSource` / `UsageSink` / `AdminStore` traits, `GrantPolicy`, `MemoryStore` reference backend, wire DTOs, `Clock` |
-| `crates/quota-store-postgres` | Transactional Postgres backend (row-locked acquire, SKIP LOCKED reclaim, ON CONFLICT idempotency) |
-| `crates/quota-server` | Axum control plane over any backend; RFC-7807 errors with stable codes |
-| `crates/quota-client` | Instance runtime: `LeaseManager` (background refill, quiescence-gated release), `UsageWriter` (permit-based shed-on-overflow batching), `HttpStore` transport |
-| `crates/quota-perf-gate` | Benchmark threshold checker (criterion estimates vs manifest, staleness-guarded) |
+| `crates/tollgate-core` | Zero-I/O, clock-free hot path: `CostUnits` (checked), `CostTable` (direct-indexed), `AccountSnapshot`, `LocalLease` (fenced, CAS), `Reservation` (pending → committed-at-execution-start \| released) |
+| `crates/tollgate-admission` | One-call pipeline: snapshot map (arc-swap and moka candidates) → permissions → quote → weighted `governor` rate token → lease reservation |
+| `crates/tollgate-store` | `LeaseAllocator` / `SnapshotSource` / `UsageSink` / `AdminStore` traits, `GrantPolicy`, `MemoryStore` reference backend, wire DTOs, `Clock` |
+| `crates/tollgate-store-postgres` | Transactional Postgres backend (row-locked acquire, SKIP LOCKED reclaim, ON CONFLICT idempotency) |
+| `crates/tollgate-server` | Axum control plane over any backend; RFC-7807 errors with stable codes |
+| `crates/tollgate-client` | Instance runtime: `LeaseManager` (background refill, quiescence-gated release), `UsageWriter` (permit-based shed-on-overflow batching), `HttpStore` transport |
+| `crates/tollgate-perf-gate` | Benchmark threshold checker (criterion estimates vs manifest, staleness-guarded) |
 | `examples/pricing-api` | Concrete API embedding the stack: HMAC-verified keys, admission, commit-at-execution-start, billing |
 
 Contract: [`INVARIANTS.md`](INVARIANTS.md). Architecture and findings:
@@ -35,7 +35,7 @@ cargo test --workspace                     # correctness (58+ tests, no infra ne
 
 # Postgres correctness suite:
 docker compose up -d
-QUOTA_PG_URL=postgres://quota:quota@127.0.0.1:5433/quota cargo test -p quota-store-postgres
+TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate cargo test -p tollgate-store-postgres
 
 # Run the example service:
 cargo run -p pricing-api
@@ -44,7 +44,7 @@ curl -s -H 'Authorization: Bearer demo-key-1' -H 'Content-Type: application/json
      http://127.0.0.1:8081/v1/price
 
 # Run the control plane:
-cargo run -p quota-server
+cargo run -p tollgate-server
 ```
 
 ## The numbers that matter (laptop, provisional)

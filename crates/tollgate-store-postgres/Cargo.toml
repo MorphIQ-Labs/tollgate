@@ -1,0 +1,25 @@
+[package]
+name = "tollgate-store-postgres"
+description = "PostgreSQL backend for tollgate: transactional fenced lease allocation, idempotent usage ingest, and snapshot storage implementing the tollgate-store traits."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+tollgate-core = { path = "../tollgate-core", features = ["serde"] }
+tollgate-store = { path = "../tollgate-store", features = ["wire"] }
+async-trait = { workspace = true }
+jiff = { workspace = true }
+serde_json = { workspace = true }
+# Runtime-checked queries only (sqlx::query, not query!): the workspace must
+# build without a DATABASE_URL. The correctness suite runs against a live
+# Postgres when TOLLGATE_PG_URL is set (see docker-compose.yml).
+sqlx = { workspace = true }
+tokio = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

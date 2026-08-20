@@ -1,4 +1,4 @@
-//! A minimal "concrete API" built on the quota-service stack — the
+//! A minimal "concrete API" built on the tollgate stack — the
 //! pluggability acceptance test from the plan: can a real web service embed
 //! the abstract product without the product knowing anything about pricing?
 //!
@@ -16,8 +16,8 @@
 //! ```
 //!
 //! The embedded topology runs `MemoryStore` in-process; pointing the same
-//! stack at a `quota-server` is a one-line swap to `HttpStore` (see the
-//! loopback test in quota-server). Readiness reports 503 until the account's
+//! stack at a `tollgate-server` is a one-line swap to `HttpStore` (see the
+//! loopback test in tollgate-server). Readiness reports 503 until the account's
 //! lease slot is stocked (INVARIANTS.md #10).
 
 use std::collections::HashMap;
@@ -35,17 +35,17 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
-use quota_admission::{
+use tollgate_admission::{
     AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot, SnapshotMap,
 };
-use quota_client::{
+use tollgate_client::{
     LeaseManager, LeaseManagerConfig, SystemClock, UsageRecorder, UsageWriter, UsageWriterConfig,
 };
-use quota_core::{
+use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, Generation,
     OpIndex, PermissionBits, Principal, RequestId, ResolvedLimits,
 };
-use quota_store::{AccountConfig, GrantPolicy, MemoryStore};
+use tollgate_store::{AccountConfig, GrantPolicy, MemoryStore};
 
 type HmacSha256 = Hmac<Sha256>;
 

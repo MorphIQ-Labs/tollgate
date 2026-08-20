@@ -21,8 +21,8 @@ rm -rf "$CRITERION_ROOT/cost_table" "$CRITERION_ROOT/snapshot" "$CRITERION_ROOT/
 mkdir -p "$(dirname "$MARKER")"
 touch "$MARKER"
 
-cargo bench --locked -p quota-core --bench core_hot_path
-cargo bench --locked -p quota-admission --bench admission_hot_path
+cargo bench --locked -p tollgate-core --bench core_hot_path
+cargo bench --locked -p tollgate-admission --bench admission_hot_path
 
-exec cargo run --locked -p quota-perf-gate --bin check_benchmark_thresholds -- \
+exec cargo run --locked -p tollgate-perf-gate --bin check_benchmark_thresholds -- \
     testing/perf_thresholds.json "$CRITERION_ROOT" "$REPORT" "$MARKER"

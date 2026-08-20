@@ -1,0 +1,23 @@
+[package]
+name = "tollgate-admission"
+description = "Per-request admission pipeline: snapshot lookup, permission and staleness checks, weighted local rate limiting, and lease reservation — with zero inline I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+tollgate-core = { path = "../tollgate-core" }
+arc-swap = { workspace = true }
+moka = { workspace = true }
+governor = { workspace = true }
+jiff = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "admission_hot_path"
+harness = false

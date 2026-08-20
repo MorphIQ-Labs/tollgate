@@ -1440,15 +1440,15 @@ dependencies = [
  "hmac",
  "http-body-util",
  "jiff",
- "quota-admission",
- "quota-client",
- "quota-core",
- "quota-store",
  "serde",
  "serde_json",
  "sha2",
  "subtle",
  "tokio",
+ "tollgate-admission",
+ "tollgate-client",
+ "tollgate-core",
+ "tollgate-store",
  "tower",
 ]
 
@@ -1500,92 +1500,6 @@ name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
-
-[[package]]
-name = "quota-admission"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "criterion",
- "governor",
- "jiff",
- "moka",
- "quota-core",
-]
-
-[[package]]
-name = "quota-client"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "jiff",
- "quota-admission",
- "quota-core",
- "quota-store",
- "reqwest",
- "tokio",
-]
-
-[[package]]
-name = "quota-core"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "jiff",
- "proptest",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "quota-perf-gate"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "quota-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "http-body-util",
- "jiff",
- "quota-admission",
- "quota-client",
- "quota-core",
- "quota-store",
- "serde",
- "serde_json",
- "tokio",
- "tower",
-]
-
-[[package]]
-name = "quota-store"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "jiff",
- "quota-core",
- "serde",
- "tokio",
-]
-
-[[package]]
-name = "quota-store-postgres"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "jiff",
- "quota-core",
- "quota-store",
- "serde_json",
- "sqlx",
- "tokio",
- "uuid",
-]
 
 [[package]]
 name = "quote"
@@ -2384,6 +2298,92 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "tollgate-admission"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "criterion",
+ "governor",
+ "jiff",
+ "moka",
+ "tollgate-core",
+]
+
+[[package]]
+name = "tollgate-client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "jiff",
+ "reqwest",
+ "tokio",
+ "tollgate-admission",
+ "tollgate-core",
+ "tollgate-store",
+]
+
+[[package]]
+name = "tollgate-core"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "jiff",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "tollgate-perf-gate"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "tollgate-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "http-body-util",
+ "jiff",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tollgate-admission",
+ "tollgate-client",
+ "tollgate-core",
+ "tollgate-store",
+ "tower",
+]
+
+[[package]]
+name = "tollgate-store"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "jiff",
+ "serde",
+ "tokio",
+ "tollgate-core",
+]
+
+[[package]]
+name = "tollgate-store-postgres"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "jiff",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tollgate-core",
+ "tollgate-store",
+ "uuid",
 ]
 
 [[package]]

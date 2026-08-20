@@ -1,0 +1,24 @@
+[package]
+name = "tollgate-server"
+description = "Control-plane HTTP service: fenced lease allocation, snapshot distribution, idempotent usage ingest, and account administration over any store backend."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+tollgate-core = { path = "../tollgate-core", features = ["serde"] }
+tollgate-store = { path = "../tollgate-store", features = ["wire"] }
+axum = { workspace = true }
+jiff = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tollgate-admission = { path = "../tollgate-admission" }
+tollgate-client = { path = "../tollgate-client", features = ["http"] }
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

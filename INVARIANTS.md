@@ -1,4 +1,4 @@
-# quota-service invariants
+# tollgate invariants
 
 A change that violates one of these is a defect even when every test passes.
 Each invariant names the test(s) that enforce it; a new invariant is not "done"
@@ -9,7 +9,7 @@ until it has one.
    clients. Enforced by fenced leases: units are spent only from a lease, and a
    lease's units were atomically debited from the account at allocation.
    *Tests:* `no_double_spend_across_instances` (memory and Postgres variants),
-   `quota-core` reservation proptests.
+   `tollgate-core` reservation proptests.
 
 2. **Zero charge before execution.** A reservation that never reaches
    `commit_at_execution_start` charges zero units, and its units return to the
@@ -29,7 +29,7 @@ until it has one.
 5. **Fail closed, zero I/O.** Unknown principal, suspended/closed account,
    expired snapshot, missing permission, exhausted or expired lease: all deny
    locally. The request path performs no database, file, lock-file, or network
-   access — not even on a miss. *Tests:* `quota-core` deny-path unit tests;
+   access — not even on a miss. *Tests:* `tollgate-core` deny-path unit tests;
    admission-crate miss tests assert no store calls from the request path.
 
 6. **Foreground isolation.** Lease refill and snapshot replacement never block
@@ -53,7 +53,7 @@ until it has one.
 
 11. **Checked arithmetic only.** Cost and lease arithmetic never wraps; any
     overflow is an explicit error that denies (fail closed), never a wrap to a
-    small charge. *Tests:* `quota-core` proptests.
+    small charge. *Tests:* `tollgate-core` proptests.
 
 Ledger roles (context for 1 and 7): leases **bound** spend; usage events **are**
 the billing record; reconciliation compares the two and steady-state drift is

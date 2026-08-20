@@ -1,0 +1,28 @@
+[package]
+name = "tollgate-client"
+description = "Instance-side quota runtime: background lease refill into the admission layer's LeaseSlot, and a bounded, batched, shed-on-overflow usage writer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+tollgate-core = { path = "../tollgate-core" }
+tollgate-admission = { path = "../tollgate-admission" }
+tollgate-store = { path = "../tollgate-store" }
+async-trait = { workspace = true }
+jiff = { workspace = true }
+reqwest = { workspace = true, optional = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+# HTTP transport implementing the store traits against a tollgate-server —
+# the "via-server" topology. Off by default: the direct-store topology
+# needs none of it.
+http = ["dep:reqwest", "tollgate-store/wire"]

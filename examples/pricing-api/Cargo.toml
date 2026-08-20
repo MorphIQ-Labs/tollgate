@@ -1,6 +1,6 @@
 [package]
 name = "pricing-api"
-description = "Example concrete web service built on the quota-service stack: HMAC-verified API keys, one-call admission, commit-at-execution-start charging, and batched usage accounting around a toy pricing kernel."
+description = "Example concrete web service built on the tollgate stack: HMAC-verified API keys, one-call admission, commit-at-execution-start charging, and batched usage accounting around a toy pricing kernel."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,10 +9,10 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-quota-core = { path = "../../crates/quota-core" }
-quota-admission = { path = "../../crates/quota-admission" }
-quota-client = { path = "../../crates/quota-client" }
-quota-store = { path = "../../crates/quota-store" }
+tollgate-core = { path = "../../crates/tollgate-core" }
+tollgate-admission = { path = "../../crates/tollgate-admission" }
+tollgate-client = { path = "../../crates/tollgate-client" }
+tollgate-store = { path = "../../crates/tollgate-store" }
 axum = { workspace = true }
 hmac = { workspace = true }
 jiff = { workspace = true }

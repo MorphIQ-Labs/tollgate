@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use pricing_api::{DEMO_ACCOUNT, DEMO_API_KEY, build_app};
-use quota_core::CostUnits;
+use tollgate_core::CostUnits;
 
 fn price_body(contracts: usize) -> Value {
     let contract =
