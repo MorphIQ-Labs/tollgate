@@ -15,10 +15,15 @@
 //! [`UsageSink`]: quota_store::UsageSink
 //! [`LeaseSlot`]: quota_admission::LeaseSlot
 
-pub mod clock;
 pub mod lease_manager;
 pub mod usage_writer;
 
-pub use clock::{Clock, ManualClock, SystemClock};
+#[cfg(feature = "http")]
+pub mod http;
+
+pub use quota_store::{Clock, ManualClock, SystemClock};
+
+#[cfg(feature = "http")]
+pub use http::HttpStore;
 pub use lease_manager::{LeaseManager, LeaseManagerConfig};
 pub use usage_writer::{UsagePermit, UsageRecorder, UsageWriter, UsageWriterConfig, WriterStats};

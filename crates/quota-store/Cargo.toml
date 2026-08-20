@@ -12,7 +12,13 @@ publish = false
 quota-core = { path = "../quota-core" }
 async-trait = { workspace = true }
 jiff = { workspace = true }
+serde = { workspace = true, optional = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+# The HTTP wire contract shared by quota-server and quota-client's HTTP
+# transport. Feature-gated so store-only consumers skip serde entirely.
+wire = ["dep:serde", "quota-core/serde"]

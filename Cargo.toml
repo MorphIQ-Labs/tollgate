@@ -8,6 +8,7 @@ members = [
     "crates/quota-client",
     "crates/quota-core",
     "crates/quota-perf-gate",
+    "crates/quota-server",
     "crates/quota-store",
 ]
 
@@ -39,6 +40,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 axum = "0.8"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "uuid", "json"] }
 hmac = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 sha2 = "0.10"
 subtle = "2"
 

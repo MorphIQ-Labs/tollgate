@@ -77,6 +77,7 @@ pub struct ResolvedLimits {
 /// Shared as `Arc<AccountSnapshot>`; replaced whole (never mutated) when the
 /// control plane publishes a newer [`Generation`].
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AccountSnapshot {
     pub account_id: AccountId,
     /// The credential this snapshot was compiled for, when key-scoped.

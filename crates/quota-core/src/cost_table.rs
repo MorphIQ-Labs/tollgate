@@ -58,6 +58,7 @@ impl fmt::Display for QuoteError {
 /// the table's bounds that was never registered. The struct is built once and
 /// shared (`Arc<CostTable>`) for the life of a policy generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CostTable {
     fixed_request: CostUnits,
     minimum_charge: CostUnits,

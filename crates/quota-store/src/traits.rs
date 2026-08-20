@@ -107,6 +107,7 @@ impl GrantPolicy {
 
 /// One lease settled by an expiry sweep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 pub struct ReclaimedLease {
     pub lease_id: LeaseId,
     pub account_id: AccountId,
@@ -170,8 +171,25 @@ pub trait SnapshotSource: Send + Sync {
     fn subscribe(&self) -> broadcast::Receiver<SnapshotPush>;
 }
 
+/// Administrative writes: the control plane's mutation surface. Kept apart
+/// from the data-plane traits so a read-only replica can implement those
+/// without this.
+#[async_trait]
+pub trait AdminStore: Send + Sync {
+    async fn create_account(&self, config: crate::memory::AccountConfig) -> Result<(), StoreError>;
+    async fn deposit(&self, account: AccountId, units: CostUnits) -> Result<(), AllocateError>;
+    async fn set_active(&self, account: AccountId, active: bool) -> Result<(), AllocateError>;
+    async fn publish_snapshot(
+        &self,
+        principal: Principal,
+        snapshot: Arc<AccountSnapshot>,
+    ) -> Result<(), StoreError>;
+    async fn remove_snapshot(&self, principal: Principal) -> Result<(), StoreError>;
+}
+
 /// Outcome of one ingest batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 pub struct IngestReport {
     /// Newly recorded events.
     pub accepted: u64,

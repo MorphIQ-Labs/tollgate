@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, watch};
 use quota_core::{DenyReason, UsageEvent};
 use quota_store::UsageSink;
 
-use crate::clock::Clock;
+use quota_store::Clock;
 
 #[derive(Debug, Clone, Copy)]
 pub struct UsageWriterConfig {

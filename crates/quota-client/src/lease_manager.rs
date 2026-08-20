@@ -32,7 +32,7 @@ use quota_admission::LeaseSlot;
 use quota_core::{AccountId, CostUnits, LocalLease};
 use quota_store::LeaseAllocator;
 
-use crate::clock::Clock;
+use quota_store::Clock;
 
 #[derive(Debug, Clone, Copy)]
 pub struct LeaseManagerConfig {

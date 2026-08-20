@@ -18,11 +18,15 @@
 //! correctness suite run without infrastructure, and to serve as executable
 //! documentation of the settlement rules a real backend must reproduce.
 
+pub mod clock;
 pub mod memory;
 pub mod traits;
+#[cfg(feature = "wire")]
+pub mod wire;
 
+pub use clock::{Clock, ManualClock, SystemClock};
 pub use memory::{AccountConfig, MemoryStore};
 pub use traits::{
-    AllocateError, GrantPolicy, IngestReport, LeaseAllocator, ReclaimedLease, SnapshotPush,
-    SnapshotSource, StoreError, UsageSink,
+    AdminStore, AllocateError, GrantPolicy, IngestReport, LeaseAllocator, ReclaimedLease,
+    SnapshotPush, SnapshotSource, StoreError, UsageSink,
 };

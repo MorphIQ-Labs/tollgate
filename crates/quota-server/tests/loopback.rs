@@ -1,0 +1,194 @@
+//! The via-server topology, end to end over real loopback TCP: the same
+//! instance stack from the direct-store no-double-spend test — admission
+//! engine, lease manager, usage writer — running over `HttpStore` against a
+//! live `quota-server`. Pluggability made executable: the client code is
+//! identical, only the `Arc<dyn LeaseAllocator>`/`Arc<dyn UsageSink>` differ.
+
+use std::sync::Arc;
+
+use jiff::{SignedDuration, Timestamp};
+
+use quota_admission::{
+    AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot, SnapshotMap,
+};
+use quota_client::{
+    HttpStore, LeaseManager, LeaseManagerConfig, SystemClock, UsageWriter, UsageWriterConfig,
+};
+use quota_core::{
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, Generation,
+    OpIndex, PermissionBits, Principal, RequestId, ResolvedLimits,
+};
+use quota_store::{AccountConfig, GrantPolicy, MemoryStore, SnapshotSource as _};
+
+use quota_server::{ServerState, serve};
+
+const ACCOUNT: AccountId = AccountId(1);
+const PRINCIPAL: Principal = Principal(7);
+const DEPOSIT: u64 = 5_000;
+const COST_PER_REQUEST: u64 = 51;
+
+#[derive(Clone, Copy)]
+struct PriceOp;
+impl OpIndex for PriceOp {
+    fn index(&self) -> usize {
+        0
+    }
+}
+
+fn snapshot() -> Arc<AccountSnapshot> {
+    Arc::new(AccountSnapshot {
+        account_id: ACCOUNT,
+        key_id: None,
+        generation: Generation(1),
+        status: AccountStatus::Active,
+        valid_until: Timestamp::from_second(4_102_444_800).unwrap(),
+        permissions: PermissionBits::bit(0),
+        limits: ResolvedLimits {
+            max_items_per_request: 64,
+            rate_units_per_second: u64::from(u32::MAX),
+            rate_burst_units: u64::from(u32::MAX),
+        },
+        cost_table: Arc::new(
+            CostTable::builder(CostUnits(50), CostUnits(50))
+                .weight(&PriceOp, CostUnits(1))
+                .build(),
+        ),
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_stack_over_loopback_http() {
+    // Server side: memory backend, system clock, real listener on an
+    // ephemeral port.
+    let store = MemoryStore::new(GrantPolicy::default());
+    store.create_account(AccountConfig {
+        account_id: ACCOUNT,
+        initial_balance: CostUnits(DEPOSIT),
+        active: true,
+    });
+    store.publish_snapshot(PRINCIPAL, snapshot());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerState {
+            store: Arc::clone(&store),
+            clock: Arc::new(SystemClock),
+        },
+        std::time::Duration::from_millis(200),
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
+
+    // Instance side: everything over HTTP.
+    let http = HttpStore::new(format!("http://{address}"));
+    let clock = Arc::new(SystemClock);
+
+    // Cold fetch of the snapshot through the transport (pull path), plus the
+    // negative case for an unknown principal.
+    let fetched = http.snapshot(PRINCIPAL).await.unwrap().expect("published");
+    assert_eq!(fetched.generation, Generation(1));
+    assert!(http.snapshot(Principal(999)).await.unwrap().is_none());
+
+    let slot = LeaseSlot::empty();
+    let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+    engine.map().install(PRINCIPAL, fetched, Arc::clone(&slot));
+
+    let manager = LeaseManager::spawn(
+        http.clone(),
+        Arc::clone(&slot),
+        clock.clone(),
+        LeaseManagerConfig {
+            account: ACCOUNT,
+            target_grant: CostUnits(2_000),
+            low_water: CostUnits(500),
+            lease_ttl: SignedDuration::from_secs(3_600),
+            poll_interval: std::time::Duration::from_millis(10),
+        },
+    );
+    let (recorder, writer) = UsageWriter::spawn(
+        http.clone(),
+        clock,
+        UsageWriterConfig {
+            queue_capacity: 64,
+            max_batch: 16,
+            flush_interval: std::time::Duration::from_millis(10),
+            retry_backoff: std::time::Duration::from_millis(10),
+        },
+    );
+
+    // Spend the account down to stable denial through the admission engine.
+    let mut committed_units = 0u64;
+    let mut request_seq = 0u128;
+    let mut quiet_rounds = 0;
+    for _ in 0..300 {
+        let mut round_commits = 0;
+        for _ in 0..10 {
+            let Ok(permit) = recorder.try_reserve() else {
+                continue;
+            };
+            match engine.admit(
+                AdmissionRequest {
+                    principal: PRINCIPAL,
+                    required: PermissionBits::bit(0),
+                    op: &PriceOp,
+                    items: 1,
+                },
+                Timestamp::now(),
+            ) {
+                Ok(admitted) => {
+                    admitted.reservation.commit_at_execution_start().unwrap();
+                    request_seq += 1;
+                    let event = admitted
+                        .reservation
+                        .usage_event(RequestId(request_seq), Timestamp::now())
+                        .unwrap();
+                    permit.record(event);
+                    committed_units += admitted.quote.total.get();
+                    round_commits += 1;
+                }
+                Err(
+                    DenyReason::LeaseUnavailable
+                    | DenyReason::LeaseExhausted { .. }
+                    | DenyReason::LeaseExpired,
+                ) => {}
+                Err(other) => panic!("unexpected deny: {other}"),
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        if round_commits == 0 {
+            quiet_rounds += 1;
+            if quiet_rounds >= 5 {
+                break;
+            }
+        } else {
+            quiet_rounds = 0;
+        }
+    }
+    assert!(quiet_rounds >= 5, "account never drained over HTTP");
+    assert!(committed_units <= DEPOSIT);
+    assert!(
+        committed_units >= DEPOSIT - 5 * COST_PER_REQUEST,
+        "underspend: {committed_units}"
+    );
+
+    // Orderly shutdown: flush billing, then release leases, then stop the
+    // server.
+    let stats = writer.shutdown().await;
+    assert_eq!(stats.lost, 0);
+    assert_eq!(stats.rejected, 0);
+    manager.shutdown().await;
+    let _ = stop_tx.send(());
+    server.await.unwrap().unwrap();
+
+    // Zero drift between admission's committed units and the billing ledger,
+    // through a real network transport.
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(committed_units));
+    assert_eq!(store.balance(ACCOUNT), CostUnits(DEPOSIT - committed_units));
+    let conservation = store.conservation(ACCOUNT).unwrap();
+    assert!(conservation.holds(), "conservation: {conservation:?}");
+    assert_eq!(conservation.settlement_loss, CostUnits::ZERO);
+}

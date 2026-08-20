@@ -12,9 +12,17 @@ publish = false
 quota-core = { path = "../quota-core" }
 quota-admission = { path = "../quota-admission" }
 quota-store = { path = "../quota-store" }
+async-trait = { workspace = true }
 jiff = { workspace = true }
+reqwest = { workspace = true, optional = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+# HTTP transport implementing the store traits against a quota-server —
+# the "via-server" topology. Off by default: the direct-store topology
+# needs none of it.
+http = ["dep:reqwest", "quota-store/wire"]

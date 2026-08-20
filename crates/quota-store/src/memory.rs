@@ -27,8 +27,8 @@ use quota_core::{
 };
 
 use crate::traits::{
-    AllocateError, GrantPolicy, IngestReport, LeaseAllocator, ReclaimedLease, SnapshotPush,
-    SnapshotSource, StoreError, UsageSink,
+    AdminStore, AllocateError, GrantPolicy, IngestReport, LeaseAllocator, ReclaimedLease,
+    SnapshotPush, SnapshotSource, StoreError, UsageSink,
 };
 
 /// Admin-side inputs when creating an account.
@@ -387,6 +387,42 @@ impl LeaseAllocator for MemoryStore {
             });
         }
         Ok(reclaimed)
+    }
+}
+
+#[async_trait]
+impl AdminStore for MemoryStore {
+    async fn create_account(&self, config: AccountConfig) -> Result<(), StoreError> {
+        MemoryStore::create_account(self, config);
+        Ok(())
+    }
+
+    async fn deposit(&self, account: AccountId, units: CostUnits) -> Result<(), AllocateError> {
+        MemoryStore::deposit(self, account, units)
+    }
+
+    async fn set_active(&self, account: AccountId, active: bool) -> Result<(), AllocateError> {
+        let mut inner = self.lock();
+        let record = inner
+            .accounts
+            .get_mut(&account)
+            .ok_or(AllocateError::UnknownAccount)?;
+        record.active = active;
+        Ok(())
+    }
+
+    async fn publish_snapshot(
+        &self,
+        principal: Principal,
+        snapshot: Arc<AccountSnapshot>,
+    ) -> Result<(), StoreError> {
+        MemoryStore::publish_snapshot(self, principal, snapshot);
+        Ok(())
+    }
+
+    async fn remove_snapshot(&self, principal: Principal) -> Result<(), StoreError> {
+        MemoryStore::remove_snapshot(self, principal);
+        Ok(())
     }
 }
 
