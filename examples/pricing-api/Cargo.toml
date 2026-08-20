@@ -21,7 +21,9 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
 tokio = { workspace = true }
-uuid = { version = "1", features = ["v4"] }
+# fast-rng: v4 ids from a userspace CSPRNG seeded once — a getrandom
+# syscall per request measurably regressed the loopback overhead gate.
+uuid = { version = "1", features = ["v4", "fast-rng"] }
 
 [dev-dependencies]
 http-body-util = "0.1"

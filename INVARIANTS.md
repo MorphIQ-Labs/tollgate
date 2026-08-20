@@ -55,6 +55,27 @@ until it has one.
     overflow is an explicit error that denies (fail closed), never a wrap to a
     small charge. *Tests:* `tollgate-core` proptests.
 
+12. **No commit outside the usability window.** A lease is locally usable
+    until `expires_at - safety margin`; both debits and commits stop there,
+    and the allocator reclaims only after `expires_at + grace` (accepting
+    releases and late usage through the window). Work committed inside the
+    window therefore always has margin + grace to be flushed and billed;
+    work cannot commit against capacity the allocator may have re-granted.
+    *Tests:* `reservation::tests::{commit_after_window_closes_releases_for_zero,
+    safety_margin_closes_window_before_expiry}`,
+    `reclaim_waits_for_grace_and_release_works_within_it` (both store suites).
+
+13. **A committed charge is always emitted.** Committing through
+    `ChargeGuard` binds the billing event to the pre-reserved queue permit;
+    normal completion, early return, panic unwind, and task abort all
+    enqueue it. A spent lease with no billing event requires losing the
+    whole process. *Tests:* `panic_after_commit_still_bills`.
+
+14. **Account creation is never destructive.** Recreating an existing
+    account is a surfaced `AlreadyExists` in every backend — never an
+    overwrite, never a silent no-op. *Tests:*
+    `recreate_account_is_refused_and_nondestructive` (both store suites).
+
 Ledger roles (context for 1 and 7): leases **bound** spend; usage events **are**
 the billing record; reconciliation compares the two and steady-state drift is
 zero.
