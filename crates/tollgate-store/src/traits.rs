@@ -179,6 +179,14 @@ pub trait SnapshotSource: Send + Sync {
     fn subscribe(&self) -> broadcast::Receiver<SnapshotPush>;
 }
 
+/// Liveness of the backing store, for readiness probes: a server must not
+/// report ready while its source of truth is unreachable (review finding
+/// #11).
+#[async_trait]
+pub trait StoreHealth: Send + Sync {
+    async fn ping(&self) -> Result<(), StoreError>;
+}
+
 /// Refusals from account creation (review finding #7): creation is never
 /// destructive and never silently idempotent — recreating an existing
 /// account is a surfaced error in every backend, because an overwrite would

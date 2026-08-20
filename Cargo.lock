@@ -2360,6 +2360,7 @@ dependencies = [
  "tollgate-client",
  "tollgate-core",
  "tollgate-store",
+ "tollgate-store-postgres",
  "tower",
 ]
 

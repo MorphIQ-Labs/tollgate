@@ -28,7 +28,7 @@ use tollgate_core::{
 
 use crate::traits::{
     AdminStore, AllocateError, CreateAccountError, GrantPolicy, IngestReport, LeaseAllocator,
-    ReclaimedLease, SnapshotPush, SnapshotSource, StoreError, UsageSink,
+    ReclaimedLease, SnapshotPush, SnapshotSource, StoreError, StoreHealth, UsageSink,
 };
 
 /// Admin-side inputs when creating an account.
@@ -425,6 +425,13 @@ impl LeaseAllocator for MemoryStore {
             });
         }
         Ok(reclaimed)
+    }
+}
+
+#[async_trait]
+impl StoreHealth for MemoryStore {
+    async fn ping(&self) -> Result<(), StoreError> {
+        Ok(())
     }
 }
 

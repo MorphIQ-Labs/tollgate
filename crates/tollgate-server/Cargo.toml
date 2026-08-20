@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 tollgate-core = { path = "../tollgate-core", features = ["serde"] }
 tollgate-store = { path = "../tollgate-store", features = ["wire"] }
+tollgate-store-postgres = { path = "../tollgate-store-postgres" }
 axum = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true }

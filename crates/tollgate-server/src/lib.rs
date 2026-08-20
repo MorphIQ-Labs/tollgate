@@ -37,7 +37,7 @@ use tollgate_store::wire::{
 };
 use tollgate_store::{
     AccountConfig, AdminStore, Clock, IngestReport, LeaseAllocator, ReclaimedLease, SnapshotSource,
-    UsageSink,
+    StoreHealth, UsageSink,
 };
 
 use crate::error::ApiError;
@@ -60,18 +60,25 @@ impl<S> Clone for ServerState<S> {
 
 /// The full store bound the server needs from a backend.
 pub trait Backend:
-    LeaseAllocator + SnapshotSource + UsageSink + AdminStore + Send + Sync + 'static
+    LeaseAllocator + SnapshotSource + UsageSink + AdminStore + StoreHealth + Send + Sync + 'static
 {
 }
 impl<T> Backend for T where
-    T: LeaseAllocator + SnapshotSource + UsageSink + AdminStore + Send + Sync + 'static
+    T: LeaseAllocator
+        + SnapshotSource
+        + UsageSink
+        + AdminStore
+        + StoreHealth
+        + Send
+        + Sync
+        + 'static
 {
 }
 
 pub fn router<S: Backend>(state: ServerState<S>) -> Router {
     Router::new()
         .route("/livez", get(async || StatusCode::OK))
-        .route("/readyz", get(async || StatusCode::OK))
+        .route("/readyz", get(readyz::<S>))
         .route("/v1/leases/acquire", post(acquire::<S>))
         .route("/v1/leases/release", post(release::<S>))
         .route("/v1/leases/reclaim", post(reclaim::<S>))
@@ -110,6 +117,15 @@ pub async fn serve<S: Backend>(
         .await;
     sweeper.abort();
     result
+}
+
+/// Ready only when the backing store answers (review finding #11): a server
+/// whose source of truth is unreachable must not attract traffic.
+async fn readyz<S: Backend>(State(state): State<ServerState<S>>) -> StatusCode {
+    match state.store.ping().await {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
 }
 
 async fn acquire<S: Backend>(

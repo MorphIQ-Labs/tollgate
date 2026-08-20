@@ -34,49 +34,13 @@ use tollgate_core::{
 use tollgate_store::memory::Conservation;
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, CreateAccountError, GrantPolicy, IngestReport,
-    LeaseAllocator, ReclaimedLease, SnapshotPush, SnapshotSource, StoreError, UsageSink,
+    LeaseAllocator, ReclaimedLease, SnapshotPush, SnapshotSource, StoreError, StoreHealth,
+    UsageSink,
 };
 
 const STATE_ACTIVE: i16 = 0;
 const STATE_RELEASED: i16 = 1;
 const STATE_EXPIRED: i16 = 2;
-
-const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS tollgate_accounts (
-    account_id      BYTEA PRIMARY KEY,
-    balance         BIGINT NOT NULL,
-    deposited       BIGINT NOT NULL,
-    active          BOOLEAN NOT NULL,
-    next_fence      BIGINT NOT NULL,
-    usage_recorded  BIGINT NOT NULL,
-    settlement_loss BIGINT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS tollgate_leases (
-    lease_id      BYTEA PRIMARY KEY,
-    account_id    BYTEA NOT NULL REFERENCES tollgate_accounts(account_id),
-    fencing_token BIGINT NOT NULL,
-    granted       BIGINT NOT NULL,
-    used          BIGINT NOT NULL,
-    credited      BIGINT NOT NULL,
-    expires_at_us BIGINT NOT NULL,
-    state         SMALLINT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS tollgate_leases_expiry
-    ON tollgate_leases (expires_at_us) WHERE state = 0;
-CREATE TABLE IF NOT EXISTS tollgate_usage_events (
-    request_id    BYTEA PRIMARY KEY,
-    account_id    BYTEA NOT NULL,
-    lease_id      BYTEA NOT NULL,
-    fencing_token BIGINT NOT NULL,
-    units         BIGINT NOT NULL,
-    occurred_at_us BIGINT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS tollgate_snapshots (
-    principal  BYTEA PRIMARY KEY,
-    generation BIGINT NOT NULL,
-    snapshot   JSONB NOT NULL
-);
-"#;
 
 fn id_bytes(id: u128) -> Vec<u8> {
     id.to_be_bytes().to_vec()
@@ -115,17 +79,18 @@ pub struct PostgresStore {
 }
 
 impl PostgresStore {
-    /// Connect and ensure the schema exists.
+    /// Connect and run pending migrations (versioned under ./migrations,
+    /// tracked by sqlx's _sqlx_migrations table — review finding #11).
     pub async fn connect(url: &str, policy: GrantPolicy) -> Result<Arc<Self>, StoreError> {
         let pool = PgPoolOptions::new()
             .max_connections(16)
             .connect(url)
             .await
             .map_err(storage)?;
-        sqlx::raw_sql(SCHEMA)
-            .execute(&pool)
+        sqlx::migrate!("./migrations")
+            .run(&pool)
             .await
-            .map_err(storage)?;
+            .map_err(|e| StoreError(format!("migrate: {e}")))?;
         let (push, _) = broadcast::channel(256);
         Ok(Arc::new(PostgresStore { pool, policy, push }))
     }
@@ -614,6 +579,17 @@ impl SnapshotSource for PostgresStore {
 
     fn subscribe(&self) -> broadcast::Receiver<SnapshotPush> {
         self.push.subscribe()
+    }
+}
+
+#[async_trait]
+impl StoreHealth for PostgresStore {
+    async fn ping(&self) -> Result<(), StoreError> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map_err(storage)?;
+        Ok(())
     }
 }
 
