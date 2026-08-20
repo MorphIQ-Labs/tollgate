@@ -1,45 +1,31 @@
 when:
   - event: [push, pull_request, manual]
 
-# Cross-run caching: a host volume holds the cargo registry and the shared
-# target dir, so runs after the first are incremental instead of
-# from-scratch. Requires the repo to be marked Trusted → Volumes in
-# Woodpecker's repo settings (admin-only) — without that flag the agent
-# refuses the volume mounts. The cache grows over time; wipe
-# /var/cache/woodpecker/tollgate on the agent host to reset it.
+# Steps share the workspace volume, so the cargo target dir carries across
+# steps within one run (no cross-run cache yet — every pipeline builds from
+# scratch; acceptable at this repo's size).
 #
 # The image tag matches rust-toolchain.toml; keep them in lockstep so rustup
 # never downloads a second toolchain inside CI.
-variables:
-  - &rust_step
-    image: rust:1.97.1-slim
-    volumes:
-      - /var/cache/woodpecker/tollgate:/cache
-    environment:
-      CARGO_HOME: /cache/cargo
-      CARGO_TARGET_DIR: /cache/target
-
 steps:
   - name: lint
-    <<: *rust_step
+    image: rust:1.97.1-slim
     commands:
       - rustc --version
       - cargo fmt --check
       - cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   - name: test
-    <<: *rust_step
+    image: rust:1.97.1-slim
     commands:
       - cargo test --locked --workspace --all-features
 
   # First-class Postgres coverage: the env-gated suite that silently skips on
   # dev machines runs for real here, against a service container. This is the
-  # backend-parity gate (mirrors tollgate-store's memory suite by scenario).
+  # backend-parity gate (mirrors quota-store's memory suite by scenario).
   - name: test-postgres
-    <<: *rust_step
+    image: rust:1.97.1-slim
     environment:
-      CARGO_HOME: /cache/cargo
-      CARGO_TARGET_DIR: /cache/target
       TOLLGATE_PG_URL: postgres://tollgate:tollgate@postgres:5432/tollgate
     commands:
       # Wait for the service to accept connections (no pg client in the rust
@@ -50,7 +36,7 @@ steps:
   # Benches must always compile; absolute latency never gates shared CI —
   # thresholds are calibrated on a controlled host (docs/DESIGN.md).
   - name: bench-compile
-    <<: *rust_step
+    image: rust:1.97.1-slim
     commands:
       - cargo bench --locked --workspace --no-run
 
