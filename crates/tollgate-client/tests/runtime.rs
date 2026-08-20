@@ -27,6 +27,7 @@ fn store(balance: u64) -> Arc<MemoryStore> {
         shrink_divisor: 1,
         min_grant: CostUnits(1),
         max_ttl: SignedDuration::from_secs(3_600),
+        reclaim_grace: SignedDuration::ZERO,
     });
     store.create_account(AccountConfig {
         account_id: ACCOUNT,
@@ -42,6 +43,7 @@ fn manager_config() -> LeaseManagerConfig {
         target_grant: CostUnits(1_000),
         low_water: CostUnits(250),
         lease_ttl: SignedDuration::from_secs(60),
+        expiry_safety_margin: SignedDuration::ZERO,
         poll_interval: std::time::Duration::from_millis(5),
     }
 }

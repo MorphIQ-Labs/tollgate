@@ -42,19 +42,55 @@ pub struct LocalLease {
     /// Refill trigger: when `remaining` falls to or below this, the holder
     /// should acquire its next lease — in the background, never inline.
     low_water: u64,
+    /// Local end of life: `expires_at - safety margin`. Debits and commits
+    /// stop here, *before* the server-stamped expiry, so clock skew between
+    /// allocator and holder plus in-flight request time fit inside the
+    /// margin. Together with the allocator's reclaim grace (which starts
+    /// *after* `expires_at`) this closes the expiry race: the holder stops
+    /// spending strictly before the server starts reclaiming.
+    usable_until: Timestamp,
 }
 
 impl LocalLease {
-    /// Wrap a grant for local spending. `low_water` is where background
-    /// refill should begin; it must be below the grant size to be useful, but
-    /// any value is accepted (0 disables early refill).
+    /// Wrap a grant for local spending with no safety margin (usable right
+    /// up to the grant's expiry). Prefer [`LocalLease::with_safety_margin`]
+    /// whenever the grant's clock is not the local clock.
+    ///
+    /// `low_water` is where background refill should begin; it must be below
+    /// the grant size to be useful, but any value is accepted (0 disables
+    /// early refill).
     #[must_use]
     pub fn new(grant: LeaseGrant, low_water: CostUnits) -> Self {
+        Self::with_safety_margin(grant, low_water, jiff::SignedDuration::ZERO)
+    }
+
+    /// Wrap a grant, refusing debits and commits once within `margin` of the
+    /// grant's expiry. Size the margin to cover worst-case allocator/holder
+    /// clock skew plus the longest request the service executes.
+    #[must_use]
+    pub fn with_safety_margin(
+        grant: LeaseGrant,
+        low_water: CostUnits,
+        margin: jiff::SignedDuration,
+    ) -> Self {
+        let usable_until = grant
+            .expires_at
+            .checked_sub(margin)
+            // A margin longer than the lease's life fails closed: never
+            // usable, settled by refill/reclaim.
+            .unwrap_or(Timestamp::MIN);
         LocalLease {
             remaining: AtomicU64::new(grant.units.get()),
             low_water: low_water.get(),
+            usable_until,
             grant,
         }
+    }
+
+    /// The instant this lease stops accepting debits and commits locally.
+    #[must_use]
+    pub fn usable_until(&self) -> Timestamp {
+        self.usable_until
     }
 
     #[must_use]
@@ -83,7 +119,7 @@ impl LocalLease {
     /// with the commit/release state machine.
     #[inline]
     pub fn try_debit(&self, units: CostUnits, now: Timestamp) -> Result<(), DenyReason> {
-        if now >= self.grant.expires_at {
+        if now >= self.usable_until {
             return Err(DenyReason::LeaseExpired);
         }
         let want = units.get();

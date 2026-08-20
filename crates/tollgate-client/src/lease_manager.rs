@@ -43,6 +43,12 @@ pub struct LeaseManagerConfig {
     /// Refill threshold installed into each `LocalLease`.
     pub low_water: CostUnits,
     pub lease_ttl: SignedDuration,
+    /// Local safety margin: installed leases stop accepting debits and
+    /// commits at `expires_at - margin`. Size it to cover worst-case
+    /// allocator/holder clock skew plus the longest request the service
+    /// executes; the allocator's reclaim grace covers the other side
+    /// (review finding #1).
+    pub expiry_safety_margin: SignedDuration,
     /// How often the slot is inspected. Refill latency is bounded by this
     /// plus one allocator round-trip — all off the request path.
     pub poll_interval: std::time::Duration,
@@ -120,7 +126,7 @@ async fn run(
         release_quiesced(&allocator, &mut parked, &clock).await;
         let needs_acquire = match slot.load() {
             None => true,
-            Some(lease) if now >= lease.grant().expires_at => {
+            Some(lease) if now >= lease.usable_until() => {
                 // Expired: fail closed immediately rather than letting the
                 // request path keep hitting LeaseExpired on a dead lease.
                 slot.clear();
@@ -142,7 +148,11 @@ async fn run(
                 if let Some(old) = slot.load() {
                     parked.push(old);
                 }
-                slot.install(Arc::new(LocalLease::new(grant, config.low_water)));
+                slot.install(Arc::new(LocalLease::with_safety_margin(
+                    grant,
+                    config.low_water,
+                    config.expiry_safety_margin,
+                )));
             }
             Err(_) => {
                 // Denied or backend down: nothing to install. The slot keeps

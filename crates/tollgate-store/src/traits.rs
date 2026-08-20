@@ -78,6 +78,13 @@ pub struct GrantPolicy {
     pub min_grant: CostUnits,
     /// Hard cap on any single lease's TTL; requests beyond it are clamped.
     pub max_ttl: SignedDuration,
+    /// How long past a lease's `expires_at` the allocator waits before
+    /// reclaiming its unspent units. Holders stop spending at
+    /// `expires_at - safety margin` (their side of the protocol), so work
+    /// committed inside the usability window has `margin + grace` to be
+    /// flushed and billed before settlement could reject it. Releases are
+    /// also accepted through the grace window (review finding #1).
+    pub reclaim_grace: SignedDuration,
 }
 
 impl Default for GrantPolicy {
@@ -86,6 +93,7 @@ impl Default for GrantPolicy {
             shrink_divisor: 2,
             min_grant: CostUnits(1),
             max_ttl: SignedDuration::from_secs(300),
+            reclaim_grace: SignedDuration::from_secs(30),
         }
     }
 }
@@ -141,10 +149,10 @@ pub trait LeaseAllocator: Send + Sync {
         now: Timestamp,
     ) -> Result<(), AllocateError>;
 
-    /// Settle every active lease whose TTL has lapsed, crediting
-    /// `granted - recorded usage` back to each account (INVARIANTS.md #9).
-    /// Backends run this from a maintenance task; it must be safe to run
-    /// concurrently with everything else.
+    /// Settle every active lease whose TTL (plus the policy's reclaim grace)
+    /// has lapsed, crediting `granted - recorded usage` back to each account
+    /// (INVARIANTS.md #9). Backends run this from a maintenance task; it
+    /// must be safe to run concurrently with everything else.
     async fn reclaim_expired(&self, now: Timestamp) -> Result<Vec<ReclaimedLease>, StoreError>;
 }
 

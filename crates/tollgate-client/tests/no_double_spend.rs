@@ -82,6 +82,7 @@ fn spawn_instance(store: &Arc<MemoryStore>, clock: &Arc<ManualClock>) -> Instanc
             target_grant: CostUnits(2_000),
             low_water: CostUnits(500),
             lease_ttl: SignedDuration::from_secs(3_600),
+            expiry_safety_margin: SignedDuration::ZERO,
             poll_interval: std::time::Duration::from_millis(5),
         },
     );
@@ -124,7 +125,10 @@ fn hammer(instance: &mut Instance, request_seq: &mut u128, burst: usize) -> usiz
         );
         match admitted {
             Ok(admitted) => {
-                admitted.reservation.commit_at_execution_start().unwrap();
+                admitted
+                    .reservation
+                    .commit_at_execution_start(t(0))
+                    .unwrap();
                 *request_seq += 1;
                 let event = admitted
                     .reservation

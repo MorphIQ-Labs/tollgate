@@ -47,6 +47,12 @@ pub enum CommitError {
     /// The reservation was committed before — committing twice is a caller
     /// bug, surfaced rather than silently absorbed.
     AlreadyCommitted,
+    /// The lease's local usability window lapsed between reserve and commit.
+    /// The reservation has been released (units returned, zero charged) and
+    /// the caller must not execute the work: past this point the allocator
+    /// may reclaim and re-grant the capacity, so committing would perform
+    /// work that can never be billed (review finding #1).
+    LeaseExpired,
 }
 
 /// One request's debited-but-not-yet-committed units.
@@ -93,8 +99,30 @@ impl Reservation {
 
     /// Commit the charge because execution is starting. From this point the
     /// full quote stands regardless of how execution ends.
+    ///
+    /// Rechecks the lease's local usability window: a reservation opened
+    /// just before the window closed must not commit after it — the
+    /// allocator's reclaim grace only protects work committed *inside* the
+    /// window. An expired commit releases the units and reports
+    /// [`CommitError::LeaseExpired`]; the caller must not execute.
     #[inline]
-    pub fn commit_at_execution_start(&self) -> Result<CostUnits, CommitError> {
+    pub fn commit_at_execution_start(&self, now: Timestamp) -> Result<CostUnits, CommitError> {
+        if now >= self.lease.usable_until() {
+            return match self.phase.compare_exchange(
+                PENDING,
+                RELEASED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.lease.credit(self.units);
+                    Err(CommitError::LeaseExpired)
+                }
+                // Someone else already resolved it; report that outcome.
+                Err(RELEASED) => Err(CommitError::AlreadyReleased),
+                Err(_) => Err(CommitError::AlreadyCommitted),
+            };
+        }
         match self
             .phase
             .compare_exchange(PENDING, COMMITTED, Ordering::AcqRel, Ordering::Acquire)
@@ -185,7 +213,7 @@ mod tests {
     fn commit_charges_and_keeps_units_spent() {
         let l = lease(100);
         let r = Reservation::reserve(&l, CostUnits(30), t(0)).unwrap();
-        assert_eq!(r.commit_at_execution_start(), Ok(CostUnits(30)));
+        assert_eq!(r.commit_at_execution_start(t(0)), Ok(CostUnits(30)));
         assert_eq!(l.remaining(), CostUnits(70));
         assert!(r.usage_event(RequestId(9), t(1)).is_some());
         drop(r);
@@ -218,7 +246,7 @@ mod tests {
     fn cancel_after_commit_reports_full_charge() {
         let l = lease(100);
         let r = Reservation::reserve(&l, CostUnits(30), t(0)).unwrap();
-        r.commit_at_execution_start().unwrap();
+        r.commit_at_execution_start(t(0)).unwrap();
         assert_eq!(
             r.cancel(),
             CancelOutcome::AlreadyCommitted {
@@ -234,7 +262,7 @@ mod tests {
         let r = Reservation::reserve(&l, CostUnits(30), t(0)).unwrap();
         assert_eq!(r.cancel(), CancelOutcome::ZeroCharged);
         assert_eq!(
-            r.commit_at_execution_start(),
+            r.commit_at_execution_start(t(0)),
             Err(CommitError::AlreadyReleased)
         );
         assert_eq!(l.remaining(), CostUnits(100));
@@ -244,10 +272,61 @@ mod tests {
     fn double_commit_is_a_surfaced_error() {
         let l = lease(100);
         let r = Reservation::reserve(&l, CostUnits(30), t(0)).unwrap();
-        r.commit_at_execution_start().unwrap();
+        r.commit_at_execution_start(t(0)).unwrap();
         assert_eq!(
-            r.commit_at_execution_start(),
+            r.commit_at_execution_start(t(0)),
             Err(CommitError::AlreadyCommitted)
+        );
+    }
+
+    /// Review finding #1 regression: a reservation opened inside the
+    /// usability window cannot commit after the window closes — it releases
+    /// for zero charge instead, so reclaimed-and-re-granted capacity can
+    /// never be double-worked.
+    #[test]
+    fn commit_after_window_closes_releases_for_zero() {
+        let l = lease(100); // usable until t(1_000) (no margin)
+        let r = Reservation::reserve(&l, CostUnits(30), t(999)).unwrap();
+        assert_eq!(l.remaining(), CostUnits(70));
+        // The window lapses between reserve and commit.
+        assert_eq!(
+            r.commit_at_execution_start(t(1_000)),
+            Err(CommitError::LeaseExpired)
+        );
+        // Units returned; no usage event can exist; later commit is refused.
+        assert_eq!(l.remaining(), CostUnits(100));
+        assert_eq!(r.usage_event(RequestId(1), t(1_001)), None);
+        assert_eq!(
+            r.commit_at_execution_start(t(999)),
+            Err(CommitError::AlreadyReleased)
+        );
+    }
+
+    /// The safety margin closes the window early: commits stop at
+    /// `expires_at - margin`, not at `expires_at`.
+    #[test]
+    fn safety_margin_closes_window_before_expiry() {
+        let l = Arc::new(LocalLease::with_safety_margin(
+            LeaseGrant {
+                lease_id: LeaseId(7),
+                account_id: AccountId(1),
+                fencing_token: FencingToken(3),
+                units: CostUnits(100),
+                expires_at: t(1_000),
+            },
+            CostUnits::ZERO,
+            jiff::SignedDuration::from_secs(10),
+        ));
+        assert_eq!(l.usable_until(), t(990));
+        // Debits stop at the margin boundary too.
+        assert_eq!(
+            Reservation::reserve(&l, CostUnits(1), t(990)).unwrap_err(),
+            DenyReason::LeaseExpired
+        );
+        let r = Reservation::reserve(&l, CostUnits(1), t(989)).unwrap();
+        assert_eq!(
+            r.commit_at_execution_start(t(990)),
+            Err(CommitError::LeaseExpired)
         );
     }
 
@@ -259,7 +338,7 @@ mod tests {
             let l = lease(100);
             let r = Arc::new(Reservation::reserve(&l, CostUnits(10), t(0)).unwrap());
             let rc = Arc::clone(&r);
-            let committer = std::thread::spawn(move || rc.commit_at_execution_start());
+            let committer = std::thread::spawn(move || rc.commit_at_execution_start(t(0)));
             let canceller = std::thread::spawn({
                 let rc = Arc::clone(&r);
                 move || rc.cancel()

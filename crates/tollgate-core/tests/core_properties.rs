@@ -93,14 +93,14 @@ proptest! {
                 continue; // exhausted: denied, nothing debited
             };
             let committed = match action {
-                Action::Commit => r.commit_at_execution_start().is_ok(),
+                Action::Commit => r.commit_at_execution_start(t(0)).is_ok(),
                 Action::Cancel => {
                     prop_assert_eq!(r.cancel(), CancelOutcome::ZeroCharged);
                     false
                 }
                 Action::Drop => { drop(r); false }
                 Action::CommitThenCancel => {
-                    r.commit_at_execution_start().unwrap();
+                    r.commit_at_execution_start(t(0)).unwrap();
                     prop_assert_eq!(
                         r.cancel(),
                         CancelOutcome::AlreadyCommitted { units: CostUnits(units) }
@@ -109,7 +109,7 @@ proptest! {
                 }
                 Action::CancelThenCommit => {
                     prop_assert_eq!(r.cancel(), CancelOutcome::ZeroCharged);
-                    prop_assert!(r.commit_at_execution_start().is_err());
+                    prop_assert!(r.commit_at_execution_start(t(0)).is_err());
                     false
                 }
             };
@@ -141,7 +141,7 @@ fn concurrent_commit_conservation() {
                 };
                 // Odd iterations cancel (zero charge), even ones commit.
                 if i % 2 == 0 {
-                    r.commit_at_execution_start().unwrap();
+                    r.commit_at_execution_start(t(0)).unwrap();
                     committed += units;
                 } else {
                     assert_eq!(r.cancel(), CancelOutcome::ZeroCharged);

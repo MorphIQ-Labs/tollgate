@@ -106,6 +106,7 @@ async fn full_stack_over_loopback_http() {
             target_grant: CostUnits(2_000),
             low_water: CostUnits(500),
             lease_ttl: SignedDuration::from_secs(3_600),
+            expiry_safety_margin: SignedDuration::from_secs(2),
             poll_interval: std::time::Duration::from_millis(10),
         },
     );
@@ -140,7 +141,10 @@ async fn full_stack_over_loopback_http() {
                 Timestamp::now(),
             ) {
                 Ok(admitted) => {
-                    admitted.reservation.commit_at_execution_start().unwrap();
+                    admitted
+                        .reservation
+                        .commit_at_execution_start(Timestamp::now())
+                        .unwrap();
                     request_seq += 1;
                     let event = admitted
                         .reservation

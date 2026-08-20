@@ -320,7 +320,15 @@ impl LeaseAllocator for MemoryStore {
         }
         // A lease that lapsed before the release arrived settles by expiry
         // reclaim instead; the late releaser is told, not silently absorbed.
-        if lease.state != LeaseState::Active || now >= lease.expires_at {
+        // Releases are accepted through the grace window: a holder shutting
+        // down slowly may reach here after `expires_at` but before the sweep
+        // settles the lease. Only a settled (or grace-exhausted) lease
+        // refuses.
+        let release_deadline = lease
+            .expires_at
+            .checked_add(self.policy.reclaim_grace)
+            .unwrap_or(lease.expires_at);
+        if lease.state != LeaseState::Active || now >= release_deadline {
             return Err(AllocateError::LeaseNotActive);
         }
         // granted = used + unspent + loss; a claim that doesn't fit is a
@@ -360,7 +368,13 @@ impl LeaseAllocator for MemoryStore {
         let expired: Vec<LeaseId> = inner
             .leases
             .iter()
-            .filter(|(_, l)| l.state == LeaseState::Active && now >= l.expires_at)
+            .filter(|(_, l)| {
+                let reclaim_at = l
+                    .expires_at
+                    .checked_add(self.policy.reclaim_grace)
+                    .unwrap_or(l.expires_at);
+                l.state == LeaseState::Active && now >= reclaim_at
+            })
             .map(|(id, _)| *id)
             .collect();
         for lease_id in expired {

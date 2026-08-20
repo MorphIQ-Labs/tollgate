@@ -318,7 +318,11 @@ impl LeaseAllocator for PostgresStore {
         if u64::try_from(fence).unwrap_or(0) != fencing_token.0 {
             return Err(AllocateError::Fenced);
         }
-        if state != STATE_ACTIVE || ts_micros(now) >= expires_at_us {
+        // Releases are accepted through the grace window (see GrantPolicy::
+        // reclaim_grace) — only a settled or grace-exhausted lease refuses.
+        let release_deadline_us =
+            expires_at_us.saturating_add(self.policy.reclaim_grace.as_micros() as i64);
+        if state != STATE_ACTIVE || ts_micros(now) >= release_deadline_us {
             return Err(AllocateError::LeaseNotActive);
         }
         let unspent_i = to_i64(unspent, "unspent").map_err(AllocateError::Storage)?;
@@ -353,13 +357,17 @@ impl LeaseAllocator for PostgresStore {
 
     async fn reclaim_expired(&self, now: Timestamp) -> Result<Vec<ReclaimedLease>, StoreError> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
+        // Reclaim only once the grace window past expiry has fully lapsed:
+        // expires_at + grace <= now  ⟺  expires_at_us <= now_us - grace_us.
+        let threshold_us =
+            ts_micros(now).saturating_sub(self.policy.reclaim_grace.as_micros() as i64);
         // SKIP LOCKED: concurrent sweeps cooperate instead of deadlocking.
         let rows = sqlx::query(
             "SELECT lease_id, account_id, granted, used FROM tollgate_leases
              WHERE state = 0 AND expires_at_us <= $1
              FOR UPDATE SKIP LOCKED",
         )
-        .bind(ts_micros(now))
+        .bind(threshold_us)
         .fetch_all(&mut *tx)
         .await
         .map_err(storage)?;

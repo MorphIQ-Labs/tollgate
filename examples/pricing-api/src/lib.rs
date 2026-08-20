@@ -233,6 +233,7 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
                 target_grant: CostUnits((deposit / 4).clamp(1_000, 1_000_000)),
                 low_water: CostUnits((deposit / 16).clamp(250, 250_000)),
                 lease_ttl: SignedDuration::from_secs(60),
+                expiry_safety_margin: SignedDuration::from_secs(2),
                 poll_interval: std::time::Duration::from_millis(20),
             },
         );
@@ -373,7 +374,10 @@ async fn price(
 
     // 4. Execution starts: the charge commits — success or failure from here
     //    on reports the full quote.
-    let units = match admitted.reservation.commit_at_execution_start() {
+    let units = match admitted
+        .reservation
+        .commit_at_execution_start(Timestamp::now())
+    {
         Ok(units) => units,
         Err(_) => return deny_response(DenyReason::LeaseUnavailable),
     };

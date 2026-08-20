@@ -202,7 +202,10 @@ mod tests {
         let engine = engine_with(AccountStatus::Active, Some(10_000));
         let admitted = engine.admit(request(14), t(0)).unwrap();
         assert_eq!(admitted.quote.total, CostUnits(64));
-        admitted.reservation.commit_at_execution_start().unwrap();
+        admitted
+            .reservation
+            .commit_at_execution_start(t(0))
+            .unwrap();
     }
 
     #[test]

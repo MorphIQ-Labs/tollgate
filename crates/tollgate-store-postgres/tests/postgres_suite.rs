@@ -39,6 +39,7 @@ fn full_grant_policy() -> GrantPolicy {
         shrink_divisor: 1,
         min_grant: CostUnits(1),
         max_ttl: SignedDuration::from_secs(300),
+        reclaim_grace: SignedDuration::ZERO,
     }
 }
 
@@ -280,6 +281,56 @@ async fn graceful_release_returns_unspent() {
             .unwrap_err(),
         AllocateError::LeaseNotActive
     );
+}
+
+/// Review finding #1, store half: reclaim waits out the grace window past
+/// expiry; a graceful release during grace is honored (mirrors the memory
+/// suite scenario for scenario).
+#[tokio::test]
+async fn reclaim_waits_for_grace_and_release_works_within_it() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(
+        GrantPolicy {
+            shrink_divisor: 1,
+            min_grant: CostUnits(1),
+            max_ttl: SignedDuration::from_secs(300),
+            reclaim_grace: SignedDuration::from_secs(30),
+        },
+        1_000,
+    )
+    .await
+    else {
+        return;
+    };
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
+        .await
+        .unwrap(); // expires t(60), reclaimable from t(90)
+
+    assert!(store.reclaim_expired(t(60)).await.unwrap().is_empty());
+    assert!(store.reclaim_expired(t(89)).await.unwrap().is_empty());
+    let report = store
+        .ingest(&[usage(&lease, 1, 120, 59)], t(65))
+        .await
+        .unwrap();
+    assert_eq!(report.accepted, 1);
+
+    store
+        .release(lease.lease_id, lease.fencing_token, CostUnits(380), t(70))
+        .await
+        .unwrap();
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(880));
+    assert_conserved(&store).await;
+
+    let lease2 = store
+        .acquire(ACCOUNT, CostUnits(400), TTL, t(70))
+        .await
+        .unwrap(); // expires t(130)
+    assert!(store.reclaim_expired(t(159)).await.unwrap().is_empty());
+    let reclaimed = store.reclaim_expired(t(160)).await.unwrap();
+    assert_eq!(reclaimed[0].lease_id, lease2.lease_id);
+    assert_eq!(reclaimed[0].reclaimed, CostUnits(400));
+    assert_conserved(&store).await;
 }
 
 #[tokio::test]

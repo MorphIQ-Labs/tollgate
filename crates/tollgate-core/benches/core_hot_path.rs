@@ -97,7 +97,7 @@ fn bench_lease(c: &mut Criterion) {
     group.bench_function("reserve_commit", |b| {
         b.iter(|| {
             let r = Reservation::reserve(black_box(&lease), CostUnits(100), now).unwrap();
-            r.commit_at_execution_start().unwrap();
+            r.commit_at_execution_start(now).unwrap();
             r
         })
     });
