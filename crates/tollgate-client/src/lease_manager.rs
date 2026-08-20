@@ -51,7 +51,7 @@ pub struct LeaseManagerConfig {
 /// Handle to the refill task.
 pub struct LeaseManager {
     shutdown: watch::Sender<bool>,
-    handle: tokio::task::JoinHandle<()>,
+    handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl LeaseManager {
@@ -63,13 +63,29 @@ impl LeaseManager {
     ) -> Self {
         let (shutdown, shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(run(allocator, slot, clock, config, shutdown_rx));
-        LeaseManager { shutdown, handle }
+        LeaseManager {
+            shutdown,
+            handle: Some(handle),
+        }
     }
 
     /// Signal the task, wait for it to release the current lease and exit.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         let _ = self.shutdown.send(true);
-        let _ = self.handle.await;
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for LeaseManager {
+    fn drop(&mut self) {
+        // Dropped without shutdown(): abort rather than leave a detached
+        // task spinning against a dead watch channel. Held leases settle by
+        // TTL reclaim (INVARIANTS.md #9) — graceful code calls shutdown().
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -88,7 +104,13 @@ async fn run(
     loop {
         tokio::select! {
             _ = tick.tick() => {}
-            _ = shutdown.changed() => {}
+            changed = shutdown.changed() => {
+                // Err = handle dropped without shutdown(); stop rather than
+                // spin against a dead channel.
+                if changed.is_err() {
+                    break;
+                }
+            }
         }
         if *shutdown.borrow() {
             break;

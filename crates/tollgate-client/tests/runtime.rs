@@ -285,6 +285,75 @@ async fn writer_retries_through_outage_without_losing_events() {
     assert_eq!(stats.lost, 0);
 }
 
+/// Review finding #2 regression: shutdown during an *ongoing* outage must
+/// still terminate via the bounded final flush, not hang in the retry loop.
+#[tokio::test(start_paused = true)]
+async fn shutdown_during_outage_terminates_and_reports_loss() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    // Sink that never recovers.
+    let sink = Arc::new(FlakySink {
+        inner: store.clone(),
+        failures_left: AtomicU32::new(u32::MAX),
+    });
+    let (recorder, writer) = UsageWriter::spawn(sink, clock, writer_config(64));
+
+    recorder.try_reserve().unwrap().record(event(1, 25, &lease));
+    recorder.try_reserve().unwrap().record(event(2, 25, &lease));
+    // Let the writer enter its retry loop against the dead sink.
+    settle().await;
+
+    // The whole point: this must complete (bounded final flush), not hang.
+    let stats = tokio::time::timeout(std::time::Duration::from_secs(60), writer.shutdown())
+        .await
+        .expect("shutdown must terminate during an outage");
+    assert_eq!(stats.lost, 2);
+    assert_eq!(stats.accepted, 0);
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits::ZERO);
+}
+
+/// Companion: a shutdown signalled during the outage still delivers if the
+/// sink recovers before the final flush runs out of attempts.
+#[tokio::test(start_paused = true)]
+async fn shutdown_after_recovery_delivers_everything() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    // Fails long enough to outlast several retry backoffs, then recovers in
+    // time for the final flush.
+    let sink = Arc::new(FlakySink {
+        inner: store.clone(),
+        failures_left: AtomicU32::new(4),
+    });
+    let (recorder, writer) = UsageWriter::spawn(sink, clock, writer_config(64));
+    recorder.try_reserve().unwrap().record(event(1, 25, &lease));
+    settle().await;
+
+    let stats = tokio::time::timeout(std::time::Duration::from_secs(60), writer.shutdown())
+        .await
+        .expect("shutdown must terminate");
+    assert_eq!(stats.lost, 0);
+    assert_eq!(stats.accepted, 1);
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(25));
+}
+
 /// A lease-expiry straggler: events flushed after reclaim are rejected and
 /// reported, never silently absorbed (bounded billing loss, INVARIANTS.md #9
 /// documentation).

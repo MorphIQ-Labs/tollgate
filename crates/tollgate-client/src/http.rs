@@ -34,12 +34,32 @@ pub struct HttpStore {
 }
 
 impl HttpStore {
+    /// Connect with default deadlines (2s connect, 10s per request). A hung
+    /// control-plane request must never stall refill, billing, or shutdown
+    /// indefinitely — background tasks rely on these bounds.
     #[must_use]
     pub fn new(base_url: impl Into<String>) -> Arc<Self> {
+        Self::with_timeouts(
+            base_url,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(10),
+        )
+    }
+
+    #[must_use]
+    pub fn with_timeouts(
+        base_url: impl Into<String>,
+        connect_timeout: std::time::Duration,
+        request_timeout: std::time::Duration,
+    ) -> Arc<Self> {
         let (push, _) = broadcast::channel(16);
         Arc::new(HttpStore {
             base: base_url.into().trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(connect_timeout)
+                .timeout(request_timeout)
+                .build()
+                .expect("static client configuration"),
             push,
         })
     }
