@@ -1,0 +1,49 @@
+when:
+  - event: [push, pull_request, manual]
+
+# Steps share the workspace volume, so the cargo target dir carries across
+# steps within one run (no cross-run cache yet — every pipeline builds from
+# scratch; acceptable at this repo's size).
+#
+# The image tag matches rust-toolchain.toml; keep them in lockstep so rustup
+# never downloads a second toolchain inside CI.
+steps:
+  - name: lint
+    image: rust:1.97.1-slim
+    commands:
+      - rustc --version
+      - cargo fmt --check
+      - cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+  - name: test
+    image: rust:1.97.1-slim
+    commands:
+      - cargo test --locked --workspace --all-features
+
+  # First-class Postgres coverage: the env-gated suite that silently skips on
+  # dev machines runs for real here, against a service container. This is the
+  # backend-parity gate (mirrors quota-store's memory suite by scenario).
+  - name: test-postgres
+    image: rust:1.97.1-slim
+    environment:
+      TOLLGATE_PG_URL: postgres://tollgate:tollgate@postgres:5432/tollgate
+    commands:
+      # Wait for the service to accept connections (no pg client in the rust
+      # image; bash /dev/tcp probe is enough).
+      - for i in $(seq 60); do (echo > /dev/tcp/postgres/5432) 2>/dev/null && break; sleep 1; done
+      - cargo test --locked -p tollgate-store-postgres
+
+  # Benches must always compile; absolute latency never gates shared CI —
+  # thresholds are calibrated on a controlled host (docs/DESIGN.md).
+  - name: bench-compile
+    image: rust:1.97.1-slim
+    commands:
+      - cargo bench --locked --workspace --no-run
+
+services:
+  - name: postgres
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: tollgate
+      POSTGRES_PASSWORD: tollgate
+      POSTGRES_DB: tollgate
