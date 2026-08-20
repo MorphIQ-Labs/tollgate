@@ -169,3 +169,23 @@ pub trait SnapshotMap: Send + Sync {
     /// Remove a principal outright (key revoked).
     fn remove(&self, principal: &Principal);
 }
+
+// A shared map is still a map: lets an `AdmissionEngine<Arc<M>>` and a
+// background snapshot manager hold the same map instance.
+impl<T: SnapshotMap + ?Sized> SnapshotMap for Arc<T> {
+    fn get(&self, principal: &Principal) -> Option<MapEntry> {
+        (**self).get(principal)
+    }
+
+    fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>) {
+        (**self).install(principal, snapshot, lease);
+    }
+
+    fn install_negative(&self, principal: Principal, until: Timestamp) {
+        (**self).install_negative(principal, until);
+    }
+
+    fn remove(&self, principal: &Principal) {
+        (**self).remove(principal);
+    }
+}

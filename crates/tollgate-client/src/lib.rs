@@ -17,6 +17,7 @@
 
 pub mod charge_guard;
 pub mod lease_manager;
+pub mod snapshot_manager;
 pub mod usage_writer;
 
 #[cfg(feature = "http")]
@@ -28,4 +29,5 @@ pub use tollgate_store::{Clock, ManualClock, SystemClock};
 #[cfg(feature = "http")]
 pub use http::HttpStore;
 pub use lease_manager::{LeaseManager, LeaseManagerConfig};
+pub use snapshot_manager::{SlotRegistry, SnapshotManager, SnapshotManagerConfig};
 pub use usage_writer::{UsagePermit, UsageRecorder, UsageWriter, UsageWriterConfig, WriterStats};

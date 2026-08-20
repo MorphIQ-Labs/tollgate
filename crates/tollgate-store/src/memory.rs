@@ -179,11 +179,20 @@ impl MemoryStore {
     }
 
     /// Bind (or replace) a principal's compiled snapshot and push it to
-    /// subscribers.
+    /// subscribers. Generation-monotonic: a replayed or reordered publish
+    /// carrying an older (or equal) generation is a no-op — matching the
+    /// Postgres backend, which enforces the same rule in its upsert (review
+    /// finding #5's backend-divergence note).
     pub fn publish_snapshot(&self, principal: Principal, snapshot: Arc<AccountSnapshot>) {
-        self.lock()
-            .snapshots
-            .insert(principal, Arc::clone(&snapshot));
+        {
+            let mut inner = self.lock();
+            if let Some(existing) = inner.snapshots.get(&principal)
+                && existing.generation >= snapshot.generation
+            {
+                return;
+            }
+            inner.snapshots.insert(principal, Arc::clone(&snapshot));
+        }
         // No receivers is fine: pull via `snapshot()` still observes it.
         let _ = self.push.send(SnapshotPush {
             principal,

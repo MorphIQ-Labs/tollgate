@@ -392,4 +392,21 @@ async fn snapshot_publish_fetch_and_push() {
     let pushed = updates.recv().await.unwrap();
     assert_eq!(pushed.principal, principal);
     assert_eq!(pushed.snapshot.generation, Generation(3));
+
+    // Generation monotonicity (backend parity with Postgres — review
+    // finding #5): a replayed older publish neither replaces the row nor
+    // pushes an update.
+    store.publish_snapshot(
+        principal,
+        Arc::new(AccountSnapshot {
+            generation: Generation(2),
+            ..(*snapshot).clone()
+        }),
+    );
+    let fetched = store.snapshot(principal).await.unwrap().unwrap();
+    assert_eq!(fetched.generation, Generation(3));
+    assert!(
+        updates.try_recv().is_err(),
+        "a discarded rollback must not be pushed"
+    );
 }

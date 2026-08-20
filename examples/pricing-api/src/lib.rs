@@ -39,8 +39,8 @@ use tollgate_admission::{
     AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot, SnapshotMap,
 };
 use tollgate_client::{
-    ChargeGuard, LeaseManager, LeaseManagerConfig, SystemClock, UsageRecorder, UsageWriter,
-    UsageWriterConfig,
+    ChargeGuard, Clock, LeaseManager, LeaseManagerConfig, SlotRegistry, SnapshotManager,
+    SnapshotManagerConfig, SystemClock, UsageRecorder, UsageWriter, UsageWriterConfig,
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, Generation,
@@ -150,9 +150,12 @@ struct Problem {
 
 struct AppState {
     auth: AuthRegistry,
-    engine: AdmissionEngine<ArcSwapSnapshotMap>,
+    engine: AdmissionEngine<Arc<ArcSwapSnapshotMap>>,
     recorder: Option<UsageRecorder>,
     slot: Arc<LeaseSlot>,
+    /// Snapshot-manager readiness: true once every tracked principal is
+    /// resolved (INVARIANTS.md #10).
+    snapshots_ready: Option<tokio::sync::watch::Receiver<bool>>,
     request_seq: AtomicU64,
     /// `false` builds the no-admission baseline the load gate compares
     /// against: same transport, same kernel, zero quota machinery.
@@ -165,15 +168,25 @@ pub struct AppRuntime {
     pub store: Arc<MemoryStore>,
     manager: Option<LeaseManager>,
     writer: Option<UsageWriter>,
+    snapshots: Option<SnapshotManager>,
+    /// Demo control plane: periodically republishes the account snapshot
+    /// with extended validity and a bumped generation.
+    republisher: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl AppRuntime {
     pub async fn shutdown(self) {
+        if let Some(republisher) = self.republisher {
+            republisher.abort();
+        }
         if let Some(writer) = self.writer {
             let _ = writer.shutdown().await;
         }
         if let Some(manager) = self.manager {
             manager.shutdown().await;
+        }
+        if let Some(snapshots) = self.snapshots {
+            snapshots.shutdown().await;
         }
     }
 }
@@ -192,39 +205,80 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
     });
 
     // Startup compilation: the service's schedule and entitlements become a
-    // CostTable + AccountSnapshot once, here — never per request.
-    let cost_table = Arc::new(
-        CostTable::builder(CostUnits(50), CostUnits(50))
-            .weight(&Op::Price, CostUnits(1))
-            .build(),
-    );
-    let snapshot = Arc::new(AccountSnapshot {
-        account_id: DEMO_ACCOUNT,
-        key_id: None,
-        generation: Generation(1),
-        status: AccountStatus::Active,
-        valid_until: Timestamp::from_second(4_102_444_800).unwrap(),
-        permissions: PERMISSION_PRICE,
-        limits: ResolvedLimits {
-            max_items_per_request: 1_024,
-            rate_units_per_second: 5_000_000,
-            rate_burst_units: 10_000_000,
-        },
-        cost_table,
-    });
+    // CostTable + AccountSnapshot once per policy generation — never per
+    // request. Validity is bounded (1h) and a demo control-plane task
+    // republishes with extended validity; the SnapshotManager keeps running
+    // instances current (review finding #5 — no more install-once-forever).
+    let clock: Arc<SystemClock> = Arc::new(SystemClock);
+    let compile_snapshot = {
+        let clock = Arc::clone(&clock);
+        move |generation: u64| {
+            Arc::new(AccountSnapshot {
+                account_id: DEMO_ACCOUNT,
+                key_id: None,
+                generation: Generation(generation),
+                status: AccountStatus::Active,
+                valid_until: clock
+                    .now()
+                    .checked_add(SignedDuration::from_secs(3_600))
+                    .expect("valid_until in range"),
+                permissions: PERMISSION_PRICE,
+                limits: ResolvedLimits {
+                    max_items_per_request: 1_024,
+                    rate_units_per_second: 5_000_000,
+                    rate_burst_units: 10_000_000,
+                },
+                cost_table: Arc::new(
+                    CostTable::builder(CostUnits(50), CostUnits(50))
+                        .weight(&Op::Price, CostUnits(1))
+                        .build(),
+                ),
+            })
+        }
+    };
 
     let mut auth = AuthRegistry {
         secret: b"demo-server-secret-rotate-me".to_vec(),
         keys: HashMap::new(),
     };
     let principal = auth.register(DEMO_API_KEY);
+    store.publish_snapshot(principal, compile_snapshot(1));
 
-    let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
-    let slot = LeaseSlot::empty();
-    engine.map().install(principal, snapshot, Arc::clone(&slot));
+    let map = Arc::new(ArcSwapSnapshotMap::new());
+    let engine = AdmissionEngine::new(Arc::clone(&map));
+    let slots = SlotRegistry::new();
+    let slot = slots.slot(DEMO_ACCOUNT);
 
-    let clock = Arc::new(SystemClock);
-    let (manager, recorder, writer) = if admission_enabled {
+    let (manager, recorder, writer, snapshots, republisher, snapshots_ready) = if admission_enabled
+    {
+        let snapshots = SnapshotManager::spawn(
+            store.clone(),
+            map,
+            Arc::clone(&slots),
+            clock.clone(),
+            SnapshotManagerConfig {
+                principals: vec![principal],
+                refresh_interval: std::time::Duration::from_secs(30),
+                negative_ttl: SignedDuration::from_secs(60),
+                retry_backoff: std::time::Duration::from_millis(200),
+            },
+        );
+        let snapshots_ready = snapshots.ready();
+        let republisher = tokio::spawn({
+            let store = store.clone();
+            let compile_snapshot = compile_snapshot.clone();
+            async move {
+                let mut generation = 1u64;
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                tick.tick().await; // immediate first tick — gen 1 published above
+                loop {
+                    tick.tick().await;
+                    generation += 1;
+                    store.publish_snapshot(principal, compile_snapshot(generation));
+                }
+            }
+        });
         let manager = LeaseManager::spawn(
             store.clone(),
             Arc::clone(&slot),
@@ -248,9 +302,16 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
                 retry_backoff: std::time::Duration::from_millis(50),
             },
         );
-        (Some(manager), Some(recorder), Some(writer))
+        (
+            Some(manager),
+            Some(recorder),
+            Some(writer),
+            Some(snapshots),
+            Some(republisher),
+            Some(snapshots_ready),
+        )
     } else {
-        (None, None, None)
+        (None, None, None, None, None, None)
     };
 
     let state = Arc::new(AppState {
@@ -258,6 +319,7 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
         engine,
         recorder,
         slot,
+        snapshots_ready,
         request_seq: AtomicU64::new(1),
         admission_enabled,
     });
@@ -273,6 +335,8 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
             store,
             manager,
             writer,
+            snapshots,
+            republisher,
         },
     )
 }
@@ -280,7 +344,12 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
 /// INVARIANTS.md #10: fail-closed correctness must not masquerade as
 /// availability — not ready until the lease slot is stocked.
 async fn readyz(State(state): State<Arc<AppState>>) -> StatusCode {
-    if !state.admission_enabled || state.slot.load().is_some() {
+    let snapshots_ready = state
+        .snapshots_ready
+        .as_ref()
+        .map(|r| *r.borrow())
+        .unwrap_or(true);
+    if !state.admission_enabled || (snapshots_ready && state.slot.load().is_some()) {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
