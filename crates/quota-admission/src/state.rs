@@ -10,12 +10,7 @@ use jiff::Timestamp;
 
 use quota_core::{AccountSnapshot, LocalLease, ResolvedLimits};
 
-/// The lookup key on the request path: an opaque fingerprint of an
-/// already-verified credential. How it is derived (API-key HMAC, capability
-/// subject, session id) is the embedding service's concern; by the time it
-/// reaches admission, verification has happened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Principal(pub u128);
+pub use quota_core::Principal;
 
 /// The slot a background refill task installs leases into. Shared between
 /// the request path (load) and the refill plane (store); per account, and

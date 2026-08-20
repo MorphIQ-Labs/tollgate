@@ -30,7 +30,7 @@ pub mod usage;
 
 pub use cost_table::{CostQuote, CostTable, CostTableBuilder, OpIndex, QuoteError};
 pub use deny::DenyReason;
-pub use ids::{AccountId, FencingToken, Generation, KeyId, LeaseId, RequestId};
+pub use ids::{AccountId, FencingToken, Generation, KeyId, LeaseId, Principal, RequestId};
 pub use lease::{LeaseGrant, LocalLease};
 pub use reservation::{CancelOutcome, CommitError, Reservation};
 pub use snapshot::{AccountSnapshot, AccountStatus, PermissionBits, ResolvedLimits};

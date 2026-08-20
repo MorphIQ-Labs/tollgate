@@ -1,0 +1,20 @@
+[package]
+name = "quota-client"
+description = "Instance-side quota runtime: background lease refill into the admission layer's LeaseSlot, and a bounded, batched, shed-on-overflow usage writer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+quota-core = { path = "../quota-core" }
+quota-admission = { path = "../quota-admission" }
+quota-store = { path = "../quota-store" }
+jiff = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

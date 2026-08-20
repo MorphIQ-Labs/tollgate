@@ -40,6 +40,13 @@ id128!(
     /// Idempotency key for usage accounting: one request, one charge.
     RequestId
 );
+id128!(
+    /// The request path's lookup key: an opaque fingerprint of an
+    /// already-verified credential. How it is derived (API-key HMAC,
+    /// capability subject, session id) is the embedding service's concern —
+    /// by the time it reaches admission, verification has happened.
+    Principal
+);
 
 /// Strictly monotonic per-account sequence stamped on every lease. A store
 /// rejects any operation carrying a token older than the newest it has issued

@@ -5,8 +5,10 @@
 resolver = "3"
 members = [
     "crates/quota-admission",
+    "crates/quota-client",
     "crates/quota-core",
     "crates/quota-perf-gate",
+    "crates/quota-store",
 ]
 
 [workspace.package]
@@ -30,6 +32,7 @@ proptest = "1.7"
 # Later members (admission/store/server/client) — declared centrally so every
 # crate resolves the same versions.
 arc-swap = "1"
+async-trait = "0.1"
 moka = { version = "0.12", features = ["sync"] }
 governor = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
