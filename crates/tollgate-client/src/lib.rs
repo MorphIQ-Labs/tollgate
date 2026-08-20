@@ -15,12 +15,14 @@
 //! [`UsageSink`]: tollgate_store::UsageSink
 //! [`LeaseSlot`]: tollgate_admission::LeaseSlot
 
+pub mod charge_guard;
 pub mod lease_manager;
 pub mod usage_writer;
 
 #[cfg(feature = "http")]
 pub mod http;
 
+pub use charge_guard::ChargeGuard;
 pub use tollgate_store::{Clock, ManualClock, SystemClock};
 
 #[cfg(feature = "http")]

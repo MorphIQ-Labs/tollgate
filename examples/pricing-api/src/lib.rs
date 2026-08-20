@@ -39,7 +39,8 @@ use tollgate_admission::{
     AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot, SnapshotMap,
 };
 use tollgate_client::{
-    LeaseManager, LeaseManagerConfig, SystemClock, UsageRecorder, UsageWriter, UsageWriterConfig,
+    ChargeGuard, LeaseManager, LeaseManagerConfig, SystemClock, UsageRecorder, UsageWriter,
+    UsageWriterConfig,
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, Generation,
@@ -372,28 +373,20 @@ async fn price(
         Err(reason) => return deny_response(reason),
     };
 
-    // 4. Execution starts: the charge commits — success or failure from here
-    //    on reports the full quote.
-    let units = match admitted
-        .reservation
-        .commit_at_execution_start(Timestamp::now())
-    {
-        Ok(units) => units,
-        Err(_) => return deny_response(DenyReason::LeaseUnavailable),
-    };
-
-    let prices: Vec<f64> = request.contracts.iter().map(black_scholes_call).collect();
-
-    // 5. Billing record via the reserved permit — cannot fail, cannot block.
+    // 4. Execution starts: the charge commits, and ChargeGuard binds the
+    //    billing event to the reserved permit *now* — a panic or task abort
+    //    during the kernel still emits the event on drop, so a spent lease
+    //    is never unbilled (review finding #3).
     let request_id = RequestId(u128::from(
         state.request_seq.fetch_add(1, Ordering::Relaxed),
     ));
-    if let Some(event) = admitted
-        .reservation
-        .usage_event(request_id, Timestamp::now())
-    {
-        permit.record(event);
-    }
+    let (_charge, units) =
+        match ChargeGuard::commit(&admitted.reservation, permit, request_id, Timestamp::now()) {
+            Ok(committed) => committed,
+            Err(_) => return deny_response(DenyReason::LeaseExpired),
+        };
+
+    let prices: Vec<f64> = request.contracts.iter().map(black_scholes_call).collect();
 
     Json(PriceResponse {
         prices,

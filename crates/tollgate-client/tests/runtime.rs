@@ -287,6 +287,45 @@ async fn writer_retries_through_outage_without_losing_events() {
     assert_eq!(stats.lost, 0);
 }
 
+/// Review finding #3 regression: a panic between commit and response must
+/// still bill — ChargeGuard binds the event to the permit at commit time and
+/// emits it during unwind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panic_after_commit_still_bills() {
+    use tollgate_client::ChargeGuard;
+    use tollgate_core::{LocalLease, Reservation};
+
+    let store = store(10_000);
+    let grant = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8));
+
+    let permit = recorder.try_reserve().unwrap();
+    let local = Arc::new(LocalLease::new(grant, CostUnits::ZERO));
+    let worker = tokio::spawn(async move {
+        let reservation = Reservation::reserve(&local, CostUnits(51), t(0)).unwrap();
+        let (_charge, units) =
+            ChargeGuard::commit(&reservation, permit, RequestId(9), t(0)).unwrap();
+        assert_eq!(units, CostUnits(51));
+        panic!("kernel exploded mid-execution");
+    });
+    assert!(worker.await.is_err(), "the worker must have panicked");
+
+    // Shutdown drains and flushes whatever the unwind enqueued.
+    let stats = writer.shutdown().await;
+    assert_eq!(stats.accepted, 1);
+    assert_eq!(stats.lost, 0);
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(51));
+}
+
 /// Review finding #2 regression: shutdown during an *ongoing* outage must
 /// still terminate via the bounded final flush, not hang in the retry loop.
 #[tokio::test(start_paused = true)]
