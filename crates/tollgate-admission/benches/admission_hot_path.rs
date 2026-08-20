@@ -155,5 +155,47 @@ fn bench_full_check(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_lookup, bench_full_check);
+/// Control-plane write amplification (review finding #9): loading 512
+/// principals one-by-one on a copy-on-write map vs one bulk install.
+/// Measured for visibility; not part of the threshold gate (control-plane
+/// cost, not request-path cost).
+fn bench_bulk_install(c: &mut Criterion) {
+    use criterion::BatchSize;
+    let mut group = c.benchmark_group("admission_control_plane");
+    group.sample_size(20);
+
+    let entries = || {
+        (0..512u128)
+            .map(|i| {
+                let slot = LeaseSlot::empty();
+                (Principal(i), snapshot(), slot)
+            })
+            .collect::<Vec<_>>()
+    };
+    group.bench_function("install_loop_512_arc_swap", |b| {
+        b.iter_batched(
+            || (ArcSwapSnapshotMap::new(), entries()),
+            |(map, entries)| {
+                for (principal, snapshot, lease) in entries {
+                    map.install(principal, snapshot, lease);
+                }
+                map
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("install_many_512_arc_swap", |b| {
+        b.iter_batched(
+            || (ArcSwapSnapshotMap::new(), entries()),
+            |(map, entries)| {
+                map.install_many(entries);
+                map
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_lookup, bench_full_check, bench_bulk_install);
 criterion_main!(benches);

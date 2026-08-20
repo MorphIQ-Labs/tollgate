@@ -130,34 +130,42 @@ impl Drop for SnapshotManager {
     }
 }
 
-/// Resolve one principal: install, or negative-cache a confirmed unknown
-/// (removing any stale entry — this is the revocation path). Returns false
-/// on source error.
-async fn resolve(
+/// Refresh a set of principals in one sweep: fetches individually, then
+/// applies every install as one bulk write (`install_many` — one
+/// copy-on-write clone per sweep, review finding #9). Unknowns are removed
+/// and negative-cached; source errors leave the principal for the next
+/// sweep and are reported back for initial-load retry.
+async fn refresh_all(
     source: &Arc<dyn SnapshotSource>,
     map: &Arc<dyn SnapshotMap>,
     slots: &Arc<SlotRegistry>,
     clock: &Arc<dyn Clock>,
     config: &SnapshotManagerConfig,
-    principal: Principal,
-) -> bool {
-    match source.snapshot(principal).await {
-        Ok(Some(snapshot)) => {
-            let slot = slots.slot(snapshot.account_id);
-            map.install(principal, snapshot, slot);
-            true
+    principals: &[Principal],
+) -> Vec<Principal> {
+    let mut installs = Vec::new();
+    let mut failed = Vec::new();
+    for principal in principals {
+        match source.snapshot(*principal).await {
+            Ok(Some(snapshot)) => {
+                let slot = slots.slot(snapshot.account_id);
+                installs.push((*principal, snapshot, slot));
+            }
+            Ok(None) => {
+                map.remove(principal);
+                let until = clock
+                    .now()
+                    .checked_add(config.negative_ttl)
+                    .unwrap_or_else(|_| clock.now());
+                map.install_negative(*principal, until);
+            }
+            Err(_) => failed.push(*principal),
         }
-        Ok(None) => {
-            map.remove(&principal);
-            let until = clock
-                .now()
-                .checked_add(config.negative_ttl)
-                .unwrap_or_else(|_| clock.now());
-            map.install_negative(principal, until);
-            true
-        }
-        Err(_) => false,
     }
+    if !installs.is_empty() {
+        map.install_many(installs);
+    }
+    failed
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -180,13 +188,7 @@ async fn run(
         if *shutdown.borrow() {
             return;
         }
-        let mut still_pending = Vec::new();
-        for principal in pending {
-            if !resolve(&source, &map, &slots, &clock, &config, principal).await {
-                still_pending.push(principal);
-            }
-        }
-        pending = still_pending;
+        pending = refresh_all(&source, &map, &slots, &clock, &config, &pending).await;
         if !pending.is_empty() {
             tokio::select! {
                 _ = tokio::time::sleep(config.retry_backoff) => {}
@@ -220,9 +222,8 @@ async fn run(
                 // Lagged: missed pushes — refetch everything rather than
                 // guess what was dropped.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    for principal in &config.principals {
-                        let _ = resolve(&source, &map, &slots, &clock, &config, *principal).await;
-                    }
+                    let _ = refresh_all(&source, &map, &slots, &clock, &config, &config.principals)
+                        .await;
                 }
                 // Push stream gone (e.g. HTTP transport): periodic refresh
                 // remains the freshness path.
@@ -233,15 +234,13 @@ async fn run(
                             if changed.is_err() { return; }
                         }
                     }
-                    for principal in &config.principals {
-                        let _ = resolve(&source, &map, &slots, &clock, &config, *principal).await;
-                    }
+                    let _ = refresh_all(&source, &map, &slots, &clock, &config, &config.principals)
+                        .await;
                 }
             },
             _ = tick.tick() => {
-                for principal in &config.principals {
-                    let _ = resolve(&source, &map, &slots, &clock, &config, *principal).await;
-                }
+                let _ = refresh_all(&source, &map, &slots, &clock, &config, &config.principals)
+                    .await;
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {

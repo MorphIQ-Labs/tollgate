@@ -147,6 +147,34 @@ impl SnapshotMap for ArcSwapSnapshotMap {
             map.remove(principal);
         });
     }
+
+    /// One map clone for the whole batch — the point of the override: bulk
+    /// loading N principals costs O(N), not O(N²).
+    fn install_many(&self, entries: Vec<(Principal, Arc<AccountSnapshot>, Arc<LeaseSlot>)>) {
+        let prepared: Vec<_> = entries
+            .into_iter()
+            .map(|(principal, snapshot, lease)| {
+                let limiter = self
+                    .limiters
+                    .limiter_for(snapshot.account_id, &snapshot.limits);
+                (principal, snapshot, lease, limiter)
+            })
+            .collect();
+        self.rcu(|map| {
+            for (principal, snapshot, lease, limiter) in &prepared {
+                if supersedes(map.get(principal), snapshot.generation) {
+                    map.insert(
+                        *principal,
+                        MapEntry::Present(AccountAdmissionState::new(
+                            Arc::clone(snapshot),
+                            Arc::clone(lease),
+                            Arc::clone(limiter),
+                        )),
+                    );
+                }
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -208,6 +236,20 @@ mod tests {
 
         map.remove(&p);
         assert!(map.get(&p).is_none());
+    }
+
+    #[test]
+    fn install_many_respects_generations_in_one_write() {
+        let map = ArcSwapSnapshotMap::new();
+        map.install(Principal(1), snapshot(5), LeaseSlot::empty());
+        map.install_many(vec![
+            (Principal(1), snapshot(3), LeaseSlot::empty()), // rollback: discarded
+            (Principal(2), snapshot(1), LeaseSlot::empty()),
+            (Principal(3), snapshot(1), LeaseSlot::empty()),
+        ]);
+        assert_eq!(generation_of(&map, &Principal(1)), Some(5));
+        assert_eq!(generation_of(&map, &Principal(2)), Some(1));
+        assert_eq!(generation_of(&map, &Principal(3)), Some(1));
     }
 
     #[test]

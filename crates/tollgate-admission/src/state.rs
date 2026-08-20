@@ -168,6 +168,17 @@ pub trait SnapshotMap: Send + Sync {
 
     /// Remove a principal outright (key revoked).
     fn remove(&self, principal: &Principal);
+
+    /// Install a batch in one logical write. The default loops over
+    /// [`install`](SnapshotMap::install); copy-on-write implementations
+    /// override it to pay their clone cost once per batch instead of once
+    /// per entry (review finding #9 — loading N principals individually is
+    /// O(N²) on a whole-map-clone structure).
+    fn install_many(&self, entries: Vec<(Principal, Arc<AccountSnapshot>, Arc<LeaseSlot>)>) {
+        for (principal, snapshot, lease) in entries {
+            self.install(principal, snapshot, lease);
+        }
+    }
 }
 
 // A shared map is still a map: lets an `AdmissionEngine<Arc<M>>` and a
@@ -187,5 +198,9 @@ impl<T: SnapshotMap + ?Sized> SnapshotMap for Arc<T> {
 
     fn remove(&self, principal: &Principal) {
         (**self).remove(principal);
+    }
+
+    fn install_many(&self, entries: Vec<(Principal, Arc<AccountSnapshot>, Arc<LeaseSlot>)>) {
+        (**self).install_many(entries);
     }
 }
