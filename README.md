@@ -29,6 +29,8 @@ Contract: [`INVARIANTS.md`](INVARIANTS.md). Architecture and findings:
 ## Quickstart
 
 ```sh
+git config core.hooksPath .githooks         # once per clone: rustfmt check on commit
+
 cargo test --workspace                     # correctness (Postgres DB cases are env-gated)
 ./scripts/check_perf_thresholds.sh         # hot-path microbench gate
 ./scripts/check_load_thresholds.sh         # loopback overhead gate (production profile)
