@@ -1,0 +1,56 @@
+# Tollgate CI — ported from the Woodpecker pipeline (same four gates).
+#
+# The image tag matches rust-toolchain.toml; keep them in lockstep so rustup
+# never downloads a second toolchain inside CI. Absolute-latency perf gates
+# never run here — thresholds are calibrated on a controlled host
+# (docs/DESIGN.md); CI proves benches compile.
+#
+# Cache: cargo registry/git only (not target/) — meaningful download savings
+# without multi-GB archive churn. GitLab manages cache storage and expiry;
+# nothing to clean up manually.
+
+image: rust:1.97.1-slim
+
+stages: [lint, test, bench]
+
+default:
+  cache:
+    key: cargo-registry
+    paths:
+      - .cargo/registry
+      - .cargo/git
+
+variables:
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+
+lint:
+  stage: lint
+  script:
+    - rustc --version
+    - cargo fmt --check
+    - cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+test:
+  stage: test
+  script:
+    - cargo test --locked --workspace --all-features
+
+# First-class Postgres coverage: the env-gated suite that silently skips on
+# dev machines runs for real here, against a service container — the
+# backend-parity gate (mirrors tollgate-store's memory suite by scenario).
+test-postgres:
+  stage: test
+  services:
+    - postgres:16-alpine
+  variables:
+    POSTGRES_USER: tollgate
+    POSTGRES_PASSWORD: tollgate
+    POSTGRES_DB: tollgate
+    TOLLGATE_PG_URL: postgres://tollgate:tollgate@postgres:5432/tollgate
+  script:
+    - cargo test --locked -p tollgate-store-postgres
+
+bench-compile:
+  stage: bench
+  script:
+    - cargo bench --locked --workspace --no-run
