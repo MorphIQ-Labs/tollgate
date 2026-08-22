@@ -1,5 +1,7 @@
 # Repository Guidelines
 
+**Correctness, performance, and clean architecture are first-class features of every MorphIQ Labs project**, not qualities traded away for delivery speed or deferred to a follow-up. Each is held to evidence, and this document is how: correctness is *proven* — by the invariants, their enforcement ladder, and the assurance gates, never asserted; performance is *designed* — the complexity class, the data structure, the allocation, and any vectorization chosen deliberately at design time, then measured wherever measurement applies; architecture is *enforced* — boundaries checked mechanically, and complexity removed rather than accumulated. What each demands concretely differs by project; that all three stay top of mind does not. A change that erodes any of the three is incomplete however quickly it ships, and "it works" is not evidence for any of them.
+
 ## Purpose and Architecture
 
 Tollgate provides quota admission and usage accounting for latency-critical services. Centrally allocated, fenced quota leases are spent through local atomic counters; immutable account snapshots drive admission; idempotent, batched usage events drive billing.
@@ -46,6 +48,7 @@ CI uses `check`, `test`, `assurance`, and `release`: format, Clippy, title conve
 - Leases bound spend; usage events are billing truth. Backends must enforce `deposited == balance + active grants + settled usage + loss`.
 - Leases are usable only through `expires_at - safety_margin`; allocation reclaims them only after `expires_at + grace`. Validate timing configuration before starting tasks or debiting balances. Readiness remains continuous across snapshot freshness, usable leases, and background-task health.
 - Keep standards documents current-state only; put discovery history in `docs/DESIGN.md`. Crates remain unpublished and are distributed deliberately by Git tag.
+- **Performance**: the request path is the hot path, and its budget is structural — no I/O, no locks, no clock reads. That is what makes the rest defensible: `SnapshotMap` lookup through arc-swap/moka, direct-indexed `CostTable` quoting that must stay O(1) in the cost table's size, a weighted token, a lease debit, a `Reservation`. A scan where an index belongs, or an allocation per admission, is a defect rather than a slow path. `./scripts/check_perf_thresholds.sh` and `./scripts/check_load_thresholds.sh` are the gates, and the `production` profile (fat LTO, `panic=abort`) is what the load gate measures. Absolute-latency thresholds are calibrated on a controlled host and meaningful only there; overhead ratios are portable, so compare like for like, and a threshold change lands with measured evidence and a deliberate manifest update.
 
 ## Compatibility, Migrations, and Operations
 
