@@ -252,21 +252,22 @@ async fn run(
 }
 
 /// Release every parked lease that has quiesced; keep the rest parked.
-/// Terminal allocator refusals (fenced, already settled) drop the lease —
-/// the store has already accounted for it; storage errors keep it parked for
-/// retry next tick.
+/// Each parked lease is examined exactly once per pass. Terminal allocator
+/// refusals (fenced, already settled) drop the lease — the store has already
+/// accounted for it; storage errors keep it parked for retry next tick.
 async fn release_quiesced(
     allocator: &Arc<dyn LeaseAllocator>,
     parked: &mut Vec<Arc<LocalLease>>,
     clock: &Arc<dyn Clock>,
 ) {
-    let mut index = 0;
-    while index < parked.len() {
-        if Arc::strong_count(&parked[index]) > 1 {
-            index += 1;
+    let mut retry = Vec::new();
+    for lease in std::mem::take(parked) {
+        // The local binding holds what was the vec's sole reference, so a
+        // count above one still means an in-flight reservation holds it.
+        if Arc::strong_count(&lease) > 1 {
+            retry.push(lease);
             continue;
         }
-        let lease = parked.swap_remove(index);
         let grant = lease.grant();
         if let Err(tollgate_store::AllocateError::Storage(_)) = allocator
             .release(
@@ -277,8 +278,143 @@ async fn release_quiesced(
             )
             .await
         {
-            parked.push(lease);
-            index += 1;
+            retry.push(lease);
         }
+    }
+    *parked = retry;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use jiff::Timestamp;
+    use tollgate_core::{FencingToken, LeaseGrant, LeaseId};
+    use tollgate_store::{AllocateError, ReclaimedLease, StoreError, SystemClock};
+
+    use super::*;
+
+    /// Records successful releases; refuses scripted lease ids with the
+    /// scripted error.
+    struct ScriptedAllocator {
+        released: Mutex<Vec<LeaseId>>,
+        storage_failures: HashSet<LeaseId>,
+        fenced: HashSet<LeaseId>,
+    }
+
+    impl ScriptedAllocator {
+        fn new(
+            storage_failures: impl Into<HashSet<LeaseId>>,
+            fenced: impl Into<HashSet<LeaseId>>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                released: Mutex::new(Vec::new()),
+                storage_failures: storage_failures.into(),
+                fenced: fenced.into(),
+            })
+        }
+
+        fn released(&self) -> Vec<LeaseId> {
+            self.released.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LeaseAllocator for ScriptedAllocator {
+        async fn acquire(
+            &self,
+            _account: AccountId,
+            _requested: CostUnits,
+            _ttl: SignedDuration,
+            _now: Timestamp,
+        ) -> Result<LeaseGrant, AllocateError> {
+            unreachable!("release_quiesced never acquires")
+        }
+
+        async fn release(
+            &self,
+            lease_id: LeaseId,
+            _fencing_token: FencingToken,
+            _unspent: CostUnits,
+            _now: Timestamp,
+        ) -> Result<(), AllocateError> {
+            if self.storage_failures.contains(&lease_id) {
+                return Err(AllocateError::Storage(StoreError("scripted outage".into())));
+            }
+            if self.fenced.contains(&lease_id) {
+                return Err(AllocateError::Fenced);
+            }
+            self.released.lock().unwrap().push(lease_id);
+            Ok(())
+        }
+
+        async fn reclaim_expired(
+            &self,
+            _now: Timestamp,
+        ) -> Result<Vec<ReclaimedLease>, StoreError> {
+            unreachable!("release_quiesced never reclaims")
+        }
+    }
+
+    fn parked_lease(id: u128) -> Arc<LocalLease> {
+        Arc::new(LocalLease::new(
+            LeaseGrant {
+                lease_id: LeaseId(id),
+                account_id: AccountId(1),
+                fencing_token: FencingToken(1),
+                units: CostUnits(100),
+                expires_at: Timestamp::from_second(3_600).unwrap(),
+            },
+            CostUnits(10),
+        ))
+    }
+
+    fn clock() -> Arc<dyn Clock> {
+        Arc::new(SystemClock)
+    }
+
+    #[tokio::test]
+    async fn storage_failure_does_not_skip_the_next_parked_lease() {
+        let scripted = ScriptedAllocator::new([LeaseId(1)], []);
+        let allocator: Arc<dyn LeaseAllocator> = Arc::clone(&scripted) as _;
+        let mut parked = vec![parked_lease(1), parked_lease(2)];
+
+        release_quiesced(&allocator, &mut parked, &clock()).await;
+
+        assert_eq!(scripted.released(), [LeaseId(2)]);
+        assert_eq!(parked.len(), 1, "only the failed lease stays parked");
+        assert_eq!(parked[0].grant().lease_id, LeaseId(1));
+    }
+
+    #[tokio::test]
+    async fn unquiesced_lease_is_never_released() {
+        let scripted = ScriptedAllocator::new([], []);
+        let allocator: Arc<dyn LeaseAllocator> = Arc::clone(&scripted) as _;
+        let lease = parked_lease(7);
+        let in_flight = Arc::clone(&lease);
+        let mut parked = vec![lease];
+
+        release_quiesced(&allocator, &mut parked, &clock()).await;
+        assert!(scripted.released().is_empty());
+        assert_eq!(parked.len(), 1, "held lease stays parked");
+
+        drop(in_flight);
+        release_quiesced(&allocator, &mut parked, &clock()).await;
+        assert_eq!(scripted.released(), [LeaseId(7)]);
+        assert!(parked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_refusal_drops_the_lease() {
+        let scripted = ScriptedAllocator::new([], [LeaseId(3)]);
+        let allocator: Arc<dyn LeaseAllocator> = Arc::clone(&scripted) as _;
+        let mut parked = vec![parked_lease(3)];
+
+        release_quiesced(&allocator, &mut parked, &clock()).await;
+
+        assert!(scripted.released().is_empty());
+        assert!(parked.is_empty(), "settled lease is not retried");
     }
 }
