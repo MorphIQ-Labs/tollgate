@@ -222,6 +222,10 @@ release:
   variables:
     GIT_DEPTH: "0"
     RUSTUP_TOOLCHAIN: "1.97.1"
+    # Cargo requires every name in workspace.package.publish to resolve during
+    # `cargo package`. This crates.io index alias is packaging metadata only:
+    # release-plz remains git-only with publication disabled.
+    CARGO_REGISTRIES_MORPHIQ_INTERNAL_INDEX: "sparse+https://index.crates.io/"
   cache:
     key: "release-plz-$RELEASE_PLZ_VERSION"
     paths:
