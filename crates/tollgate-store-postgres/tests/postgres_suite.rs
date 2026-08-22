@@ -56,15 +56,32 @@ async fn invalid_grant_policy_is_rejected_before_connecting() {
     );
 }
 
+/// The URL with userinfo stripped, safe to put in a panic message.
+fn redact_url(url: &str) -> String {
+    match url.split_once('@') {
+        Some((_, host)) => format!("postgres://<redacted>@{host}"),
+        None => url.to_owned(),
+    }
+}
+
 /// Connect (or skip), truncate, create the standard account.
+///
+/// `TOLLGATE_REQUIRE_PG` turns the local-development skip into a failure, so
+/// the CI gate that sets it cannot go green without a live database — the
+/// harness enforces this even if the CI YAML is refactored out from under it.
 async fn store_with_balance(policy: GrantPolicy, balance: u64) -> Option<Arc<PostgresStore>> {
     let Ok(url) = std::env::var("TOLLGATE_PG_URL") else {
+        assert!(
+            std::env::var_os("TOLLGATE_REQUIRE_PG").is_none(),
+            "TOLLGATE_PG_URL is unset but TOLLGATE_REQUIRE_PG is set; \
+             the Postgres gate must not pass without a database"
+        );
         eprintln!("SKIPPED: TOLLGATE_PG_URL not set (see docker-compose.yml)");
         return None;
     };
     let store = PostgresStore::connect(&url, policy)
         .await
-        .expect("postgres reachable");
+        .unwrap_or_else(|e| panic!("postgres unreachable at {}: {e}", redact_url(&url)));
     store.truncate_all().await.unwrap();
     AdminStore::create_account(
         &*store,
@@ -630,7 +647,7 @@ async fn corruption_pool() -> sqlx::PgPool {
     let url = std::env::var("TOLLGATE_PG_URL").expect("caller already gated on TOLLGATE_PG_URL");
     sqlx::PgPool::connect(&url)
         .await
-        .expect("postgres reachable")
+        .unwrap_or_else(|e| panic!("postgres unreachable at {}: {e}", redact_url(&url)))
 }
 
 fn account_bytes() -> Vec<u8> {

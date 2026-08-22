@@ -53,6 +53,28 @@ variables:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
     - when: never
 
+# Shared Postgres service wiring for every job that runs the env-gated suite.
+# TOLLGATE_REQUIRE_PG makes the test harness fail red on a silent skip, so the
+# gate cannot go green without a live database even if this YAML is refactored.
+.postgres-service:
+  services:
+    - postgres:16-alpine
+  variables:
+    POSTGRES_USER: tollgate
+    POSTGRES_PASSWORD: tollgate
+    POSTGRES_DB: tollgate
+    TOLLGATE_PG_URL: postgres://tollgate:tollgate@postgres:5432/tollgate
+    TOLLGATE_REQUIRE_PG: "1"
+
+# Readiness wait the Woodpecker port dropped: the runner's implicit service
+# check is docker-executor-only and TCP-only, so the job must wait until
+# Postgres actually accepts connections (pg_isready) before testing against it.
+.postgres-wait:
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends postgresql-client
+    - for i in $(seq 60); do pg_isready -h postgres -p 5432 -U tollgate && break; sleep 1; done
+    - pg_isready -h postgres -p 5432 -U tollgate || { echo "Postgres service not accepting connections after 60s" >&2; exit 1; }
+
 commit-convention:
   extends: .merge-request
   stage: check
@@ -108,17 +130,12 @@ test:
 # dev machines runs for real here, against a service container — the
 # backend-parity gate (mirrors tollgate-store's memory suite by scenario).
 test-postgres:
-  extends: .merge-request
+  extends: [.merge-request, .postgres-service]
   stage: test
   interruptible: true
-  services:
-    - postgres:16-alpine
-  variables:
-    POSTGRES_USER: tollgate
-    POSTGRES_PASSWORD: tollgate
-    POSTGRES_DB: tollgate
-    TOLLGATE_PG_URL: postgres://tollgate:tollgate@postgres:5432/tollgate
+  before_script: !reference [.postgres-wait, before_script]
   script:
+    - test -n "$TOLLGATE_PG_URL" || { echo "TOLLGATE_PG_URL is unset; this gate must not pass without a database" >&2; exit 1; }
     - cargo test --locked -p tollgate-store-postgres
 
 bench-compile:
@@ -149,18 +166,12 @@ formal:
     - ./scripts/check_formal.sh
 
 mutation:
-  extends: .main-merge-request
+  extends: [.main-merge-request, .postgres-service]
   stage: assurance
   timeout: 90 minutes
   interruptible: true
-  services:
-    - postgres:16-alpine
-  variables:
-    POSTGRES_USER: tollgate
-    POSTGRES_PASSWORD: tollgate
-    POSTGRES_DB: tollgate
-    TOLLGATE_PG_URL: postgres://tollgate:tollgate@postgres:5432/tollgate
   before_script:
+    - !reference [.postgres-wait, before_script]
     # The slim Rust image does not include git; diff-scoped mutation selection
     # requires it before any Rust tooling is worth installing.
     - apt-get update && apt-get install -y --no-install-recommends git
