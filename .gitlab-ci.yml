@@ -246,7 +246,7 @@ release:
       export PATH="/tmp/release-tools/bin:$PATH"
       export CARGO_HOME=/tmp/release-cargo
       export CARGO_INSTALL_ROOT=/tmp/release-tools
-      export CARGO_TARGET_DIR=/tmp/release-target
+      export CARGO_TARGET_DIR=/tmp/target
       git clean -ffdx -q
       test -z "$(git status --porcelain=v1 --untracked-files=all --ignored=matching)"
   after_script:
