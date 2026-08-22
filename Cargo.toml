@@ -20,7 +20,6 @@ edition = "2024"
 rust-version = "1.89"
 authors = ["MorphIQ Labs"]
 repository = "https://github.com/MorphIQ-Labs/tollgate"
-publish = ["private-registry"]
 
 [workspace.dependencies]
 # Time: jiff, not chrono/time — matches ferro-risk. The core crate takes

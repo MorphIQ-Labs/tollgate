@@ -103,6 +103,15 @@ repository-hygiene:
         printf 'Generated or ignored files are tracked:\n%s\n' "$tracked_ignored" >&2
         exit 1
       fi
+    - |
+      # The registry guard lives in release-plz.toml, never in manifests:
+      # release-plz derives `cargo package --registry <name>` from a manifest
+      # publish list, and an undefined registry breaks the release job (#46).
+      publish_keys="$(grep -rn '^[[:space:]]*publish' --include=Cargo.toml . || true)"
+      if [ -n "$publish_keys" ]; then
+        printf 'Cargo manifests must not carry a publish key (see AGENTS.md, issue #46):\n%s\n' "$publish_keys" >&2
+        exit 1
+      fi
 
 fmt:
   extends: .merge-request
