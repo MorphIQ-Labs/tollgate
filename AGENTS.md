@@ -73,7 +73,7 @@ Invariants live in `INVARIANTS.md`, the testable contract, with rationale in `do
 
 ## Engineering and Review Principles
 
-- Treat technical debt as a code-review concern. Address it early and continuously when the change is safe and scoped; when the blast radius is too large for the current work, create a clearly scoped follow-up issue rather than leaving an undocumented TODO.
+- Treat technical debt as a code-review concern, and finish the job in the change that surfaces it: a fix targets the defect pattern, not the instance, so same-pattern siblings in the touched component are in scope — not material for follow-on issues or MRs. Defer only when the issue proved materially misdiagnosed or the remaining work needs its own design and rollout story; then create a clearly scoped follow-up issue rather than leaving an undocumented TODO.
 - For defects caused by regressions, perform a root-cause analysis. Identify how the regression entered, why existing safeguards missed it, and what test, invariant, tooling, or process change will prevent recurrence. Use each regression to strengthen the system.
 - Fix problems at the layer where their contract is first violated. Do not mask a downstream defect with an upstream workaround or symptom-specific patch.
 - Optimize for simplicity and maintainability. Prefer clear designs over incidental compatibility with awkward internals, and refactor when doing so removes complexity or restores sound boundaries.
@@ -97,7 +97,7 @@ Use rustfmt defaults and idiomatic Rust naming: `snake_case` for modules, functi
 
 ## Merge Requests and Releases
 
-`main` accepts no direct pushes; every change lands through a merge request with all discussions resolved. One MR at a time — do not widen scope unasked — and discuss large architectural changes before implementing them.
+`main` accepts no direct pushes; every change lands through a merge request with all discussions resolved. One MR at a time — do not widen scope unasked, though completing the defect pattern an issue names is finishing the job, not widening scope — and discuss large architectural changes before implementing them.
 
 Branch and title share the conventional-commit vocabulary, because release automation reads it: branches are `<type>/<slug>` (`fix/lease-reclaim-grace`), and the MR title is a conventional commit with an optional scope (`feat(admission): install_many bulk write`), enforced by the `commit-convention` job. The MR is squash-merged, so that title becomes the single commit subject on `main` and is what release-plz reads to compute the next version and changelog entry. Never use the `release-plz-` branch prefix, which release-plz reserves for the release MR it maintains.
 
