@@ -6,57 +6,92 @@
 //! chosen for that asymmetry.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use jiff::Timestamp;
 
 use tollgate_core::{AccountSnapshot, Generation};
 
+use crate::generation_model::{accept_negative, accept_positive};
 use crate::state::{
     AccountAdmissionState, AccountLimiters, LeaseSlot, MapEntry, Principal, SnapshotMap,
     SnapshotUpdate,
 };
 
-fn installed_generation(entry: &MapEntry) -> Option<Generation> {
-    match entry {
-        MapEntry::Present(state) => Some(state.snapshot.generation),
-        MapEntry::NegativeUntil { generation, .. } => *generation,
+#[derive(Default)]
+struct GenerationWatermarks {
+    by_principal: HashMap<Principal, Generation>,
+}
+
+impl GenerationWatermarks {
+    fn accept_positive(&mut self, principal: Principal, incoming: Generation) -> bool {
+        let (next, accepted) =
+            accept_positive(self.by_principal.get(&principal).copied(), incoming);
+        if let Some(next) = next {
+            self.by_principal.insert(principal, next);
+        }
+        accepted
+    }
+
+    fn accept_negative(&mut self, principal: Principal, incoming: Option<Generation>) -> bool {
+        let (next, accepted) =
+            accept_negative(self.by_principal.get(&principal).copied(), incoming);
+        if let Some(next) = next {
+            self.by_principal.insert(principal, next);
+        }
+        accepted
     }
 }
 
-/// Should `new` replace `existing`? Present entries only ever move forward by
-/// generation. Versioned negative entries are tombstones: only a strictly
-/// newer positive snapshot may replace them.
-fn supersedes(existing: Option<&MapEntry>, new_generation: Generation) -> bool {
-    match existing.and_then(installed_generation) {
-        Some(current) => new_generation > current,
-        None => true,
-    }
+enum PreparedUpdate {
+    Present {
+        principal: Principal,
+        snapshot: Arc<AccountSnapshot>,
+        lease: Arc<LeaseSlot>,
+        limiter: Arc<crate::state::AccountLimiter>,
+    },
+    Negative {
+        principal: Principal,
+        until: Timestamp,
+        generation: Option<Generation>,
+    },
 }
 
-fn tombstone(
-    existing: Option<&MapEntry>,
-    until: Timestamp,
-    generation: Option<Generation>,
-) -> MapEntry {
-    let installed = existing.and_then(installed_generation);
-    // A delayed removal must not revoke a snapshot that is known to be
-    // newer. Equal is intentional: removing generation N creates the
-    // generation-N tombstone that only N+1 may supersede.
-    if matches!((installed, generation), (Some(current), Some(incoming)) if incoming < current) {
-        return existing
-            .cloned()
-            .expect("installed generation came from an entry");
-    }
-    MapEntry::NegativeUntil {
-        until,
-        generation: match (installed, generation) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        },
+fn apply_prepared(
+    map: &mut HashMap<Principal, MapEntry>,
+    watermarks: &mut GenerationWatermarks,
+    updates: &[PreparedUpdate],
+) {
+    for update in updates {
+        match update {
+            PreparedUpdate::Present {
+                principal,
+                snapshot,
+                lease,
+                limiter,
+            } => {
+                if watermarks.accept_positive(*principal, snapshot.generation) {
+                    map.insert(
+                        *principal,
+                        MapEntry::Present(AccountAdmissionState::new(
+                            Arc::clone(snapshot),
+                            Arc::clone(lease),
+                            Arc::clone(limiter),
+                        )),
+                    );
+                }
+            }
+            PreparedUpdate::Negative {
+                principal,
+                until,
+                generation,
+            } => {
+                if watermarks.accept_negative(*principal, *generation) {
+                    map.insert(*principal, MapEntry::NegativeUntil { until: *until });
+                }
+            }
+        }
     }
 }
 
@@ -64,6 +99,7 @@ fn tombstone(
 /// review's caution about moka cloning values on retrieval).
 pub struct MokaSnapshotMap {
     cache: moka::sync::Cache<Principal, MapEntry>,
+    watermarks: Mutex<GenerationWatermarks>,
     limiters: AccountLimiters,
 }
 
@@ -72,6 +108,7 @@ impl MokaSnapshotMap {
     pub fn new(max_capacity: u64) -> Self {
         MokaSnapshotMap {
             cache: moka::sync::Cache::new(max_capacity),
+            watermarks: Mutex::new(GenerationWatermarks::default()),
             limiters: AccountLimiters::default(),
         }
     }
@@ -83,25 +120,16 @@ impl SnapshotMap for MokaSnapshotMap {
     }
 
     fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>) {
-        let generation = snapshot.generation;
-        // The account-shared limiter, fetched outside the per-key closure.
         let limiter =
             self.limiters
                 .limiter_for(snapshot.account_id, snapshot.generation, &snapshot.limits);
-        // and_compute_with gives us an atomic read-modify-write per key, which
-        // is what makes generation monotonicity hold under concurrent pushes.
-        self.cache.entry(principal).and_compute_with(|existing| {
-            let existing = existing.map(|e| e.into_value());
-            if supersedes(existing.as_ref(), generation) {
-                moka::ops::compute::Op::Put(MapEntry::Present(AccountAdmissionState::new(
-                    Arc::clone(&snapshot),
-                    Arc::clone(&lease),
-                    Arc::clone(&limiter),
-                )))
-            } else {
-                moka::ops::compute::Op::Nop
-            }
-        });
+        let mut watermarks = self.watermarks.lock().expect("watermarks poisoned");
+        if watermarks.accept_positive(principal, snapshot.generation) {
+            self.cache.insert(
+                principal,
+                MapEntry::Present(AccountAdmissionState::new(snapshot, lease, limiter)),
+            );
+        }
     }
 
     fn install_negative(&self, principal: Principal, until: Timestamp) {
@@ -114,13 +142,15 @@ impl SnapshotMap for MokaSnapshotMap {
         until: Timestamp,
         generation: Option<Generation>,
     ) {
-        self.cache.entry(principal).and_compute_with(|existing| {
-            let existing = existing.map(|e| e.into_value());
-            moka::ops::compute::Op::Put(tombstone(existing.as_ref(), until, generation))
-        });
+        let mut watermarks = self.watermarks.lock().expect("watermarks poisoned");
+        if watermarks.accept_negative(principal, generation) {
+            self.cache
+                .insert(principal, MapEntry::NegativeUntil { until });
+        }
     }
 
     fn remove(&self, principal: &Principal) {
+        let _watermarks = self.watermarks.lock().expect("watermarks poisoned");
         self.cache.invalidate(principal);
     }
 }
@@ -128,118 +158,33 @@ impl SnapshotMap for MokaSnapshotMap {
 /// Copy-on-write immutable map behind `arc-swap`. Reads are a load plus one
 /// hash lookup; writes clone the whole map, which is acceptable because they
 /// happen at control-plane frequency, not request frequency.
-#[derive(Default)]
 pub struct ArcSwapSnapshotMap {
     map: ArcSwap<HashMap<Principal, MapEntry>>,
+    watermarks: Mutex<GenerationWatermarks>,
     limiters: AccountLimiters,
+    max_negative_entries: usize,
 }
 
 impl ArcSwapSnapshotMap {
+    pub const DEFAULT_MAX_NEGATIVE_ENTRIES: usize = 4_096;
+
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_max_negative_entries(Self::DEFAULT_MAX_NEGATIVE_ENTRIES)
     }
 
-    /// Read-copy-update loop shared by all mutations.
-    fn rcu(&self, mutate: impl Fn(&mut HashMap<Principal, MapEntry>)) {
-        self.map.rcu(|current| {
-            let mut next = HashMap::clone(current);
-            mutate(&mut next);
-            next
-        });
-    }
-}
-
-impl SnapshotMap for ArcSwapSnapshotMap {
-    fn get(&self, principal: &Principal) -> Option<MapEntry> {
-        self.map.load().get(principal).cloned()
-    }
-
-    fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>) {
-        let limiter =
-            self.limiters
-                .limiter_for(snapshot.account_id, snapshot.generation, &snapshot.limits);
-        self.rcu(|map| {
-            if supersedes(map.get(&principal), snapshot.generation) {
-                map.insert(
-                    principal,
-                    MapEntry::Present(AccountAdmissionState::new(
-                        Arc::clone(&snapshot),
-                        Arc::clone(&lease),
-                        Arc::clone(&limiter),
-                    )),
-                );
-            }
-        });
-    }
-
-    fn install_negative(&self, principal: Principal, until: Timestamp) {
-        self.install_negative_at_generation(principal, until, None);
-    }
-
-    fn install_negative_at_generation(
-        &self,
-        principal: Principal,
-        until: Timestamp,
-        generation: Option<Generation>,
-    ) {
-        self.rcu(|map| {
-            let negative = tombstone(map.get(&principal), until, generation);
-            map.insert(principal, negative);
-        });
-    }
-
-    fn remove(&self, principal: &Principal) {
-        self.rcu(|map| {
-            map.remove(principal);
-        });
-    }
-
-    /// One map clone for the whole batch — the point of the override: bulk
-    /// loading N principals costs O(N), not O(N²).
-    fn install_many(&self, entries: Vec<(Principal, Arc<AccountSnapshot>, Arc<LeaseSlot>)>) {
-        let prepared: Vec<_> = entries
-            .into_iter()
-            .map(|(principal, snapshot, lease)| {
-                let limiter = self.limiters.limiter_for(
-                    snapshot.account_id,
-                    snapshot.generation,
-                    &snapshot.limits,
-                );
-                (principal, snapshot, lease, limiter)
-            })
-            .collect();
-        self.rcu(|map| {
-            for (principal, snapshot, lease, limiter) in &prepared {
-                if supersedes(map.get(principal), snapshot.generation) {
-                    map.insert(
-                        *principal,
-                        MapEntry::Present(AccountAdmissionState::new(
-                            Arc::clone(snapshot),
-                            Arc::clone(lease),
-                            Arc::clone(limiter),
-                        )),
-                    );
-                }
-            }
-        });
-    }
-
-    fn apply_many(&self, updates: Vec<SnapshotUpdate>) {
-        enum Prepared {
-            Present {
-                principal: Principal,
-                snapshot: Arc<AccountSnapshot>,
-                lease: Arc<LeaseSlot>,
-                limiter: Arc<crate::state::AccountLimiter>,
-            },
-            Negative {
-                principal: Principal,
-                until: Timestamp,
-                generation: Option<Generation>,
-            },
+    #[must_use]
+    pub fn with_max_negative_entries(max_negative_entries: usize) -> Self {
+        ArcSwapSnapshotMap {
+            map: ArcSwap::default(),
+            watermarks: Mutex::new(GenerationWatermarks::default()),
+            limiters: AccountLimiters::default(),
+            max_negative_entries,
         }
-        let prepared: Vec<_> = updates
+    }
+
+    fn prepare(&self, updates: Vec<SnapshotUpdate>) -> Vec<PreparedUpdate> {
+        updates
             .into_iter()
             .map(|update| match update {
                 SnapshotUpdate::Present {
@@ -252,7 +197,7 @@ impl SnapshotMap for ArcSwapSnapshotMap {
                         snapshot.generation,
                         &snapshot.limits,
                     );
-                    Prepared::Present {
+                    PreparedUpdate::Present {
                         principal,
                         snapshot,
                         lease,
@@ -263,44 +208,119 @@ impl SnapshotMap for ArcSwapSnapshotMap {
                     principal,
                     until,
                     generation,
-                } => Prepared::Negative {
+                } => PreparedUpdate::Negative {
                     principal,
                     until,
                     generation,
                 },
             })
-            .collect();
-        self.rcu(|map| {
-            for update in &prepared {
-                match update {
-                    Prepared::Present {
-                        principal,
-                        snapshot,
-                        lease,
-                        limiter,
-                    } => {
-                        if supersedes(map.get(principal), snapshot.generation) {
-                            map.insert(
-                                *principal,
-                                MapEntry::Present(AccountAdmissionState::new(
-                                    Arc::clone(snapshot),
-                                    Arc::clone(lease),
-                                    Arc::clone(limiter),
-                                )),
-                            );
-                        }
-                    }
-                    Prepared::Negative {
-                        principal,
-                        until,
-                        generation,
-                    } => {
-                        let negative = tombstone(map.get(principal), *until, *generation);
-                        map.insert(*principal, negative);
-                    }
-                }
-            }
-        });
+            .collect()
+    }
+
+    /// Writers serialize only against other control-plane writers. Request
+    /// reads remain one ArcSwap load and one hash lookup.
+    fn write(&self, updates: &[PreparedUpdate], now: Option<Timestamp>) {
+        let mut watermarks = self.watermarks.lock().expect("watermarks poisoned");
+        let current = self.map.load_full();
+        let mut next = HashMap::clone(&current);
+        if let Some(now) = now {
+            next.retain(
+                |_, entry| !matches!(entry, MapEntry::NegativeUntil { until } if *until <= now),
+            );
+        }
+        apply_prepared(&mut next, &mut watermarks, updates);
+        trim_negatives(&mut next, self.max_negative_entries);
+        self.map.store(Arc::new(next));
+    }
+}
+
+impl Default for ArcSwapSnapshotMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn trim_negatives(map: &mut HashMap<Principal, MapEntry>, max_negative_entries: usize) {
+    let mut negatives: Vec<_> = map
+        .iter()
+        .filter_map(|(principal, entry)| match entry {
+            MapEntry::NegativeUntil { until } => Some((*until, *principal)),
+            MapEntry::Present(_) => None,
+        })
+        .collect();
+    let remove = negatives.len().saturating_sub(max_negative_entries);
+    if remove == 0 {
+        return;
+    }
+    negatives.sort_unstable();
+    for (_, principal) in negatives.into_iter().take(remove) {
+        map.remove(&principal);
+    }
+}
+
+impl SnapshotMap for ArcSwapSnapshotMap {
+    fn get(&self, principal: &Principal) -> Option<MapEntry> {
+        self.map.load().get(principal).cloned()
+    }
+
+    fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>) {
+        let updates = self.prepare(vec![SnapshotUpdate::Present {
+            principal,
+            snapshot,
+            lease,
+        }]);
+        self.write(&updates, None);
+    }
+
+    fn install_negative(&self, principal: Principal, until: Timestamp) {
+        self.install_negative_at_generation(principal, until, None);
+    }
+
+    fn install_negative_at_generation(
+        &self,
+        principal: Principal,
+        until: Timestamp,
+        generation: Option<Generation>,
+    ) {
+        let updates = self.prepare(vec![SnapshotUpdate::Negative {
+            principal,
+            until,
+            generation,
+        }]);
+        self.write(&updates, None);
+    }
+
+    fn remove(&self, principal: &Principal) {
+        let _watermarks = self.watermarks.lock().expect("watermarks poisoned");
+        let current = self.map.load_full();
+        let mut next = HashMap::clone(&current);
+        next.remove(principal);
+        self.map.store(Arc::new(next));
+    }
+
+    /// One map clone for the whole batch — the point of the override: bulk
+    /// loading N principals costs O(N), not O(N²).
+    fn install_many(&self, entries: Vec<(Principal, Arc<AccountSnapshot>, Arc<LeaseSlot>)>) {
+        self.apply_many(
+            entries
+                .into_iter()
+                .map(|(principal, snapshot, lease)| SnapshotUpdate::Present {
+                    principal,
+                    snapshot,
+                    lease,
+                })
+                .collect(),
+        );
+    }
+
+    fn apply_many(&self, updates: Vec<SnapshotUpdate>) {
+        let prepared = self.prepare(updates);
+        self.write(&prepared, None);
+    }
+
+    fn apply_many_at(&self, updates: Vec<SnapshotUpdate>, now: Timestamp) {
+        let prepared = self.prepare(updates);
+        self.write(&prepared, Some(now));
     }
 }
 
@@ -372,8 +392,14 @@ mod tests {
         map.install_negative_at_generation(p, t(200), Some(Generation(7)));
         assert!(matches!(map.get(&p), Some(MapEntry::NegativeUntil { .. })));
 
+        // Removing the request-visible entry must not remove the generation
+        // watermark. Otherwise cache eviction could resurrect stale state.
         map.remove(&p);
         assert!(map.get(&p).is_none());
+        map.install(p, snapshot(7), LeaseSlot::empty());
+        assert!(map.get(&p).is_none());
+        map.install(p, snapshot(8), LeaseSlot::empty());
+        assert_eq!(generation_of(&map, &p), Some(8));
     }
 
     #[test]
@@ -398,6 +424,88 @@ mod tests {
     #[test]
     fn arc_swap_map_contract() {
         exercises_map(ArcSwapSnapshotMap::new());
+    }
+
+    #[test]
+    fn apply_many_at_default_and_arc_delegate_apply_the_batch() {
+        // Moka uses SnapshotMap's default apply_many_at; wrapping it in Arc
+        // also exercises the delegating implementation used by managers.
+        let map = Arc::new(MokaSnapshotMap::new(10));
+        map.apply_many_at(
+            vec![SnapshotUpdate::Present {
+                principal: Principal(1),
+                snapshot: snapshot(1),
+                lease: LeaseSlot::empty(),
+            }],
+            t(10),
+        );
+        assert_eq!(generation_of(&map, &Principal(1)), Some(1));
+    }
+
+    #[test]
+    fn arc_swap_negative_cache_is_bounded_and_evicts_oldest_deadline_first() {
+        let map = ArcSwapSnapshotMap::with_max_negative_entries(2);
+        map.install(Principal(1), snapshot(1), LeaseSlot::empty());
+        map.install_negative(Principal(2), t(30));
+        map.install_negative(Principal(3), t(10));
+        map.install_negative(Principal(4), t(20));
+
+        assert_eq!(generation_of(&map, &Principal(1)), Some(1));
+        assert!(map.get(&Principal(3)).is_none());
+        assert!(matches!(
+            map.get(&Principal(2)),
+            Some(MapEntry::NegativeUntil { until }) if until == t(30)
+        ));
+        assert!(matches!(
+            map.get(&Principal(4)),
+            Some(MapEntry::NegativeUntil { until }) if until == t(20)
+        ));
+    }
+
+    #[test]
+    fn arc_swap_control_write_drops_expired_negatives() {
+        let map = ArcSwapSnapshotMap::with_max_negative_entries(10);
+        map.install_negative(Principal(1), t(10));
+        map.install_negative(Principal(2), t(20));
+
+        map.apply_many_at(Vec::new(), t(10));
+
+        assert!(map.get(&Principal(1)).is_none());
+        assert!(matches!(
+            map.get(&Principal(2)),
+            Some(MapEntry::NegativeUntil { until }) if until == t(20)
+        ));
+    }
+
+    #[test]
+    fn negative_eviction_preserves_generation_monotonicity() {
+        let map = ArcSwapSnapshotMap::with_max_negative_entries(0);
+        let principal = Principal(1);
+        map.install(principal, snapshot(5), LeaseSlot::empty());
+        map.install_negative_at_generation(principal, t(10), Some(Generation(5)));
+        assert!(map.get(&principal).is_none(), "zero-cap cache must evict");
+
+        map.install(principal, snapshot(4), LeaseSlot::empty());
+        map.install(principal, snapshot(5), LeaseSlot::empty());
+        assert!(
+            map.get(&principal).is_none(),
+            "eviction must not admit a stale or replayed snapshot"
+        );
+        map.install(principal, snapshot(6), LeaseSlot::empty());
+        assert_eq!(generation_of(&map, &principal), Some(6));
+    }
+
+    #[test]
+    fn many_unknowns_leave_only_the_configured_number_visible() {
+        const CAP: usize = 17;
+        let map = ArcSwapSnapshotMap::with_max_negative_entries(CAP);
+        for raw in 0..1_000 {
+            map.install_negative(Principal(raw), t(i64::try_from(raw).unwrap() + 1));
+        }
+        let visible = (0..1_000)
+            .filter(|raw| map.get(&Principal(*raw)).is_some())
+            .count();
+        assert_eq!(visible, CAP);
     }
 
     /// Review finding #4: the advertised limit is an *account* limit — every

@@ -21,7 +21,7 @@ use tollgate_core::{
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, CreateAccountError, GrantPolicy, LeaseAllocator,
-    SnapshotSource, UsageSink,
+    SnapshotResolution, SnapshotSource, UsageSink,
 };
 use tollgate_store_postgres::PostgresStore;
 
@@ -554,12 +554,17 @@ async fn snapshot_publish_fetch_and_generation_monotonicity() {
         })
     };
 
-    assert!(store.snapshot(principal).await.unwrap().is_none());
+    assert!(matches!(
+        store.snapshot(principal).await.unwrap(),
+        SnapshotResolution::Unknown
+    ));
     store
         .publish_snapshot(principal, snapshot(3))
         .await
         .unwrap();
-    let fetched = store.snapshot(principal).await.unwrap().unwrap();
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("published snapshot must be present");
+    };
     assert_eq!(fetched.generation, Generation(3));
 
     // Replayed older generation must not roll the row back.
@@ -567,11 +572,18 @@ async fn snapshot_publish_fetch_and_generation_monotonicity() {
         .publish_snapshot(principal, snapshot(2))
         .await
         .unwrap();
-    let fetched = store.snapshot(principal).await.unwrap().unwrap();
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("newest snapshot must remain present");
+    };
     assert_eq!(fetched.generation, Generation(3));
 
     store.remove_snapshot(principal).await.unwrap();
-    assert!(store.snapshot(principal).await.unwrap().is_none());
+    assert!(matches!(
+        store.snapshot(principal).await.unwrap(),
+        SnapshotResolution::Revoked {
+            generation: Generation(3)
+        }
+    ));
 
     // The deleted row is a generation-3 tombstone, so a delayed older
     // publication cannot resurrect it.
@@ -579,15 +591,20 @@ async fn snapshot_publish_fetch_and_generation_monotonicity() {
         .publish_snapshot(principal, snapshot(2))
         .await
         .unwrap();
-    assert!(store.snapshot(principal).await.unwrap().is_none());
+    assert!(matches!(
+        store.snapshot(principal).await.unwrap(),
+        SnapshotResolution::Revoked {
+            generation: Generation(3)
+        }
+    ));
     store
         .publish_snapshot(principal, snapshot(4))
         .await
         .unwrap();
-    assert_eq!(
-        store.snapshot(principal).await.unwrap().unwrap().generation,
-        Generation(4)
-    );
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("newer snapshot must supersede revocation");
+    };
+    assert_eq!(fetched.generation, Generation(4));
 
     assert!(
         store

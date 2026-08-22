@@ -29,8 +29,8 @@ use tollgate_core::{
 
 use crate::traits::{
     AdminStore, AllocateError, CreateAccountError, GrantPolicy, GrantPolicyError, IngestReport,
-    LeaseAllocator, ReclaimedLease, SnapshotPush, SnapshotSource, StoreError, StoreHealth,
-    UsageSink,
+    LeaseAllocator, ReclaimedLease, SnapshotPush, SnapshotResolution, SnapshotSource, StoreError,
+    StoreHealth, UsageSink,
 };
 
 /// Admin-side inputs when creating an account.
@@ -225,8 +225,7 @@ impl MemoryStore {
         // No receivers is fine: pull via `snapshot()` still observes it.
         let _ = self.push.send(SnapshotPush {
             principal,
-            generation: Some(snapshot.generation),
-            snapshot: Some(snapshot),
+            resolution: SnapshotResolution::Present(snapshot),
         });
     }
 
@@ -244,8 +243,7 @@ impl MemoryStore {
         };
         let _ = self.push.send(SnapshotPush {
             principal,
-            snapshot: None,
-            generation: Some(generation),
+            resolution: SnapshotResolution::Revoked { generation },
         });
     }
 
@@ -515,15 +513,16 @@ impl AdminStore for MemoryStore {
 
 #[async_trait]
 impl SnapshotSource for MemoryStore {
-    async fn snapshot(
-        &self,
-        principal: Principal,
-    ) -> Result<Option<Arc<AccountSnapshot>>, StoreError> {
-        Ok(self
-            .lock()
-            .snapshots
-            .get(&principal)
-            .and_then(|record| record.snapshot.clone()))
+    async fn snapshot(&self, principal: Principal) -> Result<SnapshotResolution, StoreError> {
+        Ok(match self.lock().snapshots.get(&principal) {
+            Some(record) => match &record.snapshot {
+                Some(snapshot) => SnapshotResolution::Present(Arc::clone(snapshot)),
+                None => SnapshotResolution::Revoked {
+                    generation: record.generation,
+                },
+            },
+            None => SnapshotResolution::Unknown,
+        })
     }
 
     fn subscribe(&self) -> broadcast::Receiver<SnapshotPush> {

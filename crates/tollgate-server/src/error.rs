@@ -8,6 +8,7 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
+use tollgate_core::Generation;
 use tollgate_store::wire::Problem;
 use tollgate_store::{AllocateError, CreateAccountError, StoreError};
 
@@ -16,6 +17,7 @@ pub struct ApiError {
     pub status: StatusCode,
     pub code: &'static str,
     pub title: String,
+    pub generation: Option<Generation>,
 }
 
 impl ApiError {
@@ -24,6 +26,16 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code,
             title: title.into(),
+            generation: None,
+        }
+    }
+
+    pub fn revoked(generation: Generation) -> Self {
+        ApiError {
+            status: StatusCode::GONE,
+            code: "revoked-principal",
+            title: "snapshot revoked".to_string(),
+            generation: Some(generation),
         }
     }
 
@@ -32,6 +44,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             code,
             title: title.into(),
+            generation: None,
         }
     }
 }
@@ -53,6 +66,7 @@ impl From<AllocateError> for ApiError {
             status,
             code,
             title: e.to_string(),
+            generation: None,
         }
     }
 }
@@ -64,6 +78,7 @@ impl From<CreateAccountError> for ApiError {
                 status: StatusCode::CONFLICT,
                 code: "account-exists",
                 title: "account already exists".to_string(),
+                generation: None,
             },
             CreateAccountError::Storage(inner) => ApiError::from(inner),
         }
@@ -76,6 +91,7 @@ impl From<StoreError> for ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: "storage",
             title: e.to_string(),
+            generation: None,
         }
     }
 }
@@ -86,6 +102,7 @@ impl IntoResponse for ApiError {
             status: self.status.as_u16(),
             code: self.code.to_string(),
             title: self.title,
+            generation: self.generation,
         };
         let mut response = (self.status, Json(problem)).into_response();
         response.headers_mut().insert(

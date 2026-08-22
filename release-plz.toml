@@ -1,0 +1,70 @@
+# Git-only release configuration. Merging the release-plz merge request creates
+# the workspace tag; no package is published to a registry.
+
+[workspace]
+publish = false
+git_only = true
+release_always = false
+semver_check = true
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+changelog_update = false
+
+# tollgate-core owns the shared changelog, tag, and GitLab release. All members
+# move as one version group, while their commits feed the root changelog.
+[[package]]
+name = "tollgate-core"
+version_group = "tollgate"
+changelog_update = true
+changelog_path = "./CHANGELOG.md"
+changelog_include = [
+  "pricing-api",
+  "tollgate-admission",
+  "tollgate-client",
+  "tollgate-perf-gate",
+  "tollgate-server",
+  "tollgate-store",
+  "tollgate-store-postgres",
+]
+
+[[package]]
+name = "tollgate-admission"
+version_group = "tollgate"
+git_tag_enable = false
+git_release_enable = false
+
+[[package]]
+name = "tollgate-client"
+version_group = "tollgate"
+git_tag_enable = false
+git_release_enable = false
+
+[[package]]
+name = "tollgate-perf-gate"
+version_group = "tollgate"
+git_tag_enable = false
+git_release_enable = false
+
+[[package]]
+name = "tollgate-server"
+version_group = "tollgate"
+git_tag_enable = false
+git_release_enable = false
+
+[[package]]
+name = "tollgate-store"
+version_group = "tollgate"
+git_tag_enable = false
+git_release_enable = false
+
+[[package]]
+name = "tollgate-store-postgres"
+version_group = "tollgate"
+git_tag_enable = false
+git_release_enable = false
+
+[[package]]
+name = "pricing-api"
+version_group = "tollgate"
+git_tag_enable = false
+git_release_enable = false

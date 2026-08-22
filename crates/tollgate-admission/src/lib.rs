@@ -19,6 +19,7 @@
 //! question for the perf gate, not a foregone conclusion.
 
 pub mod engine;
+mod generation_model;
 pub mod maps;
 pub mod state;
 

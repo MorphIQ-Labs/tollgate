@@ -1,0 +1,14 @@
+# Mutation testing is an executable check that assertions pin the behavior
+# changed by a branch. Every MISSED or TIMEOUT outcome fails; equivalent
+# mutants must be excluded narrowly here with a proof or invariant reference.
+additional_cargo_args = ["--all-features"]
+test_tool = "nextest"
+additional_cargo_test_args = ["--profile", "mutants"]
+test_workspace = true
+timeout_multiplier = 4.0
+minimum_test_timeout = 60
+
+exclude_re = [
+  # Formatting has no authorization, accounting, or operational semantics.
+  "impl (std::)?fmt::(Debug|Display)",
+]

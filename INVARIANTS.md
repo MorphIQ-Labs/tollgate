@@ -91,11 +91,15 @@ until it has one.
     revocation tombstones retain the highest generation observed. A delayed
     positive at or below a tombstone cannot resurrect a principal, and a
     delayed older tombstone cannot revoke a newer positive snapshot. The
-    source stores tombstones durably so the rule survives instance restarts.
+    source stores tombstones durably so the rule survives instance restarts;
+    evicting a request-visible entry does not evict its generation watermark.
     *Tests:* both snapshot-map contract tests,
+    `negative_eviction_preserves_generation_monotonicity`,
+    `revoked_generation_rejects_replay_after_visible_entry_is_evicted`,
     `revocation_reaches_instances_via_refresh`,
     `snapshot_publish_fetch_and_push`, and
-    `snapshot_publish_fetch_and_generation_monotonicity`.
+    `snapshot_publish_fetch_and_generation_monotonicity`. *Proof:*
+    `formal/lean/Tollgate/SnapshotCache.lean`.
 
 16. **Unsafe timing configuration never starts.** Nonpositive lease TTLs,
     polling/refresh/reclaim intervals, negative safety margins or reclaim
@@ -106,6 +110,18 @@ until it has one.
     `invalid_snapshot_manager_intervals_are_rejected`,
     `invalid_grant_policy_is_rejected`, and
     `zero_reclaim_interval_is_rejected`.
+
+17. **Negative caching is bounded and self-healing.** The ArcSwap map retains
+    at most its configured count of request-visible negatives, removes
+    expired negatives during control writes, and evicts the earliest expiry
+    first. Expiry schedules a targeted source pull even when push is
+    unavailable and the full refresh interval is much longer; source errors
+    retry with backoff. Pruning visible negatives never weakens invariant #15.
+    *Tests:* `arc_swap_negative_cache_is_bounded_and_evicts_oldest_deadline_first`,
+    `arc_swap_control_write_drops_expired_negatives`,
+    `many_unknowns_leave_only_the_configured_number_visible`, and
+    `http_negative_ttl_refetches_without_push`, and
+    `negative_ttl_retry_is_backed_off_and_recovers_without_push`.
 
 Ledger roles (context for 1 and 7): leases **bound** spend; usage events **are**
 the billing record; reconciliation compares the two and steady-state drift is

@@ -228,7 +228,9 @@ async fn admin_snapshot_roundtrip_and_probes() {
 
     let (status, _) = call(&router, "DELETE", "/v1/admin/snapshots/7", None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    let (status, _) = call(&router, "GET", "/v1/snapshots/7", None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, problem) = call(&router, "GET", "/v1/snapshots/7", None).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(problem["code"], "revoked-principal");
+    assert_eq!(problem["generation"], 3);
     let _ = Principal(7);
 }

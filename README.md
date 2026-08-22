@@ -32,12 +32,14 @@ Contract: [`INVARIANTS.md`](INVARIANTS.md). Architecture and findings:
 git config core.hooksPath .githooks         # once per clone: rustfmt check on commit
 
 cargo test --workspace                     # correctness (Postgres DB cases are env-gated)
+./scripts/check_formal.sh                  # Lean authorization-state proofs
 ./scripts/check_perf_thresholds.sh         # hot-path microbench gate
 ./scripts/check_load_thresholds.sh         # loopback overhead gate (production profile)
 
 # Postgres correctness suite:
 docker compose up -d
 TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate cargo test -p tollgate-store-postgres
+TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate ./scripts/check_mutations.sh --diff main
 
 # Run the example service:
 cargo run -p pricing-api

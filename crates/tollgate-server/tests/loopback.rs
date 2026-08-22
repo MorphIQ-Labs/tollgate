@@ -12,13 +12,17 @@ use tollgate_admission::{
     AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot, SnapshotMap,
 };
 use tollgate_client::{
-    HttpStore, LeaseManager, LeaseManagerConfig, SystemClock, UsageWriter, UsageWriterConfig,
+    HttpStore, LeaseManager, LeaseManagerConfig, SlotRegistry, SnapshotManager,
+    SnapshotManagerConfig, SystemClock, UsageWriter, UsageWriterConfig,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, Generation,
-    OpIndex, PermissionBits, Principal, RequestId, ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, FencingToken,
+    Generation, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, Principal, RequestId,
+    ResolvedLimits,
 };
-use tollgate_store::{AccountConfig, GrantPolicy, MemoryStore, SnapshotSource as _};
+use tollgate_store::{
+    AccountConfig, GrantPolicy, MemoryStore, SnapshotResolution, SnapshotSource as _,
+};
 
 use tollgate_server::{ServerState, serve};
 
@@ -74,6 +78,118 @@ fn snapshot() -> Arc<AccountSnapshot> {
     })
 }
 
+#[tokio::test]
+async fn http_negative_ttl_refetches_without_push() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerState {
+            store: Arc::clone(&store),
+            clock: Arc::new(SystemClock),
+        },
+        std::time::Duration::from_secs(60),
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
+
+    let http = HttpStore::new(format!("http://{address}"));
+    let map = Arc::new(ArcSwapSnapshotMap::new());
+    let engine = AdmissionEngine::new(Arc::clone(&map));
+    let slots = SlotRegistry::new();
+    let manager = SnapshotManager::spawn(
+        http.clone(),
+        map,
+        Arc::clone(&slots),
+        Arc::new(SystemClock),
+        SnapshotManagerConfig {
+            principals: vec![PRINCIPAL],
+            refresh_interval: std::time::Duration::from_secs(60),
+            negative_ttl: SignedDuration::from_millis(100),
+            retry_backoff: std::time::Duration::from_millis(20),
+            max_concurrent_fetches: 1,
+        },
+    )
+    .unwrap();
+
+    let mut ready = manager.ready();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !*ready.borrow() {
+            ready.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("initial unknown resolution must make the manager ready");
+    assert!(matches!(
+        engine.admit(
+            AdmissionRequest {
+                principal: PRINCIPAL,
+                required: PermissionBits::bit(0),
+                op: &PriceOp,
+                items: 1,
+            },
+            Timestamp::now(),
+        ),
+        Err(DenyReason::UnknownPrincipal)
+    ));
+
+    // HttpStore has no push stream. Publication can therefore become visible
+    // only through the negative-TTL targeted pull; the 60s full refresh must
+    // not determine recovery latency.
+    store.publish_snapshot(PRINCIPAL, snapshot());
+    slots.slot(ACCOUNT).install(Arc::new(LocalLease::new(
+        LeaseGrant {
+            lease_id: LeaseId(1),
+            account_id: ACCOUNT,
+            fencing_token: FencingToken(1),
+            units: CostUnits(1_000),
+            expires_at: Timestamp::now()
+                .checked_add(SignedDuration::from_secs(60))
+                .unwrap(),
+        },
+        CostUnits::ZERO,
+    )));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match engine.admit(
+                AdmissionRequest {
+                    principal: PRINCIPAL,
+                    required: PermissionBits::bit(0),
+                    op: &PriceOp,
+                    items: 1,
+                },
+                Timestamp::now(),
+            ) {
+                Ok(admitted) => {
+                    admitted.reservation.cancel();
+                    break;
+                }
+                Err(DenyReason::UnknownPrincipal) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(other) => panic!("unexpected deny while waiting for refetch: {other}"),
+            }
+        }
+    })
+    .await
+    .expect("negative TTL must trigger a targeted HTTP refetch");
+
+    store.remove_snapshot(PRINCIPAL);
+    assert!(matches!(
+        http.snapshot(PRINCIPAL).await.unwrap(),
+        SnapshotResolution::Revoked {
+            generation: Generation(1)
+        }
+    ));
+
+    manager.shutdown().await;
+    let _ = stop_tx.send(());
+    server.await.unwrap().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_stack_over_loopback_http() {
     // Server side: memory backend, system clock, real listener on an
@@ -107,9 +223,14 @@ async fn full_stack_over_loopback_http() {
 
     // Cold fetch of the snapshot through the transport (pull path), plus the
     // negative case for an unknown principal.
-    let fetched = http.snapshot(PRINCIPAL).await.unwrap().expect("published");
+    let SnapshotResolution::Present(fetched) = http.snapshot(PRINCIPAL).await.unwrap() else {
+        panic!("published snapshot must be present");
+    };
     assert_eq!(fetched.generation, Generation(1));
-    assert!(http.snapshot(Principal(999)).await.unwrap().is_none());
+    assert!(matches!(
+        http.snapshot(Principal(999)).await.unwrap(),
+        SnapshotResolution::Unknown
+    ));
 
     let slot = LeaseSlot::empty();
     let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
