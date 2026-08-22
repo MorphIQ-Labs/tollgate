@@ -204,6 +204,9 @@ release:
       - .ci-tools/
   before_script:
     - export PATH="$CARGO_INSTALL_ROOT/bin:$PATH"
+    - git fetch origin "$CI_DEFAULT_BRANCH"
+    - git checkout -B "$CI_DEFAULT_BRANCH" "$CI_COMMIT_SHA"
+    - git branch --set-upstream-to="origin/$CI_DEFAULT_BRANCH" "$CI_DEFAULT_BRANCH"
     - cargo install --locked release-plz --version "$RELEASE_PLZ_VERSION" --root "$CARGO_INSTALL_ROOT"
   script:
     - test -n "$RELEASE_PLZ_TOKEN"
