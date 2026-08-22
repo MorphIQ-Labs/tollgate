@@ -179,12 +179,12 @@ impl AppRuntime {
         }
         if let Some(writer) = self.writer {
             let stats = writer.shutdown().await;
-            if stats.lost > 0 || stats.rejected > 0 {
-                eprintln!(
-                    "usage-writer shutdown: {} rejected, {} lost",
-                    stats.rejected, stats.lost
-                );
-            }
+            // Always reported: a clean shutdown is itself the operator's
+            // evidence that nothing was lost or left unresolved.
+            eprintln!(
+                "usage-writer shutdown: {} accepted, {} duplicate, {} rejected, {} lost, {} unresolved",
+                stats.accepted, stats.duplicate, stats.rejected, stats.lost, stats.unresolved
+            );
         }
         if let Some(manager) = self.manager {
             manager.shutdown().await;
@@ -308,8 +308,12 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
                     max_batch: 256,
                     flush_interval: std::time::Duration::from_millis(25),
                     retry_backoff: std::time::Duration::from_millis(50),
+                    // Bounded well inside the lease TTL so late events are
+                    // still billable against a live lease.
+                    shutdown_drain_deadline: std::time::Duration::from_secs(5),
                 },
-            );
+            )
+            .expect("usage-writer configuration is valid");
             (
                 Some(manager),
                 Some(recorder),

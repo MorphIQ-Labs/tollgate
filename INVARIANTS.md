@@ -48,11 +48,20 @@ until it has one.
 
 8. **Accounting backpressure sheds.** When the usage queue is full, new work is
    refused with zero units charged. Usage events are never silently dropped
-   and enqueue never blocks unboundedly. Shutdown flushes in configured-size
-   batches; any event still undeliverable after the bounded final retries is
-   counted in `WriterStats::lost`. *Tests:* client writer overflow tests,
+   and enqueue never blocks unboundedly. Shutdown closes the queue (new
+   reservations refuse from that instant), then drains with real receives
+   until every outstanding permit resolves by sending or dropping, bounded by
+   the configured `shutdown_drain_deadline`; it flushes in configured-size
+   batches, counts any event still undeliverable after the bounded final
+   retries in `WriterStats::lost`, and reports permits still outstanding at
+   the deadline in `WriterStats::unresolved` — a deadline expiry is never a
+   clean flush. *Tests:* client writer overflow tests,
    `shutdown_flushes_in_configured_batch_sizes`,
-   `shutdown_during_outage_terminates_and_reports_loss`.
+   `shutdown_during_outage_terminates_and_reports_loss`,
+   `reserve_fails_once_shutdown_begins`,
+   `shutdown_waits_for_outstanding_permit`,
+   `late_permit_drop_completes_drain`, and
+   `drain_deadline_expiry_reports_unresolved`.
 
 9. **Crash leak is bounded by TTL.** A crashed lease holder strands its unspent
    units only until the lease TTL expires, after which the allocator reclaims
@@ -99,8 +108,13 @@ until it has one.
 13. **A committed charge is always emitted.** Committing through
     `ChargeGuard` binds the billing event to the pre-reserved queue permit;
     normal completion, early return, panic unwind, and task abort all
-    enqueue it. A spent lease with no billing event requires losing the
-    whole process. *Tests:* `panic_after_commit_still_bills`.
+    enqueue it. The guarantee extends through shutdown: the writer's drain
+    waits for the permit, so the event is ingested or explicitly counted in
+    `WriterStats::unresolved` — never silently dropped. The safe lifecycle
+    order is: stop admitting, quiesce request tasks holding permits or
+    guards, shut the usage writer down, then release leases. A spent lease
+    with no billing event requires losing the whole process. *Tests:*
+    `panic_after_commit_still_bills`, `shutdown_waits_for_committed_guard`.
 
 14. **Account creation is never destructive.** Recreating an existing
     account is a surfaced `AlreadyExists` in every backend — never an

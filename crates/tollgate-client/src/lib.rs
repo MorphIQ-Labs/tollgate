@@ -11,6 +11,13 @@
 //! Timestamps come from a [`Clock`] so every behavior is testable with a
 //! manual clock; production uses [`SystemClock`].
 //!
+//! Graceful shutdown has one safe order: stop admitting, quiesce the request
+//! tasks still holding permits or committed [`ChargeGuard`]s, await
+//! [`UsageWriter::shutdown`] (which refuses new reservations, then drains
+//! outstanding permits under its configured deadline and reports anything
+//! unresolved), and only then shut the [`LeaseManager`] down — usage events
+//! must land while their lease is live (INVARIANTS.md #12).
+//!
 //! [`LeaseAllocator`]: tollgate_store::LeaseAllocator
 //! [`UsageSink`]: tollgate_store::UsageSink
 //! [`LeaseSlot`]: tollgate_admission::LeaseSlot
@@ -32,4 +39,6 @@ pub use lease_manager::{LeaseManager, LeaseManagerConfig, LeaseManagerConfigErro
 pub use snapshot_manager::{
     SlotRegistry, SnapshotManager, SnapshotManagerConfig, SnapshotManagerConfigError,
 };
-pub use usage_writer::{UsagePermit, UsageRecorder, UsageWriter, UsageWriterConfig, WriterStats};
+pub use usage_writer::{
+    UsagePermit, UsageRecorder, UsageWriter, UsageWriterConfig, UsageWriterConfigError, WriterStats,
+};

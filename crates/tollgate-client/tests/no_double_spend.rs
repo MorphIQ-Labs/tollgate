@@ -95,8 +95,10 @@ fn spawn_instance(store: &Arc<MemoryStore>, clock: &Arc<ManualClock>) -> Instanc
             max_batch: 16,
             flush_interval: std::time::Duration::from_millis(5),
             retry_backoff: std::time::Duration::from_millis(5),
+            shutdown_drain_deadline: std::time::Duration::from_secs(60),
         },
-    );
+    )
+    .unwrap();
     Instance {
         engine,
         recorder,

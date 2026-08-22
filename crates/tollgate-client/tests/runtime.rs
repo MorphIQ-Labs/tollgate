@@ -267,6 +267,7 @@ fn writer_config(capacity: usize) -> UsageWriterConfig {
         max_batch: 4,
         flush_interval: std::time::Duration::from_millis(10),
         retry_backoff: std::time::Duration::from_millis(10),
+        shutdown_drain_deadline: std::time::Duration::from_secs(60),
     }
 }
 
@@ -283,7 +284,7 @@ async fn writer_flushes_batches_idempotently() {
         .await
         .unwrap();
     let clock = Arc::new(ManualClock::new(t(0)));
-    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(64));
+    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(64)).unwrap();
 
     // Ten events, one duplicated request id: nine accepted, one duplicate.
     for i in 0..10u128 {
@@ -308,7 +309,7 @@ async fn full_queue_sheds_before_admission() {
     let clock = Arc::new(ManualClock::new(t(0)));
     // Capacity 2 with the writer effectively idle (nothing sent yet): two
     // permits reserve the whole queue; the third sheds.
-    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(2));
+    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(2)).unwrap();
     let p1 = recorder.try_reserve().unwrap();
     let p2 = recorder.try_reserve().unwrap();
     assert_eq!(
@@ -372,8 +373,10 @@ async fn shutdown_flushes_in_configured_batch_sizes() {
             max_batch: 2,
             flush_interval: std::time::Duration::from_secs(60),
             retry_backoff: std::time::Duration::from_millis(1),
+            shutdown_drain_deadline: std::time::Duration::from_secs(60),
         },
-    );
+    )
+    .unwrap();
     for request in 0..6 {
         recorder
             .try_reserve()
@@ -422,7 +425,7 @@ async fn writer_retries_through_outage_without_losing_events() {
         inner: store.clone(),
         failures_left: AtomicU32::new(3),
     });
-    let (recorder, writer) = UsageWriter::spawn(sink, clock, writer_config(64));
+    let (recorder, writer) = UsageWriter::spawn(sink, clock, writer_config(64)).unwrap();
 
     recorder.try_reserve().unwrap().record(event(1, 25, &lease));
     settle().await;
@@ -452,7 +455,7 @@ async fn panic_after_commit_still_bills() {
         .await
         .unwrap();
     let clock = Arc::new(ManualClock::new(t(0)));
-    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8));
+    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8)).unwrap();
 
     let permit = recorder.try_reserve().unwrap();
     let local = Arc::new(LocalLease::new(grant, CostUnits::ZERO));
@@ -492,7 +495,7 @@ async fn shutdown_during_outage_terminates_and_reports_loss() {
         inner: store.clone(),
         failures_left: AtomicU32::new(u32::MAX),
     });
-    let (recorder, writer) = UsageWriter::spawn(sink, clock, writer_config(64));
+    let (recorder, writer) = UsageWriter::spawn(sink, clock, writer_config(64)).unwrap();
 
     recorder.try_reserve().unwrap().record(event(1, 25, &lease));
     recorder.try_reserve().unwrap().record(event(2, 25, &lease));
@@ -529,7 +532,7 @@ async fn shutdown_after_recovery_delivers_everything() {
         inner: store.clone(),
         failures_left: AtomicU32::new(4),
     });
-    let (recorder, writer) = UsageWriter::spawn(sink, clock, writer_config(64));
+    let (recorder, writer) = UsageWriter::spawn(sink, clock, writer_config(64)).unwrap();
     recorder.try_reserve().unwrap().record(event(1, 25, &lease));
     settle().await;
 
@@ -559,10 +562,253 @@ async fn straggler_usage_after_reclaim_is_reported_rejected() {
     store.reclaim_expired(t(120)).await.unwrap();
 
     let clock = Arc::new(ManualClock::new(t(121)));
-    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8));
+    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8)).unwrap();
     recorder.try_reserve().unwrap().record(event(1, 10, &lease));
     settle().await;
     let stats = writer.shutdown().await;
     assert_eq!(stats.rejected, 1);
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits::ZERO);
+}
+
+// ---- shutdown drain (issue #32) -------------------------------------------
+//
+// A permit reserved before shutdown must resolve — by sending or dropping —
+// before the writer returns, bounded by the drain deadline; a deadline expiry
+// is reported in `unresolved`, never a clean flush.
+
+/// Shutdown refuses new reservations from the instant it begins, while a
+/// permit reserved earlier still delivers into the drain (INVARIANTS.md #8).
+#[tokio::test(start_paused = true)]
+async fn reserve_fails_once_shutdown_begins() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8)).unwrap();
+
+    let held = recorder.try_reserve().unwrap();
+    let shutdown = tokio::spawn(writer.shutdown());
+    settle().await; // the writer has closed the channel and is draining
+
+    assert_eq!(
+        recorder.try_reserve().err(),
+        Some(DenyReason::AccountingBackpressure)
+    );
+    assert!(recorder.is_closed(), "readiness must observe the shutdown");
+
+    held.record(event(1, 25, &lease));
+    let stats = shutdown.await.unwrap();
+    assert_eq!(stats.accepted, 1);
+    assert_eq!(stats.unresolved, 0);
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(25));
+}
+
+/// The #32 defect: a permit that records only after shutdown has begun must
+/// be ingested, not silently dropped with zero reported loss.
+#[tokio::test(start_paused = true)]
+async fn shutdown_waits_for_outstanding_permit() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8)).unwrap();
+
+    let permit = recorder.try_reserve().unwrap();
+    let late = event(1, 25, &lease);
+    let sender = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        permit.record(late);
+    });
+
+    let stats = writer.shutdown().await;
+    sender.await.unwrap();
+    assert_eq!(stats.accepted, 1);
+    assert_eq!(stats.lost, 0);
+    assert_eq!(stats.unresolved, 0);
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(25));
+}
+
+/// INVARIANTS.md #13 across shutdown: a committed guard dropped after
+/// shutdown begins still bills.
+#[tokio::test(start_paused = true)]
+async fn shutdown_waits_for_committed_guard() {
+    use tollgate_client::ChargeGuard;
+    use tollgate_core::{LocalLease, Reservation};
+
+    let store = store(10_000);
+    let grant = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8)).unwrap();
+
+    let permit = recorder.try_reserve().unwrap();
+    let holder = tokio::spawn(async move {
+        let local = Arc::new(LocalLease::new(grant, CostUnits::ZERO));
+        let reservation = Reservation::reserve(&local, CostUnits(51), t(0)).unwrap();
+        let (charge, units) =
+            ChargeGuard::commit(&reservation, permit, RequestId(9), t(0)).unwrap();
+        assert_eq!(units, CostUnits(51));
+        // The guard outlives the start of shutdown; its drop must still bill.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(charge);
+    });
+
+    let stats = writer.shutdown().await;
+    holder.await.unwrap();
+    assert_eq!(stats.accepted, 1);
+    assert_eq!(stats.unresolved, 0);
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(51));
+}
+
+/// A permit dropped (zero-charge path) after shutdown begins completes the
+/// drain — no event, no hang, nothing unresolved.
+#[tokio::test(start_paused = true)]
+async fn late_permit_drop_completes_drain() {
+    let store = store(10_000);
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8)).unwrap();
+
+    let permit = recorder.try_reserve().unwrap();
+    let dropper = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(permit);
+    });
+
+    let stats = writer.shutdown().await;
+    dropper.await.unwrap();
+    assert_eq!(stats, tollgate_client::WriterStats::default());
+}
+
+/// Deadline expiry can neither hang nor report a clean flush: a permit that
+/// never resolves is counted unresolved.
+#[tokio::test(start_paused = true)]
+async fn drain_deadline_expiry_reports_unresolved() {
+    let store = store(10_000);
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8)).unwrap();
+
+    // A permit that never sends and never drops.
+    std::mem::forget(recorder.try_reserve().unwrap());
+
+    let stats = tokio::time::timeout(std::time::Duration::from_secs(120), writer.shutdown())
+        .await
+        .expect("shutdown must return at the drain deadline, not hang");
+    assert_eq!(stats.unresolved, 1);
+    assert_eq!(stats.lost, 0);
+    assert_eq!(stats.accepted, 0);
+}
+
+/// The drain's own accounting: duplicates and rejections discovered by the
+/// *final* flush are counted as such, not folded into accepted or lost.
+#[tokio::test(start_paused = true)]
+async fn final_flush_counts_duplicates_and_rejections() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let mut config = writer_config(16);
+    // Nothing flushes before shutdown, so every event meets the sink for the
+    // first time inside the final flush.
+    config.flush_interval = std::time::Duration::from_secs(3_600);
+    config.max_batch = 16;
+    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, config).unwrap();
+
+    recorder.try_reserve().unwrap().record(event(1, 10, &lease));
+    recorder.try_reserve().unwrap().record(event(1, 10, &lease));
+    let mut fenced = event(2, 10, &lease);
+    fenced.fencing_token = tollgate_core::FencingToken(999);
+    recorder.try_reserve().unwrap().record(fenced);
+
+    let stats = writer.shutdown().await;
+    assert_eq!(stats.accepted, 1);
+    assert_eq!(stats.duplicate, 1);
+    assert_eq!(stats.rejected, 1);
+    assert_eq!(stats.lost, 0);
+    assert_eq!(stats.unresolved, 0);
+}
+
+/// The final flush backs off *between* attempts and never sleeps a backoff
+/// no attempt can follow: three attempts, two waits.
+#[tokio::test(start_paused = true)]
+async fn final_flush_backs_off_only_between_attempts() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let sink = Arc::new(FlakySink {
+        inner: store.clone(),
+        failures_left: AtomicU32::new(u32::MAX),
+    });
+    let backoff = std::time::Duration::from_millis(100);
+    let mut config = writer_config(16);
+    config.flush_interval = std::time::Duration::from_secs(3_600);
+    config.retry_backoff = backoff;
+    let (recorder, writer) = UsageWriter::spawn(sink, clock, config).unwrap();
+    recorder.try_reserve().unwrap().record(event(1, 10, &lease));
+
+    let start = tokio::time::Instant::now();
+    let stats = writer.shutdown().await;
+    assert_eq!(stats.lost, 1);
+    assert_eq!(start.elapsed(), 2 * backoff, "three attempts, two backoffs");
+}
+
+/// Every unresolved permit is counted, not merely detected.
+#[tokio::test(start_paused = true)]
+async fn drain_deadline_reports_every_unresolved_permit() {
+    let store = store(10_000);
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8)).unwrap();
+
+    std::mem::forget(recorder.try_reserve().unwrap());
+    std::mem::forget(recorder.try_reserve().unwrap());
+
+    let stats = tokio::time::timeout(std::time::Duration::from_secs(120), writer.shutdown())
+        .await
+        .expect("shutdown must return at the drain deadline");
+    assert_eq!(stats.unresolved, 2);
+}
+
+/// INVARIANTS.md #16: a zero drain deadline is refused before the task starts.
+#[tokio::test]
+async fn zero_drain_deadline_is_rejected() {
+    let store = store(10_000);
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let mut config = writer_config(8);
+    config.shutdown_drain_deadline = std::time::Duration::ZERO;
+    assert!(UsageWriter::spawn(store, clock, config).is_err());
 }
