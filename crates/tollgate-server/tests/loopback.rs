@@ -258,8 +258,10 @@ async fn full_stack_over_loopback_http() {
             max_batch: 16,
             flush_interval: std::time::Duration::from_millis(10),
             retry_backoff: std::time::Duration::from_millis(10),
+            shutdown_drain_deadline: std::time::Duration::from_secs(60),
         },
-    );
+    )
+    .unwrap();
 
     // Spend the account down to stable denial through the admission engine.
     let mut committed_units = 0u64;
