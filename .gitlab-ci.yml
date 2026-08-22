@@ -219,6 +219,8 @@ release:
       - .ci-tools/
   before_script:
     - export PATH="$CARGO_INSTALL_ROOT/bin:$PATH"
+    - git config --global user.name "release-plz[bot]"
+    - git config --global user.email "release-plz@noreply.gitlab.com"
     - git fetch origin "$CI_DEFAULT_BRANCH"
     - git checkout -B "$CI_DEFAULT_BRANCH" "$CI_COMMIT_SHA"
     - git branch --set-upstream-to="origin/$CI_DEFAULT_BRANCH" "$CI_DEFAULT_BRANCH"
