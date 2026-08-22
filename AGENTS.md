@@ -20,8 +20,8 @@ Workspace crates live in `crates/`. `tollgate-store` defines `LeaseAllocator`, `
 ```sh
 git config core.hooksPath .githooks
 cargo fmt --check
-cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-cargo test --locked --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 
 cargo test -p tollgate-client
 cargo test -p tollgate-core reservation::tests::commit_cancel_race_one_winner

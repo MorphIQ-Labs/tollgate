@@ -1,17 +1,28 @@
 #!/usr/bin/env bash
-# Reject a commit whose Rust is not rustfmt-clean.
+# Tollgate pre-commit hook — the group-canonical shape
+# (the template repository templates/pre-commit.reference.sh).
 #
-# `cargo fmt --check` is the first thing CI runs (.gitlab-ci.yml, lint stage),
-# and it fails the whole pipeline before clippy or tests get a chance — so a
-# formatting slip costs a full round-trip. This catches it in under a second.
+# Enable once per clone:
 #
-# Checks, never rewrites: silently reformatting files mid-commit would stage
-# content the author never saw.
+#   git config core.hooksPath .githooks
 #
-# Enable once per clone:  git config core.hooksPath .githooks
-# Bypass deliberately:    git commit --no-verify
+# Scope: this hook catches the failures that would fail CI's `check` stage in
+# under a few seconds — formatting and lints. It deliberately does NOT run:
+#
+#   * the test suite — that is CI's `test` stage. A hook that takes minutes
+#     gets bypassed, and a bypassed hook enforces nothing.
+#   * `--locked` — that is a CI assertion ("the committed lockfile is exactly
+#     what builds"). Locally it breaks the ordinary workflow of adding or
+#     updating a dependency, and the lockfile is tracked, so real drift already
+#     shows up in `git status`.
+#
+# Checks, never rewrites: silently reformatting mid-commit would stage content
+# the author never saw. Bypass deliberately with `git commit --no-verify`.
 
 set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
 
 # Nothing staged under a Rust path? Nothing to check.
 if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '\.rs$|(^|/)Cargo\.toml$'; then
@@ -19,17 +30,24 @@ if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '\.rs$|(^|/)Car
 fi
 
 if ! command -v cargo >/dev/null 2>&1; then
-    echo "pre-commit: cargo not on PATH; skipping fmt check" >&2
+    echo "pre-commit: cargo not on PATH; skipping checks" >&2
     exit 0
 fi
 
-if ! cargo fmt --check --quiet 2>/dev/null; then
+if ! cargo fmt --all --check --quiet 2>/dev/null; then
     echo >&2
     echo "pre-commit: rustfmt would change these files —" >&2
-    cargo fmt --check 2>&1 | grep -oE '^Diff in [^:]+' | sed 's/^Diff in /  /' | sort -u >&2
+    cargo fmt --all --check 2>&1 | grep -oE '^Diff in [^:]+' | sed 's/^Diff in /  /' | sort -u >&2
     echo >&2
-    echo "  fix:    cargo fmt" >&2
+    echo "  fix:    cargo fmt --all" >&2
     echo "  bypass: git commit --no-verify" >&2
     echo >&2
+    exit 1
+fi
+
+echo "pre-commit: cargo clippy --all-targets --all-features -- -D warnings"
+if ! cargo clippy --all-targets --all-features -- -D warnings; then
+    echo >&2
+    echo "  bypass: git commit --no-verify" >&2
     exit 1
 fi

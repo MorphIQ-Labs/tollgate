@@ -19,8 +19,8 @@ docker compose up -d          # PostgreSQL for the store suite
 
 ```sh
 cargo fmt --check
-cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-cargo test --locked --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 
 TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
   cargo test -p tollgate-store-postgres
