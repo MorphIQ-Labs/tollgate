@@ -1,6 +1,6 @@
-# Virtual workspace manifest. Every member inherits version/edition/license from
-# [workspace.package] and stays `publish = false`: like ferro-risk, distribution
-# is by git tag, and publication is a deliberate decision, not automation's.
+# Virtual workspace manifest. Every member inherits version/edition/license and
+# the private-registry publication guard from [workspace.package]. Distribution
+# remains by git tag; release-plz is configured in git-only mode.
 [workspace]
 resolver = "3"
 members = [
@@ -20,6 +20,7 @@ edition = "2024"
 rust-version = "1.89"
 authors = ["MorphIQ Labs"]
 repository = "https://github.com/MorphIQ-Labs/tollgate"
+publish = ["private-registry"]
 
 [workspace.dependencies]
 # Time: jiff, not chrono/time — matches ferro-risk. The core crate takes

@@ -2348,6 +2348,7 @@ dependencies = [
  "governor",
  "jiff",
  "moka",
+ "proptest",
  "tollgate-core",
 ]
 

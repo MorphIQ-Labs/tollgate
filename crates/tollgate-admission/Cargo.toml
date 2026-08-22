@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
-publish = false
+publish.workspace = true
 
 [dependencies]
 tollgate-core = { path = "../tollgate-core" }
@@ -17,6 +17,7 @@ jiff = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+proptest = { workspace = true }
 
 [[bench]]
 name = "admission_hot_path"

@@ -33,7 +33,7 @@ use tokio::task::JoinSet;
 
 use tollgate_admission::{LeaseSlot, SnapshotMap, SnapshotUpdate};
 use tollgate_core::{AccountId, Generation, Principal};
-use tollgate_store::{Clock, SnapshotSource, StoreError};
+use tollgate_store::{Clock, SnapshotResolution, SnapshotSource, StoreError};
 
 /// Account → lease-slot registry shared between the snapshot manager (which
 /// installs the slot into admission state) and lease managers (which stock
@@ -69,8 +69,8 @@ pub struct SnapshotManagerConfig {
     pub principals: Vec<Principal>,
     /// Full refetch cadence — also the revocation propagation bound.
     pub refresh_interval: std::time::Duration,
-    /// How long a confirmed-unknown principal stays negative-cached before
-    /// the next miss may retry resolution.
+    /// How long a confirmed-negative principal stays valid before the
+    /// manager schedules a targeted control-plane refetch.
     pub negative_ttl: SignedDuration,
     /// Backoff between initial-load retries while the source is down.
     pub retry_backoff: std::time::Duration,
@@ -183,6 +183,7 @@ enum Resolution {
     },
     Negative {
         deadline: jiff::Timestamp,
+        next_refetch: jiff::Timestamp,
         generation: Option<Generation>,
     },
 }
@@ -240,6 +241,59 @@ fn next_readiness_check(
         .unwrap_or_else(|| std::time::Duration::from_secs(3_600))
 }
 
+fn next_control_wakeup(
+    resolutions: &HashMap<Principal, Resolution>,
+    now: jiff::Timestamp,
+) -> std::time::Duration {
+    resolutions
+        .values()
+        .filter_map(|resolution| match resolution {
+            Resolution::Present { deadline, .. } if *deadline > now => Some(*deadline),
+            Resolution::Present { .. } => None,
+            Resolution::Negative { next_refetch, .. } => Some(*next_refetch),
+        })
+        .map(|deadline| {
+            if deadline <= now {
+                std::time::Duration::ZERO
+            } else {
+                let nanos = deadline.duration_since(now).as_nanos();
+                u64::try_from(nanos)
+                    .map(std::time::Duration::from_nanos)
+                    .unwrap_or(std::time::Duration::MAX)
+            }
+        })
+        .min()
+        .unwrap_or_else(|| std::time::Duration::from_secs(3_600))
+}
+
+fn after_std(now: jiff::Timestamp, duration: std::time::Duration) -> jiff::Timestamp {
+    let nanos = i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX);
+    now.checked_add(SignedDuration::from_nanos(nanos))
+        .unwrap_or(jiff::Timestamp::MAX)
+}
+
+fn negative_deadline(now: jiff::Timestamp, config: &SnapshotManagerConfig) -> jiff::Timestamp {
+    now.checked_add(config.negative_ttl)
+        .unwrap_or(jiff::Timestamp::MAX)
+}
+
+/// Merge a negative resolution with the locally observed generation. `None`
+/// rejects an older revocation; `Some(None)` accepts an unversioned unknown.
+fn merge_negative_generation(
+    local: Option<Generation>,
+    incoming: Option<Generation>,
+) -> Option<Option<Generation>> {
+    if matches!((local, incoming), (Some(current), Some(incoming)) if incoming < current) {
+        return None;
+    }
+    Some(match (local, incoming) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    })
+}
+
 /// Refresh a set of principals with bounded concurrency, then apply every
 /// positive and negative result in one logical map write. A shutdown signal
 /// aborts outstanding source futures immediately.
@@ -256,10 +310,7 @@ async fn refresh_all_cancellable(
     ready: &watch::Sender<bool>,
 ) -> Option<Vec<Principal>> {
     let mut pending = principals.iter().copied();
-    let mut tasks = JoinSet::<(
-        Principal,
-        Result<Option<Arc<tollgate_core::AccountSnapshot>>, StoreError>,
-    )>::new();
+    let mut tasks = JoinSet::<(Principal, Result<SnapshotResolution, StoreError>)>::new();
     for _ in 0..config.max_concurrent_fetches {
         let Some(principal) = pending.next() else {
             break;
@@ -300,8 +351,7 @@ async fn refresh_all_cancellable(
     let mut completed = HashSet::with_capacity(results.len());
     for (principal, result) in results {
         match result {
-            Ok(Some(snapshot)) => {
-                completed.insert(principal);
+            Ok(SnapshotResolution::Present(snapshot)) => {
                 if resolutions
                     .get(&principal)
                     .and_then(|resolution| resolution.generation())
@@ -309,6 +359,7 @@ async fn refresh_all_cancellable(
                 {
                     continue;
                 }
+                completed.insert(principal);
                 let slot = slots.slot(snapshot.account_id);
                 resolutions.insert(
                     principal,
@@ -323,12 +374,37 @@ async fn refresh_all_cancellable(
                     lease: slot,
                 });
             }
-            Ok(None) => {
+            Ok(SnapshotResolution::Revoked {
+                generation: incoming,
+            }) => {
+                let now = clock.now();
+                let until = negative_deadline(now, config);
+                let local_generation = resolutions
+                    .get(&principal)
+                    .and_then(|resolution| resolution.generation());
+                let Some(generation) = merge_negative_generation(local_generation, Some(incoming))
+                else {
+                    continue;
+                };
+                completed.insert(principal);
+                resolutions.insert(
+                    principal,
+                    Resolution::Negative {
+                        deadline: until,
+                        next_refetch: until,
+                        generation,
+                    },
+                );
+                updates.push(SnapshotUpdate::Negative {
+                    principal,
+                    until,
+                    generation: Some(incoming),
+                });
+            }
+            Ok(SnapshotResolution::Unknown) => {
                 completed.insert(principal);
                 let now = clock.now();
-                let until = now
-                    .checked_add(config.negative_ttl)
-                    .unwrap_or(jiff::Timestamp::MAX);
+                let until = negative_deadline(now, config);
                 let generation = resolutions
                     .get(&principal)
                     .and_then(|resolution| resolution.generation());
@@ -336,6 +412,7 @@ async fn refresh_all_cancellable(
                     principal,
                     Resolution::Negative {
                         deadline: until,
+                        next_refetch: until,
                         generation,
                     },
                 );
@@ -349,7 +426,7 @@ async fn refresh_all_cancellable(
         }
     }
     if !updates.is_empty() {
-        map.apply_many(updates);
+        map.apply_many_at(updates, clock.now());
     }
     Some(
         principals
@@ -420,14 +497,14 @@ async fn run(
         if *shutdown.borrow() {
             return;
         }
-        let readiness_check = tokio::time::sleep(next_readiness_check(&resolutions, clock.now()));
-        tokio::pin!(readiness_check);
+        let control_wakeup = tokio::time::sleep(next_control_wakeup(&resolutions, clock.now()));
+        tokio::pin!(control_wakeup);
         tokio::select! {
             push = updates.recv(), if !updates_closed => match push {
                 Ok(push) => {
                     if tracked.contains(&push.principal) {
-                        match push.snapshot {
-                            Some(snapshot) => {
+                        match push.resolution {
+                            SnapshotResolution::Present(snapshot) => {
                                 if resolutions
                                     .get(&push.principal)
                                     .and_then(|resolution| resolution.generation())
@@ -443,44 +520,47 @@ async fn run(
                                         generation: snapshot.generation,
                                     },
                                 );
-                                map.install(push.principal, snapshot, slot);
+                                map.apply_many_at(
+                                    vec![SnapshotUpdate::Present {
+                                        principal: push.principal,
+                                        snapshot,
+                                        lease: slot,
+                                    }],
+                                    clock.now(),
+                                );
                             }
-                            None => {
-                                if matches!(
-                                    (
-                                        resolutions
-                                            .get(&push.principal)
-                                            .and_then(|resolution| resolution.generation()),
-                                        push.generation,
-                                    ),
-                                    (Some(current), Some(incoming)) if incoming < current
-                                ) {
-                                    continue;
-                                }
-                                let now = clock.now();
-                                let until = now
-                                    .checked_add(config.negative_ttl)
-                                    .unwrap_or(jiff::Timestamp::MAX);
+                            resolution @ (SnapshotResolution::Revoked { .. }
+                            | SnapshotResolution::Unknown) => {
+                                let incoming = match resolution {
+                                    SnapshotResolution::Revoked { generation } => Some(generation),
+                                    SnapshotResolution::Unknown => None,
+                                    SnapshotResolution::Present(_) => unreachable!(),
+                                };
                                 let local_generation = resolutions
                                     .get(&push.principal)
                                     .and_then(|resolution| resolution.generation());
-                                let generation = match (local_generation, push.generation) {
-                                    (Some(a), Some(b)) => Some(a.max(b)),
-                                    (Some(a), None) => Some(a),
-                                    (None, Some(b)) => Some(b),
-                                    (None, None) => None,
+                                let Some(generation) =
+                                    merge_negative_generation(local_generation, incoming)
+                                else {
+                                    continue;
                                 };
+                                let now = clock.now();
+                                let until = negative_deadline(now, &config);
                                 resolutions.insert(
                                     push.principal,
                                     Resolution::Negative {
                                         deadline: until,
+                                        next_refetch: until,
                                         generation,
                                     },
                                 );
-                                map.install_negative_at_generation(
-                                    push.principal,
-                                    until,
-                                    push.generation,
+                                map.apply_many_at(
+                                    vec![SnapshotUpdate::Negative {
+                                        principal: push.principal,
+                                        until,
+                                        generation: incoming,
+                                    }],
+                                    now,
                                 );
                             }
                         }
@@ -515,8 +595,35 @@ async fn run(
                 }
                 update_ready(&ready, &config.principals, &resolutions, &clock);
             }
-            _ = &mut readiness_check => {
+            _ = &mut control_wakeup => {
+                let now = clock.now();
                 update_ready(&ready, &config.principals, &resolutions, &clock);
+                let due: Vec<_> = resolutions
+                    .iter()
+                    .filter_map(|(principal, resolution)| match resolution {
+                        Resolution::Negative { next_refetch, .. } if *next_refetch <= now => {
+                            Some(*principal)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !due.is_empty() {
+                    let Some(failed) = refresh_all_cancellable(
+                        &source, &map, &slots, &clock, &config, &due,
+                        &mut resolutions, &mut shutdown, &ready,
+                    ).await else {
+                        return;
+                    };
+                    let retry_at = after_std(clock.now(), config.retry_backoff);
+                    for principal in failed {
+                        if let Some(Resolution::Negative { next_refetch, .. }) =
+                            resolutions.get_mut(&principal)
+                        {
+                            *next_refetch = retry_at;
+                        }
+                    }
+                    update_ready(&ready, &config.principals, &resolutions, &clock);
+                }
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -524,5 +631,99 @@ async fn run(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(seconds: i64) -> jiff::Timestamp {
+        jiff::Timestamp::from_second(seconds).unwrap()
+    }
+
+    #[test]
+    fn control_wakeup_tracks_future_positive_deadline_once() {
+        let principal = Principal(1);
+        let mut resolutions = HashMap::new();
+        resolutions.insert(
+            principal,
+            Resolution::Present {
+                deadline: t(15),
+                generation: Generation(1),
+            },
+        );
+        assert_eq!(
+            next_control_wakeup(&resolutions, t(10)),
+            std::time::Duration::from_secs(5)
+        );
+
+        resolutions.insert(
+            principal,
+            Resolution::Present {
+                deadline: t(10),
+                generation: Generation(1),
+            },
+        );
+        assert_eq!(
+            next_control_wakeup(&resolutions, t(10)),
+            std::time::Duration::from_secs(3_600)
+        );
+    }
+
+    #[test]
+    fn control_wakeup_tracks_negative_refetch_deadline() {
+        let principal = Principal(1);
+        let mut resolutions = HashMap::new();
+        resolutions.insert(
+            principal,
+            Resolution::Negative {
+                deadline: t(15),
+                next_refetch: t(15),
+                generation: None,
+            },
+        );
+        assert_eq!(
+            next_control_wakeup(&resolutions, t(10)),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            next_control_wakeup(&resolutions, t(15)),
+            std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn deadline_helpers_are_exact_in_the_supported_domain() {
+        let config = SnapshotManagerConfig {
+            principals: vec![Principal(1)],
+            refresh_interval: std::time::Duration::from_secs(60),
+            negative_ttl: SignedDuration::from_secs(30),
+            retry_backoff: std::time::Duration::from_secs(2),
+            max_concurrent_fetches: 1,
+        };
+        assert_eq!(negative_deadline(t(10), &config), t(40));
+        assert_eq!(after_std(t(10), config.retry_backoff), t(12));
+    }
+
+    #[test]
+    fn negative_generation_merge_rejects_only_older_revocations() {
+        assert_eq!(
+            merge_negative_generation(Some(Generation(5)), Some(Generation(4))),
+            None
+        );
+        assert_eq!(
+            merge_negative_generation(Some(Generation(5)), Some(Generation(5))),
+            Some(Some(Generation(5)))
+        );
+        assert_eq!(
+            merge_negative_generation(Some(Generation(5)), Some(Generation(6))),
+            Some(Some(Generation(6)))
+        );
+        assert_eq!(
+            merge_negative_generation(Some(Generation(5)), None),
+            Some(Some(Generation(5)))
+        );
+        assert_eq!(merge_negative_generation(None, None), Some(None));
     }
 }

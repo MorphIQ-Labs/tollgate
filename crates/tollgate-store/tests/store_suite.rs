@@ -13,7 +13,7 @@ use tollgate_core::{
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, CreateAccountError, GrantPolicy, LeaseAllocator,
-    MemoryStore, SnapshotSource, UsageSink,
+    MemoryStore, SnapshotResolution, SnapshotSource, UsageSink,
 };
 
 fn t(secs: i64) -> Timestamp {
@@ -472,14 +472,22 @@ async fn snapshot_publish_fetch_and_push() {
     });
 
     let mut updates = store.subscribe();
-    assert!(store.snapshot(principal).await.unwrap().is_none());
+    assert!(matches!(
+        store.snapshot(principal).await.unwrap(),
+        SnapshotResolution::Unknown
+    ));
     store.publish_snapshot(principal, Arc::clone(&snapshot));
 
-    let fetched = store.snapshot(principal).await.unwrap().unwrap();
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("published snapshot must be present");
+    };
     assert_eq!(fetched.generation, Generation(3));
     let pushed = updates.recv().await.unwrap();
     assert_eq!(pushed.principal, principal);
-    assert_eq!(pushed.snapshot.unwrap().generation, Generation(3));
+    let SnapshotResolution::Present(pushed) = pushed.resolution else {
+        panic!("publish push must be present");
+    };
+    assert_eq!(pushed.generation, Generation(3));
 
     // Generation monotonicity (backend parity with Postgres — review
     // finding #5): a replayed older publish neither replaces the row nor
@@ -491,7 +499,9 @@ async fn snapshot_publish_fetch_and_push() {
             ..(*snapshot).clone()
         }),
     );
-    let fetched = store.snapshot(principal).await.unwrap().unwrap();
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("newest snapshot must remain present");
+    };
     assert_eq!(fetched.generation, Generation(3));
     assert!(
         updates.try_recv().is_err(),
@@ -502,8 +512,12 @@ async fn snapshot_publish_fetch_and_push() {
     // publication cannot recreate the principal; generation 4 can.
     store.remove_snapshot(principal);
     let removed = updates.recv().await.unwrap();
-    assert!(removed.snapshot.is_none());
-    assert_eq!(removed.generation, Some(Generation(3)));
+    assert!(matches!(
+        removed.resolution,
+        SnapshotResolution::Revoked {
+            generation: Generation(3)
+        }
+    ));
     store.publish_snapshot(
         principal,
         Arc::new(AccountSnapshot {
@@ -511,7 +525,12 @@ async fn snapshot_publish_fetch_and_push() {
             ..(*snapshot).clone()
         }),
     );
-    assert!(store.snapshot(principal).await.unwrap().is_none());
+    assert!(matches!(
+        store.snapshot(principal).await.unwrap(),
+        SnapshotResolution::Revoked {
+            generation: Generation(3)
+        }
+    ));
     assert!(updates.try_recv().is_err());
 
     store.publish_snapshot(
@@ -521,8 +540,8 @@ async fn snapshot_publish_fetch_and_push() {
             ..(*snapshot).clone()
         }),
     );
-    assert_eq!(
-        store.snapshot(principal).await.unwrap().unwrap().generation,
-        Generation(4)
-    );
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("newer snapshot must supersede revocation");
+    };
+    assert_eq!(fetched.generation, Generation(4));
 }

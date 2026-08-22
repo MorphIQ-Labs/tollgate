@@ -10,7 +10,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, CostUnits, FencingToken, LeaseGrant, LeaseId, UsageEvent,
+    AccountId, AccountSnapshot, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId,
+    UsageEvent,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -63,4 +64,7 @@ pub struct Problem {
     pub status: u16,
     pub code: String,
     pub title: String,
+    /// Optional extension used by versioned tombstone responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<Generation>,
 }

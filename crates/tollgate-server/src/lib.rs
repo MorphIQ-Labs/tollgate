@@ -36,8 +36,8 @@ use tollgate_store::wire::{
     PublishSnapshotRequest, ReleaseRequest, SetStatusRequest,
 };
 use tollgate_store::{
-    AccountConfig, AdminStore, Clock, IngestReport, LeaseAllocator, ReclaimedLease, SnapshotSource,
-    StoreHealth, UsageSink,
+    AccountConfig, AdminStore, Clock, IngestReport, LeaseAllocator, ReclaimedLease,
+    SnapshotResolution, SnapshotSource, StoreHealth, UsageSink,
 };
 
 use crate::error::ApiError;
@@ -177,10 +177,9 @@ async fn fetch_snapshot<S: Backend>(
     Path(principal): Path<u128>,
 ) -> Result<Json<Arc<tollgate_core::AccountSnapshot>>, ApiError> {
     match state.store.snapshot(Principal(principal)).await? {
-        Some(snapshot) => Ok(Json(snapshot)),
-        // A confirmed unknown, distinct from transport failure: the client
-        // negative-caches this.
-        None => Err(ApiError::not_found("unknown-principal", "no snapshot")),
+        SnapshotResolution::Present(snapshot) => Ok(Json(snapshot)),
+        SnapshotResolution::Revoked { generation } => Err(ApiError::revoked(generation)),
+        SnapshotResolution::Unknown => Err(ApiError::not_found("unknown-principal", "no snapshot")),
     }
 }
 

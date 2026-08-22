@@ -6,10 +6,10 @@
 //! back to [`AllocateError`] variants, so fencing and settlement semantics
 //! survive the transport.
 //!
-//! `SnapshotSource::subscribe` returns a channel that never fires: push
-//! distribution over HTTP (SSE/long-poll) is a documented seam in
-//! `docs/DESIGN.md`, and the pull path (`snapshot()`) is sufficient for the
-//! PoC's cold-fetch flow.
+//! `SnapshotSource::subscribe` returns a closed channel: push distribution
+//! over HTTP (SSE/long-poll) is a documented seam in `docs/DESIGN.md`.
+//! [`SnapshotManager`](crate::SnapshotManager) detects the closure and uses
+//! periodic plus negative-TTL pulls for freshness.
 
 use std::sync::Arc;
 
@@ -22,15 +22,13 @@ use tollgate_core::{
 };
 use tollgate_store::wire::{AcquireRequest, IngestRequest, Problem, ReleaseRequest};
 use tollgate_store::{
-    AllocateError, IngestReport, LeaseAllocator, ReclaimedLease, SnapshotPush, SnapshotSource,
-    StoreError, UsageSink,
+    AllocateError, IngestReport, LeaseAllocator, ReclaimedLease, SnapshotPush, SnapshotResolution,
+    SnapshotSource, StoreError, UsageSink,
 };
 
 pub struct HttpStore {
     base: String,
     client: reqwest::Client,
-    /// Kept alive so `subscribe` can hand out receivers; nothing sends yet.
-    push: broadcast::Sender<SnapshotPush>,
 }
 
 impl HttpStore {
@@ -52,7 +50,6 @@ impl HttpStore {
         connect_timeout: std::time::Duration,
         request_timeout: std::time::Duration,
     ) -> Arc<Self> {
-        let (push, _) = broadcast::channel(16);
         Arc::new(HttpStore {
             base: base_url.into().trim_end_matches('/').to_string(),
             client: reqwest::Client::builder()
@@ -60,7 +57,6 @@ impl HttpStore {
                 .timeout(request_timeout)
                 .build()
                 .expect("static client configuration"),
-            push,
         })
     }
 
@@ -164,10 +160,7 @@ impl LeaseAllocator for HttpStore {
 
 #[async_trait]
 impl SnapshotSource for HttpStore {
-    async fn snapshot(
-        &self,
-        principal: Principal,
-    ) -> Result<Option<Arc<AccountSnapshot>>, StoreError> {
+    async fn snapshot(&self, principal: Principal) -> Result<SnapshotResolution, StoreError> {
         let response = self
             .client
             .get(self.url(&format!("/v1/snapshots/{}", principal.0)))
@@ -175,7 +168,23 @@ impl SnapshotSource for HttpStore {
             .await
             .map_err(|e| StoreError(format!("http: {e}")))?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None); // confirmed unknown → negative-cacheable
+            return Ok(SnapshotResolution::Unknown);
+        }
+        if response.status() == reqwest::StatusCode::GONE {
+            let problem: Problem = response
+                .json()
+                .await
+                .map_err(|e| StoreError(format!("http: {e}")))?;
+            if problem.code != "revoked-principal" {
+                return Err(StoreError(format!(
+                    "server {}: {}",
+                    problem.status, problem.title
+                )));
+            }
+            let generation = problem.generation.ok_or_else(|| {
+                StoreError("revoked-principal response omitted generation".into())
+            })?;
+            return Ok(SnapshotResolution::Revoked { generation });
         }
         if !response.status().is_success() {
             return Err(StoreError(format!("server returned {}", response.status())));
@@ -184,11 +193,13 @@ impl SnapshotSource for HttpStore {
             .json()
             .await
             .map_err(|e| StoreError(format!("http: {e}")))?;
-        Ok(Some(Arc::new(snapshot)))
+        Ok(SnapshotResolution::Present(Arc::new(snapshot)))
     }
 
     fn subscribe(&self) -> broadcast::Receiver<SnapshotPush> {
-        self.push.subscribe()
+        let (sender, receiver) = broadcast::channel(1);
+        drop(sender);
+        receiver
     }
 }
 

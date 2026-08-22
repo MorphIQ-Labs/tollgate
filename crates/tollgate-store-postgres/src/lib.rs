@@ -35,8 +35,8 @@ use tollgate_core::{
 use tollgate_store::memory::Conservation;
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, CreateAccountError, GrantPolicy, IngestReport,
-    LeaseAllocator, ReclaimedLease, SnapshotPush, SnapshotSource, StoreError, StoreHealth,
-    UsageSink,
+    LeaseAllocator, ReclaimedLease, SnapshotPush, SnapshotResolution, SnapshotSource, StoreError,
+    StoreHealth, UsageSink,
 };
 
 const STATE_ACTIVE: i16 = 0;
@@ -573,25 +573,28 @@ impl UsageSink for PostgresStore {
 
 #[async_trait]
 impl SnapshotSource for PostgresStore {
-    async fn snapshot(
-        &self,
-        principal: Principal,
-    ) -> Result<Option<Arc<AccountSnapshot>>, StoreError> {
+    async fn snapshot(&self, principal: Principal) -> Result<SnapshotResolution, StoreError> {
         let row = sqlx::query(
-            "SELECT snapshot FROM tollgate_snapshots WHERE principal = $1 AND deleted = FALSE",
+            "SELECT generation, snapshot, deleted FROM tollgate_snapshots WHERE principal = $1",
         )
         .bind(id_bytes(principal.0))
         .fetch_optional(&self.pool)
         .await
         .map_err(storage)?;
         match row {
+            Some(row) if row.get::<bool, _>(2) => {
+                let generation = u64::try_from(row.get::<i64, _>(0))
+                    .map(Generation)
+                    .map_err(|_| StoreError("stored snapshot generation is negative".into()))?;
+                Ok(SnapshotResolution::Revoked { generation })
+            }
             Some(row) => {
-                let value: serde_json::Value = row.get(0);
+                let value: serde_json::Value = row.get(1);
                 let snapshot: AccountSnapshot = serde_json::from_value(value)
                     .map_err(|e| StoreError(format!("snapshot decode: {e}")))?;
-                Ok(Some(Arc::new(snapshot)))
+                Ok(SnapshotResolution::Present(Arc::new(snapshot)))
             }
-            None => Ok(None),
+            None => Ok(SnapshotResolution::Unknown),
         }
     }
 
@@ -688,8 +691,7 @@ impl AdminStore for PostgresStore {
         if result.rows_affected() > 0 {
             let _ = self.push.send(SnapshotPush {
                 principal,
-                generation: Some(snapshot.generation),
-                snapshot: Some(snapshot),
+                resolution: SnapshotResolution::Present(snapshot),
             });
         }
         Ok(())
@@ -710,8 +712,7 @@ impl AdminStore for PostgresStore {
                 .map_err(|_| StoreError("stored snapshot generation is negative".into()))?;
             let _ = self.push.send(SnapshotPush {
                 principal,
-                snapshot: None,
-                generation: Some(generation),
+                resolution: SnapshotResolution::Revoked { generation },
             });
         }
         Ok(())

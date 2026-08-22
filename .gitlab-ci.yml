@@ -1,4 +1,5 @@
-# Tollgate CI — ported from the Woodpecker pipeline (same four gates).
+# Tollgate CI — Rust correctness, backend parity, performance compilation,
+# mutation assurance, and machine-checked proofs.
 #
 # The image tag matches rust-toolchain.toml; keep them in lockstep so rustup
 # never downloads a second toolchain inside CI. Absolute-latency perf gates
@@ -11,7 +12,13 @@
 
 image: rust:1.97.1-slim
 
-stages: [lint, test, bench]
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - when: never
+
+stages: [check, test, assurance, release]
 
 default:
   cache:
@@ -22,16 +29,64 @@ default:
 
 variables:
   CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  CARGO_INSTALL_ROOT: $CI_PROJECT_DIR/.ci-tools
+  RELEASE_PLZ_VERSION: "0.3.160"
 
-lint:
-  stage: lint
+.merge-request:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - when: never
+
+.main-merge-request:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
+    - when: never
+
+.main-merge-request-manual:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
+      when: manual
+    - when: never
+
+.default-branch:
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - when: never
+
+commit-convention:
+  extends: .merge-request
+  stage: check
+  image: alpine:3.21
+  interruptible: true
+  script:
+    - |
+      types='build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test'
+      if printf '%s' "$CI_MERGE_REQUEST_TITLE" | grep -qE "^($types)(\([a-z0-9._/-]+\))?!?: .+"; then
+        printf 'conventional title: %s\n' "$CI_MERGE_REQUEST_TITLE"
+      else
+        printf 'Merge request title is not a conventional commit: %s\n' "$CI_MERGE_REQUEST_TITLE" >&2
+        exit 1
+      fi
+
+fmt:
+  extends: .merge-request
+  stage: check
+  interruptible: true
+  script:
+    - cargo fmt --check
+
+clippy:
+  extends: .merge-request
+  stage: check
+  interruptible: true
   script:
     - rustc --version
-    - cargo fmt --check
     - cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
 test:
+  extends: .merge-request
   stage: test
+  interruptible: true
   script:
     - cargo test --locked --workspace --all-features
 
@@ -39,7 +94,9 @@ test:
 # dev machines runs for real here, against a service container — the
 # backend-parity gate (mirrors tollgate-store's memory suite by scenario).
 test-postgres:
+  extends: .merge-request
   stage: test
+  interruptible: true
   services:
     - postgres:16-alpine
   variables:
@@ -51,6 +108,104 @@ test-postgres:
     - cargo test --locked -p tollgate-store-postgres
 
 bench-compile:
-  stage: bench
+  extends: .merge-request
+  stage: test
+  interruptible: true
   script:
     - cargo bench --locked --workspace --no-run
+
+formal:
+  extends: .main-merge-request
+  stage: assurance
+  interruptible: true
+  variables:
+    ELAN_HOME: $CI_PROJECT_DIR/.ci-elan
+  cache:
+    key:
+      files:
+        - formal/lean/lean-toolchain
+    paths:
+      - .ci-elan
+      - formal/lean/.lake
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends ca-certificates curl
+    - curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/leanprover/elan/464c9d28395000a2a0128e07081e4956d50eced2/elan-init.sh | sh -s -- -y --default-toolchain "$(cat formal/lean/lean-toolchain)"
+    - export PATH="$ELAN_HOME/bin:$PATH"
+  script:
+    - ./scripts/check_formal.sh
+
+mutation:
+  extends: .main-merge-request
+  stage: assurance
+  timeout: 90 minutes
+  interruptible: true
+  services:
+    - postgres:16-alpine
+  variables:
+    POSTGRES_USER: tollgate
+    POSTGRES_PASSWORD: tollgate
+    POSTGRES_DB: tollgate
+    TOLLGATE_PG_URL: postgres://tollgate:tollgate@postgres:5432/tollgate
+  before_script:
+    # The slim Rust image does not include git; diff-scoped mutation selection
+    # requires it before any Rust tooling is worth installing.
+    - apt-get update && apt-get install -y --no-install-recommends git
+    - command -v git
+    - export PATH="$CARGO_INSTALL_ROOT/bin:$PATH"
+    - cargo install --locked cargo-mutants --version "$(cat .cargo/mutants-version)"
+    - cargo install --locked cargo-nextest --version "$(cat .cargo/nextest-version)"
+  script:
+    - ./scripts/check_mutations.sh --diff "$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+  artifacts:
+    when: always
+    paths:
+      - reports/mutations
+
+# Absolute latency is meaningful only on a controlled host. These lanes are
+# visible on default-target MRs for deliberate evidence collection, but are not
+# merge gates; benchmark compilation remains required in the test stage.
+perf-thresholds:
+  extends: .main-merge-request-manual
+  stage: assurance
+  allow_failure: true
+  timeout: 45 minutes
+  script:
+    - ./scripts/check_perf_thresholds.sh
+  artifacts:
+    when: always
+    paths:
+      - reports/perf_gate_report.json
+
+load-thresholds:
+  extends: .main-merge-request-manual
+  stage: assurance
+  allow_failure: true
+  timeout: 45 minutes
+  script:
+    - ./scripts/check_load_thresholds.sh
+  artifacts:
+    when: always
+    paths:
+      - reports/load_gate_report.json
+
+release:
+  extends: .default-branch
+  stage: release
+  image: rust:1.97.1-bookworm
+  interruptible: false
+  resource_group: release
+  variables:
+    GIT_DEPTH: "0"
+  cache:
+    key: "release-plz-$RELEASE_PLZ_VERSION"
+    paths:
+      - .cargo/registry
+      - .cargo/git
+      - .ci-tools/
+  before_script:
+    - export PATH="$CARGO_INSTALL_ROOT/bin:$PATH"
+    - cargo install --locked release-plz --version "$RELEASE_PLZ_VERSION" --root "$CARGO_INSTALL_ROOT"
+  script:
+    - test -n "$RELEASE_PLZ_TOKEN"
+    - release-plz release --config release-plz.toml --forge gitlab --git-token "$RELEASE_PLZ_TOKEN"
+    - release-plz release-pr --config release-plz.toml --forge gitlab --git-token "$RELEASE_PLZ_TOKEN"

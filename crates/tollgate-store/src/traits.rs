@@ -198,26 +198,32 @@ pub trait LeaseAllocator: Send + Sync {
     async fn reclaim_expired(&self, now: Timestamp) -> Result<Vec<ReclaimedLease>, StoreError>;
 }
 
+/// Authoritative state returned by a snapshot pull or push.
+#[derive(Debug, Clone)]
+pub enum SnapshotResolution {
+    /// A compiled snapshot is currently authoritative.
+    Present(Arc<AccountSnapshot>),
+    /// The principal existed but was revoked at this generation. Sources must
+    /// retain this watermark so a delayed older positive cannot resurrect it.
+    Revoked { generation: Generation },
+    /// The source has never observed this principal.
+    Unknown,
+}
+
 /// One pushed snapshot update.
 #[derive(Debug, Clone)]
 pub struct SnapshotPush {
     pub principal: Principal,
-    /// `Some` publishes a snapshot; `None` is a revocation tombstone.
-    pub snapshot: Option<Arc<AccountSnapshot>>,
-    /// Source-side generation watermark. Revocations retain the generation
-    /// they removed so delayed positive pushes cannot resurrect them.
-    pub generation: Option<Generation>,
+    pub resolution: SnapshotResolution,
 }
 
 /// Where compiled snapshots come from.
 #[async_trait]
 pub trait SnapshotSource: Send + Sync {
-    /// Fetch the current snapshot for a principal; `None` is a confirmed
-    /// unknown (candidate for the admission layer's negative cache).
-    async fn snapshot(
-        &self,
-        principal: Principal,
-    ) -> Result<Option<Arc<AccountSnapshot>>, StoreError>;
+    /// Fetch the authoritative state for a principal. Revocation is distinct
+    /// from never-known so pull, lag recovery, and restart preserve the
+    /// generation watermark required for anti-resurrection semantics.
+    async fn snapshot(&self, principal: Principal) -> Result<SnapshotResolution, StoreError>;
 
     /// Subscribe to pushes. A lagging receiver may miss updates; the
     /// contract is that a fresh `snapshot()` fetch after a lag error

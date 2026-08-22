@@ -1,0 +1,13 @@
+# Mutation testing deliberately creates non-terminating scheduler behavior.
+# Isolate tests and convert hangs into killed mutants instead of unresolved
+# cargo-mutants command timeouts.
+[profile.mutants]
+test-threads = 4
+slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
+
+[test-groups]
+postgres = { max-threads = 1 }
+
+[[profile.mutants.overrides]]
+filter = 'package(tollgate-store-postgres)'
+test-group = 'postgres'

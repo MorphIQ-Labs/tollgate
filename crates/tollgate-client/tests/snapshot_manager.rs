@@ -2,13 +2,15 @@
 //! readiness, pushes propagate, refresh recovers, and revocation reaches
 //! running instances.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
 
-use tollgate_admission::{AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap};
+use tollgate_admission::{
+    AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, MapEntry, SnapshotMap,
+};
 use tollgate_client::{
     ManualClock, SlotRegistry, SnapshotManager, SnapshotManagerConfig, SystemClock,
 };
@@ -18,7 +20,8 @@ use tollgate_core::{
     ResolvedLimits,
 };
 use tollgate_store::{
-    AccountConfig, GrantPolicy, MemoryStore, SnapshotPush, SnapshotSource, StoreError,
+    AccountConfig, GrantPolicy, MemoryStore, SnapshotPush, SnapshotResolution, SnapshotSource,
+    StoreError,
 };
 
 const ACCOUNT: AccountId = AccountId(1);
@@ -215,6 +218,108 @@ async fn unknown_principal_resolves_once_published() {
     fixture.manager.shutdown().await;
 }
 
+#[derive(Clone)]
+enum MutableMode {
+    Unknown,
+    Present(Arc<AccountSnapshot>),
+    Failing,
+}
+
+struct MutableNoPushSource {
+    mode: Mutex<MutableMode>,
+    calls: AtomicUsize,
+}
+
+impl MutableNoPushSource {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            mode: Mutex::new(MutableMode::Unknown),
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn set(&self, mode: MutableMode) {
+        *self.mode.lock().expect("source mode poisoned") = mode;
+    }
+}
+
+#[async_trait]
+impl SnapshotSource for MutableNoPushSource {
+    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        match self.mode.lock().expect("source mode poisoned").clone() {
+            MutableMode::Unknown => Ok(SnapshotResolution::Unknown),
+            MutableMode::Present(snapshot) => Ok(SnapshotResolution::Present(snapshot)),
+            MutableMode::Failing => Err(StoreError("injected targeted-refetch outage".into())),
+        }
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
+        let (sender, receiver) = tokio::sync::broadcast::channel(1);
+        drop(sender);
+        receiver
+    }
+}
+
+#[tokio::test]
+async fn negative_ttl_retry_is_backed_off_and_recovers_without_push() {
+    let source = MutableNoPushSource::new();
+    let map = Arc::new(ArcSwapSnapshotMap::new());
+    let manager = SnapshotManager::spawn(
+        source.clone(),
+        map.clone(),
+        SlotRegistry::new(),
+        Arc::new(SystemClock),
+        SnapshotManagerConfig {
+            principals: vec![PRINCIPAL],
+            refresh_interval: std::time::Duration::from_secs(60),
+            negative_ttl: SignedDuration::from_millis(40),
+            retry_backoff: std::time::Duration::from_millis(80),
+            max_concurrent_fetches: 1,
+        },
+    )
+    .unwrap();
+
+    let mut ready = manager.ready();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !*ready.borrow() {
+            ready.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("initial unknown must resolve");
+
+    source.set(MutableMode::Failing);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while source.calls.load(Ordering::Acquire) < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("negative TTL must trigger the first targeted refetch");
+    let calls_after_failure = source.calls.load(Ordering::Acquire);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(
+        source.calls.load(Ordering::Acquire),
+        calls_after_failure,
+        "a source error must not cause a zero-delay retry loop"
+    );
+
+    source.set(MutableMode::Present(snapshot(1, PermissionBits::bit(0))));
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(_))) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("backed-off targeted refetch must recover");
+
+    manager.shutdown().await;
+}
+
 struct ToggleSource {
     snapshot: Arc<AccountSnapshot>,
     fail: AtomicBool,
@@ -234,14 +339,11 @@ impl ToggleSource {
 
 #[async_trait]
 impl SnapshotSource for ToggleSource {
-    async fn snapshot(
-        &self,
-        _principal: Principal,
-    ) -> Result<Option<Arc<AccountSnapshot>>, StoreError> {
+    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
         if self.fail.load(Ordering::Acquire) {
             Err(StoreError("injected snapshot outage".into()))
         } else {
-            Ok(Some(Arc::clone(&self.snapshot)))
+            Ok(SnapshotResolution::Present(Arc::clone(&self.snapshot)))
         }
     }
 
@@ -289,12 +391,9 @@ struct FirstThenHangsSource {
 
 #[async_trait]
 impl SnapshotSource for FirstThenHangsSource {
-    async fn snapshot(
-        &self,
-        _principal: Principal,
-    ) -> Result<Option<Arc<AccountSnapshot>>, StoreError> {
+    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
         if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
-            Ok(Some(Arc::clone(&self.snapshot)))
+            Ok(SnapshotResolution::Present(Arc::clone(&self.snapshot)))
         } else {
             std::future::pending().await
         }
@@ -353,10 +452,7 @@ struct HangingSource {
 
 #[async_trait]
 impl SnapshotSource for HangingSource {
-    async fn snapshot(
-        &self,
-        _principal: Principal,
-    ) -> Result<Option<Arc<AccountSnapshot>>, StoreError> {
+    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
         std::future::pending().await
     }
 

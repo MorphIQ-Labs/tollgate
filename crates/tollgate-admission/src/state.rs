@@ -203,15 +203,11 @@ pub enum MapEntry {
     /// A compiled account is installed.
     Present(Arc<AccountAdmissionState>),
     /// The control plane recently confirmed this principal unknown; deny
-    /// without consulting anything else until `until` passes. This is the
-    /// negative cache that stops manufactured misses from becoming work.
-    NegativeUntil {
-        until: Timestamp,
-        /// Highest positive/removal generation observed before this
-        /// tombstone. A delayed push at or below it cannot resurrect a
-        /// revoked principal.
-        generation: Option<Generation>,
-    },
+    /// without consulting anything else. `until` is control-plane metadata:
+    /// the request path deliberately does not read a clock and denies both a
+    /// live negative and a missing entry. Generation watermarks live outside
+    /// this evictable entry so expiry cannot enable stale resurrection.
+    NegativeUntil { until: Timestamp },
 }
 
 /// One control-plane mutation. Mixed positive and negative batches let a
@@ -296,6 +292,13 @@ pub trait SnapshotMap: Send + Sync {
             }
         }
     }
+
+    /// Apply a control-plane batch at an explicit time. Implementations with
+    /// expiry maintenance can combine the sweep and batch in one write;
+    /// implementations without time-based maintenance use the default.
+    fn apply_many_at(&self, updates: Vec<SnapshotUpdate>, _now: Timestamp) {
+        self.apply_many(updates);
+    }
 }
 
 // A shared map is still a map: lets an `AdmissionEngine<Arc<M>>` and a
@@ -332,5 +335,9 @@ impl<T: SnapshotMap + ?Sized> SnapshotMap for Arc<T> {
 
     fn apply_many(&self, updates: Vec<SnapshotUpdate>) {
         (**self).apply_many(updates);
+    }
+
+    fn apply_many_at(&self, updates: Vec<SnapshotUpdate>, now: Timestamp) {
+        (**self).apply_many_at(updates, now);
     }
 }
