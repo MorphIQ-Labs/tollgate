@@ -68,6 +68,20 @@ commit-convention:
         exit 1
       fi
 
+repository-hygiene:
+  extends: .merge-request
+  stage: check
+  # The workspace's slim compiler image intentionally omits Git.
+  image: rust:1.97.1-bookworm
+  interruptible: true
+  script:
+    - |
+      tracked_ignored="$(git ls-files -ci --exclude-standard)"
+      if [ -n "$tracked_ignored" ]; then
+        printf 'Generated or ignored files are tracked:\n%s\n' "$tracked_ignored" >&2
+        exit 1
+      fi
+
 fmt:
   extends: .merge-request
   stage: check
@@ -196,6 +210,7 @@ release:
   resource_group: release
   variables:
     GIT_DEPTH: "0"
+    RUSTUP_TOOLCHAIN: "1.97.1"
   cache:
     key: "release-plz-$RELEASE_PLZ_VERSION"
     paths:
@@ -207,6 +222,8 @@ release:
     - git fetch origin "$CI_DEFAULT_BRANCH"
     - git checkout -B "$CI_DEFAULT_BRANCH" "$CI_COMMIT_SHA"
     - git branch --set-upstream-to="origin/$CI_DEFAULT_BRANCH" "$CI_DEFAULT_BRANCH"
+    - test -n "$RELEASE_PLZ_TOKEN"
+    - git remote set-url origin "https://oauth2:${RELEASE_PLZ_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
     - cargo install --locked release-plz --version "$RELEASE_PLZ_VERSION" --root "$CARGO_INSTALL_ROOT"
     - |
       # release-plz requires a clean tree, including ignored files. Keep the
