@@ -4,17 +4,21 @@
 [workspace]
 publish = false
 git_only = true
-release_always = false
+# One-time bootstrap: release-plz creates tollgate-v0.1.0 from this packageable
+# baseline. The follow-up MR restores false before normal release operation.
+release_always = true
 semver_check = true
-git_tag_name = "v{{ version }}"
-git_release_name = "v{{ version }}"
+# `v0.1.0` predates packageable workspace manifests. The namespaced series is
+# the reproducible release baseline for this multi-crate workspace.
+git_tag_name = "tollgate-v{{ version }}"
+git_release_name = "tollgate-v{{ version }}"
 changelog_update = false
 
-# tollgate-core owns the shared changelog, tag, and GitLab release. All members
-# move as one version group, while their commits feed the root changelog.
+# tollgate-core owns the shared version, changelog, tag, and GitLab release.
+# Other members inherit the workspace version and feed the root changelog, but
+# are not independently compared or released.
 [[package]]
 name = "tollgate-core"
-version_group = "tollgate"
 changelog_update = true
 changelog_path = "./CHANGELOG.md"
 changelog_include = [
@@ -29,42 +33,28 @@ changelog_include = [
 
 [[package]]
 name = "tollgate-admission"
-version_group = "tollgate"
-git_tag_enable = false
-git_release_enable = false
+release = false
 
 [[package]]
 name = "tollgate-client"
-version_group = "tollgate"
-git_tag_enable = false
-git_release_enable = false
+release = false
 
 [[package]]
 name = "tollgate-perf-gate"
-version_group = "tollgate"
-git_tag_enable = false
-git_release_enable = false
+release = false
 
 [[package]]
 name = "tollgate-server"
-version_group = "tollgate"
-git_tag_enable = false
-git_release_enable = false
+release = false
 
 [[package]]
 name = "tollgate-store"
-version_group = "tollgate"
-git_tag_enable = false
-git_release_enable = false
+release = false
 
 [[package]]
 name = "tollgate-store-postgres"
-version_group = "tollgate"
-git_tag_enable = false
-git_release_enable = false
+release = false
 
 [[package]]
 name = "pricing-api"
-version_group = "tollgate"
-git_tag_enable = false
-git_release_enable = false
+release = false
