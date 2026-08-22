@@ -613,3 +613,320 @@ async fn snapshot_publish_fetch_and_generation_monotonicity() {
             .is_err()
     );
 }
+
+// ---- stored-value corruption surfacing (issues #15, #45) ------------------
+//
+// A negative unit column or fence counter is corruption the store must
+// refuse loudly — never clamp or alias to zero, which would let
+// `Conservation::holds()` pass over exactly the discrepancy it exists to
+// expose (or misattribute a corrupt fence to the caller as `Fenced`).
+// These tests plant corrupt states with
+// a raw connection and assert every read path errors and every write path
+// rolls back. The memory backend has no mirror: `CostUnits` is `u64` there,
+// so negative state is unrepresentable by construction.
+
+/// Raw connection for planting corrupt states the store API cannot produce.
+async fn corruption_pool() -> sqlx::PgPool {
+    let url = std::env::var("TOLLGATE_PG_URL").expect("caller already gated on TOLLGATE_PG_URL");
+    sqlx::PgPool::connect(&url)
+        .await
+        .expect("postgres reachable")
+}
+
+fn account_bytes() -> Vec<u8> {
+    ACCOUNT.0.to_be_bytes().to_vec()
+}
+
+/// Set one checked column, dropping and re-adding its non-negative CHECK
+/// constraint around the write (re-added NOT VALID so the planted row
+/// survives while future writes stay checked). Constraint names follow the
+/// migrations' `{table}_{column}_nonneg` convention.
+async fn plant_value(
+    pool: &sqlx::PgPool,
+    table: &str,
+    column: &str,
+    id_column: &str,
+    id: Vec<u8>,
+    value: i64,
+) {
+    let constraint = format!("{table}_{column}_nonneg");
+    sqlx::raw_sql(&format!(
+        "ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {constraint}"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "UPDATE {table} SET {column} = $1 WHERE {id_column} = $2"
+    ))
+    .bind(value)
+    .bind(id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(&format!(
+        "ALTER TABLE {table} ADD CONSTRAINT {constraint} CHECK ({column} >= 0) NOT VALID"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn set_account_column(pool: &sqlx::PgPool, column: &str, value: i64) {
+    plant_value(
+        pool,
+        "tollgate_accounts",
+        column,
+        "account_id",
+        account_bytes(),
+        value,
+    )
+    .await;
+}
+
+async fn set_lease_column(pool: &sqlx::PgPool, lease: u128, column: &str, value: i64) {
+    plant_value(
+        pool,
+        "tollgate_leases",
+        column,
+        "lease_id",
+        lease.to_be_bytes().to_vec(),
+        value,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn negative_account_column_fails_conservation_read() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    let pool = corruption_pool().await;
+
+    // (column, restore value): the standard account starts at
+    // balance = deposited = 100, usage_recorded = settlement_loss = 0.
+    for (column, restore) in [
+        ("deposited", 100),
+        ("balance", 100),
+        ("usage_recorded", 0),
+        ("settlement_loss", 0),
+    ] {
+        set_account_column(&pool, column, -1).await;
+        let err = store.conservation(ACCOUNT).await.unwrap_err();
+        assert!(
+            err.0.contains(column) && err.0.contains("negative"),
+            "conservation over negative {column} must name it, got: {err}"
+        );
+        set_account_column(&pool, column, restore).await;
+    }
+    assert_conserved(&store).await;
+}
+
+#[tokio::test]
+async fn negative_account_column_fails_balance_and_usage_reads() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    let pool = corruption_pool().await;
+
+    set_account_column(&pool, "balance", -1).await;
+    let err = store.balance(ACCOUNT).await.unwrap_err();
+    assert!(err.0.contains("account balance"), "got: {err}");
+    set_account_column(&pool, "balance", 100).await;
+
+    set_account_column(&pool, "usage_recorded", -1).await;
+    let err = store.usage_recorded(ACCOUNT).await.unwrap_err();
+    assert!(err.0.contains("account usage_recorded"), "got: {err}");
+}
+
+#[tokio::test]
+async fn negative_lease_sum_fails_conservation_read() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
+        .await
+        .unwrap();
+    let pool = corruption_pool().await;
+
+    set_lease_column(&pool, lease.lease_id.0, "granted", -1).await;
+    let err = store.conservation(ACCOUNT).await.unwrap_err();
+    assert!(err.0.contains("active lease grants"), "got: {err}");
+
+    set_lease_column(&pool, lease.lease_id.0, "granted", 500).await;
+    set_lease_column(&pool, lease.lease_id.0, "used", -1).await;
+    let err = store.conservation(ACCOUNT).await.unwrap_err();
+    assert!(err.0.contains("active lease usage"), "got: {err}");
+}
+
+#[tokio::test]
+async fn acquire_surfaces_negative_stored_balance() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    let pool = corruption_pool().await;
+    set_account_column(&pool, "balance", -5).await;
+
+    let err = store
+        .acquire(ACCOUNT, CostUnits(10), TTL, t(0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AllocateError::Storage(e) if e.0.contains("account balance")),
+        "corrupt balance must surface as storage corruption, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn reclaim_refuses_negative_credit() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
+        .await
+        .unwrap();
+    let pool = corruption_pool().await;
+    // used > granted makes the reclaim credit negative; paying it out would
+    // silently debit the account.
+    sqlx::query("UPDATE tollgate_leases SET used = 600 WHERE lease_id = $1")
+        .bind(lease.lease_id.0.to_be_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let err = store.reclaim_expired(t(120)).await.unwrap_err();
+    assert!(err.0.contains("reclaim credit"), "got: {err}");
+    // The transaction rolled back: no credit or debit landed.
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(500));
+}
+
+#[tokio::test]
+async fn straggler_exceeding_recorded_loss_fails_ingest() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
+        .await
+        .unwrap();
+    store
+        .release(lease.lease_id, lease.fencing_token, CostUnits(470), t(10))
+        .await
+        .unwrap();
+    let pool = corruption_pool().await;
+    // Understate the recorded loss (10 < the lease's provisional 30) so the
+    // straggler's settlement would drive the column negative.
+    set_account_column(&pool, "settlement_loss", 10).await;
+
+    let err = store
+        .ingest(&[usage(&lease, 1, 30, 5)], t(11))
+        .await
+        .unwrap_err();
+    assert!(err.0.contains("settlement_loss underflow"), "got: {err}");
+    // The whole batch rolled back: nothing was billed.
+    assert_eq!(
+        store.usage_recorded(ACCOUNT).await.unwrap(),
+        CostUnits::ZERO
+    );
+}
+
+#[tokio::test]
+async fn acquire_surfaces_negative_stored_fence() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    let pool = corruption_pool().await;
+    set_account_column(&pool, "next_fence", -1).await;
+
+    let err = store
+        .acquire(ACCOUNT, CostUnits(10), TTL, t(0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AllocateError::Storage(e) if e.0.contains("fencing token")),
+        "corrupt fence must surface as storage corruption, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn release_and_ingest_surface_negative_stored_fence() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
+        .await
+        .unwrap();
+    let pool = corruption_pool().await;
+    set_lease_column(&pool, lease.lease_id.0, "fencing_token", -1).await;
+
+    // A corrupt stored fence is a storage error, not a Fenced rejection that
+    // misattributes the cause to the caller.
+    let err = store
+        .release(lease.lease_id, lease.fencing_token, CostUnits(500), t(1))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AllocateError::Storage(e) if e.0.contains("fencing token")),
+        "got: {err}"
+    );
+
+    let err = store
+        .ingest(&[usage(&lease, 1, 10, 2)], t(2))
+        .await
+        .unwrap_err();
+    assert!(err.0.contains("fencing token"), "got: {err}");
+}
+
+#[tokio::test]
+async fn checked_ledger_columns_reject_negative_writes() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(10), TTL, t(0))
+        .await
+        .unwrap();
+    let pool = corruption_pool().await;
+
+    let account_columns = [
+        "deposited",
+        "balance",
+        "usage_recorded",
+        "settlement_loss",
+        "next_fence",
+    ]
+    .map(|c| ("tollgate_accounts", c, "account_id", account_bytes()));
+    let lease_columns = ["fencing_token", "granted", "used", "credited"].map(|c| {
+        (
+            "tollgate_leases",
+            c,
+            "lease_id",
+            lease.lease_id.0.to_be_bytes().to_vec(),
+        )
+    });
+    for (table, column, id_column, id) in account_columns.into_iter().chain(lease_columns) {
+        let err = sqlx::query(&format!(
+            "UPDATE {table} SET {column} = -1 WHERE {id_column} = $1"
+        ))
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(&format!("{column}_nonneg")),
+            "negative {table}.{column} write must violate its CHECK constraint, got: {err}"
+        );
+    }
+}

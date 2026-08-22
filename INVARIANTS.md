@@ -23,8 +23,15 @@ until it has one.
 
 4. **Fencing is absolute.** A lease holder with a stale fencing token is
    rejected by the allocator, by renewal, and by the usage sink — regardless
-   of timing. Fencing tokens are strictly monotonic per account.
-   *Tests:* `fenced_out_holder_rejected` (store suites).
+   of timing. Fencing tokens are strictly monotonic per account. A stored
+   fence outside the token domain is surfaced as a storage error, never
+   aliased to fence 0 — aliasing would misattribute corruption to the caller
+   and break the monotonic audit trail.
+   *Tests:* `fenced_out_holder_rejected` (store suites);
+   `acquire_surfaces_negative_stored_fence` and
+   `release_and_ingest_surface_negative_stored_fence` (Postgres suite; the
+   memory backend stores tokens as `u64`, so the corrupt state is
+   unrepresentable there).
 
 5. **Fail closed, zero I/O.** Unknown principal, suspended/closed account,
    expired snapshot, missing permission, exhausted or expired lease: all deny
@@ -64,7 +71,20 @@ until it has one.
 
 11. **Checked arithmetic only.** Cost and lease arithmetic never wraps; any
     overflow is an explicit error that denies (fail closed), never a wrap to a
-    small charge. *Tests:* `tollgate-core` proptests.
+    small charge. Stored ledger values follow the same rule in both
+    directions: a negative unit column is surfaced as an explicit store
+    error, never clamped to zero — clamping would let the conservation
+    equation pass over the corruption it exists to detect. The Postgres
+    schema additionally CHECK-constrains unit columns non-negative.
+    *Tests:* `tollgate-core` proptests;
+    `negative_account_column_fails_conservation_read`,
+    `negative_account_column_fails_balance_and_usage_reads`,
+    `negative_lease_sum_fails_conservation_read`,
+    `acquire_surfaces_negative_stored_balance`,
+    `reclaim_refuses_negative_credit`,
+    `straggler_exceeding_recorded_loss_fails_ingest`, and
+    `checked_ledger_columns_reject_negative_writes` (Postgres suite; the
+    memory backend makes negative state unrepresentable via `u64`).
 
 12. **No commit outside the usability window.** A lease is locally usable
     until `expires_at - safety margin`; both debits and commits stop there,

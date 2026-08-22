@@ -11,8 +11,10 @@
 //!
 //! Representation choices (PoC-pragmatic, documented):
 //! - u128 ids as 16-byte `BYTEA` (big-endian);
-//! - units as `BIGINT` with checked u64↔i64 conversion (a balance beyond
-//!   i64::MAX is refused, not wrapped);
+//! - units as `BIGINT` with checked u64↔i64 conversion in both directions
+//!   (a balance beyond i64::MAX is refused, not wrapped; a negative stored
+//!   value is refused, not clamped) and schema-level CHECK constraints
+//!   keeping every unit column non-negative;
 //! - timestamps as `BIGINT` microseconds since the Unix epoch;
 //! - snapshots as `JSONB` of the wire serialization.
 //!
@@ -57,8 +59,13 @@ fn to_i64(units: CostUnits, what: &str) -> Result<i64, StoreError> {
     i64::try_from(units.get()).map_err(|_| StoreError(format!("{what} exceeds i64 range")))
 }
 
-fn to_units(value: i64) -> CostUnits {
-    CostUnits(u64::try_from(value).unwrap_or(0))
+/// A negative unit column is ledger corruption, never a value to normalise:
+/// clamping it to zero would let the conservation equation pass over exactly
+/// the discrepancy it exists to expose.
+fn to_units(value: i64, what: &str) -> Result<CostUnits, StoreError> {
+    u64::try_from(value)
+        .map(CostUnits)
+        .map_err(|_| StoreError(format!("{what} is negative in storage: {value}")))
 }
 
 fn ts_micros(ts: Timestamp) -> i64 {
@@ -126,9 +133,9 @@ impl PostgresStore {
             .fetch_optional(&self.pool)
             .await
             .map_err(storage)?;
-        Ok(row
-            .map(|r| to_units(r.get::<i64, _>(0)))
-            .unwrap_or(CostUnits::ZERO))
+        row.map(|r| to_units(r.get::<i64, _>(0), "account balance"))
+            .transpose()
+            .map(|units| units.unwrap_or(CostUnits::ZERO))
     }
 
     pub async fn usage_recorded(&self, account: AccountId) -> Result<CostUnits, StoreError> {
@@ -137,9 +144,9 @@ impl PostgresStore {
             .fetch_optional(&self.pool)
             .await
             .map_err(storage)?;
-        Ok(row
-            .map(|r| to_units(r.get::<i64, _>(0)))
-            .unwrap_or(CostUnits::ZERO))
+        row.map(|r| to_units(r.get::<i64, _>(0), "account usage_recorded"))
+            .transpose()
+            .map(|units| units.unwrap_or(CostUnits::ZERO))
     }
 
     pub async fn conservation(
@@ -165,16 +172,16 @@ impl PostgresStore {
         .fetch_one(&self.pool)
         .await
         .map_err(storage)?;
-        let active_grants = to_units(lease_row.get::<i64, _>(0));
-        let active_used = to_units(lease_row.get::<i64, _>(1));
+        let active_grants = to_units(lease_row.get::<i64, _>(0), "active lease grants")?;
+        let active_used = to_units(lease_row.get::<i64, _>(1), "active lease usage")?;
         Ok(Some(Conservation {
-            deposited: to_units(row.get::<i64, _>(0)),
-            balance: to_units(row.get::<i64, _>(1)),
+            deposited: to_units(row.get::<i64, _>(0), "deposited")?,
+            balance: to_units(row.get::<i64, _>(1), "balance")?,
             active_lease_grants: active_grants,
-            settled_usage: to_units(row.get::<i64, _>(2))
+            settled_usage: to_units(row.get::<i64, _>(2), "usage_recorded")?
                 .checked_sub(active_used)
                 .expect("active usage never exceeds recorded usage"),
-            settlement_loss: to_units(row.get::<i64, _>(3)),
+            settlement_loss: to_units(row.get::<i64, _>(3), "settlement_loss")?,
         }))
     }
 }
@@ -231,12 +238,20 @@ impl LeaseAllocator for PostgresStore {
         if !row.get::<bool, _>(1) {
             return Err(AllocateError::AccountInactive);
         }
-        let balance = to_units(row.get::<i64, _>(0));
+        let balance =
+            to_units(row.get::<i64, _>(0), "account balance").map_err(AllocateError::Storage)?;
         let granted = self
             .policy
             .grant(requested, balance)
             .ok_or(AllocateError::InsufficientBalance)?;
         let fence = row.get::<i64, _>(2);
+        // Fence counters are seeded at 1 and only incremented; a negative
+        // stored value is corruption, never a token to alias to 0.
+        let fence_token = u64::try_from(fence).map(FencingToken).map_err(|_| {
+            AllocateError::Storage(StoreError(format!(
+                "stored fencing token is negative: {fence}"
+            )))
+        })?;
 
         let ttl = if ttl > self.policy.max_ttl {
             self.policy.max_ttl
@@ -275,7 +290,7 @@ impl LeaseAllocator for PostgresStore {
         Ok(LeaseGrant {
             lease_id,
             account_id: account,
-            fencing_token: FencingToken(u64::try_from(fence).unwrap_or(0)),
+            fencing_token: fence_token,
             units: granted,
             expires_at,
         })
@@ -295,7 +310,12 @@ impl LeaseAllocator for PostgresStore {
                 .map_err(alloc_storage)?
                 .ok_or(AllocateError::UnknownLease)?;
 
-        if u64::try_from(fence).unwrap_or(0) != fencing_token.0 {
+        let stored_fence = u64::try_from(fence).map_err(|_| {
+            AllocateError::Storage(StoreError(format!(
+                "stored fencing token is negative: {fence}"
+            )))
+        })?;
+        if stored_fence != fencing_token.0 {
             return Err(AllocateError::Fenced);
         }
         // Releases are accepted through the grace window (see GrantPolicy::
@@ -355,6 +375,9 @@ impl LeaseAllocator for PostgresStore {
             let lease_bytes: Vec<u8> = row.get(0);
             let account_bytes: Vec<u8> = row.get(1);
             let credit: i64 = row.get::<i64, _>(2) - row.get::<i64, _>(3);
+            // Validate before either UPDATE: a negative credit (used beyond
+            // granted) is corruption, and crediting it would debit the account.
+            let credit_units = to_units(credit, "reclaim credit")?;
             sqlx::query("UPDATE tollgate_leases SET state = $2, credited = $3 WHERE lease_id = $1")
                 .bind(&lease_bytes)
                 .bind(STATE_EXPIRED)
@@ -373,7 +396,7 @@ impl LeaseAllocator for PostgresStore {
             reclaimed.push(ReclaimedLease {
                 lease_id: LeaseId(id_from(&lease_bytes)),
                 account_id: AccountId(id_from(&account_bytes)),
-                reclaimed: to_units(credit),
+                reclaimed: credit_units,
             });
         }
         tx.commit().await.map_err(storage)?;
@@ -462,6 +485,10 @@ impl UsageSink for PostgresStore {
         struct Accepted<'a> {
             event: &'a UsageEvent,
             settled: bool,
+            /// The lease's stored fence, already validated non-negative;
+            /// acceptance required the event's token to equal it, so this is
+            /// the event's fence in storage form with no reconversion.
+            fence: i64,
         }
         let mut accepted: Vec<Accepted<'_>> = Vec::with_capacity(events.len());
         for event in events {
@@ -474,7 +501,10 @@ impl UsageSink for PostgresStore {
                 report.rejected += 1;
                 continue;
             };
-            if u64::try_from(lease.fence).unwrap_or(0) != event.fencing_token.0
+            let stored_fence = u64::try_from(lease.fence).map_err(|_| {
+                StoreError(format!("stored fencing token is negative: {}", lease.fence))
+            })?;
+            if stored_fence != event.fencing_token.0
                 || id_from(&lease.account_id) != event.account_id.0
             {
                 report.rejected += 1;
@@ -490,6 +520,7 @@ impl UsageSink for PostgresStore {
             accepted.push(Accepted {
                 event,
                 settled: lease.settled,
+                fence: lease.fence,
             });
             report.accepted += 1;
         }
@@ -508,7 +539,7 @@ impl UsageSink for PostgresStore {
                 rid.push(id_bytes(a.event.request_id.0));
                 acct.push(id_bytes(a.event.account_id.0));
                 lease.push(id_bytes(a.event.lease_id.0));
-                fence.push(i64::try_from(a.event.fencing_token.0).unwrap_or(0));
+                fence.push(a.fence);
                 units.push(to_i64(a.event.units, "units")?);
                 at.push(ts_micros(a.event.occurred_at));
             }
@@ -552,11 +583,17 @@ impl UsageSink for PostgresStore {
                     .map_err(storage)?;
             }
             for (account_id, (usage_delta, loss_delta)) in &account_deltas {
-                sqlx::query(
+                // The per-lease fit check bounds every straggler by the loss
+                // its own release recorded, so the account-level subtraction
+                // cannot underflow unless the ledger is corrupt (the memory
+                // backend asserts the same implication). The predicate makes
+                // that assertion in SQL: zero rows means refuse the batch and
+                // roll back rather than store a negative loss.
+                let updated = sqlx::query(
                     "UPDATE tollgate_accounts
                      SET usage_recorded = usage_recorded + $2,
                          settlement_loss = settlement_loss - $3
-                     WHERE account_id = $1",
+                     WHERE account_id = $1 AND settlement_loss >= $3",
                 )
                 .bind(account_id)
                 .bind(usage_delta)
@@ -564,6 +601,13 @@ impl UsageSink for PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(storage)?;
+                if updated.rows_affected() != 1 {
+                    return Err(StoreError(format!(
+                        "settlement_loss underflow for account {:#034x}: settled straggler \
+                         usage {loss_delta} exceeds recorded loss",
+                        id_from(account_id)
+                    )));
+                }
             }
         }
         tx.commit().await.map_err(storage)?;
