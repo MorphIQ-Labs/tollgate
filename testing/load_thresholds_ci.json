@@ -1,0 +1,10 @@
+{
+  "_comment": "Required shared-CI gate for examples/pricing-api. Workload and ratio ceilings intentionally match load_thresholds.json. Absolute p50/p99 ceilings are explicitly disabled because shared-runner latency is not calibrated; null values are reported as disabled, never treated as passing measurements.",
+  "warmup_requests": 1000,
+  "measured_requests": 5000,
+  "concurrent_connections": 10,
+  "max_p50_overhead_ratio": 1.15,
+  "max_concurrent_p50_overhead_ratio": 1.2,
+  "max_p50_ns": null,
+  "max_p99_ns": null
+}

@@ -34,7 +34,7 @@ git config core.hooksPath .githooks         # once per clone: rustfmt check on c
 cargo test --workspace                     # correctness (Postgres DB cases are env-gated)
 ./scripts/check_formal.sh                  # Lean authorization-state proofs
 ./scripts/check_perf_thresholds.sh         # hot-path microbench gate
-./scripts/check_load_thresholds.sh         # sequential + contended loopback gates
+./scripts/check_load_thresholds.sh         # local ratios + controlled-host absolutes
 
 # Postgres correctness suite:
 docker compose up -d
@@ -77,7 +77,8 @@ The load gate retains both scenarios and separate ratio ceilings. One lease
 acquire funds thousands of requests; two instances draining one account over
 HTTP finish with **zero drift** between admission's committed units and the
 billing ledger. Gate manifests live in `testing/`; recalibrate on a controlled
-host before treating thresholds as the contract.
+host before treating absolute thresholds as the contract. Default-target
+merge requests enforce both load ratios with an explicit ratio-only manifest.
 
 ## Design rules
 
