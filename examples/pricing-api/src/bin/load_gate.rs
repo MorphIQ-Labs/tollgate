@@ -20,7 +20,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use pricing_api::build_app;
 
@@ -35,9 +35,20 @@ struct Thresholds {
     /// Concurrent same-account admitted p50 may exceed its like-for-like
     /// baseline p50 by at most this factor.
     max_concurrent_p50_overhead_ratio: f64,
-    /// Absolute ceilings for the admitted run (nanoseconds).
-    max_p50_ns: f64,
-    max_p99_ns: f64,
+    /// Controlled-host absolute ceilings for the admitted run (nanoseconds).
+    /// Both are `null` in the portable CI manifest; one without the other is
+    /// invalid because it would silently create a partial absolute gate.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    max_p50_ns: Option<f64>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    max_p99_ns: Option<f64>,
+}
+
+fn deserialize_required_option<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<f64>::deserialize(deserializer)
 }
 
 impl Thresholds {
@@ -64,11 +75,22 @@ impl Thresholds {
                 "max_concurrent_p50_overhead_ratio",
                 self.max_concurrent_p50_overhead_ratio,
             ),
-            ("max_p50_ns", self.max_p50_ns),
-            ("max_p99_ns", self.max_p99_ns),
         ] {
             if !value.is_finite() || value <= 0.0 {
                 return Err(format!("{name} must be finite and positive"));
+            }
+        }
+        match (self.max_p50_ns, self.max_p99_ns) {
+            (Some(max_p50_ns), Some(max_p99_ns)) => {
+                for (name, value) in [("max_p50_ns", max_p50_ns), ("max_p99_ns", max_p99_ns)] {
+                    if !value.is_finite() || value <= 0.0 {
+                        return Err(format!("{name} must be finite and positive"));
+                    }
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err("max_p50_ns and max_p99_ns must both be set or both be null".to_owned());
             }
         }
         Ok(connections)
@@ -93,12 +115,22 @@ struct ConcurrentReport {
 }
 
 #[derive(Serialize)]
+struct AbsoluteLatencyReport {
+    max_p50_ns: Option<f64>,
+    max_p99_ns: Option<f64>,
+    /// `None` means the selected manifest deliberately disabled absolute
+    /// latency enforcement; ratio verdicts remain active.
+    passed: Option<bool>,
+}
+
+#[derive(Serialize)]
 struct Report {
     // Keep the original sequential fields stable for report consumers.
     baseline: Percentiles,
     admitted: Percentiles,
     p50_overhead_ratio: f64,
     sequential_passed: bool,
+    absolute_latency: AbsoluteLatencyReport,
     concurrent_same_account: ConcurrentReport,
     passed: bool,
     run: RunContext,
@@ -429,14 +461,22 @@ fn p50_overhead_ratio(baseline: Percentiles, admitted: Percentiles) -> f64 {
     admitted.p50_ns / baseline.p50_ns.max(1.0)
 }
 
+fn absolute_latency_passed(thresholds: &Thresholds, admitted: Percentiles) -> Option<bool> {
+    thresholds
+        .max_p50_ns
+        .zip(thresholds.max_p99_ns)
+        .map(|(max_p50_ns, max_p99_ns)| {
+            admitted.p50_ns <= max_p50_ns && admitted.p99_ns <= max_p99_ns
+        })
+}
+
 fn sequential_passed(
     thresholds: &Thresholds,
     baseline: Percentiles,
     admitted: Percentiles,
 ) -> bool {
     p50_overhead_ratio(baseline, admitted) <= thresholds.max_p50_overhead_ratio
-        && admitted.p50_ns <= thresholds.max_p50_ns
-        && admitted.p99_ns <= thresholds.max_p99_ns
+        && absolute_latency_passed(thresholds, admitted).unwrap_or(true)
 }
 
 fn concurrent_passed(
@@ -554,6 +594,7 @@ async fn main() -> ExitCode {
 
     let ratio = p50_overhead_ratio(baseline, admitted);
     let concurrent_ratio = p50_overhead_ratio(concurrent_baseline, concurrent_admitted);
+    let absolute_latency_passed = absolute_latency_passed(&thresholds, admitted);
     let sequential_passed = sequential_passed(&thresholds, baseline, admitted);
     let concurrent_passed =
         concurrent_passed(&thresholds, concurrent_baseline, concurrent_admitted);
@@ -564,6 +605,11 @@ async fn main() -> ExitCode {
         admitted,
         p50_overhead_ratio: ratio,
         sequential_passed,
+        absolute_latency: AbsoluteLatencyReport {
+            max_p50_ns: thresholds.max_p50_ns,
+            max_p99_ns: thresholds.max_p99_ns,
+            passed: absolute_latency_passed,
+        },
         concurrent_same_account: ConcurrentReport {
             connections: concurrent_connections.get(),
             baseline: concurrent_baseline,
@@ -633,8 +679,8 @@ mod tests {
             concurrent_connections: 4,
             max_p50_overhead_ratio: 1.2,
             max_concurrent_p50_overhead_ratio: 1.5,
-            max_p50_ns: 200.0,
-            max_p99_ns: 300.0,
+            max_p50_ns: Some(200.0),
+            max_p99_ns: Some(300.0),
         }
     }
 
@@ -730,12 +776,54 @@ mod tests {
         assert!(thresholds.validate().is_err());
 
         let mut thresholds = valid_thresholds();
-        thresholds.max_p50_ns = f64::NAN;
+        thresholds.max_p50_ns = Some(f64::NAN);
         assert!(thresholds.validate().is_err());
 
         let mut thresholds = valid_thresholds();
-        thresholds.max_p99_ns = f64::INFINITY;
+        thresholds.max_p99_ns = Some(f64::INFINITY);
         assert!(thresholds.validate().is_err());
+    }
+
+    #[test]
+    fn threshold_validation_requires_both_absolute_ceilings_or_neither() {
+        let mut thresholds = valid_thresholds();
+        thresholds.max_p50_ns = None;
+        assert!(thresholds.validate().is_err());
+
+        let mut thresholds = valid_thresholds();
+        thresholds.max_p99_ns = None;
+        assert!(thresholds.validate().is_err());
+
+        thresholds.max_p50_ns = None;
+        assert_eq!(thresholds.validate().unwrap().get(), 4);
+    }
+
+    #[test]
+    fn checked_in_manifests_share_workload_and_ratio_contracts() {
+        let local_json = include_str!("../../../../testing/load_thresholds.json");
+        let ci_json = include_str!("../../../../testing/load_thresholds_ci.json");
+        let local: Thresholds = serde_json::from_str(local_json).unwrap();
+        let ci: Thresholds = serde_json::from_str(ci_json).unwrap();
+
+        assert!(local.max_p50_ns.is_some());
+        assert!(local.max_p99_ns.is_some());
+        assert!(ci.max_p50_ns.is_none());
+        assert!(ci.max_p99_ns.is_none());
+        assert_eq!(local.warmup_requests, ci.warmup_requests);
+        assert_eq!(local.measured_requests, ci.measured_requests);
+        assert_eq!(local.concurrent_connections, ci.concurrent_connections);
+        assert_eq!(local.max_p50_overhead_ratio, ci.max_p50_overhead_ratio);
+        assert_eq!(
+            local.max_concurrent_p50_overhead_ratio,
+            ci.max_concurrent_p50_overhead_ratio
+        );
+        assert!(local.validate().is_ok());
+        assert!(ci.validate().is_ok());
+
+        let missing_p50 = ci_json.replace("  \"max_p50_ns\": null,\n", "");
+        let missing_p99 = ci_json.replace("  \"max_p99_ns\": null\n", "");
+        assert!(serde_json::from_str::<Thresholds>(&missing_p50).is_err());
+        assert!(serde_json::from_str::<Thresholds>(&missing_p99).is_err());
     }
 
     #[test]
@@ -783,6 +871,29 @@ mod tests {
     }
 
     #[test]
+    fn ratio_only_verdict_disables_only_absolute_latency() {
+        let mut thresholds = valid_thresholds();
+        thresholds.max_p50_ns = None;
+        thresholds.max_p99_ns = None;
+        let baseline = timings(1_000.0, 1_000.0);
+
+        assert_eq!(
+            absolute_latency_passed(&thresholds, timings(1_000_000.0, 2_000_000.0)),
+            None
+        );
+        assert!(sequential_passed(
+            &thresholds,
+            baseline,
+            timings(1_200.0, 2_000_000.0)
+        ));
+        assert!(!sequential_passed(
+            &thresholds,
+            baseline,
+            timings(1_201.0, 1_201.0)
+        ));
+    }
+
+    #[test]
     fn concurrent_verdict_uses_its_own_ratio_ceiling() {
         let thresholds = valid_thresholds();
         assert_eq!(
@@ -816,6 +927,11 @@ mod tests {
             admitted: timings(11.0, 21.0),
             p50_overhead_ratio: 1.1,
             sequential_passed: true,
+            absolute_latency: AbsoluteLatencyReport {
+                max_p50_ns: None,
+                max_p99_ns: None,
+                passed: None,
+            },
             concurrent_same_account: ConcurrentReport {
                 connections: 4,
                 baseline: timings(20.0, 30.0),
@@ -833,6 +949,11 @@ mod tests {
         };
         let json = serde_json::to_value(report).unwrap();
         assert_eq!(json["p50_overhead_ratio"], 1.1);
+        assert_eq!(
+            json["absolute_latency"]["max_p50_ns"],
+            serde_json::Value::Null
+        );
+        assert_eq!(json["absolute_latency"]["passed"], serde_json::Value::Null);
         assert_eq!(json["concurrent_same_account"]["connections"], 4);
         assert_eq!(json["concurrent_same_account"]["p50_overhead_ratio"], 1.2);
         assert_eq!(json["passed"], true);

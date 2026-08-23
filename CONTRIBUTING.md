@@ -26,7 +26,7 @@ TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
   cargo test -p tollgate-store-postgres
 ```
 
-Performance gates (`./scripts/check_perf_thresholds.sh`, `./scripts/check_load_thresholds.sh`) are calibrated: absolute-latency thresholds are meaningful only on a controlled host, while overhead ratios are portable. `AGENTS.md` has the full command inventory.
+Performance gates (`./scripts/check_perf_thresholds.sh`, `./scripts/check_load_thresholds.sh`) are calibrated: absolute-latency thresholds are meaningful only on a controlled host, while like-for-like overhead ratios are portable and required in default-target merge-request CI. `AGENTS.md` has the full command inventory.
 
 A backend behavior change must update both the memory and PostgreSQL implementations and their mirrored scenario tests.
 

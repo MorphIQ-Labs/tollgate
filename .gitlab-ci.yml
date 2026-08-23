@@ -2,9 +2,9 @@
 # mutation assurance, and machine-checked proofs.
 #
 # The image tag matches rust-toolchain.toml; keep them in lockstep so rustup
-# never downloads a second toolchain inside CI. Absolute-latency perf gates
-# never run here — thresholds are calibrated on a controlled host
-# (docs/DESIGN.md); CI proves benches compile.
+# never downloads a second toolchain inside CI. Criterion and absolute-latency
+# thresholds stay on a controlled host; shared CI compiles every benchmark and
+# gates the load test's like-for-like sequential and contended ratios.
 #
 # Cache: cargo registry/git only (not target/) — meaningful download savings
 # without multi-GB archive churn. GitLab manages cache storage and expiry;
@@ -227,9 +227,9 @@ mutation:
     paths:
       - reports/mutations
 
-# Absolute latency is meaningful only on a controlled host. These lanes are
-# visible on default-target MRs for deliberate evidence collection, but are not
-# merge gates; benchmark compilation remains required in the test stage.
+# Criterion latency is meaningful only on a controlled host. This lane stays
+# visible on default-target MRs for deliberate evidence collection, but is not
+# a merge gate; benchmark compilation remains required in the test stage.
 perf-thresholds:
   extends: .main-merge-request-manual
   stage: assurance
@@ -243,12 +243,22 @@ perf-thresholds:
       - reports/perf_gate_report.json
 
 load-thresholds:
-  extends: .main-merge-request-manual
+  extends: .main-merge-request
   stage: assurance
-  allow_failure: true
+  interruptible: true
   timeout: 45 minutes
+  # Mutation and formal assurance are CPU- and memory-intensive. This job
+  # measures paired latencies on the same group-runner host, so wait for both
+  # instead of letting our own pipeline contaminate its denominator/numerator.
+  needs:
+    - job: mutation
+      artifacts: false
+    - job: formal
+      artifacts: false
   script:
-    - ./scripts/check_load_thresholds.sh
+    # The CI manifest explicitly disables host-dependent absolute ceilings;
+    # both admitted-vs-baseline ratio regressions remain required gates.
+    - ./scripts/check_load_thresholds.sh testing/load_thresholds_ci.json reports/load_gate_report.json
   artifacts:
     when: always
     paths:
