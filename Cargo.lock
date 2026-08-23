@@ -1473,7 +1473,7 @@ dependencies = [
 
 [[package]]
 name = "pricing-api"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "axum",
  "hmac",
@@ -2379,7 +2379,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate-admission"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -2392,7 +2392,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate-client"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "async-trait",
  "atomic-waker",
@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate-core"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "criterion",
  "jiff",
@@ -2422,7 +2422,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate-perf-gate"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -2430,7 +2430,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate-server"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "async-trait",
  "axum",
@@ -2451,7 +2451,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate-store"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "async-trait",
  "jiff",
@@ -2463,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate-store-postgres"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "async-trait",
  "criterion",
