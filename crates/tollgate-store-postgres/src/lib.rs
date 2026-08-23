@@ -80,6 +80,56 @@ fn alloc_storage(e: sqlx::Error) -> AllocateError {
     AllocateError::Storage(storage(e))
 }
 
+/// Finish a store transaction before making its result observable.
+///
+/// `sqlx::Transaction` only queues a rollback when it is dropped. A caller
+/// can therefore start a competing transaction after this future returns but
+/// before PostgreSQL has released the first transaction's row locks. That is
+/// especially visible to reclaim's `SKIP LOCKED` query, which may otherwise
+/// miss a lease owned by an operation that has already reported failure.
+async fn finish_store_transaction<T>(
+    tx: Transaction<'_, Postgres>,
+    result: Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    match result {
+        Ok(value) => {
+            tx.commit().await.map_err(storage)?;
+            Ok(value)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                return Err(StoreError(format!(
+                    "operation failed ({error}); transaction rollback failed ({})",
+                    storage(rollback_error)
+                )));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Allocator-error counterpart to [`finish_store_transaction`].
+async fn finish_allocate_transaction<T>(
+    tx: Transaction<'_, Postgres>,
+    result: Result<T, AllocateError>,
+) -> Result<T, AllocateError> {
+    match result {
+        Ok(value) => {
+            tx.commit().await.map_err(alloc_storage)?;
+            Ok(value)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                return Err(AllocateError::Storage(StoreError(format!(
+                    "operation failed ({error}); transaction rollback failed ({})",
+                    storage(rollback_error)
+                ))));
+            }
+            Err(error)
+        }
+    }
+}
+
 pub struct PostgresStore {
     pool: PgPool,
     policy: GrantPolicy,
@@ -290,75 +340,78 @@ impl LeaseAllocator for PostgresStore {
             return Err(AllocateError::InvalidTtl);
         }
         let mut tx = self.pool.begin().await.map_err(alloc_storage)?;
-        let row = sqlx::query(
-            "SELECT balance, active, next_fence FROM tollgate_accounts
-             WHERE account_id = $1 FOR UPDATE",
-        )
-        .bind(id_bytes(account.0))
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(alloc_storage)?
-        .ok_or(AllocateError::UnknownAccount)?;
+        let result = async {
+            let row = sqlx::query(
+                "SELECT balance, active, next_fence FROM tollgate_accounts
+                 WHERE account_id = $1 FOR UPDATE",
+            )
+            .bind(id_bytes(account.0))
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(alloc_storage)?
+            .ok_or(AllocateError::UnknownAccount)?;
 
-        if !row.get::<bool, _>(1) {
-            return Err(AllocateError::AccountInactive);
+            if !row.get::<bool, _>(1) {
+                return Err(AllocateError::AccountInactive);
+            }
+            let balance = to_units(row.get::<i64, _>(0), "account balance")
+                .map_err(AllocateError::Storage)?;
+            let granted = self
+                .policy
+                .grant(requested, balance)
+                .ok_or(AllocateError::InsufficientBalance)?;
+            let fence = row.get::<i64, _>(2);
+            // Fence counters are seeded at 1 and only incremented; a negative
+            // stored value is corruption, never a token to alias to 0.
+            let fence_token = u64::try_from(fence).map(FencingToken).map_err(|_| {
+                AllocateError::Storage(StoreError(format!(
+                    "stored fencing token is negative: {fence}"
+                )))
+            })?;
+
+            let ttl = if ttl > self.policy.max_ttl {
+                self.policy.max_ttl
+            } else {
+                ttl
+            };
+            let expires_at = now.checked_add(ttl).map_err(|e| {
+                AllocateError::Storage(StoreError(format!("ttl overflow: {e}")))
+            })?;
+            let lease_id = LeaseId(uuid::Uuid::new_v4().as_u128());
+
+            sqlx::query(
+                "UPDATE tollgate_accounts SET balance = balance - $2, next_fence = next_fence + 1
+                 WHERE account_id = $1",
+            )
+            .bind(id_bytes(account.0))
+            .bind(to_i64(granted, "grant").map_err(AllocateError::Storage)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(alloc_storage)?;
+            sqlx::query(
+                "INSERT INTO tollgate_leases
+                 (lease_id, account_id, fencing_token, granted, used, credited, expires_at_us, state)
+                 VALUES ($1, $2, $3, $4, 0, 0, $5, 0)",
+            )
+            .bind(id_bytes(lease_id.0))
+            .bind(id_bytes(account.0))
+            .bind(fence)
+            .bind(to_i64(granted, "grant").map_err(AllocateError::Storage)?)
+            .bind(ts_micros(expires_at))
+            .execute(&mut *tx)
+            .await
+            .map_err(alloc_storage)?;
+
+            Ok(LeaseGrant {
+                lease_id,
+                account_id: account,
+                fencing_token: fence_token,
+                units: granted,
+                expires_at,
+            })
         }
-        let balance =
-            to_units(row.get::<i64, _>(0), "account balance").map_err(AllocateError::Storage)?;
-        let granted = self
-            .policy
-            .grant(requested, balance)
-            .ok_or(AllocateError::InsufficientBalance)?;
-        let fence = row.get::<i64, _>(2);
-        // Fence counters are seeded at 1 and only incremented; a negative
-        // stored value is corruption, never a token to alias to 0.
-        let fence_token = u64::try_from(fence).map(FencingToken).map_err(|_| {
-            AllocateError::Storage(StoreError(format!(
-                "stored fencing token is negative: {fence}"
-            )))
-        })?;
-
-        let ttl = if ttl > self.policy.max_ttl {
-            self.policy.max_ttl
-        } else {
-            ttl
-        };
-        let expires_at = now
-            .checked_add(ttl)
-            .map_err(|e| AllocateError::Storage(StoreError(format!("ttl overflow: {e}"))))?;
-        let lease_id = LeaseId(uuid::Uuid::new_v4().as_u128());
-
-        sqlx::query(
-            "UPDATE tollgate_accounts SET balance = balance - $2, next_fence = next_fence + 1
-             WHERE account_id = $1",
-        )
-        .bind(id_bytes(account.0))
-        .bind(to_i64(granted, "grant").map_err(AllocateError::Storage)?)
-        .execute(&mut *tx)
-        .await
-        .map_err(alloc_storage)?;
-        sqlx::query(
-            "INSERT INTO tollgate_leases
-             (lease_id, account_id, fencing_token, granted, used, credited, expires_at_us, state)
-             VALUES ($1, $2, $3, $4, 0, 0, $5, 0)",
-        )
-        .bind(id_bytes(lease_id.0))
-        .bind(id_bytes(account.0))
-        .bind(fence)
-        .bind(to_i64(granted, "grant").map_err(AllocateError::Storage)?)
-        .bind(ts_micros(expires_at))
-        .execute(&mut *tx)
-        .await
-        .map_err(alloc_storage)?;
-        tx.commit().await.map_err(alloc_storage)?;
-
-        Ok(LeaseGrant {
-            lease_id,
-            account_id: account,
-            fencing_token: fence_token,
-            units: granted,
-            expires_at,
-        })
+        .await;
+        finish_allocate_transaction(tx, result).await
     }
 
     async fn release(
@@ -369,103 +422,112 @@ impl LeaseAllocator for PostgresStore {
         now: Timestamp,
     ) -> Result<(), AllocateError> {
         let mut tx = self.pool.begin().await.map_err(alloc_storage)?;
-        let (account_id, fence, granted, used, _credited, expires_at_us, state) =
-            lock_lease(&mut tx, lease_id)
+        let result = async {
+            let (account_id, fence, granted, used, _credited, expires_at_us, state) =
+                lock_lease(&mut tx, lease_id)
+                    .await
+                    .map_err(alloc_storage)?
+                    .ok_or(AllocateError::UnknownLease)?;
+
+            let stored_fence = u64::try_from(fence).map_err(|_| {
+                AllocateError::Storage(StoreError(format!(
+                    "stored fencing token is negative: {fence}"
+                )))
+            })?;
+            if stored_fence != fencing_token.0 {
+                return Err(AllocateError::Fenced);
+            }
+            // Releases are accepted through the grace window (see GrantPolicy::
+            // reclaim_grace) — only a settled or grace-exhausted lease refuses.
+            let release_deadline_us = expires_at_us.saturating_add(self.reclaim_grace_us);
+            if state != STATE_ACTIVE || ts_micros(now) >= release_deadline_us {
+                return Err(AllocateError::LeaseNotActive);
+            }
+            let unspent_i = to_i64(unspent, "unspent").map_err(AllocateError::Storage)?;
+            let loss = granted
+                .checked_sub(
+                    used.checked_add(unspent_i)
+                        .ok_or(AllocateError::InvalidRelease)?,
+                )
+                .filter(|l| *l >= 0)
+                .ok_or(AllocateError::InvalidRelease)?;
+
+            sqlx::query("UPDATE tollgate_leases SET state = $2, credited = $3 WHERE lease_id = $1")
+                .bind(id_bytes(lease_id.0))
+                .bind(STATE_RELEASED)
+                .bind(unspent_i)
+                .execute(&mut *tx)
                 .await
-                .map_err(alloc_storage)?
-                .ok_or(AllocateError::UnknownLease)?;
-
-        let stored_fence = u64::try_from(fence).map_err(|_| {
-            AllocateError::Storage(StoreError(format!(
-                "stored fencing token is negative: {fence}"
-            )))
-        })?;
-        if stored_fence != fencing_token.0 {
-            return Err(AllocateError::Fenced);
-        }
-        // Releases are accepted through the grace window (see GrantPolicy::
-        // reclaim_grace) — only a settled or grace-exhausted lease refuses.
-        let release_deadline_us = expires_at_us.saturating_add(self.reclaim_grace_us);
-        if state != STATE_ACTIVE || ts_micros(now) >= release_deadline_us {
-            return Err(AllocateError::LeaseNotActive);
-        }
-        let unspent_i = to_i64(unspent, "unspent").map_err(AllocateError::Storage)?;
-        let loss = granted
-            .checked_sub(
-                used.checked_add(unspent_i)
-                    .ok_or(AllocateError::InvalidRelease)?,
+                .map_err(alloc_storage)?;
+            sqlx::query(
+                "UPDATE tollgate_accounts
+                 SET balance = balance + $2, settlement_loss = settlement_loss + $3
+                 WHERE account_id = $1",
             )
-            .filter(|l| *l >= 0)
-            .ok_or(AllocateError::InvalidRelease)?;
-
-        sqlx::query("UPDATE tollgate_leases SET state = $2, credited = $3 WHERE lease_id = $1")
-            .bind(id_bytes(lease_id.0))
-            .bind(STATE_RELEASED)
+            .bind(account_id)
             .bind(unspent_i)
+            .bind(loss)
             .execute(&mut *tx)
             .await
             .map_err(alloc_storage)?;
-        sqlx::query(
-            "UPDATE tollgate_accounts
-             SET balance = balance + $2, settlement_loss = settlement_loss + $3
-             WHERE account_id = $1",
-        )
-        .bind(account_id)
-        .bind(unspent_i)
-        .bind(loss)
-        .execute(&mut *tx)
-        .await
-        .map_err(alloc_storage)?;
-        tx.commit().await.map_err(alloc_storage)
+            Ok(())
+        }
+        .await;
+        finish_allocate_transaction(tx, result).await
     }
 
     async fn reclaim_expired(&self, now: Timestamp) -> Result<Vec<ReclaimedLease>, StoreError> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        // Reclaim only once the grace window past expiry has fully lapsed:
-        // expires_at + grace <= now  ⟺  expires_at_us <= now_us - grace_us.
-        let threshold_us = ts_micros(now).saturating_sub(self.reclaim_grace_us);
-        // SKIP LOCKED: concurrent sweeps cooperate instead of deadlocking.
-        let rows = sqlx::query(
-            "SELECT lease_id, account_id, granted, used FROM tollgate_leases
-             WHERE state = 0 AND expires_at_us <= $1
-             ORDER BY account_id, lease_id FOR UPDATE SKIP LOCKED",
-        )
-        .bind(threshold_us)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(storage)?;
+        let result = async {
+            // Reclaim only once the grace window past expiry has fully lapsed:
+            // expires_at + grace <= now  ⟺  expires_at_us <= now_us - grace_us.
+            let threshold_us = ts_micros(now).saturating_sub(self.reclaim_grace_us);
+            // SKIP LOCKED: concurrent sweeps cooperate instead of deadlocking.
+            let rows = sqlx::query(
+                "SELECT lease_id, account_id, granted, used FROM tollgate_leases
+                 WHERE state = 0 AND expires_at_us <= $1
+                 ORDER BY account_id, lease_id FOR UPDATE SKIP LOCKED",
+            )
+            .bind(threshold_us)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(storage)?;
 
-        let mut reclaimed = Vec::with_capacity(rows.len());
-        for row in rows {
-            let lease_bytes: Vec<u8> = row.get(0);
-            let account_bytes: Vec<u8> = row.get(1);
-            let credit: i64 = row.get::<i64, _>(2) - row.get::<i64, _>(3);
-            // Validate before either UPDATE: a negative credit (used beyond
-            // granted) is corruption, and crediting it would debit the account.
-            let credit_units = to_units(credit, "reclaim credit")?;
-            sqlx::query("UPDATE tollgate_leases SET state = $2, credited = $3 WHERE lease_id = $1")
+            let mut reclaimed = Vec::with_capacity(rows.len());
+            for row in rows {
+                let lease_bytes: Vec<u8> = row.get(0);
+                let account_bytes: Vec<u8> = row.get(1);
+                let credit: i64 = row.get::<i64, _>(2) - row.get::<i64, _>(3);
+                // Validate before either UPDATE: a negative credit (used beyond
+                // granted) is corruption, and crediting it would debit the account.
+                let credit_units = to_units(credit, "reclaim credit")?;
+                sqlx::query(
+                    "UPDATE tollgate_leases SET state = $2, credited = $3 WHERE lease_id = $1",
+                )
                 .bind(&lease_bytes)
                 .bind(STATE_EXPIRED)
                 .bind(credit)
                 .execute(&mut *tx)
                 .await
                 .map_err(storage)?;
-            sqlx::query(
-                "UPDATE tollgate_accounts SET balance = balance + $2 WHERE account_id = $1",
-            )
-            .bind(&account_bytes)
-            .bind(credit)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
-            reclaimed.push(ReclaimedLease {
-                lease_id: LeaseId(id_from(&lease_bytes)),
-                account_id: AccountId(id_from(&account_bytes)),
-                reclaimed: credit_units,
-            });
+                sqlx::query(
+                    "UPDATE tollgate_accounts SET balance = balance + $2 WHERE account_id = $1",
+                )
+                .bind(&account_bytes)
+                .bind(credit)
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?;
+                reclaimed.push(ReclaimedLease {
+                    lease_id: LeaseId(id_from(&lease_bytes)),
+                    account_id: AccountId(id_from(&account_bytes)),
+                    reclaimed: credit_units,
+                });
+            }
+            Ok(reclaimed)
         }
-        tx.commit().await.map_err(storage)?;
-        Ok(reclaimed)
+        .await;
+        finish_store_transaction(tx, result).await
     }
 }
 
@@ -488,49 +550,50 @@ impl UsageSink for PostgresStore {
             return Ok(report);
         }
         let mut tx = self.pool.begin().await.map_err(storage)?;
+        let result = async {
 
-        // Lock every referenced lease, in stable order.
-        let mut lease_ids: Vec<Vec<u8>> = events
-            .iter()
-            .map(|e| id_bytes(e.lease_id.0))
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        lease_ids.sort();
-        struct LeaseRow {
-            account_id: Vec<u8>,
-            fence: i64,
-            granted: i64,
-            used: i64,
-            used_delta: i64,
-            credited: i64,
-            settled: bool,
-        }
-        let rows = sqlx::query(
-            "SELECT lease_id, account_id, fencing_token, granted, used, credited, state
-             FROM tollgate_leases WHERE lease_id = ANY($1) ORDER BY lease_id FOR UPDATE",
-        )
-        .bind(&lease_ids)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(storage)?;
-        let mut leases: std::collections::BTreeMap<Vec<u8>, LeaseRow> = rows
-            .into_iter()
-            .map(|r| {
-                (
-                    r.get::<Vec<u8>, _>(0),
-                    LeaseRow {
-                        account_id: r.get(1),
-                        fence: r.get(2),
-                        granted: r.get(3),
-                        used: r.get(4),
-                        used_delta: 0,
-                        credited: r.get(5),
-                        settled: r.get::<i16, _>(6) != STATE_ACTIVE,
-                    },
-                )
-            })
-            .collect();
+            // Lock every referenced lease, in stable order.
+            let mut lease_ids: Vec<Vec<u8>> = events
+                .iter()
+                .map(|e| id_bytes(e.lease_id.0))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            lease_ids.sort();
+            struct LeaseRow {
+                account_id: Vec<u8>,
+                fence: i64,
+                granted: i64,
+                used: i64,
+                used_delta: i64,
+                credited: i64,
+                settled: bool,
+            }
+            let rows = sqlx::query(
+                "SELECT lease_id, account_id, fencing_token, granted, used, credited, state
+                 FROM tollgate_leases WHERE lease_id = ANY($1) ORDER BY lease_id FOR UPDATE",
+            )
+            .bind(&lease_ids)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(storage)?;
+            let mut leases: std::collections::BTreeMap<Vec<u8>, LeaseRow> = rows
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.get::<Vec<u8>, _>(0),
+                        LeaseRow {
+                            account_id: r.get(1),
+                            fence: r.get(2),
+                            granted: r.get(3),
+                            used: r.get(4),
+                            used_delta: 0,
+                            credited: r.get(5),
+                            settled: r.get::<i16, _>(6) != STATE_ACTIVE,
+                        },
+                    )
+                })
+                .collect();
 
         // Existing request ids in one lookup.
         let request_ids: Vec<Vec<u8>> = events.iter().map(|e| id_bytes(e.request_id.0)).collect();
@@ -675,8 +738,10 @@ impl UsageSink for PostgresStore {
                 }
             }
         }
-        tx.commit().await.map_err(storage)?;
-        Ok(report)
+            Ok(report)
+        }
+        .await;
+        finish_store_transaction(tx, result).await
     }
 }
 

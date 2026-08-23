@@ -54,6 +54,18 @@ curl -s http://127.0.0.1:8081/metrics
 cargo run -p tollgate-server
 ```
 
+## Supported Rust toolchains
+
+The workspace declares Rust 1.89 as its minimum supported Rust version
+(MSRV). Every merge request checks the locked workspace, including all
+features and targets, with Rust 1.89.0 so dependency updates cannot silently
+raise that floor.
+
+`rust-toolchain.toml` separately pins Rust 1.97.1 for local development and
+the primary CI jobs. That pin provides reproducible formatting, linting,
+testing, and release tooling; it does not replace the MSRV contract. Changes
+to the declared minimum and the dedicated `msrv` job must land together.
+
 ## The numbers that matter (laptop, provisional)
 
 Full admission — lookup, status, permissions, quote, rate token, lease

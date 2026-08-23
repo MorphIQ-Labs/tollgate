@@ -238,6 +238,9 @@ async fn fenced_out_holder_rejected() {
         AllocateError::Fenced
     );
 
+    // A failed release must finish rolling back before it returns. Reclaim
+    // uses SKIP LOCKED, so a drop-queued rollback could otherwise make this
+    // immediately following sweep miss the stale lease intermittently.
     let reclaimed = store.reclaim_expired(t(61)).await.unwrap();
     assert_eq!(reclaimed.len(), 1);
     let replacement = store
