@@ -5,6 +5,12 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.1...v0.2.2) - 2026-08-23
+
+### Added
+
+- *(client)* #10 refill on the debit that crosses low water, not the next tick
+
 ## [0.2.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.0...v0.2.1) - 2026-08-23
 
 ### Added
