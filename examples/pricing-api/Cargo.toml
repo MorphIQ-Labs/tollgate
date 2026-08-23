@@ -8,10 +8,10 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-tollgate-core = { path = "../../crates/tollgate-core", version = "=0.2.6" }
-tollgate-admission = { path = "../../crates/tollgate-admission", version = "=0.2.6" }
-tollgate-client = { path = "../../crates/tollgate-client", version = "=0.2.6" }
-tollgate-store = { path = "../../crates/tollgate-store", version = "=0.2.6" }
+tollgate-core = { path = "../../crates/tollgate-core", version = "=0.2.7" }
+tollgate-admission = { path = "../../crates/tollgate-admission", version = "=0.2.7" }
+tollgate-client = { path = "../../crates/tollgate-client", version = "=0.2.7" }
+tollgate-store = { path = "../../crates/tollgate-store", version = "=0.2.7" }
 axum = { workspace = true }
 hmac = { workspace = true }
 jiff = { workspace = true }

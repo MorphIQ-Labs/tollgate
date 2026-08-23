@@ -5,6 +5,13 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.2.7](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.6...v0.2.7) - 2026-08-23
+
+### Other
+
+- *(pricing-api)* #16 one Option instead of five and a flag
+- *(store)* decouple shared types from memory backend
+
 ## [0.2.6](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.5...v0.2.6) - 2026-08-23
 
 ### Other
