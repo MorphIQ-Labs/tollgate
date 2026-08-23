@@ -44,6 +44,35 @@ struct Report {
     admitted: Percentiles,
     p50_overhead_ratio: f64,
     passed: bool,
+    run: RunContext,
+}
+
+/// What the machine looked like while measuring.
+///
+/// This gate takes one measurement and has no history to compare it against,
+/// so unlike the perf gate it cannot judge its own trustworthiness (#49) — the
+/// ratio's *denominator* is as exposed to a busy host as its numerator, which
+/// is how a ×1.241 was once reported against three re-runs at ×1.096–×1.120.
+/// Recording the context at least makes a suspect result diagnosable after the
+/// fact instead of only reproducible.
+#[derive(Serialize)]
+struct RunContext {
+    recorded_at_unix: u64,
+    available_parallelism: Option<usize>,
+    load_average: Option<String>,
+}
+
+impl RunContext {
+    fn capture() -> Self {
+        RunContext {
+            recorded_at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default(),
+            available_parallelism: std::thread::available_parallelism().ok().map(Into::into),
+            load_average: std::env::var("TOLLGATE_GATE_LOAD").ok(),
+        }
+    }
 }
 
 const BODY: &str =
@@ -211,6 +240,7 @@ async fn main() -> ExitCode {
         admitted,
         p50_overhead_ratio: ratio,
         passed,
+        run: RunContext::capture(),
     };
     println!(
         "load-gate: baseline p50 {:.1}us p99 {:.1}us | admitted p50 {:.1}us p99 {:.1}us | overhead x{:.3} (max x{:.3})",
