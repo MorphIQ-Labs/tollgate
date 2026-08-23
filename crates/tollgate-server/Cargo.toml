@@ -7,10 +7,14 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = ["postgres"]
+postgres = ["dep:tollgate-store-postgres"]
+
 [dependencies]
 tollgate-core = { path = "../tollgate-core", version = "=0.1.4", features = ["serde"] }
 tollgate-store = { path = "../tollgate-store", version = "=0.1.4", features = ["wire"] }
-tollgate-store-postgres = { path = "../tollgate-store-postgres", version = "=0.1.4" }
+tollgate-store-postgres = { path = "../tollgate-store-postgres", version = "=0.1.4", optional = true }
 axum = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true }
