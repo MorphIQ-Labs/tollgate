@@ -76,7 +76,17 @@ until it has one.
    aborted returns `WriterShutdownError` carrying a lower bound on the
    charges it was holding. A zeroed `WriterStats` is never returned for a
    task that did not report one — and, since the type is deliberately not
-   `Default`, cannot be conjured from a failure. *Tests:* client writer
+   `Default`, cannot be conjured from a failure. Those numbers are readable at
+   any time, not only from a graceful shutdown — which is precisely the case
+   where loss is least likely. They live in counters outside the task, and
+   `shutdown` returns a *snapshot of those same counters* rather than a
+   parallel tally, so the running totals and the final report cannot disagree.
+   Queue depth against its capacity makes backpressure visible before it
+   sheds; sheds are counted at `try_reserve`, the only place a refusal can
+   happen, so no embedder can forget to; and the time the sink last answered
+   separates a quiet writer from an unreachable one — a distinction `lost`
+   cannot make while the process runs, since the steady-state path retries
+   forever and declares loss only at the final flush. *Tests:* client writer
    overflow tests,
    `shutdown_flushes_in_configured_batch_sizes`,
    `shutdown_during_outage_terminates_and_reports_loss`,
@@ -84,8 +94,13 @@ until it has one.
    `shutdown_waits_for_outstanding_permit`,
    `late_permit_drop_completes_drain`,
    `drain_deadline_expiry_reports_unresolved`,
-   `panicked_writer_reports_unaccounted_charges`, and
-   `panic_after_partial_flush_counts_only_unflushed`.
+   `panicked_writer_reports_unaccounted_charges`,
+   `panic_after_partial_flush_counts_only_unflushed`,
+   `running_totals_are_readable_and_match_the_final_report`,
+   `queue_depth_rises_before_the_shed_and_sheds_are_counted`,
+   `a_failing_sink_does_not_advance_the_last_ingest_time`,
+   `rejected_events_are_visible_while_running`, and
+   `metrics_report_accounting_health_while_running`.
 
 9. **Crash leak is bounded by TTL.** A crashed lease holder strands its unspent
    units only until the lease TTL expires, after which the allocator reclaims

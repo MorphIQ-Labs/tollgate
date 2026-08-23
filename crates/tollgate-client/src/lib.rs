@@ -44,7 +44,7 @@ pub use snapshot_manager::{
 };
 pub use usage_writer::{
     UsagePermit, UsageRecorder, UsageWriter, UsageWriterConfig, UsageWriterConfigError,
-    WriterShutdownError, WriterStats,
+    WriterCounters, WriterHealth, WriterShutdownError, WriterStats,
 };
 
 /// Set a watch channel, reporting the one way it can fail.
