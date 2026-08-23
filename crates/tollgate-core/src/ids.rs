@@ -45,6 +45,25 @@ id128!(
     /// already-verified credential. How it is derived (API-key HMAC,
     /// capability subject, session id) is the embedding service's concern —
     /// by the time it reaches admission, verification has happened.
+    ///
+    /// # A caller must not be able to choose these bits
+    ///
+    /// Derive the fingerprint under a secret the caller does not hold, as the
+    /// reference embedding does with a truncated HMAC-SHA256 of the API key.
+    /// **Never key admission by a raw client-supplied token.**
+    ///
+    /// The reason is not subtle. This value selects an account's snapshot, its
+    /// lease and its rate limiter. A caller who can choose it can aim at
+    /// another tenant's entry — spending their quota, drawing on their limiter,
+    /// and being admitted under their permissions. No hashing choice defends
+    /// against that; only the derivation does.
+    ///
+    /// Because the bits are unsteerable, admission hashes them with a fast
+    /// non-cryptographic hasher rather than SipHash (see
+    /// `tollgate_admission`'s `PrincipalHasher`). That is a *consequence* of
+    /// the rule above, not an additional requirement: an embedder who breaks
+    /// it has already lost the tenant isolation SipHash was never protecting,
+    /// and would merely lose it more slowly.
     Principal
 );
 

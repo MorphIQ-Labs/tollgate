@@ -19,9 +19,28 @@ use crate::state::{
     SnapshotUpdate,
 };
 
+/// The hasher every `Principal`-keyed map in this crate uses.
+///
+/// Non-cryptographic on purpose (#9): SipHash's flooding resistance costs
+/// 15–20 ns of every request-path lookup and defends against an attack
+/// `Principal`'s own contract rules out. The argument is a property of how the
+/// key is derived, not of this crate — see [`Principal`]'s documentation,
+/// which is where an embedder who might violate it will be reading.
+///
+/// `fast` is the tier `hashbrown` picks for its own default, and `RandomState`
+/// keeps a per-process seed at no per-lookup cost, since the seed lives in the
+/// `BuildHasher` held by the map rather than being recomputed. That leaves the
+/// unpredictability as free defence in depth.
+type PrincipalHasher = foldhash::fast::RandomState;
+
+type PrincipalMap = HashMap<Principal, MapEntry, PrincipalHasher>;
+
 #[derive(Default)]
 struct GenerationWatermarks {
-    by_principal: HashMap<Principal, Generation>,
+    /// Control-plane only, and on the alias for consistency rather than for
+    /// speed: two `Principal`-keyed maps in one file disagreeing about their
+    /// hasher would read as a decision nobody made.
+    by_principal: HashMap<Principal, Generation, PrincipalHasher>,
 }
 
 impl GenerationWatermarks {
@@ -59,7 +78,7 @@ enum PreparedUpdate {
 }
 
 fn apply_prepared(
-    map: &mut HashMap<Principal, MapEntry>,
+    map: &mut PrincipalMap,
     watermarks: &mut GenerationWatermarks,
     updates: &[PreparedUpdate],
 ) {
@@ -98,7 +117,7 @@ fn apply_prepared(
 /// `moka`-backed bounded cache. Values are `Arc`-cheap by construction (the
 /// review's caution about moka cloning values on retrieval).
 pub struct MokaSnapshotMap {
-    cache: moka::sync::Cache<Principal, MapEntry>,
+    cache: moka::sync::Cache<Principal, MapEntry, PrincipalHasher>,
     watermarks: Mutex<GenerationWatermarks>,
     limiters: AccountLimiters,
 }
@@ -107,7 +126,14 @@ impl MokaSnapshotMap {
     #[must_use]
     pub fn new(max_capacity: u64) -> Self {
         MokaSnapshotMap {
-            cache: moka::sync::Cache::new(max_capacity),
+            // Same hasher as the arc-swap map, and for the same reason. It
+            // also keeps the two `snapshot_lookup` benches comparing like with
+            // like: the ~3x gap between them is the evidence for which map a
+            // deployment should pick, and it would stop measuring TinyLFU
+            // bookkeeping the moment one side hashed differently.
+            cache: moka::sync::Cache::builder()
+                .max_capacity(max_capacity)
+                .build_with_hasher(PrincipalHasher::default()),
             watermarks: Mutex::new(GenerationWatermarks::default()),
             limiters: AccountLimiters::default(),
         }
@@ -159,7 +185,7 @@ impl SnapshotMap for MokaSnapshotMap {
 /// hash lookup; writes clone the whole map, which is acceptable because they
 /// happen at control-plane frequency, not request frequency.
 pub struct ArcSwapSnapshotMap {
-    map: ArcSwap<HashMap<Principal, MapEntry>>,
+    map: ArcSwap<PrincipalMap>,
     watermarks: Mutex<GenerationWatermarks>,
     limiters: AccountLimiters,
     max_negative_entries: usize,
@@ -241,7 +267,7 @@ impl ArcSwapSnapshotMap {
     fn write(&self, updates: &[PreparedUpdate], now: Option<Timestamp>) {
         let mut watermarks = self.watermarks.lock().expect("watermarks poisoned");
         let current = self.map.load_full();
-        let mut next = HashMap::clone(&current);
+        let mut next = PrincipalMap::clone(&current);
         if let Some(now) = now {
             next.retain(
                 |_, entry| !matches!(entry, MapEntry::NegativeUntil { until } if *until <= now),
@@ -259,7 +285,7 @@ impl Default for ArcSwapSnapshotMap {
     }
 }
 
-fn trim_negatives(map: &mut HashMap<Principal, MapEntry>, max_negative_entries: usize) {
+fn trim_negatives(map: &mut PrincipalMap, max_negative_entries: usize) {
     let mut negatives: Vec<_> = map
         .iter()
         .filter_map(|(principal, entry)| match entry {
@@ -312,7 +338,7 @@ impl SnapshotMap for ArcSwapSnapshotMap {
     fn remove(&self, principal: &Principal) {
         let _watermarks = self.watermarks.lock().expect("watermarks poisoned");
         let current = self.map.load_full();
-        let mut next = HashMap::clone(&current);
+        let mut next = PrincipalMap::clone(&current);
         next.remove(principal);
         self.map.store(Arc::new(next));
     }
@@ -346,12 +372,89 @@ impl SnapshotMap for ArcSwapSnapshotMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hash::BuildHasher;
     use tollgate_core::{
         AccountId, AccountStatus, CostTable, CostUnits, PermissionBits, ResolvedLimits,
     };
 
     fn t(secs: i64) -> Timestamp {
         Timestamp::from_second(secs).unwrap()
+    }
+
+    fn hash_of(hasher: &PrincipalHasher, principal: Principal) -> u64 {
+        hasher.hash_one(principal)
+    }
+
+    /// Dropping SipHash is only sound if what replaces it still *spreads*, and
+    /// the two halves of a hash are consumed differently: hashbrown takes the
+    /// bucket index from the low bits and the control byte from the top seven.
+    /// A hasher can look fine on one and be degenerate on the other.
+    ///
+    /// This is what rules out the identity fold #9 floats as an alternative.
+    /// Truncated-HMAC principals carry entropy everywhere, so identity would
+    /// pass on them — but sequential principals, which this crate's own tests
+    /// and any integer-id embedder produce, would leave the top seven bits
+    /// constant and collapse every control byte onto one value. Both input
+    /// shapes are therefore checked, and the top bits are checked separately
+    /// rather than trusted to follow from the low ones.
+    #[test]
+    fn principal_hashing_stays_spread_for_sequential_and_random_keys() {
+        const KEYS: usize = 4_096;
+        const BUCKETS: usize = 256;
+        // Uniform over 256 buckets is 16 per bucket; 4x that is far outside
+        // anything chance produces at this size and far inside what a
+        // collapsed hash produces (4,096 in one bucket).
+        const MAX_PER_BUCKET: usize = 64;
+
+        let hasher = PrincipalHasher::default();
+        // A xorshift stand-in for truncated-HMAC principals: uniformly spread
+        // bits, generated without a dependency or a clock read.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut random = std::iter::repeat_with(move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            u128::from(state) << 64 | u128::from(state.rotate_left(31))
+        });
+
+        for (shape, principals) in [
+            (
+                "sequential",
+                (0..KEYS as u128).map(Principal).collect::<Vec<_>>(),
+            ),
+            (
+                "hmac-like",
+                (0..KEYS)
+                    .map(|_| Principal(random.next().unwrap()))
+                    .collect(),
+            ),
+        ] {
+            let mut by_low = vec![0usize; BUCKETS];
+            let mut by_top = vec![0usize; 128];
+            for principal in principals {
+                let hash = hash_of(&hasher, principal);
+                by_low[(hash as usize) % BUCKETS] += 1;
+                by_top[(hash >> 57) as usize] += 1;
+            }
+
+            let worst_low = by_low.iter().copied().max().unwrap_or(0);
+            assert!(
+                worst_low <= MAX_PER_BUCKET,
+                "{shape}: {worst_low} of {KEYS} keys landed in one of {BUCKETS} \
+                 bucket-index slots; the hash does not spread its low bits",
+            );
+            let worst_top = by_top.iter().copied().max().unwrap_or(0);
+            assert!(
+                worst_top <= MAX_PER_BUCKET,
+                "{shape}: {worst_top} of {KEYS} keys share one control byte; \
+                 the hash does not spread its top bits, so probing degrades \
+                 however well the bucket index looks",
+            );
+            assert!(
+                by_top.iter().filter(|count| **count > 0).count() > 64,
+                "{shape}: the top seven bits took too few distinct values",
+            );
+        }
     }
 
     fn snapshot(generation: u64) -> Arc<AccountSnapshot> {
