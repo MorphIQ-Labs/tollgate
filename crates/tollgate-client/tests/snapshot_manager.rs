@@ -17,7 +17,7 @@ use tollgate_client::{
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, FencingToken,
     Generation, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, Principal,
-    ResolvedLimits,
+    PublishableSnapshot, ResolvedLimits,
 };
 use tollgate_store::{
     AccountConfig, GrantPolicy, MemoryStore, SnapshotPush, SnapshotResolution, SnapshotSource,
@@ -58,6 +58,10 @@ fn snapshot(generation: u64, permissions: PermissionBits) -> Arc<AccountSnapshot
                 .build(),
         ),
     })
+}
+
+fn publishable(snapshot: Arc<AccountSnapshot>) -> PublishableSnapshot {
+    PublishableSnapshot::try_new(snapshot).expect("test snapshot limits are valid")
 }
 
 struct Fixture {
@@ -143,7 +147,7 @@ async fn settle() {
 #[tokio::test(start_paused = true)]
 async fn initial_load_gates_readiness_and_installs() {
     let store = base_store();
-    store.publish_snapshot(PRINCIPAL, snapshot(1, PermissionBits::bit(0)));
+    store.publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))));
     let fixture = fixture(store);
     stock_slot(&fixture);
 
@@ -162,14 +166,14 @@ async fn initial_load_gates_readiness_and_installs() {
 #[tokio::test(start_paused = true)]
 async fn push_update_propagates_permission_change() {
     let store = base_store();
-    store.publish_snapshot(PRINCIPAL, snapshot(1, PermissionBits::bit(0)));
+    store.publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))));
     let fixture = fixture(store.clone());
     stock_slot(&fixture);
     settle().await;
     assert_eq!(admit(&fixture), Ok(()));
 
     // The control plane strips the permission in generation 2.
-    store.publish_snapshot(PRINCIPAL, snapshot(2, PermissionBits::NONE));
+    store.publish_snapshot(PRINCIPAL, publishable(snapshot(2, PermissionBits::NONE)));
     settle().await;
     assert_eq!(admit(&fixture), Err(DenyReason::MissingPermission));
     fixture.manager.shutdown().await;
@@ -178,7 +182,7 @@ async fn push_update_propagates_permission_change() {
 #[tokio::test(start_paused = true)]
 async fn revocation_reaches_instances_via_refresh() {
     let store = base_store();
-    store.publish_snapshot(PRINCIPAL, snapshot(1, PermissionBits::bit(0)));
+    store.publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))));
     let fixture = fixture(store.clone());
     stock_slot(&fixture);
     settle().await;
@@ -192,10 +196,10 @@ async fn revocation_reaches_instances_via_refresh() {
 
     // Generation 1 is older than the retained tombstone and cannot
     // resurrect the key. A genuinely newer generation can.
-    store.publish_snapshot(PRINCIPAL, snapshot(1, PermissionBits::bit(0)));
+    store.publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))));
     settle().await;
     assert_eq!(admit(&fixture), Err(DenyReason::UnknownPrincipal));
-    store.publish_snapshot(PRINCIPAL, snapshot(2, PermissionBits::bit(0)));
+    store.publish_snapshot(PRINCIPAL, publishable(snapshot(2, PermissionBits::bit(0))));
     settle().await;
     assert_eq!(admit(&fixture), Ok(()));
     fixture.manager.shutdown().await;
@@ -212,7 +216,7 @@ async fn unknown_principal_resolves_once_published() {
     assert_eq!(admit(&fixture), Err(DenyReason::UnknownPrincipal));
 
     // Publication later is picked up by push/refresh.
-    store.publish_snapshot(PRINCIPAL, snapshot(1, PermissionBits::bit(0)));
+    store.publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))));
     settle().await;
     assert_eq!(admit(&fixture), Ok(()));
     fixture.manager.shutdown().await;
@@ -249,7 +253,9 @@ impl SnapshotSource for MutableNoPushSource {
         self.calls.fetch_add(1, Ordering::AcqRel);
         match self.mode.lock().expect("source mode poisoned").clone() {
             MutableMode::Unknown => Ok(SnapshotResolution::Unknown),
-            MutableMode::Present(snapshot) => Ok(SnapshotResolution::Present(snapshot)),
+            MutableMode::Present(snapshot) => {
+                Ok(SnapshotResolution::Present(publishable(snapshot)))
+            }
             MutableMode::Failing => Err(StoreError("injected targeted-refetch outage".into())),
         }
     }
@@ -343,7 +349,9 @@ impl SnapshotSource for ToggleSource {
         if self.fail.load(Ordering::Acquire) {
             Err(StoreError("injected snapshot outage".into()))
         } else {
-            Ok(SnapshotResolution::Present(Arc::clone(&self.snapshot)))
+            Ok(SnapshotResolution::Present(publishable(Arc::clone(
+                &self.snapshot,
+            ))))
         }
     }
 
@@ -393,7 +401,9 @@ struct FirstThenHangsSource {
 impl SnapshotSource for FirstThenHangsSource {
     async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
         if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
-            Ok(SnapshotResolution::Present(Arc::clone(&self.snapshot)))
+            Ok(SnapshotResolution::Present(publishable(Arc::clone(
+                &self.snapshot,
+            ))))
         } else {
             std::future::pending().await
         }

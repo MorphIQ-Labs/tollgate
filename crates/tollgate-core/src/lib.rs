@@ -36,6 +36,9 @@ pub use deny::DenyReason;
 pub use ids::{AccountId, FencingToken, Generation, KeyId, LeaseId, Principal, RequestId};
 pub use lease::{LeaseGrant, LocalLease};
 pub use reservation::{CancelOutcome, CommitError, Reservation};
-pub use snapshot::{AccountSnapshot, AccountStatus, PermissionBits, ResolvedLimits};
+pub use snapshot::{
+    AccountSnapshot, AccountStatus, PermissionBits, PublishableSnapshot, ResolvedLimits,
+    SnapshotValidationError,
+};
 pub use units::CostUnits;
 pub use usage::UsageEvent;

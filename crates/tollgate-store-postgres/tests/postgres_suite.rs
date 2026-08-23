@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
-    PermissionBits, Principal, RequestId, ResolvedLimits, UsageEvent,
+    PermissionBits, Principal, PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, CreateAccountError, GrantPolicy, LeaseAllocator,
@@ -33,6 +33,10 @@ fn t(secs: i64) -> Timestamp {
 
 const TTL: SignedDuration = SignedDuration::from_secs(60);
 const ACCOUNT: AccountId = AccountId(1);
+
+fn publishable(snapshot: Arc<AccountSnapshot>) -> PublishableSnapshot {
+    PublishableSnapshot::try_new(snapshot).expect("test snapshot limits are valid")
+}
 
 fn full_grant_policy() -> GrantPolicy {
     GrantPolicy {
@@ -532,7 +536,7 @@ async fn publish_pushes_to_subscribers_only_when_the_row_changes() {
     let mut updates = SnapshotSource::subscribe(&*store);
 
     let snapshot = |generation: u64| {
-        Arc::new(AccountSnapshot {
+        publishable(Arc::new(AccountSnapshot {
             account_id: ACCOUNT,
             key_id: None,
             generation: Generation(generation),
@@ -545,7 +549,7 @@ async fn publish_pushes_to_subscribers_only_when_the_row_changes() {
                 rate_burst_units: 1_000,
             },
             cost_table: Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
-        })
+        }))
     };
 
     store
@@ -629,7 +633,7 @@ async fn snapshot_publish_fetch_and_generation_monotonicity() {
     };
     let principal = Principal(42);
     let snapshot = |generation: u64| {
-        Arc::new(AccountSnapshot {
+        publishable(Arc::new(AccountSnapshot {
             account_id: ACCOUNT,
             key_id: None,
             generation: Generation(generation),
@@ -642,7 +646,7 @@ async fn snapshot_publish_fetch_and_generation_monotonicity() {
                 rate_burst_units: 1_000,
             },
             cost_table: Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
-        })
+        }))
     };
 
     assert!(matches!(
@@ -702,6 +706,49 @@ async fn snapshot_publish_fetch_and_generation_monotonicity() {
             .publish_snapshot(principal, snapshot(i64::MAX as u64 + 1))
             .await
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn legacy_invalid_snapshot_is_rejected_on_read() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    let principal = Principal(47);
+    let pool = corruption_pool().await;
+    let snapshot = serde_json::json!({
+        "account_id": 1,
+        "key_id": null,
+        "generation": 1,
+        "status": "Active",
+        "valid_until": "2100-01-01T00:00:00Z",
+        "permissions": 1,
+        "limits": {
+            "max_items_per_request": 64,
+            "rate_units_per_second": 1000,
+            "rate_burst_units": 113
+        },
+        "cost_table": {
+            "fixed_request": 50,
+            "minimum_charge": 50,
+            "weights": [1]
+        }
+    });
+    sqlx::query(
+        "INSERT INTO tollgate_snapshots (principal, generation, snapshot, deleted)
+         VALUES ($1, 1, $2, FALSE)",
+    )
+    .bind(principal.0.to_be_bytes().to_vec())
+    .bind(snapshot)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let error = store.snapshot(principal).await.unwrap_err();
+    assert!(
+        error.0.contains("invalid stored snapshot") && error.0.contains("exceeding the burst"),
+        "unexpected error: {error}"
     );
 }
 

@@ -1,1 +1,2 @@
 import Tollgate.SnapshotCache
+import Tollgate.SnapshotLimits

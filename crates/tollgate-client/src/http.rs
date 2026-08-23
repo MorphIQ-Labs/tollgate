@@ -18,7 +18,8 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, CostUnits, FencingToken, LeaseGrant, LeaseId, Principal, UsageEvent,
+    AccountId, AccountSnapshot, CostUnits, FencingToken, LeaseGrant, LeaseId, Principal,
+    PublishableSnapshot, UsageEvent,
 };
 use tollgate_store::wire::{AcquireRequest, IngestRequest, Problem, ReleaseRequest};
 use tollgate_store::{
@@ -193,7 +194,9 @@ impl SnapshotSource for HttpStore {
             .json()
             .await
             .map_err(|e| StoreError(format!("http: {e}")))?;
-        Ok(SnapshotResolution::Present(Arc::new(snapshot)))
+        let snapshot = PublishableSnapshot::try_new(Arc::new(snapshot))
+            .map_err(|error| StoreError(format!("invalid snapshot from server: {error}")))?;
+        Ok(SnapshotResolution::Present(snapshot))
     }
 
     fn subscribe(&self) -> broadcast::Receiver<SnapshotPush> {

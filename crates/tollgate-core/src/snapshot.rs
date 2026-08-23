@@ -14,6 +14,7 @@ use jiff::Timestamp;
 use crate::cost_table::CostTable;
 use crate::deny::DenyReason;
 use crate::ids::{AccountId, Generation, KeyId};
+use crate::units::CostUnits;
 
 /// Administrative state of the account at compile time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +92,118 @@ pub struct AccountSnapshot {
     pub permissions: PermissionBits,
     pub limits: ResolvedLimits,
     pub cost_table: Arc<CostTable>,
+}
+
+/// Why a compiled snapshot cannot be published.
+///
+/// The validation domain is the full `u64` configuration space. Arithmetic
+/// is checked in the same `CostTable` implementation the request path uses;
+/// overflow is a refusal, never a wrapped low quote (INVARIANTS #11/#16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotValidationError {
+    /// The most expensive registered operation overflows at the batch cap.
+    QuoteOverflow {
+        operation_index: usize,
+        max_items: u64,
+    },
+    /// A request admitted by the batch cap can never fit in the whole burst.
+    QuoteExceedsBurst {
+        operation_index: usize,
+        max_quote: CostUnits,
+        burst_units: CostUnits,
+    },
+}
+
+impl std::fmt::Display for SnapshotValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotValidationError::QuoteOverflow {
+                operation_index,
+                max_items,
+            } => write!(
+                f,
+                "operation {operation_index} cost overflows at the batch cap of {max_items} items"
+            ),
+            SnapshotValidationError::QuoteExceedsBurst {
+                operation_index,
+                max_quote,
+                burst_units,
+            } => write!(
+                f,
+                "operation {operation_index} can quote {max_quote} units, exceeding the burst of {burst_units} units"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotValidationError {}
+
+/// Evidence that an account snapshot satisfies publication-time invariants.
+///
+/// The raw [`AccountSnapshot`] intentionally remains constructible: the
+/// request path keeps `UnpriceableUnderLimits` as a defensive runtime
+/// backstop. Store publication and source boundaries exchange this proof so
+/// an invalid snapshot cannot reach them by caller convention alone.
+#[derive(Debug, Clone)]
+pub struct PublishableSnapshot(Arc<AccountSnapshot>);
+
+impl PublishableSnapshot {
+    pub fn try_new(snapshot: Arc<AccountSnapshot>) -> Result<Self, SnapshotValidationError> {
+        let Some((operation_index, maximum_weight)) = snapshot.cost_table.maximum_weight() else {
+            // With no registered operation the table cannot produce a quote,
+            // so no request can witness a quote/burst inconsistency.
+            return Ok(PublishableSnapshot(snapshot));
+        };
+        let max_quote = snapshot
+            .cost_table
+            .quote_weight(maximum_weight, snapshot.limits.max_items_per_request)
+            .map_err(|_| SnapshotValidationError::QuoteOverflow {
+                operation_index,
+                max_items: snapshot.limits.max_items_per_request,
+            })?
+            .total;
+        let burst_units = CostUnits(snapshot.limits.rate_burst_units);
+        if max_quote > burst_units {
+            return Err(SnapshotValidationError::QuoteExceedsBurst {
+                operation_index,
+                max_quote,
+                burst_units,
+            });
+        }
+        Ok(PublishableSnapshot(snapshot))
+    }
+
+    #[must_use]
+    pub fn as_snapshot(&self) -> &AccountSnapshot {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> Arc<AccountSnapshot> {
+        self.0
+    }
+}
+
+impl std::ops::Deref for PublishableSnapshot {
+    type Target = AccountSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_snapshot()
+    }
+}
+
+impl AsRef<AccountSnapshot> for PublishableSnapshot {
+    fn as_ref(&self) -> &AccountSnapshot {
+        self.as_snapshot()
+    }
+}
+
+impl TryFrom<Arc<AccountSnapshot>> for PublishableSnapshot {
+    type Error = SnapshotValidationError;
+
+    fn try_from(snapshot: Arc<AccountSnapshot>) -> Result<Self, Self::Error> {
+        PublishableSnapshot::try_new(snapshot)
+    }
 }
 
 impl AccountSnapshot {
@@ -185,5 +298,93 @@ mod tests {
             s.admit(t(0), PermissionBits::bit(0).union(PermissionBits::bit(1))),
             Err(DenyReason::MissingPermission)
         );
+    }
+
+    fn priced_snapshot(
+        fixed: u64,
+        minimum: u64,
+        weights: &[(usize, u64)],
+        max_items: u64,
+        burst: u64,
+    ) -> Arc<AccountSnapshot> {
+        struct Op(usize);
+        impl crate::cost_table::OpIndex for Op {
+            fn index(&self) -> usize {
+                self.0
+            }
+        }
+
+        let mut builder = CostTable::builder(CostUnits(fixed), CostUnits(minimum));
+        for (index, weight) in weights {
+            builder = builder.weight(&Op(*index), CostUnits(*weight));
+        }
+        Arc::new(AccountSnapshot {
+            limits: ResolvedLimits {
+                max_items_per_request: max_items,
+                rate_units_per_second: 1_000,
+                rate_burst_units: burst,
+            },
+            cost_table: Arc::new(builder.build()),
+            ..snapshot(AccountStatus::Active, t(1_000))
+        })
+    }
+
+    #[test]
+    fn publication_uses_the_largest_registered_weight() {
+        let snapshot = priced_snapshot(10, 1, &[(0, 2), (3, 7), (5, 4)], 10, 79);
+        assert_eq!(
+            PublishableSnapshot::try_new(snapshot).unwrap_err(),
+            SnapshotValidationError::QuoteExceedsBurst {
+                operation_index: 3,
+                max_quote: CostUnits(80),
+                burst_units: CostUnits(79),
+            }
+        );
+    }
+
+    #[test]
+    fn publication_reports_first_operation_when_maximum_weights_tie() {
+        assert_eq!(
+            PublishableSnapshot::try_new(priced_snapshot(0, 0, &[(2, 7), (5, 7)], 10, 69))
+                .unwrap_err(),
+            SnapshotValidationError::QuoteExceedsBurst {
+                operation_index: 2,
+                max_quote: CostUnits(70),
+                burst_units: CostUnits(69),
+            }
+        );
+    }
+
+    #[test]
+    fn publication_accepts_a_worst_case_quote_equal_to_the_burst() {
+        PublishableSnapshot::try_new(priced_snapshot(10, 1, &[(0, 7)], 10, 80)).unwrap();
+    }
+
+    #[test]
+    fn publication_rejects_a_minimum_above_the_burst() {
+        assert!(matches!(
+            PublishableSnapshot::try_new(priced_snapshot(0, 50, &[(0, 0)], 64, 49)),
+            Err(SnapshotValidationError::QuoteExceedsBurst {
+                max_quote: CostUnits(50),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn publication_rejects_worst_case_quote_overflow() {
+        assert_eq!(
+            PublishableSnapshot::try_new(priced_snapshot(1, 0, &[(0, u64::MAX)], 2, u64::MAX,))
+                .unwrap_err(),
+            SnapshotValidationError::QuoteOverflow {
+                operation_index: 0,
+                max_items: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn publication_allows_a_table_with_no_registered_operations() {
+        PublishableSnapshot::try_new(priced_snapshot(100, 100, &[], 64, 0)).unwrap();
     }
 }

@@ -83,6 +83,18 @@ impl CostTable {
             Some(Some(w)) => *w,
             _ => return Err(QuoteError::UnknownOperation { index }),
         };
+        self.quote_weight(per_item, items)
+    }
+
+    /// Quote one already-resolved weight. Keeping the arithmetic here makes
+    /// publication-time validation and request-time quoting share the exact
+    /// checked formula rather than maintaining parallel implementations.
+    #[inline]
+    pub(crate) fn quote_weight(
+        &self,
+        per_item: CostUnits,
+        items: u64,
+    ) -> Result<CostQuote, QuoteError> {
         let variable = per_item.checked_mul(items).ok_or(QuoteError::Overflow)?;
         let subtotal = self
             .fixed_request
@@ -93,6 +105,23 @@ impl CostTable {
             fixed: self.fixed_request,
             variable,
         })
+    }
+
+    /// The largest registered per-item weight and its operation index.
+    ///
+    /// This O(n) scan is used only while validating a compiled snapshot for
+    /// publication. Request-time lookup remains direct-indexed and O(1).
+    pub(crate) fn maximum_weight(&self) -> Option<(usize, CostUnits)> {
+        let mut maximum = None;
+        for (index, weight) in self.weights.iter().enumerate() {
+            let Some(weight) = *weight else {
+                continue;
+            };
+            if maximum.is_none_or(|(_, current)| weight > current) {
+                maximum = Some((index, weight));
+            }
+        }
+        maximum
     }
 
     #[must_use]

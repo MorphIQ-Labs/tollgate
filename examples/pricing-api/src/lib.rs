@@ -41,7 +41,7 @@ use tollgate_client::{
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, Generation,
-    OpIndex, PermissionBits, Principal, RequestId, ResolvedLimits,
+    OpIndex, PermissionBits, Principal, PublishableSnapshot, RequestId, ResolvedLimits,
 };
 use tollgate_store::{AccountConfig, GrantPolicy, MemoryStore};
 
@@ -239,7 +239,7 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
     let compile_snapshot = {
         let clock = Arc::clone(&clock);
         move |generation: u64| {
-            Arc::new(AccountSnapshot {
+            let snapshot = Arc::new(AccountSnapshot {
                 account_id: DEMO_ACCOUNT,
                 key_id: None,
                 generation: Generation(generation),
@@ -259,7 +259,9 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
                         .weight(&Op::Price, CostUnits(1))
                         .build(),
                 ),
-            })
+            });
+            PublishableSnapshot::try_new(snapshot)
+                .expect("example pricing schedule must fit inside its burst")
         }
     };
 

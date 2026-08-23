@@ -141,7 +141,7 @@ impl AdminStore for FlakyReclaimStore {
     async fn publish_snapshot(
         &self,
         principal: tollgate_core::Principal,
-        snapshot: Arc<tollgate_core::AccountSnapshot>,
+        snapshot: tollgate_core::PublishableSnapshot,
     ) -> Result<(), StoreError> {
         AdminStore::publish_snapshot(&*self.inner, principal, snapshot).await
     }

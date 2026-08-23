@@ -6,8 +6,9 @@ use jiff::Timestamp;
 use proptest::prelude::*;
 
 use tollgate_core::{
-    AccountId, CancelOutcome, CostTable, CostUnits, FencingToken, LeaseGrant, LeaseId, LocalLease,
-    OpIndex, QuoteError, Reservation,
+    AccountId, AccountSnapshot, AccountStatus, CancelOutcome, CostTable, CostUnits, FencingToken,
+    Generation, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, PublishableSnapshot,
+    QuoteError, Reservation, ResolvedLimits, SnapshotValidationError,
 };
 
 struct Op(usize);
@@ -66,6 +67,62 @@ proptest! {
             }
             Err(QuoteError::Overflow) => prop_assert!(exact > u128::from(u64::MAX)),
             Err(other) => prop_assert!(false, "unexpected quote error: {:?}", other),
+        }
+    }
+
+    /// Snapshot publication agrees with an independent exact-arithmetic
+    /// oracle for the worst registered operation at the configured batch cap
+    /// (INVARIANTS.md #16).
+    #[test]
+    fn snapshot_publication_matches_u128_worst_case_oracle(
+        fixed in any::<u64>(),
+        minimum in any::<u64>(),
+        weights in proptest::collection::vec(proptest::option::of(any::<u64>()), 0..16),
+        max_items in any::<u64>(),
+        burst in any::<u64>(),
+    ) {
+        let mut builder = CostTable::builder(CostUnits(fixed), CostUnits(minimum));
+        for (index, weight) in weights.iter().enumerate() {
+            if let Some(weight) = weight {
+                builder = builder.weight(&Op(index), CostUnits(*weight));
+            }
+        }
+        let snapshot = Arc::new(AccountSnapshot {
+            account_id: AccountId(1),
+            key_id: None,
+            generation: Generation(1),
+            status: AccountStatus::Active,
+            valid_until: t(10_000),
+            permissions: PermissionBits::ALL,
+            limits: ResolvedLimits {
+                max_items_per_request: max_items,
+                rate_units_per_second: 1,
+                rate_burst_units: burst,
+            },
+            cost_table: Arc::new(builder.build()),
+        });
+
+        let Some(max_weight) = weights.iter().flatten().max().copied() else {
+            prop_assert!(PublishableSnapshot::try_new(snapshot).is_ok());
+            return Ok(());
+        };
+        let exact = u128::from(fixed) + u128::from(max_weight) * u128::from(max_items);
+        let result = PublishableSnapshot::try_new(snapshot);
+
+        if exact > u128::from(u64::MAX) {
+            let is_overflow = matches!(
+                result,
+                Err(SnapshotValidationError::QuoteOverflow { .. })
+            );
+            prop_assert!(is_overflow);
+        } else if (exact as u64).max(minimum) > burst {
+            let exceeds_burst = matches!(
+                result,
+                Err(SnapshotValidationError::QuoteExceedsBurst { .. })
+            );
+            prop_assert!(exceeds_burst);
+        } else {
+            prop_assert!(result.is_ok());
         }
     }
 

@@ -1,14 +1,12 @@
 //! The storage traits and their shared vocabulary.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId,
-    Principal, UsageEvent,
+    AccountId, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId, Principal,
+    PublishableSnapshot, UsageEvent,
 };
 
 /// Backend failure unrelated to domain rules (connection lost, transaction
@@ -202,7 +200,7 @@ pub trait LeaseAllocator: Send + Sync {
 #[derive(Debug, Clone)]
 pub enum SnapshotResolution {
     /// A compiled snapshot is currently authoritative.
-    Present(Arc<AccountSnapshot>),
+    Present(PublishableSnapshot),
     /// The principal existed but was revoked at this generation. Sources must
     /// retain this watermark so a delayed older positive cannot resurrect it.
     Revoked { generation: Generation },
@@ -276,7 +274,7 @@ pub trait AdminStore: Send + Sync {
     async fn publish_snapshot(
         &self,
         principal: Principal,
-        snapshot: Arc<AccountSnapshot>,
+        snapshot: PublishableSnapshot,
     ) -> Result<(), StoreError>;
     async fn remove_snapshot(&self, principal: Principal) -> Result<(), StoreError>;
 }
