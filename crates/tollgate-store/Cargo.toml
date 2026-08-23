@@ -8,7 +8,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-tollgate-core = { path = "../tollgate-core", version = "=0.1.3" }
+tollgate-core = { path = "../tollgate-core", version = "=0.1.4" }
 async-trait = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true, optional = true }

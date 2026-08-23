@@ -5,6 +5,16 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/MorphIQ-Labs/tollgate/compare/v0.1.3...v0.1.4) - 2026-08-23
+
+### Added
+
+- *(admission)* #37 count admissions and denials without touching the request-path budget
+
+### Other
+
+- *(client)* batch usage events with recv_many
+
 ## [0.1.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.1.2...v0.1.3) - 2026-08-23
 
 ### Added
