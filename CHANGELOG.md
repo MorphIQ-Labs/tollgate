@@ -5,6 +5,13 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.1.1...v0.1.2) - 2026-08-23
+
+### Fixed
+
+- *(admission)* #40 distinguish an unadmittable schedule from throttling
+- *(client)* #34 #42 bound background store calls and surface release refusals
+
 ## [0.1.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.1.0...v0.1.1) - 2026-08-23
 
 ### Fixed
