@@ -182,11 +182,21 @@ impl AppRuntime {
             // evidence that nothing was lost or left unresolved, and a dead
             // writer must never look like one.
             match writer.shutdown().await {
-                Ok(stats) => eprintln!(
-                    "usage-writer shutdown: {} accepted, {} duplicate, {} rejected, {} lost, {} unresolved",
-                    stats.accepted, stats.duplicate, stats.rejected, stats.lost, stats.unresolved
+                Ok(stats) => tracing::info!(
+                    accepted = stats.accepted,
+                    duplicate = stats.duplicate,
+                    rejected = stats.rejected,
+                    lost = stats.lost,
+                    unresolved = stats.unresolved,
+                    "usage-writer shutdown"
                 ),
-                Err(error) => eprintln!("usage-writer shutdown FAILED: {error}"),
+                Err(error) => {
+                    tracing::error!(
+                        unaccounted = error.unaccounted,
+                        panicked = error.panicked,
+                        "usage-writer shutdown failed"
+                    );
+                }
             }
         }
         if let Some(manager) = self.manager {
@@ -194,15 +204,11 @@ impl AppRuntime {
             // released count is the operator's evidence that leases came
             // back, not just the absence of bad news.
             let report = manager.shutdown().await;
-            eprintln!(
-                "lease-manager shutdown: {} released, {} abandoned to TTL reclaim{}",
-                report.released,
-                report.abandoned,
-                if report.task_died {
-                    " (task died; counts are what is known)"
-                } else {
-                    ""
-                }
+            tracing::info!(
+                released = report.released,
+                abandoned = report.abandoned,
+                task_died = report.task_died,
+                "lease-manager shutdown; abandoned leases settle at TTL reclaim"
             );
         }
         if let Some(snapshots) = self.snapshots {

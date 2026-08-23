@@ -198,6 +198,23 @@ until it has one.
     `hung_release_times_out_and_reparks`, and
     `invalid_pool_config_is_rejected_before_connecting`.
 
+19. **A control-plane failure is never silent.** Every fallible call a
+    background plane makes either succeeds, is reported through a typed
+    result the caller can act on, or emits a structured event — never
+    nothing. This is what makes "fail closed, the background plane recovers"
+    checkable in production rather than merely intended: retrying forever is
+    correct behavior, so without a report an unreachable backend is
+    indistinguishable from an idle one. Level follows consequence: a refusal
+    the instance can absorb is `debug`, one that leaves it denying every
+    request is `warn`, and accounting divergence or a dead task is `error`.
+    Enforcement is mechanical, not conventional — the library crates deny
+    `clippy::let_underscore_must_use`, so discarding a fallible call fails
+    the build unless an `#[allow]` states why there is nothing to say.
+    *Tests:* `refill_failure_with_an_empty_slot_warns`,
+    `healthy_refill_emits_no_warning` (the converse: a healthy plane stays
+    quiet, or the signal is worthless), and
+    `usage_sink_outage_and_recovery_are_reported`.
+
 Ledger roles (context for 1 and 7): leases **bound** spend; usage events **are**
 the billing record; reconciliation compares the two and steady-state drift is
 zero.

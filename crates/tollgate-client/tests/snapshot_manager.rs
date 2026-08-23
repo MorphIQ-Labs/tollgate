@@ -479,9 +479,58 @@ async fn shutdown_cancels_in_flight_snapshot_fetches() {
     )
     .unwrap();
     tokio::task::yield_now().await;
-    tokio::time::timeout(std::time::Duration::from_millis(100), manager.shutdown())
+    let report = tokio::time::timeout(std::time::Duration::from_millis(100), manager.shutdown())
         .await
         .expect("shutdown must cancel outstanding source futures");
+    assert!(
+        !report.task_died,
+        "cancelling a hung fetch is a clean stop, not a death"
+    );
+}
+
+/// A source that panics kills only its own fetch task: the manager keeps
+/// sweeping and still reports a clean stop. The panic is not swallowed — it
+/// surfaces as an event (issue #36) — but it must not be mistaken for the
+/// manager itself dying, which is what `task_died` is for.
+#[tokio::test]
+async fn a_panicking_fetch_does_not_kill_the_manager() {
+    struct PanickingSource {
+        push: tokio::sync::broadcast::Sender<SnapshotPush>,
+    }
+
+    #[async_trait]
+    impl SnapshotSource for PanickingSource {
+        async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
+            panic!("source exploded");
+        }
+
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
+            self.push.subscribe()
+        }
+    }
+
+    let (push, _keep) = tokio::sync::broadcast::channel(4);
+    let manager = SnapshotManager::spawn(
+        Arc::new(PanickingSource { push }),
+        Arc::new(ArcSwapSnapshotMap::new()),
+        SlotRegistry::new(),
+        Arc::new(ManualClock::new(t(0))),
+        SnapshotManagerConfig {
+            principals: vec![PRINCIPAL],
+            refresh_interval: std::time::Duration::from_millis(10),
+            negative_ttl: SignedDuration::from_secs(30),
+            retry_backoff: std::time::Duration::from_millis(5),
+            max_concurrent_fetches: 1,
+        },
+    )
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let report = manager.shutdown().await;
+    assert!(
+        !report.task_died,
+        "the sweep survives a fetch that panicked; only the fetch died"
+    );
 }
 
 #[test]

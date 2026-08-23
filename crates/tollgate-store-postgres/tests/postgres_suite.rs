@@ -519,6 +519,55 @@ async fn straggler_usage_after_release_is_billed() {
     assert_eq!(report.rejected, 1);
 }
 
+/// A publish that changed the row must reach subscribers, and one that was
+/// superseded must not: push latency is the difference between propagating
+/// in milliseconds and waiting for the next refresh interval.
+#[tokio::test]
+async fn publish_pushes_to_subscribers_only_when_the_row_changes() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    let principal = Principal(4242);
+    let mut updates = SnapshotSource::subscribe(&*store);
+
+    let snapshot = |generation: u64| {
+        Arc::new(AccountSnapshot {
+            account_id: ACCOUNT,
+            key_id: None,
+            generation: Generation(generation),
+            status: AccountStatus::Active,
+            valid_until: t(10_000),
+            permissions: PermissionBits::ALL,
+            limits: ResolvedLimits {
+                max_items_per_request: 64,
+                rate_units_per_second: 1_000,
+                rate_burst_units: 1_000,
+            },
+            cost_table: Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+        })
+    };
+
+    store
+        .publish_snapshot(principal, snapshot(5))
+        .await
+        .unwrap();
+    let pushed = updates.recv().await.expect("a new generation is pushed");
+    assert_eq!(pushed.principal, principal);
+
+    // Superseded: the row is unchanged, so there is nothing to tell anyone.
+    store
+        .publish_snapshot(principal, snapshot(4))
+        .await
+        .unwrap();
+    store.remove_snapshot(principal).await.unwrap();
+    let pushed = updates.recv().await.expect("the revocation is pushed");
+    assert!(
+        matches!(pushed.resolution, SnapshotResolution::Revoked { .. }),
+        "the stale publish must not have produced a push of its own"
+    );
+}
+
 /// Review finding #7 (mirrors the memory suite).
 #[tokio::test]
 async fn recreate_account_is_refused_and_nondestructive() {

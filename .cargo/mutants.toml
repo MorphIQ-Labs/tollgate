@@ -11,4 +11,11 @@ minimum_test_timeout = 60
 exclude_re = [
   # Formatting has no authorization, accounting, or operational semantics.
   "impl (std::)?fmt::(Debug|Display)",
+  # A binary's `main` is process wiring — env parsing, subscriber install,
+  # and a call into library code that has its own tests. Nothing running
+  # in-process can observe its body being replaced, so a mutant there is
+  # unkillable rather than untested: the harness never runs `main`. Logic
+  # worth pinning is therefore extracted out of it and tested directly
+  # (`is_loopback`, `redact_dsn`, `init_tracing` in tollgate-server).
+  "replace main -> ",
 ]

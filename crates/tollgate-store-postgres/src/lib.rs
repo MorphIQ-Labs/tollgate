@@ -165,6 +165,21 @@ impl PostgresStore {
     }
 
     /// Test/reset helper: drop all quota rows (not the schema).
+    /// Broadcast a control-plane change to in-process subscribers. No
+    /// receivers is not a failure — a pull still observes the change — but
+    /// how many instances the push reached is the difference between
+    /// propagating in milliseconds and propagating at the next refresh, so
+    /// it is reported rather than discarded.
+    fn push_to_subscribers(&self, push: SnapshotPush) {
+        let principal = push.principal;
+        let subscribers = self.push.send(push).unwrap_or(0);
+        tracing::debug!(
+            principal = principal.0,
+            subscribers,
+            "snapshot pushed to subscribers"
+        );
+    }
+
     pub async fn truncate_all(&self) -> Result<(), StoreError> {
         sqlx::raw_sql(
             "TRUNCATE tollgate_usage_events, tollgate_leases, tollgate_snapshots, tollgate_accounts CASCADE",
@@ -783,7 +798,7 @@ impl AdminStore for PostgresStore {
         .await
         .map_err(storage)?;
         if result.rows_affected() > 0 {
-            let _ = self.push.send(SnapshotPush {
+            self.push_to_subscribers(SnapshotPush {
                 principal,
                 resolution: SnapshotResolution::Present(snapshot),
             });
@@ -804,7 +819,7 @@ impl AdminStore for PostgresStore {
             let generation = u64::try_from(row.get::<i64, _>(0))
                 .map(Generation)
                 .map_err(|_| StoreError("stored snapshot generation is negative".into()))?;
-            let _ = self.push.send(SnapshotPush {
+            self.push_to_subscribers(SnapshotPush {
                 principal,
                 resolution: SnapshotResolution::Revoked { generation },
             });

@@ -46,6 +46,28 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 sha2 = "0.10"
 subtle = "2"
 
+# Observability. `tracing` is a facade the control-plane libraries emit
+# through; it already builds as a transitive dependency of sqlx, axum and
+# reqwest, so taking it directly costs no additional crate. Only binaries
+# (and event-capture tests) take `tracing-subscriber`: a library emits, an
+# application decides where output goes. tollgate-core and
+# tollgate-admission take neither — the request path stays free of logging
+# exactly as it stays free of I/O.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Discarding a fallible call is how every silent failure in issue #36 got
+# written: `let _ = fallible()` reads as deliberate and reviews as harmless.
+# The library crates deny it, so the next one must either handle the error or
+# say — in an `#[allow]` with a reason — why there is nothing to say.
+# tollgate-core and tollgate-admission opt in too: they have no I/O to
+# discard, so the rule costs them nothing and the exemption would only invite
+# drift. The example service and the CI gate binaries opt out: their
+# discarded results are load-driver and report-printing plumbing, where the
+# rule would buy noise rather than failure visibility.
+[workspace.lints.clippy]
+let_underscore_must_use = "deny"
+
 # Deployment profile for load-gate runs and production builds; kept separate so
 # Criterion benches retain the default calibrated release codegen policy.
 [profile.production]

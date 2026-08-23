@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use jiff::SignedDuration;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+use tracing::Instrument as _;
 
 use tollgate_admission::{LeaseSlot, SnapshotMap, SnapshotUpdate};
 use tollgate_core::{AccountId, Generation, Principal};
@@ -117,6 +118,15 @@ impl SnapshotManagerConfig {
     }
 }
 
+/// What a snapshot-manager shutdown observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotManagerReport {
+    /// The task panicked or was aborted rather than stopping on request. Its
+    /// snapshots stopped refreshing at that moment, whatever the map still
+    /// holds.
+    pub task_died: bool,
+}
+
 /// Handle to the snapshot task.
 pub struct SnapshotManager {
     shutdown: watch::Sender<bool>,
@@ -135,15 +145,11 @@ impl SnapshotManager {
         config.validate()?;
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (ready_tx, ready) = watch::channel(false);
-        let handle = tokio::spawn(run(
-            source,
-            map,
-            slots,
-            clock,
-            config,
-            shutdown_rx,
-            ready_tx,
-        ));
+        let principals = config.principals.len();
+        let handle = tokio::spawn(
+            run(source, map, slots, clock, config, shutdown_rx, ready_tx)
+                .instrument(tracing::info_span!("snapshot_manager", principals)),
+        );
         Ok(SnapshotManager {
             shutdown,
             ready,
@@ -159,10 +165,24 @@ impl SnapshotManager {
         self.ready.clone()
     }
 
-    pub async fn shutdown(mut self) {
-        let _ = self.shutdown.send(true);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.await;
+    /// Signal the task and wait for it to stop, reporting whether it got
+    /// there on its own.
+    ///
+    /// Its two peers already return what they know at shutdown; this one
+    /// returned nothing, so a manager that panicked mid-refresh was visible
+    /// only as snapshots quietly going stale — indistinguishable from a
+    /// control plane with nothing to say (issue #36).
+    pub async fn shutdown(mut self) -> SnapshotManagerReport {
+        crate::signal(&self.shutdown, true, "snapshot-manager shutdown");
+        let Some(handle) = self.handle.take() else {
+            return SnapshotManagerReport { task_died: true };
+        };
+        match handle.await {
+            Ok(()) => SnapshotManagerReport { task_died: false },
+            Err(error) => {
+                tracing::error!(%error, "snapshot manager task died before shutdown completed");
+                SnapshotManagerReport { task_died: true }
+            }
         }
     }
 }
@@ -223,7 +243,13 @@ fn update_ready(
     resolutions: &HashMap<Principal, Resolution>,
     clock: &Arc<dyn Clock>,
 ) {
-    let _ = ready.send(is_ready(principals, resolutions, clock.now()));
+    let now_ready = is_ready(principals, resolutions, clock.now());
+    // Readiness transitions are the operator-visible half of INVARIANTS #10;
+    // report the edges, not every recomputation.
+    if ready.borrow().ne(&now_ready) {
+        tracing::info!(ready = now_ready, "snapshot readiness changed");
+    }
+    crate::signal(ready, now_ready, "snapshot-manager readiness");
 }
 
 fn next_readiness_check(
@@ -327,8 +353,16 @@ async fn refresh_all_cancellable(
         tokio::pin!(readiness_check);
         tokio::select! {
             joined = tasks.join_next() => {
-                if let Some(Ok(result)) = joined {
-                    results.push(result);
+                match joined {
+                    Some(Ok(result)) => results.push(result),
+                    // A fetch task that panicked leaves its principal simply
+                    // absent from the results, indistinguishable from one
+                    // that failed cleanly — so the panic itself must be said
+                    // out loud.
+                    Some(Err(error)) => {
+                        tracing::error!(%error, "snapshot fetch task died");
+                    }
+                    None => {}
                 }
                 if let Some(principal) = pending.next() {
                     let source = Arc::clone(source);
@@ -422,7 +456,16 @@ async fn refresh_all_cancellable(
                     generation: None,
                 });
             }
-            Err(_) => {}
+            // The principal keeps whatever resolution it already had and
+            // stays pending for the next sweep. Without this event a source
+            // that is down looks exactly like one with nothing to say.
+            Err(error) => {
+                tracing::warn!(
+                    principal = principal.0,
+                    %error,
+                    "snapshot fetch failed; principal keeps its previous resolution"
+                );
+            }
         }
     }
     if !updates.is_empty() {

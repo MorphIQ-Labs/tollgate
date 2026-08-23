@@ -40,8 +40,22 @@ pub use lease_manager::{
 };
 pub use snapshot_manager::{
     SlotRegistry, SnapshotManager, SnapshotManagerConfig, SnapshotManagerConfigError,
+    SnapshotManagerReport,
 };
 pub use usage_writer::{
     UsagePermit, UsageRecorder, UsageWriter, UsageWriterConfig, UsageWriterConfigError,
     WriterShutdownError, WriterStats,
 };
+
+/// Set a watch channel, reporting the one way it can fail.
+///
+/// A `watch` send fails only when every receiver has been dropped, which
+/// means the observer this signal was for is already gone. That is never
+/// actionable by itself — the caller's own report carries the outcome — but
+/// it is a breadcrumb, and discarding it silently is the habit issue #36
+/// exists to break.
+pub(crate) fn signal(tx: &tokio::sync::watch::Sender<bool>, value: bool, signal: &'static str) {
+    if tx.send(value).is_err() {
+        tracing::debug!(signal, value, "no receivers remain for signal");
+    }
+}

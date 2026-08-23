@@ -15,10 +15,14 @@ async-trait = { workspace = true }
 jiff = { workspace = true }
 reqwest = { workspace = true, optional = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+# Event capture: the tests assert that a failure is reported, so the events
+# are behavior rather than decoration. Subscribers stay out of the library.
+tracing-subscriber = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 
 [features]
@@ -26,3 +30,6 @@ uuid = { version = "1", features = ["v4"] }
 # the "via-server" topology. Off by default: the direct-store topology
 # needs none of it.
 http = ["dep:reqwest", "tollgate-store/wire"]
+
+[lints]
+workspace = true
