@@ -128,6 +128,21 @@ clippy:
     - rustc --version
     - cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
+# `rust-toolchain.toml` pins the development toolchain and overrides a
+# container's default toolchain. Select the declared minimum explicitly so
+# this job cannot silently install and test with the newer pinned compiler.
+msrv:
+  extends: .merge-request
+  stage: check
+  image: rust:1.89.0-slim
+  interruptible: true
+  variables:
+    RUSTUP_TOOLCHAIN: "1.89.0"
+  script:
+    - rustc --version
+    - cargo --version
+    - cargo check --locked --workspace --all-features --all-targets
+
 test:
   extends: .merge-request
   stage: test
