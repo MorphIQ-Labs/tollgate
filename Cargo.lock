@@ -2383,6 +2383,7 @@ version = "0.2.7"
 dependencies = [
  "arc-swap",
  "criterion",
+ "foldhash 0.2.0",
  "governor",
  "jiff",
  "moka",

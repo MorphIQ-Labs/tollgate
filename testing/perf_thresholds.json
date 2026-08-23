@@ -22,30 +22,34 @@
       "threshold_ns": 80.0
     },
     {
+      "_comment": "Retightened for the foldhash principal hasher (#9). Paired A/B in one session: SipHash 23.6/23.6/23.7ns, foldhash 13.9/13.8ns — a 41% cut, and the largest single saving on the request path.",
       "id": "admission/snapshot_lookup_arc_swap",
-      "target_ns": 25.0,
-      "threshold_ns": 60.0
+      "target_ns": 20.0,
+      "threshold_ns": 45.0
     },
     {
+      "_comment": "Same hasher change (#9), smaller share of the total: SipHash 74.5/74.6/74.6ns, foldhash 69.5/69.5ns. Moka's TinyLFU bookkeeping dominates its lookup, which is the point of carrying both.",
       "id": "admission/snapshot_lookup_moka",
-      "target_ns": 100.0,
-      "threshold_ns": 250.0
+      "target_ns": 90.0,
+      "threshold_ns": 220.0
     },
     {
+      "_comment": "#9: SipHash 115.1/115.7ns, foldhash 99.6/99.5ns. The 15.9ns saving exceeds the 9.8ns measured on the isolated lookup; the remainder is not accounted for by the hash alone.",
       "id": "admission/full_check",
-      "target_ns": 110.0,
-      "threshold_ns": 250.0
+      "target_ns": 105.0,
+      "threshold_ns": 220.0
     },
     {
+      "_comment": "Deliberately unchanged by #9. The foldhash side measured 2774/2784ns against SipHash's 3375-4085ns, but that baseline's own spread is 20%, so there is no improvement here this manifest can defend. Contended scheduling, not hashing, is what this benchmark is about.",
       "id": "admission/full_check_contended_8",
       "target_ns": 4000.0,
       "threshold_ns": 10000.0
     },
     {
-      "_comment": "Added with the request-path counters (#37): the cheapest refusal there is, so the per-outcome tally is the largest share of it. Measured 19.7-22.8ns across runs; target sits above that spread and threshold carries the same headroom as the lookup entries.",
+      "_comment": "Added with the request-path counters (#37) as the cheapest refusal there is: one map lookup and a return, so hashing was the largest share of it. Retightened by #9 — SipHash 20.0/19.8/19.9ns, foldhash 14.7/14.7ns.",
       "id": "admission/full_check_denied",
-      "target_ns": 25.0,
-      "threshold_ns": 50.0
+      "target_ns": 18.0,
+      "threshold_ns": 40.0
     }
   ]
 }

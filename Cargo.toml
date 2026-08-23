@@ -43,6 +43,13 @@ async-trait = "0.1"
 # waiter is parked — which is exactly our case, since the refill task is
 # normally waiting.
 atomic-waker = "1.1"
+# The request path's map hasher (#9). `Principal` is a fingerprint of an
+# already-verified credential, so its bits cannot be steered by a caller and
+# SipHash's flooding resistance buys nothing there. foldhash is a
+# zero-dependency leaf crate already compiled into tollgate-admission's own
+# graph — governor -> hashbrown -> foldhash — so taking it directly adds no
+# package, and it is the hasher hashbrown itself picked as its default.
+foldhash = "0.2"
 moka = { version = "0.12", features = ["sync"] }
 governor = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
