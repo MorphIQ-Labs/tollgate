@@ -71,6 +71,93 @@ async fn refill_installs_lease_on_cold_start() {
     manager.shutdown().await;
 }
 
+/// Issue #10: refill used to begin only when the poll timer fired, so a burst
+/// could drain a lease between ticks and deny against an account that is
+/// funded. The poll interval here is a minute — far longer than the test runs
+/// — so a tick cannot explain the rotation. Only the crossing debit can.
+#[tokio::test(start_paused = true)]
+async fn refill_begins_on_the_crossing_debit_not_the_next_tick() {
+    let store = store(10_000);
+    let slot = LeaseSlot::empty();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let manager = LeaseManager::spawn(
+        store.clone(),
+        Arc::clone(&slot),
+        clock,
+        LeaseManagerConfig {
+            poll_interval: std::time::Duration::from_secs(60),
+            ..manager_config()
+        },
+    )
+    .unwrap();
+
+    // The cold-start acquire still comes from the interval's immediate first
+    // tick — there is no lease to spend, so nothing could have signalled.
+    settle().await;
+    let first = slot.load().expect("cold start installs a lease");
+    let first_id = first.grant().lease_id;
+
+    // Cross low water: 1000 - 800 = 200, at or below the 250 mark.
+    first.try_debit(CostUnits(800), t(0)).unwrap();
+    assert!(first.needs_refill());
+    drop(first);
+
+    settle().await;
+    let second = slot.load().expect("a replacement must be installed");
+    assert_ne!(
+        second.grant().lease_id,
+        first_id,
+        "the crossing debit must have started a refill well inside the \
+         60s poll interval; on the polling-only design this is still the \
+         original lease"
+    );
+    manager.shutdown().await;
+}
+
+/// The user-visible bug, and the witness for INVARIANTS.md #6: sustained
+/// spending against a funded account must not start denying just because a
+/// rotation fell due between ticks.
+#[tokio::test(start_paused = true)]
+async fn a_burst_across_a_rotation_never_denies_a_funded_account() {
+    let store = store(1_000_000);
+    let slot = LeaseSlot::empty();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let manager = LeaseManager::spawn(
+        store.clone(),
+        Arc::clone(&slot),
+        clock,
+        LeaseManagerConfig {
+            // Long enough that polling alone cannot keep this burst funded:
+            // the 1000-unit grants below are spent in ~13 iterations.
+            poll_interval: std::time::Duration::from_secs(60),
+            ..manager_config()
+        },
+    )
+    .unwrap();
+    settle().await;
+
+    let mut denied = 0;
+    let mut spent = 0u64;
+    for _ in 0..200 {
+        match slot.load() {
+            Some(lease) => match lease.try_debit(CostUnits(75), t(0)) {
+                Ok(()) => spent += 75,
+                Err(_) => denied += 1,
+            },
+            None => denied += 1,
+        }
+        // Let the refill task act on any request the debit above raised.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    assert_eq!(
+        denied, 0,
+        "a funded account was refused {denied} times across rotations"
+    );
+    assert_eq!(spent, 200 * 75);
+    manager.shutdown().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn adaptive_tail_grant_does_not_rotate_while_unspent() {
     let store = MemoryStore::new(GrantPolicy::default()).unwrap();
