@@ -55,7 +55,9 @@
 //! as `rejected` at the sink rather than silent loss.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
+use jiff::{SignedDuration, Timestamp};
 use tokio::sync::{mpsc, watch};
 use tracing::Instrument as _;
 
@@ -128,16 +130,196 @@ impl UsageWriterConfig {
     }
 }
 
-/// Charges that entered the queue and have no billing outcome yet. Held
-/// outside the writer task, so a task that dies still leaves the count of
-/// what it was carrying (INVARIANTS.md #8).
-type Unaccounted = Arc<std::sync::atomic::AtomicU64>;
+/// A counter written from the request path, on a cache line of its own.
+///
+/// `#[repr(align(64))]` rounds the type's size up to its alignment, so no two
+/// of these — and nothing else in the struct — can share a line. The counters
+/// the writer task alone updates need no such treatment: one writer cannot
+/// contend with itself.
+#[repr(align(64))]
+#[derive(Debug)]
+struct Contended(AtomicU64);
+
+impl Contended {
+    const fn zero() -> Self {
+        Contended(AtomicU64::new(0))
+    }
+
+    #[inline]
+    fn bump(&self, by: u64) {
+        self.0.fetch_add(by, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Every accounting number the writer produces, held outside the task.
+///
+/// The tally used to be a `WriterStats` local on the task's stack, materialised
+/// only when the task exited — so a process that crashed, was killed, or simply
+/// kept running reported nothing, and `lost` was observable only after the one
+/// kind of shutdown where loss is least likely (#38). Living out here it is
+/// readable at any time, and it survives the task's death exactly as the
+/// unaccounted count always has (INVARIANTS.md #8).
+///
+/// These are also the *only* copy: [`UsageWriter::shutdown`] returns a snapshot
+/// of these counters rather than a parallel tally, so the running totals and the
+/// final report cannot disagree.
+///
+/// `Relaxed` throughout, like the admission counters: nothing is published
+/// through them, and atomicity — no lost increments — is all they need.
+#[derive(Debug)]
+pub struct WriterCounters {
+    // Written only by the writer task, between batches.
+    accepted: AtomicU64,
+    duplicate: AtomicU64,
+    rejected: AtomicU64,
+    lost: AtomicU64,
+    unresolved: AtomicU64,
+    /// When the sink last answered an ingest, in milliseconds since the epoch.
+    /// `i64::MIN` means "never": zero cannot be the sentinel, because the epoch
+    /// itself is a legitimate timestamp that tests use routinely.
+    last_ingest_ms: AtomicI64,
+    // Written from the request path, by as many cores as serve requests.
+    unaccounted: Contended,
+    shed: Contended,
+}
+
+impl WriterCounters {
+    #[must_use]
+    pub const fn new() -> Self {
+        WriterCounters {
+            accepted: AtomicU64::new(0),
+            duplicate: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+            lost: AtomicU64::new(0),
+            unresolved: AtomicU64::new(0),
+            last_ingest_ms: AtomicI64::new(i64::MIN),
+            unaccounted: Contended::zero(),
+            shed: Contended::zero(),
+        }
+    }
+
+    /// The sink answered. Recorded even when every event in the batch was
+    /// refused: `rejected` is an answer, and what this timestamp distinguishes
+    /// is a reachable sink from an unreachable one.
+    fn record_ingest(&self, report: &tollgate_store::IngestReport, at: Timestamp) {
+        self.accepted.fetch_add(report.accepted, Ordering::Relaxed);
+        self.duplicate
+            .fetch_add(report.duplicate, Ordering::Relaxed);
+        self.rejected.fetch_add(report.rejected, Ordering::Relaxed);
+        self.last_ingest_ms
+            .store(at.as_millisecond(), Ordering::Relaxed);
+    }
+
+    fn record_lost(&self, events: u64) {
+        self.lost.fetch_add(events, Ordering::Relaxed);
+    }
+
+    fn set_unresolved(&self, permits: u64) {
+        self.unresolved.store(permits, Ordering::Relaxed);
+    }
+
+    /// One charge has entered the queue with no billing outcome yet.
+    fn enqueued(&self) {
+        self.unaccounted.bump(1);
+    }
+
+    /// `events` charges have been given a billing outcome — delivered or
+    /// reported lost — so they no longer count as unaccounted.
+    fn settled(&self, events: u64) {
+        self.unaccounted.0.fetch_sub(events, Ordering::Relaxed);
+    }
+
+    /// A backpressure refusal, counted where it happens rather than by the
+    /// caller: `try_reserve` is the only way to be refused, so counting here
+    /// cannot be forgotten by an embedder.
+    fn record_shed(&self) {
+        self.shed.bump(1);
+    }
+
+    /// The five numbers [`UsageWriter::shutdown`] reports.
+    #[must_use]
+    pub fn stats(&self) -> WriterStats {
+        WriterStats {
+            accepted: self.accepted.load(Ordering::Relaxed),
+            duplicate: self.duplicate.load(Ordering::Relaxed),
+            rejected: self.rejected.load(Ordering::Relaxed),
+            lost: self.lost.load(Ordering::Relaxed),
+            unresolved: self.unresolved.load(Ordering::Relaxed),
+        }
+    }
+
+    fn last_ingest_at(&self) -> Option<Timestamp> {
+        let millis = self.last_ingest_ms.load(Ordering::Relaxed);
+        (millis != i64::MIN)
+            .then(|| Timestamp::from_millisecond(millis).ok())
+            .flatten()
+    }
+
+    /// Everything readable while the writer runs, given the queue's shape —
+    /// which only a holder of the channel can supply.
+    fn health(&self, queue_depth: usize, queue_capacity: usize) -> WriterHealth {
+        WriterHealth {
+            stats: self.stats(),
+            unaccounted: self.unaccounted.get(),
+            shed: self.shed.get(),
+            queue_depth,
+            queue_capacity,
+            last_ingest_at: self.last_ingest_at(),
+        }
+    }
+}
+
+impl Default for WriterCounters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A reading of the writer's accounting health, safe to serialise.
+///
+/// Note what `lost` does *not* tell you at runtime: the steady-state path
+/// retries a failing sink forever, so nothing is declared lost until the final
+/// flush gives up. A healthy-but-cut-off process reports `lost == 0` for its
+/// whole life. The leading indicators are [`WriterHealth::ingest_age`], a
+/// `queue_depth` approaching `queue_capacity`, and `stats.rejected` — which the
+/// sink has already refused, and which is bounded billing loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriterHealth {
+    /// The same five numbers a clean shutdown returns, read live.
+    pub stats: WriterStats,
+    /// Charges in the queue with no billing outcome yet.
+    pub unaccounted: u64,
+    /// Requests refused for want of queue capacity (INVARIANTS.md #8).
+    pub shed: u64,
+    /// Slots currently held by queued events and outstanding permits.
+    pub queue_depth: usize,
+    /// The shed point: `queue_depth` reaching this denies the next request.
+    pub queue_capacity: usize,
+    /// When the sink last answered, or `None` if it never has.
+    pub last_ingest_at: Option<Timestamp>,
+}
+
+impl WriterHealth {
+    /// How long since the sink last answered — the signal that separates "no
+    /// traffic" from "the sink has been unreachable for twenty minutes".
+    /// `None` while no ingest has ever succeeded, which is also the state of a
+    /// freshly started process.
+    #[must_use]
+    pub fn ingest_age(&self, now: Timestamp) -> Option<SignedDuration> {
+        self.last_ingest_at.map(|at| now.duration_since(at))
+    }
+}
 
 /// Cheap-to-clone handle for request handlers.
 #[derive(Clone)]
 pub struct UsageRecorder {
     tx: mpsc::Sender<UsageEvent>,
-    unaccounted: Unaccounted,
+    counters: Arc<WriterCounters>,
 }
 
 impl UsageRecorder {
@@ -148,9 +330,12 @@ impl UsageRecorder {
         match self.tx.clone().try_reserve_owned() {
             Ok(permit) => Ok(UsagePermit {
                 permit,
-                unaccounted: Arc::clone(&self.unaccounted),
+                counters: Arc::clone(&self.counters),
             }),
-            Err(_) => Err(DenyReason::AccountingBackpressure),
+            Err(_) => {
+                self.counters.record_shed();
+                Err(DenyReason::AccountingBackpressure)
+            }
         }
     }
 
@@ -159,6 +344,20 @@ impl UsageRecorder {
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()
     }
+
+    /// The writer's accounting health, readable at any time.
+    ///
+    /// Deliberately on the *recorder*: a service holds this handle in its
+    /// request state, while the [`UsageWriter`] is usually moved into whatever
+    /// owns shutdown — so exposing the numbers only there would put them out of
+    /// reach of the endpoint that needs to report them.
+    #[must_use]
+    pub fn health(&self) -> WriterHealth {
+        self.counters.health(
+            self.tx.max_capacity() - self.tx.capacity(),
+            self.tx.max_capacity(),
+        )
+    }
 }
 
 /// One reserved accounting slot. Send the committed request's event with
@@ -166,7 +365,7 @@ impl UsageRecorder {
 /// zero-charge path) releases the slot.
 pub struct UsagePermit {
     permit: mpsc::OwnedPermit<UsageEvent>,
-    unaccounted: Unaccounted,
+    counters: Arc<WriterCounters>,
 }
 
 impl UsagePermit {
@@ -174,8 +373,7 @@ impl UsagePermit {
         // Counted from the moment it enters the queue until the writer gives
         // it a billing outcome; a writer that dies in between is therefore
         // able to say how many charges it was carrying.
-        self.unaccounted
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.counters.enqueued();
         self.permit.send(event);
     }
 }
@@ -240,7 +438,11 @@ impl std::error::Error for WriterShutdownError {}
 pub struct UsageWriter {
     shutdown: watch::Sender<bool>,
     handle: Option<tokio::task::JoinHandle<WriterStats>>,
-    unaccounted: Unaccounted,
+    counters: Arc<WriterCounters>,
+    /// Only to read the queue's depth for [`UsageWriter::health`] — weak, so
+    /// this handle never keeps the channel open by itself.
+    queue: mpsc::WeakSender<UsageEvent>,
+    queue_capacity: usize,
 }
 
 impl UsageWriter {
@@ -255,17 +457,17 @@ impl UsageWriter {
         // the deadline without holding the channel open itself.
         let weak = tx.downgrade();
         let (shutdown, shutdown_rx) = watch::channel(false);
-        let unaccounted: Unaccounted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counters = Arc::new(WriterCounters::new());
         let handle = tokio::spawn(
             run(
                 Writer {
                     sink,
                     clock,
                     config,
-                    unaccounted: Arc::clone(&unaccounted),
+                    counters: Arc::clone(&counters),
                 },
                 rx,
-                weak,
+                weak.clone(),
                 shutdown_rx,
             )
             // One writer serves every account, so the span carries the
@@ -279,14 +481,28 @@ impl UsageWriter {
         Ok((
             UsageRecorder {
                 tx,
-                unaccounted: Arc::clone(&unaccounted),
+                counters: Arc::clone(&counters),
             },
             UsageWriter {
                 shutdown,
                 handle: Some(handle),
-                unaccounted,
+                counters,
+                queue: weak,
+                queue_capacity: config.queue_capacity,
             },
         ))
+    }
+
+    /// The writer's accounting health, readable at any time — the same numbers
+    /// [`UsageRecorder::health`] reports, for an embedder that holds this half.
+    #[must_use]
+    pub fn health(&self) -> WriterHealth {
+        let depth = self
+            .queue
+            .upgrade()
+            .map(|tx| tx.max_capacity() - tx.capacity())
+            .unwrap_or(0);
+        self.counters.health(depth, self.queue_capacity)
     }
 
     /// Flush everything already enqueued, then stop. Call this *before*
@@ -311,7 +527,7 @@ impl UsageWriter {
 
     fn died(&self, panicked: bool) -> WriterShutdownError {
         WriterShutdownError {
-            unaccounted: self.unaccounted.load(std::sync::atomic::Ordering::Relaxed),
+            unaccounted: self.counters.unaccounted.get(),
             panicked,
         }
     }
@@ -341,15 +557,14 @@ struct Writer {
     sink: Arc<dyn UsageSink>,
     clock: Arc<dyn Clock>,
     config: UsageWriterConfig,
-    unaccounted: Unaccounted,
+    counters: Arc<WriterCounters>,
 }
 
 impl Writer {
     /// Every event in `batch` now has a billing outcome, so it no longer
     /// counts against what a dying writer would be holding.
     fn account_for(&self, batch: &[UsageEvent]) {
-        self.unaccounted
-            .fetch_sub(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.counters.settled(batch.len() as u64);
     }
 }
 
@@ -360,7 +575,6 @@ async fn run(
     mut shutdown: watch::Receiver<bool>,
 ) -> WriterStats {
     let config = writer.config;
-    let mut stats = WriterStats::ZERO;
     let max_batch = config.max_batch;
     let mut batch: Vec<UsageEvent> = Vec::with_capacity(max_batch);
 
@@ -368,7 +582,7 @@ async fn run(
         // Level check at every loop boundary: a shutdown observed anywhere
         // below (including inside the retry backoff) lands here.
         if *shutdown.borrow() {
-            return final_flush(&writer, &mut rx, &weak, &mut batch, stats).await;
+            return final_flush(&writer, &mut rx, &weak, &mut batch).await;
         }
 
         let deadline = tokio::time::sleep(config.flush_interval);
@@ -400,15 +614,15 @@ async fn run(
 
         match outcome {
             FillOutcome::Stop => {
-                return final_flush(&writer, &mut rx, &weak, &mut batch, stats).await;
+                return final_flush(&writer, &mut rx, &weak, &mut batch).await;
             }
             FillOutcome::Flush => {
                 // Retry until delivered or shutdown interrupts; either way
                 // the loop-top level check decides what happens next.
-                flush_retrying(&writer, &mut batch, &mut stats, &mut shutdown).await;
+                flush_retrying(&writer, &mut batch, &mut shutdown).await;
                 if shutdown.has_changed().is_err() {
                     // Sender gone: same stop path as above.
-                    return final_flush(&writer, &mut rx, &weak, &mut batch, stats).await;
+                    return final_flush(&writer, &mut rx, &weak, &mut batch).await;
                 }
             }
         }
@@ -420,14 +634,13 @@ async fn run(
 async fn flush_retrying(
     writer: &Writer,
     batch: &mut Vec<UsageEvent>,
-    stats: &mut WriterStats,
     shutdown: &mut watch::Receiver<bool>,
 ) {
     let Writer {
         sink,
         clock,
         config,
-        ..
+        counters,
     } = writer;
     // An outage is a *duration*, not an event: retrying forever is the
     // designed behavior, so the only way it becomes visible is by reporting
@@ -438,7 +651,11 @@ async fn flush_retrying(
         // A sink that hangs is indistinguishable from one that is merely slow,
         // and neither may park this task: the timeout turns both into the
         // ordinary retry path.
-        match tokio::time::timeout(config.ingest_timeout, sink.ingest(batch, clock.now())).await {
+        // The same instant the batch is ingested with is the one recorded as
+        // the last time the sink answered, so the health reading and the
+        // ledger agree about when this batch happened.
+        let now = clock.now();
+        match tokio::time::timeout(config.ingest_timeout, sink.ingest(batch, now)).await {
             Ok(Ok(report)) => {
                 if let Some((began, attempts)) = outage {
                     tracing::info!(
@@ -447,9 +664,7 @@ async fn flush_retrying(
                         "usage sink recovered"
                     );
                 }
-                stats.accepted += report.accepted;
-                stats.duplicate += report.duplicate;
-                stats.rejected += report.rejected;
+                counters.record_ingest(&report, now);
                 writer.account_for(batch);
                 batch.clear();
                 return;
@@ -511,7 +726,6 @@ async fn final_flush(
     rx: &mut mpsc::Receiver<UsageEvent>,
     weak: &mpsc::WeakSender<UsageEvent>,
     batch: &mut Vec<UsageEvent>,
-    mut stats: WriterStats,
 ) -> WriterStats {
     let config = &writer.config;
     let max_batch = config.max_batch;
@@ -539,11 +753,11 @@ async fn final_flush(
         // event resolves a permit, so the finite permit set bounds the loop.
         if batch.is_empty() {
             if expired {
-                stats.unresolved = outstanding_permits(weak);
+                writer.counters.set_unresolved(outstanding_permits(weak));
             }
-            return stats;
+            return writer.counters.stats();
         }
-        flush_bounded(writer, batch, &mut stats, deadline).await;
+        flush_bounded(writer, batch, deadline).await;
     }
 }
 
@@ -553,14 +767,13 @@ async fn final_flush(
 async fn flush_bounded(
     writer: &Writer,
     batch: &mut Vec<UsageEvent>,
-    stats: &mut WriterStats,
     deadline: tokio::time::Instant,
 ) {
     let Writer {
         sink,
         clock,
         config,
-        ..
+        counters,
     } = writer;
     const FINAL_FLUSH_ATTEMPTS: u32 = 3;
     let mut delivered = false;
@@ -569,11 +782,10 @@ async fn flush_bounded(
         // timeout, and the drain as a whole may not exceed its deadline. A
         // timed-out call is a failed attempt — never a silent success.
         let attempt_deadline = deadline.min(tokio::time::Instant::now() + config.ingest_timeout);
-        match tokio::time::timeout_at(attempt_deadline, sink.ingest(batch, clock.now())).await {
+        let now = clock.now();
+        match tokio::time::timeout_at(attempt_deadline, sink.ingest(batch, now)).await {
             Ok(Ok(report)) => {
-                stats.accepted += report.accepted;
-                stats.duplicate += report.duplicate;
-                stats.rejected += report.rejected;
+                counters.record_ingest(&report, now);
                 delivered = true;
                 break;
             }
@@ -587,7 +799,7 @@ async fn flush_bounded(
         }
     }
     if !delivered {
-        stats.lost += batch.len() as u64;
+        counters.record_lost(batch.len() as u64);
     }
     // Delivered or lost, the batch has been reported either way.
     writer.account_for(batch);

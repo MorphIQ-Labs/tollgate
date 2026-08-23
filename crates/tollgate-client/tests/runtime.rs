@@ -274,6 +274,203 @@ fn writer_config(capacity: usize) -> UsageWriterConfig {
     }
 }
 
+/// Issue #38: the accounting numbers used to exist only as a local on the
+/// writer task's stack, so a process that kept running — or died — reported
+/// nothing. They are now readable at any time, and `shutdown` reports the very
+/// same counters, so the running totals and the final report cannot disagree.
+#[tokio::test(start_paused = true)]
+async fn running_totals_are_readable_and_match_the_final_report() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualClock::new(t(100)));
+    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(64)).unwrap();
+
+    // Nothing has happened yet: an ingest age of `None` is how a freshly
+    // started writer differs from one whose sink has gone quiet.
+    let health = recorder.health();
+    assert_eq!(health.stats, tollgate_client::WriterStats::ZERO);
+    assert_eq!(health.last_ingest_at, None);
+    assert_eq!(health.ingest_age(t(100)), None);
+    assert_eq!(health.queue_capacity, 64);
+
+    for i in 0..6u128 {
+        let request = if i == 5 { 0 } else { i };
+        recorder
+            .try_reserve()
+            .unwrap()
+            .record(event(request, 10, &lease));
+    }
+    settle().await;
+
+    // Read while the task is still running — the whole point of the issue.
+    let mid_flight = recorder.health();
+    assert_eq!(mid_flight.stats.accepted, 5);
+    assert_eq!(mid_flight.stats.duplicate, 1);
+    assert_eq!(mid_flight.stats.lost, 0);
+    assert_eq!(
+        mid_flight.unaccounted, 0,
+        "every event has a billing outcome once flushed"
+    );
+    assert_eq!(
+        mid_flight.last_ingest_at,
+        Some(t(100)),
+        "the sink answered, at the instant the batch was ingested with"
+    );
+    assert_eq!(
+        mid_flight.ingest_age(t(160)),
+        Some(SignedDuration::from_secs(60))
+    );
+
+    let stats = writer.shutdown().await.unwrap();
+    assert_eq!(
+        stats, mid_flight.stats,
+        "the final report is a read of the same counters, not a second tally"
+    );
+}
+
+/// Backpressure must be visible *before* it sheds, which is what the queue
+/// gauge is for; and the shed itself is counted where it happens, so an
+/// embedder cannot forget to.
+#[tokio::test(start_paused = true)]
+async fn queue_depth_rises_before_the_shed_and_sheds_are_counted() {
+    let store = store(10_000);
+    let clock = Arc::new(ManualClock::new(t(0)));
+    // Capacity 2, and the permits are held rather than sent, so the queue
+    // stays full and the writer cannot drain it.
+    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(2)).unwrap();
+
+    assert_eq!(recorder.health().queue_depth, 0);
+    let first = recorder.try_reserve().unwrap();
+    assert_eq!(recorder.health().queue_depth, 1, "a held permit is depth");
+    // The writer half reports the same queue, through a weak handle that must
+    // not itself keep the channel open. Asserting the depth here — not just
+    // that it is nonzero — pins the occupancy arithmetic on both sides.
+    assert_eq!(writer.health().queue_depth, 1);
+    assert_eq!(writer.health().queue_capacity, 2);
+
+    let second = recorder.try_reserve().unwrap();
+    let full = recorder.health();
+    assert_eq!(full.queue_depth, full.queue_capacity);
+    assert_eq!(full.shed, 0, "full is not yet shed");
+    assert_eq!(writer.health().queue_depth, 2);
+
+    assert_eq!(
+        recorder.try_reserve().err(),
+        Some(DenyReason::AccountingBackpressure)
+    );
+    assert_eq!(recorder.health().shed, 1);
+    assert_eq!(
+        recorder.try_reserve().err(),
+        Some(DenyReason::AccountingBackpressure)
+    );
+    assert_eq!(recorder.health().shed, 2);
+
+    drop(first);
+    drop(second);
+    // The permits were reserved and dropped, never sent: nothing was billed,
+    // and a shed is not a charge that went missing.
+    let stats = writer.shutdown().await.unwrap();
+    assert_eq!(stats, tollgate_client::WriterStats::ZERO);
+}
+
+/// The signal that separates "quiet" from "the sink has been down for twenty
+/// minutes": a failing sink must not advance the last-answered time, however
+/// many attempts it makes.
+#[tokio::test(start_paused = true)]
+async fn a_failing_sink_does_not_advance_the_last_ingest_time() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
+    // Never recovers on its own: the outage lasts until this test ends it.
+    let sink = Arc::new(FlakySink {
+        inner: store.clone(),
+        failures_left: AtomicU32::new(u32::MAX),
+    });
+    let clock = Arc::new(ManualClock::new(t(500)));
+    let (recorder, writer) =
+        UsageWriter::spawn(sink.clone(), clock.clone(), writer_config(64)).unwrap();
+
+    recorder.try_reserve().unwrap().record(event(1, 10, &lease));
+    // Twenty minutes of retries, all failing.
+    settle().await;
+    clock.advance(SignedDuration::from_secs(1_200));
+    settle().await;
+    let during = recorder.health();
+    assert_eq!(
+        during.last_ingest_at, None,
+        "a sink that has never answered leaves no timestamp to age"
+    );
+    assert_eq!(during.stats.accepted, 0);
+    assert_eq!(
+        during.unaccounted, 1,
+        "the charge is still in the queue with no billing outcome"
+    );
+
+    // Recovery: the sink answers, and only then does the time advance.
+    sink.failures_left.store(0, Ordering::Relaxed);
+    settle().await;
+    let after = recorder.health();
+    assert_eq!(after.stats.accepted, 1);
+    assert_eq!(after.last_ingest_at, Some(t(1_700)));
+    assert_eq!(after.unaccounted, 0);
+
+    // A recovered outage is a clean run by the time shutdown reports it —
+    // which is exactly why the age above, not `lost`, is the runtime signal.
+    let stats = writer.shutdown().await.unwrap();
+    assert_eq!(stats.accepted, 1);
+    assert_eq!(stats.lost, 0);
+}
+
+/// `rejected` is bounded billing loss the sink has already refused, and the
+/// issue singles it out because nothing surfaced it before shutdown. It is a
+/// runtime signal now.
+#[tokio::test(start_paused = true)]
+async fn rejected_events_are_visible_while_running() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(64)).unwrap();
+
+    // A fencing token the allocator never issued: the sink refuses it.
+    let mut stale = event(1, 10, &lease);
+    stale.fencing_token = tollgate_core::FencingToken(lease.fencing_token.0 + 99);
+    recorder.try_reserve().unwrap().record(stale);
+    settle().await;
+
+    let health = recorder.health();
+    assert_eq!(health.stats.rejected, 1);
+    assert_eq!(health.stats.accepted, 0);
+    assert_eq!(
+        health.unaccounted, 0,
+        "refused is still an outcome; it is not left unaccounted"
+    );
+    let stats = writer.shutdown().await.unwrap();
+    assert_eq!(stats.rejected, 1);
+}
+
 #[tokio::test(start_paused = true)]
 async fn writer_flushes_batches_idempotently() {
     let store = store(10_000);

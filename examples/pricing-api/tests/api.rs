@@ -219,6 +219,68 @@ async fn metrics_separate_admissions_from_each_kind_of_refusal() {
     runtime.shutdown().await;
 }
 
+/// Issue #38: the accounting numbers were returned once, from a graceful
+/// shutdown — the one case where loss is least likely. They are readable
+/// while the service runs now, and they agree with the admission counters
+/// about backpressure, so the two views cannot drift into contradicting each
+/// other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_report_accounting_health_while_running() {
+    let (router, runtime) = build_app(100_000, true);
+    wait_ready(&router).await;
+
+    let before = metrics(&router).await;
+    let accounting = &before["accounting"];
+    assert_eq!(accounting["accepted"], 0);
+    assert_eq!(accounting["lost"], 0);
+    assert_eq!(accounting["shed"], 0);
+    assert!(
+        accounting["queue_capacity"].as_u64().unwrap() > 0,
+        "the shed point must be visible, not implied"
+    );
+    assert!(
+        accounting["last_ingest_at"].is_null(),
+        "nothing has been billed yet"
+    );
+
+    for _ in 0..3 {
+        let (status, _) = call(&router, Some(DEMO_API_KEY), price_body(1)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    // The writer flushes on its own interval; poll until the charges land
+    // rather than sleeping a fixed amount.
+    let mut after = metrics(&router).await;
+    for _ in 0..200 {
+        if after["accounting"]["accepted"].as_u64() == Some(3) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        after = metrics(&router).await;
+    }
+
+    let accounting = &after["accounting"];
+    assert_eq!(
+        accounting["accepted"], 3,
+        "three billed charges, visible without shutting anything down"
+    );
+    assert_eq!(accounting["rejected"], 0);
+    assert_eq!(accounting["unaccounted"], 0, "all three have an outcome");
+    assert!(
+        accounting["last_ingest_at"].is_string(),
+        "the sink has answered, so there is a time to age from"
+    );
+    assert!(accounting["ingest_age_seconds"].as_i64().is_some());
+
+    // The two backpressure counters are different views of one event: the
+    // service's deny vocabulary, and the accounting subsystem's own tally.
+    assert_eq!(
+        accounting["shed"], after["denials"]["accounting_backpressure"],
+        "the deny vocabulary and the queue's own count must agree"
+    );
+
+    runtime.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn not_ready_until_lease_arrives() {
     let (router, runtime) = build_app(100_000, true);

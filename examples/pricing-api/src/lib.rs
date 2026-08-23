@@ -440,6 +440,42 @@ pub struct Metrics {
     /// expiry. Paired with `lease_remaining`, since a lease can be refused
     /// for either reason.
     pub lease_usable_until: Option<String>,
+    /// Billing health, absent only when admission is disabled (the load-gate
+    /// baseline runs no accounting at all).
+    pub accounting: Option<Accounting>,
+}
+
+/// What the usage writer has done with the charges handed to it — readable at
+/// any time, not only from a graceful shutdown (#38).
+#[derive(Debug, Serialize)]
+pub struct Accounting {
+    /// Events the sink recorded.
+    pub accepted: u64,
+    /// Events whose request id the sink had already recorded — idempotent
+    /// replay, not loss (INVARIANTS.md #7).
+    pub duplicate: u64,
+    /// Events the sink *refused*: unknown lease, fencing mismatch, settled
+    /// lease. Bounded billing loss, and the number reconciliation watches.
+    pub rejected: u64,
+    /// Events a final flush could not deliver. Note this stays zero while the
+    /// process runs — the steady-state path retries a failing sink forever, so
+    /// loss is only declared at shutdown. It is not the runtime alarm; the
+    /// three fields below are.
+    pub lost: u64,
+    /// Charges queued with no billing outcome yet.
+    pub unaccounted: u64,
+    /// Requests refused for want of queue capacity (INVARIANTS.md #8).
+    pub shed: u64,
+    /// Queue occupancy against its shed point: backpressure is visible here
+    /// *before* it starts refusing requests.
+    pub queue_depth: usize,
+    pub queue_capacity: usize,
+    /// When the sink last answered, and how long ago. `null` means it never
+    /// has — a fresh process, or one that has never reached its sink.
+    pub last_ingest_at: Option<String>,
+    /// The signal that separates "no traffic" from "the sink has been
+    /// unreachable for twenty minutes".
+    pub ingest_age_seconds: Option<i64>,
 }
 
 /// The counters are read off the engine, not the request path: this handler
@@ -448,6 +484,7 @@ pub struct Metrics {
 async fn metrics(State(state): State<Arc<AppState>>) -> Json<Metrics> {
     let counters = state.engine.counters().snapshot();
     let lease = state.slot.load();
+    let now = Timestamp::now();
     Json(Metrics {
         admitted: counters.admitted,
         units_admitted: counters.units_admitted,
@@ -455,6 +492,21 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Json<Metrics> {
         denials: counters.denials_by_name().collect(),
         lease_remaining: lease.as_ref().map(|lease| lease.remaining().get()),
         lease_usable_until: lease.map(|lease| lease.usable_until().to_string()),
+        accounting: state.recorder.as_ref().map(|recorder| {
+            let health = recorder.health();
+            Accounting {
+                accepted: health.stats.accepted,
+                duplicate: health.stats.duplicate,
+                rejected: health.stats.rejected,
+                lost: health.stats.lost,
+                unaccounted: health.unaccounted,
+                shed: health.shed,
+                queue_depth: health.queue_depth,
+                queue_capacity: health.queue_capacity,
+                last_ingest_at: health.last_ingest_at.map(|at| at.to_string()),
+                ingest_age_seconds: health.ingest_age(now).map(|age| age.as_secs()),
+            }
+        }),
     })
 }
 
