@@ -26,8 +26,11 @@ until it has one.
    of timing. Fencing tokens are strictly monotonic per account. A stored
    fence outside the token domain is surfaced as a storage error, never
    aliased to fence 0 — aliasing would misattribute corruption to the caller
-   and break the monotonic audit trail.
-   *Tests:* `fenced_out_holder_rejected` (store suites);
+   and break the monotonic audit trail. A holder that learns it is fenced
+   while releasing clears its own slot, so it stops serving immediately
+   rather than at its next acquire.
+   *Tests:* `fenced_out_holder_rejected` (store suites),
+   `fenced_release_clears_the_slot`;
    `acquire_surfaces_negative_stored_fence` and
    `release_and_ingest_surface_negative_stored_fence` (Postgres suite; the
    memory backend stores tokens as `u64`, so the corrupt state is
@@ -51,11 +54,13 @@ until it has one.
    and enqueue never blocks unboundedly. Shutdown closes the queue (new
    reservations refuse from that instant), then drains with real receives
    until every outstanding permit resolves by sending or dropping, bounded by
-   the configured `shutdown_drain_deadline`; it flushes in configured-size
-   batches, counts any event still undeliverable after the bounded final
-   retries in `WriterStats::lost`, and reports permits still outstanding at
-   the deadline in `WriterStats::unresolved` — a deadline expiry is never a
-   clean flush. The reporting holds across the writer's own death: every
+   the configured `shutdown_drain_deadline` — which governs the ingest calls
+   the drain makes as well as its receives, so the bound is the drain's total
+   wall clock. It flushes in configured-size batches, counts any event still
+   undeliverable after the bounded final retries in `WriterStats::lost`
+   (a timed-out ingest is undelivered, never a silent success), and reports
+   permits still outstanding at the deadline in `WriterStats::unresolved` —
+   a deadline expiry is never a clean flush. The reporting holds across the writer's own death: every
    charge that enters the queue is counted until it is given a billing
    outcome, in a counter outside the task, so a writer that panics or is
    aborted returns `WriterShutdownError` carrying a lower bound on the
@@ -151,8 +156,12 @@ until it has one.
     `nonpositive_lease_ttl_is_rejected_without_debiting` (both stores),
     `invalid_lease_manager_durations_are_rejected`,
     `invalid_snapshot_manager_intervals_are_rejected`,
-    `invalid_grant_policy_is_rejected`, and
-    `zero_reclaim_interval_is_rejected`.
+    `invalid_grant_policy_is_rejected`, `zero_reclaim_interval_is_rejected`,
+    `zero_drain_deadline_is_rejected`, `invalid_writer_config_is_rejected`,
+    `invalid_lease_manager_timeouts_are_rejected`, and
+    `invalid_pool_config_is_rejected_before_connecting`. No such value is
+    silently repaired: a coercion like `capacity.max(1)` would change the
+    runtime meaning of a configured contract.
 
 17. **Negative caching is bounded and self-healing.** The ArcSwap map retains
     at most its configured count of request-visible negatives, removes
@@ -165,6 +174,19 @@ until it has one.
     `many_unknowns_leave_only_the_configured_number_visible`, and
     `http_negative_ttl_refetches_without_push`, and
     `negative_ttl_retry_is_backed_off_and_recovers_without_push`.
+
+18. **Background store calls are wall-clock bounded.** No background task may
+    be parked by a backend that hangs rather than answering: every allocator
+    and sink call a client task makes carries a configured timeout, and each
+    graceful shutdown carries a total budget, so shutdown terminates whatever
+    the backend does. Bounding by retry *count* alone is not a bound. What a
+    bound could not complete is reported — a lease left unreleased is
+    `LeaseManagerReport::abandoned` and settles at TTL reclaim (#9); an
+    undelivered batch is `WriterStats::lost` — never silently assumed done.
+    *Tests:* `hung_ingest_cannot_stall_shutdown`,
+    `hung_ingest_times_out_into_the_retry_path`,
+    `hung_release_times_out_and_reparks`, and
+    `invalid_pool_config_is_rejected_before_connecting`.
 
 Ledger roles (context for 1 and 7): leases **bound** spend; usage events **are**
 the billing record; reconciliation compares the two and steady-state drift is

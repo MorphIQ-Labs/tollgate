@@ -247,6 +247,8 @@ async fn full_stack_over_loopback_http() {
             lease_ttl: SignedDuration::from_secs(3_600),
             expiry_safety_margin: SignedDuration::from_secs(2),
             poll_interval: std::time::Duration::from_millis(10),
+            store_call_timeout: std::time::Duration::from_secs(5),
+            shutdown_release_deadline: std::time::Duration::from_secs(10),
         },
     )
     .unwrap();
@@ -259,6 +261,7 @@ async fn full_stack_over_loopback_http() {
             flush_interval: std::time::Duration::from_millis(10),
             retry_backoff: std::time::Duration::from_millis(10),
             shutdown_drain_deadline: std::time::Duration::from_secs(60),
+            ingest_timeout: std::time::Duration::from_secs(5),
         },
     )
     .unwrap();

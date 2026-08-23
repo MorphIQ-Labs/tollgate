@@ -84,6 +84,8 @@ fn spawn_instance(store: &Arc<MemoryStore>, clock: &Arc<ManualClock>) -> Instanc
             lease_ttl: SignedDuration::from_secs(3_600),
             expiry_safety_margin: SignedDuration::ZERO,
             poll_interval: std::time::Duration::from_millis(5),
+            store_call_timeout: std::time::Duration::from_secs(5),
+            shutdown_release_deadline: std::time::Duration::from_secs(10),
         },
     )
     .unwrap();
@@ -96,6 +98,7 @@ fn spawn_instance(store: &Arc<MemoryStore>, clock: &Arc<ManualClock>) -> Instanc
             flush_interval: std::time::Duration::from_millis(5),
             retry_backoff: std::time::Duration::from_millis(5),
             shutdown_drain_deadline: std::time::Duration::from_secs(60),
+            ingest_timeout: std::time::Duration::from_secs(5),
         },
     )
     .unwrap();

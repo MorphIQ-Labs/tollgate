@@ -190,7 +190,20 @@ impl AppRuntime {
             }
         }
         if let Some(manager) = self.manager {
-            manager.shutdown().await;
+            // Reported unconditionally, like the writer's line above: the
+            // released count is the operator's evidence that leases came
+            // back, not just the absence of bad news.
+            let report = manager.shutdown().await;
+            eprintln!(
+                "lease-manager shutdown: {} released, {} abandoned to TTL reclaim{}",
+                report.released,
+                report.abandoned,
+                if report.task_died {
+                    " (task died; counts are what is known)"
+                } else {
+                    ""
+                }
+            );
         }
         if let Some(snapshots) = self.snapshots {
             snapshots.shutdown().await;
@@ -299,6 +312,8 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
                     lease_ttl: SignedDuration::from_secs(60),
                     expiry_safety_margin: SignedDuration::from_secs(2),
                     poll_interval: std::time::Duration::from_millis(20),
+                    store_call_timeout: std::time::Duration::from_secs(5),
+                    shutdown_release_deadline: std::time::Duration::from_secs(10),
                 },
             )
             .expect("lease-manager configuration is valid");
@@ -314,6 +329,7 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
                     // Bounded well inside the lease TTL so late events are
                     // still billable against a live lease.
                     shutdown_drain_deadline: std::time::Duration::from_secs(5),
+                    ingest_timeout: std::time::Duration::from_secs(5),
                 },
             )
             .expect("usage-writer configuration is valid");

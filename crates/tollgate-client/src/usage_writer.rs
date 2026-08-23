@@ -16,6 +16,12 @@
 //! while the channel backs up and sheds upstream — memory stays bounded at
 //! one in-flight batch plus the channel.
 //!
+//! Every ingest is wall-clock bounded by
+//! [`UsageWriterConfig::ingest_timeout`] (INVARIANTS.md #18): a sink that
+//! hangs rather than erroring is indistinguishable from one that is merely
+//! slow, and neither may park the task. A timed-out call is a failed
+//! attempt — during shutdown it counts toward `lost`, never toward success.
+//!
 //! Shutdown is level-triggered: every loop consults the watch's *current*
 //! value, never only its edge notification, so a shutdown signalled during a
 //! retry backoff still reaches the bounded final flush (this was review
@@ -69,10 +75,15 @@ pub struct UsageWriterConfig {
     pub retry_backoff: std::time::Duration,
     /// Wall-clock bound on the shutdown drain: how long `shutdown` waits for
     /// outstanding permits (slots reserved by in-flight requests or committed
-    /// `ChargeGuard`s) to resolve. Must be positive. Size it within
+    /// `ChargeGuard`s) to resolve, *including* the ingest calls it makes along
+    /// the way. Must be positive. Size it within
     /// `expiry_safety_margin + reclaim_grace` so an event landing at the end
     /// of the drain is still billable against its lease.
     pub shutdown_drain_deadline: std::time::Duration,
+    /// Wall-clock bound on one `UsageSink::ingest` call. A sink that hangs
+    /// rather than erroring would otherwise park the writer task forever, and
+    /// with it every later shutdown step. Must be positive.
+    pub ingest_timeout: std::time::Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,14 +98,30 @@ impl std::fmt::Display for UsageWriterConfigError {
 impl std::error::Error for UsageWriterConfigError {}
 
 impl UsageWriterConfig {
-    /// A zero drain deadline would report every outstanding permit as
-    /// unresolved without waiting at all; refuse it before the task starts
-    /// (INVARIANTS.md #16). Broader field validation is tracked by #34.
+    /// Every field is a contract, so none of them is silently repaired
+    /// (INVARIANTS.md #16): a zero capacity or batch size has no sensible
+    /// coercion, a zero backoff hot-spins against a failing sink, and a zero
+    /// deadline or timeout reports failure without waiting at all.
     pub fn validate(&self) -> Result<(), UsageWriterConfigError> {
+        if self.queue_capacity == 0 {
+            return Err(UsageWriterConfigError("queue_capacity must be positive"));
+        }
+        if self.max_batch == 0 {
+            return Err(UsageWriterConfigError("max_batch must be positive"));
+        }
+        if self.flush_interval.is_zero() {
+            return Err(UsageWriterConfigError("flush_interval must be positive"));
+        }
+        if self.retry_backoff.is_zero() {
+            return Err(UsageWriterConfigError("retry_backoff must be positive"));
+        }
         if self.shutdown_drain_deadline.is_zero() {
             return Err(UsageWriterConfigError(
                 "shutdown_drain_deadline must be positive",
             ));
+        }
+        if self.ingest_timeout.is_zero() {
+            return Err(UsageWriterConfigError("ingest_timeout must be positive"));
         }
         Ok(())
     }
@@ -222,7 +249,7 @@ impl UsageWriter {
         config: UsageWriterConfig,
     ) -> Result<(UsageRecorder, UsageWriter), UsageWriterConfigError> {
         config.validate()?;
-        let (tx, rx) = mpsc::channel(config.queue_capacity.max(1));
+        let (tx, rx) = mpsc::channel(config.queue_capacity);
         // A weak handle lets the drain count still-outstanding permits at
         // the deadline without holding the channel open itself.
         let weak = tx.downgrade();
@@ -324,7 +351,7 @@ async fn run(
 ) -> WriterStats {
     let config = writer.config;
     let mut stats = WriterStats::ZERO;
-    let max_batch = config.max_batch.max(1);
+    let max_batch = config.max_batch;
     let mut batch: Vec<UsageEvent> = Vec::with_capacity(max_batch);
 
     loop {
@@ -390,8 +417,11 @@ async fn flush_retrying(
         ..
     } = writer;
     loop {
-        match sink.ingest(batch, clock.now()).await {
-            Ok(report) => {
+        // A sink that hangs is indistinguishable from one that is merely slow,
+        // and neither may park this task: the timeout turns both into the
+        // ordinary retry path.
+        match tokio::time::timeout(config.ingest_timeout, sink.ingest(batch, clock.now())).await {
+            Ok(Ok(report)) => {
                 stats.accepted += report.accepted;
                 stats.duplicate += report.duplicate;
                 stats.rejected += report.rejected;
@@ -399,7 +429,7 @@ async fn flush_retrying(
                 batch.clear();
                 return;
             }
-            Err(_) => {
+            Ok(Err(_)) | Err(_) => {
                 tokio::select! {
                     _ = tokio::time::sleep(config.retry_backoff) => {}
                     _ = shutdown.changed() => {}
@@ -428,7 +458,7 @@ async fn final_flush(
     mut stats: WriterStats,
 ) -> WriterStats {
     let config = &writer.config;
-    let max_batch = config.max_batch.max(1);
+    let max_batch = config.max_batch;
     // Refuse new reservations from this instant. Permits already handed out
     // keep their slots and can still deliver into the drain below; a real
     // recv (unlike try_recv, for which a reserved-but-unsent slot is
@@ -457,13 +487,19 @@ async fn final_flush(
             }
             return stats;
         }
-        flush_bounded(writer, batch, &mut stats).await;
+        flush_bounded(writer, batch, &mut stats, deadline).await;
     }
 }
 
-/// Ingest `batch` with a bounded number of attempts; an undeliverable batch
-/// is counted lost. The batch is cleared either way.
-async fn flush_bounded(writer: &Writer, batch: &mut Vec<UsageEvent>, stats: &mut WriterStats) {
+/// Ingest `batch` with a bounded number of attempts, none of which may run
+/// past the drain `deadline`; an undeliverable batch is counted lost. The
+/// batch is cleared either way.
+async fn flush_bounded(
+    writer: &Writer,
+    batch: &mut Vec<UsageEvent>,
+    stats: &mut WriterStats,
+    deadline: tokio::time::Instant,
+) {
     let Writer {
         sink,
         clock,
@@ -473,18 +509,25 @@ async fn flush_bounded(writer: &Writer, batch: &mut Vec<UsageEvent>, stats: &mut
     const FINAL_FLUSH_ATTEMPTS: u32 = 3;
     let mut delivered = false;
     for attempt in 1..=FINAL_FLUSH_ATTEMPTS {
-        match sink.ingest(batch, clock.now()).await {
-            Ok(report) => {
+        // Two bounds, whichever is sooner: one call may not exceed the ingest
+        // timeout, and the drain as a whole may not exceed its deadline. A
+        // timed-out call is a failed attempt — never a silent success.
+        let attempt_deadline = deadline.min(tokio::time::Instant::now() + config.ingest_timeout);
+        match tokio::time::timeout_at(attempt_deadline, sink.ingest(batch, clock.now())).await {
+            Ok(Ok(report)) => {
                 stats.accepted += report.accepted;
                 stats.duplicate += report.duplicate;
                 stats.rejected += report.rejected;
                 delivered = true;
                 break;
             }
-            Err(_) if attempt < FINAL_FLUSH_ATTEMPTS => {
+            Ok(Err(_)) if attempt < FINAL_FLUSH_ATTEMPTS => {
                 tokio::time::sleep(config.retry_backoff).await;
             }
-            Err(_) => {}
+            // The deadline governs the retries too: once it has passed there
+            // is no budget left to back off into.
+            Err(_) => break,
+            Ok(Err(_)) => {}
         }
     }
     if !delivered {
