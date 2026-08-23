@@ -341,3 +341,70 @@ async fn readiness_falls_when_background_planes_stop() {
     runtime.shutdown().await;
     assert_eq!(ready(&router).await, StatusCode::SERVICE_UNAVAILABLE);
 }
+
+/// The baseline configuration had no test at all until #16 rewrote the code
+/// that distinguishes it: the load gate was its only exercise, and that lane
+/// is manual and non-gating. Transport and kernel only — no credential
+/// required, because there is no admission to present one to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn baseline_prices_without_admission() {
+    let (router, runtime) = build_app(100_000, false);
+
+    let (status, body) = call(&router, None, price_body(14)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["prices"].as_array().unwrap().len(), 14);
+    let price = body["prices"][0].as_f64().unwrap();
+    assert!(price > 1.0 && price < 10.0, "price: {price}");
+    assert_eq!(body["metadata"]["units_charged"], 0);
+    assert_eq!(body["metadata"]["request_id"], "baseline");
+
+    let store = runtime.store.clone();
+    runtime.shutdown().await;
+    assert_eq!(store.usage_recorded(DEMO_ACCOUNT), CostUnits::ZERO);
+}
+
+/// #16's acceptance criterion: readiness must not depend on machinery that was
+/// never installed. No lease is ever stocked here, and no background task
+/// exists whose death could change the answer — so 200 before shutdown and
+/// 200 after it, the exact counterpart of
+/// `readiness_falls_when_background_planes_stop`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn baseline_is_ready_before_any_lease() {
+    let (router, runtime) = build_app(100_000, false);
+    assert_eq!(ready(&router).await, StatusCode::OK);
+    runtime.shutdown().await;
+    assert_eq!(ready(&router).await, StatusCode::OK);
+}
+
+/// `accounting`, `refill` and `snapshots` are three views of one plane, so
+/// they are absent together or present together. That correlation used to be
+/// five parallel `Option`s in `AppState`, provable only by reading every
+/// construction site; #16 made it one `Option`, and this is its witness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn baseline_metrics_omit_the_uninstalled_planes() {
+    let (router, runtime) = build_app(100_000, false);
+    let (status, _) = call(&router, None, price_body(1)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let body = metrics(&router).await;
+    assert!(
+        body["accounting"].is_null(),
+        "no writer was spawned: {body}"
+    );
+    assert!(body["refill"].is_null(), "no lease manager was spawned");
+    assert!(
+        body["snapshots"].is_null(),
+        "no snapshot manager was spawned"
+    );
+    // Nothing ever stocked the slot, so the gauges read off it report absence
+    // rather than a zero that would read as an exhausted lease.
+    assert!(body["lease_remaining"].is_null());
+    assert!(body["lease_usable_until"].is_null());
+    // The request-path counters stay present: the engine is built in both
+    // configurations, and a baseline request simply never reaches it.
+    assert_eq!(body["admitted"], 0);
+    assert_eq!(body["denied"], 0);
+    assert_eq!(body["denials"].as_object().unwrap().len(), 14);
+
+    runtime.shutdown().await;
+}
