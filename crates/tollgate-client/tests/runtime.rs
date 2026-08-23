@@ -274,6 +274,71 @@ fn writer_config(capacity: usize) -> UsageWriterConfig {
     }
 }
 
+/// Issue #4: the refill task's numbers existed only as `tracing` events with
+/// nothing to threshold on, and a shutdown report nobody sees while the
+/// process runs. A refusal must be attributable to its reason — that is what
+/// separates "the account is out of balance" from "the allocator is down".
+#[tokio::test(start_paused = true)]
+async fn refill_counters_attribute_refusals_to_their_reason() {
+    // An account that does not exist: every acquire is refused, always the
+    // same way.
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    let slot = LeaseSlot::empty();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let manager =
+        LeaseManager::spawn(store.clone(), Arc::clone(&slot), clock, manager_config()).unwrap();
+    let counters = manager.counters();
+
+    assert_eq!(counters.snapshot().refused(), 0, "nothing tried yet");
+    settle().await;
+
+    let stats = counters.snapshot();
+    assert_eq!(stats.acquired, 0);
+    assert_eq!(stats.acquired_units, 0);
+    assert!(stats.refused() > 0, "the allocator refused every acquire");
+    let refusals: Vec<_> = stats
+        .refusals_by_name()
+        .filter(|(_, count)| *count > 0)
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        refusals,
+        vec!["unknown_account"],
+        "one reason, and the others left alone: {:?}",
+        stats.acquire_refused
+    );
+    assert_eq!(stats.acquire_timeouts, 0, "a refusal is not a timeout");
+
+    manager.shutdown().await;
+}
+
+/// A healthy refill counts what it was granted, not just that it succeeded:
+/// adaptive allocation can return less than `target_grant`, so the units are
+/// the number that says whether the instance is actually being funded.
+#[tokio::test(start_paused = true)]
+async fn refill_counters_record_grants_and_releases() {
+    let store = store(10_000);
+    let slot = LeaseSlot::empty();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let manager =
+        LeaseManager::spawn(store.clone(), Arc::clone(&slot), clock, manager_config()).unwrap();
+    let counters = manager.counters();
+    settle().await;
+
+    let stats = counters.snapshot();
+    assert_eq!(stats.acquired, 1);
+    assert_eq!(stats.acquired_units, 1_000, "the grant, not the request");
+    assert_eq!(stats.refused(), 0);
+    assert_eq!(stats.released, 0, "nothing returned while still serving");
+    assert_eq!(stats.abandoned, 0);
+
+    manager.shutdown().await;
+    // Shutdown returns the lease, and the running counter says so too — the
+    // report is no longer the only place that knows.
+    assert_eq!(counters.snapshot().released, 1);
+    assert_eq!(counters.snapshot().abandoned, 0);
+}
+
 /// Issue #38: the accounting numbers used to exist only as a local on the
 /// writer task's stack, so a process that kept running — or died — reported
 /// nothing. They are now readable at any time, and `shutdown` reports the very
@@ -1305,6 +1370,81 @@ async fn slow_but_healthy_sink_still_delivers_at_shutdown() {
 }
 
 /// An allocator that grants normally but never answers a release.
+/// An allocator that never answers an acquire. Distinct from refusing: the
+/// grant may well have been made, so the client cannot treat this as a
+/// domain answer.
+struct HangingAcquireAllocator;
+
+#[async_trait]
+impl LeaseAllocator for HangingAcquireAllocator {
+    async fn acquire(
+        &self,
+        _account: AccountId,
+        _requested: CostUnits,
+        _ttl: SignedDuration,
+        _now: Timestamp,
+    ) -> Result<tollgate_core::LeaseGrant, tollgate_store::AllocateError> {
+        std::future::pending().await
+    }
+
+    async fn release(
+        &self,
+        _lease_id: tollgate_core::LeaseId,
+        _fencing_token: tollgate_core::FencingToken,
+        _unspent: CostUnits,
+        _now: Timestamp,
+    ) -> Result<(), tollgate_store::AllocateError> {
+        Ok(())
+    }
+
+    async fn reclaim_expired(
+        &self,
+        _now: Timestamp,
+    ) -> Result<Vec<tollgate_store::ReclaimedLease>, StoreError> {
+        Ok(Vec::new())
+    }
+}
+
+/// INVARIANTS.md #18: an allocator that hangs rather than answering is
+/// bounded by `store_call_timeout`. It is counted apart from every refusal,
+/// because it is not a domain answer — treating it as one would assert the
+/// lease was not granted, which this client cannot know.
+#[tokio::test(start_paused = true)]
+async fn a_hung_acquire_is_counted_as_a_timeout_not_a_refusal() {
+    let slot = LeaseSlot::empty();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let manager = LeaseManager::spawn(
+        Arc::new(HangingAcquireAllocator) as Arc<dyn LeaseAllocator>,
+        Arc::clone(&slot),
+        clock,
+        LeaseManagerConfig {
+            // Short enough that the bound is reached inside a settle; the
+            // shared config's five seconds is a production-shaped value.
+            store_call_timeout: std::time::Duration::from_millis(10),
+            ..manager_config()
+        },
+    )
+    .unwrap();
+    let counters = manager.counters();
+
+    settle().await;
+    let stats = counters.snapshot();
+    assert!(
+        stats.acquire_timeouts > 0,
+        "the refill loop must not park on a hung allocator"
+    );
+    assert_eq!(
+        stats.refused(),
+        0,
+        "a timeout is not a refusal: {:?}",
+        stats.acquire_refused
+    );
+    assert_eq!(stats.acquired, 0);
+    assert!(slot.load().is_none(), "fail closed while unanswered");
+
+    manager.shutdown().await;
+}
+
 struct HangingReleaseAllocator {
     inner: Arc<MemoryStore>,
 }
@@ -1374,8 +1514,10 @@ async fn hung_release_cannot_stall_shutdown() {
         manager_config(),
     )
     .unwrap();
+    let counters = manager.counters();
     settle().await;
     assert!(slot.load().is_some());
+    assert_eq!(counters.snapshot().abandoned, 0, "nothing abandoned yet");
 
     let report = tokio::time::timeout(std::time::Duration::from_secs(300), manager.shutdown())
         .await
@@ -1383,6 +1525,11 @@ async fn hung_release_cannot_stall_shutdown() {
     assert_eq!(report.released, 0);
     assert_eq!(report.abandoned, 1, "the unreturned lease is reported");
     assert!(!report.task_died);
+    // The same number outside the report: stranded units are visible to a
+    // scrape, not only to whoever awaited this shutdown.
+    let stats = counters.snapshot();
+    assert_eq!(stats.abandoned, 1);
+    assert_eq!(stats.released, 0);
 }
 
 /// INVARIANTS.md #16: no writer field is silently repaired.

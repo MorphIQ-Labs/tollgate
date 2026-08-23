@@ -36,11 +36,12 @@ pub use tollgate_store::{Clock, ManualClock, SystemClock};
 #[cfg(feature = "http")]
 pub use http::HttpStore;
 pub use lease_manager::{
-    LeaseManager, LeaseManagerConfig, LeaseManagerConfigError, LeaseManagerReport,
+    LeaseCounters, LeaseManager, LeaseManagerConfig, LeaseManagerConfigError, LeaseManagerReport,
+    LeaseStats,
 };
 pub use snapshot_manager::{
-    SlotRegistry, SnapshotManager, SnapshotManagerConfig, SnapshotManagerConfigError,
-    SnapshotManagerReport,
+    SlotRegistry, SnapshotCounters, SnapshotManager, SnapshotManagerConfig,
+    SnapshotManagerConfigError, SnapshotManagerReport, SnapshotStats,
 };
 pub use usage_writer::{
     UsagePermit, UsageRecorder, UsageWriter, UsageWriterConfig, UsageWriterConfigError,

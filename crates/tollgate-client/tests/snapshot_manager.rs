@@ -391,6 +391,66 @@ async fn readiness_falls_when_snapshot_expires_during_outage() {
     manager.shutdown().await;
 }
 
+/// Issue #4: `ready` answers one bit, which is the right shape for a probe
+/// and the wrong shape for diagnosis — it cannot say whether one principal is
+/// unresolved or a thousand, nor whether the source has been failing all
+/// morning. The counters are what distinguish those, and `unresolved` is
+/// computed from the same pass that decides readiness, so the two agree by
+/// construction rather than by luck.
+#[tokio::test(start_paused = true)]
+async fn snapshot_counters_track_failures_and_the_unresolved_gauge() {
+    let source = ToggleSource::new(snapshot(1, PermissionBits::bit(0)));
+    let map = Arc::new(ArcSwapSnapshotMap::new());
+    let slots = SlotRegistry::new();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let manager = SnapshotManager::spawn(
+        source.clone(),
+        map,
+        slots,
+        Arc::clone(&clock) as _,
+        SnapshotManagerConfig {
+            principals: vec![PRINCIPAL],
+            refresh_interval: std::time::Duration::from_millis(20),
+            negative_ttl: SignedDuration::from_secs(30),
+            retry_backoff: std::time::Duration::from_millis(5),
+            max_concurrent_fetches: 2,
+        },
+    )
+    .unwrap();
+    let counters = manager.counters();
+    let ready = manager.ready();
+    settle().await;
+
+    let healthy = counters.snapshot();
+    assert!(healthy.refresh_attempts > 0, "the loop is fetching");
+    assert_eq!(healthy.refresh_failures, 0);
+    assert_eq!(
+        healthy.unresolved,
+        0,
+        "resolved, and readiness agrees: {}",
+        *ready.borrow()
+    );
+    assert!(*ready.borrow());
+
+    // The source goes down and the resolution lapses. Readiness falls, and
+    // the gauge says how much of the tracked set is affected — the thing a
+    // boolean cannot report.
+    source.fail.store(true, Ordering::Release);
+    clock.set(t(100_000));
+    settle().await;
+
+    let outage = counters.snapshot();
+    assert!(!*ready.borrow());
+    assert_eq!(outage.unresolved, 1, "one tracked principal, unresolved");
+    assert!(
+        outage.refresh_failures > 0,
+        "a failing source is distinguishable from an idle one"
+    );
+    assert!(outage.refresh_attempts > healthy.refresh_attempts);
+
+    manager.shutdown().await;
+}
+
 struct FirstThenHangsSource {
     snapshot: Arc<AccountSnapshot>,
     calls: AtomicUsize,

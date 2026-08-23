@@ -49,6 +49,55 @@ pub enum AllocateError {
     Storage(StoreError),
 }
 
+impl AllocateError {
+    /// Stable metric labels, in [`index`](AllocateError::index) order.
+    ///
+    /// Variant names, not [`Display`](std::fmt::Display) output: `Storage`
+    /// wraps a backend message that varies per failure, so labelling by
+    /// rendered text would mint a fresh time series per connection error.
+    pub const NAMES: [&'static str; Self::COUNT] = [
+        "unknown_account",
+        "account_inactive",
+        "insufficient_balance",
+        "invalid_ttl",
+        "unknown_lease",
+        "fenced",
+        "lease_not_active",
+        "invalid_release",
+        "storage",
+    ];
+
+    /// How many distinct refusals exist — the width of a per-reason tally.
+    pub const COUNT: usize = 9;
+
+    /// This refusal's dense slot, for direct-indexed per-reason counters.
+    ///
+    /// `Storage` carries data, so there is no discriminant to cast; the
+    /// mapping is written out and the match is exhaustive, so a new variant
+    /// fails to compile until it is given a slot rather than silently landing
+    /// in another's bucket. Mirrors `DenyReason::index`.
+    #[must_use]
+    pub const fn index(&self) -> usize {
+        match self {
+            AllocateError::UnknownAccount => 0,
+            AllocateError::AccountInactive => 1,
+            AllocateError::InsufficientBalance => 2,
+            AllocateError::InvalidTtl => 3,
+            AllocateError::UnknownLease => 4,
+            AllocateError::Fenced => 5,
+            AllocateError::LeaseNotActive => 6,
+            AllocateError::InvalidRelease => 7,
+            AllocateError::Storage(_) => 8,
+        }
+    }
+
+    /// This refusal's stable metric label.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        Self::NAMES[self.index()]
+    }
+}
+
 impl std::fmt::Display for AllocateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -303,4 +352,73 @@ pub trait UsageSink: Send + Sync {
         events: &[UsageEvent],
         now: Timestamp,
     ) -> Result<IngestReport, StoreError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every variant, once. Sized by `COUNT`, so adding a refusal without
+    /// widening this array fails to compile.
+    fn all() -> [AllocateError; AllocateError::COUNT] {
+        [
+            AllocateError::UnknownAccount,
+            AllocateError::AccountInactive,
+            AllocateError::InsufficientBalance,
+            AllocateError::InvalidTtl,
+            AllocateError::UnknownLease,
+            AllocateError::Fenced,
+            AllocateError::LeaseNotActive,
+            AllocateError::InvalidRelease,
+            AllocateError::Storage(StoreError("connection reset".into())),
+        ]
+    }
+
+    /// The indices must be a permutation of `0..COUNT`: two refusals sharing
+    /// a slot would silently merge their tallies, and a slot no refusal maps
+    /// to would export a counter that can never move.
+    #[test]
+    fn indices_cover_every_slot_exactly_once() {
+        let mut seen = [false; AllocateError::COUNT];
+        for error in all() {
+            let index = error.index();
+            assert!(index < AllocateError::COUNT, "{error} indexes out of range");
+            assert!(!seen[index], "{error} shares slot {index}");
+            seen[index] = true;
+        }
+        assert!(seen.iter().all(|hit| *hit), "every slot must be claimed");
+    }
+
+    /// Labels are read by whatever scrapes the counters, so they are a
+    /// contract: distinct, and free of the backend text `Display` carries.
+    /// `Storage` wraps an arbitrary message, so labelling by rendered text
+    /// would mint a fresh time series per connection failure.
+    #[test]
+    fn labels_are_distinct_and_free_of_backend_text() {
+        for (position, error) in all().iter().enumerate() {
+            assert_eq!(error.name(), AllocateError::NAMES[position]);
+        }
+        let storage = AllocateError::Storage(StoreError("connection reset".into()));
+        assert_eq!(storage.name(), "storage");
+        assert!(
+            !storage.name().contains("connection"),
+            "the label must not carry the backend's message"
+        );
+        let mut names = AllocateError::NAMES;
+        names.sort_unstable();
+        names.iter().reduce(|previous, next| {
+            assert_ne!(previous, next, "duplicate label {next}");
+            next
+        });
+    }
+
+    /// The payload must not affect the slot, or one refusal would scatter
+    /// across slots as its message varied.
+    #[test]
+    fn payload_does_not_affect_the_slot() {
+        assert_eq!(
+            AllocateError::Storage(StoreError("a".into())).index(),
+            AllocateError::Storage(StoreError("b".into())).index()
+        );
+    }
 }
