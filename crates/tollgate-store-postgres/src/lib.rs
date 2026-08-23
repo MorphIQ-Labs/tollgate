@@ -32,7 +32,7 @@ use tokio::sync::broadcast;
 
 use tollgate_core::{
     AccountId, AccountSnapshot, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId,
-    Principal, UsageEvent,
+    Principal, PublishableSnapshot, UsageEvent,
 };
 use tollgate_store::memory::Conservation;
 use tollgate_store::{
@@ -701,7 +701,14 @@ impl SnapshotSource for PostgresStore {
                 let value: serde_json::Value = row.get(1);
                 let snapshot: AccountSnapshot = serde_json::from_value(value)
                     .map_err(|e| StoreError(format!("snapshot decode: {e}")))?;
-                Ok(SnapshotResolution::Present(Arc::new(snapshot)))
+                let snapshot =
+                    PublishableSnapshot::try_new(Arc::new(snapshot)).map_err(|error| {
+                        StoreError(format!(
+                            "invalid stored snapshot for principal {:#034x}: {error}",
+                            principal.0
+                        ))
+                    })?;
+                Ok(SnapshotResolution::Present(snapshot))
             }
             None => Ok(SnapshotResolution::Unknown),
         }
@@ -777,12 +784,12 @@ impl AdminStore for PostgresStore {
     async fn publish_snapshot(
         &self,
         principal: Principal,
-        snapshot: Arc<AccountSnapshot>,
+        snapshot: PublishableSnapshot,
     ) -> Result<(), StoreError> {
         let generation = i64::try_from(snapshot.generation.0).map_err(|_| {
             StoreError("snapshot generation exceeds PostgreSQL BIGINT range".into())
         })?;
-        let value = serde_json::to_value(&*snapshot)
+        let value = serde_json::to_value(snapshot.as_snapshot())
             .map_err(|e| StoreError(format!("snapshot encode: {e}")))?;
         let result = sqlx::query(
             "INSERT INTO tollgate_snapshots (principal, generation, snapshot, deleted)

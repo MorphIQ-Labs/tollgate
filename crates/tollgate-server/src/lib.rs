@@ -31,7 +31,7 @@ use axum::{Json, Router};
 use jiff::SignedDuration;
 use tracing::Instrument as _;
 
-use tollgate_core::{AccountId, CostUnits, Principal};
+use tollgate_core::{AccountId, CostUnits, Principal, PublishableSnapshot};
 use tollgate_store::wire::{
     AcquireRequest, AcquireResponse, CreateAccountRequest, DepositRequest, IngestRequest,
     PublishSnapshotRequest, ReleaseRequest, SetStatusRequest,
@@ -226,7 +226,7 @@ async fn fetch_snapshot<S: Backend>(
     Path(principal): Path<u128>,
 ) -> Result<Json<Arc<tollgate_core::AccountSnapshot>>, ApiError> {
     match state.store.snapshot(Principal(principal)).await? {
-        SnapshotResolution::Present(snapshot) => Ok(Json(snapshot)),
+        SnapshotResolution::Present(snapshot) => Ok(Json(snapshot.into_inner())),
         SnapshotResolution::Revoked { generation } => Err(ApiError::revoked(generation)),
         SnapshotResolution::Unknown => Err(ApiError::not_found("unknown-principal", "no snapshot")),
     }
@@ -294,9 +294,10 @@ async fn publish_snapshot<S: Backend>(
     Path(principal): Path<u128>,
     Json(request): Json<PublishSnapshotRequest>,
 ) -> Result<StatusCode, ApiError> {
+    let snapshot = PublishableSnapshot::try_new(request.snapshot)?;
     state
         .store
-        .publish_snapshot(Principal(principal), request.snapshot)
+        .publish_snapshot(Principal(principal), snapshot)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

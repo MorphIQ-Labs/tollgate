@@ -393,6 +393,7 @@ async fn refresh_all_cancellable(
                 {
                     continue;
                 }
+                let snapshot = snapshot.into_inner();
                 completed.insert(principal);
                 let slot = slots.slot(snapshot.account_id);
                 resolutions.insert(
@@ -555,6 +556,7 @@ async fn run(
                                 {
                                     continue;
                                 }
+                                let snapshot = snapshot.into_inner();
                                 let slot = slots.slot(snapshot.account_id);
                                 resolutions.insert(
                                     push.principal,

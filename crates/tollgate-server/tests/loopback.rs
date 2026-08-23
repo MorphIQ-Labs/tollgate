@@ -24,8 +24,8 @@ use tollgate_client::{
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, FencingToken,
-    Generation, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, Principal, RequestId,
-    ResolvedLimits,
+    Generation, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, Principal,
+    PublishableSnapshot, RequestId, ResolvedLimits,
 };
 use tollgate_store::{
     AccountConfig, GrantPolicy, MemoryStore, SnapshotResolution, SnapshotSource as _,
@@ -83,6 +83,48 @@ fn snapshot() -> Arc<AccountSnapshot> {
                 .build(),
         ),
     })
+}
+
+fn publishable(snapshot: Arc<AccountSnapshot>) -> PublishableSnapshot {
+    PublishableSnapshot::try_new(snapshot).expect("test snapshot limits are valid")
+}
+
+#[tokio::test]
+async fn http_store_rejects_invalid_snapshot_from_legacy_server() {
+    use axum::Json;
+    use axum::routing::get;
+
+    let mut invalid = (*snapshot()).clone();
+    invalid.limits.rate_burst_units = 113;
+    let invalid = Arc::new(invalid);
+    let app = axum::Router::new().route(
+        "/v1/snapshots/{principal}",
+        get(move || {
+            let invalid = Arc::clone(&invalid);
+            async move { Json(invalid) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = stop_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let http = HttpStore::new(format!("http://{address}"));
+    let error = http.snapshot(PRINCIPAL).await.unwrap_err();
+    assert!(
+        error.0.contains("invalid snapshot from server") && error.0.contains("exceeding the burst"),
+        "unexpected error: {error}"
+    );
+
+    let _ = stop_tx.send(());
+    server.await.unwrap();
 }
 
 #[tokio::test]
@@ -146,7 +188,7 @@ async fn http_negative_ttl_refetches_without_push() {
     // HttpStore has no push stream. Publication can therefore become visible
     // only through the negative-TTL targeted pull; the 60s full refresh must
     // not determine recovery latency.
-    store.publish_snapshot(PRINCIPAL, snapshot());
+    store.publish_snapshot(PRINCIPAL, publishable(snapshot()));
     slots.slot(ACCOUNT).install(Arc::new(LocalLease::new(
         LeaseGrant {
             lease_id: LeaseId(1),
@@ -207,7 +249,7 @@ async fn full_stack_over_loopback_http() {
         initial_balance: CostUnits(DEPOSIT),
         active: true,
     });
-    store.publish_snapshot(PRINCIPAL, snapshot());
+    store.publish_snapshot(PRINCIPAL, publishable(snapshot()));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -241,7 +283,9 @@ async fn full_stack_over_loopback_http() {
 
     let slot = LeaseSlot::empty();
     let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
-    engine.map().install(PRINCIPAL, fetched, Arc::clone(&slot));
+    engine
+        .map()
+        .install(PRINCIPAL, fetched.into_inner(), Arc::clone(&slot));
 
     let manager = LeaseManager::spawn(
         http.clone(),

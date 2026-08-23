@@ -8,7 +8,7 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-use tollgate_core::Generation;
+use tollgate_core::{Generation, SnapshotValidationError};
 use tollgate_store::wire::Problem;
 use tollgate_store::{AllocateError, CreateAccountError, StoreError};
 
@@ -91,6 +91,17 @@ impl From<StoreError> for ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: "storage",
             title: e.to_string(),
+            generation: None,
+        }
+    }
+}
+
+impl From<SnapshotValidationError> for ApiError {
+    fn from(error: SnapshotValidationError) -> Self {
+        ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "invalid-snapshot-limits",
+            title: error.to_string(),
             generation: None,
         }
     }

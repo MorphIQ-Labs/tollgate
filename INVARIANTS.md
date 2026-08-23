@@ -174,19 +174,29 @@ until it has one.
     `snapshot_publish_fetch_and_generation_monotonicity`. *Proof:*
     `formal/lean/Tollgate/SnapshotCache.lean`.
 
-16. **Unsafe timing configuration never starts.** Nonpositive lease TTLs,
-    polling/refresh/reclaim intervals, negative safety margins or reclaim
-    grace, and internally inconsistent lease thresholds are rejected before
-    allocation or task startup. *Tests:*
+16. **Unsafe configuration never becomes authoritative.** Nonpositive lease
+    TTLs, polling/refresh/reclaim intervals, negative safety margins or
+    reclaim grace, and internally inconsistent lease thresholds are rejected
+    before allocation or task startup. A snapshot is publishable only when
+    checked arithmetic proves that its worst registered operation at
+    `max_items_per_request` — including fixed and minimum charges — does not
+    exceed `rate_burst_units`; overflow and above-burst results are refused at
+    every publication or decode boundary. *Tests:*
     `nonpositive_lease_ttl_is_rejected_without_debiting` (both stores),
     `invalid_lease_manager_durations_are_rejected`,
     `invalid_snapshot_manager_intervals_are_rejected`,
     `invalid_grant_policy_is_rejected`, `zero_reclaim_interval_is_rejected`,
     `zero_drain_deadline_is_rejected`, `invalid_writer_config_is_rejected`,
     `invalid_lease_manager_timeouts_are_rejected`, and
-    `invalid_pool_config_is_rejected_before_connecting`. No such value is
-    silently repaired: a coercion like `capacity.max(1)` would change the
-    runtime meaning of a configured contract.
+    `invalid_pool_config_is_rejected_before_connecting`, plus
+    `publication_uses_the_largest_registered_weight`,
+    `snapshot_publication_matches_u128_worst_case_oracle`,
+    `admin_refuses_snapshot_whose_batch_quote_exceeds_burst`,
+    `http_store_rejects_invalid_snapshot_from_legacy_server`, and
+    `legacy_invalid_snapshot_is_rejected_on_read`. *Proof:*
+    `formal/lean/Tollgate/SnapshotLimits.lean`. No such value is silently
+    repaired: coercing a capacity or overriding a declared limit would change
+    the runtime meaning of a configured contract.
 
 17. **Negative caching is bounded and self-healing.** The ArcSwap map retains
     at most its configured count of request-visible negatives, removes

@@ -9,7 +9,7 @@ use jiff::{SignedDuration, Timestamp};
 
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
-    PermissionBits, Principal, RequestId, ResolvedLimits, UsageEvent,
+    PermissionBits, Principal, PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, CreateAccountError, GrantPolicy, LeaseAllocator,
@@ -22,6 +22,10 @@ fn t(secs: i64) -> Timestamp {
 
 const TTL: SignedDuration = SignedDuration::from_secs(60);
 const ACCOUNT: AccountId = AccountId(1);
+
+fn publishable(snapshot: Arc<AccountSnapshot>) -> PublishableSnapshot {
+    PublishableSnapshot::try_new(snapshot).expect("test snapshot limits are valid")
+}
 
 /// Full-request grants (no adaptive shrink) for scenarios that need exact
 /// lease sizes.
@@ -476,7 +480,7 @@ async fn snapshot_publish_fetch_and_push() {
         store.snapshot(principal).await.unwrap(),
         SnapshotResolution::Unknown
     ));
-    store.publish_snapshot(principal, Arc::clone(&snapshot));
+    store.publish_snapshot(principal, publishable(Arc::clone(&snapshot)));
 
     let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
         panic!("published snapshot must be present");
@@ -494,10 +498,10 @@ async fn snapshot_publish_fetch_and_push() {
     // pushes an update.
     store.publish_snapshot(
         principal,
-        Arc::new(AccountSnapshot {
+        publishable(Arc::new(AccountSnapshot {
             generation: Generation(2),
             ..(*snapshot).clone()
-        }),
+        })),
     );
     let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
         panic!("newest snapshot must remain present");
@@ -520,10 +524,10 @@ async fn snapshot_publish_fetch_and_push() {
     ));
     store.publish_snapshot(
         principal,
-        Arc::new(AccountSnapshot {
+        publishable(Arc::new(AccountSnapshot {
             generation: Generation(2),
             ..(*snapshot).clone()
-        }),
+        })),
     );
     assert!(matches!(
         store.snapshot(principal).await.unwrap(),
@@ -535,10 +539,10 @@ async fn snapshot_publish_fetch_and_push() {
 
     store.publish_snapshot(
         principal,
-        Arc::new(AccountSnapshot {
+        publishable(Arc::new(AccountSnapshot {
             generation: Generation(4),
             ..(*snapshot).clone()
-        }),
+        })),
     );
     let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
         panic!("newer snapshot must supersede revocation");

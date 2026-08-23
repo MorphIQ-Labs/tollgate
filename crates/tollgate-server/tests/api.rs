@@ -234,3 +234,43 @@ async fn admin_snapshot_roundtrip_and_probes() {
     assert_eq!(problem["generation"], 3);
     let _ = Principal(7);
 }
+
+#[tokio::test]
+async fn admin_refuses_snapshot_whose_batch_quote_exceeds_burst() {
+    let (_store, router) = state();
+    let snapshot = json!({
+        "account_id": 1,
+        "key_id": null,
+        "generation": 1,
+        "status": "Active",
+        "valid_until": "2100-01-01T00:00:00Z",
+        "permissions": 1,
+        "limits": {
+            "max_items_per_request": 64,
+            "rate_units_per_second": 1000,
+            "rate_burst_units": 113
+        },
+        "cost_table": {
+            "fixed_request": 50,
+            "minimum_charge": 50,
+            "weights": [1]
+        }
+    });
+
+    // The largest possible quote is 50 + 1 * 64 = 114, so publication is
+    // refused instead of installing a plan that the request path cannot
+    // admit at its documented batch cap.
+    let (status, problem) = call(
+        &router,
+        "PUT",
+        "/v1/admin/snapshots/7",
+        Some(json!({"snapshot": snapshot})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(problem["code"], "invalid-snapshot-limits");
+
+    let (status, problem) = call(&router, "GET", "/v1/snapshots/7", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(problem["code"], "unknown-principal");
+}

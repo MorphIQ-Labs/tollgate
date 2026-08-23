@@ -23,8 +23,8 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId,
-    Principal, UsageEvent,
+    AccountId, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId, Principal,
+    PublishableSnapshot, UsageEvent,
 };
 
 use crate::traits::{
@@ -80,7 +80,7 @@ struct AccountRecord {
 #[derive(Debug)]
 struct SnapshotRecord {
     generation: Generation,
-    snapshot: Option<Arc<AccountSnapshot>>,
+    snapshot: Option<PublishableSnapshot>,
 }
 
 #[derive(Default)]
@@ -206,7 +206,7 @@ impl MemoryStore {
     /// carrying an older (or equal) generation is a no-op — matching the
     /// Postgres backend, which enforces the same rule in its upsert (review
     /// finding #5's backend-divergence note).
-    pub fn publish_snapshot(&self, principal: Principal, snapshot: Arc<AccountSnapshot>) {
+    pub fn publish_snapshot(&self, principal: Principal, snapshot: PublishableSnapshot) {
         {
             let mut inner = self.lock();
             if let Some(existing) = inner.snapshots.get(&principal)
@@ -218,7 +218,7 @@ impl MemoryStore {
                 principal,
                 SnapshotRecord {
                     generation: snapshot.generation,
-                    snapshot: Some(Arc::clone(&snapshot)),
+                    snapshot: Some(snapshot.clone()),
                 },
             );
         }
@@ -513,7 +513,7 @@ impl AdminStore for MemoryStore {
     async fn publish_snapshot(
         &self,
         principal: Principal,
-        snapshot: Arc<AccountSnapshot>,
+        snapshot: PublishableSnapshot,
     ) -> Result<(), StoreError> {
         MemoryStore::publish_snapshot(self, principal, snapshot);
         Ok(())
@@ -530,7 +530,7 @@ impl SnapshotSource for MemoryStore {
     async fn snapshot(&self, principal: Principal) -> Result<SnapshotResolution, StoreError> {
         Ok(match self.lock().snapshots.get(&principal) {
             Some(record) => match &record.snapshot {
-                Some(snapshot) => SnapshotResolution::Present(Arc::clone(snapshot)),
+                Some(snapshot) => SnapshotResolution::Present(snapshot.clone()),
                 None => SnapshotResolution::Revoked {
                     generation: record.generation,
                 },

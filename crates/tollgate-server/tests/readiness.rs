@@ -8,7 +8,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
 
-use tollgate_core::{AccountId, AccountSnapshot, CostUnits, Principal};
+use tollgate_core::{AccountId, CostUnits, Principal, PublishableSnapshot};
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, CreateAccountError, IngestReport, LeaseAllocator,
     ReclaimedLease, SnapshotPush, SnapshotResolution, SnapshotSource, StoreError, StoreHealth,
@@ -100,7 +100,7 @@ impl AdminStore for PingOnlyStore {
     async fn publish_snapshot(
         &self,
         _principal: Principal,
-        _snapshot: Arc<AccountSnapshot>,
+        _snapshot: PublishableSnapshot,
     ) -> Result<(), StoreError> {
         unreachable!("readiness never administers")
     }
