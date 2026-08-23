@@ -5,6 +5,12 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.2...v0.2.3) - 2026-08-23
+
+### Other
+
+- *(store)* bound expired lease reclaim
+
 ## [0.2.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.1...v0.2.2) - 2026-08-23
 
 ### Added
