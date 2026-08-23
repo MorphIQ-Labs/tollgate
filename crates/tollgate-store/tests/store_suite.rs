@@ -3,6 +3,7 @@
 //! Written against [`MemoryStore`] as the reference; the Postgres backend
 //! must pass the same scenarios (its test file mirrors these by name).
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use jiff::{SignedDuration, Timestamp};
@@ -13,7 +14,7 @@ use tollgate_core::{
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, CreateAccountError, GrantPolicy, LeaseAllocator,
-    MemoryStore, SnapshotResolution, SnapshotSource, UsageSink,
+    MemoryStore, ReclaimBatch, ReclaimedLease, SnapshotResolution, SnapshotSource, UsageSink,
 };
 
 fn t(secs: i64) -> Timestamp {
@@ -251,6 +252,87 @@ async fn expired_lease_units_reclaimed() {
         .unwrap();
     assert_eq!(report.rejected, 1);
     assert_conserved(&store);
+}
+
+/// INVARIANTS.md #9: an outage-sized backlog is split into bounded atomic
+/// settlements without capping how much legitimate quota eventually returns.
+#[tokio::test]
+async fn expired_backlog_is_reclaimed_in_bounded_batches() {
+    const OTHER: AccountId = AccountId(2);
+    let store = store_with_balance(full_grant_policy(), 200);
+    AdminStore::create_account(
+        &*store,
+        AccountConfig {
+            account_id: OTHER,
+            initial_balance: CostUnits(400),
+            active: true,
+        },
+    )
+    .await
+    .unwrap();
+    let leases = [
+        store
+            .acquire(ACCOUNT, CostUnits(200), TTL, t(0))
+            .await
+            .unwrap(),
+        store
+            .acquire(OTHER, CostUnits(200), TTL, t(0))
+            .await
+            .unwrap(),
+        store
+            .acquire(OTHER, CostUnits(200), TTL, t(0))
+            .await
+            .unwrap(),
+    ];
+    store
+        .ingest(
+            &[usage(&leases[0], 10, 25, 10), usage(&leases[2], 11, 50, 10)],
+            t(10),
+        )
+        .await
+        .unwrap();
+
+    let limit = NonZeroUsize::new(2).unwrap();
+    let first = store.reclaim_expired_batch(t(60), limit).await.unwrap();
+    assert_eq!(first.len(), 2);
+    assert!(first.is_saturated());
+
+    let second = store.reclaim_expired_batch(t(60), limit).await.unwrap();
+    assert_eq!(second.len(), 1);
+    assert!(!second.is_saturated());
+
+    let mut expected_ids: Vec<_> = leases.iter().map(|lease| lease.lease_id).collect();
+    expected_ids.sort_by_key(|lease_id| lease_id.0);
+    let mut reclaimed_ids: Vec<_> = first
+        .reclaimed()
+        .iter()
+        .chain(second.reclaimed())
+        .map(|lease| lease.lease_id)
+        .collect();
+    reclaimed_ids.sort_by_key(|lease_id| lease_id.0);
+    assert_eq!(reclaimed_ids, expected_ids);
+    assert_eq!(store.balance(ACCOUNT), CostUnits(175));
+    assert_eq!(store.balance(OTHER), CostUnits(350));
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(25));
+    assert_eq!(store.usage_recorded(OTHER), CostUnits(50));
+    assert_conserved(&store);
+    let other_conservation = store.conservation(OTHER).unwrap();
+    assert!(
+        other_conservation.holds(),
+        "conservation violated: {other_conservation:?}"
+    );
+}
+
+#[test]
+fn reclaim_batch_rejects_backend_results_over_the_limit() {
+    let reclaimed = (0..3)
+        .map(|id| ReclaimedLease {
+            lease_id: tollgate_core::LeaseId(id),
+            account_id: ACCOUNT,
+            reclaimed: CostUnits(1),
+        })
+        .collect();
+    assert!(ReclaimBatch::try_new(reclaimed, NonZeroUsize::new(2).unwrap()).is_err());
 }
 
 /// INVARIANTS.md #7: replaying a batch never double-bills.

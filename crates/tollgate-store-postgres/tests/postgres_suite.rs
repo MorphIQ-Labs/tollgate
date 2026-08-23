@@ -10,6 +10,7 @@
 //! Tests share one database, so they serialize on a global lock and truncate
 //! before running.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use jiff::{SignedDuration, Timestamp};
@@ -299,6 +300,78 @@ async fn expired_lease_units_reclaimed() {
         .unwrap();
     assert_eq!(report.rejected, 1);
     assert_conserved(&store).await;
+}
+
+/// INVARIANTS.md #9: the production backend commits an outage backlog in
+/// bounded chunks while preserving exact per-account conservation.
+#[tokio::test]
+async fn expired_backlog_is_reclaimed_in_bounded_batches() {
+    const OTHER: AccountId = AccountId(2);
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 200).await else {
+        return;
+    };
+    AdminStore::create_account(
+        &*store,
+        AccountConfig {
+            account_id: OTHER,
+            initial_balance: CostUnits(400),
+            active: true,
+        },
+    )
+    .await
+    .unwrap();
+    let leases = [
+        store
+            .acquire(ACCOUNT, CostUnits(200), TTL, t(0))
+            .await
+            .unwrap(),
+        store
+            .acquire(OTHER, CostUnits(200), TTL, t(0))
+            .await
+            .unwrap(),
+        store
+            .acquire(OTHER, CostUnits(200), TTL, t(0))
+            .await
+            .unwrap(),
+    ];
+    store
+        .ingest(
+            &[usage(&leases[0], 10, 25, 10), usage(&leases[2], 11, 50, 10)],
+            t(10),
+        )
+        .await
+        .unwrap();
+
+    let limit = NonZeroUsize::new(2).unwrap();
+    let first = store.reclaim_expired_batch(t(60), limit).await.unwrap();
+    assert_eq!(first.len(), 2);
+    assert!(first.is_saturated());
+
+    let second = store.reclaim_expired_batch(t(60), limit).await.unwrap();
+    assert_eq!(second.len(), 1);
+    assert!(!second.is_saturated());
+
+    let mut expected_ids: Vec<_> = leases.iter().map(|lease| lease.lease_id).collect();
+    expected_ids.sort_by_key(|lease_id| lease_id.0);
+    let mut reclaimed_ids: Vec<_> = first
+        .reclaimed()
+        .iter()
+        .chain(second.reclaimed())
+        .map(|lease| lease.lease_id)
+        .collect();
+    reclaimed_ids.sort_by_key(|lease_id| lease_id.0);
+    assert_eq!(reclaimed_ids, expected_ids);
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(175));
+    assert_eq!(store.balance(OTHER).await.unwrap(), CostUnits(350));
+    assert_eq!(store.usage_recorded(ACCOUNT).await.unwrap(), CostUnits(25));
+    assert_eq!(store.usage_recorded(OTHER).await.unwrap(), CostUnits(50));
+    assert_conserved(&store).await;
+    let other_conservation = store.conservation(OTHER).await.unwrap().unwrap();
+    assert!(
+        other_conservation.holds(),
+        "conservation violated: {other_conservation:?}"
+    );
 }
 
 #[tokio::test]

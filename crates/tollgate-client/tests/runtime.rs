@@ -1,6 +1,7 @@
 //! Behavior tests for the lease manager and usage writer (INVARIANTS.md #5,
 //! #6, #8, #9's client half).
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
@@ -13,7 +14,8 @@ use tollgate_client::{
 };
 use tollgate_core::{AccountId, CostUnits, DenyReason, RequestId, UsageEvent};
 use tollgate_store::{
-    AccountConfig, GrantPolicy, IngestReport, LeaseAllocator, MemoryStore, StoreError, UsageSink,
+    AccountConfig, GrantPolicy, IngestReport, LeaseAllocator, MemoryStore, ReclaimBatch,
+    StoreError, UsageSink,
 };
 
 const ACCOUNT: AccountId = AccountId(1);
@@ -1484,11 +1486,12 @@ impl LeaseAllocator for HangingAcquireAllocator {
         Ok(())
     }
 
-    async fn reclaim_expired(
+    async fn reclaim_expired_batch(
         &self,
         _now: Timestamp,
-    ) -> Result<Vec<tollgate_store::ReclaimedLease>, StoreError> {
-        Ok(Vec::new())
+        limit: NonZeroUsize,
+    ) -> Result<ReclaimBatch, StoreError> {
+        ReclaimBatch::try_new(Vec::new(), limit)
     }
 }
 
@@ -1558,11 +1561,12 @@ impl LeaseAllocator for HangingReleaseAllocator {
         std::future::pending().await
     }
 
-    async fn reclaim_expired(
+    async fn reclaim_expired_batch(
         &self,
         now: Timestamp,
-    ) -> Result<Vec<tollgate_store::ReclaimedLease>, StoreError> {
-        self.inner.reclaim_expired(now).await
+        limit: NonZeroUsize,
+    ) -> Result<ReclaimBatch, StoreError> {
+        self.inner.reclaim_expired_batch(now, limit).await
     }
 }
 

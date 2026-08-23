@@ -15,6 +15,7 @@
 //! before settlement).
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -29,8 +30,8 @@ use tollgate_core::{
 
 use crate::traits::{
     AdminStore, AllocateError, CreateAccountError, GrantPolicy, GrantPolicyError, IngestReport,
-    LeaseAllocator, ReclaimedLease, SnapshotPush, SnapshotResolution, SnapshotSource, StoreError,
-    StoreHealth, UsageSink,
+    LeaseAllocator, ReclaimBatch, ReclaimedLease, SnapshotPush, SnapshotResolution, SnapshotSource,
+    StoreError, StoreHealth, UsageSink,
 };
 
 /// Admin-side inputs when creating an account.
@@ -441,9 +442,12 @@ impl LeaseAllocator for MemoryStore {
         Ok(())
     }
 
-    async fn reclaim_expired(&self, now: Timestamp) -> Result<Vec<ReclaimedLease>, StoreError> {
+    async fn reclaim_expired_batch(
+        &self,
+        now: Timestamp,
+        limit: NonZeroUsize,
+    ) -> Result<ReclaimBatch, StoreError> {
         let mut inner = self.lock();
-        let mut reclaimed = Vec::new();
         let expired: Vec<LeaseId> = inner
             .leases
             .iter()
@@ -455,7 +459,9 @@ impl LeaseAllocator for MemoryStore {
                 l.state == LeaseState::Active && now >= reclaim_at
             })
             .map(|(id, _)| *id)
+            .take(limit.get())
             .collect();
+        let mut reclaimed = Vec::with_capacity(expired.len());
         for lease_id in expired {
             let lease = inner.leases.get_mut(&lease_id).expect("just listed");
             lease.state = LeaseState::Expired;
@@ -479,7 +485,7 @@ impl LeaseAllocator for MemoryStore {
                 reclaimed: credit,
             });
         }
-        Ok(reclaimed)
+        ReclaimBatch::try_new(reclaimed, limit)
     }
 }
 
