@@ -118,6 +118,46 @@ impl std::fmt::Display for AllocateError {
 
 impl std::error::Error for AllocateError {}
 
+/// Admin-side inputs when creating an account.
+#[derive(Debug, Clone, Copy)]
+pub struct AccountConfig {
+    pub account_id: AccountId,
+    pub initial_balance: CostUnits,
+    /// Inactive accounts refuse leases but keep their ledger.
+    pub active: bool,
+}
+
+/// Per-account conservation view for reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Conservation {
+    pub deposited: CostUnits,
+    pub balance: CostUnits,
+    pub active_lease_grants: CostUnits,
+    /// Usage billed against leases that have settled (released or expired).
+    /// Usage on active leases is inside `active_lease_grants`.
+    pub settled_usage: CostUnits,
+    pub settlement_loss: CostUnits,
+}
+
+impl Conservation {
+    /// `deposited == balance + active grants + settled usage + loss`, exactly.
+    #[must_use]
+    pub fn holds(&self) -> bool {
+        let mut sum = self.balance;
+        for part in [
+            self.active_lease_grants,
+            self.settled_usage,
+            self.settlement_loss,
+        ] {
+            match sum.checked_add(part) {
+                Some(next) => sum = next,
+                None => return false,
+            }
+        }
+        sum == self.deposited
+    }
+}
+
 /// How an allocator sizes grants as an account's balance shrinks.
 ///
 /// Deep balances grant the full request; near exhaustion the grant is capped
@@ -421,10 +461,7 @@ impl std::error::Error for CreateAccountError {}
 /// without this.
 #[async_trait]
 pub trait AdminStore: Send + Sync {
-    async fn create_account(
-        &self,
-        config: crate::memory::AccountConfig,
-    ) -> Result<(), CreateAccountError>;
+    async fn create_account(&self, config: AccountConfig) -> Result<(), CreateAccountError>;
     async fn deposit(&self, account: AccountId, units: CostUnits) -> Result<(), AllocateError>;
     async fn set_active(&self, account: AccountId, active: bool) -> Result<(), AllocateError>;
     async fn publish_snapshot(
@@ -582,6 +619,33 @@ mod tests {
             AllocateError::Storage(StoreError("a".into())).index(),
             AllocateError::Storage(StoreError("b".into())).index()
         );
+    }
+
+    #[test]
+    fn conservation_requires_an_exact_equation_without_overflow() {
+        let balanced = Conservation {
+            deposited: CostUnits(10),
+            balance: CostUnits(1),
+            active_lease_grants: CostUnits(2),
+            settled_usage: CostUnits(3),
+            settlement_loss: CostUnits(4),
+        };
+        assert!(balanced.holds());
+
+        let drifted = Conservation {
+            deposited: CostUnits(11),
+            ..balanced
+        };
+        assert!(!drifted.holds());
+
+        let overflowing = Conservation {
+            deposited: CostUnits(u64::MAX),
+            balance: CostUnits(u64::MAX),
+            active_lease_grants: CostUnits(1),
+            settled_usage: CostUnits::ZERO,
+            settlement_loss: CostUnits::ZERO,
+        };
+        assert!(!overflowing.holds());
     }
 
     #[test]

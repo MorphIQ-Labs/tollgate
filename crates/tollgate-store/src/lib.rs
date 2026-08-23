@@ -25,9 +25,10 @@ pub mod traits;
 pub mod wire;
 
 pub use clock::{Clock, ManualClock, SystemClock};
-pub use memory::{AccountConfig, MemoryStore};
+pub use memory::MemoryStore;
 pub use traits::{
-    AdminStore, AllocateError, CreateAccountError, DEFAULT_RECLAIM_BATCH_LIMIT, GrantPolicy,
-    GrantPolicyError, IngestReport, LeaseAllocator, ReclaimBatch, ReclaimedLease, SnapshotPush,
-    SnapshotResolution, SnapshotSource, StoreError, StoreHealth, UsageSink,
+    AccountConfig, AdminStore, AllocateError, Conservation, CreateAccountError,
+    DEFAULT_RECLAIM_BATCH_LIMIT, GrantPolicy, GrantPolicyError, IngestReport, LeaseAllocator,
+    ReclaimBatch, ReclaimedLease, SnapshotPush, SnapshotResolution, SnapshotSource, StoreError,
+    StoreHealth, UsageSink,
 };

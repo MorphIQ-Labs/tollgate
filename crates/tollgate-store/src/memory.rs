@@ -28,20 +28,12 @@ use tollgate_core::{
     PublishableSnapshot, UsageEvent,
 };
 
+pub use crate::traits::{AccountConfig, Conservation};
 use crate::traits::{
     AdminStore, AllocateError, CreateAccountError, GrantPolicy, GrantPolicyError, IngestReport,
     LeaseAllocator, ReclaimBatch, ReclaimedLease, SnapshotPush, SnapshotResolution, SnapshotSource,
     StoreError, StoreHealth, UsageSink,
 };
-
-/// Admin-side inputs when creating an account.
-#[derive(Debug, Clone, Copy)]
-pub struct AccountConfig {
-    pub account_id: AccountId,
-    pub initial_balance: CostUnits,
-    /// Inactive accounts refuse leases but keep their ledger.
-    pub active: bool,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeaseState {
@@ -91,37 +83,6 @@ struct Inner {
     snapshots: HashMap<Principal, SnapshotRecord>,
     usage: HashMap<tollgate_core::RequestId, UsageEvent>,
     next_lease_id: u128,
-}
-
-/// Per-account conservation view for tests and reconciliation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Conservation {
-    pub deposited: CostUnits,
-    pub balance: CostUnits,
-    pub active_lease_grants: CostUnits,
-    /// Usage billed against leases that have settled (released or expired).
-    /// Usage on active leases is inside `active_lease_grants`.
-    pub settled_usage: CostUnits,
-    pub settlement_loss: CostUnits,
-}
-
-impl Conservation {
-    /// `deposited == balance + active grants + settled usage + loss`, exactly.
-    #[must_use]
-    pub fn holds(&self) -> bool {
-        let mut sum = self.balance;
-        for part in [
-            self.active_lease_grants,
-            self.settled_usage,
-            self.settlement_loss,
-        ] {
-            match sum.checked_add(part) {
-                Some(next) => sum = next,
-                None => return false,
-            }
-        }
-        sum == self.deposited
-    }
 }
 
 pub struct MemoryStore {
