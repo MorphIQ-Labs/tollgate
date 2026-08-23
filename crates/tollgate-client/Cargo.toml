@@ -8,9 +8,9 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-tollgate-core = { path = "../tollgate-core", version = "=0.1.4" }
-tollgate-admission = { path = "../tollgate-admission", version = "=0.1.4" }
-tollgate-store = { path = "../tollgate-store", version = "=0.1.4" }
+tollgate-core = { path = "../tollgate-core", version = "=0.2.0" }
+tollgate-admission = { path = "../tollgate-admission", version = "=0.2.0" }
+tollgate-store = { path = "../tollgate-store", version = "=0.2.0" }
 async-trait = { workspace = true }
 jiff = { workspace = true }
 reqwest = { workspace = true, optional = true }
