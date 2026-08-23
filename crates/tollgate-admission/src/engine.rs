@@ -6,7 +6,8 @@ use std::sync::Arc;
 use jiff::Timestamp;
 
 use tollgate_core::{
-    AccountSnapshot, CostQuote, DenyReason, OpIndex, PermissionBits, QuoteError, Reservation,
+    AccountSnapshot, CostQuote, CostUnits, DenyReason, OpIndex, PermissionBits, QuoteError,
+    Reservation,
 };
 
 use crate::state::{MapEntry, Principal, SnapshotMap};
@@ -88,9 +89,22 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
             })?;
 
         // 4. Weighted rate token. Cost-weighted: heavy requests draw down the
-        //    bucket proportionally. A weight beyond the bucket's burst can
-        //    never pass (`check_n` reports insufficient capacity), which is
-        //    fail-closed for misconfigured schedules.
+        //    bucket proportionally.
+        //
+        //    A weight beyond the bucket's whole burst can never pass, however
+        //    long the caller waits — that is a schedule whose batch cap admits
+        //    a quote its burst cannot hold, and it is reported as such rather
+        //    than as throttling (#40). Deciding it here, in full width against
+        //    the configured burst, is what keeps the u32 conversion below
+        //    honest: the weight is known to fit the bucket before it is
+        //    narrowed, so narrowing can no longer disguise an unadmittable
+        //    request as an ordinary empty bucket.
+        if quote.total.get() > limits.rate_burst_units {
+            return Err(DenyReason::UnpriceableUnderLimits {
+                weight: quote.total,
+                burst_units: CostUnits(limits.rate_burst_units),
+            });
+        }
         let weight = u32::try_from(quote.total.get()).unwrap_or(u32::MAX);
         match NonZeroU32::new(weight) {
             // Zero-cost requests draw no token; the minimum-charge floor
@@ -98,7 +112,17 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
             None => {}
             Some(n) => match state.limiter.check_n(n) {
                 Ok(Ok(())) => {}
-                Ok(Err(_)) | Err(_) => return Err(DenyReason::RateLimited),
+                Ok(Err(_)) => return Err(DenyReason::RateLimited),
+                // Unreachable given the check above, which uses the same
+                // configured burst the bucket was built from; kept because
+                // "the bucket cannot ever hold this" must never be reported
+                // as "the bucket is momentarily empty".
+                Err(_) => {
+                    return Err(DenyReason::UnpriceableUnderLimits {
+                        weight: quote.total,
+                        burst_units: CostUnits(limits.rate_burst_units),
+                    });
+                }
             },
         }
 
@@ -311,7 +335,117 @@ mod tests {
         }
         assert_eq!(
             engine.admit(req, t(0)).unwrap_err(),
+            DenyReason::RateLimited,
+            "an empty-but-refilling bucket is throttling, not misconfiguration"
+        );
+    }
+
+    /// Builds an engine whose account carries the given limits.
+    fn engine_with_limits(limits: ResolvedLimits) -> AdmissionEngine<ArcSwapSnapshotMap> {
+        let snapshot = Arc::new(AccountSnapshot {
+            limits,
+            ..(*snapshot(AccountStatus::Active)).clone()
+        });
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::empty();
+        slot.install(lease(1_000_000));
+        engine.map().install(Principal(1), snapshot, slot);
+        engine
+    }
+
+    /// Issue #40: a batch cap that admits a quote larger than the whole burst
+    /// is a misconfigured schedule. Reporting it as throttling invites a retry
+    /// that can never succeed.
+    #[test]
+    fn batch_cap_above_burst_is_unpriceable_not_throttled() {
+        let engine = engine_with_limits(ResolvedLimits {
+            max_items_per_request: 64,
+            rate_units_per_second: 1_000,
+            // 64 items quote 50 + 64 = 114 units: inside the batch cap, past
+            // the burst, and unadmittable however long the caller waits.
+            rate_burst_units: 64,
+        });
+
+        assert_eq!(
+            engine.admit(request(64), t(0)).unwrap_err(),
+            DenyReason::UnpriceableUnderLimits {
+                weight: CostUnits(114),
+                burst_units: CostUnits(64),
+            }
+        );
+        // Repeating never converts it into ordinary throttling.
+        assert_eq!(
+            engine.admit(request(64), t(0)).unwrap_err(),
+            DenyReason::UnpriceableUnderLimits {
+                weight: CostUnits(114),
+                burst_units: CostUnits(64),
+            }
+        );
+        // A request the burst *can* hold still admits: the deny is about this
+        // request's weight, not a wedged account.
+        engine.admit(request(1), t(0)).unwrap();
+    }
+
+    /// The burst bound is inclusive, matching GCRA's own inclusive boundary
+    /// (see `rate_limiter_weights_by_cost`): a quote of exactly the burst is
+    /// admissible, so it must not be pre-empted as unpriceable. An off-by-one
+    /// here would deny requests governor would have accepted.
+    #[test]
+    fn weight_equal_to_burst_admits() {
+        let engine = engine_with_limits(ResolvedLimits {
+            max_items_per_request: 64,
+            rate_units_per_second: 1,
+            // 64 items quote exactly 50 + 64 = 114 units.
+            rate_burst_units: 114,
+        });
+
+        let admitted = engine.admit(request(64), t(0)).unwrap();
+        assert_eq!(admitted.quote.total, CostUnits(114));
+        // The bucket is now empty, so the next one is ordinary throttling —
+        // never the terminal reason.
+        assert_eq!(
+            engine.admit(request(64), t(0)).unwrap_err(),
             DenyReason::RateLimited
+        );
+    }
+
+    /// A zero burst is not silently repaired into a burst of one: every
+    /// priced request is refused, and says why.
+    #[test]
+    fn zero_burst_denies_every_priced_request() {
+        let engine = engine_with_limits(ResolvedLimits {
+            max_items_per_request: 64,
+            rate_units_per_second: 1_000,
+            rate_burst_units: 0,
+        });
+
+        assert_eq!(
+            engine.admit(request(1), t(0)).unwrap_err(),
+            DenyReason::UnpriceableUnderLimits {
+                weight: CostUnits(51),
+                burst_units: CostUnits::ZERO,
+            }
+        );
+    }
+
+    /// A quote wider than the bucket's u32 domain is unadmittable by
+    /// construction; narrowing must not disguise it as an empty bucket.
+    #[test]
+    fn quote_beyond_the_bucket_domain_is_unpriceable() {
+        let engine = engine_with_limits(ResolvedLimits {
+            max_items_per_request: u64::MAX,
+            rate_units_per_second: 1_000,
+            rate_burst_units: u64::from(u32::MAX),
+        });
+
+        // 50 fixed + items: the first quote to exceed the burst.
+        let items = u64::from(u32::MAX);
+        assert_eq!(
+            engine.admit(request(items), t(0)).unwrap_err(),
+            DenyReason::UnpriceableUnderLimits {
+                weight: CostUnits(items + 50),
+                burst_units: CostUnits(u64::from(u32::MAX)),
+            }
         );
     }
 

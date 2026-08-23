@@ -186,6 +186,15 @@ fn build_limiter(limits: &ResolvedLimits) -> AccountRateLimiter {
     // governor buckets are u32-denominated. Rates/bursts beyond u32::MAX are
     // clamped rather than wrapped; a per-account rate of 4.29e9 units/sec is
     // beyond any current schedule by orders of magnitude.
+    //
+    // These clamps decide bucket *construction* only, never a verdict. A
+    // schedule whose burst cannot hold a request is refused upstream in
+    // `AdmissionEngine::admit`, comparing the quote against
+    // `rate_burst_units` in full width — so `burst = 0` denies every priced
+    // request as `UnpriceableUnderLimits` rather than silently behaving like
+    // a burst of 1, and a burst above u32::MAX admits by the same comparison
+    // it was configured with (#40). The `max(1)` below exists because
+    // governor requires a nonzero quota, not to repair a configured value.
     let rate = u32::try_from(limits.rate_units_per_second)
         .unwrap_or(u32::MAX)
         .max(1);
