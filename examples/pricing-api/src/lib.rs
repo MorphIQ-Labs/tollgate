@@ -432,6 +432,13 @@ fn deny_response(reason: DenyReason) -> Response {
             (StatusCode::UNPROCESSABLE_ENTITY, "unpriceable")
         }
         DenyReason::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate-limited"),
+        // Deliberately not 429 and deliberately its own code: this request
+        // can never be admitted under the current plan, so inviting a retry
+        // would be a lie, and folding it into "unpriceable" would hide which
+        // half of the schedule is wrong.
+        DenyReason::UnpriceableUnderLimits { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "unpriceable-under-limits")
+        }
         DenyReason::LeaseUnavailable | DenyReason::LeaseExpired => {
             (StatusCode::SERVICE_UNAVAILABLE, "quota-unavailable")
         }

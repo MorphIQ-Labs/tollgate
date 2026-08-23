@@ -39,8 +39,18 @@ until it has one.
 5. **Fail closed, zero I/O.** Unknown principal, suspended/closed account,
    expired snapshot, missing permission, exhausted or expired lease: all deny
    locally. The request path performs no database, file, lock-file, or network
-   access — not even on a miss. *Tests:* `tollgate-core` deny-path unit tests;
-   admission-crate miss tests assert no store calls from the request path.
+   access — not even on a miss. A deny also says which kind it is: a request
+   that can *never* be admitted under the account's current schedule — its
+   quote exceeds the whole burst — is `UnpriceableUnderLimits`, never
+   `RateLimited`, so a caller is never told to retry something that cannot
+   succeed and an operator is never shown throttling for a misconfiguration.
+   *Tests:* `tollgate-core` deny-path unit tests; admission-crate miss tests
+   assert no store calls from the request path;
+   `batch_cap_above_burst_is_unpriceable_not_throttled`,
+   `zero_burst_denies_every_priced_request`,
+   `quote_beyond_the_bucket_domain_is_unpriceable`, and
+   `rate_limiter_weights_by_cost` (the converse: genuine throttling stays
+   `RateLimited`).
 
 6. **Foreground isolation.** Lease refill and snapshot replacement never block
    an in-flight request. *Tests:* client refill tests; `lease/refill_offpath`

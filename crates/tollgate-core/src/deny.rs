@@ -35,8 +35,18 @@ pub enum DenyReason {
     /// cannot be charged, so it cannot be admitted.
     UnpricedOperation,
     /// The account's local rate limiter has no capacity for this request's
-    /// weight.
+    /// weight *right now*. Transient: the bucket refills.
     RateLimited,
+    /// The request's quoted weight exceeds the account's entire burst
+    /// capacity, so no amount of waiting can admit it. A schedule whose batch
+    /// cap admits a quote larger than its burst is misconfigured, not
+    /// throttled — telling the caller to retry would be a lie.
+    UnpriceableUnderLimits {
+        /// The quote that could not fit.
+        weight: CostUnits,
+        /// The account's whole burst capacity at the time of refusal.
+        burst_units: CostUnits,
+    },
     /// No lease is currently installed for the account — the instance has not
     /// yet acquired one (cold start) or lost it. Fail closed; the background
     /// refill task is responsible for recovery.
@@ -70,6 +80,14 @@ impl fmt::Display for DenyReason {
             }
             DenyReason::UnpricedOperation => f.write_str("operation is not priced"),
             DenyReason::RateLimited => f.write_str("rate limited"),
+            DenyReason::UnpriceableUnderLimits {
+                weight,
+                burst_units,
+            } => write!(
+                f,
+                "request weight {weight} exceeds the account's whole burst capacity \
+                 ({burst_units} units); retrying cannot help"
+            ),
             DenyReason::LeaseUnavailable => f.write_str("no quota lease available"),
             DenyReason::LeaseExpired => f.write_str("quota lease expired"),
             DenyReason::LeaseExhausted { remaining } => {
