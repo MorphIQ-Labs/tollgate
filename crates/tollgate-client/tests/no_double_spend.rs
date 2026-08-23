@@ -205,8 +205,8 @@ async fn two_instances_never_overspend_one_account() {
 
     // Orderly shutdown: flush usage first, then release leases.
     let [a, b] = instances;
-    let stats_a = a.writer.shutdown().await;
-    let stats_b = b.writer.shutdown().await;
+    let stats_a = a.writer.shutdown().await.unwrap();
+    let stats_b = b.writer.shutdown().await.unwrap();
     assert_eq!(stats_a.lost + stats_b.lost, 0);
     assert_eq!(stats_a.rejected + stats_b.rejected, 0);
     // Independent generators must never collide into duplicates.
