@@ -267,4 +267,5 @@ release:
   script:
     - test -n "$RELEASE_PLZ_TOKEN"
     - release-plz release --config release-plz.toml --forge gitlab --git-token "$RELEASE_PLZ_TOKEN"
+    - git fetch --tags origin
     - release-plz release-pr --config release-plz.toml --forge gitlab --git-token "$RELEASE_PLZ_TOKEN"
