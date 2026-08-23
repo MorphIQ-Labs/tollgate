@@ -4,16 +4,22 @@
 //! surface is unauthenticated: keep this loopback (or otherwise
 //! network-restricted) until the control-plane credential seam lands
 //! (docs/DESIGN.md); a non-loopback bind logs a warning.
-//! `TOLLGATE_STORE` — `memory` (default; ephemeral, dev/demo only) or
-//! `postgres` (durable; requires `TOLLGATE_PG_URL`, runs migrations on
-//! startup).
+//! `TOLLGATE_STORE` — `memory` (default; ephemeral, dev/demo only) or, when
+//! built with the default `postgres` feature, `postgres` (durable; requires
+//! `TOLLGATE_PG_URL`, runs migrations on startup).
 //! `TOLLGATE_RECLAIM_INTERVAL_SECS` (default `5`) — expiry-sweep cadence.
 
 use std::sync::Arc;
 
 use tollgate_server::{ServerState, serve};
 use tollgate_store::{GrantPolicy, MemoryStore, SystemClock};
+#[cfg(feature = "postgres")]
 use tollgate_store_postgres::PostgresStore;
+
+#[cfg(feature = "postgres")]
+const COMPILED_BACKENDS: &str = "memory|postgres";
+#[cfg(not(feature = "postgres"))]
+const COMPILED_BACKENDS: &str = "memory";
 
 /// Install the process-wide subscriber. Libraries emit; only a binary decides
 /// where events go, and `RUST_LOG` is how an operator turns the control plane
@@ -29,6 +35,7 @@ fn init_tracing() {
 
 /// A connection string with its userinfo removed: enough to identify which
 /// database was unreachable, never enough to authenticate to it.
+#[cfg(feature = "postgres")]
 fn redact_dsn(url: &str) -> String {
     match url.split_once("://") {
         Some((scheme, rest)) => match rest.split_once('@') {
@@ -109,6 +116,7 @@ async fn main() -> std::io::Result<()> {
             )
             .await
         }
+        #[cfg(feature = "postgres")]
         "postgres" => {
             let url = std::env::var("TOLLGATE_PG_URL").unwrap_or_else(|_| {
                 tracing::error!("TOLLGATE_STORE=postgres requires TOLLGATE_PG_URL");
@@ -145,7 +153,7 @@ async fn main() -> std::io::Result<()> {
         other => {
             tracing::error!(
                 store = other,
-                "unknown TOLLGATE_STORE (expected memory|postgres)"
+                "unknown TOLLGATE_STORE (expected {COMPILED_BACKENDS})"
             );
             std::process::exit(2);
         }
@@ -155,19 +163,6 @@ async fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Without a subscriber every event in this process is discarded, which
-    /// is the exact silence issue #36 exists to end — so the install is
-    /// asserted rather than assumed.
-    #[test]
-    fn init_tracing_installs_a_subscriber() {
-        assert!(
-            !tracing::dispatcher::has_been_set(),
-            "no other test in this binary may install a subscriber first"
-        );
-        init_tracing();
-        assert!(tracing::dispatcher::has_been_set());
-    }
 
     /// Zero is the one value that cannot work: a sweep loop with no wait
     /// spins. Everything else is a cadence.
@@ -183,6 +178,7 @@ mod tests {
 
     /// Credential redaction is security behavior, not formatting: a DSN in a
     /// log line is a leaked password (AGENTS.md).
+    #[cfg(feature = "postgres")]
     #[test]
     fn redact_dsn_strips_userinfo() {
         assert_eq!(

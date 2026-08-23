@@ -135,6 +135,23 @@ test:
   script:
     - cargo test --locked --workspace --all-features
 
+# The service library remains backend-generic when the binary's optional
+# Postgres backend is disabled. The tree check makes that architecture claim
+# executable; the test run covers the complete workspace in that feature mode.
+test-no-default-features:
+  extends: .merge-request
+  stage: test
+  interruptible: true
+  script:
+    - |
+      dependency_tree="$(cargo tree --locked -p tollgate-server --no-default-features)"
+      printf '%s\n' "$dependency_tree"
+      if printf '%s\n' "$dependency_tree" | grep -Eq 'tollgate-store-postgres|sqlx'; then
+        printf 'tollgate-server without default features must not depend on Postgres or sqlx\n' >&2
+        exit 1
+      fi
+    - cargo test --locked --workspace --no-default-features
+
 # First-class Postgres coverage: the env-gated suite that silently skips on
 # dev machines runs for real here, against a service container — the
 # backend-parity gate (mirrors tollgate-store's memory suite by scenario).
