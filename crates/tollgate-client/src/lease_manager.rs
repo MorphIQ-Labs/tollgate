@@ -37,6 +37,7 @@
 //! the store's are not a safe basis for further spending.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use jiff::SignedDuration;
 use tokio::sync::watch;
@@ -44,7 +45,7 @@ use tracing::Instrument as _;
 
 use tollgate_admission::LeaseSlot;
 use tollgate_core::{AccountId, CostUnits, LocalLease};
-use tollgate_store::LeaseAllocator;
+use tollgate_store::{AllocateError, LeaseAllocator};
 
 use tollgate_store::Clock;
 
@@ -141,11 +142,129 @@ impl LeaseManagerConfig {
     }
 }
 
+/// What the refill task has done, readable at any time.
+///
+/// [`LeaseManagerReport`] says what happened *at shutdown*, which leaves the
+/// running instance silent: whether refill is keeping up, and why the
+/// allocator is refusing when it does, were visible only as `tracing` events
+/// with nothing to threshold on (#4). These counters are the scrapeable half.
+///
+/// Written only by the refill task, so unlike the usage writer's counters they
+/// need no cache-line padding: one writer cannot contend with itself.
+/// `Relaxed` throughout — nothing is published through them.
+#[derive(Debug)]
+pub struct LeaseCounters {
+    acquired: AtomicU64,
+    acquired_units: AtomicU64,
+    acquire_timeouts: AtomicU64,
+    acquire_refused: [AtomicU64; AllocateError::COUNT],
+    released: AtomicU64,
+    abandoned: AtomicU64,
+}
+
+impl LeaseCounters {
+    #[must_use]
+    pub const fn new() -> Self {
+        LeaseCounters {
+            acquired: AtomicU64::new(0),
+            acquired_units: AtomicU64::new(0),
+            acquire_timeouts: AtomicU64::new(0),
+            acquire_refused: [const { AtomicU64::new(0) }; AllocateError::COUNT],
+            released: AtomicU64::new(0),
+            abandoned: AtomicU64::new(0),
+        }
+    }
+
+    fn record_acquired(&self, units: CostUnits) {
+        self.acquired.fetch_add(1, Ordering::Relaxed);
+        self.acquired_units
+            .fetch_add(units.get(), Ordering::Relaxed);
+    }
+
+    /// An allocator call that exceeded `store_call_timeout`. Counted apart
+    /// from a refusal because it is not a domain answer: the allocator may
+    /// well have granted the lease and simply failed to say so in time.
+    fn record_acquire_timeout(&self) {
+        self.acquire_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_acquire_refused(&self, error: &AllocateError) {
+        self.acquire_refused[error.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A lease the allocator is no longer holding open for this instance —
+    /// released cleanly, or refused in a way that means it is already settled.
+    fn record_released(&self) {
+        self.released.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_abandoned(&self) {
+        self.abandoned.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> LeaseStats {
+        LeaseStats {
+            acquired: self.acquired.load(Ordering::Relaxed),
+            acquired_units: self.acquired_units.load(Ordering::Relaxed),
+            acquire_timeouts: self.acquire_timeouts.load(Ordering::Relaxed),
+            acquire_refused: std::array::from_fn(|slot| {
+                self.acquire_refused[slot].load(Ordering::Relaxed)
+            }),
+            released: self.released.load(Ordering::Relaxed),
+            abandoned: self.abandoned.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Default for LeaseCounters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A reading of [`LeaseCounters`], safe to serialise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseStats {
+    /// Acquires that returned a grant.
+    pub acquired: u64,
+    /// Units granted across those acquires. Adaptive allocation can return
+    /// less than `target_grant`, so this is not `acquired × target_grant`.
+    pub acquired_units: u64,
+    /// Acquires the allocator did not answer within `store_call_timeout`.
+    pub acquire_timeouts: u64,
+    /// Acquire refusals per [`AllocateError::index`] slot.
+    pub acquire_refused: [u64; AllocateError::COUNT],
+    /// Leases the allocator no longer holds open for this instance.
+    pub released: u64,
+    /// Leases the shutdown budget could not return; their units come back at
+    /// TTL reclaim (INVARIANTS.md #9). Like the writer's `lost`, this can only
+    /// move at shutdown — it is a confirmation, not an early warning.
+    pub abandoned: u64,
+}
+
+impl LeaseStats {
+    /// Refusals paired with their stable labels, in slot order.
+    pub fn refusals_by_name(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        AllocateError::NAMES
+            .iter()
+            .copied()
+            .zip(self.acquire_refused.iter().copied())
+    }
+
+    /// Every acquire refusal, whatever the reason.
+    #[must_use]
+    pub fn refused(&self) -> u64 {
+        self.acquire_refused.iter().sum()
+    }
+}
+
 /// Handle to the refill task.
 pub struct LeaseManager {
     shutdown: watch::Sender<bool>,
     health: watch::Receiver<bool>,
     handle: Option<tokio::task::JoinHandle<LeaseManagerReport>>,
+    counters: Arc<LeaseCounters>,
 }
 
 impl LeaseManager {
@@ -159,9 +278,20 @@ impl LeaseManager {
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (health_tx, health) = watch::channel(true);
         let account = config.account;
+        let counters = Arc::new(LeaseCounters::new());
+        let task_counters = Arc::clone(&counters);
         let handle = tokio::spawn(
             async move {
-                let report = run(allocator, slot, clock, config, shutdown_rx, &health_tx).await;
+                let report = run(
+                    allocator,
+                    slot,
+                    clock,
+                    config,
+                    shutdown_rx,
+                    &health_tx,
+                    &task_counters,
+                )
+                .await;
                 crate::signal(&health_tx, false, "lease-manager health");
                 report
             }
@@ -171,7 +301,19 @@ impl LeaseManager {
             shutdown,
             health,
             handle: Some(handle),
+            counters,
         })
+    }
+
+    /// The refill task's running counters.
+    ///
+    /// Returns the shared handle rather than a snapshot: a service keeps this
+    /// in its request state while the [`LeaseManager`] itself is usually moved
+    /// into whatever owns shutdown, and the counters outlive the task, so a
+    /// reader keeps working after the refill task dies.
+    #[must_use]
+    pub fn counters(&self) -> Arc<LeaseCounters> {
+        Arc::clone(&self.counters)
     }
 
     /// True while the refill task is alive *and* its accounting still agrees
@@ -220,6 +362,7 @@ async fn run(
     config: LeaseManagerConfig,
     mut shutdown: watch::Receiver<bool>,
     health: &watch::Sender<bool>,
+    counters: &LeaseCounters,
 ) -> LeaseManagerReport {
     let mut tick = tokio::time::interval(config.poll_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -242,7 +385,16 @@ async fn run(
         }
 
         let now = clock.now();
-        release_quiesced(&allocator, &mut parked, &clock, &config, &slot, health).await;
+        release_quiesced(
+            &allocator,
+            &mut parked,
+            &clock,
+            &config,
+            &slot,
+            health,
+            counters,
+        )
+        .await;
         let needs_acquire = match slot.load() {
             None => true,
             Some(lease) if now >= lease.usable_until() => {
@@ -253,7 +405,16 @@ async fn run(
                 if let Some(old) = slot.take() {
                     parked.push(old);
                 }
-                release_quiesced(&allocator, &mut parked, &clock, &config, &slot, health).await;
+                release_quiesced(
+                    &allocator,
+                    &mut parked,
+                    &clock,
+                    &config,
+                    &slot,
+                    health,
+                    counters,
+                )
+                .await;
                 true
             }
             Some(lease) => lease.needs_refill(),
@@ -272,6 +433,7 @@ async fn run(
         .await
         {
             Ok(Ok(grant)) => {
+                counters.record_acquired(grant.units);
                 // Rotation: install the fresh lease and park the superseded
                 // one until it quiesces (module docs). Adaptive allocation
                 // may return less than target_grant; cap low-water below the
@@ -302,9 +464,18 @@ async fn run(
             // request, which is the condition an operator must see.
             outcome => {
                 let serving = slot.load().is_some();
+                // A timeout is not a domain answer — the allocator may have
+                // granted and merely failed to say so — so it is counted
+                // apart from the refusals rather than folded into one of them.
                 let reason: &dyn std::fmt::Display = match &outcome {
-                    Ok(Err(error)) => error,
-                    _ => &"allocator timed out",
+                    Ok(Err(error)) => {
+                        counters.record_acquire_refused(error);
+                        error
+                    }
+                    _ => {
+                        counters.record_acquire_timeout();
+                        &"allocator timed out"
+                    }
                 };
                 if serving {
                     tracing::debug!(%reason, "lease acquire refused; still serving");
@@ -351,9 +522,13 @@ async fn run(
             // open for us — only an unfinished call leaves it outstanding.
             // The count says how many; the event says which refusal, which
             // the count alone cannot distinguish from a clean release.
-            Ok(Ok(())) => report.released += 1,
+            Ok(Ok(())) => {
+                report.released += 1;
+                counters.record_released();
+            }
             Ok(Err(error)) => {
                 report.released += 1;
+                counters.record_released();
                 tracing::warn!(
                     lease = grant.lease_id.0,
                     %error,
@@ -362,6 +537,7 @@ async fn run(
             }
             Err(_) => {
                 report.abandoned += 1;
+                counters.record_abandoned();
                 tracing::warn!(
                     lease = grant.lease_id.0,
                     units = lease.remaining().get(),
@@ -392,9 +568,8 @@ async fn release_quiesced(
     config: &LeaseManagerConfig,
     slot: &Arc<LeaseSlot>,
     health: &watch::Sender<bool>,
+    counters: &LeaseCounters,
 ) {
-    use tollgate_store::AllocateError;
-
     let mut retry = Vec::new();
     for lease in std::mem::take(parked) {
         // The local binding holds what was the vec's sole reference, so a
@@ -429,12 +604,16 @@ async fn release_quiesced(
                 );
                 retry.push(lease);
             }
-            // Settled, or nothing to settle.
-            Ok(Ok(())) => {}
+            // Settled, or nothing to settle. Every arm below stops tracking
+            // the lease, so each counts as released; only the two retry arms
+            // above leave it on our books.
+            Ok(Ok(())) => counters.record_released(),
             Ok(Err(error @ (AllocateError::LeaseNotActive | AllocateError::UnknownLease))) => {
+                counters.record_released();
                 tracing::debug!(lease = lease_id, %error, "lease was already settled");
             }
             Ok(Err(AllocateError::Fenced)) => {
+                counters.record_released();
                 tracing::warn!(
                     lease = lease_id,
                     "fenced by a newer holder; clearing the slot so this instance stops serving"
@@ -442,6 +621,7 @@ async fn release_quiesced(
                 slot.take();
             }
             Ok(Err(AllocateError::InvalidRelease)) => {
+                counters.record_released();
                 tracing::error!(
                     lease = lease_id,
                     units = lease.remaining().get(),
@@ -453,6 +633,7 @@ async fn release_quiesced(
             // Acquire-only refusals; a release cannot produce them. Reaching
             // this arm means the allocator's contract changed under us.
             Ok(Err(error)) => {
+                counters.record_released();
                 tracing::error!(
                     lease = lease_id,
                     %error,
@@ -558,12 +739,14 @@ mod tests {
         slot: Arc<LeaseSlot>,
         health: watch::Sender<bool>,
         healthy: watch::Receiver<bool>,
+        counters: LeaseCounters,
     }
 
     impl Harness {
         fn new() -> Self {
             let (health, healthy) = watch::channel(true);
             Self {
+                counters: LeaseCounters::new(),
                 config: LeaseManagerConfig {
                     account: AccountId(1),
                     target_grant: CostUnits(1_000),
@@ -592,8 +775,13 @@ mod tests {
                 &self.config,
                 &self.slot,
                 &self.health,
+                &self.counters,
             )
             .await;
+        }
+
+        fn stats(&self) -> LeaseStats {
+            self.counters.snapshot()
         }
 
         fn is_healthy(&self) -> bool {
@@ -644,11 +832,17 @@ mod tests {
         harness.release_quiesced(&allocator, &mut parked).await;
         assert!(scripted.released().is_empty());
         assert_eq!(parked.len(), 1, "held lease stays parked");
+        assert_eq!(
+            harness.stats().released,
+            0,
+            "a lease still on our books has not been released"
+        );
 
         drop(in_flight);
         harness.release_quiesced(&allocator, &mut parked).await;
         assert_eq!(scripted.released(), [LeaseId(7)]);
         assert!(parked.is_empty());
+        assert_eq!(harness.stats().released, 1);
     }
 
     /// Genuinely settled: the store is not holding these open, so dropping
@@ -668,6 +862,11 @@ mod tests {
             assert!(parked.is_empty(), "settled lease is not retried");
             assert!(harness.is_healthy(), "settlement is not a health event");
             assert!(harness.slot.load().is_some(), "the slot is untouched");
+            assert_eq!(
+                harness.stats().released,
+                1,
+                "already settled still means the store no longer holds it"
+            );
         }
     }
 

@@ -36,8 +36,9 @@ use subtle::ConstantTimeEq;
 
 use tollgate_admission::{AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot};
 use tollgate_client::{
-    ChargeGuard, Clock, LeaseManager, LeaseManagerConfig, SlotRegistry, SnapshotManager,
-    SnapshotManagerConfig, SystemClock, UsageRecorder, UsageWriter, UsageWriterConfig,
+    ChargeGuard, Clock, LeaseCounters, LeaseManager, LeaseManagerConfig, SlotRegistry,
+    SnapshotCounters, SnapshotManager, SnapshotManagerConfig, SystemClock, UsageRecorder,
+    UsageWriter, UsageWriterConfig,
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, Generation,
@@ -155,6 +156,11 @@ struct AppState {
     /// Snapshot-manager readiness: true while every tracked principal has a
     /// fresh resolution; channel closure also exposes task failure.
     snapshots_ready: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Refill and snapshot counters. Held as the shared handles rather than
+    /// the managers themselves, which are moved into `AppRuntime` for
+    /// shutdown and so are out of a handler's reach.
+    lease_counters: Option<Arc<LeaseCounters>>,
+    snapshot_counters: Option<Arc<SnapshotCounters>>,
     /// `false` builds the no-admission baseline the load gate compares
     /// against: same transport, same kernel, zero quota machinery.
     admission_enabled: bool,
@@ -354,6 +360,12 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
             (None, None, None, None, None, None, None)
         };
 
+    // Taken from the handles already in scope rather than threaded through
+    // the tuple above: that tuple is the wart issue #16 tracks, and widening
+    // it to nine would make the case for fixing it worse, not better.
+    let lease_counters = manager.as_ref().map(LeaseManager::counters);
+    let snapshot_counters = snapshots.as_ref().map(SnapshotManager::counters);
+
     let state = Arc::new(AppState {
         auth,
         engine,
@@ -361,6 +373,8 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
         slot,
         lease_manager_health,
         snapshots_ready,
+        lease_counters,
+        snapshot_counters,
         admission_enabled,
     });
 
@@ -445,6 +459,46 @@ pub struct Metrics {
     /// Billing health, absent only when admission is disabled (the load-gate
     /// baseline runs no accounting at all).
     pub accounting: Option<Accounting>,
+    /// Refill health: whether this instance can keep its lease stocked.
+    pub refill: Option<Refill>,
+    /// Snapshot-distribution health.
+    pub snapshots: Option<Snapshots>,
+}
+
+/// What the refill task has done. The counter that matters here is
+/// `refused`, broken down by reason: a `lease_exhausted` denial with balance
+/// still in the account is a refill problem, and this says which one.
+#[derive(Debug, Serialize)]
+pub struct Refill {
+    /// Acquires that returned a grant, and the units they carried.
+    pub acquired: u64,
+    pub acquired_units: u64,
+    /// Acquires the allocator did not answer in time. Not a refusal — the
+    /// grant may well have been made and simply not reported.
+    pub acquire_timeouts: u64,
+    /// Every acquire refusal, and the breakdown by reason. Every reason is
+    /// present, so a zero reads as "has not happened".
+    pub refused: u64,
+    pub refusals: BTreeMap<&'static str, u64>,
+    /// Leases the allocator no longer holds open for this instance.
+    pub released: u64,
+    /// Leases a shutdown budget could not return. Like `accounting.lost`,
+    /// this can only move at shutdown.
+    pub abandoned: u64,
+}
+
+/// What the snapshot task has done.
+#[derive(Debug, Serialize)]
+pub struct Snapshots {
+    /// Fetches attempted, one per principal per pass. A rate that has fallen
+    /// to zero means the refresh loop itself has stopped.
+    pub refresh_attempts: u64,
+    /// Fetches the source could not answer.
+    pub refresh_failures: u64,
+    /// Principals with no currently valid resolution — the gauge that makes
+    /// readiness false, and the disambiguator for an `unknown_principal`
+    /// spike: nonzero means distribution, zero means credentials.
+    pub unresolved: u64,
 }
 
 /// What the usage writer has done with the charges handed to it — readable at
@@ -507,6 +561,26 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Json<Metrics> {
                 queue_capacity: health.queue_capacity,
                 last_ingest_at: health.last_ingest_at.map(|at| at.to_string()),
                 ingest_age_seconds: health.ingest_age(now).map(|age| age.as_secs()),
+            }
+        }),
+        refill: state.lease_counters.as_ref().map(|counters| {
+            let stats = counters.snapshot();
+            Refill {
+                acquired: stats.acquired,
+                acquired_units: stats.acquired_units,
+                acquire_timeouts: stats.acquire_timeouts,
+                refused: stats.refused(),
+                refusals: stats.refusals_by_name().collect(),
+                released: stats.released,
+                abandoned: stats.abandoned,
+            }
+        }),
+        snapshots: state.snapshot_counters.as_ref().map(|counters| {
+            let stats = counters.snapshot();
+            Snapshots {
+                refresh_attempts: stats.refresh_attempts,
+                refresh_failures: stats.refresh_failures,
+                unresolved: stats.unresolved,
             }
         }),
     })

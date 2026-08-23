@@ -111,11 +111,17 @@ until it has one.
     lease remains inside the local usability window, and its snapshot and
     refill/accounting tasks are alive. Readiness falls again on exhaustion,
     expiry, or task exit;
-    fail-closed correctness must not masquerade as availability. *Tests:*
+    fail-closed correctness must not masquerade as availability. Readiness is
+    a single bit, so it says *that* an instance is unready and never *how
+    much* is unresolved; the count of principals without a valid resolution is
+    exported alongside it and is derived from the same pass that decides the
+    bit, so the two cannot disagree — a separate predicate would be free to
+    drift, leaving readiness false with nothing to explain it. *Tests:*
     `initial_load_gates_readiness_and_installs`,
     `readiness_falls_when_snapshot_expires_during_outage`,
     `readiness_falls_if_refresh_hangs_across_snapshot_expiry`,
-    `readiness_falls_when_background_planes_stop`.
+    `readiness_falls_when_background_planes_stop`, and
+    `snapshot_counters_track_failures_and_the_unresolved_gauge`.
 
 11. **Checked arithmetic only.** Cost and lease arithmetic never wraps; any
     overflow is an explicit error that denies (fail closed), never a wrap to a

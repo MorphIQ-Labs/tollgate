@@ -281,6 +281,48 @@ async fn metrics_report_accounting_health_while_running() {
     runtime.shutdown().await;
 }
 
+/// Issue #4's counter set is only complete once the refill and snapshot
+/// planes are scrapeable too: both were visible as `tracing` events with
+/// nothing to threshold on. The `unresolved` gauge in particular is what
+/// disambiguates an `unknown_principal` spike — distribution failure, or
+/// callers presenting keys nobody published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_report_refill_and_snapshot_health() {
+    let (router, runtime) = build_app(100_000, true);
+    wait_ready(&router).await;
+
+    let body = metrics(&router).await;
+
+    let refill = &body["refill"];
+    assert!(
+        refill["acquired"].as_u64().unwrap() >= 1,
+        "readiness implies a lease was granted: {refill}"
+    );
+    assert!(refill["acquired_units"].as_u64().unwrap() > 0);
+    assert_eq!(refill["refused"], 0, "a healthy allocator refuses nothing");
+    assert_eq!(refill["acquire_timeouts"], 0);
+    assert_eq!(refill["abandoned"], 0);
+    assert_eq!(
+        refill["refusals"].as_object().unwrap().len(),
+        9,
+        "every refusal reason is exported, including the ones at zero"
+    );
+
+    let snapshots = &body["snapshots"];
+    assert!(
+        snapshots["refresh_attempts"].as_u64().unwrap() >= 1,
+        "the refresh loop is running: {snapshots}"
+    );
+    assert_eq!(snapshots["refresh_failures"], 0);
+    assert_eq!(
+        snapshots["unresolved"], 0,
+        "readiness is true, so nothing may be unresolved — the gauge and the \
+         readiness bit are computed from one pass"
+    );
+
+    runtime.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn not_ready_until_lease_arrives() {
     let (router, runtime) = build_app(100_000, true);

@@ -25,6 +25,7 @@
 //! `LeaseManager` refills.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use jiff::SignedDuration;
@@ -127,11 +128,86 @@ pub struct SnapshotManagerReport {
     pub task_died: bool,
 }
 
+/// What the snapshot task has done, readable at any time.
+///
+/// [`ready`](SnapshotManager::ready) answers one bit — every principal
+/// resolved, or not. That is the right shape for a readiness probe and the
+/// wrong shape for diagnosis: it cannot say whether one principal is
+/// unresolved or a thousand, nor whether the source has been failing all
+/// morning (#4). These counters are the scrapeable half, and the
+/// `unresolved` gauge is computed from the same pass that decides readiness,
+/// so the two cannot disagree.
+///
+/// Written only by the snapshot task; `Relaxed` throughout.
+#[derive(Debug)]
+pub struct SnapshotCounters {
+    refresh_attempts: AtomicU64,
+    refresh_failures: AtomicU64,
+    unresolved: AtomicU64,
+}
+
+impl SnapshotCounters {
+    #[must_use]
+    pub const fn new() -> Self {
+        SnapshotCounters {
+            refresh_attempts: AtomicU64::new(0),
+            refresh_failures: AtomicU64::new(0),
+            unresolved: AtomicU64::new(0),
+        }
+    }
+
+    /// One fetch of one principal, whatever its outcome.
+    fn record_attempt(&self) {
+        self.refresh_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A fetch the source refused or could not answer. The principal keeps
+    /// its previous resolution, so this is not itself a loss of authorization
+    /// — only a loss of freshness, which `unresolved` reports once the old
+    /// resolution lapses.
+    fn record_failure(&self) {
+        self.refresh_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn set_unresolved(&self, principals: u64) {
+        self.unresolved.store(principals, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> SnapshotStats {
+        SnapshotStats {
+            refresh_attempts: self.refresh_attempts.load(Ordering::Relaxed),
+            refresh_failures: self.refresh_failures.load(Ordering::Relaxed),
+            unresolved: self.unresolved.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Default for SnapshotCounters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A reading of [`SnapshotCounters`], safe to serialise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotStats {
+    /// Fetches attempted, one per principal per pass.
+    pub refresh_attempts: u64,
+    /// Fetches the source could not answer.
+    pub refresh_failures: u64,
+    /// Principals with no currently valid resolution — a gauge, not a total.
+    /// Nonzero is exactly the condition that makes `ready` false, and the
+    /// count says how much of the tracked set is affected.
+    pub unresolved: u64,
+}
+
 /// Handle to the snapshot task.
 pub struct SnapshotManager {
     shutdown: watch::Sender<bool>,
     ready: watch::Receiver<bool>,
     handle: Option<tokio::task::JoinHandle<()>>,
+    counters: Arc<SnapshotCounters>,
 }
 
 impl SnapshotManager {
@@ -146,15 +222,38 @@ impl SnapshotManager {
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (ready_tx, ready) = watch::channel(false);
         let principals = config.principals.len();
+        let counters = Arc::new(SnapshotCounters::new());
+        let task_counters = Arc::clone(&counters);
         let handle = tokio::spawn(
-            run(source, map, slots, clock, config, shutdown_rx, ready_tx)
-                .instrument(tracing::info_span!("snapshot_manager", principals)),
+            run(
+                source,
+                map,
+                slots,
+                clock,
+                config,
+                shutdown_rx,
+                ready_tx,
+                task_counters,
+            )
+            .instrument(tracing::info_span!("snapshot_manager", principals)),
         );
         Ok(SnapshotManager {
             shutdown,
             ready,
             handle: Some(handle),
+            counters,
         })
+    }
+
+    /// The snapshot task's running counters.
+    ///
+    /// Returns the shared handle for the same reason
+    /// [`LeaseManager::counters`](crate::LeaseManager::counters) does: a
+    /// service keeps it in request state while the manager itself is moved
+    /// into whatever owns shutdown, and the counters outlive the task.
+    #[must_use]
+    pub fn counters(&self) -> Arc<SnapshotCounters> {
+        Arc::clone(&self.counters)
     }
 
     /// True while every tracked principal has a currently valid positive or
@@ -225,16 +324,24 @@ impl Resolution {
     }
 }
 
-fn is_ready(
+/// Principals with no currently valid resolution.
+///
+/// Readiness is derived from this rather than computed beside it: a separate
+/// predicate could drift from the gauge an operator reads, leaving `ready`
+/// false with `unresolved` at zero and nothing to explain it.
+fn unresolved(
     principals: &[Principal],
     resolutions: &HashMap<Principal, Resolution>,
     now: jiff::Timestamp,
-) -> bool {
-    principals.iter().all(|principal| {
-        resolutions
-            .get(principal)
-            .is_some_and(|resolution| now < resolution.deadline())
-    })
+) -> usize {
+    principals
+        .iter()
+        .filter(|principal| {
+            !resolutions
+                .get(principal)
+                .is_some_and(|resolution| now < resolution.deadline())
+        })
+        .count()
 }
 
 fn update_ready(
@@ -242,8 +349,11 @@ fn update_ready(
     principals: &[Principal],
     resolutions: &HashMap<Principal, Resolution>,
     clock: &Arc<dyn Clock>,
+    counters: &SnapshotCounters,
 ) {
-    let now_ready = is_ready(principals, resolutions, clock.now());
+    let outstanding = unresolved(principals, resolutions, clock.now());
+    counters.set_unresolved(outstanding as u64);
+    let now_ready = outstanding == 0;
     // Readiness transitions are the operator-visible half of INVARIANTS #10;
     // report the edges, not every recomputation.
     if ready.borrow().ne(&now_ready) {
@@ -334,6 +444,7 @@ async fn refresh_all_cancellable(
     resolutions: &mut HashMap<Principal, Resolution>,
     shutdown: &mut watch::Receiver<bool>,
     ready: &watch::Sender<bool>,
+    counters: &SnapshotCounters,
 ) -> Option<Vec<Principal>> {
     let mut pending = principals.iter().copied();
     let mut tasks = JoinSet::<(Principal, Result<SnapshotResolution, StoreError>)>::new();
@@ -376,7 +487,7 @@ async fn refresh_all_cancellable(
                 }
             }
             _ = &mut readiness_check => {
-                update_ready(ready, &config.principals, resolutions, clock);
+                update_ready(ready, &config.principals, resolutions, clock, counters);
             }
         }
     }
@@ -384,6 +495,10 @@ async fn refresh_all_cancellable(
     let mut updates = Vec::with_capacity(results.len());
     let mut completed = HashSet::with_capacity(results.len());
     for (principal, result) in results {
+        // One attempt per principal per pass, counted whatever the outcome:
+        // an attempt rate that has gone to zero is itself the signal that the
+        // refresh loop has stopped.
+        counters.record_attempt();
         match result {
             Ok(SnapshotResolution::Present(snapshot)) => {
                 if resolutions
@@ -461,6 +576,7 @@ async fn refresh_all_cancellable(
             // stays pending for the next sweep. Without this event a source
             // that is down looks exactly like one with nothing to say.
             Err(error) => {
+                counters.record_failure();
                 tracing::warn!(
                     principal = principal.0,
                     %error,
@@ -490,6 +606,7 @@ async fn run(
     config: SnapshotManagerConfig,
     mut shutdown: watch::Receiver<bool>,
     ready: watch::Sender<bool>,
+    counters: Arc<SnapshotCounters>,
 ) {
     let mut updates = source.subscribe();
     let tracked: HashSet<Principal> = config.principals.iter().copied().collect();
@@ -513,13 +630,14 @@ async fn run(
             &mut resolutions,
             &mut shutdown,
             &ready,
+            &counters,
         )
         .await
         else {
             return;
         };
         pending = failed;
-        update_ready(&ready, &config.principals, &resolutions, &clock);
+        update_ready(&ready, &config.principals, &resolutions, &clock, &counters);
         if !pending.is_empty() {
             tokio::select! {
                 _ = tokio::time::sleep(config.retry_backoff) => {}
@@ -531,7 +649,7 @@ async fn run(
             }
         }
     }
-    update_ready(&ready, &config.principals, &resolutions, &clock);
+    update_ready(&ready, &config.principals, &resolutions, &clock, &counters);
 
     let mut tick = tokio::time::interval(config.refresh_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -609,7 +727,7 @@ async fn run(
                                 );
                             }
                         }
-                        update_ready(&ready, &config.principals, &resolutions, &clock);
+                        update_ready(&ready, &config.principals, &resolutions, &clock, &counters);
                     }
                 }
                 // Lagged: missed pushes — refetch everything rather than
@@ -619,10 +737,11 @@ async fn run(
                         &source, &map, &slots, &clock, &config, &config.principals,
                         &mut resolutions, &mut shutdown,
                         &ready,
+                        &counters,
                     ).await.is_none() {
                         return;
                     }
-                    update_ready(&ready, &config.principals, &resolutions, &clock);
+                    update_ready(&ready, &config.principals, &resolutions, &clock, &counters);
                 }
                 // Push stream gone (e.g. HTTP transport): periodic refresh
                 // remains the freshness path.
@@ -635,14 +754,15 @@ async fn run(
                     &source, &map, &slots, &clock, &config, &config.principals,
                     &mut resolutions, &mut shutdown,
                     &ready,
+                    &counters,
                 ).await.is_none() {
                     return;
                 }
-                update_ready(&ready, &config.principals, &resolutions, &clock);
+                update_ready(&ready, &config.principals, &resolutions, &clock, &counters);
             }
             _ = &mut control_wakeup => {
                 let now = clock.now();
-                update_ready(&ready, &config.principals, &resolutions, &clock);
+                update_ready(&ready, &config.principals, &resolutions, &clock, &counters);
                 let due: Vec<_> = resolutions
                     .iter()
                     .filter_map(|(principal, resolution)| match resolution {
@@ -655,7 +775,7 @@ async fn run(
                 if !due.is_empty() {
                     let Some(failed) = refresh_all_cancellable(
                         &source, &map, &slots, &clock, &config, &due,
-                        &mut resolutions, &mut shutdown, &ready,
+                        &mut resolutions, &mut shutdown, &ready, &counters,
                     ).await else {
                         return;
                     };
@@ -667,7 +787,7 @@ async fn run(
                             *next_refetch = retry_at;
                         }
                     }
-                    update_ready(&ready, &config.principals, &resolutions, &clock);
+                    update_ready(&ready, &config.principals, &resolutions, &clock, &counters);
                 }
             }
             changed = shutdown.changed() => {
