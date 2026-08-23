@@ -68,8 +68,12 @@ until it has one.
    `a_lease_signals_at_most_once_however_long_it_drains`, and the
    `RefillRequests` handoff tests.
 
-7. **Idempotent accounting.** Replaying a usage batch (same request IDs) never
-   double-bills. *Tests:* `usage_replay_is_idempotent` (store suites).
+7. **Idempotent partial accounting.** Replaying a usage batch (same request
+   IDs) never double-bills. Every successful mixed batch classifies each
+   input exactly once as accepted, duplicate, or rejected; only accepted
+   events change either ledger, and their grouped lease/account effects stay
+   in the same atomic transaction. *Tests:* `usage_replay_is_idempotent` and
+   `mixed_usage_batch_preserves_partial_acceptance` (store suites).
 
 8. **Accounting backpressure sheds.** When the usage queue is full, new work is
    refused with zero units charged. Usage events are never silently dropped

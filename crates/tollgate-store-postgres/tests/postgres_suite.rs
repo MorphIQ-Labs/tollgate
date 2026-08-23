@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
-    PermissionBits, Principal, PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent,
+    LeaseId, PermissionBits, Principal, PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, CreateAccountError, GrantPolicy, LeaseAllocator,
@@ -398,6 +398,92 @@ async fn usage_replay_is_idempotent() {
     assert_eq!((report.accepted, report.duplicate), (1, 1));
     assert_eq!(store.usage_recorded(ACCOUNT).await.unwrap(), CostUnits(130));
     assert_conserved(&store).await;
+}
+
+/// INVARIANTS.md #7: a successful mixed batch classifies every event once
+/// while applying only accepted deltas across active and settled leases.
+#[tokio::test]
+async fn mixed_usage_batch_preserves_partial_acceptance() {
+    const OTHER: AccountId = AccountId(2);
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    AdminStore::create_account(
+        &*store,
+        AccountConfig {
+            account_id: OTHER,
+            initial_balance: CostUnits(400),
+            active: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    let active = store
+        .acquire(ACCOUNT, CostUnits(300), TTL, t(0))
+        .await
+        .unwrap();
+    let settled = store
+        .acquire(ACCOUNT, CostUnits(200), TTL, t(0))
+        .await
+        .unwrap();
+    let other = store
+        .acquire(OTHER, CostUnits(300), TTL, t(0))
+        .await
+        .unwrap();
+    store
+        .release(
+            settled.lease_id,
+            settled.fencing_token,
+            CostUnits(170),
+            t(5),
+        )
+        .await
+        .unwrap();
+
+    let prior = usage(&active, 1, 10, 2);
+    assert_eq!(store.ingest(&[prior], t(2)).await.unwrap().accepted, 1);
+    let mut replay_with_unrepresentable_units = prior;
+    replay_with_unrepresentable_units.units = CostUnits(u64::MAX);
+    let repeated = usage(&other, 4, 40, 6);
+    let mut wrong_fence = usage(&other, 6, 10, 6);
+    wrong_fence.fencing_token = FencingToken(other.fencing_token.0.checked_add(1).unwrap());
+    let mut unknown_lease = usage(&other, 7, 10, 6);
+    unknown_lease.lease_id = LeaseId(u128::MAX);
+    let batch = [
+        usage(&active, 2, 20, 6),
+        replay_with_unrepresentable_units,
+        wrong_fence,
+        unknown_lease,
+        usage(&settled, 3, 30, 4),
+        repeated,
+        repeated,
+        usage(&active, 5, 15, 6),
+    ];
+
+    let report = store.ingest(&batch, t(6)).await.unwrap();
+    assert_eq!(
+        (report.accepted, report.duplicate, report.rejected),
+        (4, 2, 2)
+    );
+    assert_eq!(store.usage_recorded(ACCOUNT).await.unwrap(), CostUnits(75));
+    assert_eq!(store.usage_recorded(OTHER).await.unwrap(), CostUnits(40));
+    assert_eq!(
+        store
+            .conservation(ACCOUNT)
+            .await
+            .unwrap()
+            .unwrap()
+            .settlement_loss,
+        CostUnits::ZERO
+    );
+    assert_conserved(&store).await;
+    let other_conservation = store.conservation(OTHER).await.unwrap().unwrap();
+    assert!(
+        other_conservation.holds(),
+        "conservation violated: {other_conservation:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
