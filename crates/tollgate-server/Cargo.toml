@@ -12,9 +12,9 @@ default = ["postgres"]
 postgres = ["dep:tollgate-store-postgres"]
 
 [dependencies]
-tollgate-core = { path = "../tollgate-core", version = "=0.2.1", features = ["serde"] }
-tollgate-store = { path = "../tollgate-store", version = "=0.2.1", features = ["wire"] }
-tollgate-store-postgres = { path = "../tollgate-store-postgres", version = "=0.2.1", optional = true }
+tollgate-core = { path = "../tollgate-core", version = "=0.2.2", features = ["serde"] }
+tollgate-store = { path = "../tollgate-store", version = "=0.2.2", features = ["wire"] }
+tollgate-store-postgres = { path = "../tollgate-store-postgres", version = "=0.2.2", optional = true }
 axum = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true }
@@ -26,8 +26,8 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
-tollgate-admission = { path = "../tollgate-admission", version = "=0.2.1" }
-tollgate-client = { path = "../tollgate-client", version = "=0.2.1", features = ["http"] }
+tollgate-admission = { path = "../tollgate-admission", version = "=0.2.2" }
+tollgate-client = { path = "../tollgate-client", version = "=0.2.2", features = ["http"] }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 
