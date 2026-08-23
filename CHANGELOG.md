@@ -5,6 +5,13 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.2.6](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.5...v0.2.6) - 2026-08-23
+
+### Other
+
+- #49 let the perf gate report an untrusted run
+- *(postgres)* use set-wise usage updates
+
 ## [0.2.5](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.4...v0.2.5) - 2026-08-23
 
 ### Other
