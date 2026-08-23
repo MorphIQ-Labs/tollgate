@@ -79,3 +79,8 @@ recalibrate on a controlled host before treating thresholds as the contract.
   loss`) is asserted exactly in every backend's suite.
 - Backends are honest trait implementations: the memory store is the
   executable spec, and Postgres passes the same scenario suite by name.
+- Every failure here is silent and recoverable by design, so the signals are
+  the only way to tell "working" from "broken for twenty minutes": what is
+  emitted, what normal looks like, and what to do about each reading are in
+  [Observability](docs/DESIGN.md#observability), along with the reconciliation
+  query for checking the two ledgers agree on a live system.
