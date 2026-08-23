@@ -4,7 +4,8 @@
 # The image tag matches rust-toolchain.toml; keep them in lockstep so rustup
 # never downloads a second toolchain inside CI. Criterion and absolute-latency
 # thresholds stay on a controlled host; shared CI compiles every benchmark and
-# gates the load test's like-for-like sequential and contended ratios.
+# records the load test's like-for-like sequential and contended ratios as
+# non-gating evidence.
 #
 # Cache: cargo registry/git only (not target/) — meaningful download savings
 # without multi-GB archive churn. GitLab manages cache storage and expiry;
@@ -245,6 +246,7 @@ perf-thresholds:
 load-thresholds:
   extends: .main-merge-request
   stage: assurance
+  allow_failure: true
   interruptible: true
   timeout: 45 minutes
   # Mutation and formal assurance are CPU- and memory-intensive. This job
@@ -257,7 +259,8 @@ load-thresholds:
       artifacts: false
   script:
     # The CI manifest explicitly disables host-dependent absolute ceilings;
-    # both admitted-vs-baseline ratio regressions remain required gates.
+    # paired ratios remain useful evidence, but a shared host can contaminate
+    # their denominator and numerator differently (#49).
     - ./scripts/check_load_thresholds.sh testing/load_thresholds_ci.json reports/load_gate_report.json
   artifacts:
     when: always

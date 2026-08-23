@@ -5,6 +5,14 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.2.11](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.10...v0.2.11) - 2026-08-23
+
+### Other
+
+- Merge branch 'ci/17-gate-load-ratios' into 'main'
+- gate load overhead ratios
+- *(store)* #12 index the reconciliation query's account filter
+
 ## [0.2.10](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.9...v0.2.10) - 2026-08-23
 
 ### Other
