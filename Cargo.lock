@@ -2460,6 +2460,7 @@ dependencies = [
  "tokio",
  "tollgate-core",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -13,6 +13,29 @@
 //! the equation once the lease settles. A settlement loss is billing a
 //! released/expired lease could not account for (usage that never arrived
 //! before settlement).
+//!
+//! # This backend never forgets
+//!
+//! Nothing here is ever deleted, and two of the maps therefore grow with what
+//! the process has *done* rather than with what it currently holds:
+//!
+//! - `usage` is the idempotency index and keeps one event per request served,
+//!   for the life of the process. It is the unbounded term, and bounding it
+//!   needs a dedup-window retention decision rather than a deletion — see the
+//!   deferred list in `docs/DESIGN.md`.
+//! - `leases` keeps settled records, so it grows with lease rotations. They
+//!   are retained because a straggling usage event may still have to be
+//!   fenced and rejected against one (see [`UsageSink::ingest`]).
+//! - `snapshots` keeps revoked principals as tombstones, deliberately: that is
+//!   INVARIANTS.md #15's anti-resurrection watermark, and the population is
+//!   bounded by the number of principals rather than by traffic.
+//!
+//! The *sweep* cost does not follow that growth. Active leases are indexed
+//! (see [`crate::leases`]), so reclaim and [`MemoryStore::conservation`] walk
+//! the live population, not the historical one (#23). Memory still does grow,
+//! so this backend suits development and demos but not soak or load testing;
+//! [`MemoryStore::stored_records`] reports the numbers, and the server logs
+//! them once per sweep.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -28,33 +51,13 @@ use tollgate_core::{
     PublishableSnapshot, UsageEvent,
 };
 
+use crate::leases::{LeaseRecord, Leases, Settled};
 pub use crate::traits::{AccountConfig, Conservation};
 use crate::traits::{
     AdminStore, AllocateError, CreateAccountError, GrantPolicy, GrantPolicyError, IngestReport,
     LeaseAllocator, ReclaimBatch, ReclaimedLease, SnapshotPush, SnapshotResolution, SnapshotSource,
     StoreError, StoreHealth, UsageSink,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LeaseState {
-    Active,
-    Released,
-    Expired,
-}
-
-#[derive(Debug)]
-struct LeaseRecord {
-    account_id: AccountId,
-    fencing_token: FencingToken,
-    granted: CostUnits,
-    /// Usage recorded against this lease so far.
-    used: CostUnits,
-    /// Units credited back to the account at settlement (release `unspent`,
-    /// or the full remainder at expiry reclaim). Zero while active.
-    credited: CostUnits,
-    expires_at: Timestamp,
-    state: LeaseState,
-}
 
 #[derive(Debug)]
 struct AccountRecord {
@@ -79,10 +82,29 @@ struct SnapshotRecord {
 #[derive(Default)]
 struct Inner {
     accounts: HashMap<AccountId, AccountRecord>,
-    leases: HashMap<LeaseId, LeaseRecord>,
+    leases: Leases,
     snapshots: HashMap<Principal, SnapshotRecord>,
     usage: HashMap<tollgate_core::RequestId, UsageEvent>,
     next_lease_id: u128,
+}
+
+/// What the in-memory ledger is currently holding.
+///
+/// This backend never forgets, so the first two numbers climb with traffic for
+/// the life of the process while the third returns to the live population.
+/// Reported so "grows without bound" is a number an operator can watch rather
+/// than a claim in a doc comment (#23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredRecords {
+    /// Usage events retained for idempotency: one per request served, kept
+    /// forever. This is the term that grows without bound.
+    pub usage_events: usize,
+    /// Lease records, active and settled together — grows with rotations.
+    pub leases: usize,
+    /// Of those, the ones still active: the only records the reclaim sweep and
+    /// [`MemoryStore::conservation`] examine. Steady-state, unlike the two
+    /// above, which is what makes the sweep's cost independent of them.
+    pub active_leases: usize,
 }
 
 pub struct MemoryStore {
@@ -225,21 +247,24 @@ impl MemoryStore {
 
     // ---- reconciliation / test surface -------------------------------
 
+    /// The sums are recomputed from the lease records every time. The index
+    /// narrows *which* records are read (#23) and is never the source of the
+    /// numbers: this function exists to catch ledger bugs, and one that read a
+    /// running total maintained by the same writers that might be wrong could
+    /// not catch them.
     #[must_use]
     pub fn conservation(&self, account: AccountId) -> Option<Conservation> {
         let inner = self.lock();
         let record = inner.accounts.get(&account)?;
         let mut active_grants = CostUnits::ZERO;
         let mut active_used = CostUnits::ZERO;
-        for lease in inner.leases.values() {
-            if lease.account_id == account && lease.state == LeaseState::Active {
-                active_grants = active_grants
-                    .checked_add(lease.granted)
-                    .expect("grant sum overflow");
-                active_used = active_used
-                    .checked_add(lease.used)
-                    .expect("used sum overflow");
-            }
+        for lease in inner.leases.active_of(account) {
+            active_grants = active_grants
+                .checked_add(lease.granted)
+                .expect("grant sum overflow");
+            active_used = active_used
+                .checked_add(lease.used)
+                .expect("used sum overflow");
         }
         Some(Conservation {
             deposited: record.deposited,
@@ -269,6 +294,26 @@ impl MemoryStore {
             .get(&account)
             .map(|a| a.balance)
             .unwrap_or(CostUnits::ZERO)
+    }
+
+    /// Lease records examined by the sweep and by `conservation` since this
+    /// store was created. The bound #23 claims is about work, so only a count
+    /// of records actually looked at can witness it.
+    #[cfg(test)]
+    fn leases_examined(&self) -> usize {
+        self.lock().leases.examined()
+    }
+
+    /// What this backend is currently holding — see [`StoredRecords`], and the
+    /// module docs for why two of the three only ever climb.
+    #[must_use]
+    pub fn stored_records(&self) -> StoredRecords {
+        let inner = self.lock();
+        StoredRecords {
+            usage_events: inner.usage.len(),
+            leases: inner.leases.len(),
+            active_leases: inner.leases.active_len(),
+        }
     }
 }
 
@@ -323,17 +368,9 @@ impl LeaseAllocator for MemoryStore {
 
         inner.next_lease_id = next_lease_id;
         let lease_id = LeaseId(next_lease_id);
-        inner.leases.insert(
+        inner.leases.open(
             lease_id,
-            LeaseRecord {
-                account_id: account,
-                fencing_token,
-                granted,
-                used: CostUnits::ZERO,
-                credited: CostUnits::ZERO,
-                expires_at,
-                state: LeaseState::Active,
-            },
+            LeaseRecord::opened(account, fencing_token, granted, expires_at),
         );
         Ok(LeaseGrant {
             lease_id,
@@ -354,7 +391,7 @@ impl LeaseAllocator for MemoryStore {
         let mut inner = self.lock();
         let lease = inner
             .leases
-            .get_mut(&lease_id)
+            .get(lease_id)
             .ok_or(AllocateError::UnknownLease)?;
         if lease.fencing_token != fencing_token {
             return Err(AllocateError::Fenced);
@@ -369,7 +406,7 @@ impl LeaseAllocator for MemoryStore {
             .expires_at
             .checked_add(self.policy.reclaim_grace)
             .unwrap_or(Timestamp::MAX);
-        if lease.state != LeaseState::Active || now >= release_deadline {
+        if !lease.is_active() || now >= release_deadline {
             return Err(AllocateError::LeaseNotActive);
         }
         // granted = used + unspent + loss; a claim that doesn't fit is a
@@ -385,9 +422,11 @@ impl LeaseAllocator for MemoryStore {
             .granted
             .checked_sub(spent_plus_unspent)
             .ok_or(AllocateError::InvalidRelease)?;
-        lease.state = LeaseState::Released;
-        lease.credited = unspent;
         let account_id = lease.account_id;
+        assert!(
+            inner.leases.settle(lease_id, Settled::Released, unspent),
+            "the lease was active a line ago, under this same lock"
+        );
         let record = inner
             .accounts
             .get_mut(&account_id)
@@ -409,29 +448,24 @@ impl LeaseAllocator for MemoryStore {
         limit: NonZeroUsize,
     ) -> Result<ReclaimBatch, StoreError> {
         let mut inner = self.lock();
-        let expired: Vec<LeaseId> = inner
+        // Walks the active index, oldest expiry first, and stops at the first
+        // lease that is not yet due — so the cost is what is being reclaimed,
+        // not what the process has ever leased (#23).
+        let expired = inner
             .leases
-            .iter()
-            .filter(|(_, l)| {
-                let reclaim_at = l
-                    .expires_at
-                    .checked_add(self.policy.reclaim_grace)
-                    .unwrap_or(Timestamp::MAX);
-                l.state == LeaseState::Active && now >= reclaim_at
-            })
-            .map(|(id, _)| *id)
-            .take(limit.get())
-            .collect();
+            .reclaimable(now, self.policy.reclaim_grace, limit.get());
         let mut reclaimed = Vec::with_capacity(expired.len());
         for lease_id in expired {
-            let lease = inner.leases.get_mut(&lease_id).expect("just listed");
-            lease.state = LeaseState::Expired;
+            let lease = inner.leases.get(lease_id).expect("just listed");
             let credit = lease
                 .granted
                 .checked_sub(lease.used)
                 .expect("usage never exceeds grant");
-            lease.credited = credit;
             let account_id = lease.account_id;
+            assert!(
+                inner.leases.settle(lease_id, Settled::Expired, credit),
+                "reclaimable only yields active leases"
+            );
             let record = inner
                 .accounts
                 .get_mut(&account_id)
@@ -445,6 +479,22 @@ impl LeaseAllocator for MemoryStore {
                 account_id,
                 reclaimed: credit,
             });
+        }
+        // One line per sweep rather than one per batch: a drain calls this
+        // until a batch comes back unsaturated, and that last call carries the
+        // post-sweep numbers.
+        if reclaimed.len() < limit.get() {
+            let held = StoredRecords {
+                usage_events: inner.usage.len(),
+                leases: inner.leases.len(),
+                active_leases: inner.leases.active_len(),
+            };
+            tracing::debug!(
+                usage_events = held.usage_events,
+                leases = held.leases,
+                active_leases = held.active_leases,
+                "memory store holdings; usage events and settled leases are never reclaimed"
+            );
         }
         ReclaimBatch::try_new(reclaimed, limit)
     }
@@ -533,7 +583,7 @@ impl UsageSink for MemoryStore {
             // was committed before release converts loss into billed usage.
             // For an expired lease the reclaim credited the full remainder —
             // nothing fits, so stragglers stay rejected (they'd double-count).
-            let Some(lease) = inner.leases.get_mut(&event.lease_id) else {
+            let Some(lease) = inner.leases.get_mut(event.lease_id) else {
                 report.rejected += 1;
                 continue;
             };
@@ -541,10 +591,10 @@ impl UsageSink for MemoryStore {
                 report.rejected += 1;
                 continue;
             }
-            let was_settled = lease.state != LeaseState::Active;
+            let was_settled = !lease.is_active();
             let capacity = lease
                 .used
-                .checked_add(lease.credited)
+                .checked_add(lease.credited())
                 .and_then(|committed| lease.granted.checked_sub(committed));
             let fits = matches!(capacity, Some(cap) if event.units <= cap);
             if !fits {
@@ -575,5 +625,127 @@ impl UsageSink for MemoryStore {
             report.accepted += 1;
         }
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroUsize;
+
+    const ACCOUNT: AccountId = AccountId(1);
+    const TTL: SignedDuration = SignedDuration::from_secs(60);
+
+    fn t(secs: i64) -> Timestamp {
+        Timestamp::from_second(secs).unwrap()
+    }
+
+    /// Grants exactly what is asked for, so a test can open a precise number
+    /// of leases without the default policy's halving getting in the way.
+    fn exact_grants() -> GrantPolicy {
+        GrantPolicy {
+            shrink_divisor: 1,
+            min_grant: CostUnits(1),
+            max_ttl: SignedDuration::from_secs(300),
+            reclaim_grace: SignedDuration::ZERO,
+        }
+    }
+
+    fn store_with(balance: u64) -> Arc<MemoryStore> {
+        let store = MemoryStore::new(exact_grants()).expect("policy is valid");
+        store.create_account(AccountConfig {
+            account_id: ACCOUNT,
+            initial_balance: CostUnits(balance),
+            active: true,
+        });
+        store
+    }
+
+    /// Build a store holding `settled` long-settled leases plus one that is
+    /// due for reclaim, sweep it, and report how many lease records the sweep
+    /// had to look at.
+    async fn examined_by_a_sweep_past(settled: usize) -> usize {
+        let store = store_with(1_000_000);
+        for _ in 0..settled {
+            let lease = store
+                .acquire(ACCOUNT, CostUnits(1), TTL, t(0))
+                .await
+                .expect("funded");
+            store
+                .release(lease.lease_id, lease.fencing_token, lease.units, t(1))
+                .await
+                .expect("active");
+        }
+        let due = store
+            .acquire(ACCOUNT, CostUnits(1), TTL, t(0))
+            .await
+            .expect("funded");
+
+        let before = store.leases_examined();
+        let batch = store
+            .reclaim_expired_batch(t(120), NonZeroUsize::new(64).unwrap())
+            .await
+            .expect("sweep");
+        assert_eq!(batch.len(), 1, "exactly the one expired lease is settled");
+        assert_eq!(batch.reclaimed()[0].lease_id, due.lease_id);
+        store.leases_examined() - before
+    }
+
+    /// #23's whole claim: the sweep's cost follows the live population, not
+    /// what the process has ever leased. Two settled populations two orders of
+    /// magnitude apart must cost the sweep the same, which is a stronger
+    /// statement than any absolute constant — and the one that fails if the
+    /// index is removed and the filter goes back over the whole table.
+    #[tokio::test]
+    async fn sweeping_examines_only_live_leases() {
+        let few = examined_by_a_sweep_past(10).await;
+        let many = examined_by_a_sweep_past(1_000).await;
+        assert_eq!(
+            few, many,
+            "1,000 settled leases cost the sweep {many} record reads against \
+             {few} for 10; the sweep is walking history again"
+        );
+        assert!(
+            many <= 4,
+            "one live lease should not cost {many} record reads"
+        );
+    }
+
+    /// The same for the other scan. `conservation` is the ledger checker, so
+    /// it stays a recomputation from the lease records — the index only
+    /// narrows which records it reads.
+    #[tokio::test]
+    async fn conservation_examines_only_live_leases() {
+        async fn examined_by_conservation_past(settled: usize) -> usize {
+            let store = store_with(1_000_000);
+            for _ in 0..settled {
+                let lease = store
+                    .acquire(ACCOUNT, CostUnits(1), TTL, t(0))
+                    .await
+                    .expect("funded");
+                store
+                    .release(lease.lease_id, lease.fencing_token, lease.units, t(1))
+                    .await
+                    .expect("active");
+            }
+            let _live = store.acquire(ACCOUNT, CostUnits(5), TTL, t(0)).await;
+
+            let before = store.leases_examined();
+            let conservation = store.conservation(ACCOUNT).expect("account exists");
+            assert!(
+                conservation.holds(),
+                "conservation violated: {conservation:?}"
+            );
+            assert_eq!(conservation.active_lease_grants, CostUnits(5));
+            store.leases_examined() - before
+        }
+
+        let few = examined_by_conservation_past(10).await;
+        let many = examined_by_conservation_past(1_000).await;
+        assert_eq!(
+            few, many,
+            "conservation read {many} records against {few}; it is summing \
+             over settled leases again"
+        );
     }
 }
