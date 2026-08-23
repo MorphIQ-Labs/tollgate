@@ -5,6 +5,16 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.0...v0.2.1) - 2026-08-23
+
+### Added
+
+- *(client)* #4 make the refill and snapshot planes scrapeable
+
+### Fixed
+
+- *(store-postgres)* await rollback before returning
+
 ## [0.2.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.1.4...v0.2.0) - 2026-08-23
 
 ### Added
