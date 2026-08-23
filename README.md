@@ -34,7 +34,7 @@ git config core.hooksPath .githooks         # once per clone: rustfmt check on c
 cargo test --workspace                     # correctness (Postgres DB cases are env-gated)
 ./scripts/check_formal.sh                  # Lean authorization-state proofs
 ./scripts/check_perf_thresholds.sh         # hot-path microbench gate
-./scripts/check_load_thresholds.sh         # loopback overhead gate (production profile)
+./scripts/check_load_thresholds.sh         # sequential + contended loopback gates
 
 # Postgres correctness suite:
 docker compose up -d
@@ -69,12 +69,15 @@ to the declared minimum and the dedicated `msrv` job must land together.
 ## The numbers that matter (laptop, provisional)
 
 Full admission — lookup, status, permissions, quote, rate token, lease
-debit — costs **~112 ns** uncontended; end-to-end loopback overhead of the
-whole stack (HMAC verification included) is **×1.05** over a no-admission
-baseline. One lease acquire funds thousands of requests; two instances
-draining one account over HTTP finish with **zero drift** between admission's
-committed units and the billing ledger. Gate manifests live in `testing/`;
-recalibrate on a controlled host before treating thresholds as the contract.
+debit — costs **~112 ns** in the uncontended microbenchmark. Across five
+controlled-host production-profile loopback repetitions, the paired admitted
+vs no-admission p50 ratio was **×0.997–×1.101** for one persistent connection
+and **×1.015–×1.104** for 10 persistent connections contending on one account.
+The load gate retains both scenarios and separate ratio ceilings. One lease
+acquire funds thousands of requests; two instances draining one account over
+HTTP finish with **zero drift** between admission's committed units and the
+billing ledger. Gate manifests live in `testing/`; recalibrate on a controlled
+host before treating thresholds as the contract.
 
 ## Design rules
 
