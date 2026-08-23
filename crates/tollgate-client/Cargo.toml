@@ -12,6 +12,7 @@ tollgate-core = { path = "../tollgate-core", version = "=0.2.1" }
 tollgate-admission = { path = "../tollgate-admission", version = "=0.2.1" }
 tollgate-store = { path = "../tollgate-store", version = "=0.2.1" }
 async-trait = { workspace = true }
+atomic-waker = { workspace = true }
 jiff = { workspace = true }
 reqwest = { workspace = true, optional = true }
 tokio = { workspace = true }

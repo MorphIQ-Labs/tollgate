@@ -53,8 +53,20 @@ until it has one.
    `RateLimited`).
 
 6. **Foreground isolation.** Lease refill and snapshot replacement never block
-   an in-flight request. *Tests:* client refill tests; `lease/refill_offpath`
-   bench assertion.
+   an in-flight request, and the request path never waits on the plane that
+   refills it. A draining lease *tells* the refill task rather than being
+   discovered by it — the debit that crosses low water raises a signal whose
+   implementation is contractually non-blocking — so refill latency is no
+   longer bounded below by the poll interval, and a funded account is not
+   refused between ticks. Cold start and usability-window rollover keep the
+   interval as their backstop, having no debit to announce them.
+   *Tests:* `refill_begins_on_the_crossing_debit_not_the_next_tick`,
+   `a_burst_across_a_rotation_never_denies_a_funded_account`,
+   `refill_installs_lease_on_cold_start`,
+   `usability_window_rollover_returns_unspent_capacity`,
+   `the_crossing_debit_raises_the_signal`,
+   `a_lease_signals_at_most_once_however_long_it_drains`, and the
+   `RefillRequests` handoff tests.
 
 7. **Idempotent accounting.** Replaying a usage batch (same request IDs) never
    double-bills. *Tests:* `usage_replay_is_idempotent` (store suites).

@@ -37,14 +37,15 @@
 //! the store's are not a safe basis for further spending.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use atomic_waker::AtomicWaker;
 use jiff::SignedDuration;
 use tokio::sync::watch;
 use tracing::Instrument as _;
 
 use tollgate_admission::LeaseSlot;
-use tollgate_core::{AccountId, CostUnits, LocalLease};
+use tollgate_core::{AccountId, CostUnits, LocalLease, RefillSignal};
 use tollgate_store::{AllocateError, LeaseAllocator};
 
 use tollgate_store::Clock;
@@ -139,6 +140,60 @@ impl LeaseManagerConfig {
             ));
         }
         Ok(())
+    }
+}
+
+/// The refill task's doorbell: rung by the debit that drains a lease past low
+/// water, answered by the loop below.
+///
+/// Lock-free by construction, because [`RefillSignal::request_refill`] runs on
+/// the request path (INVARIANTS.md #5, #6). `AtomicWaker` is the primitive
+/// built for exactly this handoff; tokio's `Notify` was rejected because
+/// `notify_one` takes an internal mutex whenever a waiter is parked, which is
+/// the normal state of this task.
+///
+/// The claim is bounded and worth stating precisely: *this code* takes no
+/// lock. `Waker::wake` then enters the runtime's scheduler, whose internals
+/// are not ours to characterise. What is ours is that the handoff is a pair of
+/// atomics and that it happens at most once per lease rotation.
+#[derive(Debug, Default)]
+struct RefillRequests {
+    waker: AtomicWaker,
+    pending: AtomicBool,
+}
+
+impl RefillSignal for RefillRequests {
+    fn request_refill(&self) {
+        // Release/Acquire pairs with `requested`: the flag must be visible
+        // before the wake, or the woken task could observe neither.
+        self.pending.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+}
+
+impl RefillRequests {
+    /// Wait for a lease to ask for replacement.
+    ///
+    /// Cancel-safe, which matters because this is one arm of a `select!`: a
+    /// request is consumed only on the path that returns `Ready`, so losing
+    /// the race to another arm cannot swallow it.
+    async fn requested(&self) {
+        std::future::poll_fn(|cx| {
+            if self.pending.swap(false, Ordering::Acquire) {
+                return std::task::Poll::Ready(());
+            }
+            self.waker.register(cx.waker());
+            // Re-check after registering. A request landing between the first
+            // check and the registration would otherwise be waited on
+            // forever — the poll interval would eventually cover it, but the
+            // whole point of #10 is not to wait for that.
+            if self.pending.swap(false, Ordering::Acquire) {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
     }
 }
 
@@ -366,12 +421,22 @@ async fn run(
 ) -> LeaseManagerReport {
     let mut tick = tokio::time::interval(config.poll_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Rung by the debit that crosses low water. The interval remains the
+    // backstop for the two cases no debit can announce: a cold start, where
+    // there is no lease to spend, and a usability-window rollover, where the
+    // lease lapses rather than drains.
+    let refill = Arc::new(RefillRequests::default());
     // Superseded leases waiting for quiescence before their unspent units go
     // back to the allocator.
     let mut parked: Vec<Arc<LocalLease>> = Vec::new();
     loop {
         tokio::select! {
             _ = tick.tick() => {}
+            // Falls through to the level check below like every other arm —
+            // deliberately doing nothing here. An arm that returned or
+            // continued early would reintroduce review finding #2, where a
+            // shutdown observed concurrently is consumed and never acted on.
+            () = refill.requested() => {}
             changed = shutdown.changed() => {
                 // Err = handle dropped without shutdown(); stop rather than
                 // spin against a dead channel.
@@ -445,11 +510,13 @@ async fn run(
                         .get()
                         .min(grant.units.get().saturating_sub(1)),
                 );
-                let fresh = Arc::new(LocalLease::with_safety_margin(
-                    grant,
-                    low_water,
-                    config.expiry_safety_margin,
-                ));
+                let fresh = Arc::new(
+                    LocalLease::with_safety_margin(grant, low_water, config.expiry_safety_margin)
+                        // Each fresh lease gets the doorbell and its own
+                        // unrung flag, so "at most one request per rotation"
+                        // needs no reset protocol.
+                        .with_refill(Arc::clone(&refill) as Arc<dyn RefillSignal>),
+                );
                 if let Some(old) = slot.replace(fresh) {
                     parked.push(old);
                 }
@@ -656,6 +723,73 @@ mod tests {
     use tollgate_store::{AllocateError, ReclaimedLease, StoreError, SystemClock};
 
     use super::*;
+
+    /// The doorbell's two orderings, tested directly rather than inferred from
+    /// end-to-end behaviour: a lost request would show up only as refill
+    /// silently reverting to the poll interval, which every other test would
+    /// still pass.
+    ///
+    /// Signal first, then wait — the request must survive until someone asks.
+    #[tokio::test]
+    async fn a_request_raised_before_the_wait_is_not_lost() {
+        let refill = RefillRequests::default();
+        refill.request_refill();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), refill.requested())
+            .await
+            .expect("a request raised before the wait must complete it");
+    }
+
+    /// Wait first, then signal — the ordinary case, where the task is parked
+    /// and the debit wakes it.
+    #[tokio::test]
+    async fn a_request_raised_during_the_wait_wakes_it() {
+        let refill = Arc::new(RefillRequests::default());
+        let signal = Arc::clone(&refill);
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            signal.request_refill();
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), refill.requested())
+            .await
+            .expect("a request raised while waiting must wake the waiter");
+    }
+
+    /// One request satisfies one wait: the flag is consumed, so the next wait
+    /// blocks until something rings again. Without this, a single crossing
+    /// would spin the refill loop forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_is_consumed_by_the_wait_it_completes() {
+        let refill = RefillRequests::default();
+        refill.request_refill();
+        refill.requested().await;
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), refill.requested())
+                .await
+                .is_err(),
+            "the request was already answered; waiting again must block"
+        );
+    }
+
+    /// Repeated requests before anyone waits collapse into one wake — the
+    /// counterpart to `LocalLease` signalling at most once per lease.
+    #[tokio::test(start_paused = true)]
+    async fn repeated_requests_collapse_into_one_wake() {
+        let refill = RefillRequests::default();
+        for _ in 0..10 {
+            refill.request_refill();
+        }
+        refill.requested().await;
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), refill.requested())
+                .await
+                .is_err(),
+            "ten requests are still one outstanding refill, not ten"
+        );
+    }
 
     /// How the scripted allocator answers a release for a given lease.
     #[derive(Clone, Copy, PartialEq, Eq)]

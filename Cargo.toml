@@ -36,6 +36,13 @@ proptest = "1.7"
 # crate resolves the same versions.
 arc-swap = "1"
 async-trait = "0.1"
+# The refill wake (#10). A single-purpose, dependency-free leaf crate already
+# in the lockfile via hyper, so taking it directly compiles nothing new. It is
+# deliberately not tokio's `Notify`: the signal is raised from inside a lease
+# debit, on the request path, and `notify_one` takes an internal mutex when a
+# waiter is parked — which is exactly our case, since the refill task is
+# normally waiting.
+atomic-waker = "1.1"
 moka = { version = "0.12", features = ["sync"] }
 governor = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
