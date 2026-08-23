@@ -59,6 +59,15 @@ fn snapshot() -> Arc<AccountSnapshot> {
     })
 }
 
+/// The same snapshot under a named account, so a benchmark can put N
+/// principals across N accounts rather than all under `AccountId(1)`.
+fn snapshot_for_account(account: u128) -> Arc<AccountSnapshot> {
+    Arc::new(AccountSnapshot {
+        account_id: AccountId(account),
+        ..(*snapshot()).clone()
+    })
+}
+
 fn big_lease() -> Arc<LocalLease> {
     Arc::new(LocalLease::new(
         LeaseGrant {
@@ -212,6 +221,47 @@ fn bench_bulk_install(c: &mut Criterion) {
             || (ArcSwapSnapshotMap::new(), entries()),
             |(map, entries)| {
                 map.install_many(entries);
+                map
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    // The two above share one account, so the limiter registry holds a single
+    // entry and its dead-entry sweep is O(1) — they isolate map-clone cost and
+    // cannot see the registry rescan at all (#8). These give every principal
+    // its own account, so the registry holds N entries and a per-lookup sweep
+    // costs O(N) each time. Both sizes are measured: the point is the shape of
+    // the curve, since the defect is quadratic rather than merely slow.
+    for accounts in [512u128, 2_048] {
+        let distinct = move || {
+            (0..accounts)
+                .map(|i| (Principal(i), snapshot_for_account(i), LeaseSlot::empty()))
+                .collect::<Vec<_>>()
+        };
+        group.bench_function(format!("install_many_{accounts}_distinct_accounts"), |b| {
+            b.iter_batched(
+                || (ArcSwapSnapshotMap::new(), distinct()),
+                |(map, entries)| {
+                    map.install_many(entries);
+                    map
+                },
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    group.bench_function("install_loop_512_distinct_accounts", |b| {
+        let distinct = || {
+            (0..512u128)
+                .map(|i| (Principal(i), snapshot_for_account(i), LeaseSlot::empty()))
+                .collect::<Vec<_>>()
+        };
+        b.iter_batched(
+            || (ArcSwapSnapshotMap::new(), distinct()),
+            |(map, entries)| {
+                for (principal, snapshot, lease) in entries {
+                    map.install(principal, snapshot, lease);
+                }
                 map
             },
             BatchSize::SmallInput,
