@@ -335,6 +335,7 @@ struct FlakySink {
 struct BatchCappedSink {
     cap: usize,
     largest: AtomicUsize,
+    ingested: AtomicUsize,
 }
 
 #[async_trait]
@@ -348,6 +349,7 @@ impl UsageSink for BatchCappedSink {
         if events.len() > self.cap {
             return Err(StoreError("batch exceeds sink limit".into()));
         }
+        self.ingested.fetch_add(events.len(), Ordering::AcqRel);
         Ok(IngestReport {
             accepted: events.len() as u64,
             ..IngestReport::default()
@@ -356,10 +358,59 @@ impl UsageSink for BatchCappedSink {
 }
 
 #[tokio::test(start_paused = true)]
+async fn steady_state_flushes_in_configured_batch_sizes() {
+    let sink = Arc::new(BatchCappedSink {
+        cap: 2,
+        largest: AtomicUsize::new(0),
+        ingested: AtomicUsize::new(0),
+    });
+    let grant = tollgate_core::LeaseGrant {
+        lease_id: tollgate_core::LeaseId(1),
+        account_id: ACCOUNT,
+        fencing_token: tollgate_core::FencingToken(1),
+        units: CostUnits(100),
+        expires_at: t(100),
+    };
+    let (recorder, writer) = UsageWriter::spawn(
+        Arc::clone(&sink) as Arc<dyn UsageSink>,
+        Arc::new(ManualClock::new(t(0))),
+        UsageWriterConfig {
+            queue_capacity: 8,
+            max_batch: 2,
+            flush_interval: std::time::Duration::from_secs(60),
+            retry_backoff: std::time::Duration::from_millis(1),
+            shutdown_drain_deadline: std::time::Duration::from_secs(60),
+            ingest_timeout: std::time::Duration::from_secs(5),
+        },
+    )
+    .unwrap();
+    // Let the writer receive one event into a partial batch before the rest
+    // arrive. The next bulk receive must be limited to the one remaining
+    // slot, even though more events are buffered.
+    recorder.try_reserve().unwrap().record(event(0, 1, &grant));
+    tokio::task::yield_now().await;
+    for request in 1..4 {
+        recorder
+            .try_reserve()
+            .unwrap()
+            .record(event(request, 1, &grant));
+    }
+
+    settle().await;
+    assert_eq!(sink.ingested.load(Ordering::Acquire), 4);
+    assert_eq!(sink.largest.load(Ordering::Acquire), 2);
+
+    let stats = writer.shutdown().await.unwrap();
+    assert_eq!(stats.accepted, 4);
+    assert_eq!(stats.lost, 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn shutdown_flushes_in_configured_batch_sizes() {
     let sink = Arc::new(BatchCappedSink {
         cap: 2,
         largest: AtomicUsize::new(0),
+        ingested: AtomicUsize::new(0),
     });
     let grant = tollgate_core::LeaseGrant {
         lease_id: tollgate_core::LeaseId(1),

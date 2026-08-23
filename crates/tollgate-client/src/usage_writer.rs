@@ -374,16 +374,19 @@ async fn run(
         let deadline = tokio::time::sleep(config.flush_interval);
         tokio::pin!(deadline);
         let outcome = loop {
+            // `recv_many`'s limit is the number of events appended, not the
+            // final vector length. Restrict it to the remaining capacity so
+            // one ingest call can never exceed `max_batch`.
+            let remaining = max_batch - batch.len();
             tokio::select! {
-                event = rx.recv() => match event {
-                    Some(event) => {
-                        batch.push(event);
-                        if batch.len() >= max_batch {
-                            break FillOutcome::Flush;
-                        }
+                received = rx.recv_many(&mut batch, remaining) => {
+                    if received == 0 {
+                        break FillOutcome::Stop;
                     }
-                    None => break FillOutcome::Stop,
-                },
+                    if batch.len() >= max_batch {
+                        break FillOutcome::Flush;
+                    }
+                }
                 _ = &mut deadline, if !batch.is_empty() => break FillOutcome::Flush,
                 changed = shutdown.changed() => {
                     // Err = sender dropped without shutdown(); treat both as
