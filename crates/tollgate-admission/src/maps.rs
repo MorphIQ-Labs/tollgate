@@ -381,7 +381,7 @@ mod tests {
         Timestamp::from_second(secs).unwrap()
     }
 
-    fn hash_of(hasher: &PrincipalHasher, principal: Principal) -> u64 {
+    fn hash_of<S: BuildHasher>(hasher: &S, principal: Principal) -> u64 {
         hasher.hash_one(principal)
     }
 
@@ -401,12 +401,31 @@ mod tests {
     fn principal_hashing_stays_spread_for_sequential_and_random_keys() {
         const KEYS: usize = 4_096;
         const BUCKETS: usize = 256;
-        // Uniform over 256 buckets is 16 per bucket; 4x that is far outside
-        // anything chance produces at this size and far inside what a
-        // collapsed hash produces (4,096 in one bucket).
+        // Independent nonzero constants make the corpus repeatable without
+        // manufacturing correlated weak points in foldhash's two seed layers.
+        const PER_HASHER_SEEDS: [u64; 4] = [
+            0x4D59_5DF4_D0F3_3173,
+            0xD7A0_0D5E_A50D_0C75,
+            0x8B8B_8B8B_8B8B_8B8B,
+            0x6A09_E667_F3BC_C909,
+        ];
+        static SHARED_SEEDS: [foldhash::SharedSeed; 4] = [
+            foldhash::SharedSeed::from_u64(0xBB67_AE85_84CA_A73B),
+            foldhash::SharedSeed::from_u64(0x3C6E_F372_FE94_F82B),
+            foldhash::SharedSeed::from_u64(0xA54F_F53A_5F1D_36F1),
+            foldhash::SharedSeed::from_u64(0x510E_527F_ADE6_82D1),
+        ];
+        // Uniform over 256 buckets is 16 per bucket. This deliberately wide
+        // regression bound distinguishes a spread hash from a collapse
+        // without treating fast foldhash as a statistical-quality hash.
         const MAX_PER_BUCKET: usize = 64;
 
-        let hasher = PrincipalHasher::default();
+        // Keep the behavioral witness deterministic while mechanically tying
+        // the production alias to foldhash's randomized fast state. Production
+        // maps must retain their per-instance unpredictability; only this test
+        // substitutes explicit seeds.
+        let _: PrincipalHasher = foldhash::fast::RandomState::default();
+
         // A xorshift stand-in for truncated-HMAC principals: uniformly spread
         // bits, generated without a dependency or a clock read.
         let mut state = 0x9E37_79B9_7F4A_7C15u64;
@@ -417,7 +436,7 @@ mod tests {
             u128::from(state) << 64 | u128::from(state.rotate_left(31))
         });
 
-        for (shape, principals) in [
+        let input_shapes = [
             (
                 "sequential",
                 (0..KEYS as u128).map(Principal).collect::<Vec<_>>(),
@@ -428,32 +447,44 @@ mod tests {
                     .map(|_| Principal(random.next().unwrap()))
                     .collect(),
             ),
-        ] {
-            let mut by_low = vec![0usize; BUCKETS];
-            let mut by_top = vec![0usize; 128];
-            for principal in principals {
-                let hash = hash_of(&hasher, principal);
-                by_low[(hash as usize) % BUCKETS] += 1;
-                by_top[(hash >> 57) as usize] += 1;
-            }
+        ];
 
-            let worst_low = by_low.iter().copied().max().unwrap_or(0);
-            assert!(
-                worst_low <= MAX_PER_BUCKET,
-                "{shape}: {worst_low} of {KEYS} keys landed in one of {BUCKETS} \
-                 bucket-index slots; the hash does not spread its low bits",
-            );
-            let worst_top = by_top.iter().copied().max().unwrap_or(0);
-            assert!(
-                worst_top <= MAX_PER_BUCKET,
-                "{shape}: {worst_top} of {KEYS} keys share one control byte; \
-                 the hash does not spread its top bits, so probing degrades \
-                 however well the bucket index looks",
-            );
-            assert!(
-                by_top.iter().filter(|count| **count > 0).count() > 64,
-                "{shape}: the top seven bits took too few distinct values",
-            );
+        for (shared_seed_index, shared_seed) in SHARED_SEEDS.iter().enumerate() {
+            for per_hasher_seed in PER_HASHER_SEEDS {
+                let hasher =
+                    foldhash::fast::SeedableRandomState::with_seed(per_hasher_seed, shared_seed);
+
+                for (shape, principals) in &input_shapes {
+                    let mut by_low = vec![0usize; BUCKETS];
+                    let mut by_top = vec![0usize; 128];
+                    for principal in principals {
+                        let hash = hash_of(&hasher, *principal);
+                        by_low[(hash as usize) % BUCKETS] += 1;
+                        by_top[(hash >> 57) as usize] += 1;
+                    }
+
+                    let worst_low = by_low.iter().copied().max().unwrap_or(0);
+                    assert!(
+                        worst_low <= MAX_PER_BUCKET,
+                        "{shape}, shared seed {shared_seed_index}, per-hasher seed \
+                         {per_hasher_seed}: {worst_low} of {KEYS} keys landed in one of \
+                         {BUCKETS} bucket-index slots; the hash does not spread its low bits",
+                    );
+                    let worst_top = by_top.iter().copied().max().unwrap_or(0);
+                    assert!(
+                        worst_top <= MAX_PER_BUCKET,
+                        "{shape}, shared seed {shared_seed_index}, per-hasher seed \
+                         {per_hasher_seed}: {worst_top} of {KEYS} keys share one control byte; \
+                         the hash does not spread its top bits, so probing degrades however \
+                         well the bucket index looks",
+                    );
+                    assert!(
+                        by_top.iter().filter(|count| **count > 0).count() > 64,
+                        "{shape}, shared seed {shared_seed_index}, per-hasher seed \
+                         {per_hasher_seed}: the top seven bits took too few distinct values",
+                    );
+                }
+            }
         }
     }
 

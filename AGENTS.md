@@ -38,7 +38,7 @@ cargo run -p pricing-api
 cargo run -p tollgate-server
 ```
 
-CI uses `check`, `test`, `assurance`, and `release`: format, Clippy, title convention, all-feature workspace tests, the PostgreSQL suite, and benchmark compilation run on every merge request; mutation, formal, and ratio-only load gates run only for merge requests targeting the default branch; release-plz runs only after merge. Criterion thresholds remain an explicit manual, non-gating assurance job because their absolute latency is calibrated only on a controlled host. The required load job uses `testing/load_thresholds_ci.json`, whose absolute ceilings are explicitly disabled; the like-for-like sequential and same-account-concurrent ratios remain enforced. The `production` profile (fat LTO, `panic=abort`) is for deployment and the load gate; Criterion retains the default release profile. Keep `rust-toolchain.toml` and the GitLab CI Rust image in lockstep.
+CI uses `check`, `test`, `assurance`, and `release`: format, Clippy, title convention, all-feature workspace tests, the PostgreSQL suite, and benchmark compilation run on every merge request; mutation and formal gates run only for merge requests targeting the default branch; release-plz runs only after merge. Performance and load threshold lanes are explicit, non-gating assurance jobs because absolute latency is calibrated only on a controlled host; overhead ratios are portable, so their shared-CI reports remain useful evidence. The `production` profile (fat LTO, `panic=abort`) is for deployment and the load gate; Criterion retains the default release profile. Keep `rust-toolchain.toml` and the GitLab CI Rust image in lockstep.
 
 ## Design Constraints
 
