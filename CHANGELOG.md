@@ -5,6 +5,19 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.1.0...v0.1.1) - 2026-08-23
+
+### Fixed
+
+- #28 examine every parked lease during release quiescence
+- #32 drain outstanding usage permits during bounded shutdown
+- #41 report unaccounted charges when the usage writer dies
+
+### Other
+
+- #44 restore a packageable canonical release baseline
+- #46 remove the manifest-level registry guard that broke packaging
+
 ## [0.1.0](https://github.com/MorphIQ-Labs/tollgate/releases/tag/v0.1.0) - 2026-08-22
 
 ### Fixed
