@@ -20,7 +20,7 @@
 //! loopback test in tollgate-server). Readiness reports 503 until the account's
 //! lease slot is stocked (INVARIANTS.md #10).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use axum::Json;
@@ -365,6 +365,7 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
     let router = axum::Router::new()
         .route("/livez", get(async || StatusCode::OK))
         .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
         .route("/v1/price", post(price))
         .with_state(state);
     (
@@ -409,6 +410,52 @@ async fn readyz(State(state): State<Arc<AppState>>) -> StatusCode {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     }
+}
+
+/// What this instance admitted, refused, and has left to spend.
+///
+/// JSON rather than an exposition format on purpose: naming the metrics is
+/// the decision, and issue #38 owns continuous export while #39 owns the
+/// operator documentation. Choosing a wire format here would pre-empt both.
+#[derive(Debug, Serialize)]
+pub struct Metrics {
+    /// Requests admitted by the engine.
+    pub admitted: u64,
+    /// Units quoted by admitted requests — *not* units billed. Usage events
+    /// are billing truth; a request admitted and then cancelled before
+    /// execution is counted here and charged nothing.
+    pub units_admitted: u64,
+    /// Every refusal, whatever the reason.
+    pub denied: u64,
+    /// Refusals by reason. Every reason is present, so a zero says "this has
+    /// not happened" rather than leaving the reader to guess whether the
+    /// counter exists. Ordered, so two scrapes diff cleanly.
+    pub denials: BTreeMap<&'static str, u64>,
+    /// Units left on the installed lease, absent when no lease is installed
+    /// (cold start, or fenced out). Read off the shared slot, never from the
+    /// request path.
+    pub lease_remaining: Option<u64>,
+    /// How long the installed lease may still be spent against — the
+    /// `expires_at - safety_margin` bound of INVARIANTS.md #12, not the raw
+    /// expiry. Paired with `lease_remaining`, since a lease can be refused
+    /// for either reason.
+    pub lease_usable_until: Option<String>,
+}
+
+/// The counters are read off the engine, not the request path: this handler
+/// does the loads, the formatting and the allocation that INVARIANTS.md #5
+/// keeps out of `admit`.
+async fn metrics(State(state): State<Arc<AppState>>) -> Json<Metrics> {
+    let counters = state.engine.counters().snapshot();
+    let lease = state.slot.load();
+    Json(Metrics {
+        admitted: counters.admitted,
+        units_admitted: counters.units_admitted,
+        denied: counters.denied(),
+        denials: counters.denials_by_name().collect(),
+        lease_remaining: lease.as_ref().map(|lease| lease.remaining().get()),
+        lease_usable_until: lease.map(|lease| lease.usable_until().to_string()),
+    })
 }
 
 fn problem(status: StatusCode, code: &'static str, title: impl Into<String>) -> Response {
@@ -480,12 +527,27 @@ async fn price(
         .and_then(|v| v.strip_prefix("Bearer "))
         .and_then(|key| state.auth.verify(key))
     else {
+        // Also recorded here: a credential that fails verification is refused
+        // before the engine is reached, and an operator watching
+        // `unknown_principal` wants both halves — a bad key and a key with no
+        // snapshot are the same refusal from the caller's side.
+        state
+            .engine
+            .counters()
+            .record_deny(&DenyReason::UnknownPrincipal);
         return deny_response(DenyReason::UnknownPrincipal);
     };
 
     // 2. Accounting capacity before admission (INVARIANTS.md #8).
     let recorder = state.recorder.as_ref().expect("admission implies recorder");
     let Ok(permit) = recorder.try_reserve() else {
+        // Shed before admission, so the engine never sees this one: the
+        // service records it against the same tally, or the reason would
+        // export a permanent zero and read as "never happens" (#37).
+        state
+            .engine
+            .counters()
+            .record_deny(&DenyReason::AccountingBackpressure);
         return deny_response(DenyReason::AccountingBackpressure);
     };
 

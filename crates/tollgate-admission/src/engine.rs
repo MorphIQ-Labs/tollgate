@@ -10,6 +10,7 @@ use tollgate_core::{
     Reservation,
 };
 
+use crate::counters::AdmissionCounters;
 use crate::state::{MapEntry, Principal, SnapshotMap};
 
 /// One request's admission inputs. `items` is the batch size (1 for a single
@@ -38,12 +39,19 @@ pub struct Admitted {
 /// moka and arc-swap candidates compete under identical logic.
 pub struct AdmissionEngine<M: SnapshotMap> {
     map: M,
+    // By value, not behind an `Arc`: the counters sit at a known offset from
+    // an engine the embedder already holds, so recording an outcome is a
+    // direct index off `self` rather than a pointer chase (#37).
+    counters: AdmissionCounters,
 }
 
 impl<M: SnapshotMap> AdmissionEngine<M> {
     #[must_use]
     pub fn new(map: M) -> Self {
-        AdmissionEngine { map }
+        AdmissionEngine {
+            map,
+            counters: AdmissionCounters::new(),
+        }
     }
 
     /// Control-plane surface: the underlying map, for installs/invalidation.
@@ -52,9 +60,34 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
         &self.map
     }
 
+    /// Observability surface: what this instance has admitted and refused.
+    #[must_use]
+    pub fn counters(&self) -> &AdmissionCounters {
+        &self.counters
+    }
+
     /// Admit or deny. No I/O, no locks, no clock reads; every deny charges
     /// zero because the reservation is the last step.
+    ///
+    /// The outcome is tallied here rather than at each exit: five of the
+    /// fourteen reasons never appear literally in [`Self::admit_inner`], since
+    /// `AccountSnapshot::admit` and `Reservation::reserve` produce them and
+    /// `?` propagates them. Counting at the sites would therefore have been
+    /// both noisier and — where it mattered — incomplete.
     pub fn admit<O: OpIndex>(
+        &self,
+        request: AdmissionRequest<'_, O>,
+        now: Timestamp,
+    ) -> Result<Admitted, DenyReason> {
+        let outcome = self.admit_inner(request, now);
+        match &outcome {
+            Ok(admitted) => self.counters.record_admit(admitted.quote.total),
+            Err(reason) => self.counters.record_deny(reason),
+        }
+        outcome
+    }
+
+    fn admit_inner<O: OpIndex>(
         &self,
         request: AdmissionRequest<'_, O>,
         now: Timestamp,
@@ -187,13 +220,17 @@ mod tests {
     }
 
     fn lease(units: u64) -> Arc<LocalLease> {
+        lease_until(units, t(10_000))
+    }
+
+    fn lease_until(units: u64, expires_at: Timestamp) -> Arc<LocalLease> {
         Arc::new(LocalLease::new(
             LeaseGrant {
                 lease_id: LeaseId(7),
                 account_id: AccountId(1),
                 fencing_token: FencingToken(1),
                 units: CostUnits(units),
-                expires_at: t(10_000),
+                expires_at,
             },
             CostUnits::ZERO,
         ))
@@ -447,6 +484,163 @@ mod tests {
                 burst_units: CostUnits(u64::from(u32::MAX)),
             }
         );
+    }
+
+    /// The counters must attribute each outcome to the right slot and leave
+    /// every other slot alone. The sequence deliberately mixes reasons raised
+    /// inside `admit_inner` with ones that only arrive through `?` from
+    /// `AccountSnapshot::admit` and `Reservation::reserve` — the latter are
+    /// exactly the ones per-site instrumentation would have missed.
+    #[test]
+    fn counters_attribute_every_outcome() {
+        let engine = engine_with(AccountStatus::Active, Some(10_000));
+
+        // Two admissions: 1 item quotes 51 units, 14 items quote 64.
+        engine.admit(request(1), t(0)).unwrap();
+        engine.admit(request(14), t(0)).unwrap();
+        // Raised in the pipeline itself.
+        engine.admit(request(65), t(0)).unwrap_err();
+        engine.admit(request(65), t(0)).unwrap_err();
+        // Propagated out of `AccountSnapshot::admit`: staleness is decided
+        // against `valid_until`, never by an inline refresh.
+        assert_eq!(
+            engine.admit(request(1), t(20_000)).unwrap_err(),
+            DenyReason::SnapshotExpired
+        );
+        // Propagated out of `AccountSnapshot::admit`: permissions.
+        assert_eq!(
+            engine
+                .admit(
+                    AdmissionRequest {
+                        principal: Principal(1),
+                        required: PermissionBits::bit(3),
+                        op: &Op::Price,
+                        items: 1,
+                    },
+                    t(0)
+                )
+                .unwrap_err(),
+            DenyReason::MissingPermission
+        );
+
+        let snapshot = engine.counters().snapshot();
+        assert_eq!(snapshot.admitted, 2);
+        assert_eq!(snapshot.units_admitted, 115, "51 + 64 units quoted");
+        assert_eq!(snapshot.denied(), 4);
+        let denials: Vec<_> = snapshot
+            .denials_by_name()
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        assert_eq!(
+            denials,
+            vec![
+                ("snapshot_expired", 1),
+                ("missing_permission", 1),
+                ("request_too_large", 2),
+            ],
+            "each reason in its own slot, and nothing in the others"
+        );
+    }
+
+    /// Every reason the engine can produce must reach its own slot. Six of
+    /// these had no engine-level test before the counters needed one, so a
+    /// reason could have been produced and never observed here.
+    #[test]
+    fn each_reason_reaches_its_own_slot() {
+        // Closed and suspended accounts, and an unknown principal.
+        for (status, expected) in [
+            (AccountStatus::Suspended, DenyReason::AccountSuspended),
+            (AccountStatus::Closed, DenyReason::AccountClosed),
+        ] {
+            let engine = engine_with(status, Some(10_000));
+            assert_eq!(engine.admit(request(1), t(0)).unwrap_err(), expected);
+            let snapshot = engine.counters().snapshot();
+            assert_eq!(snapshot.denials[expected.index()], 1);
+            assert_eq!(snapshot.denied(), 1, "exactly one slot moved");
+        }
+
+        // A lease past its expiry: `Reservation::reserve` refuses it, and the
+        // reason propagates through `?`. The lease must lapse well before the
+        // snapshot does, or the staleness check upstream would answer first
+        // and this slot would never be reached.
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::empty();
+        slot.install(lease_until(10_000, t(100)));
+        engine
+            .map()
+            .install(Principal(1), snapshot(AccountStatus::Active), slot);
+        assert_eq!(
+            engine.admit(request(1), t(200)).unwrap_err(),
+            DenyReason::LeaseExpired
+        );
+        assert_eq!(
+            engine.counters().snapshot().denials[DenyReason::LeaseExpired.index()],
+            1
+        );
+
+        // Cost overflow: a table whose weight cannot be multiplied out.
+        let overflowing = Arc::new(AccountSnapshot {
+            limits: ResolvedLimits {
+                max_items_per_request: u64::MAX,
+                rate_units_per_second: u64::MAX,
+                rate_burst_units: u64::MAX,
+            },
+            cost_table: Arc::new(
+                CostTable::builder(CostUnits(50), CostUnits(50))
+                    .weight(&Op::Price, CostUnits(u64::MAX / 2))
+                    .build(),
+            ),
+            ..(*snapshot(AccountStatus::Active)).clone()
+        });
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::empty();
+        slot.install(lease(u64::MAX));
+        engine.map().install(Principal(1), overflowing, slot);
+        assert_eq!(
+            engine.admit(request(4), t(0)).unwrap_err(),
+            DenyReason::CostOverflow
+        );
+        assert_eq!(
+            engine.counters().snapshot().denials[DenyReason::CostOverflow.index()],
+            1
+        );
+
+        // AccountingBackpressure is decided before admission by the embedder,
+        // so the engine cannot raise it — recording it is the caller's job,
+        // and the slot exists for exactly that (INVARIANTS.md #8).
+        let engine = engine_with(AccountStatus::Active, Some(10_000));
+        engine
+            .counters()
+            .record_deny(&DenyReason::AccountingBackpressure);
+        assert_eq!(
+            engine.counters().snapshot().denials[DenyReason::AccountingBackpressure.index()],
+            1
+        );
+    }
+
+    /// A denial charges zero units, so it must never move `units_admitted` —
+    /// the counter an operator is most likely to misread as money.
+    #[test]
+    fn denied_requests_add_no_units() {
+        let engine = engine_with(AccountStatus::Active, Some(60));
+        // Held, not dropped: an uncommitted reservation returns its units on
+        // drop, so releasing it here would refill the lease and the next
+        // request would be admitted instead of refused.
+        let held = engine.admit(request(1), t(0)).unwrap();
+        // The lease now has 9 units left: the next request is refused.
+        engine.admit(request(1), t(0)).unwrap_err();
+
+        let snapshot = engine.counters().snapshot();
+        assert_eq!(snapshot.admitted, 1);
+        assert_eq!(snapshot.units_admitted, 51);
+        assert_eq!(
+            snapshot.denials[DenyReason::LeaseExhausted {
+                remaining: CostUnits(9)
+            }
+            .index()],
+            1
+        );
+        drop(held);
     }
 
     /// The lease slot is shared: a refill installed after a cold-start deny

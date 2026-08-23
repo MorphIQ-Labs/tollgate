@@ -47,6 +47,9 @@ curl -s -H 'Authorization: Bearer demo-key-1' -H 'Content-Type: application/json
      -d '{"contracts":[{"spot":100,"strike":105,"rate":0.05,"vol":0.2,"tte_years":0.25}]}' \
      http://127.0.0.1:8081/v1/price
 
+# What that instance admitted and refused, by reason:
+curl -s http://127.0.0.1:8081/metrics
+
 # Run the control plane:
 cargo run -p tollgate-server
 ```
