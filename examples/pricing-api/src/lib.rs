@@ -178,13 +178,16 @@ impl AppRuntime {
             republisher.abort();
         }
         if let Some(writer) = self.writer {
-            let stats = writer.shutdown().await;
             // Always reported: a clean shutdown is itself the operator's
-            // evidence that nothing was lost or left unresolved.
-            eprintln!(
-                "usage-writer shutdown: {} accepted, {} duplicate, {} rejected, {} lost, {} unresolved",
-                stats.accepted, stats.duplicate, stats.rejected, stats.lost, stats.unresolved
-            );
+            // evidence that nothing was lost or left unresolved, and a dead
+            // writer must never look like one.
+            match writer.shutdown().await {
+                Ok(stats) => eprintln!(
+                    "usage-writer shutdown: {} accepted, {} duplicate, {} rejected, {} lost, {} unresolved",
+                    stats.accepted, stats.duplicate, stats.rejected, stats.lost, stats.unresolved
+                ),
+                Err(error) => eprintln!("usage-writer shutdown FAILED: {error}"),
+            }
         }
         if let Some(manager) = self.manager {
             manager.shutdown().await;

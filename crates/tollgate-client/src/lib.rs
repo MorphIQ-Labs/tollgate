@@ -40,5 +40,6 @@ pub use snapshot_manager::{
     SlotRegistry, SnapshotManager, SnapshotManagerConfig, SnapshotManagerConfigError,
 };
 pub use usage_writer::{
-    UsagePermit, UsageRecorder, UsageWriter, UsageWriterConfig, UsageWriterConfigError, WriterStats,
+    UsagePermit, UsageRecorder, UsageWriter, UsageWriterConfig, UsageWriterConfigError,
+    WriterShutdownError, WriterStats,
 };

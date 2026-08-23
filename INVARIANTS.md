@@ -55,13 +55,22 @@ until it has one.
    batches, counts any event still undeliverable after the bounded final
    retries in `WriterStats::lost`, and reports permits still outstanding at
    the deadline in `WriterStats::unresolved` — a deadline expiry is never a
-   clean flush. *Tests:* client writer overflow tests,
+   clean flush. The reporting holds across the writer's own death: every
+   charge that enters the queue is counted until it is given a billing
+   outcome, in a counter outside the task, so a writer that panics or is
+   aborted returns `WriterShutdownError` carrying a lower bound on the
+   charges it was holding. A zeroed `WriterStats` is never returned for a
+   task that did not report one — and, since the type is deliberately not
+   `Default`, cannot be conjured from a failure. *Tests:* client writer
+   overflow tests,
    `shutdown_flushes_in_configured_batch_sizes`,
    `shutdown_during_outage_terminates_and_reports_loss`,
    `reserve_fails_once_shutdown_begins`,
    `shutdown_waits_for_outstanding_permit`,
-   `late_permit_drop_completes_drain`, and
-   `drain_deadline_expiry_reports_unresolved`.
+   `late_permit_drop_completes_drain`,
+   `drain_deadline_expiry_reports_unresolved`,
+   `panicked_writer_reports_unaccounted_charges`, and
+   `panic_after_partial_flush_counts_only_unflushed`.
 
 9. **Crash leak is bounded by TTL.** A crashed lease holder strands its unspent
    units only until the lease TTL expires, after which the allocator reclaims

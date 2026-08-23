@@ -297,7 +297,7 @@ async fn writer_flushes_batches_idempotently() {
     settle().await;
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(90));
 
-    let stats = writer.shutdown().await;
+    let stats = writer.shutdown().await.unwrap();
     assert_eq!(stats.accepted, 9);
     assert_eq!(stats.duplicate, 1);
     assert_eq!(stats.lost, 0);
@@ -320,7 +320,7 @@ async fn full_queue_sheds_before_admission() {
     drop(p1);
     let _p3 = recorder.try_reserve().unwrap();
     drop(p2);
-    writer.shutdown().await;
+    writer.shutdown().await.unwrap();
 }
 
 /// A sink that fails its first N calls, then delegates to the store.
@@ -384,7 +384,7 @@ async fn shutdown_flushes_in_configured_batch_sizes() {
             .record(event(request, 1, &grant));
     }
 
-    let stats = writer.shutdown().await;
+    let stats = writer.shutdown().await.unwrap();
     assert_eq!(stats.accepted, 6);
     assert_eq!(stats.lost, 0);
     assert_eq!(sink.largest.load(Ordering::Acquire), 2);
@@ -431,7 +431,7 @@ async fn writer_retries_through_outage_without_losing_events() {
     settle().await;
     settle().await;
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(25));
-    let stats = writer.shutdown().await;
+    let stats = writer.shutdown().await.unwrap();
     assert_eq!(stats.accepted, 1);
     assert_eq!(stats.lost, 0);
 }
@@ -469,7 +469,7 @@ async fn panic_after_commit_still_bills() {
     assert!(worker.await.is_err(), "the worker must have panicked");
 
     // Shutdown drains and flushes whatever the unwind enqueued.
-    let stats = writer.shutdown().await;
+    let stats = writer.shutdown().await.unwrap();
     assert_eq!(stats.accepted, 1);
     assert_eq!(stats.lost, 0);
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(51));
@@ -505,7 +505,8 @@ async fn shutdown_during_outage_terminates_and_reports_loss() {
     // The whole point: this must complete (bounded final flush), not hang.
     let stats = tokio::time::timeout(std::time::Duration::from_secs(60), writer.shutdown())
         .await
-        .expect("shutdown must terminate during an outage");
+        .expect("shutdown must terminate during an outage")
+        .unwrap();
     assert_eq!(stats.lost, 2);
     assert_eq!(stats.accepted, 0);
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits::ZERO);
@@ -538,7 +539,8 @@ async fn shutdown_after_recovery_delivers_everything() {
 
     let stats = tokio::time::timeout(std::time::Duration::from_secs(60), writer.shutdown())
         .await
-        .expect("shutdown must terminate");
+        .expect("shutdown must terminate")
+        .unwrap();
     assert_eq!(stats.lost, 0);
     assert_eq!(stats.accepted, 1);
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(25));
@@ -565,7 +567,7 @@ async fn straggler_usage_after_reclaim_is_reported_rejected() {
     let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8)).unwrap();
     recorder.try_reserve().unwrap().record(event(1, 10, &lease));
     settle().await;
-    let stats = writer.shutdown().await;
+    let stats = writer.shutdown().await.unwrap();
     assert_eq!(stats.rejected, 1);
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits::ZERO);
 }
@@ -604,7 +606,7 @@ async fn reserve_fails_once_shutdown_begins() {
     assert!(recorder.is_closed(), "readiness must observe the shutdown");
 
     held.record(event(1, 25, &lease));
-    let stats = shutdown.await.unwrap();
+    let stats = shutdown.await.unwrap().unwrap();
     assert_eq!(stats.accepted, 1);
     assert_eq!(stats.unresolved, 0);
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(25));
@@ -634,7 +636,7 @@ async fn shutdown_waits_for_outstanding_permit() {
         permit.record(late);
     });
 
-    let stats = writer.shutdown().await;
+    let stats = writer.shutdown().await.unwrap();
     sender.await.unwrap();
     assert_eq!(stats.accepted, 1);
     assert_eq!(stats.lost, 0);
@@ -674,7 +676,7 @@ async fn shutdown_waits_for_committed_guard() {
         drop(charge);
     });
 
-    let stats = writer.shutdown().await;
+    let stats = writer.shutdown().await.unwrap();
     holder.await.unwrap();
     assert_eq!(stats.accepted, 1);
     assert_eq!(stats.unresolved, 0);
@@ -695,9 +697,9 @@ async fn late_permit_drop_completes_drain() {
         drop(permit);
     });
 
-    let stats = writer.shutdown().await;
+    let stats = writer.shutdown().await.unwrap();
     dropper.await.unwrap();
-    assert_eq!(stats, tollgate_client::WriterStats::default());
+    assert_eq!(stats, tollgate_client::WriterStats::ZERO);
 }
 
 /// Deadline expiry can neither hang nor report a clean flush: a permit that
@@ -713,7 +715,8 @@ async fn drain_deadline_expiry_reports_unresolved() {
 
     let stats = tokio::time::timeout(std::time::Duration::from_secs(120), writer.shutdown())
         .await
-        .expect("shutdown must return at the drain deadline, not hang");
+        .expect("shutdown must return at the drain deadline, not hang")
+        .unwrap();
     assert_eq!(stats.unresolved, 1);
     assert_eq!(stats.lost, 0);
     assert_eq!(stats.accepted, 0);
@@ -747,7 +750,7 @@ async fn final_flush_counts_duplicates_and_rejections() {
     fenced.fencing_token = tollgate_core::FencingToken(999);
     recorder.try_reserve().unwrap().record(fenced);
 
-    let stats = writer.shutdown().await;
+    let stats = writer.shutdown().await.unwrap();
     assert_eq!(stats.accepted, 1);
     assert_eq!(stats.duplicate, 1);
     assert_eq!(stats.rejected, 1);
@@ -782,7 +785,7 @@ async fn final_flush_backs_off_only_between_attempts() {
     recorder.try_reserve().unwrap().record(event(1, 10, &lease));
 
     let start = tokio::time::Instant::now();
-    let stats = writer.shutdown().await;
+    let stats = writer.shutdown().await.unwrap();
     assert_eq!(stats.lost, 1);
     assert_eq!(start.elapsed(), 2 * backoff, "three attempts, two backoffs");
 }
@@ -799,8 +802,126 @@ async fn drain_deadline_reports_every_unresolved_permit() {
 
     let stats = tokio::time::timeout(std::time::Duration::from_secs(120), writer.shutdown())
         .await
-        .expect("shutdown must return at the drain deadline");
+        .expect("shutdown must return at the drain deadline")
+        .unwrap();
     assert_eq!(stats.unresolved, 2);
+}
+
+// ---- a dead writer never reports zero loss (issue #41) --------------------
+
+/// A sink that panics once it has been called `panic_after` times.
+struct PanickingSink {
+    inner: Arc<MemoryStore>,
+    calls_before_panic: AtomicU32,
+}
+
+#[async_trait]
+impl UsageSink for PanickingSink {
+    async fn ingest(
+        &self,
+        events: &[UsageEvent],
+        now: Timestamp,
+    ) -> Result<IngestReport, StoreError> {
+        if self
+            .calls_before_panic
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_err()
+        {
+            panic!("sink exploded mid-ingest");
+        }
+        self.inner.ingest(events, now).await
+    }
+}
+
+/// The #41 defect: a writer that dies holding committed charges must say so,
+/// not return a zeroed report indistinguishable from a clean shutdown.
+#[tokio::test(start_paused = true)]
+async fn panicked_writer_reports_unaccounted_charges() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let sink = Arc::new(PanickingSink {
+        inner: store.clone(),
+        calls_before_panic: AtomicU32::new(0),
+    });
+    let mut config = writer_config(16);
+    config.flush_interval = std::time::Duration::from_secs(3_600);
+    let (recorder, writer) = UsageWriter::spawn(sink, clock, config).unwrap();
+
+    for request in 0..3u128 {
+        recorder
+            .try_reserve()
+            .unwrap()
+            .record(event(request, 10, &lease));
+    }
+
+    let error = writer
+        .shutdown()
+        .await
+        .expect_err("a panicked writer must not report a clean shutdown");
+    assert!(error.panicked);
+    assert_eq!(error.unaccounted, 3);
+    assert!(
+        error.to_string().contains("no billing record"),
+        "operator-facing message must name the consequence: {error}"
+    );
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits::ZERO);
+}
+
+/// The count is what is still unaccounted, not everything ever enqueued:
+/// charges already given a billing outcome are excluded.
+#[tokio::test(start_paused = true)]
+async fn panic_after_partial_flush_counts_only_unflushed() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    // The first batch is ingested; the second kills the task.
+    let sink = Arc::new(PanickingSink {
+        inner: store.clone(),
+        calls_before_panic: AtomicU32::new(1),
+    });
+    let mut config = writer_config(16);
+    config.max_batch = 2;
+    config.flush_interval = std::time::Duration::from_secs(3_600);
+    let (recorder, writer) = UsageWriter::spawn(sink, clock, config).unwrap();
+
+    for request in 0..2u128 {
+        recorder
+            .try_reserve()
+            .unwrap()
+            .record(event(request, 10, &lease));
+    }
+    settle().await; // first full batch flushes cleanly
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(20));
+
+    for request in 2..5u128 {
+        recorder
+            .try_reserve()
+            .unwrap()
+            .record(event(request, 10, &lease));
+    }
+
+    let error = writer.shutdown().await.expect_err("the sink panicked");
+    assert_eq!(
+        error.unaccounted, 3,
+        "the two billed charges must not be counted again"
+    );
 }
 
 /// INVARIANTS.md #16: a zero drain deadline is refused before the task starts.

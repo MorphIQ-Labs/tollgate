@@ -323,7 +323,7 @@ async fn full_stack_over_loopback_http() {
 
     // Orderly shutdown: flush billing, then release leases, then stop the
     // server.
-    let stats = writer.shutdown().await;
+    let stats = writer.shutdown().await.unwrap();
     assert_eq!(stats.lost, 0);
     assert_eq!(stats.rejected, 0);
     manager.shutdown().await;
