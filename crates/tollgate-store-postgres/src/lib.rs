@@ -45,6 +45,18 @@ const STATE_ACTIVE: i16 = 0;
 const STATE_RELEASED: i16 = 1;
 const STATE_EXPIRED: i16 = 2;
 
+/// The reconciliation query's active-lease sum, named because two callers must
+/// agree on it: `conservation` runs it, and `explain_active_lease_sum` asks the
+/// planner what it does with it. A test that copied the text would keep
+/// reporting an index scan after the real predicate had drifted away from
+/// migration 0005's index (#12).
+///
+/// `state = 0` is spelled out rather than bound, so the predicate is a literal
+/// the partial index can match.
+const ACTIVE_LEASE_SUM_SQL: &str =
+    "SELECT COALESCE(SUM(granted), 0)::BIGINT, COALESCE(SUM(used), 0)::BIGINT
+     FROM tollgate_leases WHERE account_id = $1 AND state = 0";
+
 fn id_bytes(id: u128) -> Vec<u8> {
     id.to_be_bytes().to_vec()
 }
@@ -230,6 +242,35 @@ impl PostgresStore {
         );
     }
 
+    /// The plan PostgreSQL chooses for the active-lease sum inside
+    /// [`Self::conservation`] — the query migration 0005's partial index
+    /// exists to serve (#12).
+    ///
+    /// Whether an index is *used* is a claim only the planner can settle, and
+    /// this explains the same query string `conservation` runs rather than one
+    /// a test wrote: a hand-copied query would keep reporting an index scan
+    /// long after the real predicate had drifted away from the index.
+    ///
+    /// Statistics are refreshed first. `TRUNCATE` resets `reltuples` to zero
+    /// and autoanalyze runs on its own schedule, so a plan chosen immediately
+    /// after a load would describe an empty table rather than a real one.
+    pub async fn explain_active_lease_sum(&self, account: AccountId) -> Result<String, StoreError> {
+        sqlx::raw_sql("ANALYZE tollgate_leases")
+            .execute(&self.pool)
+            .await
+            .map_err(storage)?;
+        let rows = sqlx::query(&format!("EXPLAIN {ACTIVE_LEASE_SUM_SQL}"))
+            .bind(id_bytes(account.0))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)?;
+        Ok(rows
+            .iter()
+            .map(|row| row.get::<String, _>(0))
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
     pub async fn truncate_all(&self) -> Result<(), StoreError> {
         sqlx::raw_sql(
             "TRUNCATE tollgate_usage_events, tollgate_leases, tollgate_snapshots, tollgate_accounts CASCADE",
@@ -279,14 +320,11 @@ impl PostgresStore {
         else {
             return Ok(None);
         };
-        let lease_row = sqlx::query(
-            "SELECT COALESCE(SUM(granted), 0)::BIGINT, COALESCE(SUM(used), 0)::BIGINT
-             FROM tollgate_leases WHERE account_id = $1 AND state = 0",
-        )
-        .bind(id_bytes(account.0))
-        .fetch_one(&self.pool)
-        .await
-        .map_err(storage)?;
+        let lease_row = sqlx::query(ACTIVE_LEASE_SUM_SQL)
+            .bind(id_bytes(account.0))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(storage)?;
         let active_grants = to_units(lease_row.get::<i64, _>(0), "active lease grants")?;
         let active_used = to_units(lease_row.get::<i64, _>(1), "active lease usage")?;
         Ok(Some(Conservation {

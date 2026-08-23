@@ -914,6 +914,90 @@ async fn legacy_invalid_snapshot_is_rejected_on_read() {
     );
 }
 
+/// Issue #12: `conservation` is the reconciliation primitive, and its
+/// active-lease sum filtered on `account_id` with nothing indexing it.
+///
+/// The mechanism is not the one the issue describes. `tollgate_leases_expiry`
+/// is already partial on `state = 0`, so PostgreSQL scans *that* and discards
+/// non-matching accounts — the cost never grew with the table's lifetime rows,
+/// it grew with the number of live leases **fleet-wide**. A per-account
+/// reconciliation query paying for every other account's live set.
+///
+/// So the property to pin is not "no sequential scan" (there was not one) but
+/// that the account predicate is answered *by an index* rather than by reading
+/// rows and throwing them away. Without the migration `account_id` can only
+/// ever be a `Filter`, since no other index leads with it; with it, the
+/// predicate becomes an `Index Cond`. The fixture spreads live leases across
+/// many accounts because that is the only shape in which the two plans differ.
+#[tokio::test]
+async fn the_account_filter_is_answered_by_an_index_not_by_discarding_rows() {
+    /// Live leases held by *other* accounts. These are what the expiry index
+    /// makes this query read and discard when nothing indexes `account_id`.
+    const OTHER_ACCOUNTS: u128 = 40;
+    const LIVE_PER_ACCOUNT: usize = 25;
+    /// Rotations on the measured account, settled and left behind: the table
+    /// is never pruned, so this is the shape a long-running fleet has.
+    const SETTLED: usize = 500;
+
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000_000).await else {
+        return;
+    };
+    for id in 2..=(OTHER_ACCOUNTS + 1) {
+        AdminStore::create_account(
+            &*store,
+            AccountConfig {
+                account_id: AccountId(id),
+                initial_balance: CostUnits(1_000_000),
+                active: true,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let long = SignedDuration::from_secs(300);
+    let short = SignedDuration::from_secs(60);
+    for _ in 0..SETTLED {
+        store
+            .acquire(ACCOUNT, CostUnits(1), short, t(0))
+            .await
+            .unwrap();
+    }
+    for account in std::iter::once(ACCOUNT).chain((2..=(OTHER_ACCOUNTS + 1)).map(AccountId)) {
+        for _ in 0..LIVE_PER_ACCOUNT {
+            store
+                .acquire(account, CostUnits(1), long, t(0))
+                .await
+                .unwrap();
+        }
+    }
+    let settled = store.reclaim_expired(t(120)).await.unwrap();
+    assert_eq!(settled.len(), SETTLED, "only the short-TTL leases are due");
+
+    let conservation = store.conservation(ACCOUNT).await.unwrap().unwrap();
+    assert!(
+        conservation.holds(),
+        "conservation violated: {conservation:?}"
+    );
+    assert_eq!(
+        conservation.active_lease_grants,
+        CostUnits(LIVE_PER_ACCOUNT as u64),
+        "the measured account holds its own live leases and no one else's"
+    );
+
+    let plan = store.explain_active_lease_sum(ACCOUNT).await.unwrap();
+    assert!(
+        plan.contains("tollgate_leases_account_active"),
+        "the reconciliation query must reach its index; plan was:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Filter: (account_id"),
+        "the account predicate is still being applied by discarding rows other \
+         accounts own, which is the cost #12 exists to remove; plan was:\n{plan}"
+    );
+}
+
 // ---- stored-value corruption surfacing (issues #15, #45) ------------------
 //
 // A negative unit column or fence counter is corruption the store must

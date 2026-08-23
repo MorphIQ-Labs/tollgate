@@ -1,0 +1,33 @@
+-- no-transaction
+-- Issue #12: `conservation` sums an account's active leases, and nothing
+-- indexed `account_id`, so the reconciliation primitive sequentially scanned a
+-- table that grows with every lease rotation across the fleet and is never
+-- pruned. The sweep path was already fine — `tollgate_leases_expiry` covers it.
+--
+-- Partial on `state = 0` for the same reason that index is: it matches the
+-- query's predicate exactly and stays proportional to *live* leases, which is
+-- single digits per account, rather than to lifetime leases.
+--
+-- CONCURRENTLY, unlike migrations 0003 and 0004. Those add constraints to
+-- `tollgate_accounts`, which holds one row per account, so their ACCESS
+-- EXCLUSIVE scan is trivial. This one touches the unbounded table: a plain
+-- CREATE INDEX takes a SHARE lock and blocks writes for its whole duration,
+-- which here means blocked lease acquisition, which means the request path
+-- failing closed. `-- no-transaction` above is sqlx's directive to run this
+-- migration outside a transaction, which CONCURRENTLY requires.
+--
+-- Deliberately NOT `IF NOT EXISTS`. A CONCURRENTLY build that fails partway
+-- leaves an INVALID index behind; with IF NOT EXISTS the retry would skip it
+-- silently, reporting a successful migration while the query kept seq-scanning
+-- an index that can never be used. Failing loudly is the only version an
+-- operator can act on, and sqlx re-runs a migration only when it did not
+-- complete — which is exactly this case.
+--
+-- Recovery, if this migration fails: check
+--     SELECT indisvalid FROM pg_index
+--      WHERE indexrelid = 'tollgate_leases_account_active'::regclass;
+-- and if it is false, `DROP INDEX tollgate_leases_account_active;` before
+-- re-running. Dropping it is always safe — it carries no constraint, so
+-- nothing but query cost depends on it.
+CREATE INDEX CONCURRENTLY tollgate_leases_account_active
+    ON tollgate_leases (account_id) WHERE state = 0;
