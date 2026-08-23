@@ -2396,7 +2396,9 @@ version = "0.2.3"
 dependencies = [
  "async-trait",
  "atomic-waker",
+ "criterion",
  "jiff",
+ "proptest",
  "reqwest",
  "tokio",
  "tollgate-admission",

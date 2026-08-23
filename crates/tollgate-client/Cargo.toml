@@ -20,6 +20,11 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+# The indexed resolution set (#22) must answer exactly what the scans it
+# replaced answered; a property test against a naive reference is the only way
+# to cover the interleavings the fixed tests do not reach.
+proptest = { workspace = true }
+criterion = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 # Event capture: the tests assert that a failure is reported, so the events
 # are behavior rather than decoration. Subscribers stay out of the library.
@@ -31,6 +36,13 @@ uuid = { version = "1", features = ["v4"] }
 # the "via-server" topology. Off by default: the direct-store topology
 # needs none of it.
 http = ["dep:reqwest", "tollgate-store/wire"]
+
+# Control-plane scaling, reported but not gated: unlike the request-path
+# benches this one is not in testing/perf_thresholds.json, because its
+# absolute numbers are host-dependent and the point is the curve's shape.
+[[bench]]
+name = "readiness_scaling"
+harness = false
 
 [lints]
 workspace = true
