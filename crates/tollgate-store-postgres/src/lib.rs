@@ -22,6 +22,7 @@
 //! (LISTEN/NOTIFY or the server's future SSE) is a documented seam in
 //! `docs/DESIGN.md`.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -37,8 +38,8 @@ use tollgate_core::{
 use tollgate_store::memory::Conservation;
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, CreateAccountError, GrantPolicy, IngestReport,
-    LeaseAllocator, ReclaimedLease, SnapshotPush, SnapshotResolution, SnapshotSource, StoreError,
-    StoreHealth, UsageSink,
+    LeaseAllocator, ReclaimBatch, ReclaimedLease, SnapshotPush, SnapshotResolution, SnapshotSource,
+    StoreError, StoreHealth, UsageSink,
 };
 
 const STATE_ACTIVE: i16 = 0;
@@ -476,55 +477,139 @@ impl LeaseAllocator for PostgresStore {
         finish_allocate_transaction(tx, result).await
     }
 
-    async fn reclaim_expired(&self, now: Timestamp) -> Result<Vec<ReclaimedLease>, StoreError> {
+    async fn reclaim_expired_batch(
+        &self,
+        now: Timestamp,
+        limit: NonZeroUsize,
+    ) -> Result<ReclaimBatch, StoreError> {
+        let limit_i = i64::try_from(limit.get())
+            .map_err(|_| StoreError(format!("reclaim batch limit exceeds i64 range: {limit}")))?;
         let mut tx = self.pool.begin().await.map_err(storage)?;
         let result = async {
             // Reclaim only once the grace window past expiry has fully lapsed:
             // expires_at + grace <= now  ⟺  expires_at_us <= now_us - grace_us.
             let threshold_us = ts_micros(now).saturating_sub(self.reclaim_grace_us);
-            // SKIP LOCKED: concurrent sweeps cooperate instead of deadlocking.
+            // SKIP LOCKED lets concurrent sweepers cooperate; the limit keeps
+            // both the lease locks and the transaction's row work bounded.
             let rows = sqlx::query(
                 "SELECT lease_id, account_id, granted, used FROM tollgate_leases
                  WHERE state = 0 AND expires_at_us <= $1
-                 ORDER BY account_id, lease_id FOR UPDATE SKIP LOCKED",
+                 ORDER BY account_id, lease_id LIMIT $2 FOR UPDATE SKIP LOCKED",
             )
             .bind(threshold_us)
+            .bind(limit_i)
             .fetch_all(&mut *tx)
             .await
             .map_err(storage)?;
 
             let mut reclaimed = Vec::with_capacity(rows.len());
+            let mut lease_ids = Vec::with_capacity(rows.len());
+            let mut lease_credits = Vec::with_capacity(rows.len());
+            let mut account_credits: std::collections::BTreeMap<Vec<u8>, i64> =
+                std::collections::BTreeMap::new();
             for row in rows {
                 let lease_bytes: Vec<u8> = row.get(0);
                 let account_bytes: Vec<u8> = row.get(1);
-                let credit: i64 = row.get::<i64, _>(2) - row.get::<i64, _>(3);
-                // Validate before either UPDATE: a negative credit (used beyond
-                // granted) is corruption, and crediting it would debit the account.
+                let granted = row.get::<i64, _>(2);
+                let used = row.get::<i64, _>(3);
+                let credit = granted.checked_sub(used).ok_or_else(|| {
+                    StoreError(format!(
+                        "reclaim credit overflow: granted {granted}, used {used}"
+                    ))
+                })?;
+                // Validate the whole batch before either set-wise UPDATE: a
+                // negative credit is corruption, and paying it would debit the
+                // account rather than returning quota.
                 let credit_units = to_units(credit, "reclaim credit")?;
-                sqlx::query(
-                    "UPDATE tollgate_leases SET state = $2, credited = $3 WHERE lease_id = $1",
-                )
-                .bind(&lease_bytes)
-                .bind(STATE_EXPIRED)
-                .bind(credit)
-                .execute(&mut *tx)
-                .await
-                .map_err(storage)?;
-                sqlx::query(
-                    "UPDATE tollgate_accounts SET balance = balance + $2 WHERE account_id = $1",
-                )
-                .bind(&account_bytes)
-                .bind(credit)
-                .execute(&mut *tx)
-                .await
-                .map_err(storage)?;
+                let account_credit = account_credits.entry(account_bytes.clone()).or_default();
+                *account_credit = account_credit.checked_add(credit).ok_or_else(|| {
+                    StoreError(format!(
+                        "reclaim credit sum overflow for account {:#034x}",
+                        id_from(&account_bytes)
+                    ))
+                })?;
+                lease_ids.push(lease_bytes.clone());
+                lease_credits.push(credit);
                 reclaimed.push(ReclaimedLease {
                     lease_id: LeaseId(id_from(&lease_bytes)),
                     account_id: AccountId(id_from(&account_bytes)),
                     reclaimed: credit_units,
                 });
             }
-            Ok(reclaimed)
+
+            let batch = ReclaimBatch::try_new(reclaimed, limit)?;
+            if batch.is_empty() {
+                return Ok(batch);
+            }
+
+            let (account_ids, account_credit_deltas): (Vec<_>, Vec<_>) =
+                account_credits.into_iter().unzip();
+            let expected_lease_rows = u64::try_from(lease_ids.len())
+                .map_err(|_| StoreError("reclaim lease row count exceeds u64 range".into()))?;
+            let expected_account_rows = u64::try_from(account_ids.len())
+                .map_err(|_| StoreError("reclaim account row count exceeds u64 range".into()))?;
+
+            // A set-wise UPDATE does not promise row-lock order. Lock every
+            // affected account explicitly in byte-sorted order first, matching
+            // release and ingest's lease-then-account order and preventing
+            // concurrent multi-account sweeps from forming a deadlock cycle.
+            let locked_accounts = sqlx::query(
+                "SELECT account_id FROM tollgate_accounts
+                 WHERE account_id = ANY($1) ORDER BY account_id FOR UPDATE",
+            )
+            .bind(&account_ids)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(storage)?;
+            if locked_accounts.len() != account_ids.len() {
+                return Err(StoreError(format!(
+                    "reclaim locked {} of {} referenced account rows",
+                    locked_accounts.len(),
+                    account_ids.len()
+                )));
+            }
+
+            let updated_leases = sqlx::query(
+                "UPDATE tollgate_leases AS lease
+                 SET state = $3, credited = delta.credit
+                 FROM UNNEST($1::bytea[], $2::bigint[]) AS delta(lease_id, credit)
+                 WHERE lease.lease_id = delta.lease_id AND lease.state = $4",
+            )
+            .bind(&lease_ids)
+            .bind(&lease_credits)
+            .bind(STATE_EXPIRED)
+            .bind(STATE_ACTIVE)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+            if updated_leases.rows_affected() != expected_lease_rows {
+                return Err(StoreError(format!(
+                    "reclaim updated {} of {} locked lease rows",
+                    updated_leases.rows_affected(),
+                    lease_ids.len()
+                )));
+            }
+
+            let updated_accounts = sqlx::query(
+                "UPDATE tollgate_accounts AS account
+                 SET balance = account.balance + delta.credit
+                 FROM UNNEST($1::bytea[], $2::bigint[]) AS delta(account_id, credit)
+                 WHERE account.account_id = delta.account_id",
+            )
+            .bind(&account_ids)
+            .bind(&account_credit_deltas)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+            if updated_accounts.rows_affected() != expected_account_rows {
+                return Err(StoreError(format!(
+                    "reclaim updated {} of {} locked account rows",
+                    updated_accounts.rows_affected(),
+                    account_ids.len()
+                )));
+            }
+
+            Ok(batch)
         }
         .await;
         finish_store_transaction(tx, result).await

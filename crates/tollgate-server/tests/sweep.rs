@@ -11,6 +11,7 @@
 //! shutdown misbehaves.
 #![allow(clippy::let_underscore_must_use)]
 
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -19,8 +20,8 @@ use jiff::{SignedDuration, Timestamp};
 
 use tollgate_core::{AccountId, CostUnits};
 use tollgate_store::{
-    AccountConfig, AdminStore, GrantPolicy, LeaseAllocator, MemoryStore, ReclaimedLease,
-    StoreError, StoreHealth, SystemClock,
+    AccountConfig, AdminStore, DEFAULT_RECLAIM_BATCH_LIMIT, GrantPolicy, LeaseAllocator,
+    MemoryStore, ReclaimBatch, StoreError, StoreHealth, SystemClock,
 };
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
@@ -40,6 +41,7 @@ fn t(secs: i64) -> Timestamp {
 struct FlakyReclaimStore {
     inner: Arc<MemoryStore>,
     failures_left: AtomicU32,
+    fail_on_call: Option<u32>,
     calls: AtomicU32,
 }
 
@@ -67,8 +69,15 @@ impl LeaseAllocator for FlakyReclaimStore {
             .await
     }
 
-    async fn reclaim_expired(&self, now: Timestamp) -> Result<Vec<ReclaimedLease>, StoreError> {
-        self.calls.fetch_add(1, Ordering::AcqRel);
+    async fn reclaim_expired_batch(
+        &self,
+        now: Timestamp,
+        limit: NonZeroUsize,
+    ) -> Result<ReclaimBatch, StoreError> {
+        let call = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
+        if self.fail_on_call == Some(call) {
+            return Err(StoreError("sweep backend unavailable".into()));
+        }
         if self
             .failures_left
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
@@ -76,7 +85,7 @@ impl LeaseAllocator for FlakyReclaimStore {
         {
             return Err(StoreError("sweep backend unavailable".into()));
         }
-        self.inner.reclaim_expired(now).await
+        self.inner.reclaim_expired_batch(now, limit).await
     }
 }
 
@@ -231,6 +240,7 @@ async fn the_server_reclaims_expired_leases_on_its_interval() {
     let store = Arc::new(FlakyReclaimStore {
         inner: Arc::clone(&inner),
         failures_left: AtomicU32::new(0),
+        fail_on_call: None,
         calls: AtomicU32::new(0),
     });
     let captor = Captor::default();
@@ -287,6 +297,143 @@ async fn the_server_reclaims_expired_leases_on_its_interval() {
     );
 }
 
+/// A full transaction is evidence to continue now, not after the next
+/// interval. The long interval makes a second scheduled tick impossible
+/// during the test, so both calls must belong to the first sweep cycle.
+#[tokio::test]
+async fn one_scheduled_sweep_drains_every_saturated_batch() {
+    let inner = store_with_expired_lease();
+    let lease_count = DEFAULT_RECLAIM_BATCH_LIMIT.get() + 1;
+    for _ in 0..lease_count {
+        inner
+            .acquire(ACCOUNT, CostUnits(1), SignedDuration::from_secs(1), t(0))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        inner.balance(ACCOUNT),
+        CostUnits(1_000 - u64::try_from(lease_count).unwrap())
+    );
+
+    let store = Arc::new(FlakyReclaimStore {
+        inner: Arc::clone(&inner),
+        failures_left: AtomicU32::new(0),
+        fail_on_call: None,
+        calls: AtomicU32::new(0),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerState {
+            store: Arc::clone(&store),
+            clock: Arc::new(tollgate_store::ManualClock::new(t(120))),
+        },
+        std::time::Duration::from_secs(3_600),
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while store.calls.load(Ordering::Acquire) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first sweep cycle must drain both batches");
+    assert_eq!(store.calls.load(Ordering::Acquire), 2);
+    assert_eq!(inner.balance(ACCOUNT), CostUnits(1_000));
+
+    let _ = stop_tx.send(());
+    let _ = server.await;
+}
+
+/// A later batch can fail after earlier transactions committed. That partial
+/// progress is part of the operational result and must be carried by the
+/// warning rather than disappearing behind the final error.
+#[tokio::test]
+async fn a_failed_later_batch_reports_already_committed_progress() {
+    let inner = store_with_expired_lease();
+    let lease_count = DEFAULT_RECLAIM_BATCH_LIMIT.get() + 1;
+    for _ in 0..lease_count {
+        inner
+            .acquire(ACCOUNT, CostUnits(1), SignedDuration::from_secs(1), t(0))
+            .await
+            .unwrap();
+    }
+    let store = Arc::new(FlakyReclaimStore {
+        inner,
+        failures_left: AtomicU32::new(0),
+        fail_on_call: Some(2),
+        calls: AtomicU32::new(0),
+    });
+    let captor = Captor::default();
+    let guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(captor.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerState {
+            store: Arc::clone(&store),
+            clock: Arc::new(tollgate_store::ManualClock::new(t(120))),
+        },
+        std::time::Duration::from_secs(3_600),
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if captor.0.lock().unwrap().iter().any(|event| {
+                event.level == Level::WARN
+                    && event
+                        .fields
+                        .iter()
+                        .any(|(key, _)| key == "completed_batches")
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the failed second batch must be reported");
+    drop(guard);
+
+    {
+        let events = captor.0.lock().unwrap();
+        let warning = events
+            .iter()
+            .find(|event| {
+                event.level == Level::WARN
+                    && event
+                        .fields
+                        .iter()
+                        .any(|(key, _)| key == "completed_batches")
+            })
+            .unwrap();
+        assert!(warning.fields.contains(&(
+            "reclaimed_leases".to_string(),
+            DEFAULT_RECLAIM_BATCH_LIMIT.get().to_string()
+        )));
+        assert!(warning.fields.contains(&(
+            "reclaimed_units".to_string(),
+            DEFAULT_RECLAIM_BATCH_LIMIT.get().to_string()
+        )));
+        assert!(
+            warning
+                .fields
+                .contains(&("completed_batches".to_string(), "1".to_string()))
+        );
+    }
+
+    let _ = stop_tx.send(());
+    let _ = server.await;
+}
+
 /// Recovery is its own signal: an operator watching a failing sweep needs to
 /// learn it came back, and how long it was down for.
 #[tokio::test]
@@ -294,6 +441,7 @@ async fn a_recovering_sweep_reports_how_many_failures_it_took() {
     let store = Arc::new(FlakyReclaimStore {
         inner: store_with_expired_lease(),
         failures_left: AtomicU32::new(2),
+        fail_on_call: None,
         calls: AtomicU32::new(0),
     });
     let captor = Captor::default();
@@ -333,6 +481,7 @@ async fn a_failing_sweep_reports_consecutive_failures() {
     let store = Arc::new(FlakyReclaimStore {
         inner: store_with_expired_lease(),
         failures_left: AtomicU32::new(u32::MAX),
+        fail_on_call: None,
         calls: AtomicU32::new(0),
     });
     serve_briefly(Arc::clone(&store), Arc::new(SystemClock)).await;

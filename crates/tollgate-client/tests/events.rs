@@ -6,6 +6,7 @@
 //! *structured fields* (target, level, named values), never on rendered
 //! message text, which would be the source-text assertion AGENTS.md forbids.
 
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -16,7 +17,7 @@ use tollgate_client::{LeaseManager, LeaseManagerConfig, ManualClock, UsageWriter
 use tollgate_core::{AccountId, CostUnits, UsageEvent};
 use tollgate_store::{
     AccountConfig, AllocateError, GrantPolicy, IngestReport, LeaseAllocator, MemoryStore,
-    ReclaimedLease, StoreError, UsageSink,
+    ReclaimBatch, StoreError, UsageSink,
 };
 use tracing::field::{Field, Visit};
 use tracing::subscriber::DefaultGuard;
@@ -160,8 +161,12 @@ impl LeaseAllocator for RefusingAllocator {
         Ok(())
     }
 
-    async fn reclaim_expired(&self, _now: Timestamp) -> Result<Vec<ReclaimedLease>, StoreError> {
-        Ok(Vec::new())
+    async fn reclaim_expired_batch(
+        &self,
+        _now: Timestamp,
+        limit: NonZeroUsize,
+    ) -> Result<ReclaimBatch, StoreError> {
+        ReclaimBatch::try_new(Vec::new(), limit)
     }
 }
 
@@ -355,8 +360,12 @@ impl LeaseAllocator for FencedReleaseAllocator {
         Err(AllocateError::Fenced)
     }
 
-    async fn reclaim_expired(&self, now: Timestamp) -> Result<Vec<ReclaimedLease>, StoreError> {
-        self.inner.reclaim_expired(now).await
+    async fn reclaim_expired_batch(
+        &self,
+        now: Timestamp,
+        limit: NonZeroUsize,
+    ) -> Result<ReclaimBatch, StoreError> {
+        self.inner.reclaim_expired_batch(now, limit).await
     }
 }
 

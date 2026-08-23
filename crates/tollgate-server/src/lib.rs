@@ -37,8 +37,9 @@ use tollgate_store::wire::{
     PublishSnapshotRequest, ReleaseRequest, SetStatusRequest,
 };
 use tollgate_store::{
-    AccountConfig, AdminStore, Clock, IngestReport, LeaseAllocator, ReclaimedLease,
-    SnapshotResolution, SnapshotSource, StoreHealth, UsageSink,
+    AccountConfig, AdminStore, Clock, DEFAULT_RECLAIM_BATCH_LIMIT, IngestReport, LeaseAllocator,
+    ReclaimBatch, ReclaimedLease, SnapshotResolution, SnapshotSource, StoreError, StoreHealth,
+    UsageSink,
 };
 
 use crate::error::ApiError;
@@ -138,13 +139,78 @@ async fn reclaim_sweep<S: Backend>(
     clock: Arc<dyn Clock>,
     interval: std::time::Duration,
 ) {
+    #[derive(Default)]
+    struct Progress {
+        leases: u128,
+        units: u128,
+        batches: u64,
+    }
+
+    impl Progress {
+        fn record(&mut self, batch: &ReclaimBatch) -> Result<(), StoreError> {
+            let batch_leases =
+                u128::from(u64::try_from(batch.len()).map_err(|_| {
+                    StoreError("reclaim batch lease count exceeds u64 range".into())
+                })?);
+            let batch_units = batch.reclaimed().iter().try_fold(0u128, |total, lease| {
+                total
+                    .checked_add(u128::from(lease.reclaimed.get()))
+                    .ok_or_else(|| StoreError("reclaim batch unit total overflow".into()))
+            })?;
+            let leases = self
+                .leases
+                .checked_add(batch_leases)
+                .ok_or_else(|| StoreError("reclaim cycle lease count overflow".into()))?;
+            let units = self
+                .units
+                .checked_add(batch_units)
+                .ok_or_else(|| StoreError("reclaim cycle unit total overflow".into()))?;
+            let batches = self
+                .batches
+                .checked_add(1)
+                .ok_or_else(|| StoreError("reclaim cycle batch count overflow".into()))?;
+            *self = Progress {
+                leases,
+                units,
+                batches,
+            };
+            Ok(())
+        }
+    }
+
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut consecutive_failures: u64 = 0;
     loop {
         tick.tick().await;
-        match store.reclaim_expired(clock.now()).await {
-            Ok(reclaimed) => {
+        // Freeze the cutoff for this cycle. A continuously advancing cutoff
+        // could make a busy allocator feed the drain forever; a fixed one is
+        // a finite backlog and still returns all quota expired at this tick.
+        let now = clock.now();
+        let mut progress = Progress::default();
+        let outcome = loop {
+            match store
+                .reclaim_expired_batch(now, DEFAULT_RECLAIM_BATCH_LIMIT)
+                .await
+            {
+                Ok(batch) => {
+                    if let Err(error) = progress.record(&batch) {
+                        break Err(error);
+                    }
+                    if !batch.is_saturated() {
+                        break Ok(());
+                    }
+                    // MemoryStore can finish a batch without an .await that
+                    // yields. Let request handlers run between backlog chunks;
+                    // PostgreSQL benefits from the same explicit fairness.
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => break Err(error),
+            }
+        };
+
+        match outcome {
+            Ok(()) => {
                 if consecutive_failures > 0 {
                     tracing::info!(
                         after_failures = consecutive_failures,
@@ -152,9 +218,13 @@ async fn reclaim_sweep<S: Backend>(
                     );
                     consecutive_failures = 0;
                 }
-                if !reclaimed.is_empty() {
-                    let units: u64 = reclaimed.iter().map(|lease| lease.reclaimed.get()).sum();
-                    tracing::info!(leases = reclaimed.len(), units, "reclaimed expired leases");
+                if progress.leases > 0 {
+                    tracing::info!(
+                        leases = %progress.leases,
+                        units = %progress.units,
+                        batches = progress.batches,
+                        "reclaimed expired leases"
+                    );
                 }
             }
             Err(error) => {
@@ -162,7 +232,10 @@ async fn reclaim_sweep<S: Backend>(
                 tracing::warn!(
                     %error,
                     consecutive_failures,
-                    "reclaim sweep failed; expired leases stay stranded until it recovers"
+                    reclaimed_leases = %progress.leases,
+                    reclaimed_units = %progress.units,
+                    completed_batches = progress.batches,
+                    "reclaim sweep failed; completed batches stay committed and remaining expired leases stay stranded until it recovers"
                 );
             }
         }

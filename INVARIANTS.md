@@ -116,7 +116,12 @@ until it has one.
 
 9. **Crash leak is bounded by TTL.** A crashed lease holder strands its unspent
    units only until the lease TTL expires, after which the allocator reclaims
-   them. *Tests:* `expired_lease_units_reclaimed` (store suites).
+   them. Each reclaim transaction is bounded; the server fixes one expiry
+   cutoff and drains saturated batches immediately, so bounding lock scope
+   never caps the legitimate backlog that returns. *Tests:*
+   `expired_lease_units_reclaimed` and
+   `expired_backlog_is_reclaimed_in_bounded_batches` (store suites), plus
+   `one_scheduled_sweep_drains_every_saturated_batch` (server suite).
 
 10. **Ready means currently admissible.** An instance reports ready only while
     every tracked principal has a fresh positive or negative resolution, its

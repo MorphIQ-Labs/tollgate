@@ -720,7 +720,7 @@ mod tests {
     use async_trait::async_trait;
     use jiff::Timestamp;
     use tollgate_core::{FencingToken, LeaseGrant, LeaseId};
-    use tollgate_store::{AllocateError, ReclaimedLease, StoreError, SystemClock};
+    use tollgate_store::{AllocateError, ReclaimBatch, StoreError, SystemClock};
 
     use super::*;
 
@@ -858,10 +858,11 @@ mod tests {
             }
         }
 
-        async fn reclaim_expired(
+        async fn reclaim_expired_batch(
             &self,
             _now: Timestamp,
-        ) -> Result<Vec<ReclaimedLease>, StoreError> {
+            _limit: std::num::NonZeroUsize,
+        ) -> Result<ReclaimBatch, StoreError> {
             unreachable!("release_quiesced never reclaims")
         }
     }

@@ -3,6 +3,7 @@
 //! A server whose source of truth is unreachable must not attract traffic,
 //! and — since #36 — must also say *why* rather than only answering 503.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -11,7 +12,7 @@ use jiff::{SignedDuration, Timestamp};
 use tollgate_core::{AccountId, CostUnits, Principal, PublishableSnapshot};
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, CreateAccountError, IngestReport, LeaseAllocator,
-    ReclaimedLease, SnapshotPush, SnapshotResolution, SnapshotSource, StoreError, StoreHealth,
+    ReclaimBatch, SnapshotPush, SnapshotResolution, SnapshotSource, StoreError, StoreHealth,
     SystemClock, UsageSink,
 };
 
@@ -56,7 +57,11 @@ impl LeaseAllocator for PingOnlyStore {
         unreachable!("readiness never releases")
     }
 
-    async fn reclaim_expired(&self, _now: Timestamp) -> Result<Vec<ReclaimedLease>, StoreError> {
+    async fn reclaim_expired_batch(
+        &self,
+        _now: Timestamp,
+        _limit: NonZeroUsize,
+    ) -> Result<ReclaimBatch, StoreError> {
         unreachable!("readiness never reclaims")
     }
 }

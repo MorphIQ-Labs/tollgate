@@ -1,5 +1,7 @@
 //! The storage traits and their shared vocabulary.
 
+use std::num::NonZeroUsize;
+
 use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
 use tokio::sync::broadcast;
@@ -212,6 +214,70 @@ pub struct ReclaimedLease {
     pub reclaimed: CostUnits,
 }
 
+/// The production-sized upper bound for one expiry-reclaim transaction.
+///
+/// The limit bounds locks, row materialization, and SQL parameters per
+/// transaction; it does not cap a legitimate backlog because the maintenance
+/// task drains saturated batches until it reaches a partial one.
+pub const DEFAULT_RECLAIM_BATCH_LIMIT: NonZeroUsize =
+    NonZeroUsize::new(256).expect("the reclaim batch limit is nonzero");
+
+/// Verified evidence returned by one bounded expiry-reclaim transaction.
+///
+/// The fields are private so `saturated` cannot disagree with the requested
+/// limit. Callers may therefore use it to decide whether another batch is
+/// required without re-deriving the backend's result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimBatch {
+    reclaimed: Vec<ReclaimedLease>,
+    saturated: bool,
+}
+
+impl ReclaimBatch {
+    /// Build a batch and derive its saturation evidence from `limit`.
+    pub fn try_new(
+        reclaimed: Vec<ReclaimedLease>,
+        limit: NonZeroUsize,
+    ) -> Result<Self, StoreError> {
+        if reclaimed.len() > limit.get() {
+            return Err(StoreError(format!(
+                "reclaim backend returned {} leases for a batch limit of {}",
+                reclaimed.len(),
+                limit
+            )));
+        }
+        Ok(ReclaimBatch {
+            saturated: reclaimed.len() == limit.get(),
+            reclaimed,
+        })
+    }
+
+    #[must_use]
+    pub fn reclaimed(&self) -> &[ReclaimedLease] {
+        &self.reclaimed
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.reclaimed.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.reclaimed.is_empty()
+    }
+
+    #[must_use]
+    pub fn is_saturated(&self) -> bool {
+        self.saturated
+    }
+
+    #[must_use]
+    pub fn into_reclaimed(self) -> Vec<ReclaimedLease> {
+        self.reclaimed
+    }
+}
+
 /// Atomic lease allocation against the account balance — the amortization
 /// point: one `acquire` funds thousands of local reservations.
 #[async_trait]
@@ -238,11 +304,52 @@ pub trait LeaseAllocator: Send + Sync {
         now: Timestamp,
     ) -> Result<(), AllocateError>;
 
-    /// Settle every active lease whose TTL (plus the policy's reclaim grace)
-    /// has lapsed, crediting `granted - recorded usage` back to each account
-    /// (INVARIANTS.md #9). Backends run this from a maintenance task; it
-    /// must be safe to run concurrently with everything else.
-    async fn reclaim_expired(&self, now: Timestamp) -> Result<Vec<ReclaimedLease>, StoreError>;
+    /// Settle at most `limit` active leases whose TTL (plus the policy's
+    /// reclaim grace) has lapsed, crediting `granted - recorded usage` back
+    /// to each account (INVARIANTS.md #9). One call is one bounded atomic
+    /// transaction; [`ReclaimBatch::is_saturated`] is verified evidence that
+    /// the caller should immediately run another batch. It must be safe to
+    /// run concurrently with everything else.
+    async fn reclaim_expired_batch(
+        &self,
+        now: Timestamp,
+        limit: NonZeroUsize,
+    ) -> Result<ReclaimBatch, StoreError>;
+
+    /// Settle every currently expired lease through bounded transactions.
+    ///
+    /// This preserves the original full-drain caller API. If a later batch
+    /// fails, earlier batches are already committed, so the returned error
+    /// explicitly reports that partial progress rather than presenting the
+    /// operation as all-or-nothing.
+    async fn reclaim_expired(&self, now: Timestamp) -> Result<Vec<ReclaimedLease>, StoreError> {
+        let mut reclaimed: Vec<ReclaimedLease> = Vec::new();
+        loop {
+            let batch = match self
+                .reclaim_expired_batch(now, DEFAULT_RECLAIM_BATCH_LIMIT)
+                .await
+            {
+                Ok(batch) => batch,
+                Err(error) if reclaimed.is_empty() => return Err(error),
+                Err(error) => {
+                    let units: u128 = reclaimed
+                        .iter()
+                        .map(|lease| u128::from(lease.reclaimed.get()))
+                        .sum();
+                    return Err(StoreError(format!(
+                        "reclaim drain failed after {} leases totaling {units} units were committed: {error}",
+                        reclaimed.len()
+                    )));
+                }
+            };
+            let saturated = batch.is_saturated();
+            reclaimed.extend(batch.into_reclaimed());
+            if !saturated {
+                return Ok(reclaimed);
+            }
+            tokio::task::yield_now().await;
+        }
+    }
 }
 
 /// Authoritative state returned by a snapshot pull or push.
@@ -356,7 +463,62 @@ pub trait UsageSink: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    #[derive(Clone, Copy)]
+    enum ReclaimScript {
+        FailFirst,
+        FullBatchThenFail,
+    }
+
+    struct ScriptedReclaimer {
+        script: ReclaimScript,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LeaseAllocator for ScriptedReclaimer {
+        async fn acquire(
+            &self,
+            _account: AccountId,
+            _requested: CostUnits,
+            _ttl: SignedDuration,
+            _now: Timestamp,
+        ) -> Result<LeaseGrant, AllocateError> {
+            unreachable!("the full-drain tests only reclaim")
+        }
+
+        async fn release(
+            &self,
+            _lease_id: LeaseId,
+            _fencing_token: FencingToken,
+            _unspent: CostUnits,
+            _now: Timestamp,
+        ) -> Result<(), AllocateError> {
+            unreachable!("the full-drain tests only reclaim")
+        }
+
+        async fn reclaim_expired_batch(
+            &self,
+            _now: Timestamp,
+            limit: NonZeroUsize,
+        ) -> Result<ReclaimBatch, StoreError> {
+            let call = self.calls.fetch_add(1, Ordering::AcqRel);
+            if matches!(self.script, ReclaimScript::FailFirst) || call > 0 {
+                return Err(StoreError("scripted reclaim failure".into()));
+            }
+            let reclaimed = (0..limit.get())
+                .map(|id| ReclaimedLease {
+                    lease_id: LeaseId(u128::try_from(id).unwrap()),
+                    account_id: AccountId(1),
+                    reclaimed: CostUnits(1),
+                })
+                .collect();
+            ReclaimBatch::try_new(reclaimed, limit)
+        }
+    }
 
     /// Every variant, once. Sized by `COUNT`, so adding a refusal without
     /// widening this array fails to compile.
@@ -420,5 +582,42 @@ mod tests {
             AllocateError::Storage(StoreError("a".into())).index(),
             AllocateError::Storage(StoreError("b".into())).index()
         );
+    }
+
+    #[test]
+    fn reclaim_batch_reports_an_empty_result() {
+        let batch = ReclaimBatch::try_new(Vec::new(), NonZeroUsize::new(2).unwrap()).unwrap();
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+        assert!(!batch.is_saturated());
+        assert!(batch.reclaimed().is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_drain_preserves_an_initial_batch_error() {
+        let allocator = ScriptedReclaimer {
+            script: ReclaimScript::FailFirst,
+            calls: AtomicUsize::new(0),
+        };
+        let expected = StoreError("scripted reclaim failure".into());
+        assert_eq!(
+            allocator.reclaim_expired(Timestamp::MIN).await,
+            Err(expected)
+        );
+        assert_eq!(allocator.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn full_drain_reports_progress_before_a_later_batch_error() {
+        let allocator = ScriptedReclaimer {
+            script: ReclaimScript::FullBatchThenFail,
+            calls: AtomicUsize::new(0),
+        };
+        let original = StoreError("scripted reclaim failure".into());
+        let error = allocator.reclaim_expired(Timestamp::MIN).await.unwrap_err();
+        assert_ne!(error, original);
+        assert!(error.0.contains("256 leases"));
+        assert!(error.0.contains("256 units"));
+        assert_eq!(allocator.calls.load(Ordering::Acquire), 2);
     }
 }

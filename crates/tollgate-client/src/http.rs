@@ -11,6 +11,7 @@
 //! [`SnapshotManager`](crate::SnapshotManager) detects the closure and uses
 //! periodic plus negative-TTL pulls for freshness.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -23,7 +24,7 @@ use tollgate_core::{
 };
 use tollgate_store::wire::{AcquireRequest, IngestRequest, Problem, ReleaseRequest};
 use tollgate_store::{
-    AllocateError, IngestReport, LeaseAllocator, ReclaimedLease, SnapshotPush, SnapshotResolution,
+    AllocateError, IngestReport, LeaseAllocator, ReclaimBatch, SnapshotPush, SnapshotResolution,
     SnapshotSource, StoreError, UsageSink,
 };
 
@@ -150,7 +151,11 @@ impl LeaseAllocator for HttpStore {
         Ok(())
     }
 
-    async fn reclaim_expired(&self, _now: Timestamp) -> Result<Vec<ReclaimedLease>, StoreError> {
+    async fn reclaim_expired_batch(
+        &self,
+        _now: Timestamp,
+        _limit: NonZeroUsize,
+    ) -> Result<ReclaimBatch, StoreError> {
         // Reclaim is the server's own maintenance loop; the HTTP transport
         // can trigger it but instances never need to.
         Err(StoreError(
