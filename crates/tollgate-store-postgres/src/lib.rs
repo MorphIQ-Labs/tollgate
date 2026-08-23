@@ -35,11 +35,10 @@ use tollgate_core::{
     AccountId, AccountSnapshot, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId,
     Principal, PublishableSnapshot, UsageEvent,
 };
-use tollgate_store::memory::Conservation;
 use tollgate_store::{
-    AccountConfig, AdminStore, AllocateError, CreateAccountError, GrantPolicy, IngestReport,
-    LeaseAllocator, ReclaimBatch, ReclaimedLease, SnapshotPush, SnapshotResolution, SnapshotSource,
-    StoreError, StoreHealth, UsageSink,
+    AccountConfig, AdminStore, AllocateError, Conservation, CreateAccountError, GrantPolicy,
+    IngestReport, LeaseAllocator, ReclaimBatch, ReclaimedLease, SnapshotPush, SnapshotResolution,
+    SnapshotSource, StoreError, StoreHealth, UsageSink,
 };
 
 const STATE_ACTIVE: i16 = 0;
