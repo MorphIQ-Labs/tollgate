@@ -87,17 +87,67 @@ pub struct PostgresStore {
     push: broadcast::Sender<SnapshotPush>,
 }
 
+/// Connection-pool bounds. Callers that hold background tasks open against
+/// this store rely on `acquire_timeout`: when every connection is checked out
+/// by a stalled query, it is the only thing that turns "wait forever" into an
+/// error the caller can report (INVARIANTS.md #18).
+#[derive(Debug, Clone, Copy)]
+pub struct PoolConfig {
+    pub max_connections: u32,
+    /// How long a caller may wait for a free connection before the call
+    /// fails. Must be positive.
+    pub acquire_timeout: std::time::Duration,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        PoolConfig {
+            max_connections: 16,
+            acquire_timeout: std::time::Duration::from_secs(5),
+        }
+    }
+}
+
+impl PoolConfig {
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if self.max_connections == 0 {
+            return Err(StoreError("max_connections must be positive".into()));
+        }
+        if self.acquire_timeout.is_zero() {
+            return Err(StoreError("acquire_timeout must be positive".into()));
+        }
+        Ok(())
+    }
+}
+
 impl PostgresStore {
+    /// Connect with default pool bounds and run pending migrations.
+    pub async fn connect(url: &str, policy: GrantPolicy) -> Result<Arc<Self>, StoreError> {
+        Self::connect_with(url, policy, PoolConfig::default()).await
+    }
+
     /// Connect and run pending migrations (versioned under ./migrations,
     /// tracked by sqlx's _sqlx_migrations table — review finding #11).
-    pub async fn connect(url: &str, policy: GrantPolicy) -> Result<Arc<Self>, StoreError> {
+    ///
+    /// Note the limits of what a pool bound can promise: `acquire_timeout`
+    /// covers waiting for a connection, including establishing one, but a
+    /// query already in flight on a healthy connection is bounded only by a
+    /// server-side `statement_timeout`. Callers must still bound their own
+    /// calls (INVARIANTS.md #18).
+    pub async fn connect_with(
+        url: &str,
+        policy: GrantPolicy,
+        pool_config: PoolConfig,
+    ) -> Result<Arc<Self>, StoreError> {
         policy
             .validate()
             .map_err(|e| StoreError(format!("invalid grant policy: {e}")))?;
+        pool_config.validate()?;
         let reclaim_grace_us = i64::try_from(policy.reclaim_grace.as_micros())
             .map_err(|_| StoreError("reclaim_grace exceeds PostgreSQL timestamp range".into()))?;
         let pool = PgPoolOptions::new()
-            .max_connections(16)
+            .max_connections(pool_config.max_connections)
+            .acquire_timeout(pool_config.acquire_timeout)
             .connect(url)
             .await
             .map_err(storage)?;

@@ -46,6 +46,8 @@ fn manager_config() -> LeaseManagerConfig {
         lease_ttl: SignedDuration::from_secs(60),
         expiry_safety_margin: SignedDuration::ZERO,
         poll_interval: std::time::Duration::from_millis(5),
+        store_call_timeout: std::time::Duration::from_secs(5),
+        shutdown_release_deadline: std::time::Duration::from_secs(10),
     }
 }
 
@@ -268,6 +270,7 @@ fn writer_config(capacity: usize) -> UsageWriterConfig {
         flush_interval: std::time::Duration::from_millis(10),
         retry_backoff: std::time::Duration::from_millis(10),
         shutdown_drain_deadline: std::time::Duration::from_secs(60),
+        ingest_timeout: std::time::Duration::from_secs(5),
     }
 }
 
@@ -374,6 +377,7 @@ async fn shutdown_flushes_in_configured_batch_sizes() {
             flush_interval: std::time::Duration::from_secs(60),
             retry_backoff: std::time::Duration::from_millis(1),
             shutdown_drain_deadline: std::time::Duration::from_secs(60),
+            ingest_timeout: std::time::Duration::from_secs(5),
         },
     )
     .unwrap();
@@ -924,12 +928,261 @@ async fn panic_after_partial_flush_counts_only_unflushed() {
     );
 }
 
-/// INVARIANTS.md #16: a zero drain deadline is refused before the task starts.
-#[tokio::test]
-async fn zero_drain_deadline_is_rejected() {
+// ---- wall-clock bounds on a wedged backend (issue #34) --------------------
+
+/// A sink whose `ingest` never resolves — a backend that is hung rather than
+/// erroring, which retry *counts* alone cannot bound.
+struct HangingSink;
+
+#[async_trait]
+impl UsageSink for HangingSink {
+    async fn ingest(
+        &self,
+        _events: &[UsageEvent],
+        _now: Timestamp,
+    ) -> Result<IngestReport, StoreError> {
+        std::future::pending().await
+    }
+}
+
+/// The #34 defect: a hung ingest parked the writer task forever, and with it
+/// every later shutdown step. The drain must terminate and report.
+#[tokio::test(start_paused = true)]
+async fn hung_ingest_cannot_stall_shutdown() {
     let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
     let clock = Arc::new(ManualClock::new(t(0)));
-    let mut config = writer_config(8);
-    config.shutdown_drain_deadline = std::time::Duration::ZERO;
-    assert!(UsageWriter::spawn(store, clock, config).is_err());
+    let mut config = writer_config(16);
+    config.flush_interval = std::time::Duration::from_secs(3_600);
+    let (recorder, writer) =
+        UsageWriter::spawn(Arc::new(HangingSink) as Arc<dyn UsageSink>, clock, config).unwrap();
+    recorder.try_reserve().unwrap().record(event(1, 25, &lease));
+
+    let stats = tokio::time::timeout(std::time::Duration::from_secs(300), writer.shutdown())
+        .await
+        .expect("a hung sink must not stall shutdown")
+        .unwrap();
+
+    // Undeliverable is undeliverable: counted lost, never accepted.
+    assert_eq!(stats.lost, 1);
+    assert_eq!(stats.accepted, 0);
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits::ZERO);
+}
+
+/// Steady state: a hung ingest times out into the ordinary retry path rather
+/// than parking the task, so a later shutdown still observes the signal.
+#[tokio::test(start_paused = true)]
+async fn hung_ingest_times_out_into_the_retry_path() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let mut config = writer_config(16);
+    config.ingest_timeout = std::time::Duration::from_millis(100);
+    let (recorder, writer) =
+        UsageWriter::spawn(Arc::new(HangingSink) as Arc<dyn UsageSink>, clock, config).unwrap();
+    recorder.try_reserve().unwrap().record(event(1, 25, &lease));
+
+    // Several timeout+backoff rounds elapse; the task stays responsive.
+    settle().await;
+    let stats = tokio::time::timeout(std::time::Duration::from_secs(300), writer.shutdown())
+        .await
+        .expect("the retry loop must remain interruptible")
+        .unwrap();
+    assert_eq!(stats.accepted, 0);
+    assert_eq!(stats.lost, 1);
+}
+
+/// A sink that is slow but healthy must still be delivered to: the timeout
+/// bounds a hang, it does not shorten the budget of a working call.
+struct SlowSink {
+    inner: Arc<MemoryStore>,
+    delay: std::time::Duration,
+}
+
+#[async_trait]
+impl UsageSink for SlowSink {
+    async fn ingest(
+        &self,
+        events: &[UsageEvent],
+        now: Timestamp,
+    ) -> Result<IngestReport, StoreError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.ingest(events, now).await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_but_healthy_sink_still_delivers_at_shutdown() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let sink = Arc::new(SlowSink {
+        inner: store.clone(),
+        delay: std::time::Duration::from_millis(50),
+    });
+    let mut config = writer_config(16);
+    config.flush_interval = std::time::Duration::from_secs(3_600);
+    config.ingest_timeout = std::time::Duration::from_secs(5);
+    let (recorder, writer) = UsageWriter::spawn(sink as Arc<dyn UsageSink>, clock, config).unwrap();
+    recorder.try_reserve().unwrap().record(event(1, 25, &lease));
+
+    let stats = writer.shutdown().await.unwrap();
+    assert_eq!(stats.accepted, 1, "a slow call inside its budget delivers");
+    assert_eq!(stats.lost, 0);
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(25));
+}
+
+/// An allocator that grants normally but never answers a release.
+struct HangingReleaseAllocator {
+    inner: Arc<MemoryStore>,
+}
+
+#[async_trait]
+impl LeaseAllocator for HangingReleaseAllocator {
+    async fn acquire(
+        &self,
+        account: AccountId,
+        requested: CostUnits,
+        ttl: SignedDuration,
+        now: Timestamp,
+    ) -> Result<tollgate_core::LeaseGrant, tollgate_store::AllocateError> {
+        self.inner.acquire(account, requested, ttl, now).await
+    }
+
+    async fn release(
+        &self,
+        _lease_id: tollgate_core::LeaseId,
+        _fencing_token: tollgate_core::FencingToken,
+        _unspent: CostUnits,
+        _now: Timestamp,
+    ) -> Result<(), tollgate_store::AllocateError> {
+        std::future::pending().await
+    }
+
+    async fn reclaim_expired(
+        &self,
+        now: Timestamp,
+    ) -> Result<Vec<tollgate_store::ReclaimedLease>, StoreError> {
+        self.inner.reclaim_expired(now).await
+    }
+}
+
+/// A clean shutdown accounts for the leases it returned.
+#[tokio::test(start_paused = true)]
+async fn shutdown_reports_released_leases() {
+    let store = store(10_000);
+    let slot = LeaseSlot::empty();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let manager =
+        LeaseManager::spawn(store.clone(), Arc::clone(&slot), clock, manager_config()).unwrap();
+    settle().await;
+    assert!(slot.load().is_some());
+
+    let report = manager.shutdown().await;
+    assert_eq!(report.released, 1);
+    assert_eq!(report.abandoned, 0);
+    assert!(!report.task_died);
+    assert_eq!(store.balance(ACCOUNT), CostUnits(10_000), "units came back");
+}
+
+/// A hung release cannot stall shutdown, and what it could not return is
+/// reported rather than assumed settled (INVARIANTS.md #18).
+#[tokio::test(start_paused = true)]
+async fn hung_release_cannot_stall_shutdown() {
+    let store = store(10_000);
+    let slot = LeaseSlot::empty();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let allocator = Arc::new(HangingReleaseAllocator {
+        inner: store.clone(),
+    });
+    let manager = LeaseManager::spawn(
+        allocator as Arc<dyn LeaseAllocator>,
+        Arc::clone(&slot),
+        clock,
+        manager_config(),
+    )
+    .unwrap();
+    settle().await;
+    assert!(slot.load().is_some());
+
+    let report = tokio::time::timeout(std::time::Duration::from_secs(300), manager.shutdown())
+        .await
+        .expect("a hung release must not stall shutdown");
+    assert_eq!(report.released, 0);
+    assert_eq!(report.abandoned, 1, "the unreturned lease is reported");
+    assert!(!report.task_died);
+}
+
+/// INVARIANTS.md #16: no writer field is silently repaired.
+#[tokio::test]
+async fn invalid_writer_config_is_rejected() {
+    let zero = std::time::Duration::ZERO;
+    let mut zero_capacity = writer_config(8);
+    zero_capacity.queue_capacity = 0;
+    let mut zero_batch = writer_config(8);
+    zero_batch.max_batch = 0;
+    let mut zero_flush = writer_config(8);
+    zero_flush.flush_interval = zero;
+    let mut zero_backoff = writer_config(8);
+    zero_backoff.retry_backoff = zero;
+    let mut zero_drain = writer_config(8);
+    zero_drain.shutdown_drain_deadline = zero;
+    let mut zero_ingest = writer_config(8);
+    zero_ingest.ingest_timeout = zero;
+
+    for (field, config) in [
+        ("queue_capacity", zero_capacity),
+        ("max_batch", zero_batch),
+        ("flush_interval", zero_flush),
+        ("retry_backoff", zero_backoff),
+        ("shutdown_drain_deadline", zero_drain),
+        ("ingest_timeout", zero_ingest),
+    ] {
+        assert!(
+            config.validate().is_err(),
+            "zero {field} must be rejected, not coerced"
+        );
+        let store = store(10_000);
+        let clock = Arc::new(ManualClock::new(t(0)));
+        assert!(
+            UsageWriter::spawn(store, clock, config).is_err(),
+            "zero {field} must not start a task"
+        );
+    }
+}
+
+/// INVARIANTS.md #16, manager half: the two new bounds are contracts too.
+#[test]
+fn invalid_lease_manager_timeouts_are_rejected() {
+    let mut config = manager_config();
+    config.store_call_timeout = std::time::Duration::ZERO;
+    assert!(config.validate().is_err());
+
+    let mut config = manager_config();
+    config.shutdown_release_deadline = std::time::Duration::ZERO;
+    assert!(config.validate().is_err());
 }

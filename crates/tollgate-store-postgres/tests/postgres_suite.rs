@@ -43,6 +43,31 @@ fn full_grant_policy() -> GrantPolicy {
     }
 }
 
+/// INVARIANTS.md #16/#18: pool bounds are validated before any network use,
+/// and an unbounded acquire is not an option a caller can pick by accident.
+#[tokio::test]
+async fn invalid_pool_config_is_rejected_before_connecting() {
+    use tollgate_store_postgres::PoolConfig;
+
+    for config in [
+        PoolConfig {
+            max_connections: 0,
+            ..PoolConfig::default()
+        },
+        PoolConfig {
+            acquire_timeout: std::time::Duration::ZERO,
+            ..PoolConfig::default()
+        },
+    ] {
+        assert!(config.validate().is_err());
+        assert!(
+            PostgresStore::connect_with("postgres://invalid", full_grant_policy(), config)
+                .await
+                .is_err()
+        );
+    }
+}
+
 #[tokio::test]
 async fn invalid_grant_policy_is_rejected_before_connecting() {
     let policy = GrantPolicy {

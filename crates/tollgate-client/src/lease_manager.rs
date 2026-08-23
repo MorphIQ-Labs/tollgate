@@ -22,6 +22,19 @@
 //! embedding service must stop admitting and flush its usage writer *before*
 //! shutting the manager down — releasing first would make honest usage
 //! events land on a settled lease and be rejected.
+//!
+//! Every allocator call is wall-clock bounded and the shutdown carries a
+//! total budget (INVARIANTS.md #18), so a backend that hangs rather than
+//! answering cannot park the refill loop or stall shutdown. Leases the budget
+//! could not return are counted in [`LeaseManagerReport::abandoned`] and
+//! settle at TTL reclaim.
+//!
+//! What a release refusal *means* differs by variant (issue #42): a storage
+//! error or timeout is retried next tick, a settled lease is dropped, a
+//! fenced release also clears the slot so a superseded holder stops serving
+//! at once, and an invalid release — the store rejecting the claim as an
+//! accounting bug — drops readiness, because local counts that disagree with
+//! the store's are not a safe basis for further spending.
 
 use std::sync::Arc;
 
@@ -52,6 +65,28 @@ pub struct LeaseManagerConfig {
     /// How often the slot is inspected. Refill latency is bounded by this
     /// plus one allocator round-trip — all off the request path.
     pub poll_interval: std::time::Duration,
+    /// Wall-clock bound on one allocator call (acquire or release). An
+    /// allocator that hangs rather than erroring would otherwise park the
+    /// refill task forever. Must be positive.
+    pub store_call_timeout: std::time::Duration,
+    /// Total budget for returning leases at shutdown, across every parked
+    /// lease. Leases still unreleased when it expires are reported and left
+    /// to TTL reclaim (INVARIANTS.md #9). Must be positive.
+    pub shutdown_release_deadline: std::time::Duration,
+}
+
+/// What a graceful shutdown managed to return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseManagerReport {
+    /// Leases the allocator accepted, or already considered settled.
+    pub released: u64,
+    /// Leases still held when the shutdown budget ran out. Their units come
+    /// back at TTL reclaim, not at shutdown — reported, never silent.
+    pub abandoned: u64,
+    /// The task died (panic or abort) instead of reporting: the counts above
+    /// are what is known, not what happened. Never `true` for a task that
+    /// completed its own shutdown.
+    pub task_died: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +126,16 @@ impl LeaseManagerConfig {
         if self.poll_interval.is_zero() {
             return Err(LeaseManagerConfigError("poll_interval must be positive"));
         }
+        if self.store_call_timeout.is_zero() {
+            return Err(LeaseManagerConfigError(
+                "store_call_timeout must be positive",
+            ));
+        }
+        if self.shutdown_release_deadline.is_zero() {
+            return Err(LeaseManagerConfigError(
+                "shutdown_release_deadline must be positive",
+            ));
+        }
         Ok(())
     }
 }
@@ -99,7 +144,7 @@ impl LeaseManagerConfig {
 pub struct LeaseManager {
     shutdown: watch::Sender<bool>,
     health: watch::Receiver<bool>,
-    handle: Option<tokio::task::JoinHandle<()>>,
+    handle: Option<tokio::task::JoinHandle<LeaseManagerReport>>,
 }
 
 impl LeaseManager {
@@ -113,8 +158,9 @@ impl LeaseManager {
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (health_tx, health) = watch::channel(true);
         let handle = tokio::spawn(async move {
-            run(allocator, slot, clock, config, shutdown_rx).await;
+            let report = run(allocator, slot, clock, config, shutdown_rx, &health_tx).await;
             let _ = health_tx.send(false);
+            report
         });
         Ok(LeaseManager {
             shutdown,
@@ -123,19 +169,30 @@ impl LeaseManager {
         })
     }
 
-    /// True while the refill task is alive. Channel closure also means the
-    /// task exited (including panic/abort), so readiness probes should check
-    /// both the current value and `Receiver::has_changed().is_ok()`.
+    /// True while the refill task is alive *and* its accounting still agrees
+    /// with the store. Channel closure also means the task exited (including
+    /// panic/abort), so readiness probes should check both the current value
+    /// and `Receiver::has_changed().is_ok()`.
     #[must_use]
     pub fn health(&self) -> watch::Receiver<bool> {
         self.health.clone()
     }
 
-    /// Signal the task, wait for it to release the current lease and exit.
-    pub async fn shutdown(mut self) {
+    /// Signal the task, wait for it to return what it can of its leases, and
+    /// report what it managed. Bounded by `shutdown_release_deadline`: a hung
+    /// allocator cannot stall this call.
+    pub async fn shutdown(mut self) -> LeaseManagerReport {
         let _ = self.shutdown.send(true);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.await;
+        let died = LeaseManagerReport {
+            released: 0,
+            abandoned: 0,
+            task_died: true,
+        };
+        match self.handle.take() {
+            // A task that died reports nothing it can substantiate; the flag
+            // says so rather than a zero that reads like a clean run (#41).
+            Some(handle) => handle.await.unwrap_or(died),
+            None => died,
         }
     }
 }
@@ -157,7 +214,8 @@ async fn run(
     clock: Arc<dyn Clock>,
     config: LeaseManagerConfig,
     mut shutdown: watch::Receiver<bool>,
-) {
+    health: &watch::Sender<bool>,
+) -> LeaseManagerReport {
     let mut tick = tokio::time::interval(config.poll_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Superseded leases waiting for quiescence before their unspent units go
@@ -179,7 +237,7 @@ async fn run(
         }
 
         let now = clock.now();
-        release_quiesced(&allocator, &mut parked, &clock).await;
+        release_quiesced(&allocator, &mut parked, &clock, &config, &slot, health).await;
         let needs_acquire = match slot.load() {
             None => true,
             Some(lease) if now >= lease.usable_until() => {
@@ -190,7 +248,7 @@ async fn run(
                 if let Some(old) = slot.take() {
                     parked.push(old);
                 }
-                release_quiesced(&allocator, &mut parked, &clock).await;
+                release_quiesced(&allocator, &mut parked, &clock, &config, &slot, health).await;
                 true
             }
             Some(lease) => lease.needs_refill(),
@@ -199,11 +257,16 @@ async fn run(
             continue;
         }
 
-        match allocator
-            .acquire(config.account, config.target_grant, config.lease_ttl, now)
-            .await
+        // A hung allocator must not park the refill loop: a timeout takes the
+        // same path as a refusal, so the slot fails closed and the next tick
+        // tries again.
+        match tokio::time::timeout(
+            config.store_call_timeout,
+            allocator.acquire(config.account, config.target_grant, config.lease_ttl, now),
+        )
+        .await
         {
-            Ok(grant) => {
+            Ok(Ok(grant)) => {
                 // Rotation: install the fresh lease and park the superseded
                 // one until it quiesces (module docs). Adaptive allocation
                 // may return less than target_grant; cap low-water below the
@@ -224,10 +287,11 @@ async fn run(
                     parked.push(old);
                 }
             }
-            Err(_) => {
-                // Denied or backend down: nothing to install. The slot keeps
-                // whatever live lease it still has (spend continues until
-                // exhaustion/expiry); an empty slot stays empty — deny.
+            Ok(Err(_)) | Err(_) => {
+                // Denied, backend down, or too slow: nothing to install. The
+                // slot keeps whatever live lease it still has (spend
+                // continues until exhaustion/expiry); an empty slot stays
+                // empty — deny.
             }
         }
     }
@@ -238,28 +302,59 @@ async fn run(
     if let Some(lease) = slot.take() {
         parked.push(lease);
     }
+    let deadline = tokio::time::Instant::now() + config.shutdown_release_deadline;
+    let mut report = LeaseManagerReport {
+        released: 0,
+        abandoned: 0,
+        task_died: false,
+    };
     for lease in parked {
         let grant = lease.grant();
-        let _ = allocator
-            .release(
+        // One budget across every lease, and no single call may outlast the
+        // per-call timeout inside it. Whatever the budget cannot cover is
+        // reported abandoned and settles at TTL reclaim (INVARIANTS.md #9).
+        let call_deadline = deadline.min(tokio::time::Instant::now() + config.store_call_timeout);
+        match tokio::time::timeout_at(
+            call_deadline,
+            allocator.release(
                 grant.lease_id,
                 grant.fencing_token,
                 lease.remaining(),
                 clock.now(),
-            )
-            .await;
+            ),
+        )
+        .await
+        {
+            // A refusal still means the store is no longer holding this lease
+            // open for us — only an unfinished call leaves it outstanding.
+            Ok(_) => report.released += 1,
+            Err(_) => report.abandoned += 1,
+        }
     }
+    report
 }
 
-/// Release every parked lease that has quiesced; keep the rest parked.
-/// Each parked lease is examined exactly once per pass. Terminal allocator
-/// refusals (fenced, already settled) drop the lease — the store has already
-/// accounted for it; storage errors keep it parked for retry next tick.
+/// Release every parked lease that has quiesced; keep the rest parked. Each
+/// parked lease is examined exactly once per pass, and each release call is
+/// wall-clock bounded.
+///
+/// The allocator's answer decides what the refusal *means* (issue #42):
+/// storage errors and timeouts keep the lease parked for the next tick; a
+/// settled lease is dropped; a fenced release also closes the slot, because
+/// another holder has superseded this one and spending must stop now rather
+/// than at the next acquire; and an invalid release means local accounting
+/// disagrees with the store's, which is not a state in which continuing to
+/// spend is safe — readiness drops and stays down.
 async fn release_quiesced(
     allocator: &Arc<dyn LeaseAllocator>,
     parked: &mut Vec<Arc<LocalLease>>,
     clock: &Arc<dyn Clock>,
+    config: &LeaseManagerConfig,
+    slot: &Arc<LeaseSlot>,
+    health: &watch::Sender<bool>,
 ) {
+    use tollgate_store::AllocateError;
+
     let mut retry = Vec::new();
     for lease in std::mem::take(parked) {
         // The local binding holds what was the vec's sole reference, so a
@@ -269,16 +364,29 @@ async fn release_quiesced(
             continue;
         }
         let grant = lease.grant();
-        if let Err(tollgate_store::AllocateError::Storage(_)) = allocator
-            .release(
+        let outcome = tokio::time::timeout(
+            config.store_call_timeout,
+            allocator.release(
                 grant.lease_id,
                 grant.fencing_token,
                 lease.remaining(),
                 clock.now(),
-            )
-            .await
-        {
-            retry.push(lease);
+            ),
+        )
+        .await;
+        match outcome {
+            // Unfinished or unreachable: nothing was settled, try next tick.
+            Err(_) | Ok(Err(AllocateError::Storage(_))) => retry.push(lease),
+            // Settled, or nothing to settle.
+            Ok(Ok(())) | Ok(Err(AllocateError::LeaseNotActive | AllocateError::UnknownLease)) => {}
+            Ok(Err(AllocateError::Fenced)) => {
+                slot.take();
+            }
+            Ok(Err(AllocateError::InvalidRelease)) => {
+                let _ = health.send(false);
+            }
+            // Acquire-only refusals; a release cannot produce them.
+            Ok(Err(_)) => {}
         }
     }
     *parked = retry;
@@ -286,7 +394,7 @@ async fn release_quiesced(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -296,23 +404,30 @@ mod tests {
 
     use super::*;
 
-    /// Records successful releases; refuses scripted lease ids with the
-    /// scripted error.
+    /// How the scripted allocator answers a release for a given lease.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Refusal {
+        Storage,
+        Fenced,
+        InvalidRelease,
+        LeaseNotActive,
+        UnknownLease,
+        /// Never resolves — stands in for a wedged backend.
+        Hang,
+    }
+
+    /// Records successful releases; answers scripted lease ids with the
+    /// scripted refusal.
     struct ScriptedAllocator {
         released: Mutex<Vec<LeaseId>>,
-        storage_failures: HashSet<LeaseId>,
-        fenced: HashSet<LeaseId>,
+        refusals: HashMap<LeaseId, Refusal>,
     }
 
     impl ScriptedAllocator {
-        fn new(
-            storage_failures: impl Into<HashSet<LeaseId>>,
-            fenced: impl Into<HashSet<LeaseId>>,
-        ) -> Arc<Self> {
+        fn new(refusals: impl IntoIterator<Item = (LeaseId, Refusal)>) -> Arc<Self> {
             Arc::new(Self {
                 released: Mutex::new(Vec::new()),
-                storage_failures: storage_failures.into(),
-                fenced: fenced.into(),
+                refusals: refusals.into_iter().collect(),
             })
         }
 
@@ -340,14 +455,20 @@ mod tests {
             _unspent: CostUnits,
             _now: Timestamp,
         ) -> Result<(), AllocateError> {
-            if self.storage_failures.contains(&lease_id) {
-                return Err(AllocateError::Storage(StoreError("scripted outage".into())));
+            match self.refusals.get(&lease_id) {
+                Some(Refusal::Storage) => {
+                    Err(AllocateError::Storage(StoreError("scripted outage".into())))
+                }
+                Some(Refusal::Fenced) => Err(AllocateError::Fenced),
+                Some(Refusal::InvalidRelease) => Err(AllocateError::InvalidRelease),
+                Some(Refusal::LeaseNotActive) => Err(AllocateError::LeaseNotActive),
+                Some(Refusal::UnknownLease) => Err(AllocateError::UnknownLease),
+                Some(Refusal::Hang) => std::future::pending().await,
+                None => {
+                    self.released.lock().unwrap().push(lease_id);
+                    Ok(())
+                }
             }
-            if self.fenced.contains(&lease_id) {
-                return Err(AllocateError::Fenced);
-            }
-            self.released.lock().unwrap().push(lease_id);
-            Ok(())
         }
 
         async fn reclaim_expired(
@@ -355,6 +476,56 @@ mod tests {
             _now: Timestamp,
         ) -> Result<Vec<ReclaimedLease>, StoreError> {
             unreachable!("release_quiesced never reclaims")
+        }
+    }
+
+    /// `release_quiesced`'s collaborators, with the parts these tests do not
+    /// vary held at sensible defaults.
+    struct Harness {
+        config: LeaseManagerConfig,
+        slot: Arc<LeaseSlot>,
+        health: watch::Sender<bool>,
+        healthy: watch::Receiver<bool>,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let (health, healthy) = watch::channel(true);
+            Self {
+                config: LeaseManagerConfig {
+                    account: AccountId(1),
+                    target_grant: CostUnits(1_000),
+                    low_water: CostUnits(250),
+                    lease_ttl: SignedDuration::from_secs(60),
+                    expiry_safety_margin: SignedDuration::ZERO,
+                    poll_interval: std::time::Duration::from_millis(5),
+                    store_call_timeout: std::time::Duration::from_millis(50),
+                    shutdown_release_deadline: std::time::Duration::from_secs(10),
+                },
+                slot: LeaseSlot::empty(),
+                health,
+                healthy,
+            }
+        }
+
+        async fn release_quiesced(
+            &self,
+            allocator: &Arc<dyn LeaseAllocator>,
+            parked: &mut Vec<Arc<LocalLease>>,
+        ) {
+            release_quiesced(
+                allocator,
+                parked,
+                &clock(),
+                &self.config,
+                &self.slot,
+                &self.health,
+            )
+            .await;
+        }
+
+        fn is_healthy(&self) -> bool {
+            *self.healthy.borrow()
         }
     }
 
@@ -377,11 +548,12 @@ mod tests {
 
     #[tokio::test]
     async fn storage_failure_does_not_skip_the_next_parked_lease() {
-        let scripted = ScriptedAllocator::new([LeaseId(1)], []);
+        let scripted = ScriptedAllocator::new([(LeaseId(1), Refusal::Storage)]);
         let allocator: Arc<dyn LeaseAllocator> = Arc::clone(&scripted) as _;
+        let harness = Harness::new();
         let mut parked = vec![parked_lease(1), parked_lease(2)];
 
-        release_quiesced(&allocator, &mut parked, &clock()).await;
+        harness.release_quiesced(&allocator, &mut parked).await;
 
         assert_eq!(scripted.released(), [LeaseId(2)]);
         assert_eq!(parked.len(), 1, "only the failed lease stays parked");
@@ -390,31 +562,102 @@ mod tests {
 
     #[tokio::test]
     async fn unquiesced_lease_is_never_released() {
-        let scripted = ScriptedAllocator::new([], []);
+        let scripted = ScriptedAllocator::new([]);
         let allocator: Arc<dyn LeaseAllocator> = Arc::clone(&scripted) as _;
+        let harness = Harness::new();
         let lease = parked_lease(7);
         let in_flight = Arc::clone(&lease);
         let mut parked = vec![lease];
 
-        release_quiesced(&allocator, &mut parked, &clock()).await;
+        harness.release_quiesced(&allocator, &mut parked).await;
         assert!(scripted.released().is_empty());
         assert_eq!(parked.len(), 1, "held lease stays parked");
 
         drop(in_flight);
-        release_quiesced(&allocator, &mut parked, &clock()).await;
+        harness.release_quiesced(&allocator, &mut parked).await;
         assert_eq!(scripted.released(), [LeaseId(7)]);
         assert!(parked.is_empty());
     }
 
+    /// Genuinely settled: the store is not holding these open, so dropping
+    /// them is correct and nothing else changes (issue #42).
     #[tokio::test]
-    async fn terminal_refusal_drops_the_lease() {
-        let scripted = ScriptedAllocator::new([], [LeaseId(3)]);
+    async fn settled_refusals_drop_silently() {
+        for refusal in [Refusal::LeaseNotActive, Refusal::UnknownLease] {
+            let scripted = ScriptedAllocator::new([(LeaseId(3), refusal)]);
+            let allocator: Arc<dyn LeaseAllocator> = Arc::clone(&scripted) as _;
+            let harness = Harness::new();
+            harness.slot.install(parked_lease(99));
+            let mut parked = vec![parked_lease(3)];
+
+            harness.release_quiesced(&allocator, &mut parked).await;
+
+            assert!(scripted.released().is_empty());
+            assert!(parked.is_empty(), "settled lease is not retried");
+            assert!(harness.is_healthy(), "settlement is not a health event");
+            assert!(harness.slot.load().is_some(), "the slot is untouched");
+        }
+    }
+
+    /// A newer holder has superseded this one, so spending must stop now
+    /// rather than at the next acquire (issue #42).
+    #[tokio::test]
+    async fn fenced_release_clears_the_slot() {
+        let scripted = ScriptedAllocator::new([(LeaseId(3), Refusal::Fenced)]);
         let allocator: Arc<dyn LeaseAllocator> = Arc::clone(&scripted) as _;
+        let harness = Harness::new();
+        harness.slot.install(parked_lease(99));
         let mut parked = vec![parked_lease(3)];
 
-        release_quiesced(&allocator, &mut parked, &clock()).await;
+        harness.release_quiesced(&allocator, &mut parked).await;
 
-        assert!(scripted.released().is_empty());
-        assert!(parked.is_empty(), "settled lease is not retried");
+        assert!(parked.is_empty(), "a fenced lease is settled, not retried");
+        assert!(
+            harness.slot.load().is_none(),
+            "a fenced holder must stop serving immediately"
+        );
+    }
+
+    /// The store rejected the claim as an accounting bug; continuing to spend
+    /// on divergent local counts is not safe (issue #42).
+    #[tokio::test]
+    async fn invalid_release_fails_readiness() {
+        let scripted = ScriptedAllocator::new([(LeaseId(3), Refusal::InvalidRelease)]);
+        let allocator: Arc<dyn LeaseAllocator> = Arc::clone(&scripted) as _;
+        let harness = Harness::new();
+        let mut parked = vec![parked_lease(3)];
+
+        assert!(harness.is_healthy());
+        harness.release_quiesced(&allocator, &mut parked).await;
+
+        assert!(
+            !harness.is_healthy(),
+            "accounting divergence must drop readiness"
+        );
+    }
+
+    /// A wedged backend cannot park the refill loop: the call is bounded and
+    /// the lease stays parked for the next tick (issue #34).
+    #[tokio::test(start_paused = true)]
+    async fn hung_release_times_out_and_reparks() {
+        let scripted = ScriptedAllocator::new([(LeaseId(5), Refusal::Hang)]);
+        let allocator: Arc<dyn LeaseAllocator> = Arc::clone(&scripted) as _;
+        let harness = Harness::new();
+        let mut parked = vec![parked_lease(5), parked_lease(6)];
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            harness.release_quiesced(&allocator, &mut parked),
+        )
+        .await
+        .expect("a hung release must not stall the pass");
+
+        assert_eq!(scripted.released(), [LeaseId(6)], "the pass continues");
+        assert_eq!(parked.len(), 1, "the timed-out lease is retried, not lost");
+        assert_eq!(parked[0].grant().lease_id, LeaseId(5));
+        assert!(
+            harness.is_healthy(),
+            "a timeout is not accounting divergence"
+        );
     }
 }
