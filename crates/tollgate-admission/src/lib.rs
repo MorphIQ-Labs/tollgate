@@ -13,16 +13,23 @@
 //! clock for bucket arithmetic only). Misses deny — resolution is the
 //! background plane's job (INVARIANTS.md #5).
 //!
+//! That prohibition covers logging too, so what this plane reports about
+//! itself is a tally rather than an event stream: every outcome lands in
+//! [`AdmissionCounters`], indexed by reason, and an embedder exports it from
+//! off the request path.
+//!
 //! Two interchangeable snapshot-map implementations exist behind
 //! [`SnapshotMap`] — [`MokaSnapshotMap`] and [`ArcSwapSnapshotMap`] — because
 //! the design review deliberately treats the cache choice as an empirical
 //! question for the perf gate, not a foregone conclusion.
 
+pub mod counters;
 pub mod engine;
 mod generation_model;
 pub mod maps;
 pub mod state;
 
+pub use counters::{AdmissionCounters, CountersSnapshot};
 pub use engine::{AdmissionEngine, AdmissionRequest, Admitted};
 pub use maps::{ArcSwapSnapshotMap, MokaSnapshotMap};
 pub use state::{

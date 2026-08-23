@@ -34,6 +34,22 @@ async fn call(router: &axum::Router, auth: Option<&str>, body: Value) -> (Status
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
+async fn metrics(router: &axum::Router) -> Value {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
 async fn ready(router: &axum::Router) -> StatusCode {
     router
         .clone()
@@ -150,6 +166,57 @@ async fn exhausted_quota_returns_429_and_never_overspends() {
     let store = runtime.store.clone();
     runtime.shutdown().await;
     assert!(store.usage_recorded(DEMO_ACCOUNT).get() <= 200);
+}
+
+/// Issue #37: an instance that is refusing everything must not look like one
+/// serving nothing. The counters are the request path's only voice, so the
+/// scrape has to distinguish the two — and attribute each refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_separate_admissions_from_each_kind_of_refusal() {
+    let (router, runtime) = build_app(100_000, true);
+    wait_ready(&router).await;
+
+    let before = metrics(&router).await;
+    assert_eq!(before["admitted"], 0);
+    assert_eq!(before["denied"], 0);
+    // Every reason is present up front, so a zero means "has not happened"
+    // rather than "no such counter".
+    assert_eq!(
+        before["denials"].as_object().unwrap().len(),
+        14,
+        "every reason must be exported, including the ones at zero"
+    );
+
+    // Two admissions: 14 contracts quote 64 units, 1 contract quotes 51.
+    for items in [14, 1] {
+        let (status, _) = call(&router, Some(DEMO_API_KEY), price_body(items)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    // Three refusals of two distinct kinds, one of them raised before the
+    // engine is ever consulted.
+    let (status, _) = call(&router, None, price_body(1)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = call(&router, Some("wrong-key"), price_body(1)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = call(&router, Some(DEMO_API_KEY), price_body(1_025)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    let after = metrics(&router).await;
+    assert_eq!(after["admitted"], 2);
+    assert_eq!(after["units_admitted"], 115, "64 + 51 units quoted");
+    assert_eq!(after["denied"], 3);
+    assert_eq!(after["denials"]["unknown_principal"], 2);
+    assert_eq!(after["denials"]["request_too_large"], 1);
+    assert_eq!(
+        after["denials"]["rate_limited"], 0,
+        "a reason that did not occur must stay at zero"
+    );
+    // The off-path gauges: what is left to spend, and until when. A lease can
+    // be refused for either reason, so both are exported.
+    assert!(after["lease_remaining"].as_u64().is_some());
+    assert!(after["lease_usable_until"].as_str().is_some());
+
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -40,6 +40,12 @@
       "id": "admission/full_check_contended_8",
       "target_ns": 4000.0,
       "threshold_ns": 10000.0
+    },
+    {
+      "_comment": "Added with the request-path counters (#37): the cheapest refusal there is, so the per-outcome tally is the largest share of it. Measured 19.7-22.8ns across runs; target sits above that spread and threshold carries the same headroom as the lookup entries.",
+      "id": "admission/full_check_denied",
+      "target_ns": 25.0,
+      "threshold_ns": 50.0
     }
   ]
 }

@@ -4,7 +4,9 @@
 //! whole pipeline (lookup → checks → quote → rate token → lease debit →
 //! reservation, then cancel to keep the lease balanced); `full_check_contended_8`
 //! runs the same pipeline with seven background threads hammering the same
-//! account, measuring cross-core contention on the shared limiter and lease.
+//! account, measuring cross-core contention on the shared limiter and lease;
+//! `full_check_denied` measures the refusal path, which the other two never
+//! take.
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -151,6 +153,27 @@ fn bench_full_check(c: &mut Criterion) {
     for w in workers {
         w.join().unwrap();
     }
+
+    // The deny path, which nothing measured before #37 — both benches above
+    // set limits high enough that only the admit path runs. An unknown
+    // principal is the cheapest refusal there is: one map lookup and a
+    // return, with no quote, no rate token and no lease debit to hide behind.
+    // That makes it the most sensitive place to detect the per-outcome
+    // counter, since it is the largest fraction of the smallest path.
+    group.bench_function("full_check_denied", |b| {
+        b.iter(|| {
+            let denied = uncontended.admit(
+                AdmissionRequest {
+                    principal: black_box(Principal(9_999)),
+                    required: PermissionBits::bit(0),
+                    op: &PriceOp,
+                    items: 64,
+                },
+                now,
+            );
+            black_box(denied.unwrap_err())
+        })
+    });
 
     group.finish();
 }

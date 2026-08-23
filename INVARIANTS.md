@@ -215,6 +215,27 @@ until it has one.
     quiet, or the signal is worthless), and
     `usage_sink_outage_and_recovery_are_reported`.
 
+20. **Every admission outcome is counted, exactly once, under its own reason.**
+    The request path may not log (5), so its tallies are the only account it
+    can give of itself; an instance refusing every request must be
+    distinguishable from one serving none. `AdmissionEngine::admit` records the
+    single outcome of each call — never the individual exits, five of which
+    only ever arrive by `?` from `AccountSnapshot::admit` and
+    `Reservation::reserve` — so a reason cannot be produced without being
+    tallied. `DenyReason::index` is an exhaustive match, making a slot
+    per reason total by construction and a shared slot unrepresentable; a new
+    variant fails to compile until it has one. Denials add no units, because a
+    refusal charges zero (2). `units_admitted` counts what was *quoted*, not
+    what was billed — usage events remain the billing record. Refusals decided
+    before the engine is reached (accounting backpressure, 8) are recorded by
+    the embedder against the same tally, so no reason exports a permanent zero
+    that reads as "never happens". *Tests:*
+    `indices_cover_every_slot_exactly_once`,
+    `labels_are_distinct_and_payload_free`, `payload_does_not_affect_the_slot`,
+    `counters_attribute_every_outcome`, `each_reason_reaches_its_own_slot`,
+    `denied_requests_add_no_units`, `concurrent_increments_are_not_lost`, and
+    `metrics_separate_admissions_from_each_kind_of_refusal`.
+
 Ledger roles (context for 1 and 7): leases **bound** spend; usage events **are**
 the billing record; reconciliation compares the two and steady-state drift is
 zero.
