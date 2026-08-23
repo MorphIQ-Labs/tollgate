@@ -5,6 +5,12 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.4...v0.2.5) - 2026-08-23
+
+### Other
+
+- *(admission)* #8 stop rescanning the limiter registry on every install
+
 ## [0.2.4](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.3...v0.2.4) - 2026-08-23
 
 ### Other
