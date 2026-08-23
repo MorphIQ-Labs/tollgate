@@ -1,8 +1,10 @@
 {
-  "_comment": "Loopback single-request gate for examples/pricing-api under the production profile. Absolute ceilings are provisional laptop bounds; the overhead ratio (admitted p50 vs no-admission baseline p50) is the meaningful figure everywhere and encodes the plan's <=~10% target with headroom for jitter.",
+  "_comment": "Persistent-loopback gates for examples/pricing-api under the production profile. Request counts are totals per scenario. Sequential absolute ceilings are provisional laptop bounds; each admitted-vs-baseline p50 ratio is portable only when its configured connection count is held constant.",
   "warmup_requests": 1000,
   "measured_requests": 5000,
+  "concurrent_connections": 10,
   "max_p50_overhead_ratio": 1.15,
+  "max_concurrent_p50_overhead_ratio": 1.2,
   "max_p50_ns": 200000.0,
   "max_p99_ns": 2000000.0
 }
