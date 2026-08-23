@@ -5,6 +5,12 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.1.2...v0.1.3) - 2026-08-23
+
+### Added
+
+- *(client)* #36 replace every silent control-plane discard with a structured event
+
 ## [0.1.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.1.1...v0.1.2) - 2026-08-23
 
 ### Fixed
