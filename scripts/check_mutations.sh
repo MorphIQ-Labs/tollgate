@@ -6,6 +6,9 @@ VERSION_FILE="$ROOT/.cargo/mutants-version"
 NEXTEST_VERSION_FILE="$ROOT/.cargo/nextest-version"
 OUTPUT="$ROOT/reports/mutations"
 JOBS=${MUTANTS_JOBS:-4}
+# `set -u` is on, so the verdict below needs this defined even when the run
+# never reaches cargo-mutants.
+status=0
 
 required=$(cat "$VERSION_FILE")
 installed=$(cargo mutants --version 2>/dev/null || true)
@@ -43,19 +46,33 @@ case "${1:-}" in
       echo "mutation gate: Postgres changed; set TOLLGATE_PG_URL so backend mutants are exercised" >&2
       exit 1
     fi
-    cargo mutants --workspace -j "$JOBS" --line-col true --in-diff "$diff" --output "$OUTPUT"
+    cargo mutants --workspace -j "$JOBS" --line-col true --in-diff "$diff" --output "$OUTPUT" \
+      || status=$?
     ;;
   "")
     if [ -z "${TOLLGATE_PG_URL:-}" ]; then
       echo "mutation gate: full sweep requires TOLLGATE_PG_URL" >&2
       exit 1
     fi
-    cargo mutants --workspace -j "$JOBS" --line-col true --output "$OUTPUT"
+    cargo mutants --workspace -j "$JOBS" --line-col true --output "$OUTPUT" || status=$?
     ;;
   *)
     echo "usage: $0 [--diff [base-ref]]" >&2
     exit 2
     ;;
 esac
+
+# State the verdict, not only the evidence. cargo-mutants' own last line is
+# "N mutants tested: 2 missed, 34 caught, 11 unviable" — which reads as a
+# result unless you already know that a missed mutant is fatal. Letting
+# `set -e` abort here printed nothing at all on failure, so a caller skimming
+# the tail of the output, or piping it (a shell pipeline reports only its
+# last command's status), saw a run that looked clean. Both sibling gates
+# print PASS or FAIL explicitly; this one now does too, and exits with the
+# status it was given.
+if [ "$status" -ne 0 ]; then
+  echo "mutation gate: FAILED (cargo-mutants exit $status; report: $OUTPUT)" >&2
+  exit "$status"
+fi
 
 echo "mutation gate: OK (report: reports/mutations)"
