@@ -22,7 +22,7 @@
 //! (LISTEN/NOTIFY or the server's future SSE) is a documented seam in
 //! `docs/DESIGN.md`.
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroI64, NonZeroUsize};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -627,136 +627,235 @@ impl UsageSink for PostgresStore {
         // in a single sorted ANY() query (sorted to keep concurrent batches
         // deadlock-free), duplicates are detected with one lookup, events are
         // classified in memory against the locked rows, and the accepted set
-        // lands via one bulk insert plus grouped per-lease/per-account
+        // lands via one bulk insert plus set-wise per-lease/per-account
         // updates. Classification in application code preserves the partial
         // acceptance contract without savepoints.
         let mut report = IngestReport::default();
         if events.is_empty() {
             return Ok(report);
         }
+
+        // Encode each ID and timestamp exactly once before opening the
+        // transaction. The prepared values are reused by the lock, dedup,
+        // classification, insert, and aggregate-update phases. Units are
+        // checked once later, after duplicate and fencing classification, to
+        // preserve the partial-acceptance ordering.
+        struct PreparedEvent<'a> {
+            source: &'a UsageEvent,
+            request_id: Vec<u8>,
+            account_id: Vec<u8>,
+            lease_id: Vec<u8>,
+            occurred_at_us: i64,
+        }
+        let prepared: Vec<PreparedEvent<'_>> = events
+            .iter()
+            .map(|event| {
+                Ok(PreparedEvent {
+                    source: event,
+                    request_id: id_bytes(event.request_id.0),
+                    account_id: id_bytes(event.account_id.0),
+                    lease_id: id_bytes(event.lease_id.0),
+                    occurred_at_us: ts_micros(event.occurred_at),
+                })
+            })
+            .collect::<Result<_, StoreError>>()?;
+
         let mut tx = self.pool.begin().await.map_err(storage)?;
         let result = async {
-
-            // Lock every referenced lease, in stable order.
-            let mut lease_ids: Vec<Vec<u8>> = events
+            // Lock every referenced lease in the same global account/lease
+            // order as reclaim. Release touches one lease, so every
+            // lease-writing transaction now agrees on this order.
+            let lease_ids: Vec<Vec<u8>> = prepared
                 .iter()
-                .map(|e| id_bytes(e.lease_id.0))
+                .map(|event| event.lease_id.clone())
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect();
-            lease_ids.sort();
             struct LeaseRow {
                 account_id: Vec<u8>,
                 fence: i64,
                 granted: i64,
                 used: i64,
-                used_delta: i64,
+                used_delta: Option<NonZeroI64>,
                 credited: i64,
                 settled: bool,
             }
             let rows = sqlx::query(
                 "SELECT lease_id, account_id, fencing_token, granted, used, credited, state
-                 FROM tollgate_leases WHERE lease_id = ANY($1) ORDER BY lease_id FOR UPDATE",
+                 FROM tollgate_leases
+                 WHERE lease_id = ANY($1)
+                 ORDER BY account_id, lease_id FOR UPDATE",
             )
             .bind(&lease_ids)
             .fetch_all(&mut *tx)
             .await
             .map_err(storage)?;
-            let mut leases: std::collections::BTreeMap<Vec<u8>, LeaseRow> = rows
-                .into_iter()
-                .map(|r| {
-                    (
-                        r.get::<Vec<u8>, _>(0),
-                        LeaseRow {
-                            account_id: r.get(1),
-                            fence: r.get(2),
-                            granted: r.get(3),
-                            used: r.get(4),
-                            used_delta: 0,
-                            credited: r.get(5),
-                            settled: r.get::<i16, _>(6) != STATE_ACTIVE,
-                        },
-                    )
-                })
+            let mut leases: std::collections::BTreeMap<Vec<u8>, LeaseRow> =
+                std::collections::BTreeMap::new();
+            for row in rows {
+                let lease_id: Vec<u8> = row.get(0);
+                let fence: i64 = row.get(2);
+                let granted: i64 = row.get(3);
+                let used: i64 = row.get(4);
+                let credited: i64 = row.get(5);
+                leases.insert(
+                    lease_id,
+                    LeaseRow {
+                        account_id: row.get(1),
+                        fence,
+                        granted,
+                        used,
+                        used_delta: None,
+                        credited,
+                        settled: row.get::<i16, _>(6) != STATE_ACTIVE,
+                    },
+                );
+            }
+
+            // Existing request ids in one lookup.
+            let request_ids: Vec<Vec<u8>> = prepared
+                .iter()
+                .map(|event| event.request_id.clone())
                 .collect();
+            let mut seen: std::collections::HashSet<Vec<u8>> = sqlx::query(
+                "SELECT request_id FROM tollgate_usage_events WHERE request_id = ANY($1)",
+            )
+            .bind(&request_ids)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(storage)?
+            .into_iter()
+            .map(|row| row.get::<Vec<u8>, _>(0))
+            .collect();
 
-        // Existing request ids in one lookup.
-        let request_ids: Vec<Vec<u8>> = events.iter().map(|e| id_bytes(e.request_id.0)).collect();
-        let mut seen: std::collections::HashSet<Vec<u8>> =
-            sqlx::query("SELECT request_id FROM tollgate_usage_events WHERE request_id = ANY($1)")
-                .bind(&request_ids)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(storage)?
-                .into_iter()
-                .map(|r| r.get::<Vec<u8>, _>(0))
-                .collect();
+            // Classify in memory against the locked rows (identical rules to
+            // MemoryStore: fencing triple, then the conservation fit that also
+            // converts a released lease's provisional loss into billed usage).
+            struct Accepted {
+                event_index: usize,
+                settled: bool,
+                /// The lease's stored fence, already validated non-negative;
+                /// acceptance required the event's token to equal it, so this
+                /// is the event's fence in storage form with no reconversion.
+                fence: i64,
+                /// Checked once during classification and reused by every
+                /// aggregate and insert array.
+                units: i64,
+            }
+            let mut accepted: Vec<Accepted> = Vec::with_capacity(prepared.len());
+            for (event_index, event) in prepared.iter().enumerate() {
+                if seen.contains(event.request_id.as_slice()) {
+                    report.duplicate += 1;
+                    continue;
+                }
+                let Some(lease) = leases.get_mut(event.lease_id.as_slice()) else {
+                    report.rejected += 1;
+                    continue;
+                };
+                let stored_fence = u64::try_from(lease.fence).map_err(|_| {
+                    StoreError(format!(
+                        "stored fencing token is negative: {}",
+                        lease.fence
+                    ))
+                })?;
+                if stored_fence != event.source.fencing_token.0
+                    || lease.account_id.as_slice() != event.account_id.as_slice()
+                {
+                    report.rejected += 1;
+                    continue;
+                }
+                let units = to_i64(event.source.units, "units")?;
+                to_units(lease.granted, "lease granted")?;
+                to_units(lease.used, "lease used")?;
+                to_units(lease.credited, "lease credited")?;
+                let committed = lease
+                    .used
+                    .checked_add(lease.used_delta.map_or(0, NonZeroI64::get))
+                    .and_then(|used| used.checked_add(lease.credited))
+                    .ok_or_else(|| {
+                        StoreError(format!(
+                            "lease accounting overflow for {:#034x}",
+                            event.source.lease_id.0
+                        ))
+                    })?;
+                let remaining = lease.granted.checked_sub(committed).ok_or_else(|| {
+                    StoreError(format!(
+                        "lease accounting exceeds grant for {:#034x}: granted {}, committed {committed}",
+                        event.source.lease_id.0, lease.granted
+                    ))
+                })?;
+                if units > remaining {
+                    report.rejected += 1;
+                    continue;
+                }
+                let used_delta = lease
+                    .used_delta
+                    .map_or(0, NonZeroI64::get)
+                    .checked_add(units)
+                    .ok_or_else(|| {
+                        StoreError(format!(
+                            "lease usage delta overflow for {:#034x}",
+                            event.source.lease_id.0
+                        ))
+                    })?;
+                lease.used_delta = NonZeroI64::new(used_delta);
+                seen.insert(event.request_id.clone());
+                accepted.push(Accepted {
+                    event_index,
+                    settled: lease.settled,
+                    fence: lease.fence,
+                    units,
+                });
+                report.accepted += 1;
+            }
 
-        // Classify in memory against the locked rows (identical rules to
-        // MemoryStore: fencing triple, then the conservation fit that also
-        // converts a released lease's provisional loss into billed usage).
-        struct Accepted<'a> {
-            event: &'a UsageEvent,
-            settled: bool,
-            /// The lease's stored fence, already validated non-negative;
-            /// acceptance required the event's token to equal it, so this is
-            /// the event's fence in storage form with no reconversion.
-            fence: i64,
-        }
-        let mut accepted: Vec<Accepted<'_>> = Vec::with_capacity(events.len());
-        for event in events {
-            let rid = id_bytes(event.request_id.0);
-            if seen.contains(&rid) {
-                report.duplicate += 1;
-                continue;
+            if accepted.is_empty() {
+                return Ok(report);
             }
-            let Some(lease) = leases.get_mut(&id_bytes(event.lease_id.0)) else {
-                report.rejected += 1;
-                continue;
-            };
-            let stored_fence = u64::try_from(lease.fence).map_err(|_| {
-                StoreError(format!("stored fencing token is negative: {}", lease.fence))
-            })?;
-            if stored_fence != event.fencing_token.0
-                || id_from(&lease.account_id) != event.account_id.0
-            {
-                report.rejected += 1;
-                continue;
-            }
-            let units = to_i64(event.units, "units")?;
-            if units > lease.granted - lease.used - lease.used_delta - lease.credited {
-                report.rejected += 1;
-                continue;
-            }
-            lease.used_delta += units;
-            seen.insert(rid);
-            accepted.push(Accepted {
-                event,
-                settled: lease.settled,
-                fence: lease.fence,
-            });
-            report.accepted += 1;
-        }
 
-        if !accepted.is_empty() {
+            #[derive(Default)]
+            struct AccountDelta {
+                usage: i64,
+                loss: i64,
+            }
+
             // Bulk insert the accepted events.
             let (mut rid, mut acct, mut lease, mut fence, mut units, mut at) = (
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
+                Vec::with_capacity(accepted.len()),
+                Vec::with_capacity(accepted.len()),
+                Vec::with_capacity(accepted.len()),
+                Vec::with_capacity(accepted.len()),
+                Vec::with_capacity(accepted.len()),
+                Vec::with_capacity(accepted.len()),
             );
-            for a in &accepted {
-                rid.push(id_bytes(a.event.request_id.0));
-                acct.push(id_bytes(a.event.account_id.0));
-                lease.push(id_bytes(a.event.lease_id.0));
-                fence.push(a.fence);
-                units.push(to_i64(a.event.units, "units")?);
-                at.push(ts_micros(a.event.occurred_at));
+            let mut account_deltas: std::collections::BTreeMap<Vec<u8>, AccountDelta> =
+                std::collections::BTreeMap::new();
+            for accepted_event in &accepted {
+                let event = &prepared[accepted_event.event_index];
+                rid.push(event.request_id.clone());
+                acct.push(event.account_id.clone());
+                lease.push(event.lease_id.clone());
+                fence.push(accepted_event.fence);
+                units.push(accepted_event.units);
+                at.push(event.occurred_at_us);
+
+                let entry = account_deltas.entry(event.account_id.clone()).or_default();
+                entry.usage = entry.usage.checked_add(accepted_event.units).ok_or_else(|| {
+                    StoreError(format!(
+                        "usage delta overflow for account {:#034x}",
+                        event.source.account_id.0
+                    ))
+                })?;
+                if accepted_event.settled {
+                    entry.loss = entry.loss.checked_add(accepted_event.units).ok_or_else(|| {
+                        StoreError(format!(
+                            "settlement loss delta overflow for account {:#034x}",
+                            event.source.account_id.0
+                        ))
+                    })?;
+                }
             }
-            sqlx::query(
+            let inserted = sqlx::query(
                 "INSERT INTO tollgate_usage_events
                  (request_id, account_id, lease_id, fencing_token, units, occurred_at_us)
                  SELECT * FROM UNNEST($1::bytea[], $2::bytea[], $3::bytea[], $4::bigint[], $5::bigint[], $6::bigint[])",
@@ -770,59 +869,138 @@ impl UsageSink for PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(storage)?;
+            let expected_event_rows = u64::try_from(accepted.len())
+                .map_err(|_| StoreError("accepted event count exceeds u64 range".into()))?;
+            if inserted.rows_affected() != expected_event_rows {
+                return Err(StoreError(format!(
+                    "ingest inserted {} of {} accepted usage rows",
+                    inserted.rows_affected(),
+                    accepted.len()
+                )));
+            }
 
-            // Grouped per-lease and per-account aggregate updates.
-            // BTreeMap gives every transaction the same account-row lock
-            // order. Sorted lease locks alone are insufficient when two
-            // batches touch disjoint leases belonging to the same accounts.
-            let mut account_deltas: std::collections::BTreeMap<Vec<u8>, (i64, i64)> =
-                std::collections::BTreeMap::new();
-            for a in &accepted {
-                let units = to_i64(a.event.units, "units")?;
-                let entry = account_deltas
-                    .entry(id_bytes(a.event.account_id.0))
-                    .or_insert((0, 0));
-                entry.0 += units;
-                if a.settled {
-                    entry.1 += units;
-                }
-            }
-            for (lease_id, row) in leases.iter().filter(|(_, r)| r.used_delta > 0) {
-                sqlx::query("UPDATE tollgate_leases SET used = used + $2 WHERE lease_id = $1")
-                    .bind(lease_id)
-                    .bind(row.used_delta)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(storage)?;
-            }
-            for (account_id, (usage_delta, loss_delta)) in &account_deltas {
-                // The per-lease fit check bounds every straggler by the loss
-                // its own release recorded, so the account-level subtraction
-                // cannot underflow unless the ledger is corrupt (the memory
-                // backend asserts the same implication). The predicate makes
-                // that assertion in SQL: zero rows means refuse the batch and
-                // roll back rather than store a negative loss.
-                let updated = sqlx::query(
-                    "UPDATE tollgate_accounts
-                     SET usage_recorded = usage_recorded + $2,
-                         settlement_loss = settlement_loss - $3
-                     WHERE account_id = $1 AND settlement_loss >= $3",
+            // Every lease row was already locked by the sorted SELECT above,
+            // so one set-wise statement can apply the grouped usage deltas
+            // without adding a round trip per distinct lease.
+            let (lease_update_ids, lease_used_deltas): (Vec<Vec<u8>>, Vec<i64>) = leases
+                .iter()
+                .filter_map(|(lease_id, row)| {
+                    row.used_delta
+                        .map(|used_delta| (lease_id.clone(), used_delta.get()))
+                })
+                .unzip();
+            if !lease_update_ids.is_empty() {
+                let updated_leases = sqlx::query(
+                    "UPDATE tollgate_leases AS lease
+                     SET used = lease.used + delta.used
+                     FROM UNNEST($1::bytea[], $2::bigint[]) AS delta(lease_id, used)
+                     WHERE lease.lease_id = delta.lease_id",
                 )
-                .bind(account_id)
-                .bind(usage_delta)
-                .bind(loss_delta)
+                .bind(&lease_update_ids)
+                .bind(&lease_used_deltas)
                 .execute(&mut *tx)
                 .await
                 .map_err(storage)?;
-                if updated.rows_affected() != 1 {
+                let expected_lease_rows = u64::try_from(lease_update_ids.len())
+                    .map_err(|_| StoreError("ingest lease row count exceeds u64 range".into()))?;
+                if updated_leases.rows_affected() != expected_lease_rows {
                     return Err(StoreError(format!(
-                        "settlement_loss underflow for account {:#034x}: settled straggler \
-                         usage {loss_delta} exceeds recorded loss",
-                        id_from(account_id)
+                        "ingest updated {} of {} locked lease rows",
+                        updated_leases.rows_affected(),
+                        lease_update_ids.len()
                     )));
                 }
             }
-        }
+
+            let mut account_ids = Vec::with_capacity(account_deltas.len());
+            let mut account_usage_deltas = Vec::with_capacity(account_deltas.len());
+            let mut account_loss_deltas = Vec::with_capacity(account_deltas.len());
+            for (account_id, delta) in &account_deltas {
+                account_ids.push(account_id.clone());
+                account_usage_deltas.push(delta.usage);
+                account_loss_deltas.push(delta.loss);
+            }
+
+            // A set-wise UPDATE does not promise row-lock order. Lock every
+            // affected account explicitly in byte order first. BTreeMap made
+            // account_ids sorted, preserving ingest's lease-then-account
+            // order and preventing concurrent multi-account batches from
+            // forming a deadlock cycle.
+            let locked_accounts = sqlx::query(
+                "SELECT account_id, usage_recorded, settlement_loss
+                 FROM tollgate_accounts
+                 WHERE account_id = ANY($1)
+                 ORDER BY account_id FOR UPDATE",
+            )
+            .bind(&account_ids)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(storage)?;
+            if locked_accounts.len() != account_ids.len() {
+                return Err(StoreError(format!(
+                    "ingest locked {} of {} referenced account rows",
+                    locked_accounts.len(),
+                    account_ids.len()
+                )));
+            }
+
+            // Validate every account before the set-wise mutation. The
+            // per-lease fit check bounds each straggler by the provisional
+            // loss its own release recorded, so a short account loss means
+            // ledger corruption and the entire transaction must roll back.
+            for row in locked_accounts {
+                let account_id: Vec<u8> = row.get(0);
+                let usage_recorded: i64 = row.get(1);
+                let settlement_loss: i64 = row.get(2);
+                to_units(usage_recorded, "account usage_recorded")?;
+                to_units(settlement_loss, "account settlement_loss")?;
+                let delta = account_deltas.get(&account_id).ok_or_else(|| {
+                    StoreError(format!(
+                        "ingest locked unexpected account {:#034x}",
+                        id_from(&account_id)
+                    ))
+                })?;
+                usage_recorded.checked_add(delta.usage).ok_or_else(|| {
+                    StoreError(format!(
+                        "usage_recorded overflow for account {:#034x}",
+                        id_from(&account_id)
+                    ))
+                })?;
+                if settlement_loss < delta.loss {
+                    return Err(StoreError(format!(
+                        "settlement_loss underflow for account {:#034x}: settled straggler \
+                         usage {} exceeds recorded loss",
+                        id_from(&account_id),
+                        delta.loss
+                    )));
+                }
+            }
+
+            let updated_accounts = sqlx::query(
+                "UPDATE tollgate_accounts AS account
+                 SET usage_recorded = account.usage_recorded + delta.usage,
+                     settlement_loss = account.settlement_loss - delta.loss
+                 FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[])
+                      AS delta(account_id, usage, loss)
+                 WHERE account.account_id = delta.account_id
+                   AND account.settlement_loss >= delta.loss",
+            )
+            .bind(&account_ids)
+            .bind(&account_usage_deltas)
+            .bind(&account_loss_deltas)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+            let expected_account_rows = u64::try_from(account_ids.len())
+                .map_err(|_| StoreError("ingest account row count exceeds u64 range".into()))?;
+            if updated_accounts.rows_affected() != expected_account_rows {
+                return Err(StoreError(format!(
+                    "ingest updated {} of {} locked account rows",
+                    updated_accounts.rows_affected(),
+                    account_ids.len()
+                )));
+            }
+
             Ok(report)
         }
         .await;

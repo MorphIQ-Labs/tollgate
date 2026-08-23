@@ -17,7 +17,7 @@ permission bits — never plan names, FCUs, or SQL.
 | `crates/tollgate-core` | Zero-I/O, clock-free hot path: `CostUnits` (checked), `CostTable` (direct-indexed), `AccountSnapshot`, `LocalLease` (fenced, CAS), `Reservation` (pending → committed-at-execution-start \| released) |
 | `crates/tollgate-admission` | One-call pipeline: snapshot map (arc-swap and moka candidates) → permissions → quote → weighted `governor` rate token → lease reservation |
 | `crates/tollgate-store` | `LeaseAllocator` / `SnapshotSource` / `UsageSink` / `AdminStore` traits, `GrantPolicy`, `MemoryStore` reference backend, wire DTOs, `Clock` |
-| `crates/tollgate-store-postgres` | Transactional Postgres backend (row-locked acquire, bounded set-wise SKIP LOCKED reclaim, ON CONFLICT idempotency) |
+| `crates/tollgate-store-postgres` | Transactional Postgres backend (row-locked acquire, set-wise usage ingest, bounded set-wise SKIP LOCKED reclaim) |
 | `crates/tollgate-server` | Axum control plane over any backend; RFC-7807 errors with stable codes |
 | `crates/tollgate-client` | Instance runtime: `LeaseManager` (background refill, quiescence-gated release), `UsageWriter` (permit-based shed-on-overflow batching), `HttpStore` transport |
 | `crates/tollgate-perf-gate` | Benchmark threshold checker (criterion estimates vs manifest, staleness-guarded) |

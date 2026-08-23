@@ -22,7 +22,16 @@ tracing = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+criterion = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+
+# Control-plane database latency, reported but not gated: the absolute result
+# depends on the PostgreSQL host and connection path. This benchmark exists to
+# compare the per-record update shape against the set-wise ingest shape on the
+# same database.
+[[bench]]
+name = "ingest"
+harness = false
 
 [lints]
 workspace = true

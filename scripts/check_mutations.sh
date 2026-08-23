@@ -5,7 +5,19 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 VERSION_FILE="$ROOT/.cargo/mutants-version"
 NEXTEST_VERSION_FILE="$ROOT/.cargo/nextest-version"
 OUTPUT="$ROOT/reports/mutations"
-JOBS=${MUTANTS_JOBS:-4}
+# Each cargo-mutants worker starts its own nextest process. Nextest test groups
+# can serialize PostgreSQL tests within one process, but not across workers;
+# parallel workers would therefore truncate the same database underneath one
+# another and could turn unrelated failures into false "caught" mutants.
+if [ -n "${TOLLGATE_PG_URL:-}" ]; then
+  if [ "${MUTANTS_JOBS:-1}" != "1" ]; then
+    echo "mutation gate: MUTANTS_JOBS must be 1 when TOLLGATE_PG_URL is set; PostgreSQL tests share one database" >&2
+    exit 2
+  fi
+  JOBS=1
+else
+  JOBS=${MUTANTS_JOBS:-4}
+fi
 # `set -u` is on, so the verdict below needs this defined even when the run
 # never reaches cargo-mutants.
 status=0

@@ -8,6 +8,10 @@ slow-timeout = { period = "10s", terminate-after = 1, grace-period = "1s" }
 [test-groups]
 postgres = { max-threads = 1 }
 
+# This group serializes PostgreSQL tests inside one nextest process.
+# `scripts/check_mutations.sh` also restricts cargo-mutants to one worker when
+# PostgreSQL is enabled because separate nextest processes cannot share this
+# group semaphore and the suite intentionally truncates one shared database.
 [[profile.mutants.overrides]]
 filter = 'package(tollgate-store-postgres)'
 test-group = 'postgres'
