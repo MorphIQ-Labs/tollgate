@@ -5,6 +5,20 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.1.4...v0.2.0) - 2026-08-23
+
+### Added
+
+- *(client)* #38 export accounting health continuously, not only at shutdown
+
+### Fixed
+
+- *(snapshot)* [**breaking**] validate batch quotes against burst
+
+### Other
+
+- *(server)* feature-gate postgres backend
+
 ## [0.1.4](https://github.com/MorphIQ-Labs/tollgate/compare/v0.1.3...v0.1.4) - 2026-08-23
 
 ### Added
