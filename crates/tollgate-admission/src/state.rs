@@ -153,9 +153,78 @@ fn rate_params(limits: &ResolvedLimits) -> (u64, u64) {
 /// by account count.
 #[derive(Default)]
 pub(crate) struct AccountLimiters {
-    inner: std::sync::Mutex<
+    inner: std::sync::Mutex<Registry>,
+}
+
+#[derive(Default)]
+struct Registry {
+    by_account:
         std::collections::HashMap<tollgate_core::AccountId, std::sync::Weak<AccountLimiter>>,
-    >,
+    /// Size at the last sweep, so dead entries are reclaimed in proportion to
+    /// how many have accumulated rather than on every single lookup.
+    swept_at: usize,
+    /// Entries walked across every sweep so far.
+    ///
+    /// The amortised bound is the whole point of #8, and it is a claim about
+    /// total *work*, not sweep count: many tiny sweeps of a registry that
+    /// keeps emptying are cheap, while one sweep per install over a registry
+    /// full of live accounts is the quadratic. Only the entries-walked total
+    /// distinguishes them.
+    #[cfg(test)]
+    swept_entries: usize,
+}
+
+/// Below this many accounts a sweep is too cheap to be worth deferring, and
+/// deferring it would let a tiny registry hold dead entries indefinitely.
+const SWEEP_FLOOR: usize = 8;
+
+impl Registry {
+    /// Reclaim dead entries, but only once the registry has grown enough since
+    /// the last sweep to be worth walking.
+    ///
+    /// Sweeping on every lookup made a bulk install O(N·A): every one of N
+    /// entries walked all A accounts (#8). Since the sweep reclaims memory and
+    /// nothing else — a dead `Weak` upgrades to `None`, which the lookup below
+    /// already handles by building a fresh limiter — it can be deferred freely.
+    /// Doubling keeps dead entries within a constant factor of live ones and
+    /// makes the amortised cost per lookup O(1).
+    fn sweep_if_overgrown(&mut self) {
+        // Doubling is what makes the amortisation work: each sweep costs the
+        // registry's size, and the next one cannot come until that size has
+        // doubled, so the total walked across N installs stays proportional to
+        // N. The floor keeps a small registry from being walked repeatedly on
+        // the way up from empty.
+        let threshold = self.swept_at.saturating_mul(2).max(SWEEP_FLOOR);
+        if self.by_account.len() <= threshold {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.swept_entries += self.by_account.len();
+        }
+        self.by_account
+            .retain(|_, limiter| limiter.strong_count() > 0);
+        self.swept_at = self.by_account.len();
+    }
+
+    fn resolve(
+        &mut self,
+        account: tollgate_core::AccountId,
+        generation: Generation,
+        limits: &ResolvedLimits,
+    ) -> Arc<AccountLimiter> {
+        if let Some(limiter) = self
+            .by_account
+            .get(&account)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            limiter.update(generation, limits);
+            return limiter;
+        }
+        let limiter = Arc::new(AccountLimiter::new(generation, limits));
+        self.by_account.insert(account, Arc::downgrade(&limiter));
+        limiter
+    }
 }
 
 impl AccountLimiters {
@@ -169,16 +238,54 @@ impl AccountLimiters {
         limits: &ResolvedLimits,
     ) -> Arc<AccountLimiter> {
         let mut inner = self.inner.lock().expect("limiter registry poisoned");
-        // The registry must not defeat a bounded snapshot cache: entries with
-        // no remaining principal state are discarded at control-plane time.
-        inner.retain(|_, limiter| limiter.strong_count() > 0);
-        if let Some(limiter) = inner.get(&account).and_then(std::sync::Weak::upgrade) {
-            limiter.update(generation, limits);
-            return limiter;
-        }
-        let limiter = Arc::new(AccountLimiter::new(generation, limits));
-        inner.insert(account, Arc::downgrade(&limiter));
-        limiter
+        inner.sweep_if_overgrown();
+        inner.resolve(account, generation, limits)
+    }
+
+    /// Resolve a whole batch under one lock.
+    ///
+    /// The bulk paths used to take and release the registry mutex once per
+    /// entry; a batch of N took it N times. `resolve` still runs per entry —
+    /// two principals of one account can arrive in the same batch carrying
+    /// different generations, and de-duplicating by account would silently
+    /// drop one of them. What is shared is the lock and the sweep decision,
+    /// not the update.
+    pub(crate) fn limiters_for<T>(
+        &self,
+        batch: impl IntoIterator<Item = T>,
+        mut key: impl FnMut(&T) -> (tollgate_core::AccountId, Generation),
+        mut limits: impl FnMut(&T) -> ResolvedLimits,
+    ) -> Vec<(T, Arc<AccountLimiter>)> {
+        let mut inner = self.inner.lock().expect("limiter registry poisoned");
+        inner.sweep_if_overgrown();
+        batch
+            .into_iter()
+            .map(|item| {
+                let (account, generation) = key(&item);
+                let limiter = inner.resolve(account, generation, &limits(&item));
+                (item, limiter)
+            })
+            .collect()
+    }
+
+    /// How many accounts the registry is holding, live or not yet reclaimed.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("limiter registry poisoned")
+            .by_account
+            .len()
+    }
+
+    /// Total entries walked across every sweep — the work the amortisation
+    /// exists to bound.
+    #[cfg(test)]
+    pub(crate) fn swept_entries(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("limiter registry poisoned")
+            .swept_entries
     }
 }
 

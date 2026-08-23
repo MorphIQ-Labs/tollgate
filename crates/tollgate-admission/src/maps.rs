@@ -183,37 +183,56 @@ impl ArcSwapSnapshotMap {
         }
     }
 
+    /// Resolve each update's limiter ahead of the map write.
+    ///
+    /// The positives are resolved as one batch under a single registry lock
+    /// (#8): this used to take and release that mutex once per entry, so a
+    /// bulk install of N principals took it N times — inside the very function
+    /// that exists to make bulk installs cheap.
     fn prepare(&self, updates: Vec<SnapshotUpdate>) -> Vec<PreparedUpdate> {
-        updates
-            .into_iter()
-            .map(|update| match update {
+        // Negatives need no limiter, so they skip the registry entirely and
+        // keep their place by index rather than by being carried through it.
+        let mut prepared: Vec<Option<PreparedUpdate>> = Vec::with_capacity(updates.len());
+        let mut positives = Vec::new();
+        for update in updates {
+            match update {
                 SnapshotUpdate::Present {
                     principal,
                     snapshot,
                     lease,
                 } => {
-                    let limiter = self.limiters.limiter_for(
-                        snapshot.account_id,
-                        snapshot.generation,
-                        &snapshot.limits,
-                    );
-                    PreparedUpdate::Present {
-                        principal,
-                        snapshot,
-                        lease,
-                        limiter,
-                    }
+                    prepared.push(None);
+                    positives.push((prepared.len() - 1, principal, snapshot, lease));
                 }
                 SnapshotUpdate::Negative {
                     principal,
                     until,
                     generation,
-                } => PreparedUpdate::Negative {
+                } => prepared.push(Some(PreparedUpdate::Negative {
                     principal,
                     until,
                     generation,
-                },
-            })
+                })),
+            }
+        }
+
+        let resolved = self.limiters.limiters_for(
+            positives,
+            |(_, _, snapshot, _)| (snapshot.account_id, snapshot.generation),
+            |(_, _, snapshot, _)| snapshot.limits,
+        );
+        for ((slot, principal, snapshot, lease), limiter) in resolved {
+            prepared[slot] = Some(PreparedUpdate::Present {
+                principal,
+                snapshot,
+                lease,
+                limiter,
+            });
+        }
+
+        prepared
+            .into_iter()
+            .map(|update| update.expect("every slot is filled by exactly one branch above"))
             .collect()
     }
 
@@ -506,6 +525,168 @@ mod tests {
             .filter(|raw| map.get(&Principal(*raw)).is_some())
             .count();
         assert_eq!(visible, CAP);
+    }
+
+    /// A snapshot for a named account, so a test can build the many-account
+    /// workload the single-account `snapshot()` fixture cannot express.
+    fn snapshot_for(account: u128, generation: u64) -> Arc<AccountSnapshot> {
+        Arc::new(AccountSnapshot {
+            account_id: AccountId(account),
+            ..(*snapshot(generation)).clone()
+        })
+    }
+
+    /// Issue #8 moved the dead-entry sweep off the per-lookup path, so the
+    /// registry no longer reclaims on every call. It must still reclaim: an
+    /// unbounded registry would defeat the bounded snapshot cache it sits
+    /// beside. Nothing asserted this before, which is what made deferring the
+    /// sweep a live question rather than an obvious win.
+    #[test]
+    fn the_limiter_registry_stays_bounded_across_account_churn() {
+        let map = ArcSwapSnapshotMap::new();
+        // A *distinct* account each time, installed and then evicted, so every
+        // limiter's strong reference dies and its registry entry becomes
+        // reclaimable. Reusing account ids would prove nothing: `insert`
+        // replaces in place, so the registry would stay small even if the
+        // sweep never ran at all.
+        for account in 0..1_000u128 {
+            let principal = Principal(account);
+            map.install(principal, snapshot_for(account, 1), LeaseSlot::empty());
+            map.remove(&principal);
+        }
+
+        let held = map.limiters.len();
+        assert!(
+            held <= 64,
+            "1,000 dead accounts left {held} registry entries; the sweep is \
+             not reclaiming, and the registry grows without bound"
+        );
+    }
+
+    /// The quadratic #8 describes needs *live* accounts: a registry that keeps
+    /// emptying is cheap to walk however often you do it. With a thousand
+    /// accounts all still present, sweeping per install would walk on the
+    /// order of a thousand entries a thousand times.
+    ///
+    /// Total entries walked is therefore the measure, not sweep count — this
+    /// is the property the benchmark demonstrates, pinned as a test so a
+    /// future change cannot quietly put the walk back on the install path.
+    #[test]
+    fn sweeping_costs_work_proportional_to_installs_not_to_their_square() {
+        let map = ArcSwapSnapshotMap::new();
+        // Kept alive: no `remove`, so every account stays in the registry and
+        // each sweep has the full set to walk.
+        for account in 0..1_000u128 {
+            map.install(
+                Principal(account),
+                snapshot_for(account, 1),
+                LeaseSlot::empty(),
+            );
+        }
+
+        let walked = map.limiters.swept_entries();
+        assert!(
+            walked <= 4_000,
+            "1,000 installs walked {walked} registry entries; sweeping is \
+             back on the per-install path, which is O(N·A) again"
+        );
+        assert!(
+            walked > 0,
+            "no entry was ever walked, so either nothing sweeps or the \
+             measurement is broken — both make the bound above vacuous"
+        );
+    }
+
+    /// The sweep is deferred, not skipped: entries for accounts still present
+    /// in the map must survive it, or a live account would lose its shared
+    /// bucket and every principal would get its own.
+    #[test]
+    fn sweeping_never_reclaims_a_live_account() {
+        let map = ArcSwapSnapshotMap::new();
+        map.install(Principal(0), snapshot_for(7, 1), LeaseSlot::empty());
+        let before = match map.get(&Principal(0)).unwrap() {
+            MapEntry::Present(state) => state.limiter.clone(),
+            MapEntry::NegativeUntil { .. } => unreachable!(),
+        };
+
+        // Enough churn to force several sweeps past the growth watermark.
+        for account in 100..300u128 {
+            let principal = Principal(account);
+            map.install(principal, snapshot_for(account, 1), LeaseSlot::empty());
+            map.remove(&principal);
+        }
+
+        map.install(Principal(1), snapshot_for(7, 1), LeaseSlot::empty());
+        let after = match map.get(&Principal(1)).unwrap() {
+            MapEntry::Present(state) => state.limiter.clone(),
+            MapEntry::NegativeUntil { .. } => unreachable!(),
+        };
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "account 7 was still in the map; its limiter must have survived \
+             the sweeps, or its principals stop sharing a bucket"
+        );
+    }
+
+    /// Batching the registry lookup must not batch the *update*: two
+    /// principals of one account can arrive in one write carrying different
+    /// generations, and the newer must win whichever order they appear in.
+    #[test]
+    fn one_batch_with_two_generations_keeps_the_newer() {
+        for reversed in [false, true] {
+            let map = ArcSwapSnapshotMap::new();
+            // A larger burst, so which generation won is observable: the
+            // rate alone is not, without waiting for the bucket to refill.
+            let faster = Arc::new(AccountSnapshot {
+                limits: ResolvedLimits {
+                    max_items_per_request: 100,
+                    rate_units_per_second: 1_000,
+                    rate_burst_units: 9_000,
+                },
+                ..(*snapshot(5)).clone()
+            });
+            let mut updates = vec![
+                SnapshotUpdate::Present {
+                    principal: Principal(1),
+                    snapshot: snapshot(3),
+                    lease: LeaseSlot::empty(),
+                },
+                SnapshotUpdate::Present {
+                    principal: Principal(2),
+                    snapshot: faster,
+                    lease: LeaseSlot::empty(),
+                },
+            ];
+            if reversed {
+                updates.reverse();
+            }
+            map.apply_many(updates);
+
+            let state = match map.get(&Principal(1)).unwrap() {
+                MapEntry::Present(state) => state,
+                MapEntry::NegativeUntil { .. } => unreachable!(),
+            };
+            assert_eq!(
+                state.snapshot.generation,
+                Generation(3),
+                "each principal keeps its own snapshot"
+            );
+            // Both principals share one limiter, and generation 5's limits are
+            // what it must be carrying: the older update cannot roll it back.
+            let other = match map.get(&Principal(2)).unwrap() {
+                MapEntry::Present(state) => state,
+                MapEntry::NegativeUntil { .. } => unreachable!(),
+            };
+            assert!(Arc::ptr_eq(&state.limiter, &other.limiter));
+            assert!(
+                state
+                    .limiter
+                    .check_n(std::num::NonZeroU32::new(6_000).unwrap())
+                    .is_ok(),
+                "generation 5's larger burst must have been applied \
+                 (reversed order: {reversed})"
+            );
+        }
     }
 
     /// Review finding #4: the advertised limit is an *account* limit — every
