@@ -5,6 +5,12 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.3...v0.2.4) - 2026-08-23
+
+### Other
+
+- *(client)* #22 index the resolution deadlines instead of rescanning them
+
 ## [0.2.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.2...v0.2.3) - 2026-08-23
 
 ### Other
