@@ -4,7 +4,10 @@
 [workspace]
 publish = false
 git_only = true
-release_always = false
+# One-time migration: force release-plz to open the 0.1.1 release MR from the
+# packageable namespaced baseline. That MR restores the canonical tag pattern
+# and this guard before it is merged.
+release_always = true
 semver_check = true
 # `v0.1.0` predates packageable workspace manifests. The namespaced series is
 # the reproducible release baseline for this multi-crate workspace.
