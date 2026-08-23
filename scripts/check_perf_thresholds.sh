@@ -24,5 +24,18 @@ touch "$MARKER"
 cargo bench --locked -p tollgate-core --bench core_hot_path
 cargo bench --locked -p tollgate-admission --bench admission_hot_path
 
-exec cargo run --locked -p tollgate-perf-gate --bin check_benchmark_thresholds -- \
+# Read the load average here rather than in the gate binary: there is no
+# portable way to ask for it from std, and capturing the environment is the
+# wrapper's job while judging it is the checker's. Recorded straight after the
+# benchmarks, so it reflects the machine that produced these numbers.
+load_average() {
+    if [ -r /proc/loadavg ]; then
+        cut -d' ' -f1-3 /proc/loadavg
+    elif command -v sysctl > /dev/null 2>&1; then
+        sysctl -n vm.loadavg 2> /dev/null | tr -d '{}' | awk '{ print $1, $2, $3 }'
+    fi
+}
+
+TOLLGATE_GATE_LOAD="$(load_average)" \
+    exec cargo run --locked -p tollgate-perf-gate --bin check_benchmark_thresholds -- \
     testing/perf_thresholds.json "$CRITERION_ROOT" "$REPORT" "$MARKER"
