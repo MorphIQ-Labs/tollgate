@@ -222,11 +222,25 @@ impl MemoryStore {
                 },
             );
         }
-        // No receivers is fine: pull via `snapshot()` still observes it.
-        let _ = self.push.send(SnapshotPush {
+        self.push_to_subscribers(SnapshotPush {
             principal,
             resolution: SnapshotResolution::Present(snapshot),
         });
+    }
+
+    /// Broadcast a control-plane change. No receivers is not a failure — a
+    /// pull via `snapshot()` still observes it — but how many instances the
+    /// push actually reached is the difference between "propagated in
+    /// milliseconds" and "propagated at the next refresh interval", so it is
+    /// reported rather than discarded.
+    fn push_to_subscribers(&self, push: SnapshotPush) {
+        let principal = push.principal;
+        let subscribers = self.push.send(push).unwrap_or(0);
+        tracing::debug!(
+            principal = principal.0,
+            subscribers,
+            "snapshot pushed to subscribers"
+        );
     }
 
     pub fn remove_snapshot(&self, principal: Principal) {
@@ -241,7 +255,7 @@ impl MemoryStore {
             record.snapshot = None;
             record.generation
         };
-        let _ = self.push.send(SnapshotPush {
+        self.push_to_subscribers(SnapshotPush {
             principal,
             resolution: SnapshotResolution::Revoked { generation },
         });

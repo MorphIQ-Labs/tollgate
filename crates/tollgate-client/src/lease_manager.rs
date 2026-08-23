@@ -40,6 +40,7 @@ use std::sync::Arc;
 
 use jiff::SignedDuration;
 use tokio::sync::watch;
+use tracing::Instrument as _;
 
 use tollgate_admission::LeaseSlot;
 use tollgate_core::{AccountId, CostUnits, LocalLease};
@@ -157,11 +158,15 @@ impl LeaseManager {
         config.validate()?;
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (health_tx, health) = watch::channel(true);
-        let handle = tokio::spawn(async move {
-            let report = run(allocator, slot, clock, config, shutdown_rx, &health_tx).await;
-            let _ = health_tx.send(false);
-            report
-        });
+        let account = config.account;
+        let handle = tokio::spawn(
+            async move {
+                let report = run(allocator, slot, clock, config, shutdown_rx, &health_tx).await;
+                crate::signal(&health_tx, false, "lease-manager health");
+                report
+            }
+            .instrument(tracing::info_span!("lease_manager", account = account.0)),
+        );
         Ok(LeaseManager {
             shutdown,
             health,
@@ -182,7 +187,7 @@ impl LeaseManager {
     /// report what it managed. Bounded by `shutdown_release_deadline`: a hung
     /// allocator cannot stall this call.
     pub async fn shutdown(mut self) -> LeaseManagerReport {
-        let _ = self.shutdown.send(true);
+        crate::signal(&self.shutdown, true, "lease-manager shutdown");
         let died = LeaseManagerReport {
             released: 0,
             abandoned: 0,
@@ -287,11 +292,28 @@ async fn run(
                     parked.push(old);
                 }
             }
-            Ok(Err(_)) | Err(_) => {
-                // Denied, backend down, or too slow: nothing to install. The
-                // slot keeps whatever live lease it still has (spend
-                // continues until exhaustion/expiry); an empty slot stays
-                // empty — deny.
+            // Denied, backend down, or too slow: nothing to install. The slot
+            // keeps whatever live lease it still has (spend continues until
+            // exhaustion/expiry); an empty slot stays empty — deny.
+            //
+            // Level follows consequence, not cause: refusal during ordinary
+            // rotation is routine and stays `debug`, but the same refusal
+            // against an empty slot means this instance is denying every
+            // request, which is the condition an operator must see.
+            outcome => {
+                let serving = slot.load().is_some();
+                let reason: &dyn std::fmt::Display = match &outcome {
+                    Ok(Err(error)) => error,
+                    _ => &"allocator timed out",
+                };
+                if serving {
+                    tracing::debug!(%reason, "lease acquire refused; still serving");
+                } else {
+                    tracing::warn!(
+                        %reason,
+                        "lease acquire refused with an empty slot; requests are denied"
+                    );
+                }
             }
         }
     }
@@ -327,8 +349,26 @@ async fn run(
         {
             // A refusal still means the store is no longer holding this lease
             // open for us — only an unfinished call leaves it outstanding.
-            Ok(_) => report.released += 1,
-            Err(_) => report.abandoned += 1,
+            // The count says how many; the event says which refusal, which
+            // the count alone cannot distinguish from a clean release.
+            Ok(Ok(())) => report.released += 1,
+            Ok(Err(error)) => {
+                report.released += 1;
+                tracing::warn!(
+                    lease = grant.lease_id.0,
+                    %error,
+                    "lease refused at shutdown; the store considers it settled"
+                );
+            }
+            Err(_) => {
+                report.abandoned += 1;
+                tracing::warn!(
+                    lease = grant.lease_id.0,
+                    units = lease.remaining().get(),
+                    "shutdown budget expired with a lease unreturned; \
+                     its units settle at TTL reclaim"
+                );
+            }
         }
     }
     report
@@ -374,19 +414,51 @@ async fn release_quiesced(
             ),
         )
         .await;
+        let lease_id = grant.lease_id.0;
         match outcome {
             // Unfinished or unreachable: nothing was settled, try next tick.
-            Err(_) | Ok(Err(AllocateError::Storage(_))) => retry.push(lease),
+            Err(_) => {
+                tracing::debug!(lease = lease_id, "release timed out; retrying next tick");
+                retry.push(lease);
+            }
+            Ok(Err(AllocateError::Storage(error))) => {
+                tracing::warn!(
+                    lease = lease_id,
+                    %error,
+                    "release failed against the store; retrying next tick"
+                );
+                retry.push(lease);
+            }
             // Settled, or nothing to settle.
-            Ok(Ok(())) | Ok(Err(AllocateError::LeaseNotActive | AllocateError::UnknownLease)) => {}
+            Ok(Ok(())) => {}
+            Ok(Err(error @ (AllocateError::LeaseNotActive | AllocateError::UnknownLease))) => {
+                tracing::debug!(lease = lease_id, %error, "lease was already settled");
+            }
             Ok(Err(AllocateError::Fenced)) => {
+                tracing::warn!(
+                    lease = lease_id,
+                    "fenced by a newer holder; clearing the slot so this instance stops serving"
+                );
                 slot.take();
             }
             Ok(Err(AllocateError::InvalidRelease)) => {
-                let _ = health.send(false);
+                tracing::error!(
+                    lease = lease_id,
+                    units = lease.remaining().get(),
+                    "the store rejected this release as an accounting error; \
+                     local counts disagree with the ledger and readiness is dropping"
+                );
+                crate::signal(health, false, "lease-manager health");
             }
-            // Acquire-only refusals; a release cannot produce them.
-            Ok(Err(_)) => {}
+            // Acquire-only refusals; a release cannot produce them. Reaching
+            // this arm means the allocator's contract changed under us.
+            Ok(Err(error)) => {
+                tracing::error!(
+                    lease = lease_id,
+                    %error,
+                    "allocator returned an acquire-only refusal to a release"
+                );
+            }
         }
     }
     *parked = retry;

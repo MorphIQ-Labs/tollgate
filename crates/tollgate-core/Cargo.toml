@@ -24,3 +24,6 @@ serde = ["dep:serde", "jiff/serde"]
 [[bench]]
 name = "core_hot_path"
 harness = false
+
+[lints]
+workspace = true

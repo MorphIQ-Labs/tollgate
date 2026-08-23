@@ -21,3 +21,6 @@ proptest = { workspace = true }
 [[bench]]
 name = "admission_hot_path"
 harness = false
+
+[lints]
+workspace = true

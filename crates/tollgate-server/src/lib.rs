@@ -29,6 +29,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use jiff::SignedDuration;
+use tracing::Instrument as _;
 
 use tollgate_core::{AccountId, CostUnits, Principal};
 use tollgate_store::wire::{
@@ -110,14 +111,12 @@ pub async fn serve<S: Backend>(
     }
     let sweep_store = Arc::clone(&state.store);
     let sweep_clock = Arc::clone(&state.clock);
-    let sweeper = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(reclaim_interval);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            let _ = sweep_store.reclaim_expired(sweep_clock.now()).await;
-        }
-    });
+    let sweeper = tokio::spawn(
+        reclaim_sweep(sweep_store, sweep_clock, reclaim_interval).instrument(tracing::info_span!(
+            "reclaim_sweep",
+            interval_ms = reclaim_interval.as_millis()
+        )),
+    );
     let result = axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown)
         .await;
@@ -125,12 +124,62 @@ pub async fn serve<S: Backend>(
     result
 }
 
+/// Reclaim expired leases forever, on the configured interval.
+///
+/// This is INVARIANTS.md #9's server half, and it is the only thing that
+/// returns units stranded by a crashed holder. A sweep that fails every tick
+/// breaks that guarantee indefinitely while `/readyz` still answers, because
+/// a store can serve `ping` and fail `reclaim_expired` — so the failure must
+/// be said out loud. Both outcomes are reported: silence about success would
+/// leave "the sweep is running but finding nothing" and "the sweep stopped"
+/// indistinguishable.
+async fn reclaim_sweep<S: Backend>(
+    store: Arc<S>,
+    clock: Arc<dyn Clock>,
+    interval: std::time::Duration,
+) {
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut consecutive_failures: u64 = 0;
+    loop {
+        tick.tick().await;
+        match store.reclaim_expired(clock.now()).await {
+            Ok(reclaimed) => {
+                if consecutive_failures > 0 {
+                    tracing::info!(
+                        after_failures = consecutive_failures,
+                        "reclaim sweep recovered"
+                    );
+                    consecutive_failures = 0;
+                }
+                if !reclaimed.is_empty() {
+                    let units: u64 = reclaimed.iter().map(|lease| lease.reclaimed.get()).sum();
+                    tracing::info!(leases = reclaimed.len(), units, "reclaimed expired leases");
+                }
+            }
+            Err(error) => {
+                consecutive_failures += 1;
+                tracing::warn!(
+                    %error,
+                    consecutive_failures,
+                    "reclaim sweep failed; expired leases stay stranded until it recovers"
+                );
+            }
+        }
+    }
+}
+
 /// Ready only when the backing store answers (review finding #11): a server
 /// whose source of truth is unreachable must not attract traffic.
 async fn readyz<S: Backend>(State(state): State<ServerState<S>>) -> StatusCode {
     match state.store.ping().await {
         Ok(()) => StatusCode::OK,
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+        Err(error) => {
+            // The 503 says "not ready"; only the event says why, and "why"
+            // is the difference between a restart and a page.
+            tracing::warn!(%error, "readiness probe failed: the store did not answer");
+            StatusCode::SERVICE_UNAVAILABLE
+        }
     }
 }
 

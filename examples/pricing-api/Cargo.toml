@@ -20,6 +20,8 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 # fast-rng: v4 ids from a userspace CSPRNG seeded once — a getrandom
 # syscall per request measurably regressed the loopback overhead gate.
 uuid = { version = "1", features = ["v4", "fast-rng"] }

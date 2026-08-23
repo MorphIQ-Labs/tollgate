@@ -57,6 +57,7 @@
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, watch};
+use tracing::Instrument as _;
 
 use tollgate_core::{DenyReason, UsageEvent};
 use tollgate_store::Clock;
@@ -255,17 +256,26 @@ impl UsageWriter {
         let weak = tx.downgrade();
         let (shutdown, shutdown_rx) = watch::channel(false);
         let unaccounted: Unaccounted = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let handle = tokio::spawn(run(
-            Writer {
-                sink,
-                clock,
-                config,
-                unaccounted: Arc::clone(&unaccounted),
-            },
-            rx,
-            weak,
-            shutdown_rx,
-        ));
+        let handle = tokio::spawn(
+            run(
+                Writer {
+                    sink,
+                    clock,
+                    config,
+                    unaccounted: Arc::clone(&unaccounted),
+                },
+                rx,
+                weak,
+                shutdown_rx,
+            )
+            // One writer serves every account, so the span carries the
+            // queue's shape; account and lease identify individual events.
+            .instrument(tracing::info_span!(
+                "usage_writer",
+                queue_capacity = config.queue_capacity,
+                max_batch = config.max_batch
+            )),
+        );
         Ok((
             UsageRecorder {
                 tx,
@@ -287,7 +297,7 @@ impl UsageWriter {
     /// never a zeroed [`WriterStats`], which would be indistinguishable from
     /// a clean shutdown (INVARIANTS.md #8).
     pub async fn shutdown(mut self) -> Result<WriterStats, WriterShutdownError> {
-        let _ = self.shutdown.send(true);
+        crate::signal(&self.shutdown, true, "usage-writer shutdown");
         let Some(handle) = self.handle.take() else {
             // Unreachable through the public API: `shutdown` consumes the
             // handle, and `Drop` runs only afterwards.
@@ -416,12 +426,24 @@ async fn flush_retrying(
         config,
         ..
     } = writer;
+    // An outage is a *duration*, not an event: retrying forever is the
+    // designed behavior, so the only way it becomes visible is by reporting
+    // when it began, and how long it lasted once it ends. `WriterStats` sees
+    // none of this — a recovered outage produces a perfectly clean report.
+    let mut outage: Option<(tokio::time::Instant, u64)> = None;
     loop {
         // A sink that hangs is indistinguishable from one that is merely slow,
         // and neither may park this task: the timeout turns both into the
         // ordinary retry path.
         match tokio::time::timeout(config.ingest_timeout, sink.ingest(batch, clock.now())).await {
             Ok(Ok(report)) => {
+                if let Some((began, attempts)) = outage {
+                    tracing::info!(
+                        attempts,
+                        outage_ms = began.elapsed().as_millis(),
+                        "usage sink recovered"
+                    );
+                }
                 stats.accepted += report.accepted;
                 stats.duplicate += report.duplicate;
                 stats.rejected += report.rejected;
@@ -429,7 +451,29 @@ async fn flush_retrying(
                 batch.clear();
                 return;
             }
-            Ok(Err(_)) | Err(_) => {
+            outcome => {
+                let timed_out = outcome.is_err();
+                let attempts = match &mut outage {
+                    Some((_, attempts)) => {
+                        *attempts += 1;
+                        *attempts
+                    }
+                    none => {
+                        // First failure of this outage: say so once at warn,
+                        // then stay quiet at debug so a long outage does not
+                        // become a log flood.
+                        *none = Some((tokio::time::Instant::now(), 1));
+                        tracing::warn!(
+                            events = batch.len(),
+                            timed_out,
+                            "usage sink failing; batching up and retrying"
+                        );
+                        1
+                    }
+                };
+                if attempts > 1 {
+                    tracing::debug!(attempts, timed_out, "usage sink still failing");
+                }
                 tokio::select! {
                     _ = tokio::time::sleep(config.retry_backoff) => {}
                     _ = shutdown.changed() => {}
@@ -437,6 +481,15 @@ async fn flush_retrying(
                 // Level check covers every wake-up path: backoff elapsed,
                 // signal received, or sender dropped.
                 if *shutdown.borrow() || shutdown.has_changed().is_err() {
+                    if let Some((began, attempts)) = outage {
+                        tracing::warn!(
+                            attempts,
+                            outage_ms = began.elapsed().as_millis(),
+                            events = batch.len(),
+                            "shutdown observed during a sink outage; \
+                             the final flush decides these events' fate"
+                        );
+                    }
                     return;
                 }
             }

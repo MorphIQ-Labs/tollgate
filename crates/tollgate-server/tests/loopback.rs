@@ -3,6 +3,13 @@
 //! engine, lease manager, usage writer — running over `HttpStore` against a
 //! live `tollgate-server`. Pluggability made executable: the client code is
 //! identical, only the `Arc<dyn LeaseAllocator>`/`Arc<dyn UsageSink>` differ.
+//!
+//! The workspace denies discarding a fallible call (issue #36), because that
+//! is how production failures went unseen. This harness's oneshot teardown
+//! signals are the exception the rule is not aimed at: the test's assertions
+//! are what fail if shutdown misbehaves, and a receiver that has already gone
+//! away is the normal end of a test.
+#![allow(clippy::let_underscore_must_use)]
 
 use std::sync::Arc;
 
