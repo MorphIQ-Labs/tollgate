@@ -18,6 +18,9 @@
 //! units, and the resulting [`Reservation`] either commits at execution start
 //! or releases for zero charge — producing a [`UsageEvent`] only when
 //! committed. See `INVARIANTS.md` at the workspace root.
+//!
+//! Tollgate distributes the workspace as one git-tagged unit under the
+//! canonical `v{version}` release series; this crate is not published alone.
 
 pub mod cost_table;
 pub mod deny;
