@@ -17,6 +17,9 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# Event-capture tests only, matching tollgate-client: a library emits, and only
+# a test or an application installs a subscriber to observe it.
+tracing-subscriber = { workspace = true }
 
 [features]
 # The HTTP wire contract shared by tollgate-server and tollgate-client's HTTP

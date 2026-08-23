@@ -19,13 +19,14 @@
 //! documentation of the settlement rules a real backend must reproduce.
 
 pub mod clock;
+mod leases;
 pub mod memory;
 pub mod traits;
 #[cfg(feature = "wire")]
 pub mod wire;
 
 pub use clock::{Clock, ManualClock, SystemClock};
-pub use memory::MemoryStore;
+pub use memory::{MemoryStore, StoredRecords};
 pub use traits::{
     AccountConfig, AdminStore, AllocateError, Conservation, CreateAccountError,
     DEFAULT_RECLAIM_BATCH_LIMIT, GrantPolicy, GrantPolicyError, IngestReport, LeaseAllocator,

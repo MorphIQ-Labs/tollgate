@@ -6,7 +6,10 @@
 //! (docs/DESIGN.md); a non-loopback bind logs a warning.
 //! `TOLLGATE_STORE` — `memory` (default; ephemeral, dev/demo only) or, when
 //! built with the default `postgres` feature, `postgres` (durable; requires
-//! `TOLLGATE_PG_URL`, runs migrations on startup).
+//! `TOLLGATE_PG_URL`, runs migrations on startup). The memory backend never
+//! forgets a usage event — it is the idempotency index — so its footprint
+//! grows with lifetime request count and it is not a soak- or load-test
+//! target. Each reclaim sweep logs what it is holding at `debug`.
 //! `TOLLGATE_RECLAIM_INTERVAL_SECS` (default `5`) — expiry-sweep cadence.
 
 use std::sync::Arc;
@@ -103,7 +106,12 @@ async fn main() -> std::io::Result<()> {
 
     match backend.as_str() {
         "memory" => {
-            tracing::info!(%bind, backend = "memory", "tollgate-server listening (ephemeral, dev/demo only)");
+            tracing::info!(
+                %bind,
+                backend = "memory",
+                "tollgate-server listening (ephemeral, dev/demo only; memory grows with \
+                 lifetime request count — not a soak or load-test target)"
+            );
             serve(
                 listener,
                 ServerState {
