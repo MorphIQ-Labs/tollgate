@@ -5,6 +5,12 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.2.8](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.7...v0.2.8) - 2026-08-23
+
+### Other
+
+- *(admission)* #9 hash principals with foldhash, not SipHash
+
 ## [0.2.7](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.6...v0.2.7) - 2026-08-23
 
 ### Other
