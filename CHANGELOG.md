@@ -5,6 +5,12 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.3.0...v0.3.1) - 2026-08-24
+
+### Other
+
+- *(postgres)* baseline existing mutation surface
+
 ## [0.3.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.14...v0.3.0) - 2026-08-24
 
 ### Other
