@@ -7,6 +7,12 @@
 # records the load test's like-for-like sequential and contended ratios as
 # non-gating evidence.
 #
+# Every job carries `dependencies: []`. No job consumes another job's artifacts,
+# and left implicit GitLab makes each later-stage job download every
+# earlier-stage artifact. a sibling workspace lost its entire test stage to a 403 that
+# way, fetching whitepaper PDFs nothing reads. `dependencies` controls downloads
+# only; the mutation, perf and load jobs still publish their reports.
+#
 # Cache: Cargo sources and target artifacts are keyed by Cargo.lock plus the
 # pinned toolchain. Clippy is the sole writer; later build jobs pull read-only,
 # so parallel jobs cannot replace one another's archive. This self-managed
@@ -90,6 +96,7 @@ variables:
     - pg_isready -h postgres -p 5432 -U tollgate || { echo "Postgres service not accepting connections after 60s" >&2; exit 1; }
 
 commit-convention:
+  dependencies: []
   extends: .merge-request
   stage: check
   image: alpine:3.21
@@ -105,6 +112,7 @@ commit-convention:
       fi
 
 repository-hygiene:
+  dependencies: []
   extends: .merge-request
   stage: check
   # The workspace's slim compiler image intentionally omits Git.
@@ -131,6 +139,7 @@ repository-hygiene:
       fi
 
 fmt:
+  dependencies: []
   extends: .merge-request
   stage: check
   interruptible: true
@@ -138,6 +147,7 @@ fmt:
     - cargo fmt --check
 
 clippy:
+  dependencies: []
   extends: .merge-request
   stage: check
   interruptible: true
@@ -152,6 +162,7 @@ clippy:
 # requests and the default branch so a newly published advisory blocks the next
 # change immediately and also withdraws a just-merged revision from release.
 audit:
+  dependencies: []
   stage: check
   interruptible: true
   rules:
@@ -168,6 +179,7 @@ audit:
 # container's default toolchain. Select the declared minimum explicitly so
 # this job cannot silently install and test with the newer pinned compiler.
 msrv:
+  dependencies: []
   extends: .merge-request
   stage: check
   image: rust:1.89.0-slim
@@ -180,6 +192,7 @@ msrv:
     - cargo check --locked --workspace --all-features --all-targets
 
 test:
+  dependencies: []
   extends: .merge-request
   stage: test
   interruptible: true
@@ -191,6 +204,7 @@ test:
 # Postgres backend is disabled. The tree check makes that architecture claim
 # executable; the test run covers the complete workspace in that feature mode.
 test-no-default-features:
+  dependencies: []
   extends: .merge-request
   stage: test
   interruptible: true
@@ -209,6 +223,7 @@ test-no-default-features:
 # dev machines runs for real here, against a service container — the
 # backend-parity gate (mirrors tollgate-store's memory suite by scenario).
 test-postgres:
+  dependencies: []
   extends: [.merge-request, .postgres-service]
   stage: test
   interruptible: true
@@ -219,6 +234,7 @@ test-postgres:
     - cargo test --locked -p tollgate-store-postgres
 
 bench-compile:
+  dependencies: []
   extends: .merge-request
   stage: test
   interruptible: true
@@ -227,6 +243,7 @@ bench-compile:
     - cargo bench --locked --workspace --no-run
 
 formal:
+  dependencies: []
   extends: .main-merge-request
   stage: assurance
   interruptible: true
@@ -247,6 +264,7 @@ formal:
     - ./scripts/check_formal.sh
 
 mutation:
+  dependencies: []
   extends: [.main-merge-request, .postgres-service]
   stage: assurance
   timeout: 90 minutes
@@ -272,6 +290,7 @@ mutation:
 # visible on default-target MRs for deliberate evidence collection, but is not
 # a merge gate; benchmark compilation remains required in the test stage.
 perf-thresholds:
+  dependencies: []
   extends: .main-merge-request-manual
   stage: assurance
   allow_failure: true
@@ -285,6 +304,7 @@ perf-thresholds:
       - reports/perf_gate_report.json
 
 load-thresholds:
+  dependencies: []
   extends: .main-merge-request
   stage: assurance
   interruptible: true
@@ -326,6 +346,7 @@ load-thresholds:
 # the changelog — and `repository-hygiene` still rejects a manifest registry list
 # on every merge request.
 tag-release:
+  dependencies: []
   extends: .default-branch
   stage: release
   image: alpine:3.21
