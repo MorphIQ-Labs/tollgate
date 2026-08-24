@@ -50,15 +50,9 @@ impl SnapshotMap for NullMap {
     ) {
     }
 
-    fn install_negative(&self, _principal: Principal, _until: Timestamp) {}
+    fn install_revoked(&self, _principal: Principal, _until: Timestamp, _generation: Generation) {}
 
-    fn install_negative_at_generation(
-        &self,
-        _principal: Principal,
-        _until: Timestamp,
-        _generation: Option<Generation>,
-    ) {
-    }
+    fn install_unknown(&self, _principal: Principal, _until: Timestamp) {}
 
     fn remove(&self, _principal: &Principal) {}
 }

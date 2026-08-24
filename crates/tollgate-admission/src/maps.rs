@@ -13,7 +13,7 @@ use jiff::Timestamp;
 
 use tollgate_core::{AccountSnapshot, Generation};
 
-use crate::generation_model::{accept_negative, accept_positive};
+use crate::generation_model::{Watermark, accept_positive, accept_revoked};
 use crate::state::{
     AccountAdmissionState, AccountLimiters, LeaseSlot, MapEntry, Principal, SnapshotMap,
     SnapshotUpdate,
@@ -40,22 +40,32 @@ struct GenerationWatermarks {
     /// Control-plane only, and on the alias for consistency rather than for
     /// speed: two `Principal`-keyed maps in one file disagreeing about their
     /// hasher would read as a decision nobody made.
-    by_principal: HashMap<Principal, Generation, PrincipalHasher>,
+    by_principal: HashMap<Principal, Watermark, PrincipalHasher>,
 }
 
 impl GenerationWatermarks {
-    fn accept_positive(&mut self, principal: Principal, incoming: Generation) -> bool {
-        let (next, accepted) =
-            accept_positive(self.by_principal.get(&principal).copied(), incoming);
+    /// `visible` is whether the principal currently has a request-visible
+    /// positive entry, which is what keeps a duplicate publish of a live
+    /// snapshot an idempotent no-op (#53).
+    fn accept_positive(
+        &mut self,
+        principal: Principal,
+        incoming: Generation,
+        visible: bool,
+    ) -> bool {
+        let (next, accepted) = accept_positive(
+            self.by_principal.get(&principal).copied(),
+            incoming,
+            visible,
+        );
         if let Some(next) = next {
             self.by_principal.insert(principal, next);
         }
         accepted
     }
 
-    fn accept_negative(&mut self, principal: Principal, incoming: Option<Generation>) -> bool {
-        let (next, accepted) =
-            accept_negative(self.by_principal.get(&principal).copied(), incoming);
+    fn accept_revoked(&mut self, principal: Principal, incoming: Generation) -> bool {
+        let (next, accepted) = accept_revoked(self.by_principal.get(&principal).copied(), incoming);
         if let Some(next) = next {
             self.by_principal.insert(principal, next);
         }
@@ -70,10 +80,14 @@ enum PreparedUpdate {
         lease: Arc<LeaseSlot>,
         limiter: Arc<crate::state::AccountLimiter>,
     },
-    Negative {
+    Revoked {
         principal: Principal,
         until: Timestamp,
-        generation: Option<Generation>,
+        generation: Generation,
+    },
+    Unknown {
+        principal: Principal,
+        until: Timestamp,
     },
 }
 
@@ -90,7 +104,8 @@ fn apply_prepared(
                 lease,
                 limiter,
             } => {
-                if watermarks.accept_positive(*principal, snapshot.generation) {
+                let visible = matches!(map.get(principal), Some(MapEntry::Present(_)));
+                if watermarks.accept_positive(*principal, snapshot.generation, visible) {
                     map.insert(
                         *principal,
                         MapEntry::Present(AccountAdmissionState::new(
@@ -101,14 +116,22 @@ fn apply_prepared(
                     );
                 }
             }
-            PreparedUpdate::Negative {
+            PreparedUpdate::Revoked {
                 principal,
                 until,
                 generation,
             } => {
-                if watermarks.accept_negative(*principal, *generation) {
+                if watermarks.accept_revoked(*principal, *generation) {
                     map.insert(*principal, MapEntry::NegativeUntil { until: *until });
                 }
+            }
+            // No watermark call: an absence neither consults nor changes it.
+            // There is deliberately no `accept_unknown` here to mirror the
+            // other two arms -- a call that always returns true only looks
+            // like a decision, and the mutation gate says so by surviving its
+            // removal.
+            PreparedUpdate::Unknown { principal, until } => {
+                map.insert(*principal, MapEntry::NegativeUntil { until: *until });
             }
         }
     }
@@ -150,7 +173,8 @@ impl SnapshotMap for MokaSnapshotMap {
             self.limiters
                 .limiter_for(snapshot.account_id, snapshot.generation, &snapshot.limits);
         let mut watermarks = self.watermarks.lock().expect("watermarks poisoned");
-        if watermarks.accept_positive(principal, snapshot.generation) {
+        let visible = matches!(self.cache.get(&principal), Some(MapEntry::Present(_)));
+        if watermarks.accept_positive(principal, snapshot.generation, visible) {
             self.cache.insert(
                 principal,
                 MapEntry::Present(AccountAdmissionState::new(snapshot, lease, limiter)),
@@ -158,21 +182,22 @@ impl SnapshotMap for MokaSnapshotMap {
         }
     }
 
-    fn install_negative(&self, principal: Principal, until: Timestamp) {
-        self.install_negative_at_generation(principal, until, None);
-    }
-
-    fn install_negative_at_generation(
-        &self,
-        principal: Principal,
-        until: Timestamp,
-        generation: Option<Generation>,
-    ) {
+    fn install_revoked(&self, principal: Principal, until: Timestamp, generation: Generation) {
         let mut watermarks = self.watermarks.lock().expect("watermarks poisoned");
-        if watermarks.accept_negative(principal, generation) {
+        if watermarks.accept_revoked(principal, generation) {
             self.cache
                 .insert(principal, MapEntry::NegativeUntil { until });
         }
+    }
+
+    fn install_unknown(&self, principal: Principal, until: Timestamp) {
+        // The lock is still taken, and deliberately: it serializes this write
+        // against a concurrent positive install the way `remove` does. What it
+        // does *not* do is consult the watermark, because an absence says
+        // nothing about any generation.
+        let _watermarks = self.watermarks.lock().expect("watermarks poisoned");
+        self.cache
+            .insert(principal, MapEntry::NegativeUntil { until });
     }
 
     fn remove(&self, principal: &Principal) {
@@ -230,15 +255,18 @@ impl ArcSwapSnapshotMap {
                     prepared.push(None);
                     positives.push((prepared.len() - 1, principal, snapshot, lease));
                 }
-                SnapshotUpdate::Negative {
+                SnapshotUpdate::Revoked {
                     principal,
                     until,
                     generation,
-                } => prepared.push(Some(PreparedUpdate::Negative {
+                } => prepared.push(Some(PreparedUpdate::Revoked {
                     principal,
                     until,
                     generation,
                 })),
+                SnapshotUpdate::Unknown { principal, until } => {
+                    prepared.push(Some(PreparedUpdate::Unknown { principal, until }));
+                }
             }
         }
 
@@ -317,21 +345,17 @@ impl SnapshotMap for ArcSwapSnapshotMap {
         self.write(&updates, None);
     }
 
-    fn install_negative(&self, principal: Principal, until: Timestamp) {
-        self.install_negative_at_generation(principal, until, None);
-    }
-
-    fn install_negative_at_generation(
-        &self,
-        principal: Principal,
-        until: Timestamp,
-        generation: Option<Generation>,
-    ) {
-        let updates = self.prepare(vec![SnapshotUpdate::Negative {
+    fn install_revoked(&self, principal: Principal, until: Timestamp, generation: Generation) {
+        let updates = self.prepare(vec![SnapshotUpdate::Revoked {
             principal,
             until,
             generation,
         }]);
+        self.write(&updates, None);
+    }
+
+    fn install_unknown(&self, principal: Principal, until: Timestamp) {
+        let updates = self.prepare(vec![SnapshotUpdate::Unknown { principal, until }]);
         self.write(&updates, None);
     }
 
@@ -521,37 +545,93 @@ mod tests {
         assert_eq!(generation_of(&map, &p), Some(5));
         map.install(p, snapshot(3), LeaseSlot::empty());
         assert_eq!(generation_of(&map, &p), Some(5));
-        // Same generation is also a no-op (idempotent replay).
+        // Same generation is also a no-op (idempotent replay) -- and it must
+        // be observed as *the same entry*, not merely the same generation.
+        // Since #53 the equal-generation rule turns on `visible`, and a
+        // regression that dropped it would still leave generation 5 here while
+        // rebuilding the entry, which on this map is a clone of the whole map
+        // per republish. Identity is what makes that detectable.
+        let before = match map.get(&p) {
+            Some(MapEntry::Present(state)) => state,
+            other => panic!("expected a present entry, got {other:?}"),
+        };
         map.install(p, snapshot(5), LeaseSlot::empty());
         assert_eq!(generation_of(&map, &p), Some(5));
+        let after = match map.get(&p) {
+            Some(MapEntry::Present(state)) => state,
+            other => panic!("expected a present entry, got {other:?}"),
+        };
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "a duplicate publish of a visible snapshot must not reinstall it"
+        );
         // Newer generation replaces.
         map.install(p, snapshot(6), LeaseSlot::empty());
         assert_eq!(generation_of(&map, &p), Some(6));
 
-        // Negative entries replace and are replaced by real snapshots.
-        map.install_negative(p, t(100));
+        // An absent row denies, and a *delayed older* push still cannot roll
+        // the account back behind what this instance last saw.
+        //
+        // This used to assert that a generation-1 push "cannot resurrect the
+        // revoked principal" after an unversioned negative — but nothing had
+        // revoked it. The assertion passed on the positive's own watermark
+        // being treated as a tombstone, which is exactly the conflation #53
+        // removed. Ordering is the real property here; revocation is asserted
+        // below, against an actual revocation.
+        map.install_unknown(p, t(100));
         assert!(matches!(map.get(&p), Some(MapEntry::NegativeUntil { .. })));
-        // The negative retained generation 6: a delayed generation-1 push
-        // cannot resurrect the revoked principal.
         map.install(p, snapshot(1), LeaseSlot::empty());
         assert!(matches!(map.get(&p), Some(MapEntry::NegativeUntil { .. })));
+
+        // And the principal returns at the generation it already had: an
+        // absence is not a statement that generation 6 is dead (#53).
+        map.install(p, snapshot(6), LeaseSlot::empty());
+        assert_eq!(generation_of(&map, &p), Some(6));
+
         map.install(p, snapshot(7), LeaseSlot::empty());
         assert_eq!(generation_of(&map, &p), Some(7));
 
-        // The symmetric reorder is safe too: an old removal cannot revoke a
+        // The symmetric reorder is safe too: an old revocation cannot revoke a
         // snapshot that has already advanced beyond it.
-        map.install_negative_at_generation(p, t(200), Some(Generation(6)));
+        map.install_revoked(p, t(200), Generation(6));
         assert_eq!(generation_of(&map, &p), Some(7));
-        map.install_negative_at_generation(p, t(200), Some(Generation(7)));
+        map.install_revoked(p, t(200), Generation(7));
         assert!(matches!(map.get(&p), Some(MapEntry::NegativeUntil { .. })));
+
+        // A real revocation *does* refuse its own generation back -- the half
+        // that must not loosen (INVARIANTS.md #15).
+        map.install(p, snapshot(7), LeaseSlot::empty());
+        assert!(
+            matches!(map.get(&p), Some(MapEntry::NegativeUntil { .. })),
+            "a replay at the tombstone's generation stays dead"
+        );
 
         // Removing the request-visible entry must not remove the generation
         // watermark. Otherwise cache eviction could resurrect stale state.
+        // The watermark here is a *revocation* at 7, so 7 stays refused.
         map.remove(&p);
         assert!(map.get(&p).is_none());
         map.install(p, snapshot(7), LeaseSlot::empty());
         assert!(map.get(&p).is_none());
         map.install(p, snapshot(8), LeaseSlot::empty());
+        assert_eq!(generation_of(&map, &p), Some(8));
+
+        // The other half of `remove`, which nothing pinned before #53 and
+        // which the change above alters: with the watermark left by a
+        // *positive* (8, from the install just above), re-installing the
+        // evicted generation repairs the entry. That is what lets a bounded
+        // map recover from capacity pressure instead of denying a principal
+        // until someone publishes a higher generation.
+        map.remove(&p);
+        assert!(map.get(&p).is_none());
+        map.install(p, snapshot(8), LeaseSlot::empty());
+        assert_eq!(
+            generation_of(&map, &p),
+            Some(8),
+            "an evicted entry is repaired by re-fetching the generation it had"
+        );
+        // Ordering still holds across the eviction: older is still refused.
+        map.install(p, snapshot(7), LeaseSlot::empty());
         assert_eq!(generation_of(&map, &p), Some(8));
     }
 
@@ -577,6 +657,21 @@ mod tests {
     #[test]
     fn arc_swap_map_contract() {
         exercises_map(ArcSwapSnapshotMap::new());
+    }
+
+    /// `impl SnapshotMap for Arc<T>` is a `SnapshotMap` in its own right, and
+    /// every method on it has to reach the inner map: this is the impl
+    /// `SnapshotManager` writes the request path's map through. Running the
+    /// whole contract through the delegation is what gives the single-principal
+    /// writes a witness — mutation testing showed `install_revoked` and
+    /// `install_unknown` could both be replaced by no-ops with the suite green,
+    /// because the bulk test below reaches the inner map's own `apply_many` and
+    /// never these two. Driving the contract, rather than adding one test per
+    /// method as each is noticed, is what covers the ones nobody has renamed
+    /// yet.
+    #[test]
+    fn arc_delegation_map_contract() {
+        exercises_map(Arc::new(ArcSwapSnapshotMap::new()));
     }
 
     #[test]
@@ -620,10 +715,10 @@ mod tests {
                 snapshot: snapshot(2),
                 lease: LeaseSlot::empty(),
             },
-            SnapshotUpdate::Negative {
+            SnapshotUpdate::Revoked {
                 principal: Principal(2),
                 until: t(100),
-                generation: Some(Generation(2)),
+                generation: Generation(2),
             },
         ]);
         assert_eq!(generation_of(&map, &Principal(1)), Some(2));
@@ -640,9 +735,9 @@ mod tests {
     fn arc_swap_negative_cache_is_bounded_and_evicts_oldest_deadline_first() {
         let map = ArcSwapSnapshotMap::with_max_negative_entries(2);
         map.install(Principal(1), snapshot(1), LeaseSlot::empty());
-        map.install_negative(Principal(2), t(30));
-        map.install_negative(Principal(3), t(10));
-        map.install_negative(Principal(4), t(20));
+        map.install_unknown(Principal(2), t(30));
+        map.install_unknown(Principal(3), t(10));
+        map.install_unknown(Principal(4), t(20));
 
         assert_eq!(generation_of(&map, &Principal(1)), Some(1));
         assert!(map.get(&Principal(3)).is_none());
@@ -659,8 +754,8 @@ mod tests {
     #[test]
     fn arc_swap_control_write_drops_expired_negatives() {
         let map = ArcSwapSnapshotMap::with_max_negative_entries(10);
-        map.install_negative(Principal(1), t(10));
-        map.install_negative(Principal(2), t(20));
+        map.install_unknown(Principal(1), t(10));
+        map.install_unknown(Principal(2), t(20));
 
         map.apply_many_at(Vec::new(), t(10));
 
@@ -676,7 +771,7 @@ mod tests {
         let map = ArcSwapSnapshotMap::with_max_negative_entries(0);
         let principal = Principal(1);
         map.install(principal, snapshot(5), LeaseSlot::empty());
-        map.install_negative_at_generation(principal, t(10), Some(Generation(5)));
+        map.install_revoked(principal, t(10), Generation(5));
         assert!(map.get(&principal).is_none(), "zero-cap cache must evict");
 
         map.install(principal, snapshot(4), LeaseSlot::empty());
@@ -694,7 +789,7 @@ mod tests {
         const CAP: usize = 17;
         let map = ArcSwapSnapshotMap::with_max_negative_entries(CAP);
         for raw in 0..1_000 {
-            map.install_negative(Principal(raw), t(i64::try_from(raw).unwrap() + 1));
+            map.install_unknown(Principal(raw), t(i64::try_from(raw).unwrap() + 1));
         }
         let visible = (0..1_000)
             .filter(|raw| map.get(&Principal(*raw)).is_some())

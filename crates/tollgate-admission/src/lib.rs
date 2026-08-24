@@ -25,12 +25,13 @@
 
 pub mod counters;
 pub mod engine;
-mod generation_model;
+pub mod generation_model;
 pub mod maps;
 pub mod state;
 
 pub use counters::{AdmissionCounters, CountersSnapshot};
 pub use engine::{AdmissionEngine, AdmissionRequest, Admitted};
+pub use generation_model::{Watermark, accept_positive, accept_revoked, accept_unknown};
 pub use maps::{ArcSwapSnapshotMap, MokaSnapshotMap};
 pub use state::{
     AccountAdmissionState, LeaseSlot, MapEntry, Principal, SnapshotMap, SnapshotUpdate,

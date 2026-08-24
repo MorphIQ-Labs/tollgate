@@ -336,10 +336,17 @@ pub enum SnapshotUpdate {
         snapshot: Arc<AccountSnapshot>,
         lease: Arc<LeaseSlot>,
     },
-    Negative {
+    /// A revocation the source published, which always carries its generation.
+    Revoked {
         principal: Principal,
         until: Timestamp,
-        generation: Option<Generation>,
+        generation: Generation,
+    },
+    /// An absent row, which carries no generation and asserts nothing about
+    /// any (#53).
+    Unknown {
+        principal: Principal,
+        until: Timestamp,
     },
 }
 
@@ -357,22 +364,33 @@ pub trait SnapshotMap: Send + Sync {
     /// account's principals by the caller.
     fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>);
 
-    /// Record a confirmed-unknown principal until `until`.
-    fn install_negative(&self, principal: Principal, until: Timestamp);
+    /// Record a revocation the source published at `generation`, denying until
+    /// `until`.
+    ///
+    /// The generation is not optional: a revocation always carries one, and it
+    /// is what refuses a replayed snapshot at or below it (INVARIANTS.md #15).
+    fn install_revoked(&self, principal: Principal, until: Timestamp, generation: Generation);
 
-    /// Install a negative result carrying an optional source-side generation
-    /// watermark. Implementations also preserve any generation already held
-    /// locally.
-    fn install_negative_at_generation(
-        &self,
-        principal: Principal,
-        until: Timestamp,
-        generation: Option<Generation>,
-    );
+    /// Record that the source has no row for this principal, denying until
+    /// `until`.
+    ///
+    /// Deliberately takes no generation, because an absence has none to give —
+    /// the 404 path cannot supply one, and inventing one from what this
+    /// instance last saw is #53. It therefore leaves any existing watermark
+    /// exactly as it was rather than raising or re-tagging it.
+    fn install_unknown(&self, principal: Principal, until: Timestamp);
 
     /// Evict a principal outright. Revocations must use
-    /// [`SnapshotMap::install_negative_at_generation`] so their generation
-    /// watermark survives reordered control-plane messages.
+    /// [`SnapshotMap::install_revoked`] so their generation watermark survives
+    /// reordered control-plane messages.
+    ///
+    /// Eviction keeps the watermark, but keeping it no longer means the
+    /// principal cannot be reinstalled at the same generation: since #53 a
+    /// watermark left by a *positive* refuses only strictly older snapshots, so
+    /// re-fetching the evicted generation repairs the entry. That is
+    /// deliberate — it is what lets a bounded map recover from capacity
+    /// pressure. A watermark left by a *revocation* still refuses its own
+    /// generation, evicted or not.
     fn remove(&self, principal: &Principal);
 
     /// Install a batch in one logical write. The default loops over
@@ -401,11 +419,14 @@ pub trait SnapshotMap: Send + Sync {
                     snapshot,
                     lease,
                 } => self.install(principal, snapshot, lease),
-                SnapshotUpdate::Negative {
+                SnapshotUpdate::Revoked {
                     principal,
                     until,
                     generation,
-                } => self.install_negative_at_generation(principal, until, generation),
+                } => self.install_revoked(principal, until, generation),
+                SnapshotUpdate::Unknown { principal, until } => {
+                    self.install_unknown(principal, until);
+                }
             }
         }
     }
@@ -429,17 +450,12 @@ impl<T: SnapshotMap + ?Sized> SnapshotMap for Arc<T> {
         (**self).install(principal, snapshot, lease);
     }
 
-    fn install_negative(&self, principal: Principal, until: Timestamp) {
-        (**self).install_negative(principal, until);
+    fn install_revoked(&self, principal: Principal, until: Timestamp, generation: Generation) {
+        (**self).install_revoked(principal, until, generation);
     }
 
-    fn install_negative_at_generation(
-        &self,
-        principal: Principal,
-        until: Timestamp,
-        generation: Option<Generation>,
-    ) {
-        (**self).install_negative_at_generation(principal, until, generation);
+    fn install_unknown(&self, principal: Principal, until: Timestamp) {
+        (**self).install_unknown(principal, until);
     }
 
     fn remove(&self, principal: &Principal) {

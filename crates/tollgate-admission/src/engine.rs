@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn negative_cache_denies() {
         let engine = AdmissionEngine::new(MokaSnapshotMap::new(10));
-        engine.map().install_negative(Principal(1), t(100));
+        engine.map().install_unknown(Principal(1), t(100));
         assert_eq!(
             engine.admit(request(1), t(0)).unwrap_err(),
             DenyReason::UnknownPrincipal
