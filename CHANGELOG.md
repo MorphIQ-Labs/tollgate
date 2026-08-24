@@ -5,6 +5,12 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.2.13](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.12...v0.2.13) - 2026-08-24
+
+### Other
+
+- *(store)* define lease-scoped fencing contract
+
 ## [0.2.12](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.11...v0.2.12) - 2026-08-24
 
 ### Other
