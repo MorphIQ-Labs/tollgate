@@ -23,8 +23,30 @@ pub enum AccountStatus {
     Active,
     /// Temporarily disabled; denies but may return.
     Suspended,
-    /// Terminally disabled.
+    /// Terminally disabled. One-way: an account enters `Closed` from any
+    /// status and leaves it never (INVARIANTS.md #22).
     Closed,
+}
+
+impl AccountStatus {
+    /// The one spelling of each status: serde's, the ledger column's, and the
+    /// operator-facing one.
+    ///
+    /// Three places compare these strings — the `tollgate_accounts.status`
+    /// `CHECK` constraint, the JSONB predicate that decides which snapshots a
+    /// status change rewrites, and the admin wire DTO. Spelling them
+    /// separately is how they drift, so they all read from here, and
+    /// `account_status_text_matches_its_serde_spelling` pins this against
+    /// serde. Exhaustive by construction: a new variant fails to compile
+    /// until it has a spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            AccountStatus::Active => "Active",
+            AccountStatus::Suspended => "Suspended",
+            AccountStatus::Closed => "Closed",
+        }
+    }
 }
 
 /// Up to 64 permission slots, compiled from whatever entitlement vocabulary
@@ -182,6 +204,26 @@ impl PublishableSnapshot {
     pub fn into_inner(self) -> Arc<AccountSnapshot> {
         self.0
     }
+
+    /// Re-stamp status and generation, carrying the publication proof over.
+    ///
+    /// Sound without revalidating, and the reason is worth keeping next to the
+    /// code rather than at the call site: [`try_new`](Self::try_new) checks
+    /// exactly one thing — that `cost_table`'s worst quote at
+    /// `limits.max_items_per_request` fits `limits.rate_burst_units`. Neither
+    /// `status` nor `generation` participates, so a snapshot that was
+    /// publishable stays publishable under any value of either.
+    ///
+    /// This is what an account-wide status change needs (#22): the ledger and
+    /// every live snapshot move together, and re-deriving a proof that cannot
+    /// have changed would only invite an `expect` at each call site.
+    #[must_use]
+    pub fn restamped(&self, status: AccountStatus, generation: Generation) -> Self {
+        let mut snapshot = AccountSnapshot::clone(&self.0);
+        snapshot.status = status;
+        snapshot.generation = generation;
+        PublishableSnapshot(Arc::new(snapshot))
+    }
 }
 
 impl std::ops::Deref for PublishableSnapshot {
@@ -231,6 +273,65 @@ impl AccountSnapshot {
 mod tests {
     use super::*;
     use crate::units::CostUnits;
+
+    /// The ledger column, the JSONB predicate and the wire DTO all compare
+    /// these strings, so `as_str` and serde must agree exactly. If they ever
+    /// diverge, a status change silently rewrites the wrong set of snapshots
+    /// — the failure this whole mechanism exists to prevent (#51).
+    #[test]
+    #[cfg(feature = "serde")]
+    fn account_status_text_matches_its_serde_spelling() {
+        for status in [
+            AccountStatus::Active,
+            AccountStatus::Suspended,
+            AccountStatus::Closed,
+        ] {
+            assert_eq!(
+                serde_json::to_value(status).expect("a unit variant serializes"),
+                serde_json::Value::String(status.as_str().to_owned()),
+                "{status:?} disagrees with its serde spelling"
+            );
+        }
+    }
+
+    /// Re-stamping carries the publication proof because neither field it
+    /// touches participates in validation. Pinned against a snapshot whose
+    /// margin is exact: if `restamped` ever rebuilt the proof from scratch
+    /// this would still pass, but if it ever *altered* limits or cost table
+    /// it would not.
+    #[test]
+    fn restamping_preserves_everything_validation_depends_on() {
+        let original = PublishableSnapshot::try_new(Arc::new(snapshot(
+            AccountStatus::Active,
+            Timestamp::from_second(1_000).unwrap(),
+        )))
+        .expect("the fixture is publishable");
+
+        let restamped = original.restamped(AccountStatus::Suspended, Generation(9));
+
+        assert_eq!(restamped.status, AccountStatus::Suspended);
+        assert_eq!(restamped.generation, Generation(9));
+        assert_eq!(restamped.account_id, original.account_id);
+        assert_eq!(restamped.key_id, original.key_id);
+        assert_eq!(restamped.valid_until, original.valid_until);
+        assert_eq!(restamped.permissions, original.permissions);
+        assert_eq!(
+            restamped.limits.max_items_per_request,
+            original.limits.max_items_per_request
+        );
+        assert_eq!(
+            restamped.limits.rate_burst_units,
+            original.limits.rate_burst_units
+        );
+        assert!(
+            Arc::ptr_eq(&restamped.cost_table, &original.cost_table),
+            "the cost table is shared, not rebuilt"
+        );
+        // The proof still holds when re-derived, which is the claim the doc
+        // comment makes.
+        PublishableSnapshot::try_new(restamped.into_inner())
+            .expect("status and generation do not affect publishability");
+    }
 
     fn snapshot(status: AccountStatus, valid_until: Timestamp) -> AccountSnapshot {
         AccountSnapshot {

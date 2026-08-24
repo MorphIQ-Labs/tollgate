@@ -2456,6 +2456,7 @@ version = "0.4.0"
 dependencies = [
  "async-trait",
  "jiff",
+ "proptest",
  "serde",
  "serde_json",
  "tokio",

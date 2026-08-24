@@ -13,7 +13,9 @@ use serde::de::DeserializeOwned;
 
 use tollgate_core::{Generation, SnapshotValidationError};
 use tollgate_store::wire::Problem;
-use tollgate_store::{AllocateError, CreateAccountError, StoreError};
+use tollgate_store::{
+    AllocateError, CreateAccountError, PublishSnapshotError, SetStatusError, StoreError,
+};
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -160,6 +162,43 @@ impl From<CreateAccountError> for ApiError {
                 generation: None,
             },
             CreateAccountError::Storage(inner) => ApiError::from(inner),
+        }
+    }
+}
+
+impl From<SetStatusError> for ApiError {
+    fn from(e: SetStatusError) -> Self {
+        match e {
+            SetStatusError::UnknownAccount => ApiError {
+                status: StatusCode::NOT_FOUND,
+                code: "unknown-account",
+                title: e.to_string(),
+                generation: None,
+            },
+            // 409, not 422: the request is well-formed and the operator is
+            // not at fault for asking. The account is simply in a state no
+            // transition leaves (INVARIANTS.md #22).
+            SetStatusError::AccountClosed => ApiError {
+                status: StatusCode::CONFLICT,
+                code: "account-closed",
+                title: e.to_string(),
+                generation: None,
+            },
+            SetStatusError::Storage(inner) => ApiError::from(inner),
+        }
+    }
+}
+
+impl From<PublishSnapshotError> for ApiError {
+    fn from(e: PublishSnapshotError) -> Self {
+        match e {
+            PublishSnapshotError::StatusMismatch { .. } => ApiError {
+                status: StatusCode::CONFLICT,
+                code: "snapshot-status-mismatch",
+                title: e.to_string(),
+                generation: None,
+            },
+            PublishSnapshotError::Storage(inner) => ApiError::from(inner),
         }
     }
 }

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
 
-use tollgate_core::{AccountId, CostUnits};
+use tollgate_core::{AccountId, AccountStatus, CostUnits};
 use tollgate_store::{
     AccountConfig, AdminStore, DEFAULT_RECLAIM_BATCH_LIMIT, GrantPolicy, LeaseAllocator,
     MemoryStore, ReclaimBatch, StoreError, StoreHealth, SystemClock,
@@ -139,19 +139,19 @@ impl AdminStore for FlakyReclaimStore {
         AdminStore::deposit(&*self.inner, account, units).await
     }
 
-    async fn set_active(
+    async fn set_account_status(
         &self,
         account: AccountId,
-        active: bool,
-    ) -> Result<(), tollgate_store::AllocateError> {
-        AdminStore::set_active(&*self.inner, account, active).await
+        status: AccountStatus,
+    ) -> Result<tollgate_store::StatusChange, tollgate_store::SetStatusError> {
+        AdminStore::set_account_status(&*self.inner, account, status).await
     }
 
     async fn publish_snapshot(
         &self,
         principal: tollgate_core::Principal,
         snapshot: tollgate_core::PublishableSnapshot,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), tollgate_store::PublishSnapshotError> {
         AdminStore::publish_snapshot(&*self.inner, principal, snapshot).await
     }
 
@@ -204,7 +204,7 @@ fn store_with_expired_lease() -> Arc<MemoryStore> {
     store.create_account(AccountConfig {
         account_id: ACCOUNT,
         initial_balance: CostUnits(1_000),
-        active: true,
+        status: AccountStatus::Active,
     });
     store
 }

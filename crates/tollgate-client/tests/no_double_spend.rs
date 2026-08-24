@@ -165,7 +165,7 @@ async fn two_instances_never_overspend_one_account() {
     store.create_account(AccountConfig {
         account_id: ACCOUNT,
         initial_balance: CostUnits(DEPOSIT),
-        active: true,
+        status: AccountStatus::Active,
     });
     let clock = Arc::new(ManualClock::new(t(0)));
 

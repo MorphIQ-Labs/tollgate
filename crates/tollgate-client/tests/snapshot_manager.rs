@@ -102,7 +102,7 @@ fn base_store() -> Arc<MemoryStore> {
     store.create_account(AccountConfig {
         account_id: ACCOUNT,
         initial_balance: CostUnits(1_000_000),
-        active: true,
+        status: AccountStatus::Active,
     });
     store
 }
