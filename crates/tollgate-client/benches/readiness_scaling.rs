@@ -107,6 +107,21 @@ fn source(principals: usize) -> Arc<MemoryStore> {
     store
 }
 
+/// A *churned* catalogue: a live minority among tombstones, which is what a
+/// service accumulates over years of signups and cancellations.
+///
+/// The all-live fixture above cannot show #52's problem at all — every entry
+/// costs a fetch and every entry is one an instance can serve, so cost and
+/// value scale together. Here they come apart: the catalogue is `principals`
+/// entries and only `live` of them are serviceable.
+fn churned_source(principals: usize, live: usize) -> Arc<MemoryStore> {
+    let store = source(principals);
+    for index in live as u128..principals as u128 {
+        store.remove_snapshot(Principal(index));
+    }
+    store
+}
+
 fn config(principals: usize) -> SnapshotManagerConfig {
     config_for(TrackedPrincipals::Fixed(
         (0..principals as u128).map(Principal).collect(),
@@ -125,7 +140,8 @@ fn config_for(principals: TrackedPrincipals) -> SnapshotManagerConfig {
         // Short, so a refresh sweep follows the initial load immediately:
         // the refresh is what this benchmark times.
         refresh_interval: std::time::Duration::from_millis(1),
-        negative_ttl: SignedDuration::from_secs(30),
+        unknown_ttl: SignedDuration::from_secs(30),
+        revoked_ttl: SignedDuration::from_secs(3_600),
         retry_backoff: std::time::Duration::from_millis(5),
         max_concurrent_fetches: 64,
     }
@@ -153,11 +169,30 @@ fn bench_refresh(c: &mut Criterion) {
 
     for principals in [512usize, 4_096, 16_384] {
         let store: Arc<dyn tollgate_store::SnapshotSource> = source(principals);
-        for (label, config) in [
-            (format!("refresh_{principals}"), config(principals)),
+        // A tenth live, the rest tombstoned.
+        let churned: Arc<dyn tollgate_store::SnapshotSource> =
+            churned_source(principals, principals / 10);
+        let live = principals / 10;
+        for (label, source, config, per_sweep) in [
+            (
+                format!("refresh_{principals}"),
+                Arc::clone(&store),
+                config(principals),
+                principals,
+            ),
             (
                 format!("refresh_discovering_{principals}"),
+                Arc::clone(&store),
                 discovering_config(),
+                principals,
+            ),
+            // Same catalogue size, a tenth of it serviceable: the sweep
+            // fetches only the live entries, so that is what one pass costs.
+            (
+                format!("refresh_churned_{principals}"),
+                Arc::clone(&churned),
+                discovering_config(),
+                live,
             ),
         ] {
             group.bench_function(label, |b| {
@@ -167,7 +202,7 @@ fn bench_refresh(c: &mut Criterion) {
                         // load, so the map below is full when the sweep runs.
                         runtime.block_on(async {
                             let manager = SnapshotManager::spawn(
-                                Arc::clone(&store),
+                                Arc::clone(&source),
                                 Arc::new(NullMap),
                                 SlotRegistry::new(),
                                 Arc::new(SystemClock),
@@ -184,7 +219,7 @@ fn bench_refresh(c: &mut Criterion) {
                     |manager| {
                         runtime.block_on(async {
                             let counters = manager.counters();
-                            let target = counters.snapshot().refresh_attempts + principals as u64;
+                            let target = counters.snapshot().refresh_attempts + per_sweep as u64;
                             while counters.snapshot().refresh_attempts < target {
                                 tokio::task::yield_now().await;
                             }

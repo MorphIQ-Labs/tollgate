@@ -108,9 +108,32 @@ pub struct SnapshotManagerConfig {
     pub principals: TrackedPrincipals,
     /// Full refetch cadence — also the revocation propagation bound.
     pub refresh_interval: std::time::Duration,
-    /// How long a confirmed-negative principal stays valid before the
-    /// manager schedules a targeted control-plane refetch.
-    pub negative_ttl: SignedDuration,
+    /// How long a principal the source returned no row for stays negative
+    /// before the manager rechecks it.
+    ///
+    /// Short, and it covers every absence rather than only new principals: a
+    /// signup may be in flight, and a source that is rebuilding, failing over,
+    /// or serving a lagging replica reports a principal it has served for
+    /// years as absent too. This is the ceiling on how long such a gap can
+    /// deny a live customer, so it is an availability bound, not just
+    /// onboarding latency.
+    pub unknown_ttl: SignedDuration,
+    /// How long a *published revocation tombstone* stays negative before the
+    /// manager rechecks it (#52).
+    ///
+    /// Long: coming back means an operator reinstated the account, which is
+    /// rare, and a catalogue accumulates these forever — every cancelled
+    /// customer is one, and each recheck is a fetch on every instance.
+    ///
+    /// This bounds *reinstatement*, never revocation. A live principal is
+    /// always swept, so withdrawing one still propagates within
+    /// `refresh_interval`.
+    ///
+    /// It applies only when the source *said* "revoked at generation N". An
+    /// absent row is [`NegativeKind::Unknown`] and takes `unknown_ttl`, however
+    /// long this instance has served that principal: a tombstone is a durable
+    /// statement, an absence is not.
+    pub revoked_ttl: SignedDuration,
     /// Backoff between initial-load retries while the source is down.
     pub retry_backoff: std::time::Duration,
     /// Maximum snapshot fetches in flight during a full refresh.
@@ -135,8 +158,11 @@ impl SnapshotManagerConfig {
                 "refresh_interval must be positive",
             ));
         }
-        if self.negative_ttl <= SignedDuration::ZERO {
-            return Err(SnapshotManagerConfigError("negative_ttl must be positive"));
+        if self.unknown_ttl <= SignedDuration::ZERO {
+            return Err(SnapshotManagerConfigError("unknown_ttl must be positive"));
+        }
+        if self.revoked_ttl <= SignedDuration::ZERO {
+            return Err(SnapshotManagerConfigError("revoked_ttl must be positive"));
         }
         if self.retry_backoff.is_zero() {
             return Err(SnapshotManagerConfigError("retry_backoff must be positive"));
@@ -593,10 +619,64 @@ impl Resolutions {
         earliest.map_or(IDLE_WAKEUP, |deadline| until(deadline, now))
     }
 
-    /// Negative principals whose next attempt is due.
-    fn due_for_refetch(&self, now: jiff::Timestamp) -> Vec<Principal> {
+    /// Principals the full refresh should cover: everything tracked whose
+    /// resolution is not negative.
+    ///
+    /// Negatives are excluded because they already have a schedule of their
+    /// own — [`Self::due_for_refetch`], on the TTL their kind carries. Sweeping
+    /// them as well fetched every tombstone twice per cycle for nothing (#52).
+    ///
+    /// Principals with *no* resolution stay in: that is the initial load, and
+    /// every principal discovery has just added.
+    ///
+    /// Ordered, so a sweep visits principals the same way twice running.
+    fn due_for_sweep(&self) -> Vec<Principal> {
+        let mut principals: Vec<Principal> = self
+            .tracked
+            .iter()
+            .filter(|principal| {
+                !matches!(
+                    self.by_principal.get(principal),
+                    Some(Resolution::Negative { .. })
+                )
+            })
+            .copied()
+            .collect();
+        principals.sort_unstable();
+        principals
+    }
+
+    /// Every tracked principal, ordered — what the lag-recovery path sweeps.
+    ///
+    /// Deliberately *not* [`Self::due_for_sweep`]. A dropped push is most
+    /// likely a reinstatement, Negative → Present, so the principals this
+    /// path exists to repair are exactly the ones `due_for_sweep` filters
+    /// out. Lag means local resolutions are untrustworthy; filtering by them
+    /// would be assuming the answer (#52).
+    fn all_tracked(&self) -> Vec<Principal> {
+        let mut principals: Vec<Principal> = self.tracked.iter().copied().collect();
+        principals.sort_unstable();
+        principals
+    }
+
+    /// Negative principals whose next attempt is due, earliest first, at most
+    /// `limit` of them.
+    ///
+    /// The cap is what keeps a due *population* from becoming one unbounded
+    /// await. Before #52 every sweep re-armed each negative's deadline, so the
+    /// refetch index rarely fired at all; now a catalogue resolved in one
+    /// initial load shares a deadline and comes due together. The caller
+    /// awaits this batch inline, so an uncapped set would hold the select
+    /// loop — and the `tick` arm with it — for the whole population, which is
+    /// the arm that carries revocation within `refresh_interval`. Chunking
+    /// returns to the loop between waves without losing any: whatever is
+    /// still due stays due, and the range is ordered by deadline, so the
+    /// earliest go first and nothing starves.
+    ///
+    fn due_for_refetch(&self, now: jiff::Timestamp, limit: usize) -> Vec<Principal> {
         self.refetch
             .range(..(next_instant(now), Principal(0)))
+            .take(limit)
             .map(|(_, principal)| *principal)
             .collect()
     }
@@ -673,9 +753,43 @@ fn after_std(now: jiff::Timestamp, duration: std::time::Duration) -> jiff::Times
         .unwrap_or(jiff::Timestamp::MAX)
 }
 
-fn negative_deadline(now: jiff::Timestamp, config: &SnapshotManagerConfig) -> jiff::Timestamp {
-    now.checked_add(config.negative_ttl)
-        .unwrap_or(jiff::Timestamp::MAX)
+/// Which negative TTL a resolution takes.
+///
+/// The distinction is the source's answer, not this instance's memory. An
+/// earlier cut of #52 keyed the TTL on the merged generation, reasoning that
+/// `Some(_)` meant "once served, now withdrawn". It does not: a principal the
+/// instance has served resolves `Unknown` whenever the source's row is merely
+/// *absent* — a store rebuilding after restart, a lagging replica, a failover
+/// — and that inherited the hour-long reinstatement TTL. Combined with the
+/// sweep no longer covering negatives, a transient absence blackholed a live
+/// principal until `revoked_ttl`, with readiness still reporting healthy
+/// because a negative counts as resolved.
+///
+/// A tombstone is a statement the source published; an absence is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NegativeKind {
+    /// The source published a revocation tombstone. Durable, and undone only
+    /// by an operator reinstating the account, so it takes `revoked_ttl`.
+    Revoked,
+    /// The source has no row for this principal. May be a signup in flight or
+    /// a source that has not finished coming up, so it takes `unknown_ttl`.
+    Unknown,
+}
+
+/// When a negative resolution should next be rechecked.
+///
+/// Keyed on [`NegativeKind`] — what the *source* answered — never on the
+/// generation this instance happens to remember (#52).
+fn negative_deadline(
+    now: jiff::Timestamp,
+    config: &SnapshotManagerConfig,
+    kind: NegativeKind,
+) -> jiff::Timestamp {
+    let ttl = match kind {
+        NegativeKind::Revoked => config.revoked_ttl,
+        NegativeKind::Unknown => config.unknown_ttl,
+    };
+    now.checked_add(ttl).unwrap_or(jiff::Timestamp::MAX)
 }
 
 /// Merge a negative resolution with the locally observed generation. `None`
@@ -792,12 +906,12 @@ async fn refresh_all_cancellable(
                 generation: incoming,
             }) => {
                 let now = clock.now();
-                let until = negative_deadline(now, config);
                 let local_generation = resolutions.generation_of(principal);
                 let Some(generation) = merge_negative_generation(local_generation, Some(incoming))
                 else {
                     continue;
                 };
+                let until = negative_deadline(now, config, NegativeKind::Revoked);
                 completed.insert(principal);
                 resolutions.insert(
                     principal,
@@ -816,8 +930,8 @@ async fn refresh_all_cancellable(
             Ok(SnapshotResolution::Unknown) => {
                 completed.insert(principal);
                 let now = clock.now();
-                let until = negative_deadline(now, config);
                 let generation = resolutions.generation_of(principal);
+                let until = negative_deadline(now, config, NegativeKind::Unknown);
                 resolutions.insert(
                     principal,
                     Resolution::Negative {
@@ -879,16 +993,6 @@ async fn discover(
             tracing::warn!(%error, "principal enumeration failed; keeping the current set");
         }
     }
-}
-
-/// Everything currently tracked, as the slice `refresh_all_cancellable` takes.
-///
-/// Ordered, so a sweep visits principals the same way twice running and a
-/// truncated one resumes predictably rather than by hash order.
-fn sweep_set(resolutions: &Resolutions) -> Vec<Principal> {
-    let mut principals: Vec<Principal> = resolutions.tracked.iter().copied().collect();
-    principals.sort_unstable();
-    principals
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1012,9 +1116,11 @@ async fn run(
                             }
                             resolution @ (SnapshotResolution::Revoked { .. }
                             | SnapshotResolution::Unknown) => {
-                                let incoming = match resolution {
-                                    SnapshotResolution::Revoked { generation } => Some(generation),
-                                    SnapshotResolution::Unknown => None,
+                                let (incoming, kind) = match resolution {
+                                    SnapshotResolution::Revoked { generation } => {
+                                        (Some(generation), NegativeKind::Revoked)
+                                    }
+                                    SnapshotResolution::Unknown => (None, NegativeKind::Unknown),
                                     SnapshotResolution::Present(_) => unreachable!(),
                                 };
                                 let local_generation = resolutions.generation_of(push.principal);
@@ -1024,7 +1130,7 @@ async fn run(
                                     continue;
                                 };
                                 let now = clock.now();
-                                let until = negative_deadline(now, &config);
+                                let until = negative_deadline(now, &config, kind);
                                 resolutions.insert(
                                     push.principal,
                                     Resolution::Negative {
@@ -1047,10 +1153,12 @@ async fn run(
                     }
                 }
                 // Lagged: missed pushes — refetch everything rather than
-                // guess what was dropped.
+                // guess what was dropped. `all_tracked`, not `due_for_sweep`:
+                // a dropped reinstatement leaves a stale Negative behind, and
+                // that is the one thing a filtered sweep would never revisit.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     if refresh_all_cancellable(
-                        &source, &map, &slots, &clock, &config, &sweep_set(&resolutions),
+                        &source, &map, &slots, &clock, &config, &resolutions.all_tracked(),
                         &mut resolutions, &mut shutdown,
                         &ready,
                         &counters,
@@ -1074,7 +1182,7 @@ async fn run(
                     discover(&source, &mut resolutions, &counters).await;
                 }
                 if refresh_all_cancellable(
-                    &source, &map, &slots, &clock, &config, &sweep_set(&resolutions),
+                    &source, &map, &slots, &clock, &config, &resolutions.due_for_sweep(),
                     &mut resolutions, &mut shutdown,
                     &ready,
                     &counters,
@@ -1086,7 +1194,7 @@ async fn run(
             _ = &mut control_wakeup => {
                 let now = clock.now();
                 update_ready(&ready, &mut resolutions, &clock, &counters, &config.principals);
-                let due = resolutions.due_for_refetch(now);
+                let due = resolutions.due_for_refetch(now, config.max_concurrent_fetches);
                 if !due.is_empty() {
                     let Some(failed) = refresh_all_cancellable(
                         &source, &map, &slots, &clock, &config, &due,
@@ -1238,18 +1346,27 @@ mod tests {
         pub(super) fn due_for_refetch(
             resolutions: &HashMap<Principal, Resolution>,
             now: jiff::Timestamp,
+            limit: usize,
         ) -> Vec<Principal> {
             let mut due: Vec<_> = resolutions
                 .iter()
                 .filter_map(|(principal, resolution)| match resolution {
-                    Resolution::Negative { next_refetch, .. } if *next_refetch <= now => {
-                        Some(*principal)
-                    }
+                    Resolution::Negative {
+                        next_refetch,
+                        deadline,
+                        ..
+                    } if *next_refetch <= now => Some((*next_refetch, *deadline, *principal)),
                     _ => None,
                 })
                 .collect();
-            due.sort_unstable();
-            due
+            // The index is keyed on (next_refetch, principal), so the naive
+            // reference has to take the earliest by that same order before
+            // truncating — otherwise the two disagree on *which* are dropped.
+            due.sort_unstable_by_key(|(next_refetch, _, principal)| (*next_refetch, *principal));
+            due.into_iter()
+                .take(limit)
+                .map(|(_, _, principal)| principal)
+                .collect()
         }
     }
 
@@ -1348,13 +1465,17 @@ mod tests {
                     naive::next_control_wakeup(&reference, now),
                     "next_control_wakeup disagreed at {:?}", now
                 );
-                let mut due = indexed.due_for_refetch(now);
-                due.sort_unstable();
-                prop_assert_eq!(
-                    due,
-                    naive::due_for_refetch(&reference, now),
-                    "due_for_refetch disagreed at {:?}", now
-                );
+                for limit in [1usize, 3, usize::MAX] {
+                    let mut due = indexed.due_for_refetch(now, limit);
+                    let mut expected = naive::due_for_refetch(&reference, now, limit);
+                    due.sort_unstable();
+                    expected.sort_unstable();
+                    prop_assert_eq!(
+                        due,
+                        expected,
+                        "due_for_refetch disagreed at {:?} under limit {}", now, limit
+                    );
+                }
             }
         }
     }
@@ -1422,10 +1543,86 @@ mod tests {
 
         assert_eq!(resolutions.unresolved(t(40)), 0, "the positive is live");
         assert!(
-            resolutions.due_for_refetch(t(40)).is_empty(),
+            resolutions.due_for_refetch(t(40), usize::MAX).is_empty(),
             "the superseded negative must not still ask to be refetched"
         );
         assert_eq!(resolutions.next_control_wakeup(t(40)), secs(50));
+    }
+
+    /// A whole due population is handed back in bounded waves, earliest
+    /// deadline first.
+    ///
+    /// Tombstones resolved in one initial load share a deadline and come due
+    /// together. The caller awaits the batch inline, so an uncapped set would
+    /// hold the select loop — and with it the `tick` arm that carries
+    /// revocation within `refresh_interval` — for the entire catalogue. The
+    /// remainder must stay due rather than be dropped, and the order must be
+    /// by deadline so a large population cannot starve its own tail (#52).
+    #[test]
+    fn a_due_population_is_refetched_in_bounded_waves() {
+        let principals: Vec<Principal> = (0..5).map(Principal).collect();
+        let mut resolutions = Resolutions::new(principals.iter().copied());
+        for (offset, principal) in principals.iter().enumerate() {
+            resolutions.insert(
+                *principal,
+                Resolution::Negative {
+                    deadline: t(10 + offset as i64),
+                    next_refetch: t(10 + offset as i64),
+                    generation: Some(Generation(9)),
+                },
+            );
+        }
+
+        assert_eq!(
+            resolutions.due_for_refetch(t(100), 2),
+            vec![Principal(0), Principal(1)],
+            "one wave, and the earliest deadlines lead it"
+        );
+        assert_eq!(
+            resolutions.due_for_refetch(t(100), usize::MAX).len(),
+            5,
+            "capping a wave must not retire the rest: they are still due"
+        );
+    }
+
+    /// Lag recovery must not filter by local resolutions, because lag is
+    /// exactly the state in which they cannot be trusted.
+    ///
+    /// A dropped push is most likely a reinstatement — Negative → Present —
+    /// so the principals the recovery path exists to repair are precisely the
+    /// ones `due_for_sweep` leaves out. The two sets must stay distinct: if
+    /// `all_tracked` ever starts filtering, a lagged broadcast strands a
+    /// reinstated principal until its tombstone TTL, with nothing else on the
+    /// HTTP topology to notice (#52).
+    #[test]
+    fn lag_recovery_covers_the_negatives_a_sweep_skips() {
+        let mut resolutions = Resolutions::new([Principal(0), Principal(1)]);
+        resolutions.insert(
+            Principal(0),
+            Resolution::Present {
+                deadline: t(90),
+                generation: Generation(2),
+            },
+        );
+        resolutions.insert(
+            Principal(1),
+            Resolution::Negative {
+                deadline: t(3_600),
+                next_refetch: t(3_600),
+                generation: Some(Generation(9)),
+            },
+        );
+
+        assert_eq!(
+            resolutions.due_for_sweep(),
+            vec![Principal(0)],
+            "a routine sweep leaves the tombstone to its own schedule"
+        );
+        assert_eq!(
+            resolutions.all_tracked(),
+            vec![Principal(0), Principal(1)],
+            "lag recovery refetches everything, tombstones included"
+        );
     }
 
     /// The generation watermark outlives the resolution that carried it, or a
@@ -1459,11 +1656,23 @@ mod tests {
         let config = SnapshotManagerConfig {
             principals: TrackedPrincipals::Fixed(vec![Principal(1)]),
             refresh_interval: std::time::Duration::from_secs(60),
-            negative_ttl: SignedDuration::from_secs(30),
+            unknown_ttl: SignedDuration::from_secs(30),
+            revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_secs(2),
             max_concurrent_fetches: 1,
         };
-        assert_eq!(negative_deadline(t(10), &config), t(40));
+        // An absent row: the short TTL, so a signup in flight — or a source
+        // still coming up — is picked up soon. A published tombstone: the long
+        // one, because coming back means an operator reinstated the account
+        // (#52).
+        assert_eq!(
+            negative_deadline(t(10), &config, NegativeKind::Unknown),
+            t(40)
+        );
+        assert_eq!(
+            negative_deadline(t(10), &config, NegativeKind::Revoked),
+            t(3_610)
+        );
         assert_eq!(after_std(t(10), config.retry_backoff), t(12));
     }
 
