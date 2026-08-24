@@ -1,5 +1,5 @@
-# Tollgate CI — Rust correctness, backend parity, performance compilation,
-# mutation assurance, and machine-checked proofs.
+# Tollgate CI — Rust correctness, dependency advisories, backend parity,
+# performance compilation, mutation assurance, and machine-checked proofs.
 #
 # The image tag matches rust-toolchain.toml; keep them in lockstep so rustup
 # never downloads a second toolchain inside CI. Criterion and absolute-latency
@@ -129,6 +129,22 @@ clippy:
     - rustc --version
     - cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
+# Cargo.lock makes this a reproducible whole-tree scan. Run it on both merge
+# requests and the default branch so a newly published advisory blocks the next
+# change immediately and also withdraws a just-merged revision from release.
+audit:
+  stage: check
+  interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - when: never
+  before_script:
+    - export PATH="$CARGO_INSTALL_ROOT/bin:$PATH"
+    - cargo install --locked --no-default-features cargo-audit --version "$(cat .cargo/audit-version)" --root "$CARGO_INSTALL_ROOT"
+  script:
+    - ./scripts/check_advisories.sh
+
 # `rust-toolchain.toml` pins the development toolchain and overrides a
 # container's default toolchain. Select the declared minimum explicitly so
 # this job cannot silently install and test with the newer pinned compiler.
@@ -246,7 +262,6 @@ perf-thresholds:
 load-thresholds:
   extends: .main-merge-request
   stage: assurance
-  allow_failure: true
   interruptible: true
   timeout: 45 minutes
   # Mutation and formal assurance are CPU- and memory-intensive. This job
@@ -260,8 +275,10 @@ load-thresholds:
   script:
     # The CI manifest explicitly disables host-dependent absolute ceilings;
     # paired ratios remain useful evidence, but a shared host can contaminate
-    # their denominator and numerator differently (#49).
-    - ./scripts/check_load_thresholds.sh testing/load_thresholds_ci.json reports/load_gate_report.json
+    # their denominator and numerator differently (#49). Evidence mode records
+    # a threshold miss without tainting the pipeline; build, configuration,
+    # execution, and report failures still fail this job.
+    - ./scripts/check_load_thresholds.sh --evidence testing/load_thresholds_ci.json reports/load_gate_report.json
   artifacts:
     when: always
     paths:

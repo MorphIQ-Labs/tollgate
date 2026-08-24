@@ -32,6 +32,7 @@ Contract: [`INVARIANTS.md`](INVARIANTS.md). Architecture and findings:
 git config core.hooksPath .githooks         # once per clone: rustfmt check on commit
 
 cargo test --workspace                     # correctness (Postgres DB cases are env-gated)
+./scripts/check_advisories.sh              # RustSec + yanked/informational dependency gate
 ./scripts/check_formal.sh                  # Lean authorization-state proofs
 ./scripts/check_perf_thresholds.sh         # hot-path microbench gate
 ./scripts/check_load_thresholds.sh         # local ratios + controlled-host absolutes
@@ -78,7 +79,8 @@ acquire funds thousands of requests; two instances draining one account over
 HTTP finish with **zero drift** between admission's committed units and the
 billing ledger. Gate manifests live in `testing/`; recalibrate on a controlled
 host before treating absolute thresholds as the contract. Default-target
-merge requests enforce both load ratios with an explicit ratio-only manifest.
+merge requests record both load ratios with an explicit ratio-only manifest;
+shared-runner threshold misses are evidence rather than merge gates.
 
 ## Design rules
 

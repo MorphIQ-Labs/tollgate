@@ -7,10 +7,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+load_gate_mode=()
+if [ "${1:-}" = "--evidence" ]; then
+    load_gate_mode=(--evidence)
+    shift
+fi
+
 load_thresholds_path="${1:-testing/load_thresholds.json}"
 load_report_path="${2:-reports/load_gate_report.json}"
 if [ "$#" -gt 2 ]; then
-    printf 'usage: %s [thresholds.json] [report.json]\n' "$0" >&2
+    printf 'usage: %s [--evidence] [thresholds.json] [report.json]\n' "$0" >&2
     exit 2
 fi
 
@@ -27,4 +33,4 @@ load_average() {
 
 TOLLGATE_GATE_LOAD="$(load_average)" \
     exec cargo run --locked --profile production -p pricing-api --bin load_gate -- \
-    "$load_thresholds_path" "$load_report_path"
+    "${load_gate_mode[@]}" "$load_thresholds_path" "$load_report_path"
