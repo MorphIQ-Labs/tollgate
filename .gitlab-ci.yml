@@ -26,6 +26,10 @@ workflow:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    # The release-preparation schedule. Nothing else runs on it: the
+    # `.default-branch` rule excludes scheduled pipelines, so a schedule
+    # cannot silently re-run the gates or re-enter `tag-release`.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
     - when: never
 
 stages: [check, test, assurance, release]
@@ -70,7 +74,16 @@ variables:
 
 .default-branch:
   rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "schedule"'
+    - when: never
+
+# The release-preparation lane: the schedule that opens the release merge
+# request, plus a manual button on the default branch for cutting one now.
+.release-prep:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
     - when: never
 
 # Shared Postgres service wiring for every job that runs the env-gated suite.
@@ -329,6 +342,34 @@ load-thresholds:
     when: always
     paths:
       - reports/load_gate_report.json
+
+# Advances the version; `tag-release` below publishes whatever version the
+# manifest declares. Splitting it this way is what release-plz did, and dropping
+# release-plz took this half with it: for six commits after v0.5.0 — one of them
+# breaking — `tag-release` reported "already exists; nothing to do" on every
+# push and the repository looked healthy while releasing nothing.
+#
+# Idempotent: with no releasable commits it exits 0 having done nothing, so the
+# schedule is quiet until there is something to release. It keeps one long-lived
+# `chore/release` branch and refreshes the open merge request in place, so the
+# proposed version always reflects the current tip of the default branch.
+prepare-release:
+  dependencies: []
+  extends: .release-prep
+  stage: release
+  interruptible: false
+  resource_group: release
+  variables:
+    # Tags are how the script finds the last release; a shallow clone has none.
+    GIT_DEPTH: "0"
+    # The group CI/CD variable keeps the name RELEASE_PLZ_TOKEN; it is an
+    # ordinary Maintainer project token.
+    RELEASE_TOKEN: $RELEASE_PLZ_TOKEN
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq --no-install-recommends git curl jq ca-certificates
+  script:
+    - ./scripts/prepare-release.sh
 
 # Bump the workspace version and the CHANGELOG section in an ordinary merge
 # request; this cuts the tag and the GitLab release when it lands.
