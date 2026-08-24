@@ -224,8 +224,11 @@ until it has one.
     `negative_eviction_preserves_generation_monotonicity`,
     `revoked_generation_rejects_replay_after_visible_entry_is_evicted`,
     `revocation_reaches_instances_via_refresh`,
-    `snapshot_publish_fetch_and_push`, and
-    `snapshot_publish_fetch_and_generation_monotonicity`. *Proof:*
+    `snapshot_publish_fetch_and_push`,
+    `snapshot_publish_fetch_and_generation_monotonicity`, and
+    `a_vestigial_jsonb_generation_is_ignored_in_favour_of_the_column` (which
+    pins *which* stored number the watermark is, now that a backend keeps only
+    one). *Proof:*
     `formal/lean/Tollgate/SnapshotCache.lean`.
 
 16. **Unsafe configuration never becomes authoritative.** Nonpositive lease
