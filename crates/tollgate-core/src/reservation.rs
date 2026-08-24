@@ -221,6 +221,34 @@ mod tests {
         assert_eq!(l.remaining(), CostUnits(70));
     }
 
+    /// `units()` is how a caller learns what a pending reservation will charge
+    /// before deciding to commit it, and no test called it — it could report
+    /// zero for any reservation with the suite green (#43). A caller checking
+    /// the quote before execution would have been told everything is free.
+    ///
+    /// Asserted against what the reservation actually does with those units,
+    /// not just against the constructor argument: the debit taken at reserve,
+    /// the charge returned by commit, and the units billed on the usage event
+    /// must all be the number `units()` advertises.
+    #[test]
+    fn a_reservation_reports_the_units_it_will_charge() {
+        let l = lease(100);
+        let r = Reservation::reserve(&l, CostUnits(30), t(0)).unwrap();
+        assert_eq!(r.units(), CostUnits(30));
+        assert_eq!(
+            l.remaining(),
+            CostUnits(70),
+            "the pending debit is the advertised amount"
+        );
+
+        assert_eq!(r.commit_at_execution_start(t(0)), Ok(r.units()));
+        assert_eq!(
+            r.usage_event(RequestId(1), t(1)).unwrap().units,
+            r.units(),
+            "and the billing event carries it too"
+        );
+    }
+
     #[test]
     fn cancel_charges_zero_and_refunds() {
         let l = lease(100);

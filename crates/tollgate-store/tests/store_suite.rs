@@ -606,13 +606,98 @@ async fn recreate_account_is_refused_and_nondestructive() {
 #[tokio::test]
 async fn inactive_account_refuses_leases() {
     let store = store_with_balance(GrantPolicy::default(), 1_000);
-    store.set_active(ACCOUNT, false);
+    // Through `AdminStore`, matching the PostgreSQL mirror. The two had
+    // drifted: this side called the inherent method, so the trait
+    // implementation could be replaced by `Ok(())` — suspending an account
+    // and still serving it — with the whole suite green (#43).
+    AdminStore::set_active(&*store, ACCOUNT, false)
+        .await
+        .unwrap();
     assert_eq!(
         store
             .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
             .await
             .unwrap_err(),
         AllocateError::AccountInactive
+    );
+}
+
+/// `max_ttl` is the allocator's hard cap on how long any one lease may hold
+/// units, which is what bounds the time a crashed holder can strand them
+/// (INVARIANTS.md #9). Nothing asserted the clamp: a request for an hour
+/// against a five-minute policy could have been honoured in full.
+#[tokio::test]
+async fn a_ttl_beyond_the_policy_maximum_is_clamped() {
+    let store = store_with_balance(full_grant_policy(), 1_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(100),
+            SignedDuration::from_secs(3_600),
+            t(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        lease.expires_at,
+        t(300),
+        "the policy caps the lease at max_ttl, not at what the caller asked for"
+    );
+
+    // At or under the cap the caller's own TTL stands.
+    let exact = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(100),
+            SignedDuration::from_secs(300),
+            t(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact.expires_at, t(300));
+    let shorter = store
+        .acquire(ACCOUNT, CostUnits(100), SignedDuration::from_secs(30), t(0))
+        .await
+        .unwrap();
+    assert_eq!(shorter.expires_at, t(30));
+}
+
+/// Funding an account is the only way quota enters the system, and neither
+/// suite exercised it: `deposit` could return `Ok(())` without moving a single
+/// unit and nothing failed (#43). A silently ignored top-up means an account
+/// that was paid for keeps being denied.
+#[tokio::test]
+async fn depositing_funds_the_account_and_the_ledger_agrees() {
+    // Full grants, so the acquire below reflects the deposited balance
+    // rather than the default policy's halving.
+    let store = store_with_balance(full_grant_policy(), 100);
+    assert_eq!(store.balance(ACCOUNT), CostUnits(100));
+
+    AdminStore::deposit(&*store, ACCOUNT, CostUnits(400))
+        .await
+        .unwrap();
+    assert_eq!(store.balance(ACCOUNT), CostUnits(500));
+
+    // Deposits move `deposited` too, or the conservation equation would read
+    // the top-up as units appearing from nowhere.
+    let conservation = store.conservation(ACCOUNT).unwrap();
+    assert_eq!(conservation.deposited, CostUnits(500));
+    assert!(conservation.holds(), "conservation: {conservation:?}");
+
+    // And the new balance is spendable, which is the point of depositing.
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
+        .await
+        .unwrap();
+    assert_eq!(lease.units, CostUnits(500));
+    assert_conserved(&store);
+
+    assert_eq!(
+        AdminStore::deposit(&*store, AccountId(999), CostUnits(1))
+            .await
+            .unwrap_err(),
+        AllocateError::UnknownAccount,
+        "an unknown account is refused, not silently created"
     );
 }
 

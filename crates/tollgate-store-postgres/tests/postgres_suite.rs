@@ -787,6 +787,82 @@ async fn inactive_account_refuses_leases() {
     );
 }
 
+/// Mirrors `store_suite::a_ttl_beyond_the_policy_maximum_is_clamped`.
+#[tokio::test]
+async fn a_ttl_beyond_the_policy_maximum_is_clamped() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(100),
+            SignedDuration::from_secs(3_600),
+            t(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        lease.expires_at,
+        t(300),
+        "the policy caps the lease at max_ttl, not at what the caller asked for"
+    );
+
+    let exact = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(100),
+            SignedDuration::from_secs(300),
+            t(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact.expires_at, t(300));
+    let shorter = store
+        .acquire(ACCOUNT, CostUnits(100), SignedDuration::from_secs(30), t(0))
+        .await
+        .unwrap();
+    assert_eq!(shorter.expires_at, t(30));
+}
+
+/// Mirrors `store_suite::depositing_funds_the_account_and_the_ledger_agrees`.
+/// Neither suite exercised `deposit` before #43 found it on the memory side,
+/// and a mirror that covers a scenario on only one backend is how the two
+/// drift apart in the first place.
+#[tokio::test]
+async fn depositing_funds_the_account_and_the_ledger_agrees() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(100));
+
+    AdminStore::deposit(&*store, ACCOUNT, CostUnits(400))
+        .await
+        .unwrap();
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(500));
+
+    let conservation = store.conservation(ACCOUNT).await.unwrap().unwrap();
+    assert_eq!(conservation.deposited, CostUnits(500));
+    assert!(conservation.holds(), "conservation: {conservation:?}");
+
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
+        .await
+        .unwrap();
+    assert_eq!(lease.units, CostUnits(500));
+    assert_conserved(&store).await;
+
+    assert_eq!(
+        AdminStore::deposit(&*store, AccountId(999), CostUnits(1))
+            .await
+            .unwrap_err(),
+        AllocateError::UnknownAccount,
+        "an unknown account is refused, not silently created"
+    );
+}
+
 #[tokio::test]
 async fn snapshot_publish_fetch_and_generation_monotonicity() {
     let _guard = DB_LOCK.lock().await;

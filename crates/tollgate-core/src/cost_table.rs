@@ -223,4 +223,33 @@ mod tests {
         assert_eq!(t.quote(&Op::Price, 2), Err(QuoteError::Overflow));
         assert_eq!(t.quote(&Op::Price, u64::MAX), Err(QuoteError::Overflow));
     }
+
+    /// The two accessors are how an embedder reads a compiled schedule back —
+    /// to display pricing, or to reconcile a charge — and nothing asserted
+    /// they report the schedule that is actually applied. Both mutated to
+    /// `CostUnits(0)` without a single failure (#43).
+    ///
+    /// So this asserts agreement rather than the stored values alone: what
+    /// `fixed_request()` reports is the fixed component a quote charges, and
+    /// what `minimum_charge()` reports is the floor a quote is raised to.
+    #[test]
+    fn the_accessors_report_the_schedule_a_quote_applies() {
+        let table = CostTable::builder(CostUnits(50), CostUnits(80))
+            .weight(&Op::Price, CostUnits(1))
+            .build();
+        assert_eq!(table.fixed_request(), CostUnits(50));
+        assert_eq!(table.minimum_charge(), CostUnits(80));
+
+        // Above the floor: the quote's fixed component is exactly what
+        // `fixed_request()` advertises.
+        let priced = table.quote(&Op::Price, 100).unwrap();
+        assert_eq!(priced.fixed, table.fixed_request());
+        assert_eq!(priced.total, CostUnits(150));
+
+        // Below the floor: the total is exactly what `minimum_charge()`
+        // advertises, so an embedder quoting from the accessor and the engine
+        // charging from the table cannot disagree.
+        let floored = table.quote(&Op::Price, 1).unwrap();
+        assert_eq!(floored.total, table.minimum_charge());
+    }
 }

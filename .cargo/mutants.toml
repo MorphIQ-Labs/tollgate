@@ -11,6 +11,22 @@ minimum_test_timeout = 60
 exclude_re = [
   # Formatting has no authorization, accounting, or operational semantics.
   "impl (std::)?fmt::(Debug|Display)",
+  # `MemoryStore::acquire` clamps an over-long TTL: `if ttl > max_ttl { max_ttl }
+  # else { ttl }`. Widening that to `>=` changes only the case `ttl == max_ttl`,
+  # where both arms yield the same duration. Not "hard to test" — there is no
+  # input that separates them, so a test claiming to would be asserting on the
+  # branch rather than on behaviour. The clamp itself *was* unwitnessed, and
+  # now is: `a_ttl_beyond_the_policy_maximum_is_clamped`, in both backend
+  # suites. Baselined by #43.
+  "replace > with >= in <impl LeaseAllocator for MemoryStore>::acquire",
+  # `LeaseSlot::empty` builds an empty slot two indistinguishable ways.
+  # `LeaseSlot` derives `Default`, and `ArcSwapOption::default()` is the same
+  # empty slot `ArcSwapOption::const_empty()` produces — `const_empty` is
+  # usable in const context, which nothing here needs. No test can separate
+  # them because there is nothing to separate: both satisfy the documented
+  # contract that a fresh slot is `None` and denies (INVARIANTS.md #5, #10),
+  # which `a_cleared_slot_stops_the_instance_spending` pins. Baselined by #43.
+  "replace LeaseSlot::empty -> Arc<Self> with Arc::new\\(Default::default\\(\\)\\)",
   # A binary's `main` is process wiring — env parsing, subscriber install,
   # and a call into library code that has its own tests. Nothing running
   # in-process can observe its body being replaced, so a mutant there is

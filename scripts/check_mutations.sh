@@ -61,6 +61,22 @@ case "${1:-}" in
     cargo mutants --workspace -j "$JOBS" --line-col true --in-diff "$diff" --output "$OUTPUT" \
       || status=$?
     ;;
+  # One crate's whole surface, rather than only what a branch touched. The
+  # diff mode protects code as it is written; this is how code written before
+  # the gate existed gets measured at all (#43). `test_workspace` stays on, so
+  # a mutant here is still allowed to die to any test in the workspace.
+  --package)
+    package=${2:-}
+    if [ -z "$package" ]; then
+      echo "usage: $0 --package <crate>" >&2
+      exit 2
+    fi
+    if [ "$package" = "tollgate-store-postgres" ] && [ -z "${TOLLGATE_PG_URL:-}" ]; then
+      echo "mutation gate: $package needs TOLLGATE_PG_URL, or its tests skip and every mutant reads as missed" >&2
+      exit 1
+    fi
+    cargo mutants -p "$package" -j "$JOBS" --line-col true --output "$OUTPUT" || status=$?
+    ;;
   "")
     if [ -z "${TOLLGATE_PG_URL:-}" ]; then
       echo "mutation gate: full sweep requires TOLLGATE_PG_URL" >&2
@@ -69,7 +85,7 @@ case "${1:-}" in
     cargo mutants --workspace -j "$JOBS" --line-col true --output "$OUTPUT" || status=$?
     ;;
   *)
-    echo "usage: $0 [--diff [base-ref]]" >&2
+    echo "usage: $0 [--diff [base-ref] | --package <crate>]" >&2
     exit 2
     ;;
 esac

@@ -179,12 +179,6 @@ impl MemoryStore {
         Ok(())
     }
 
-    pub fn set_active(&self, account: AccountId, active: bool) {
-        if let Some(record) = self.lock().accounts.get_mut(&account) {
-            record.active = active;
-        }
-    }
-
     /// Bind (or replace) a principal's compiled snapshot and push it to
     /// subscribers. Generation-monotonic: a replayed or reordered publish
     /// carrying an older (or equal) generation is a no-op — matching the

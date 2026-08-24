@@ -595,6 +595,47 @@ mod tests {
         assert_eq!(generation_of(&map, &Principal(1)), Some(1));
     }
 
+    /// The other two bulk methods on the `Arc` delegation had no witness, and
+    /// both could be replaced by no-ops with the whole suite green (#43).
+    ///
+    /// That is not a cosmetic gap. `impl<T: SnapshotMap + ?Sized> SnapshotMap
+    /// for Arc<T>` is what `SnapshotManager`'s own `Arc<dyn SnapshotMap>`
+    /// dispatches through, so a silent no-op there means a refresh pass that
+    /// reports success and installs nothing — every principal ageing out to
+    /// `SnapshotExpired` with no error anywhere.
+    #[test]
+    fn the_arc_delegation_forwards_every_bulk_write() {
+        let map: Arc<dyn SnapshotMap> = Arc::new(ArcSwapSnapshotMap::new());
+
+        map.install_many(vec![
+            (Principal(1), snapshot(1), LeaseSlot::empty()),
+            (Principal(2), snapshot(1), LeaseSlot::empty()),
+        ]);
+        assert_eq!(generation_of(&map, &Principal(1)), Some(1));
+        assert_eq!(generation_of(&map, &Principal(2)), Some(1));
+
+        map.apply_many(vec![
+            SnapshotUpdate::Present {
+                principal: Principal(1),
+                snapshot: snapshot(2),
+                lease: LeaseSlot::empty(),
+            },
+            SnapshotUpdate::Negative {
+                principal: Principal(2),
+                until: t(100),
+                generation: Some(Generation(2)),
+            },
+        ]);
+        assert_eq!(generation_of(&map, &Principal(1)), Some(2));
+        assert!(matches!(
+            map.get(&Principal(2)),
+            Some(MapEntry::NegativeUntil { .. })
+        ));
+
+        map.remove(&Principal(1));
+        assert!(map.get(&Principal(1)).is_none());
+    }
+
     #[test]
     fn arc_swap_negative_cache_is_bounded_and_evicts_oldest_deadline_first() {
         let map = ArcSwapSnapshotMap::with_max_negative_entries(2);
