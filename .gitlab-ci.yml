@@ -30,7 +30,6 @@ variables:
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: "3"
   CARGO_TERM_COLOR: "always"
-  RELEASE_PLZ_VERSION: "0.3.160"
 
 # The policy lives in one mapping so pull-only is the default for every
 # consumer. The sole producer overrides only policy after inheriting the same
@@ -120,55 +119,16 @@ repository-hygiene:
       fi
     - |
       # #46 was a registry *list* — `publish = ["private-registry"]` — from which
-      # release-plz derives `cargo package --registry <name>`; the name resolved
+      # tooling derives `cargo package --registry <name>`; the name resolved
       # nowhere and every main pipeline failed. The plain `publish = false` is a
       # different thing and is required: it is what refuses a stray
-      # `cargo publish`, and release-plz tags private packages under
-      # `git_only = true` (0.3.152, PR #2603). Reject only the list form, in any
-      # manifest — a member inheriting it would evade a workspace-only check.
+      # `cargo publish`. Reject only the list form, in any manifest — a member
+      # inheriting it would evade a workspace-only check.
       publish_lists="$(git grep -n '^[[:space:]]*publish[[:space:]]*=[[:space:]]*\[' -- '*Cargo.toml' || true)"
       if [ -n "$publish_lists" ]; then
         printf 'Cargo manifests must not carry a publish registry list (see AGENTS.md, issue #46):\n%s\n' "$publish_lists" >&2
         exit 1
       fi
-
-# #46 stayed latent for ten hours because the release job runs only on main, so
-# no merge-request pipeline could reach the packaging step. `update` computes the
-# next version and changelog locally — no forge token, no tags, nothing committed
-# — which exercises release-plz.toml and the manifests it reads, on the merge
-# request that changes them.
-release-config:
-  stage: check
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-      changes:
-        - "**/Cargo.toml"
-        - Cargo.lock
-        - release-plz.toml
-    - when: never
-  image: rust:1.97.1-bookworm
-  interruptible: true
-  variables:
-    GIT_DEPTH: "0"
-    RUSTUP_TOOLCHAIN: "1.97.1"
-  cache:
-    key: "release-plz-$RELEASE_PLZ_VERSION"
-    paths:
-      - .ci-cargo/registry/cache/
-      - .ci-cargo/registry/index/
-      - .ci-cargo/git/db/
-      - .ci-tools/
-  before_script:
-    - export PATH="$CARGO_INSTALL_ROOT/bin:$PATH"
-    - cargo install --locked release-plz --version "$RELEASE_PLZ_VERSION" --root "$CARGO_INSTALL_ROOT"
-    # GitLab checks out a detached commit; release-plz resolves the release
-    # history from the current branch and its upstream. Same preamble the
-    # release job uses, which also makes this a faithful dry-run of it.
-    - git fetch origin "$CI_DEFAULT_BRANCH"
-    - git checkout -B "$CI_DEFAULT_BRANCH" "$CI_COMMIT_SHA"
-    - git branch --set-upstream-to="origin/$CI_DEFAULT_BRANCH" "$CI_DEFAULT_BRANCH"
-  script:
-    - release-plz update --config release-plz.toml
 
 fmt:
   extends: .merge-request
@@ -350,47 +310,33 @@ load-thresholds:
     paths:
       - reports/load_gate_report.json
 
-release:
+# Bump the workspace version and the CHANGELOG section in an ordinary merge
+# request; this cuts the tag and the GitLab release when it lands.
+#
+# Replaces release-plz. Not because release-plz failed here — it worked — but
+# because it cannot work in the server project, a sibling workspace or a sibling workspace
+# (`cargo package` needs every dependency to resolve on crates.io, and internal
+# crates never publish), and one release model across the group beats a working
+# exception. It also cost 9.5 minutes a pipeline to produce what this does in
+# seconds.
+#
+# #46's lesson survives the swap: the failure it describes was latent because the
+# release job runs only on main. This job has no configuration for a merge
+# request to get wrong — the version comes from the manifest and the notes from
+# the changelog — and `repository-hygiene` still rejects a manifest registry list
+# on every merge request.
+tag-release:
   extends: .default-branch
   stage: release
-  image: rust:1.97.1-bookworm
+  image: alpine:3.21
   interruptible: false
   resource_group: release
   variables:
     GIT_DEPTH: "0"
-    RUSTUP_TOOLCHAIN: "1.97.1"
-  cache:
-    key: "release-plz-$RELEASE_PLZ_VERSION"
-    paths:
-      - .ci-cargo/registry/cache/
-      - .ci-cargo/registry/index/
-      - .ci-cargo/git/db/
-      - .ci-tools/
+    # The group CI/CD variable keeps the name RELEASE_PLZ_TOKEN; it is an
+    # ordinary Maintainer project token.
+    RELEASE_TOKEN: $RELEASE_PLZ_TOKEN
   before_script:
-    - export PATH="$CARGO_INSTALL_ROOT/bin:$PATH"
-    - git config --global user.name "release-plz[bot]"
-    - git config --global user.email "release-plz@noreply.gitlab.com"
-    - git fetch origin "$CI_DEFAULT_BRANCH"
-    - git checkout -B "$CI_DEFAULT_BRANCH" "$CI_COMMIT_SHA"
-    - git branch --set-upstream-to="origin/$CI_DEFAULT_BRANCH" "$CI_DEFAULT_BRANCH"
-    - test -n "$RELEASE_PLZ_TOKEN"
-    - git remote set-url origin "https://oauth2:${RELEASE_PLZ_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
-    - cargo install --locked release-plz --version "$RELEASE_PLZ_VERSION" --root "$CARGO_INSTALL_ROOT"
-    - |
-      # release-plz requires a clean tree, including ignored files. Keep the
-      # executable outside the checkout while generated CI state is removed.
-      mkdir -p /tmp/release-tools
-      cp -R "$CARGO_INSTALL_ROOT/." /tmp/release-tools/
-      export PATH="/tmp/release-tools/bin:$PATH"
-      export CARGO_HOME=/tmp/release-cargo
-      export CARGO_INSTALL_ROOT=/tmp/release-tools
-      export CARGO_TARGET_DIR=/tmp/target
-      git clean -ffdx -q
-      test -z "$(git status --porcelain=v1 --untracked-files=all --ignored=matching)"
-  after_script:
-    - if [ -d /tmp/release-tools ]; then mkdir -p "$CI_PROJECT_DIR/.ci-tools" && cp -R /tmp/release-tools/. "$CI_PROJECT_DIR/.ci-tools/"; fi
+    - apk add --no-cache git curl jq
   script:
-    - test -n "$RELEASE_PLZ_TOKEN"
-    - release-plz release --config release-plz.toml --forge gitlab --git-token "$RELEASE_PLZ_TOKEN"
-    - git fetch --tags origin
-    - release-plz release-pr --config release-plz.toml --forge gitlab --git-token "$RELEASE_PLZ_TOKEN"
+    - ./scripts/tag-release.sh

@@ -33,8 +33,8 @@ A backend behavior change must update both the memory and PostgreSQL implementat
 ## Proposing a change
 
 1. Find or open an issue stating the objective, scope, and acceptance criteria.
-2. Branch as `<type>/<slug>` using the conventional-commit vocabulary (`feat/`, `fix/`, `docs/`, `chore/`, …). The `release-plz-` prefix is reserved for release automation.
-3. Open a merge request whose **title is a conventional commit**, optionally scoped (`feat(admission): install_many bulk write`) — CI enforces this, and the squash subject drives the version and changelog.
+2. Branch as `<type>/<slug>` using the conventional-commit vocabulary (`feat/`, `fix/`, `docs/`, `chore/`, …).
+3. Open a merge request whose **title is a conventional commit**, optionally scoped (`feat(admission): install_many bulk write`) — CI enforces this, and the squash subject becomes the single commit on `main`. A release is a merge request that bumps the workspace version and writes the `CHANGELOG.md` section; the `tag-release` job cuts the tag when it lands.
 4. In the description, describe behavioral impact, list the validation performed, and call out invariant, migration, API, or threshold changes, with benchmark evidence for performance-sensitive work. Close the issues it resolves with `Closes #N`.
 5. Resolve every discussion; `main` accepts no direct pushes.
 
