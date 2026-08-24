@@ -6,8 +6,8 @@ use std::sync::Arc;
 use jiff::Timestamp;
 
 use tollgate_core::{
-    AccountSnapshot, CostQuote, CostUnits, DenyReason, OpIndex, PermissionBits, QuoteError,
-    Reservation,
+    AccountSnapshot, CostQuote, CostUnits, DenyReason, Locality, OpIndex, PermissionBits,
+    QuoteError, Reservation,
 };
 
 use crate::counters::AdmissionCounters;
@@ -48,9 +48,10 @@ pub struct AdmissionEngine<M: SnapshotMap> {
 impl<M: SnapshotMap> AdmissionEngine<M> {
     #[must_use]
     pub fn new(map: M) -> Self {
+        let sharding = map.local_sharding();
         AdmissionEngine {
             map,
-            counters: AdmissionCounters::new(),
+            counters: AdmissionCounters::with_sharding(sharding),
         }
     }
 
@@ -79,10 +80,13 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
         request: AdmissionRequest<'_, O>,
         now: Timestamp,
     ) -> Result<Admitted, DenyReason> {
-        let outcome = self.admit_inner(request, now);
+        let locality = Locality::current();
+        let outcome = self.admit_inner(request, now, locality);
         match &outcome {
-            Ok(admitted) => self.counters.record_admit(admitted.quote.total),
-            Err(reason) => self.counters.record_deny(reason),
+            Ok(admitted) => self
+                .counters
+                .record_admit_at(admitted.quote.total, locality),
+            Err(reason) => self.counters.record_deny_at(reason, locality),
         }
         outcome
     }
@@ -91,11 +95,12 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
         &self,
         request: AdmissionRequest<'_, O>,
         now: Timestamp,
+        locality: Locality,
     ) -> Result<Admitted, DenyReason> {
         // 1. Lookup. A miss or live negative entry denies; an expired
         //    negative entry also denies but signals the background plane may
         //    retry resolution (it observes the map, not this return value).
-        let state = match self.map.get(&request.principal) {
+        let state = match self.map.get_at(&request.principal, locality) {
             Some(MapEntry::Present(state)) => state,
             Some(MapEntry::NegativeUntil { .. }) | None => {
                 return Err(DenyReason::UnknownPrincipal);
@@ -143,13 +148,16 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
             // Zero-cost requests draw no token; the minimum-charge floor
             // makes this unreachable for any real table.
             None => {}
-            Some(n) => match state.limiter.check_n(n) {
+            Some(n) => match state.limiter.check_n_at(n, locality) {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => return Err(DenyReason::RateLimited),
-                // Unreachable given the check above, which uses the same
-                // configured burst the bucket was built from; kept because
-                // "the bucket cannot ever hold this" must never be reported
-                // as "the bucket is momentarily empty".
+                // Unreachable: the check above clears the quote against the
+                // account's whole burst, and a split bucket's shards are
+                // sized to admit the largest quote any principal sharing the
+                // account can present (`shard_ceiling`), so clearing the
+                // whole burst clears every shard. Kept because "the bucket
+                // cannot ever hold this" must never be reported as "the
+                // bucket is momentarily empty".
                 Err(_) => {
                     return Err(DenyReason::UnpriceableUnderLimits {
                         weight: quote.total,
@@ -162,8 +170,11 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
         // 5. Quota: debit the lease and open the state machine. Note the
         //    deliberate ordering — a lease-denied request has still consumed
         //    its rate token, because it did arrive and was priced.
-        let lease = state.lease.load().ok_or(DenyReason::LeaseUnavailable)?;
-        let reservation = Reservation::reserve(&lease, quote.total, now)?;
+        let lease = state
+            .lease
+            .load_at(locality)
+            .ok_or(DenyReason::LeaseUnavailable)?;
+        let reservation = Reservation::reserve_at_locality(&lease, quote.total, now, locality)?;
 
         Ok(Admitted {
             snapshot: Arc::clone(&state.snapshot),
@@ -180,7 +191,7 @@ mod tests {
     use crate::state::LeaseSlot;
     use tollgate_core::{
         AccountId, AccountStatus, CancelOutcome, CostTable, CostUnits, FencingToken, Generation,
-        LeaseGrant, LeaseId, LocalLease, ResolvedLimits,
+        LeaseGrant, LeaseId, LocalLease, LocalSharding, PublishableSnapshot, ResolvedLimits,
     };
 
     #[derive(Clone, Copy)]
@@ -484,6 +495,71 @@ mod tests {
                 burst_units: CostUnits(u64::from(u32::MAX)),
             }
         );
+    }
+
+    /// The account's rate bucket is shared by every principal, but the split
+    /// is sized from a *snapshot's* largest quote. Sizing it from whichever
+    /// principal installed first left a sibling with a heavier cost table
+    /// unable to spend its largest quote in any shard — reported as
+    /// `UnpriceableUnderLimits` for a request the account's burst can hold,
+    /// and admitted before the split existed (INVARIANTS.md #5).
+    #[test]
+    fn a_shared_split_bucket_never_wedges_a_principal_the_burst_can_hold() {
+        let sharding = LocalSharding::new(std::num::NonZeroUsize::new(8).unwrap());
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::with_sharding(sharding));
+        let limits = ResolvedLimits {
+            max_items_per_request: 64,
+            rate_units_per_second: 800,
+            rate_burst_units: 800,
+        };
+
+        // A light key: 64 items quote 2 + 64 = 66 units, so eight buckets of
+        // a hundred each can hold one.
+        let light = PublishableSnapshot::try_new(Arc::new(AccountSnapshot {
+            limits,
+            cost_table: Arc::new(
+                CostTable::builder(CostUnits(2), CostUnits(1))
+                    .weight(&Op::Price, CostUnits(1))
+                    .build(),
+            ),
+            ..(*snapshot(AccountStatus::Active)).clone()
+        }))
+        .unwrap();
+
+        // A heavy key of the same account at the same generation: 64 items
+        // quote 2 + 640 = 642 units. Publication accepts it — it fits the
+        // account's 800-unit burst — so admission must too.
+        let heavy = PublishableSnapshot::try_new(Arc::new(AccountSnapshot {
+            limits,
+            cost_table: Arc::new(
+                CostTable::builder(CostUnits(2), CostUnits(1))
+                    .weight(&Op::Price, CostUnits(10))
+                    .build(),
+            ),
+            ..(*snapshot(AccountStatus::Active)).clone()
+        }))
+        .unwrap();
+
+        let slot = LeaseSlot::with_sharding(sharding);
+        slot.install(lease(1_000_000));
+        engine
+            .map()
+            .install_publishable(Principal(1), light, Arc::clone(&slot));
+        engine.map().install_publishable(Principal(2), heavy, slot);
+
+        let admitted = engine
+            .admit(
+                AdmissionRequest {
+                    principal: Principal(2),
+                    required: PermissionBits::bit(0),
+                    op: &Op::Price,
+                    items: 64,
+                },
+                t(0),
+            )
+            .expect("a quote within the account's burst is admissible");
+        assert_eq!(admitted.quote.total, CostUnits(642));
+        assert_eq!(admitted.reservation.cancel(), CancelOutcome::ZeroCharged);
     }
 
     /// The counters must attribute each outcome to the right slot and leave

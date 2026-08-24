@@ -28,6 +28,12 @@ exclude_re = [
   # contract that a fresh slot is `None` and denies (INVARIANTS.md #5, #10),
   # which `a_cleared_slot_stops_the_instance_spending` pins. Baselined by #43.
   "replace LeaseSlot::empty -> Arc<Self> with Arc::new\\(Default::default\\(\\)\\)",
+  # `SnapshotMap`'s compatibility default spells the same value as
+  # `LocalSharding::default()`: both are `LocalSharding::SINGLE`. Sharded maps
+  # override the method, and `the_arc_delegation_forwards_every_bulk_write`
+  # proves that a non-default value survives dynamic dispatch. No input can
+  # distinguish these two bodies.
+  "replace SnapshotMap::local_sharding -> LocalSharding with Default::default\\(\\)",
   # A binary's `main` is process wiring — env parsing, subscriber install,
   # and a call into library code that has its own tests. Nothing running
   # in-process can observe its body being replaced, so a mutant there is

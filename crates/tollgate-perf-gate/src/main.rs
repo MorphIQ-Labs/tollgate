@@ -8,6 +8,8 @@
 //!   a manifest with `target_ns > threshold_ns` is itself invalid.
 //! - Each benchmark id maps to `<criterion-root>/<id>/new/estimates.json`,
 //!   whose `mean.point_estimate` (nanoseconds) is compared to `threshold_ns`.
+//! - Optional ratio bounds compare two measurements from the same run, so a
+//!   contention budget is portable across otherwise different hosts.
 //! - Estimates older than the freshness marker are rejected: the gate must
 //!   never pass on stale output left by a previous run.
 //! - A JSON report is always written; the exit code is nonzero when any
@@ -36,7 +38,16 @@ const UNTRUSTED_EXIT: u8 = 3;
 struct Manifest {
     benchmarks: Vec<Entry>,
     #[serde(default)]
+    ratios: Vec<RatioBound>,
+    #[serde(default)]
     trust: TrustPolicy,
+}
+
+#[derive(Deserialize)]
+struct RatioBound {
+    numerator: String,
+    denominator: String,
+    max_ratio: f64,
 }
 
 #[derive(Deserialize)]
@@ -172,6 +183,39 @@ fn all_passed(rows: &[ReportRow]) -> bool {
     rows.iter().all(|row| row.status == "pass")
 }
 
+/// Whether both the absolute-latency rows and the portable ratio rows passed.
+///
+/// Keep this aggregation outside `main` so its fail-closed conjunction is a
+/// directly testable contract rather than process wiring.
+fn all_results_passed(rows: &[ReportRow], ratios: &[RatioRow]) -> bool {
+    all_passed(rows) && ratios.iter().all(|ratio| ratio.status == "pass")
+}
+
+fn evaluate_ratio(bound: &RatioBound, means: &BTreeMap<String, f64>) -> RatioRow {
+    let numerator_ns = means.get(&bound.numerator).copied();
+    let denominator_ns = means.get(&bound.denominator).copied();
+    let ratio = numerator_ns
+        .zip(denominator_ns)
+        .and_then(|(numerator, denominator)| {
+            (denominator > 0.0).then_some(numerator / denominator)
+        });
+    let status = match ratio {
+        Some(ratio) if bound.max_ratio > 0.0 && ratio <= bound.max_ratio => "pass",
+        Some(_) if bound.max_ratio > 0.0 => "over-ratio",
+        Some(_) => "invalid-manifest",
+        None => "missing-or-zero-denominator",
+    };
+    RatioRow {
+        numerator: bound.numerator.clone(),
+        denominator: bound.denominator.clone(),
+        numerator_ns,
+        denominator_ns,
+        ratio,
+        max_ratio: bound.max_ratio,
+        status,
+    }
+}
+
 /// How far a measurement has moved from its previous value, as a fraction.
 ///
 /// `None` when there is nothing to compare against, or when the previous
@@ -249,6 +293,17 @@ struct ReportRow {
     unstable: bool,
 }
 
+#[derive(Serialize)]
+struct RatioRow {
+    numerator: String,
+    denominator: String,
+    numerator_ns: Option<f64>,
+    denominator_ns: Option<f64>,
+    ratio: Option<f64>,
+    max_ratio: f64,
+    status: &'static str,
+}
+
 /// What the machine looked like while measuring, so a suspect result can be
 /// diagnosed after the fact instead of re-litigated.
 #[derive(Serialize)]
@@ -276,6 +331,7 @@ impl RunContext {
 #[derive(Serialize)]
 struct Report {
     rows: Vec<ReportRow>,
+    ratios: Vec<RatioRow>,
     passed: bool,
     trust: Trust,
     policy: TrustPolicy,
@@ -392,11 +448,29 @@ fn main() -> ExitCode {
         rows.push(row);
     }
 
-    let passed = all_passed(&rows);
+    let ratios: Vec<_> = manifest
+        .ratios
+        .iter()
+        .map(|bound| evaluate_ratio(bound, &current))
+        .collect();
+    for ratio in &ratios {
+        match ratio.ratio {
+            Some(measured) => println!(
+                "perf-gate: {}/{}: ratio {:.2} (max {:.2}) — {}",
+                ratio.numerator, ratio.denominator, measured, ratio.max_ratio, ratio.status
+            ),
+            None => eprintln!(
+                "perf-gate: {}/{}: ratio unavailable — {}",
+                ratio.numerator, ratio.denominator, ratio.status
+            ),
+        }
+    }
+    let passed = all_results_passed(&rows, &ratios);
     let trust = assess_trust(&current, &previous, &manifest.trust);
 
     let report = Report {
         rows,
+        ratios,
         passed,
         trust: trust.clone(),
         policy: manifest.trust,
@@ -697,6 +771,68 @@ mod tests {
         assert!(!all_passed(&[good, slow]));
         assert!(!all_passed(&[absent]));
         assert!(all_passed(&[]), "nothing to fail");
+    }
+
+    #[test]
+    fn a_same_run_ratio_enforces_the_portable_contention_budget() {
+        let bound = RatioBound {
+            numerator: "contended".to_string(),
+            denominator: "uncontended".to_string(),
+            max_ratio: 3.0,
+        };
+        let within = means(&[("contended", 300.0), ("uncontended", 100.0)]);
+        let over = means(&[("contended", 301.0), ("uncontended", 100.0)]);
+
+        assert_eq!(evaluate_ratio(&bound, &within).status, "pass");
+        assert_eq!(evaluate_ratio(&bound, &over).status, "over-ratio");
+        assert_eq!(
+            evaluate_ratio(&bound, &BTreeMap::new()).status,
+            "missing-or-zero-denominator"
+        );
+        for denominator in [0.0, -1.0] {
+            let unusable = means(&[("contended", 300.0), ("uncontended", denominator)]);
+            let row = evaluate_ratio(&bound, &unusable);
+            assert_eq!(row.status, "missing-or-zero-denominator");
+            assert_eq!(row.ratio, None);
+        }
+
+        // A ratio ceiling is a contract, not a switch. Zero and negative
+        // values are invalid even when the measured ratio is also zero; they
+        // must never become an accidental pass or an ordinary threshold miss.
+        let zero_measurement = means(&[("contended", 0.0), ("uncontended", 100.0)]);
+        for max_ratio in [0.0, -1.0] {
+            let invalid = RatioBound {
+                numerator: bound.numerator.clone(),
+                denominator: bound.denominator.clone(),
+                max_ratio,
+            };
+            assert_eq!(
+                evaluate_ratio(&invalid, &zero_measurement).status,
+                "invalid-manifest"
+            );
+            assert_eq!(evaluate_ratio(&invalid, &over).status, "invalid-manifest");
+        }
+    }
+
+    #[test]
+    fn absolute_and_ratio_verdicts_must_both_pass() {
+        let policy = TrustPolicy::default();
+        let passing_row = evaluate(&entry(), measured(120.0, None), None, &policy);
+        let failing_row = evaluate(&entry(), measured(9_999.0, None), None, &policy);
+        let ratio = |status| RatioRow {
+            numerator: "contended".to_string(),
+            denominator: "uncontended".to_string(),
+            numerator_ns: Some(100.0),
+            denominator_ns: Some(100.0),
+            ratio: Some(1.0),
+            max_ratio: 3.0,
+            status,
+        };
+
+        assert!(all_results_passed(&[passing_row], &[ratio("pass")]));
+        let passing_row = evaluate(&entry(), measured(120.0, None), None, &policy);
+        assert!(!all_results_passed(&[failing_row], &[ratio("pass")]));
+        assert!(!all_results_passed(&[passing_row], &[ratio("over-ratio")]));
     }
 
     fn entry() -> Entry {

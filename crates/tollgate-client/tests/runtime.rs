@@ -12,7 +12,9 @@ use tollgate_admission::LeaseSlot;
 use tollgate_client::{
     Clock, LeaseManager, LeaseManagerConfig, ManualClock, UsageWriter, UsageWriterConfig,
 };
-use tollgate_core::{AccountId, AccountStatus, CostUnits, DenyReason, RequestId, UsageEvent};
+use tollgate_core::{
+    AccountId, AccountStatus, CostUnits, DenyReason, LocalSharding, RequestId, UsageEvent,
+};
 use tollgate_store::{
     AccountConfig, GrantPolicy, IngestReport, LeaseAllocator, MemoryStore, ReclaimBatch,
     StoreError, UsageSink,
@@ -195,7 +197,7 @@ async fn adaptive_tail_grant_does_not_rotate_while_unspent() {
 #[tokio::test(start_paused = true)]
 async fn rotation_at_low_water_installs_fresh_lease() {
     let store = store(10_000);
-    let slot = LeaseSlot::empty();
+    let slot = LeaseSlot::with_sharding(LocalSharding::new(NonZeroUsize::new(8).unwrap()));
     let clock = Arc::new(ManualClock::new(t(0)));
     let manager =
         LeaseManager::spawn(store.clone(), Arc::clone(&slot), clock, manager_config()).unwrap();
@@ -321,7 +323,7 @@ fn invalid_lease_manager_durations_are_rejected() {
 #[tokio::test(start_paused = true)]
 async fn shutdown_releases_unspent_units() {
     let store = store(10_000);
-    let slot = LeaseSlot::empty();
+    let slot = LeaseSlot::with_sharding(LocalSharding::new(NonZeroUsize::new(8).unwrap()));
     let clock = Arc::new(ManualClock::new(t(0)));
     let manager =
         LeaseManager::spawn(store.clone(), Arc::clone(&slot), clock, manager_config()).unwrap();

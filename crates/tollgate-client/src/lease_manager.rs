@@ -9,9 +9,10 @@
 //!   it. The superseded lease is **not** released immediately: in-flight
 //!   reservations may still hold it. It is parked instead, and released back
 //!   to the allocator once it has *quiesced* — when the manager holds the
-//!   only remaining `Arc` (`Arc::strong_count == 1`), no reservation exists
-//!   and none can be created (the slot no longer points at it), so its
-//!   remaining count is final and the release cannot race a debit or credit.
+//!   only remaining outer `Arc` and no independently reference-counted local
+//!   view remains, no reservation exists and none can be created (the slot no
+//!   longer points at it), so its remaining count is final and the release
+//!   cannot race a debit or credit.
 //!   Until quiescence the over-reservation is bounded by one grant per
 //!   rotation, and TTL reclaim remains the backstop.
 //! - allocator refusal with an expired/empty slot → the slot is cleared and
@@ -483,7 +484,7 @@ async fn run(
                 .await;
                 true
             }
-            Some(lease) => lease.needs_refill(),
+            Some(lease) => lease.refill_due_or_rearm(),
         };
         if !needs_acquire {
             continue;
@@ -512,11 +513,20 @@ async fn run(
                         .min(grant.units.get().saturating_sub(1)),
                 );
                 let fresh = Arc::new(
-                    LocalLease::with_safety_margin(grant, low_water, config.expiry_safety_margin)
-                        // Each fresh lease gets the doorbell and its own
-                        // unrung flag, so "at most one request per rotation"
-                        // needs no reset protocol.
-                        .with_refill(Arc::clone(&refill) as Arc<dyn RefillSignal>),
+                    LocalLease::with_sharding(
+                        grant,
+                        low_water,
+                        config.expiry_safety_margin,
+                        slot.sharding(),
+                    )
+                    // Each fresh lease gets the doorbell and its own
+                    // unrung shard flags. A single-counter lease therefore
+                    // rings once for the whole rotation; a sharded one rings
+                    // at most once per shard between aggregate checks, which
+                    // is what `refill_due_or_rearm` above clears whenever the
+                    // aggregate shows an early crossing was premature
+                    // (INVARIANTS.md #6).
+                    .with_refill(Arc::clone(&refill) as Arc<dyn RefillSignal>),
                 );
                 if let Some(old) = slot.replace(fresh) {
                     parked.push(old);
@@ -640,9 +650,11 @@ async fn release_quiesced(
 ) {
     let mut retry = Vec::new();
     for lease in std::mem::take(parked) {
-        // The local binding holds what was the vec's sole reference, so a
-        // count above one still means an in-flight reservation holds it.
-        if Arc::strong_count(&lease) > 1 {
+        // The local binding must be the sole outer handle, and sharded slots
+        // must have no independently reference-counted locality alias left.
+        // Together those conditions mean no request can still reserve or
+        // return units before the aggregate is released.
+        if Arc::strong_count(&lease) > 1 || !lease.is_only_local_view() {
             retry.push(lease);
             continue;
         }

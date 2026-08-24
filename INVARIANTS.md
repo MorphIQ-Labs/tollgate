@@ -8,14 +8,32 @@ until it has one.
    the units allocated to the account, under any interleaving of concurrent
    clients. Enforced by centrally allocated leases: units are spent only from
    a lease, and a lease's units were atomically debited from the account at
-   allocation.
+   allocation. Opt-in local shards partition that one grant exactly; a debit
+   first uses its sticky local counter, then siblings, and fragmented debits
+   carry a fixed-size exact-total receipt. Sharding never creates capacity and
+   never leaves a positive aggregate unspendable at exhaustion. A *live*
+   aggregate read is an estimate — the walk is not one atomic instant and a
+   refund may concentrate on a shard it has passed or not yet reached — so it
+   is clamped to the grant, never asserted against it; settlement reads it
+   only at quiescence, where it is exact.
    *Tests:* `no_double_spend_across_instances` (memory and Postgres variants),
-   `tollgate-core` reservation proptests.
+   `lease_units_are_conserved` and `concurrent_commit_conservation` across
+   sharded layouts, `sharded_grant_and_low_water_partitions_are_exact`,
+   `a_whole_sibling_is_used_before_fragmenting`,
+   `sharded_lease_spends_to_exact_exhaustion_without_stranding`,
+   `failed_fragmented_debit_reports_true_remaining_and_rolls_back`,
+   `a_torn_aggregate_above_the_grant_reads_as_the_grant`,
+   `a_fragmenting_rollback_never_panics_a_concurrent_aggregate_read`, and the
+   exact aggregate model in `formal/lean/Tollgate/LeaseShards.lean`.
 
 2. **Zero charge before execution.** A reservation that never reaches
    `commit_at_execution_start` charges zero units, and its units return to the
    local lease. Dropping a pending reservation is a release, not a leak.
-   *Tests:* `reservation::tests::{drop_releases_pending, cancel_charges_zero}`.
+   A fragmented sharded reservation refunds its exact aggregate once; shards
+   may rebalance because they are partitions of the same lease bound. *Tests:*
+   `reservation::tests::{drop_releases_pending, cancel_charges_zero}`,
+   `fragmented_reservation_refunds_without_stranding_capacity`, and
+   `lease_units_are_conserved`.
 
 3. **Atomic commit-vs-cancel.** Commit and cancel race on a single atomic
    transition; exactly one wins. A cancelled reservation can never later
@@ -61,6 +79,26 @@ until it has one.
    `quote_beyond_the_bucket_domain_is_unpriceable`, and
    `rate_limiter_weights_by_cost` (the converse: genuine throttling stays
    `RateLimited`).
+   An opt-in sharded limiter partitions (never copies) the instance-local
+   account rate and burst; publication's already-validated maximum quote
+   limits the shard count so every shard can admit the largest legitimate
+   request. That limit is account-wide, because the bucket is: it is the
+   tightest ceiling any principal sharing the account has presented, tightened
+   by every install irrespective of generation ordering and never widened, so
+   a key with a heavier cost table is never wedged by a split its sibling
+   sized. Raw snapshot installs retain one defensive bucket because they do
+   not carry that proof. A shard that cannot hold a request is not the
+   account's answer: siblings are tried, the soonest retry any of them offers
+   is what `RateLimited` reports, and `UnpriceableUnderLimits` is returned only
+   when no bucket can take the request now or later.
+   *Additional tests:* `rate_shards_partition_one_account_burst_without_multiplying_it`,
+   `maximum_quote_limits_shards_to_buckets_that_can_admit_it`,
+   `publication_accepts_a_worst_case_quote_equal_to_the_burst`,
+   `publishable_install_carries_maximum_quote_into_rate_sharding`,
+   `a_heavier_principal_resplits_the_account_bucket_it_shares`,
+   `an_unproven_principal_collapses_the_account_split`,
+   `a_stale_snapshot_still_narrows_the_split_it_cannot_widen`, and
+   `a_shared_split_bucket_never_wedges_a_principal_the_burst_can_hold`.
 
 6. **Foreground isolation.** Lease refill and snapshot replacement never block
    an in-flight request, and the request path never waits on the plane that
@@ -69,14 +107,29 @@ until it has one.
    implementation is contractually non-blocking — so refill latency is no
    longer bounded below by the poll interval, and a funded account is not
    refused between ticks. Cold start and usability-window rollover keep the
-   interval as their backstop, having no debit to announce them.
+   interval as their backstop, having no debit to announce them. In a sharded
+   lease, an early local low-water crossing wakes at most once per shard; if
+   the aggregate is not low yet, the manager clears those doorbells and
+   rechecks the aggregate so a concurrent crossing cannot be lost. Publishing
+   a lease to N locality views is N swaps, so mutators are serialized: a
+   reader straddles one publication exactly as it straddled the single-view
+   slot's one swap, but the slot never *ends* a publication holding two
+   different leases, which is what would let a locality keep spending past a
+   revocation. Rotation and shutdown wait for every locality's independently
+   reference-counted lease view before releasing the exact aggregate.
    *Tests:* `refill_begins_on_the_crossing_debit_not_the_next_tick`,
    `a_burst_across_a_rotation_never_denies_a_funded_account`,
    `refill_installs_lease_on_cold_start`,
    `usability_window_rollover_returns_unspent_capacity`,
    `the_crossing_debit_raises_the_signal`,
-   `a_lease_signals_at_most_once_however_long_it_drains`, and the
-   `RefillRequests` handoff tests.
+   `a_lease_signals_at_most_once_however_long_it_drains`,
+   `an_early_shard_signal_is_rearmed_until_the_aggregate_crosses`,
+   `rotation_at_low_water_installs_fresh_lease`,
+   `shutdown_releases_unspent_units`,
+   `sharded_slot_keeps_release_parked_while_any_local_view_is_held`,
+   `racing_mutators_never_leave_a_slot_holding_two_answers`, and the
+   `RefillRequests` handoff tests. Configuration ownership is witnessed by
+   `mismatched_local_sharding_is_rejected_before_tasks_start`.
 
 7. **Idempotent partial accounting.** Replaying a usage batch (same request
    IDs) never double-bills. Every successful mixed batch classifies each

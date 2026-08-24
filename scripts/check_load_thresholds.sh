@@ -7,9 +7,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-load_gate_mode=()
+load_gate_evidence=false
 if [ "${1:-}" = "--evidence" ]; then
-    load_gate_mode=(--evidence)
+    load_gate_evidence=true
     shift
 fi
 
@@ -31,6 +31,11 @@ load_average() {
     fi
 }
 
+load_gate_args=("$load_thresholds_path" "$load_report_path")
+if [ "$load_gate_evidence" = true ]; then
+    load_gate_args=(--evidence "${load_gate_args[@]}")
+fi
+
 TOLLGATE_GATE_LOAD="$(load_average)" \
     exec cargo run --locked --profile production -p pricing-api --bin load_gate -- \
-    "${load_gate_mode[@]}" "$load_thresholds_path" "$load_report_path"
+    "${load_gate_args[@]}"

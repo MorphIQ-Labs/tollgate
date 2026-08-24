@@ -34,5 +34,6 @@ pub use engine::{AdmissionEngine, AdmissionRequest, Admitted};
 pub use generation_model::{Watermark, accept_positive, accept_revoked, accept_unknown};
 pub use maps::{ArcSwapSnapshotMap, MokaSnapshotMap};
 pub use state::{
-    AccountAdmissionState, LeaseSlot, MapEntry, Principal, SnapshotMap, SnapshotUpdate,
+    AccountAdmissionState, LeaseSlot, MapEntry, Principal, PublishableSnapshotUpdate, SnapshotMap,
+    SnapshotUpdate,
 };

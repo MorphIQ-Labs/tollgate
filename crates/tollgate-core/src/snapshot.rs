@@ -100,6 +100,7 @@ pub struct ResolvedLimits {
 /// Shared as `Arc<AccountSnapshot>`; replaced whole (never mutated) when the
 /// control plane publishes a newer [`Generation`].
 #[derive(Debug, Clone)]
+#[repr(align(128))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AccountSnapshot {
     pub account_id: AccountId,
@@ -167,14 +168,20 @@ impl std::error::Error for SnapshotValidationError {}
 /// backstop. Store publication and source boundaries exchange this proof so
 /// an invalid snapshot cannot reach them by caller convention alone.
 #[derive(Debug, Clone)]
-pub struct PublishableSnapshot(Arc<AccountSnapshot>);
+pub struct PublishableSnapshot {
+    snapshot: Arc<AccountSnapshot>,
+    maximum_quote: Option<CostUnits>,
+}
 
 impl PublishableSnapshot {
     pub fn try_new(snapshot: Arc<AccountSnapshot>) -> Result<Self, SnapshotValidationError> {
         let Some((operation_index, maximum_weight)) = snapshot.cost_table.maximum_weight() else {
             // With no registered operation the table cannot produce a quote,
             // so no request can witness a quote/burst inconsistency.
-            return Ok(PublishableSnapshot(snapshot));
+            return Ok(PublishableSnapshot {
+                snapshot,
+                maximum_quote: None,
+            });
         };
         let max_quote = snapshot
             .cost_table
@@ -192,17 +199,28 @@ impl PublishableSnapshot {
                 burst_units,
             });
         }
-        Ok(PublishableSnapshot(snapshot))
+        Ok(PublishableSnapshot {
+            snapshot,
+            maximum_quote: Some(max_quote),
+        })
     }
 
     #[must_use]
     pub fn as_snapshot(&self) -> &AccountSnapshot {
-        &self.0
+        &self.snapshot
+    }
+
+    /// The largest quote publication proved the configured request shape can
+    /// produce. Control-plane consumers use this evidence directly instead
+    /// of repeating the cost-table scan at the next trust boundary.
+    #[must_use]
+    pub fn maximum_quote(&self) -> Option<CostUnits> {
+        self.maximum_quote
     }
 
     #[must_use]
     pub fn into_inner(self) -> Arc<AccountSnapshot> {
-        self.0
+        self.snapshot
     }
 
     /// Re-stamp status and generation, carrying the publication proof over.
@@ -219,10 +237,13 @@ impl PublishableSnapshot {
     /// have changed would only invite an `expect` at each call site.
     #[must_use]
     pub fn restamped(&self, status: AccountStatus, generation: Generation) -> Self {
-        let mut snapshot = AccountSnapshot::clone(&self.0);
+        let mut snapshot = AccountSnapshot::clone(&self.snapshot);
         snapshot.status = status;
         snapshot.generation = generation;
-        PublishableSnapshot(Arc::new(snapshot))
+        PublishableSnapshot {
+            snapshot: Arc::new(snapshot),
+            maximum_quote: self.maximum_quote,
+        }
     }
 }
 
@@ -458,7 +479,13 @@ mod tests {
 
     #[test]
     fn publication_accepts_a_worst_case_quote_equal_to_the_burst() {
-        PublishableSnapshot::try_new(priced_snapshot(10, 1, &[(0, 7)], 10, 80)).unwrap();
+        let publishable =
+            PublishableSnapshot::try_new(priced_snapshot(10, 1, &[(0, 7)], 10, 80)).unwrap();
+        assert_eq!(
+            publishable.maximum_quote(),
+            Some(CostUnits(80)),
+            "the proof passed to the next trust boundary is the quote validated here"
+        );
     }
 
     #[test]
