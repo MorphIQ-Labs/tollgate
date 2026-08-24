@@ -5,6 +5,12 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.2.14](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.13...v0.2.14) - 2026-08-24
+
+### Added
+
+- *(client)* #48 discover the tracked principal set at runtime
+
 ## [0.2.13](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.12...v0.2.13) - 2026-08-24
 
 ### Other
