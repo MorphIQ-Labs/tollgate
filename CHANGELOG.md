@@ -1,9 +1,32 @@
 # Changelog
 
-All notable Tollgate changes are recorded here by release-plz from conventional
-merge request titles.
+All notable Tollgate changes are recorded here. A release is prepared in an
+ordinary merge request that bumps the workspace version and writes the section
+below; the `tag-release` job then cuts the `v{version}` tag and the GitLab
+release from that section when the merge request lands.
 
 ## [Unreleased]
+
+## [0.6.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.5.0...v0.6.0) - 2026-08-24
+
+### Fixed
+
+- *(admission)* [**breaking**] #53 an absence is not a revocation. Only a
+  generation the source published a revocation at may refuse that same
+  generation back. A generation this instance merely observed still orders
+  snapshots — a strictly older one is refused — but asserts nothing about the
+  principal being dead, so the same generation arriving again is a
+  re-observation. Conflating the two stranded any principal whose row went
+  briefly absent: the absence inherited the positive's generation and then
+  refused it back forever. This is #17's rule — keyed on what the source
+  answered, never on what the instance remembers — applied to admission rather
+  than to TTL selection. Invariant 15 and `formal/lean/Tollgate/SnapshotCache.lean`
+  are updated to match.
+- *(ci)* add `dependencies: []` so jobs do not fetch artifacts they never read.
+
+### Documentation
+
+- carry the Repository and Branch Settings section into the engineering contract.
 
 ## [0.5.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.4.0...v0.5.0) - 2026-08-24
 
