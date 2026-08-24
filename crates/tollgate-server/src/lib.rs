@@ -25,7 +25,7 @@ pub mod error;
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -34,8 +34,8 @@ use tracing::Instrument as _;
 
 use tollgate_core::{AccountId, CostUnits, Principal, PublishableSnapshot};
 use tollgate_store::wire::{
-    AcquireRequest, AcquireResponse, CreateAccountRequest, DepositRequest, IngestRequest,
-    PrincipalsResponse, PublishSnapshotRequest, ReleaseRequest, SetStatusRequest,
+    API_PREFIX, AcquireRequest, AcquireResponse, CreateAccountRequest, DepositRequest,
+    IngestRequest, PrincipalsResponse, PublishSnapshotRequest, ReleaseRequest, SetStatusRequest,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, Clock, DEFAULT_RECLAIM_BATCH_LIMIT, IngestReport, LeaseAllocator,
@@ -43,7 +43,7 @@ use tollgate_store::{
     UsageSink,
 };
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson, ApiPath};
 
 /// Everything the handlers need. `S` is the storage backend; the clock is the
 /// single place wall time enters the server.
@@ -82,18 +82,22 @@ pub fn router<S: Backend>(state: ServerState<S>) -> Router {
     Router::new()
         .route("/livez", get(async || StatusCode::OK))
         .route("/readyz", get(readyz::<S>))
-        .route("/v1/leases/acquire", post(acquire::<S>))
-        .route("/v1/leases/release", post(release::<S>))
-        .route("/v1/leases/reclaim", post(reclaim::<S>))
-        .route("/v1/snapshots", get(list_principals::<S>))
-        .route("/v1/snapshots/{principal}", get(fetch_snapshot::<S>))
-        .route("/v1/usage/ingest", post(ingest::<S>))
-        .route("/v1/admin/accounts", post(create_account::<S>))
-        .route("/v1/admin/accounts/{account}/deposit", post(deposit::<S>))
-        .route("/v1/admin/accounts/{account}/status", post(set_status::<S>))
-        .route(
-            "/v1/admin/snapshots/{principal}",
-            put(publish_snapshot::<S>).delete(remove_snapshot::<S>),
+        .nest(
+            API_PREFIX,
+            Router::new()
+                .route("/leases/acquire", post(acquire::<S>))
+                .route("/leases/release", post(release::<S>))
+                .route("/leases/reclaim", post(reclaim::<S>))
+                .route("/snapshots", get(list_principals::<S>))
+                .route("/snapshots/{principal}", get(fetch_snapshot::<S>))
+                .route("/usage/ingest", post(ingest::<S>))
+                .route("/admin/accounts", post(create_account::<S>))
+                .route("/admin/accounts/{account}/deposit", post(deposit::<S>))
+                .route("/admin/accounts/{account}/status", post(set_status::<S>))
+                .route(
+                    "/admin/snapshots/{principal}",
+                    put(publish_snapshot::<S>).delete(remove_snapshot::<S>),
+                ),
         )
         .with_state(state)
 }
@@ -260,7 +264,7 @@ async fn readyz<S: Backend>(State(state): State<ServerState<S>>) -> StatusCode {
 
 async fn acquire<S: Backend>(
     State(state): State<ServerState<S>>,
-    Json(request): Json<AcquireRequest>,
+    ApiJson(request): ApiJson<AcquireRequest>,
 ) -> Result<Json<AcquireResponse>, ApiError> {
     let grant = state
         .store
@@ -276,7 +280,7 @@ async fn acquire<S: Backend>(
 
 async fn release<S: Backend>(
     State(state): State<ServerState<S>>,
-    Json(request): Json<ReleaseRequest>,
+    ApiJson(request): ApiJson<ReleaseRequest>,
 ) -> Result<StatusCode, ApiError> {
     state
         .store
@@ -298,9 +302,9 @@ async fn reclaim<S: Backend>(
 
 async fn fetch_snapshot<S: Backend>(
     State(state): State<ServerState<S>>,
-    Path(principal): Path<u128>,
+    ApiPath(principal): ApiPath<Principal>,
 ) -> Result<Json<Arc<tollgate_core::AccountSnapshot>>, ApiError> {
-    match state.store.snapshot(Principal(principal)).await? {
+    match state.store.snapshot(principal).await? {
         SnapshotResolution::Present(snapshot) => Ok(Json(snapshot.into_inner())),
         SnapshotResolution::Revoked { generation } => Err(ApiError::revoked(generation)),
         SnapshotResolution::Unknown => Err(ApiError::not_found("unknown-principal", "no snapshot")),
@@ -328,7 +332,7 @@ async fn list_principals<S: Backend>(
 
 async fn ingest<S: Backend>(
     State(state): State<ServerState<S>>,
-    Json(request): Json<IngestRequest>,
+    ApiJson(request): ApiJson<IngestRequest>,
 ) -> Result<Json<IngestReport>, ApiError> {
     Ok(Json(
         state
@@ -340,7 +344,7 @@ async fn ingest<S: Backend>(
 
 async fn create_account<S: Backend>(
     State(state): State<ServerState<S>>,
-    Json(request): Json<CreateAccountRequest>,
+    ApiJson(request): ApiJson<CreateAccountRequest>,
 ) -> Result<StatusCode, ApiError> {
     state
         .store
@@ -355,8 +359,8 @@ async fn create_account<S: Backend>(
 
 async fn deposit<S: Backend>(
     State(state): State<ServerState<S>>,
-    Path(account): Path<u128>,
-    Json(request): Json<DepositRequest>,
+    ApiPath(account): ApiPath<AccountId>,
+    ApiJson(request): ApiJson<DepositRequest>,
 ) -> Result<StatusCode, ApiError> {
     if request.units == CostUnits::ZERO {
         return Err(ApiError::bad_request(
@@ -364,42 +368,33 @@ async fn deposit<S: Backend>(
             "deposit must be positive",
         ));
     }
-    state
-        .store
-        .deposit(AccountId(account), request.units)
-        .await?;
+    state.store.deposit(account, request.units).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn set_status<S: Backend>(
     State(state): State<ServerState<S>>,
-    Path(account): Path<u128>,
-    Json(request): Json<SetStatusRequest>,
+    ApiPath(account): ApiPath<AccountId>,
+    ApiJson(request): ApiJson<SetStatusRequest>,
 ) -> Result<StatusCode, ApiError> {
-    state
-        .store
-        .set_active(AccountId(account), request.active)
-        .await?;
+    state.store.set_active(account, request.active).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn publish_snapshot<S: Backend>(
     State(state): State<ServerState<S>>,
-    Path(principal): Path<u128>,
-    Json(request): Json<PublishSnapshotRequest>,
+    ApiPath(principal): ApiPath<Principal>,
+    ApiJson(request): ApiJson<PublishSnapshotRequest>,
 ) -> Result<StatusCode, ApiError> {
     let snapshot = PublishableSnapshot::try_new(request.snapshot)?;
-    state
-        .store
-        .publish_snapshot(Principal(principal), snapshot)
-        .await?;
+    state.store.publish_snapshot(principal, snapshot).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn remove_snapshot<S: Backend>(
     State(state): State<ServerState<S>>,
-    Path(principal): Path<u128>,
+    ApiPath(principal): ApiPath<Principal>,
 ) -> Result<StatusCode, ApiError> {
-    state.store.remove_snapshot(Principal(principal)).await?;
+    state.store.remove_snapshot(principal).await?;
     Ok(StatusCode::NO_CONTENT)
 }

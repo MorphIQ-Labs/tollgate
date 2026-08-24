@@ -18,7 +18,8 @@ use tokio::sync::Mutex;
 
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
-    LeaseId, PermissionBits, Principal, PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent,
+    KeyId, LeaseId, PermissionBits, Principal, PublishableSnapshot, RequestId, ResolvedLimits,
+    UsageEvent,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, CreateAccountError, GrantPolicy, LeaseAllocator,
@@ -1060,6 +1061,47 @@ async fn snapshot_publish_fetch_and_generation_monotonicity() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn snapshot_json_preserves_legacy_numbers_and_encodes_high_ids_exactly() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    let key = KeyId((1u128 << 127) | 2);
+    let principal = Principal((1u128 << 127) | 3);
+    let snapshot = publishable(Arc::new(AccountSnapshot {
+        account_id: ACCOUNT,
+        key_id: Some(key),
+        generation: Generation(1),
+        status: AccountStatus::Active,
+        valid_until: t(10_000),
+        permissions: PermissionBits::ALL,
+        limits: ResolvedLimits {
+            max_items_per_request: 64,
+            rate_units_per_second: 1_000,
+            rate_burst_units: 1_000,
+        },
+        cost_table: Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+    }));
+    store.publish_snapshot(principal, snapshot).await.unwrap();
+
+    let pool = corruption_pool().await;
+    let row = sqlx::query("SELECT snapshot FROM tollgate_snapshots WHERE principal = $1")
+        .bind(principal.0.to_be_bytes().to_vec())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let stored: serde_json::Value = sqlx::Row::get(&row, 0);
+    assert_eq!(stored["account_id"], serde_json::json!(ACCOUNT.0));
+    assert_eq!(stored["key_id"], serde_json::json!(key.to_string()));
+
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("the storage-local representation must decode");
+    };
+    assert_eq!(fetched.account_id, ACCOUNT);
+    assert_eq!(fetched.key_id, Some(key));
 }
 
 #[tokio::test]

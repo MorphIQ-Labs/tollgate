@@ -12,6 +12,7 @@ tollgate-core = { path = "../tollgate-core", version = "=0.2.14", features = ["s
 tollgate-store = { path = "../tollgate-store", version = "=0.2.14", features = ["wire"] }
 async-trait = { workspace = true }
 jiff = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 # Runtime-checked queries only (sqlx::query, not query!): the workspace must
 # build without a DATABASE_URL. The correctness suite runs against a live

@@ -216,7 +216,7 @@ impl MemoryStore {
         let principal = push.principal;
         let subscribers = self.push.send(push).unwrap_or(0);
         tracing::debug!(
-            principal = principal.0,
+            %principal,
             subscribers,
             "snapshot pushed to subscribers"
         );

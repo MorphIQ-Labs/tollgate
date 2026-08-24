@@ -1,9 +1,11 @@
 //! The HTTP wire contract between `tollgate-server` and `tollgate-client`'s HTTP
-//! transport. One place, versioned by path prefix (`/v1/...`) on the server.
+//! transport. One place, versioned by [`API_PREFIX`] on the server.
 //!
-//! Ids serialize as JSON numbers (`serde_json` handles u128 natively);
-//! snapshots travel whole, cost table included — the receiving instance
-//! installs them as-is, resolving nothing.
+//! Every 128-bit identifier is exactly 32 lowercase hexadecimal characters,
+//! without a `0x` prefix, in both JSON strings and URL path segments. JSON
+//! numbers are not portable for these values: common consumers round integers
+//! above 2^53. Snapshots travel whole, cost table included — the receiving
+//! instance validates them and resolves nothing again.
 
 use std::sync::Arc;
 
@@ -13,6 +15,13 @@ use tollgate_core::{
     AccountId, AccountSnapshot, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId,
     UsageEvent,
 };
+
+/// Current HTTP wire-contract prefix.
+///
+/// The pre-public V1 contract uses canonical textual identifiers. Keeping the
+/// prefix here makes client and server select the same contract without
+/// duplicating a magic string.
+pub const API_PREFIX: &str = "/v1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AcquireRequest {
@@ -151,5 +160,31 @@ mod tests {
         assert_eq!(body, r#"{"events":[]}"#);
         let received: IngestRequest = serde_json::from_str(&body).unwrap();
         assert!(received.events.is_empty());
+    }
+
+    #[test]
+    fn high_bit_ids_are_portable_text_in_an_untyped_json_consumer() {
+        let high = (1u128 << 127) | 0x2a;
+        let mut event = event(high);
+        event.account_id = AccountId(high + 1);
+        event.lease_id = LeaseId(high + 2);
+        let events = [event];
+        let value = serde_json::to_value(IngestRequestRef { events: &events }).unwrap();
+        let event = &value["events"][0];
+
+        for (field, expected) in [
+            ("request_id", high),
+            ("account_id", high + 1),
+            ("lease_id", high + 2),
+        ] {
+            let text = event[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("{field} must be JSON text, got {}", event[field]));
+            assert_eq!(text.len(), 32);
+            assert_eq!(u128::from_str_radix(text, 16).unwrap(), expected);
+        }
+
+        let received: IngestRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(received.events, events);
     }
 }

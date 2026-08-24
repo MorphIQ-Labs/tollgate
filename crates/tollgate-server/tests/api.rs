@@ -12,12 +12,21 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use tollgate_core::{AccountId, CostUnits, Principal};
+use tollgate_store::wire::API_PREFIX;
 use tollgate_store::{AccountConfig, GrantPolicy, ManualClock, MemoryStore};
 
 use tollgate_server::{ServerState, router};
 
 fn t(secs: i64) -> Timestamp {
     Timestamp::from_second(secs).unwrap()
+}
+
+fn id(value: u128) -> String {
+    format!("{value:032x}")
+}
+
+fn api(path: &str) -> String {
+    format!("{API_PREFIX}{path}")
 }
 
 fn state() -> (Arc<MemoryStore>, axum::Router) {
@@ -71,8 +80,8 @@ async fn lease_lifecycle_over_http() {
     let (status, grant) = call(
         &router,
         "POST",
-        "/v1/leases/acquire",
-        Some(json!({"account_id": 1, "requested": 600, "ttl_seconds": 60})),
+        &api("/leases/acquire"),
+        Some(json!({"account_id": id(1), "requested": 600, "ttl_seconds": 60})),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -83,7 +92,7 @@ async fn lease_lifecycle_over_http() {
     let (status, _) = call(
         &router,
         "POST",
-        "/v1/leases/release",
+        &api("/leases/release"),
         Some(json!({
             "lease_id": grant["lease_id"],
             "fencing_token": grant["fencing_token"],
@@ -103,8 +112,8 @@ async fn problem_codes_are_stable() {
     let (status, problem) = call(
         &router,
         "POST",
-        "/v1/leases/acquire",
-        Some(json!({"account_id": 9, "requested": 1, "ttl_seconds": 60})),
+        &api("/leases/acquire"),
+        Some(json!({"account_id": id(9), "requested": 1, "ttl_seconds": 60})),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -119,8 +128,8 @@ async fn problem_codes_are_stable() {
     let (status, problem) = call(
         &router,
         "POST",
-        "/v1/leases/acquire",
-        Some(json!({"account_id": 8, "requested": 10, "ttl_seconds": 0})),
+        &api("/leases/acquire"),
+        Some(json!({"account_id": id(8), "requested": 10, "ttl_seconds": 0})),
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -136,14 +145,14 @@ async fn problem_codes_are_stable() {
     let (_, grant) = call(
         &router,
         "POST",
-        "/v1/leases/acquire",
-        Some(json!({"account_id": 1, "requested": 10, "ttl_seconds": 60})),
+        &api("/leases/acquire"),
+        Some(json!({"account_id": id(1), "requested": 10, "ttl_seconds": 60})),
     )
     .await;
     let (status, problem) = call(
         &router,
         "POST",
-        "/v1/leases/release",
+        &api("/leases/release"),
         Some(json!({"lease_id": grant["lease_id"], "fencing_token": 999, "unspent": 10})),
     )
     .await;
@@ -151,9 +160,34 @@ async fn problem_codes_are_stable() {
     assert_eq!(problem["code"], "fenced");
 
     // Unknown principal snapshot.
-    let (status, problem) = call(&router, "GET", "/v1/snapshots/42", None).await;
+    let (status, problem) = call(
+        &router,
+        "GET",
+        &api(&format!("/snapshots/{}", Principal(42))),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(problem["code"], "unknown-principal");
+}
+
+#[tokio::test]
+async fn identifier_failures_are_structured_and_never_unknown() {
+    let (_store, router) = state();
+
+    let (status, problem) = call(&router, "GET", &api("/snapshots/not-an-id"), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(problem["code"], "invalid-id");
+
+    let (status, problem) = call(
+        &router,
+        "POST",
+        &api("/leases/acquire"),
+        Some(json!({"account_id": 1, "requested": 1, "ttl_seconds": 60})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(problem["code"], "invalid-json");
 }
 
 #[tokio::test]
@@ -168,18 +202,39 @@ async fn admin_snapshot_roundtrip_and_probes() {
     let (status, _) = call(
         &router,
         "POST",
-        "/v1/admin/accounts",
-        Some(json!({"account_id": 1, "initial_balance": 500, "active": true})),
+        &api("/admin/accounts"),
+        Some(json!({"account_id": id(1), "initial_balance": 500, "active": true})),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
     let (status, _) = call(
         &router,
         "POST",
-        "/v1/admin/accounts/1/deposit",
+        &api(&format!("/admin/accounts/{}/deposit", AccountId(1))),
         Some(json!({"units": 250})),
     )
     .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let status_path = api(&format!("/admin/accounts/{}/status", AccountId(1)));
+    let (status, _) = call(
+        &router,
+        "POST",
+        &status_path,
+        Some(json!({"active": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, problem) = call(
+        &router,
+        "POST",
+        &api("/leases/acquire"),
+        Some(json!({"account_id": id(1), "requested": 1, "ttl_seconds": 60})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(problem["code"], "account-inactive");
+    let (status, _) = call(&router, "POST", &status_path, Some(json!({"active": true}))).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     // Recreating an existing account is a surfaced conflict, never a silent
@@ -187,15 +242,15 @@ async fn admin_snapshot_roundtrip_and_probes() {
     let (status, problem) = call(
         &router,
         "POST",
-        "/v1/admin/accounts",
-        Some(json!({"account_id": 1, "initial_balance": 999, "active": true})),
+        &api("/admin/accounts"),
+        Some(json!({"account_id": id(1), "initial_balance": 999, "active": true})),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(problem["code"], "account-exists");
 
     let snapshot = json!({
-        "account_id": 1,
+        "account_id": id(1),
         "key_id": null,
         "generation": 3,
         "status": "Active",
@@ -215,20 +270,38 @@ async fn admin_snapshot_roundtrip_and_probes() {
     let (status, _) = call(
         &router,
         "PUT",
-        "/v1/admin/snapshots/7",
+        &api(&format!("/admin/snapshots/{}", Principal(7))),
         Some(json!({"snapshot": snapshot})),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let (status, fetched) = call(&router, "GET", "/v1/snapshots/7", None).await;
+    let (status, fetched) = call(
+        &router,
+        "GET",
+        &api(&format!("/snapshots/{}", Principal(7))),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(fetched["generation"], 3);
     assert_eq!(fetched["cost_table"]["fixed_request"], 50);
 
-    let (status, _) = call(&router, "DELETE", "/v1/admin/snapshots/7", None).await;
+    let (status, _) = call(
+        &router,
+        "DELETE",
+        &api(&format!("/admin/snapshots/{}", Principal(7))),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    let (status, problem) = call(&router, "GET", "/v1/snapshots/7", None).await;
+    let (status, problem) = call(
+        &router,
+        "GET",
+        &api(&format!("/snapshots/{}", Principal(7))),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::GONE);
     assert_eq!(problem["code"], "revoked-principal");
     assert_eq!(problem["generation"], 3);
@@ -239,7 +312,7 @@ async fn admin_snapshot_roundtrip_and_probes() {
 async fn admin_refuses_snapshot_whose_batch_quote_exceeds_burst() {
     let (_store, router) = state();
     let snapshot = json!({
-        "account_id": 1,
+        "account_id": id(1),
         "key_id": null,
         "generation": 1,
         "status": "Active",
@@ -263,14 +336,20 @@ async fn admin_refuses_snapshot_whose_batch_quote_exceeds_burst() {
     let (status, problem) = call(
         &router,
         "PUT",
-        "/v1/admin/snapshots/7",
+        &api(&format!("/admin/snapshots/{}", Principal(7))),
         Some(json!({"snapshot": snapshot})),
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(problem["code"], "invalid-snapshot-limits");
 
-    let (status, problem) = call(&router, "GET", "/v1/snapshots/7", None).await;
+    let (status, problem) = call(
+        &router,
+        "GET",
+        &api(&format!("/snapshots/{}", Principal(7))),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(problem["code"], "unknown-principal");
 }

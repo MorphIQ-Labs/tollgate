@@ -4,9 +4,12 @@
 //! them back to `AllocateError` variants. Change one and the loopback
 //! correctness suite fails.
 
-use axum::Json;
+use axum::extract::rejection::{JsonRejection, PathRejection};
+use axum::extract::{FromRequest, FromRequestParts, Json, Path, Request};
 use axum::http::StatusCode;
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
+use serde::de::DeserializeOwned;
 
 use tollgate_core::{Generation, SnapshotValidationError};
 use tollgate_store::wire::Problem;
@@ -18,6 +21,46 @@ pub struct ApiError {
     pub code: &'static str,
     pub title: String,
     pub generation: Option<Generation>,
+}
+
+/// JSON input whose extractor failures stay inside the RFC-7807 contract.
+///
+/// Axum's default rejection is plain text. Keeping the wrapper at the service
+/// boundary makes malformed identifiers and every same-pattern body failure
+/// structured without relying on each handler to remember an error mapping.
+pub(crate) struct ApiJson<T>(pub T);
+
+impl<T, S> FromRequest<S> for ApiJson<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        Json::<T>::from_request(request, state)
+            .await
+            .map(|Json(value)| Self(value))
+            .map_err(ApiError::from)
+    }
+}
+
+/// Path input whose parse failures stay distinct from a legitimate 404.
+pub(crate) struct ApiPath<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for ApiPath<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Path::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Path(value)| Self(value))
+            .map_err(ApiError::from)
+    }
 }
 
 impl ApiError {
@@ -56,6 +99,30 @@ impl ApiError {
             status: StatusCode::NOT_IMPLEMENTED,
             code,
             title: title.into(),
+            generation: None,
+        }
+    }
+}
+
+impl From<JsonRejection> for ApiError {
+    fn from(error: JsonRejection) -> Self {
+        let status = error.into_response().status();
+        ApiError {
+            status,
+            code: "invalid-json",
+            title: "request body is not valid JSON for this endpoint".to_string(),
+            generation: None,
+        }
+    }
+}
+
+impl From<PathRejection> for ApiError {
+    fn from(error: PathRejection) -> Self {
+        let status = error.into_response().status();
+        ApiError {
+            status,
+            code: "invalid-id",
+            title: "path identifier must be exactly 32 lowercase hexadecimal digits".to_string(),
             generation: None,
         }
     }
