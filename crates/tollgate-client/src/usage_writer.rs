@@ -132,11 +132,12 @@ impl UsageWriterConfig {
 
 /// A counter written from the request path, on a cache line of its own.
 ///
-/// `#[repr(align(64))]` rounds the type's size up to its alignment, so no two
-/// of these — and nothing else in the struct — can share a line. The counters
-/// the writer task alone updates need no such treatment: one writer cannot
+/// `#[repr(align(128))]` rounds the type's size up to its alignment, so no two
+/// of these — and nothing else in the struct — can share a line on the
+/// 128-byte Apple Silicon target or on 64-byte-line x86-64. The counters the
+/// writer task alone updates need no such treatment: one writer cannot
 /// contend with itself.
-#[repr(align(64))]
+#[repr(align(128))]
 #[derive(Debug)]
 struct Contended(AtomicU64);
 
@@ -814,4 +815,15 @@ fn outstanding_permits(weak: &mpsc::WeakSender<UsageEvent>) -> u64 {
     weak.upgrade()
         .map(|tx| (tx.max_capacity() - tx.capacity()) as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::Contended;
+
+    #[test]
+    fn request_path_counters_are_isolated_on_supported_cache_lines() {
+        assert_eq!(align_of::<Contended>(), 128);
+        assert_eq!(size_of::<Contended>(), 128);
+    }
 }

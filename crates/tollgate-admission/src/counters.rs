@@ -5,8 +5,8 @@
 //! from outside. The control plane closes that gap with structured events,
 //! but this plane cannot — INVARIANTS.md #5 forbids I/O, locks and clock
 //! reads on the request path, and a logging call is all three. What remains
-//! affordable is a counter: no allocation, no formatting, no branch beyond
-//! the one the pipeline already took.
+//! affordable is a counter: no allocation, no formatting, and only the fixed
+//! single-vs-sharded layout branch selected at engine construction.
 //!
 //! [`DenyReason`] is a closed enum, so the tally is a fixed array indexed by
 //! [`DenyReason::index`] — never a map, never a string key. That is what
@@ -19,16 +19,15 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tollgate_core::{CostUnits, DenyReason};
+use tollgate_core::{CostUnits, DenyReason, LocalSharding, Locality};
 
 /// One counter on its own cache line.
 ///
 /// Without the padding the whole array shares a handful of lines, so eight
 /// cores counting eight *different* reasons would serialise on the same line
-/// for no reason at all — the classic false-sharing tax. 64 bytes is the line
-/// size on both targets that matter here (x86-64 and aarch64); being wrong
-/// about it costs a little memory and never correctness.
-#[repr(align(64))]
+/// for no reason at all — the classic false-sharing tax. Apple Silicon uses
+/// 128-byte cache lines; over-aligning on 64-byte-line x86-64 is harmless.
+#[repr(align(128))]
 #[derive(Debug)]
 struct Padded(AtomicU64);
 
@@ -73,6 +72,28 @@ pub struct AdmissionCounters {
     admitted: Padded,
     units_admitted: Padded,
     denials: [Padded; DenyReason::COUNT],
+    shards: Option<Box<[CounterShard]>>,
+}
+
+/// One locality's complete tally. Different localities never share a cache
+/// line; counters within one locality are deliberately compact because the
+/// same request updates them.
+#[repr(align(128))]
+#[derive(Debug)]
+struct CounterShard {
+    admitted: AtomicU64,
+    units_admitted: AtomicU64,
+    denials: [AtomicU64; DenyReason::COUNT],
+}
+
+impl CounterShard {
+    fn zero() -> Self {
+        Self {
+            admitted: AtomicU64::new(0),
+            units_admitted: AtomicU64::new(0),
+            denials: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
 }
 
 impl AdmissionCounters {
@@ -82,12 +103,48 @@ impl AdmissionCounters {
             admitted: Padded::zero(),
             units_admitted: Padded::zero(),
             denials: [const { Padded::zero() }; DenyReason::COUNT],
+            shards: None,
+        }
+    }
+
+    /// Create counters partitioned by the same sticky locality used by lease
+    /// and rate state. One shard preserves the inline historical layout.
+    #[must_use]
+    pub fn with_sharding(sharding: LocalSharding) -> Self {
+        if sharding == LocalSharding::SINGLE {
+            return Self::new();
+        }
+        Self {
+            admitted: Padded::zero(),
+            units_admitted: Padded::zero(),
+            denials: [const { Padded::zero() }; DenyReason::COUNT],
+            shards: Some(
+                (0..sharding.get())
+                    .map(|_| CounterShard::zero())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
         }
     }
 
     /// Record an admitted request and the units it was quoted.
     #[inline]
     pub fn record_admit(&self, units: CostUnits) {
+        self.record_admit_at(units, Locality::current());
+    }
+
+    #[inline]
+    pub(crate) fn record_admit_at(&self, units: CostUnits, locality: Locality) {
+        if let Some(shards) = &self.shards {
+            let shard = &shards[locality.index(LocalSharding::new(
+                std::num::NonZeroUsize::new(shards.len()).expect("sharded counters are non-empty"),
+            ))];
+            shard.admitted.fetch_add(1, Ordering::Relaxed);
+            shard
+                .units_admitted
+                .fetch_add(units.get(), Ordering::Relaxed);
+            return;
+        }
         self.admitted.bump(1);
         self.units_admitted.bump(units.get());
     }
@@ -103,6 +160,18 @@ impl AdmissionCounters {
     /// read as "this never happens".
     #[inline]
     pub fn record_deny(&self, reason: &DenyReason) {
+        self.record_deny_at(reason, Locality::current());
+    }
+
+    #[inline]
+    pub(crate) fn record_deny_at(&self, reason: &DenyReason, locality: Locality) {
+        if let Some(shards) = &self.shards {
+            let shard = &shards[locality.index(LocalSharding::new(
+                std::num::NonZeroUsize::new(shards.len()).expect("sharded counters are non-empty"),
+            ))];
+            shard.denials[reason.index()].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         self.denials[reason.index()].bump(1);
     }
 
@@ -115,6 +184,25 @@ impl AdmissionCounters {
     /// does not survive the scrape interval that consumes them.
     #[must_use]
     pub fn snapshot(&self) -> CountersSnapshot {
+        if let Some(shards) = &self.shards {
+            let mut snapshot = CountersSnapshot {
+                admitted: 0,
+                units_admitted: 0,
+                denials: [0; DenyReason::COUNT],
+            };
+            for shard in shards {
+                snapshot.admitted = snapshot
+                    .admitted
+                    .wrapping_add(shard.admitted.load(Ordering::Relaxed));
+                snapshot.units_admitted = snapshot
+                    .units_admitted
+                    .wrapping_add(shard.units_admitted.load(Ordering::Relaxed));
+                for (total, counter) in snapshot.denials.iter_mut().zip(&shard.denials) {
+                    *total = total.wrapping_add(counter.load(Ordering::Relaxed));
+                }
+            }
+            return snapshot;
+        }
         CountersSnapshot {
             admitted: self.admitted.get(),
             units_admitted: self.units_admitted.get(),
@@ -171,12 +259,29 @@ mod tests {
     /// attribute.
     #[test]
     fn each_counter_occupies_its_own_cache_line() {
-        assert_eq!(align_of::<Padded>(), 64);
-        assert_eq!(size_of::<Padded>(), 64);
+        assert_eq!(align_of::<Padded>(), 128);
+        assert_eq!(size_of::<Padded>(), 128);
         let counters = AdmissionCounters::new();
         let first = std::ptr::from_ref(&counters.denials[0]).addr();
         let second = std::ptr::from_ref(&counters.denials[1]).addr();
-        assert_eq!(second - first, 64, "adjacent slots must not share a line");
+        assert_eq!(second - first, 128, "adjacent slots must not share a line");
+    }
+
+    #[test]
+    fn configured_sharding_selects_the_matching_counter_layout() {
+        assert!(
+            AdmissionCounters::with_sharding(LocalSharding::SINGLE)
+                .shards
+                .is_none()
+        );
+        let sharding = LocalSharding::new(std::num::NonZeroUsize::new(8).unwrap());
+        assert_eq!(
+            AdmissionCounters::with_sharding(sharding)
+                .shards
+                .as_ref()
+                .map(|shards| shards.len()),
+            Some(8)
+        );
     }
 
     /// Each reason must land in its own slot and leave the rest alone.
@@ -218,7 +323,9 @@ mod tests {
     /// `Relaxed` still owes us.
     #[test]
     fn concurrent_increments_are_not_lost() {
-        let counters = AdmissionCounters::new();
+        let counters = AdmissionCounters::with_sharding(LocalSharding::new(
+            std::num::NonZeroUsize::new(8).unwrap(),
+        ));
         std::thread::scope(|scope| {
             for _ in 0..8 {
                 scope.spawn(|| {

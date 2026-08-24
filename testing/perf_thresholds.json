@@ -40,16 +40,42 @@
       "threshold_ns": 220.0
     },
     {
-      "_comment": "Deliberately unchanged by #9. The foldhash side measured 2774/2784ns against SipHash's 3375-4085ns, but that baseline's own spread is 20%, so there is no improvement here this manifest can defend. Contended scheduling, not hashing, is what this benchmark is about.",
+      "_comment": "Deliberately unchanged by #9. The foldhash side measured 2774/2784ns against SipHash's 3375-4085ns, but that baseline's own spread is 20%, so there is no improvement here this manifest can defend. Contended scheduling, not hashing, is what this benchmark is about. #3 kept it on the default single-counter topology: it is the layout nearly every deployment runs, and the sharded variant is gated separately below.",
       "id": "admission/full_check_contended_8",
       "target_ns": 4000.0,
       "threshold_ns": 10000.0
+    },
+    {
+      "_comment": "#3, opt-in eight-shard topology, uncontended: the price of sharding when nothing is contending. Measured 116.6/124.3ns against the same run's 103.2/110.2ns default, so roughly 10-15% for the locality read and shard indexing. Provisional laptop bounds taken under load average 17-26; recalibrate on the controlled host.",
+      "id": "admission/full_check_sharded",
+      "target_ns": 125.0,
+      "threshold_ns": 280.0
+    },
+    {
+      "_comment": "#3, opt-in eight-shard topology under the same eight-thread load as admission/full_check_contended_8. Measured 446.4/618.0ns against that benchmark's 2.74/2.80us in the same runs — the contention the layout exists to remove. The portable acceptance bounds are the same-run ratios below; this absolute ceiling is a configuration/execution backstop.",
+      "id": "admission/full_check_contended_8_sharded",
+      "target_ns": 700.0,
+      "threshold_ns": 2500.0
     },
     {
       "_comment": "Added with the request-path counters (#37) as the cheapest refusal there is: one map lookup and a return, so hashing was the largest share of it. Retightened by #9 — SipHash 20.0/19.8/19.9ns, foldhash 14.7/14.7ns.",
       "id": "admission/full_check_denied",
       "target_ns": 18.0,
       "threshold_ns": 40.0
+    }
+  ],
+  "ratios": [
+    {
+      "_comment": "What sharding is for: eight threads on one account cost the sharded layout a fraction of what they cost the default one. Measured 0.16-0.23 on a loaded laptop; the bound leaves room for a host where the default topology contends less.",
+      "numerator": "admission/full_check_contended_8_sharded",
+      "denominator": "admission/full_check_contended_8",
+      "max_ratio": 0.5
+    },
+    {
+      "_comment": "The sharded layout's own contention budget: eight threads against one. Measured 3.8-5.0 under load average 17-26, where the foreground measurement competes with far more than its seven background threads.",
+      "numerator": "admission/full_check_contended_8_sharded",
+      "denominator": "admission/full_check_sharded",
+      "max_ratio": 8.0
     }
   ]
 }

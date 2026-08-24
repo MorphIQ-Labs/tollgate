@@ -34,10 +34,10 @@ use tokio::task::JoinSet;
 use tracing::Instrument as _;
 
 use tollgate_admission::{
-    LeaseSlot, SnapshotMap, SnapshotUpdate, Watermark, accept_positive, accept_revoked,
+    LeaseSlot, PublishableSnapshotUpdate, SnapshotMap, Watermark, accept_positive, accept_revoked,
     accept_unknown,
 };
-use tollgate_core::{AccountId, Generation, Principal};
+use tollgate_core::{AccountId, Generation, LocalSharding, Principal};
 use tollgate_store::{Clock, SnapshotResolution, SnapshotSource, StoreError};
 
 /// Account → lease-slot registry shared between the snapshot manager (which
@@ -46,12 +46,24 @@ use tollgate_store::{Clock, SnapshotResolution, SnapshotSource, StoreError};
 #[derive(Default)]
 pub struct SlotRegistry {
     inner: Mutex<HashMap<AccountId, Arc<LeaseSlot>>>,
+    sharding: LocalSharding,
 }
 
 impl SlotRegistry {
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Create a registry whose account slots request the same local shard
+    /// layout. The value is fixed for the registry's life so every principal
+    /// of an account observes one coherent slot configuration.
+    #[must_use]
+    pub fn with_sharding(sharding: LocalSharding) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(HashMap::new()),
+            sharding,
+        })
     }
 
     /// The account's slot, created empty on first use.
@@ -62,8 +74,13 @@ impl SlotRegistry {
                 .lock()
                 .expect("slot registry poisoned")
                 .entry(account)
-                .or_insert_with(LeaseSlot::empty),
+                .or_insert_with(|| LeaseSlot::with_sharding(self.sharding)),
         )
+    }
+
+    #[must_use]
+    pub fn sharding(&self) -> LocalSharding {
+        self.sharding
     }
 }
 
@@ -304,6 +321,11 @@ impl SnapshotManager {
         config: SnapshotManagerConfig,
     ) -> Result<Self, SnapshotManagerConfigError> {
         config.validate()?;
+        if map.local_sharding() != slots.sharding() {
+            return Err(SnapshotManagerConfigError(
+                "snapshot map and lease slots must use the same local sharding",
+            ));
+        }
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (ready_tx, ready) = watch::channel(false);
         let principals = config.principals.initial().len();
@@ -943,7 +965,6 @@ async fn refresh_all_cancellable(
                     );
                     continue;
                 }
-                let snapshot = snapshot.into_inner();
                 completed.insert(principal);
                 let slot = slots.slot(snapshot.account_id);
                 resolutions.insert(
@@ -953,7 +974,7 @@ async fn refresh_all_cancellable(
                         generation: snapshot.generation,
                     },
                 );
-                updates.push(SnapshotUpdate::Present {
+                updates.push(PublishableSnapshotUpdate::Present {
                     principal,
                     snapshot,
                     lease: slot,
@@ -986,7 +1007,7 @@ async fn refresh_all_cancellable(
                         watermark,
                     },
                 );
-                updates.push(SnapshotUpdate::Revoked {
+                updates.push(PublishableSnapshotUpdate::Revoked {
                     principal,
                     until,
                     generation: incoming,
@@ -1009,7 +1030,7 @@ async fn refresh_all_cancellable(
                         watermark,
                     },
                 );
-                updates.push(SnapshotUpdate::Unknown { principal, until });
+                updates.push(PublishableSnapshotUpdate::Unknown { principal, until });
             }
             // The principal keeps whatever resolution it already had and
             // stays pending for the next sweep. Without this event a source
@@ -1025,7 +1046,7 @@ async fn refresh_all_cancellable(
         }
     }
     if !updates.is_empty() {
-        map.apply_many_at(updates, clock.now());
+        map.apply_publishable_many_at(updates, clock.now());
     }
     Some(
         principals
@@ -1161,7 +1182,6 @@ async fn run(
                                 {
                                     continue;
                                 }
-                                let snapshot = snapshot.into_inner();
                                 let slot = slots.slot(snapshot.account_id);
                                 resolutions.insert(
                                     push.principal,
@@ -1170,8 +1190,8 @@ async fn run(
                                         generation: snapshot.generation,
                                     },
                                 );
-                                map.apply_many_at(
-                                    vec![SnapshotUpdate::Present {
+                                map.apply_publishable_many_at(
+                                    vec![PublishableSnapshotUpdate::Present {
                                         principal: push.principal,
                                         snapshot,
                                         lease: slot,
@@ -1208,17 +1228,17 @@ async fn run(
                                     },
                                 );
                                 let update = match update {
-                                    Some(generation) => SnapshotUpdate::Revoked {
+                                    Some(generation) => PublishableSnapshotUpdate::Revoked {
                                         principal: push.principal,
                                         until,
                                         generation,
                                     },
-                                    None => SnapshotUpdate::Unknown {
+                                    None => PublishableSnapshotUpdate::Unknown {
                                         principal: push.principal,
                                         until,
                                     },
                                 };
-                                map.apply_many_at(vec![update], now);
+                                map.apply_publishable_many_at(vec![update], now);
                             }
                         }
                         update_ready(&ready, &mut resolutions, &clock, &counters, &config.principals);

@@ -1,14 +1,18 @@
 //! Admission-layer benchmarks, gated against `testing/perf_thresholds.json`.
 //!
-//! `snapshot_lookup_*` races the two map candidates; `full_check` is the
+//! `snapshot_lookup_*` races the two map candidates. `full_check` is the
 //! whole pipeline (lookup → checks → quote → rate token → lease debit →
-//! reservation, then cancel to keep the lease balanced); `full_check_contended_8`
-//! runs the same pipeline with seven background threads hammering the same
-//! account, measuring cross-core contention on the shared limiter and lease;
-//! `full_check_denied` measures the refusal path, which the other two never
+//! reservation, then cancel to keep the lease balanced), and
+//! `full_check_contended_8` runs it with seven background threads hammering
+//! the same account. Both measure the shipped default topology — the one
+//! nearly every deployment runs — and their `_sharded` counterparts repeat
+//! them under the opt-in eight-shard layout, so the manifest gates the
+//! default and prices the option separately rather than confusing the two.
+//! `full_check_denied` measures the refusal path, which none of the others
 //! take.
 
 use std::hint::black_box;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -21,7 +25,8 @@ use tollgate_admission::{
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
-    LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, ResolvedLimits,
+    LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex, PermissionBits, PublishableSnapshot,
+    ResolvedLimits,
 };
 
 #[derive(Clone, Copy)]
@@ -68,8 +73,8 @@ fn snapshot_for_account(account: u128) -> Arc<AccountSnapshot> {
     })
 }
 
-fn big_lease() -> Arc<LocalLease> {
-    Arc::new(LocalLease::new(
+fn big_lease(sharding: LocalSharding) -> Arc<LocalLease> {
+    Arc::new(LocalLease::with_sharding(
         LeaseGrant {
             lease_id: LeaseId(7),
             account_id: AccountId(1),
@@ -78,15 +83,22 @@ fn big_lease() -> Arc<LocalLease> {
             expires_at: far_future(),
         },
         CostUnits::ZERO,
+        jiff::SignedDuration::ZERO,
+        sharding,
     ))
 }
 
 fn populate(map: &impl SnapshotMap) {
     // A realistic working set: the benched principal among hundreds.
+    let sharding = map.local_sharding();
     for i in 0..512u128 {
-        let slot = LeaseSlot::empty();
-        slot.install(big_lease());
-        map.install(Principal(i), snapshot(), slot);
+        let slot = LeaseSlot::with_sharding(sharding);
+        slot.install(big_lease(sharding));
+        map.install_publishable(
+            Principal(i),
+            PublishableSnapshot::try_new(snapshot()).unwrap(),
+            slot,
+        );
     }
 }
 
@@ -109,8 +121,8 @@ fn bench_lookup(c: &mut Criterion) {
     group.finish();
 }
 
-fn engine() -> AdmissionEngine<ArcSwapSnapshotMap> {
-    let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+fn engine(sharding: LocalSharding) -> AdmissionEngine<ArcSwapSnapshotMap> {
+    let engine = AdmissionEngine::new(ArcSwapSnapshotMap::with_sharding(sharding));
     populate(engine.map());
     engine
 }
@@ -131,22 +143,37 @@ fn admit_once(engine: &AdmissionEngine<ArcSwapSnapshotMap>, principal: Principal
     black_box(admitted.reservation.cancel());
 }
 
-fn bench_full_check(c: &mut Criterion) {
-    let mut group = c.benchmark_group("admission");
+/// Seven background admitters on the account under measurement, stopped and
+/// joined when the guard drops so one benchmark's load never leaks into the
+/// next one's numbers.
+struct Contended {
+    engine: Arc<AdmissionEngine<ArcSwapSnapshotMap>>,
+    stop: Arc<AtomicBool>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Contended {
+    fn engine(&self) -> &AdmissionEngine<ArcSwapSnapshotMap> {
+        &self.engine
+    }
+}
+
+impl Drop for Contended {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for worker in self.workers.drain(..) {
+            worker.join().unwrap();
+        }
+    }
+}
+
+fn contended_engine(sharding: LocalSharding) -> Contended {
     let now = Timestamp::from_second(1_755_600_000).unwrap();
-
-    let uncontended = engine();
-    group.bench_function("full_check", |b| {
-        b.iter(|| admit_once(&uncontended, black_box(Principal(97)), now))
-    });
-
-    // Contended: seven background threads on the same account as the
-    // foreground measurement, sharing one limiter and one lease counter.
-    let contended = Arc::new(engine());
+    let engine = Arc::new(engine(sharding));
     let stop = Arc::new(AtomicBool::new(false));
-    let workers: Vec<_> = (0..7)
+    let workers = (0..7)
         .map(|_| {
-            let engine = Arc::clone(&contended);
+            let engine = Arc::clone(&engine);
             let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
@@ -155,12 +182,50 @@ fn bench_full_check(c: &mut Criterion) {
             })
         })
         .collect();
-    group.bench_function("full_check_contended_8", |b| {
-        b.iter(|| admit_once(&contended, black_box(Principal(97)), now))
+    Contended {
+        engine,
+        stop,
+        workers,
+    }
+}
+
+fn bench_full_check(c: &mut Criterion) {
+    let mut group = c.benchmark_group("admission");
+    let now = Timestamp::from_second(1_755_600_000).unwrap();
+    let sharded = LocalSharding::new(NonZeroUsize::new(8).unwrap());
+
+    // `full_check` and `full_check_contended_8` are the gated ids, and they
+    // measure the *shipped default* topology. Sharding is opt-in, so pointing
+    // them at it would leave the layout nearly every deployment runs with no
+    // threshold at all — and would silently redefine two manifest entries
+    // whose calibration was taken against the single-counter path.
+    let uncontended = engine(LocalSharding::SINGLE);
+    group.bench_function("full_check", |b| {
+        b.iter(|| admit_once(&uncontended, black_box(Principal(97)), now))
     });
-    stop.store(true, Ordering::Relaxed);
-    for w in workers {
-        w.join().unwrap();
+
+    let uncontended_sharded = engine(sharded);
+    group.bench_function("full_check_sharded", |b| {
+        b.iter(|| admit_once(&uncontended_sharded, black_box(Principal(97)), now))
+    });
+
+    // Contended: seven background threads on the same account as the
+    // foreground measurement. Under the opt-in layout each normally lands on
+    // one local shard; under the default they all share one counter, which is
+    // the contention the layout exists to remove.
+    // Scoped, so each contended run's background threads are stopped and
+    // joined before the next one starts measuring.
+    {
+        let contended = contended_engine(LocalSharding::SINGLE);
+        group.bench_function("full_check_contended_8", |b| {
+            b.iter(|| admit_once(contended.engine(), black_box(Principal(97)), now))
+        });
+    }
+    {
+        let contended = contended_engine(sharded);
+        group.bench_function("full_check_contended_8_sharded", |b| {
+            b.iter(|| admit_once(contended.engine(), black_box(Principal(97)), now))
+        });
     }
 
     // The deny path, which nothing measured before #37 — both benches above

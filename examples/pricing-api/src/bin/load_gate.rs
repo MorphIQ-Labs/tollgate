@@ -22,7 +22,8 @@ use std::time::Instant;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use pricing_api::build_app;
+use pricing_api::build_app_with_sharding;
+use tollgate_core::LocalSharding;
 
 #[derive(Clone, Deserialize)]
 struct Thresholds {
@@ -300,7 +301,8 @@ async fn run_scenario(
     let address = listener
         .local_addr()
         .map_err(|error| format!("read load-gate server address: {error}"))?;
-    let (router, runtime) = build_app(u64::MAX / 4, admission);
+    let (router, runtime) =
+        build_app_with_sharding(u64::MAX / 4, admission, LocalSharding::new(connections));
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         axum::serve(listener, router)

@@ -33,7 +33,7 @@ git config core.hooksPath .githooks         # once per clone: rustfmt check on c
 
 cargo test --workspace                     # correctness (Postgres DB cases are env-gated)
 ./scripts/check_advisories.sh              # RustSec + yanked/informational dependency gate
-./scripts/check_formal.sh                  # Lean authorization-state proofs
+./scripts/check_formal.sh                  # Lean lease/snapshot proofs
 ./scripts/check_perf_thresholds.sh         # hot-path microbench gate
 ./scripts/check_load_thresholds.sh         # local ratios + controlled-host absolutes
 
@@ -47,6 +47,8 @@ TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate ./scripts/c
 
 # Run the example service:
 cargo run -p pricing-api
+# Opt in only after profiling sustained same-account cross-core contention:
+TOLLGATE_LOCAL_SHARDS=8 cargo run -p pricing-api
 curl -s -H 'Authorization: Bearer demo-key-1' -H 'Content-Type: application/json' \
      -d '{"contracts":[{"spot":100,"strike":105,"rate":0.05,"vol":0.2,"tte_years":0.25}]}' \
      http://127.0.0.1:8081/v1/price
@@ -73,8 +75,12 @@ to the declared minimum and the dedicated `msrv` job must land together.
 ## The numbers that matter (laptop, provisional)
 
 Full admission — lookup, status, permissions, quote, rate token, lease
-debit — costs **~112 ns** in the uncontended microbenchmark. Across five
-controlled-host production-profile loopback repetitions, the paired admitted
+debit — costs **~115 ns** in the opt-in eight-shard uncontended
+microbenchmark and **~132 ns** with eight threads saturating the same account
+on the development host (a same-run **×1.14** ratio; the gate allows ×3).
+The retained single-counter diagnostic was **~106 ns** uncontended and
+**~2.87 µs** contended. Across five
+development-host production-profile loopback repetitions, the paired admitted
 vs no-admission p50 ratio was **×0.997–×1.101** for one persistent connection
 and **×1.015–×1.104** for 10 persistent connections contending on one account.
 The load gate retains both scenarios and separate ratio ceilings. One lease

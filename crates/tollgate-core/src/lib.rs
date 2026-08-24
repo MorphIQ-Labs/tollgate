@@ -27,6 +27,7 @@ pub mod deny;
 pub mod ids;
 pub mod lease;
 pub mod reservation;
+pub mod sharding;
 pub mod snapshot;
 pub mod units;
 pub mod usage;
@@ -38,6 +39,7 @@ pub use ids::{
 };
 pub use lease::{LeaseGrant, LocalLease, RefillSignal};
 pub use reservation::{CancelOutcome, CommitError, Reservation};
+pub use sharding::{LocalSharding, Locality};
 pub use snapshot::{
     AccountSnapshot, AccountStatus, PermissionBits, PublishableSnapshot, ResolvedLimits,
     SnapshotValidationError,

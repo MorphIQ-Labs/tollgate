@@ -1,5 +1,6 @@
 //! Property tests for the hot-path invariants (INVARIANTS.md #1–#3, #11).
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use jiff::Timestamp;
@@ -7,8 +8,8 @@ use proptest::prelude::*;
 
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CancelOutcome, CostTable, CostUnits, FencingToken,
-    Generation, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, PublishableSnapshot,
-    QuoteError, Reservation, ResolvedLimits, SnapshotValidationError,
+    Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex, PermissionBits,
+    PublishableSnapshot, QuoteError, Reservation, ResolvedLimits, SnapshotValidationError,
 };
 
 struct Op(usize);
@@ -22,8 +23,8 @@ fn t(secs: i64) -> Timestamp {
     Timestamp::from_second(secs).unwrap()
 }
 
-fn lease(units: u64) -> Arc<LocalLease> {
-    Arc::new(LocalLease::new(
+fn sharded_lease(units: u64, shards: usize) -> Arc<LocalLease> {
+    Arc::new(LocalLease::with_sharding(
         LeaseGrant {
             lease_id: LeaseId(1),
             account_id: AccountId(1),
@@ -32,6 +33,8 @@ fn lease(units: u64) -> Arc<LocalLease> {
             expires_at: t(i64::from(u16::MAX)),
         },
         CostUnits::ZERO,
+        jiff::SignedDuration::ZERO,
+        LocalSharding::new(NonZeroUsize::new(shards).unwrap()),
     ))
 }
 
@@ -144,6 +147,7 @@ proptest! {
     #[test]
     fn lease_units_are_conserved(
         capacity in 0u64..10_000,
+        shards in 1usize..16,
         requests in proptest::collection::vec(
             (1u64..200, prop_oneof![
                 Just(Action::Commit),
@@ -155,7 +159,7 @@ proptest! {
             0..64,
         ),
     ) {
-        let l = lease(capacity);
+        let l = sharded_lease(capacity, shards);
         let mut committed_total: u64 = 0;
         for (units, action) in requests {
             let Ok(r) = Reservation::reserve(&l, CostUnits(units), t(0)) else {
@@ -197,7 +201,7 @@ proptest! {
 #[test]
 fn concurrent_commit_conservation() {
     let capacity = 5_000u64;
-    let l = lease(capacity);
+    let l = sharded_lease(capacity, 8);
     let mut handles = Vec::new();
     for worker in 0..8 {
         let l = Arc::clone(&l);

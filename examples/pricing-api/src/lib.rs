@@ -42,7 +42,8 @@ use tollgate_client::{
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, Generation,
-    OpIndex, PermissionBits, Principal, PublishableSnapshot, RequestId, ResolvedLimits,
+    LocalSharding, OpIndex, PermissionBits, Principal, PublishableSnapshot, RequestId,
+    ResolvedLimits,
 };
 use tollgate_store::{AccountConfig, GrantPolicy, MemoryStore};
 
@@ -284,6 +285,16 @@ fn refill_sizing(deposit: u64) -> (CostUnits, CostUnits) {
 /// Build the service. `deposit` funds the demo account; `admission_enabled:
 /// false` is the load-gate baseline.
 pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRuntime) {
+    build_app_with_sharding(deposit, admission_enabled, LocalSharding::SINGLE)
+}
+
+/// Build the service with an explicit instance-local hot-path shard count.
+/// Keep one shard unless profiling shows sustained same-account saturation.
+pub fn build_app_with_sharding(
+    deposit: u64,
+    admission_enabled: bool,
+    sharding: LocalSharding,
+) -> (axum::Router, AppRuntime) {
     let store = MemoryStore::new(GrantPolicy::default()).expect("default grant policy is valid");
     store.create_account(AccountConfig {
         account_id: DEMO_ACCOUNT,
@@ -333,9 +344,9 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
     let principal = auth.register(DEMO_API_KEY);
     store.publish_snapshot(principal, compile_snapshot(1));
 
-    let map = Arc::new(ArcSwapSnapshotMap::new());
+    let map = Arc::new(ArcSwapSnapshotMap::with_sharding(sharding));
     let engine = AdmissionEngine::new(Arc::clone(&map));
-    let slots = SlotRegistry::new();
+    let slots = SlotRegistry::with_sharding(sharding);
     let slot = slots.slot(DEMO_ACCOUNT);
 
     // Either the whole quota machinery is installed, or none of it is. The

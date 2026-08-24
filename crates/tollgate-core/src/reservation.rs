@@ -20,7 +20,8 @@ use jiff::Timestamp;
 
 use crate::deny::DenyReason;
 use crate::ids::RequestId;
-use crate::lease::LocalLease;
+use crate::lease::{LeaseDebit, LocalLease};
+use crate::sharding::Locality;
 use crate::units::CostUnits;
 use crate::usage::UsageEvent;
 
@@ -65,6 +66,7 @@ pub enum CommitError {
 pub struct Reservation {
     lease: Arc<LocalLease>,
     units: CostUnits,
+    debit: LeaseDebit,
     phase: AtomicU8,
 }
 
@@ -79,10 +81,24 @@ impl Reservation {
         units: CostUnits,
         now: Timestamp,
     ) -> Result<Reservation, DenyReason> {
-        lease.try_debit(units, now)?;
+        Self::reserve_at_locality(lease, units, now, Locality::current())
+    }
+
+    /// Reserve using locality already resolved by the enclosing admission
+    /// pipeline, avoiding repeated thread-local lookups between stages.
+    #[doc(hidden)]
+    #[inline]
+    pub fn reserve_at_locality(
+        lease: &Arc<LocalLease>,
+        units: CostUnits,
+        now: Timestamp,
+        locality: Locality,
+    ) -> Result<Reservation, DenyReason> {
+        let debit = lease.try_reserve_at(units, now, locality)?;
         Ok(Reservation {
             lease: Arc::clone(lease),
             units,
+            debit,
             phase: AtomicU8::new(PENDING),
         })
     }
@@ -115,7 +131,7 @@ impl Reservation {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    self.lease.credit(self.units);
+                    self.lease.credit(&self.debit);
                     Err(CommitError::LeaseExpired)
                 }
                 // Someone else already resolved it; report that outcome.
@@ -144,7 +160,7 @@ impl Reservation {
             .compare_exchange(PENDING, RELEASED, Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => {
-                self.lease.credit(self.units);
+                self.lease.credit(&self.debit);
                 CancelOutcome::ZeroCharged
             }
             Err(COMMITTED) => CancelOutcome::AlreadyCommitted { units: self.units },
@@ -181,7 +197,7 @@ impl Drop for Reservation {
             .compare_exchange(PENDING, RELEASED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            self.lease.credit(self.units);
+            self.lease.credit(&self.debit);
         }
     }
 }

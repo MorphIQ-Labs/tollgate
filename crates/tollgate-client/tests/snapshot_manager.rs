@@ -2,6 +2,7 @@
 //! readiness, pushes propagate, refresh recovers, and revocation reaches
 //! running instances.
 
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -17,7 +18,7 @@ use tollgate_client::{
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, FencingToken,
-    Generation, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, Principal,
+    Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex, PermissionBits, Principal,
     PublishableSnapshot, ResolvedLimits,
 };
 use tollgate_store::{
@@ -626,6 +627,33 @@ fn invalid_snapshot_manager_intervals_are_rejected() {
         max_concurrent_fetches: 4,
     };
     assert!(config.validate().is_err());
+}
+
+#[tokio::test]
+async fn mismatched_local_sharding_is_rejected_before_tasks_start() {
+    let sharding = LocalSharding::new(NonZeroUsize::new(8).unwrap());
+    let result = SnapshotManager::spawn(
+        base_store(),
+        Arc::new(ArcSwapSnapshotMap::with_sharding(sharding)),
+        SlotRegistry::new(),
+        Arc::new(ManualClock::new(t(0))),
+        SnapshotManagerConfig {
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
+            refresh_interval: std::time::Duration::from_millis(20),
+            unknown_ttl: SignedDuration::from_secs(30),
+            revoked_ttl: SignedDuration::from_secs(3_600),
+            retry_backoff: std::time::Duration::from_millis(5),
+            max_concurrent_fetches: 4,
+        },
+    );
+    let error = match result {
+        Ok(_) => panic!("mismatched sharding must not start"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.0,
+        "snapshot map and lease slots must use the same local sharding"
+    );
 }
 
 // ---- dynamic principal discovery (#48) ------------------------------------

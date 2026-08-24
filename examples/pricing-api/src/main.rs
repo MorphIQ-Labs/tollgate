@@ -1,7 +1,8 @@
 //! pricing-api binary.
 //!
 //! `PRICING_BIND` (default `127.0.0.1:8081`), `PRICING_DEPOSIT` (default
-//! `1_000_000` units). One demo account, API key `demo-key-1`:
+//! `1_000_000` units), and `TOLLGATE_LOCAL_SHARDS` (default `1`). One demo
+//! account, API key `demo-key-1`:
 //!
 //! ```sh
 //! curl -s -H 'Authorization: Bearer demo-key-1' \
@@ -10,7 +11,10 @@
 //!      http://127.0.0.1:8081/v1/price
 //! ```
 
-use pricing_api::build_app;
+use std::num::NonZeroUsize;
+
+use pricing_api::build_app_with_sharding;
+use tollgate_core::LocalSharding;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -19,6 +23,21 @@ async fn main() -> std::io::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1_000_000);
+    let sharding = match std::env::var("TOLLGATE_LOCAL_SHARDS") {
+        Ok(value) => LocalSharding::new(value.parse::<NonZeroUsize>().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("TOLLGATE_LOCAL_SHARDS must be a positive integer: {error}"),
+            )
+        })?),
+        Err(std::env::VarError::NotPresent) => LocalSharding::SINGLE,
+        Err(error) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("cannot read TOLLGATE_LOCAL_SHARDS: {error}"),
+            ));
+        }
+    };
 
     // The embedding application installs the subscriber; the tollgate
     // libraries only emit. `RUST_LOG=tollgate_client=debug` turns up the
@@ -30,9 +49,9 @@ async fn main() -> std::io::Result<()> {
         )
         .init();
 
-    let (router, runtime) = build_app(deposit, true);
+    let (router, runtime) = build_app_with_sharding(deposit, true, sharding);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    tracing::info!(%bind, deposit, "pricing-api listening");
+    tracing::info!(%bind, deposit, local_shards = sharding.get(), "pricing-api listening");
     axum::serve(listener, router)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

@@ -11,12 +11,14 @@ use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 use jiff::Timestamp;
 
-use tollgate_core::{AccountSnapshot, Generation};
+use tollgate_core::{
+    AccountSnapshot, CostUnits, Generation, LocalSharding, Locality, PublishableSnapshot,
+};
 
 use crate::generation_model::{Watermark, accept_positive, accept_revoked};
 use crate::state::{
-    AccountAdmissionState, AccountLimiters, LeaseSlot, MapEntry, Principal, SnapshotMap,
-    SnapshotUpdate,
+    AccountAdmissionState, AccountLimiters, LeaseSlot, MapEntry, Principal,
+    PublishableSnapshotUpdate, SnapshotMap, SnapshotUpdate,
 };
 
 /// The hasher every `Principal`-keyed map in this crate uses.
@@ -33,7 +35,65 @@ use crate::state::{
 /// unpredictability as free defence in depth.
 type PrincipalHasher = foldhash::fast::RandomState;
 
-type PrincipalMap = HashMap<Principal, MapEntry, PrincipalHasher>;
+type PrincipalMap = HashMap<Principal, StoredEntry, PrincipalHasher>;
+
+/// A stored entry is cloned on every moka hit and on every copy-on-write
+/// install, so each variant is one refcount bump: the shard array is shared
+/// behind an `Arc`, never copied element by element.
+#[derive(Clone)]
+enum StoredEntry {
+    Present(Arc<AccountAdmissionState>),
+    ShardedPresent(Arc<[Arc<AccountAdmissionState>]>),
+    NegativeUntil { until: Timestamp },
+}
+
+fn present_state(
+    snapshot: Arc<AccountSnapshot>,
+    lease: Arc<LeaseSlot>,
+    limiter: Arc<crate::state::AccountLimiter>,
+    sharding: LocalSharding,
+) -> StoredEntry {
+    if sharding == LocalSharding::SINGLE {
+        return StoredEntry::Present(AccountAdmissionState::new(snapshot, lease, limiter));
+    }
+    let states: Vec<_> = (0..sharding.get())
+        .map(|_| {
+            AccountAdmissionState::new(
+                Arc::new((*snapshot).clone()),
+                Arc::clone(&lease),
+                Arc::clone(&limiter),
+            )
+        })
+        .collect();
+    StoredEntry::ShardedPresent(states.into())
+}
+
+/// Resolve an owned entry, which is what a cache that hands back a clone
+/// gives us. Moving the single-state `Arc` out matters: re-cloning it and
+/// dropping the temporary would put two refcount operations on the shared
+/// state back onto every request-path lookup.
+fn request_entry_from(entry: StoredEntry, sharding: LocalSharding, locality: Locality) -> MapEntry {
+    match entry {
+        StoredEntry::Present(state) => MapEntry::Present(state),
+        StoredEntry::ShardedPresent(states) => {
+            MapEntry::Present(Arc::clone(&states[locality.index(sharding)]))
+        }
+        StoredEntry::NegativeUntil { until } => MapEntry::NegativeUntil { until },
+    }
+}
+
+/// The same resolution for a borrowed entry, which is what a map read under a
+/// guard gives us. Kept separate from [`request_entry_from`] rather than
+/// cloning into it: the clone is the very thing that function exists to avoid.
+fn request_entry_at(entry: &StoredEntry, sharding: LocalSharding, locality: Locality) -> MapEntry {
+    match entry {
+        StoredEntry::Present(state) => MapEntry::Present(Arc::clone(state)),
+        StoredEntry::ShardedPresent(states) => {
+            MapEntry::Present(Arc::clone(&states[locality.index(sharding)]))
+        }
+        StoredEntry::NegativeUntil { until } => MapEntry::NegativeUntil { until: *until },
+    }
+}
 
 #[derive(Default)]
 struct GenerationWatermarks {
@@ -91,10 +151,29 @@ enum PreparedUpdate {
     },
 }
 
+enum InstallUpdate {
+    Present {
+        principal: Principal,
+        snapshot: Arc<AccountSnapshot>,
+        maximum_quote: Option<CostUnits>,
+        lease: Arc<LeaseSlot>,
+    },
+    Revoked {
+        principal: Principal,
+        until: Timestamp,
+        generation: Generation,
+    },
+    Unknown {
+        principal: Principal,
+        until: Timestamp,
+    },
+}
+
 fn apply_prepared(
     map: &mut PrincipalMap,
     watermarks: &mut GenerationWatermarks,
     updates: &[PreparedUpdate],
+    sharding: LocalSharding,
 ) {
     for update in updates {
         match update {
@@ -104,15 +183,19 @@ fn apply_prepared(
                 lease,
                 limiter,
             } => {
-                let visible = matches!(map.get(principal), Some(MapEntry::Present(_)));
+                let visible = matches!(
+                    map.get(principal),
+                    Some(StoredEntry::Present(_) | StoredEntry::ShardedPresent(_))
+                );
                 if watermarks.accept_positive(*principal, snapshot.generation, visible) {
                     map.insert(
                         *principal,
-                        MapEntry::Present(AccountAdmissionState::new(
+                        present_state(
                             Arc::clone(snapshot),
                             Arc::clone(lease),
                             Arc::clone(limiter),
-                        )),
+                            sharding,
+                        ),
                     );
                 }
             }
@@ -122,7 +205,7 @@ fn apply_prepared(
                 generation,
             } => {
                 if watermarks.accept_revoked(*principal, *generation) {
-                    map.insert(*principal, MapEntry::NegativeUntil { until: *until });
+                    map.insert(*principal, StoredEntry::NegativeUntil { until: *until });
                 }
             }
             // No watermark call: an absence neither consults nor changes it.
@@ -131,23 +214,32 @@ fn apply_prepared(
             // like a decision, and the mutation gate says so by surviving its
             // removal.
             PreparedUpdate::Unknown { principal, until } => {
-                map.insert(*principal, MapEntry::NegativeUntil { until: *until });
+                map.insert(*principal, StoredEntry::NegativeUntil { until: *until });
             }
         }
     }
 }
 
 /// `moka`-backed bounded cache. Values are `Arc`-cheap by construction (the
-/// review's caution about moka cloning values on retrieval).
+/// review's caution about moka cloning values on retrieval) — and moka clones
+/// on its *write* path too, so a stored value must not resolve anything
+/// request-local in `Clone`: it would be resolved against the installing
+/// thread before any request saw it. Locality is applied in `get_at`.
 pub struct MokaSnapshotMap {
-    cache: moka::sync::Cache<Principal, MapEntry, PrincipalHasher>,
+    cache: moka::sync::Cache<Principal, StoredEntry, PrincipalHasher>,
     watermarks: Mutex<GenerationWatermarks>,
     limiters: AccountLimiters,
+    sharding: LocalSharding,
 }
 
 impl MokaSnapshotMap {
     #[must_use]
     pub fn new(max_capacity: u64) -> Self {
+        Self::with_sharding(max_capacity, LocalSharding::SINGLE)
+    }
+
+    #[must_use]
+    pub fn with_sharding(max_capacity: u64, sharding: LocalSharding) -> Self {
         MokaSnapshotMap {
             // Same hasher as the arc-swap map, and for the same reason. It
             // also keeps the two `snapshot_lookup` benches comparing like with
@@ -158,26 +250,70 @@ impl MokaSnapshotMap {
                 .max_capacity(max_capacity)
                 .build_with_hasher(PrincipalHasher::default()),
             watermarks: Mutex::new(GenerationWatermarks::default()),
-            limiters: AccountLimiters::default(),
+            limiters: AccountLimiters::new(sharding),
+            sharding,
         }
     }
 }
 
 impl SnapshotMap for MokaSnapshotMap {
     fn get(&self, principal: &Principal) -> Option<MapEntry> {
-        self.cache.get(principal)
+        self.get_at(principal, Locality::current())
+    }
+
+    fn get_at(&self, principal: &Principal, locality: Locality) -> Option<MapEntry> {
+        self.cache
+            .get(principal)
+            .map(|entry| request_entry_from(entry, self.sharding, locality))
+    }
+
+    fn local_sharding(&self) -> LocalSharding {
+        self.sharding
     }
 
     fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>) {
-        let limiter =
-            self.limiters
-                .limiter_for(snapshot.account_id, snapshot.generation, &snapshot.limits);
+        let limiter = self.limiters.limiter_for(
+            snapshot.account_id,
+            snapshot.generation,
+            &snapshot.limits,
+            None,
+        );
         let mut watermarks = self.watermarks.lock().expect("watermarks poisoned");
-        let visible = matches!(self.cache.get(&principal), Some(MapEntry::Present(_)));
+        let visible = matches!(
+            self.cache.get(&principal),
+            Some(StoredEntry::Present(_) | StoredEntry::ShardedPresent(_))
+        );
         if watermarks.accept_positive(principal, snapshot.generation, visible) {
             self.cache.insert(
                 principal,
-                MapEntry::Present(AccountAdmissionState::new(snapshot, lease, limiter)),
+                present_state(snapshot, lease, limiter, self.sharding),
+            );
+        }
+    }
+
+    fn install_publishable(
+        &self,
+        principal: Principal,
+        snapshot: PublishableSnapshot,
+        lease: Arc<LeaseSlot>,
+    ) {
+        let maximum_quote = snapshot.maximum_quote();
+        let snapshot = snapshot.into_inner();
+        let limiter = self.limiters.limiter_for(
+            snapshot.account_id,
+            snapshot.generation,
+            &snapshot.limits,
+            maximum_quote,
+        );
+        let mut watermarks = self.watermarks.lock().expect("watermarks poisoned");
+        let visible = matches!(
+            self.cache.get(&principal),
+            Some(StoredEntry::Present(_) | StoredEntry::ShardedPresent(_))
+        );
+        if watermarks.accept_positive(principal, snapshot.generation, visible) {
+            self.cache.insert(
+                principal,
+                present_state(snapshot, lease, limiter, self.sharding),
             );
         }
     }
@@ -186,7 +322,7 @@ impl SnapshotMap for MokaSnapshotMap {
         let mut watermarks = self.watermarks.lock().expect("watermarks poisoned");
         if watermarks.accept_revoked(principal, generation) {
             self.cache
-                .insert(principal, MapEntry::NegativeUntil { until });
+                .insert(principal, StoredEntry::NegativeUntil { until });
         }
     }
 
@@ -197,7 +333,7 @@ impl SnapshotMap for MokaSnapshotMap {
         // nothing about any generation.
         let _watermarks = self.watermarks.lock().expect("watermarks poisoned");
         self.cache
-            .insert(principal, MapEntry::NegativeUntil { until });
+            .insert(principal, StoredEntry::NegativeUntil { until });
     }
 
     fn remove(&self, principal: &Principal) {
@@ -214,6 +350,7 @@ pub struct ArcSwapSnapshotMap {
     watermarks: Mutex<GenerationWatermarks>,
     limiters: AccountLimiters,
     max_negative_entries: usize,
+    sharding: LocalSharding,
 }
 
 impl ArcSwapSnapshotMap {
@@ -221,16 +358,30 @@ impl ArcSwapSnapshotMap {
 
     #[must_use]
     pub fn new() -> Self {
-        Self::with_max_negative_entries(Self::DEFAULT_MAX_NEGATIVE_ENTRIES)
+        Self::with_sharding(LocalSharding::SINGLE)
+    }
+
+    #[must_use]
+    pub fn with_sharding(sharding: LocalSharding) -> Self {
+        Self::with_sharding_and_max_negative_entries(sharding, Self::DEFAULT_MAX_NEGATIVE_ENTRIES)
     }
 
     #[must_use]
     pub fn with_max_negative_entries(max_negative_entries: usize) -> Self {
+        Self::with_sharding_and_max_negative_entries(LocalSharding::SINGLE, max_negative_entries)
+    }
+
+    #[must_use]
+    pub fn with_sharding_and_max_negative_entries(
+        sharding: LocalSharding,
+        max_negative_entries: usize,
+    ) -> Self {
         ArcSwapSnapshotMap {
             map: ArcSwap::default(),
             watermarks: Mutex::new(GenerationWatermarks::default()),
-            limiters: AccountLimiters::default(),
+            limiters: AccountLimiters::new(sharding),
             max_negative_entries,
+            sharding,
         }
     }
 
@@ -241,21 +392,86 @@ impl ArcSwapSnapshotMap {
     /// bulk install of N principals took it N times — inside the very function
     /// that exists to make bulk installs cheap.
     fn prepare(&self, updates: Vec<SnapshotUpdate>) -> Vec<PreparedUpdate> {
+        self.prepare_updates(updates.into_iter().map(|update| match update {
+            SnapshotUpdate::Present {
+                principal,
+                snapshot,
+                lease,
+            } => InstallUpdate::Present {
+                principal,
+                snapshot,
+                maximum_quote: None,
+                lease,
+            },
+            SnapshotUpdate::Revoked {
+                principal,
+                until,
+                generation,
+            } => InstallUpdate::Revoked {
+                principal,
+                until,
+                generation,
+            },
+            SnapshotUpdate::Unknown { principal, until } => {
+                InstallUpdate::Unknown { principal, until }
+            }
+        }))
+    }
+
+    fn prepare_publishable(&self, updates: Vec<PublishableSnapshotUpdate>) -> Vec<PreparedUpdate> {
+        self.prepare_updates(updates.into_iter().map(|update| match update {
+            PublishableSnapshotUpdate::Present {
+                principal,
+                snapshot,
+                lease,
+            } => InstallUpdate::Present {
+                principal,
+                maximum_quote: snapshot.maximum_quote(),
+                snapshot: snapshot.into_inner(),
+                lease,
+            },
+            PublishableSnapshotUpdate::Revoked {
+                principal,
+                until,
+                generation,
+            } => InstallUpdate::Revoked {
+                principal,
+                until,
+                generation,
+            },
+            PublishableSnapshotUpdate::Unknown { principal, until } => {
+                InstallUpdate::Unknown { principal, until }
+            }
+        }))
+    }
+
+    fn prepare_updates(
+        &self,
+        updates: impl IntoIterator<Item = InstallUpdate>,
+    ) -> Vec<PreparedUpdate> {
         // Negatives need no limiter, so they skip the registry entirely and
         // keep their place by index rather than by being carried through it.
-        let mut prepared: Vec<Option<PreparedUpdate>> = Vec::with_capacity(updates.len());
+        let updates = updates.into_iter();
+        let mut prepared: Vec<Option<PreparedUpdate>> = Vec::with_capacity(updates.size_hint().0);
         let mut positives = Vec::new();
         for update in updates {
             match update {
-                SnapshotUpdate::Present {
+                InstallUpdate::Present {
                     principal,
                     snapshot,
+                    maximum_quote,
                     lease,
                 } => {
                     prepared.push(None);
-                    positives.push((prepared.len() - 1, principal, snapshot, lease));
+                    positives.push((
+                        prepared.len() - 1,
+                        principal,
+                        snapshot,
+                        maximum_quote,
+                        lease,
+                    ));
                 }
-                SnapshotUpdate::Revoked {
+                InstallUpdate::Revoked {
                     principal,
                     until,
                     generation,
@@ -264,7 +480,7 @@ impl ArcSwapSnapshotMap {
                     until,
                     generation,
                 })),
-                SnapshotUpdate::Unknown { principal, until } => {
+                InstallUpdate::Unknown { principal, until } => {
                     prepared.push(Some(PreparedUpdate::Unknown { principal, until }));
                 }
             }
@@ -272,10 +488,11 @@ impl ArcSwapSnapshotMap {
 
         let resolved = self.limiters.limiters_for(
             positives,
-            |(_, _, snapshot, _)| (snapshot.account_id, snapshot.generation),
-            |(_, _, snapshot, _)| snapshot.limits,
+            |(_, _, snapshot, _, _)| (snapshot.account_id, snapshot.generation),
+            |(_, _, snapshot, _, _)| snapshot.limits,
+            |(_, _, _, maximum_quote, _)| *maximum_quote,
         );
-        for ((slot, principal, snapshot, lease), limiter) in resolved {
+        for ((slot, principal, snapshot, _, lease), limiter) in resolved {
             prepared[slot] = Some(PreparedUpdate::Present {
                 principal,
                 snapshot,
@@ -298,10 +515,10 @@ impl ArcSwapSnapshotMap {
         let mut next = PrincipalMap::clone(&current);
         if let Some(now) = now {
             next.retain(
-                |_, entry| !matches!(entry, MapEntry::NegativeUntil { until } if *until <= now),
+                |_, entry| !matches!(entry, StoredEntry::NegativeUntil { until } if *until <= now),
             );
         }
-        apply_prepared(&mut next, &mut watermarks, updates);
+        apply_prepared(&mut next, &mut watermarks, updates, self.sharding);
         trim_negatives(&mut next, self.max_negative_entries);
         self.map.store(Arc::new(next));
     }
@@ -317,8 +534,8 @@ fn trim_negatives(map: &mut PrincipalMap, max_negative_entries: usize) {
     let mut negatives: Vec<_> = map
         .iter()
         .filter_map(|(principal, entry)| match entry {
-            MapEntry::NegativeUntil { until } => Some((*until, *principal)),
-            MapEntry::Present(_) => None,
+            StoredEntry::NegativeUntil { until } => Some((*until, *principal)),
+            StoredEntry::Present(_) | StoredEntry::ShardedPresent(_) => None,
         })
         .collect();
     let remove = negatives.len().saturating_sub(max_negative_entries);
@@ -333,11 +550,36 @@ fn trim_negatives(map: &mut PrincipalMap, max_negative_entries: usize) {
 
 impl SnapshotMap for ArcSwapSnapshotMap {
     fn get(&self, principal: &Principal) -> Option<MapEntry> {
-        self.map.load().get(principal).cloned()
+        self.get_at(principal, Locality::current())
+    }
+
+    fn get_at(&self, principal: &Principal, locality: Locality) -> Option<MapEntry> {
+        self.map
+            .load()
+            .get(principal)
+            .map(|entry| request_entry_at(entry, self.sharding, locality))
+    }
+
+    fn local_sharding(&self) -> LocalSharding {
+        self.sharding
     }
 
     fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>) {
         let updates = self.prepare(vec![SnapshotUpdate::Present {
+            principal,
+            snapshot,
+            lease,
+        }]);
+        self.write(&updates, None);
+    }
+
+    fn install_publishable(
+        &self,
+        principal: Principal,
+        snapshot: PublishableSnapshot,
+        lease: Arc<LeaseSlot>,
+    ) {
+        let updates = self.prepare_publishable(vec![PublishableSnapshotUpdate::Present {
             principal,
             snapshot,
             lease,
@@ -391,15 +633,34 @@ impl SnapshotMap for ArcSwapSnapshotMap {
         let prepared = self.prepare(updates);
         self.write(&prepared, Some(now));
     }
+
+    fn apply_publishable_many(&self, updates: Vec<PublishableSnapshotUpdate>) {
+        let prepared = self.prepare_publishable(updates);
+        self.write(&prepared, None);
+    }
+
+    fn apply_publishable_many_at(&self, updates: Vec<PublishableSnapshotUpdate>, now: Timestamp) {
+        let prepared = self.prepare_publishable(updates);
+        self.write(&prepared, Some(now));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::hash::BuildHasher;
+    use std::num::NonZeroUsize;
     use tollgate_core::{
-        AccountId, AccountStatus, CostTable, CostUnits, PermissionBits, ResolvedLimits,
+        AccountId, AccountStatus, CostTable, CostUnits, OpIndex, PermissionBits, ResolvedLimits,
     };
+
+    struct PricedOp;
+
+    impl OpIndex for PricedOp {
+        fn index(&self) -> usize {
+            0
+        }
+    }
 
     fn t(secs: i64) -> Timestamp {
         Timestamp::from_second(secs).unwrap()
@@ -529,6 +790,79 @@ mod tests {
         })
     }
 
+    #[derive(Default)]
+    struct DefaultMethodsMap {
+        installs: std::sync::atomic::AtomicUsize,
+        negatives: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SnapshotMap for DefaultMethodsMap {
+        fn get(&self, _principal: &Principal) -> Option<MapEntry> {
+            Some(MapEntry::NegativeUntil { until: t(1) })
+        }
+
+        fn install(
+            &self,
+            _principal: Principal,
+            _snapshot: Arc<AccountSnapshot>,
+            _lease: Arc<LeaseSlot>,
+        ) {
+            self.installs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn install_revoked(
+            &self,
+            _principal: Principal,
+            _until: Timestamp,
+            _generation: Generation,
+        ) {
+            self.negatives
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn install_unknown(&self, _principal: Principal, _until: Timestamp) {
+            self.negatives
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn remove(&self, _principal: &Principal) {}
+    }
+
+    #[test]
+    fn snapshot_map_compatibility_defaults_preserve_single_shard_behavior() {
+        let map = DefaultMethodsMap::default();
+        assert!(matches!(
+            map.get_at(&Principal(1), Locality::current()),
+            Some(MapEntry::NegativeUntil { .. })
+        ));
+        assert_eq!(map.local_sharding(), LocalSharding::SINGLE);
+
+        let publishable = PublishableSnapshot::try_new(snapshot(1)).unwrap();
+        map.install_publishable(Principal(1), publishable.clone(), LeaseSlot::empty());
+        map.apply_publishable_many(vec![
+            PublishableSnapshotUpdate::Present {
+                principal: Principal(2),
+                snapshot: publishable.clone(),
+                lease: LeaseSlot::empty(),
+            },
+            PublishableSnapshotUpdate::Unknown {
+                principal: Principal(3),
+                until: t(2),
+            },
+        ]);
+        map.apply_publishable_many_at(
+            vec![PublishableSnapshotUpdate::Present {
+                principal: Principal(4),
+                snapshot: publishable,
+                lease: LeaseSlot::empty(),
+            }],
+            t(3),
+        );
+        assert_eq!(map.installs.load(std::sync::atomic::Ordering::Relaxed), 3);
+        assert_eq!(map.negatives.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
     fn generation_of(map: &impl SnapshotMap, p: &Principal) -> Option<u64> {
         match map.get(p)? {
             MapEntry::Present(state) => Some(state.snapshot.generation.0),
@@ -655,6 +989,72 @@ mod tests {
     }
 
     #[test]
+    fn moka_publishable_install_preserves_configured_sharding() {
+        let sharding = LocalSharding::new(NonZeroUsize::new(2).unwrap());
+        let map = MokaSnapshotMap::with_sharding(10, sharding);
+        map.install_publishable(
+            Principal(1),
+            PublishableSnapshot::try_new(snapshot(1)).unwrap(),
+            LeaseSlot::with_sharding(sharding),
+        );
+
+        assert_eq!(map.local_sharding(), sharding);
+        assert!(matches!(map.get(&Principal(1)), Some(MapEntry::Present(_))));
+    }
+
+    /// Sharding the moka map is only real if lookups actually reach
+    /// different states. They did not: moka clones a value on its *write*
+    /// path, so an entry that resolved locality in `Clone` was already
+    /// resolved — to the installing thread's shard — before any request saw
+    /// it, and every worker on every locality then shared that one state.
+    /// The entry now stays a shard array until `get_at` indexes it.
+    #[test]
+    fn moka_lookup_at_a_locality_selects_that_locality_own_state() {
+        let sharding = LocalSharding::new(NonZeroUsize::new(2).unwrap());
+        let map = Arc::new(MokaSnapshotMap::with_sharding(10, sharding));
+        map.install_publishable(
+            Principal(1),
+            PublishableSnapshot::try_new(snapshot(1)).unwrap(),
+            LeaseSlot::with_sharding(sharding),
+        );
+
+        let seen: Vec<_> = (0..8)
+            .map(|_| {
+                let map = Arc::clone(&map);
+                std::thread::spawn(move || {
+                    let locality = Locality::current();
+                    let first = present(map.get_at(&Principal(1), locality));
+                    let second = present(map.get_at(&Principal(1), locality));
+                    assert!(
+                        Arc::ptr_eq(&first, &second),
+                        "one thread's locality selects one state"
+                    );
+                    (locality.index(sharding), Arc::as_ptr(&first) as usize)
+                })
+                .join()
+                .unwrap()
+            })
+            .collect();
+
+        for (shard, state) in &seen {
+            for (other_shard, other_state) in &seen {
+                assert_eq!(
+                    shard == other_shard,
+                    state == other_state,
+                    "each shard has exactly one state, and no two share one"
+                );
+            }
+        }
+    }
+
+    fn present(entry: Option<MapEntry>) -> Arc<AccountAdmissionState> {
+        match entry {
+            Some(MapEntry::Present(state)) => state,
+            _ => panic!("the principal is installed"),
+        }
+    }
+
+    #[test]
     fn arc_swap_map_contract() {
         exercises_map(ArcSwapSnapshotMap::new());
     }
@@ -672,6 +1072,67 @@ mod tests {
     #[test]
     fn arc_delegation_map_contract() {
         exercises_map(Arc::new(ArcSwapSnapshotMap::new()));
+    }
+
+    #[test]
+    fn publishable_install_carries_maximum_quote_into_rate_sharding() {
+        assert_eq!(align_of::<AccountAdmissionState>(), 128);
+        assert_eq!(align_of::<AccountSnapshot>(), 128);
+        let sharding = LocalSharding::new(NonZeroUsize::new(8).unwrap());
+        let map = ArcSwapSnapshotMap::with_sharding(sharding);
+        let priced = Arc::new(AccountSnapshot {
+            limits: ResolvedLimits {
+                max_items_per_request: 1,
+                rate_units_per_second: 8,
+                rate_burst_units: 800,
+            },
+            cost_table: Arc::new(
+                CostTable::builder(CostUnits(100), CostUnits(100))
+                    .weight(&PricedOp, CostUnits::ZERO)
+                    .build(),
+            ),
+            ..(*snapshot(1)).clone()
+        });
+        let publishable = PublishableSnapshot::try_new(priced).unwrap();
+        map.install_publishable(
+            Principal(1),
+            publishable.clone(),
+            LeaseSlot::with_sharding(sharding),
+        );
+
+        match map.map.load().get(&Principal(1)).unwrap() {
+            StoredEntry::ShardedPresent(states) => {
+                assert_eq!(states.len(), 8);
+                assert!(!Arc::ptr_eq(&states[0], &states[1]));
+            }
+            StoredEntry::Present(_) | StoredEntry::NegativeUntil { .. } => {
+                panic!("sharded publication must install locality-owned states")
+            }
+        }
+
+        let state = match map.get(&Principal(1)).unwrap() {
+            MapEntry::Present(state) => state,
+            MapEntry::NegativeUntil { .. } => unreachable!(),
+        };
+        assert_eq!(state.limiter.current().shard_count(), 8);
+        assert_eq!(map.local_sharding(), sharding);
+        assert_eq!(state.lease.sharding(), sharding);
+
+        map.apply_publishable_many(vec![PublishableSnapshotUpdate::Present {
+            principal: Principal(2),
+            snapshot: publishable.clone(),
+            lease: LeaseSlot::with_sharding(sharding),
+        }]);
+        map.apply_publishable_many_at(
+            vec![PublishableSnapshotUpdate::Present {
+                principal: Principal(3),
+                snapshot: publishable,
+                lease: LeaseSlot::with_sharding(sharding),
+            }],
+            t(1),
+        );
+        assert_eq!(generation_of(&map, &Principal(2)), Some(1));
+        assert_eq!(generation_of(&map, &Principal(3)), Some(1));
     }
 
     #[test]
@@ -700,7 +1161,19 @@ mod tests {
     /// `SnapshotExpired` with no error anywhere.
     #[test]
     fn the_arc_delegation_forwards_every_bulk_write() {
-        let map: Arc<dyn SnapshotMap> = Arc::new(ArcSwapSnapshotMap::new());
+        let sharding = LocalSharding::new(NonZeroUsize::new(2).unwrap());
+        let map: Arc<dyn SnapshotMap> = Arc::new(ArcSwapSnapshotMap::with_sharding(sharding));
+
+        map.install_publishable(
+            Principal(0),
+            PublishableSnapshot::try_new(snapshot(1)).unwrap(),
+            LeaseSlot::with_sharding(sharding),
+        );
+        assert_eq!(map.local_sharding(), sharding);
+        assert!(matches!(
+            map.get_at(&Principal(0), Locality::current()),
+            Some(MapEntry::Present(_))
+        ));
 
         map.install_many(vec![
             (Principal(1), snapshot(1), LeaseSlot::empty()),
@@ -726,6 +1199,22 @@ mod tests {
             map.get(&Principal(2)),
             Some(MapEntry::NegativeUntil { .. })
         ));
+
+        map.apply_publishable_many(vec![PublishableSnapshotUpdate::Present {
+            principal: Principal(3),
+            snapshot: PublishableSnapshot::try_new(snapshot(1)).unwrap(),
+            lease: LeaseSlot::empty(),
+        }]);
+        assert_eq!(generation_of(&map, &Principal(3)), Some(1));
+        map.apply_publishable_many_at(
+            vec![PublishableSnapshotUpdate::Present {
+                principal: Principal(3),
+                snapshot: PublishableSnapshot::try_new(snapshot(2)).unwrap(),
+                lease: LeaseSlot::empty(),
+            }],
+            t(10),
+        );
+        assert_eq!(generation_of(&map, &Principal(3)), Some(2));
 
         map.remove(&Principal(1));
         assert!(map.get(&Principal(1)).is_none());
