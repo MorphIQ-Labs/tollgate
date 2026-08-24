@@ -5,6 +5,14 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.2.12](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.11...v0.2.12) - 2026-08-24
+
+### Other
+
+- #43 mutation-test core, admission and store
+- harden dependency and load assurance gates
+- *(client)* #20 serialize the usage batch without copying it
+
 ## [0.2.11](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.10...v0.2.11) - 2026-08-23
 
 ### Other
