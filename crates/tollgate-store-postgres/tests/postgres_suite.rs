@@ -859,6 +859,32 @@ async fn inactive_account_refuses_leases() {
     );
 }
 
+/// Mirrors `store_suite::unknown_account_activity_update_is_refused`.
+#[tokio::test]
+async fn unknown_account_activity_update_is_refused() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    let unknown = AccountId(999);
+
+    for active in [false, true] {
+        assert_eq!(
+            AdminStore::set_active(&*store, unknown, active)
+                .await
+                .unwrap_err(),
+            AllocateError::UnknownAccount,
+            "an unknown account cannot be {}",
+            if active { "activated" } else { "deactivated" }
+        );
+    }
+
+    store
+        .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
+        .await
+        .expect("refusing the unknown account leaves existing accounts active");
+}
+
 /// Mirrors `store_suite::enumerating_principals_includes_revoked_ones`.
 #[tokio::test]
 async fn enumerating_principals_includes_revoked_ones() {

@@ -488,6 +488,10 @@ impl std::error::Error for CreateAccountError {}
 pub trait AdminStore: Send + Sync {
     async fn create_account(&self, config: AccountConfig) -> Result<(), CreateAccountError>;
     async fn deposit(&self, account: AccountId, units: CostUnits) -> Result<(), AllocateError>;
+    /// Set whether an existing account is active.
+    ///
+    /// A missing account is [`AllocateError::UnknownAccount`], never a silent
+    /// no-op; both activation and deactivation obey the same contract.
     async fn set_active(&self, account: AccountId, active: bool) -> Result<(), AllocateError>;
     async fn publish_snapshot(
         &self,
