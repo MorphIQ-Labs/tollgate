@@ -2457,6 +2457,7 @@ dependencies = [
  "async-trait",
  "jiff",
  "serde",
+ "serde_json",
  "tokio",
  "tollgate-core",
  "tracing",

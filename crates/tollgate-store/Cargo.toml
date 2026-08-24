@@ -17,6 +17,9 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# Wire-contract tests only: `wire.rs` decides what goes on the network, so what
+# it serializes is checked rather than asserted (#20).
+serde_json = { workspace = true }
 # Event-capture tests only, matching tollgate-client: a library emits, and only
 # a test or an application installs a subscriber to observe it.
 tracing-subscriber = { workspace = true }
