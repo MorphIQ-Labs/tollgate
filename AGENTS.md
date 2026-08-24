@@ -100,7 +100,7 @@ Use rustfmt defaults and idiomatic Rust naming: `snake_case` for modules, functi
 
 `main` accepts no direct pushes; every change lands through a merge request with all discussions resolved. One MR at a time: do not widen scope unasked, and discuss large architectural changes before implementing them. Completing the defect pattern an issue names is finishing the job, not widening scope.
 
-Branch and title share the conventional-commit vocabulary, because release automation reads it: branches are `<type>/<slug>` (`fix/lease-reclaim-grace`), and the MR title is a conventional commit with an optional scope (`feat(admission): install_many bulk write`), enforced by the `commit-convention` job. The MR is squash-merged, so that title becomes the single commit subject on `main` and is what release-plz reads to compute the next version and changelog entry. Never use the `release-plz-` branch prefix, which release-plz reserves for the release MR it maintains.
+Branch and title share the conventional-commit vocabulary, because release automation reads it: branches are `<type>/<slug>` (`fix/lease-reclaim-grace`), and the MR title is a conventional commit with an optional scope (`feat(admission): install_many bulk write`), enforced by the `commit-convention` job. The MR is squash-merged, so that title becomes the single commit subject on `main` and is what the release notes are computed from.
 
 An MR describes behavioral impact, lists the validation performed, and calls out invariant, migration, API, or threshold changes, with benchmark evidence for performance-sensitive work. It **must close the issues it resolves**: put `Closes #N` (or `Closes #N, #M`) in the description so merging closes them automatically, and confirm they closed. A resolved issue left open is incomplete work; if the change only partially addresses one, say what remains instead of closing it.
 
@@ -109,6 +109,22 @@ Merging to `main` must leave the repository releasable. A release is prepared in
 **This project does not use release-plz.** It did, and it worked here — but it cannot work in the other MorphIQ Labs workspaces, because `git_only` still runs `cargo package` per crate, which requires every dependency to carry a version requirement *and* resolve on crates.io. Internal unpublished crates cannot satisfy that. One release model across the group beats a working exception, and packaging cost 9.5 minutes a pipeline to produce a tag this job produces in seconds. See `templates/gitlab-ci.reference.yml` in `the template repository`.
 
 The registry guard stays split the way #46 established: manifests carry `publish = false`, and must never carry a registry list (`publish = ["name"]`), which is what made `cargo package --registry <name>` fail. `repository-hygiene` rejects the list form on every merge request. Crates remain unpublished and are distributed deliberately by git tag.
+
+## Repository and Branch Settings
+
+Trunk-based, one long-lived branch. The workflow above is prose until these settings enforce it, and settings drift without ever failing a build — so they are stated here and audited, not assumed. Every MorphIQ Labs project carries the same configuration:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| Default branch | `main` | There is no `develop` and no release train. A second long-lived branch also silently disables the `assurance` stage, which runs only on merge requests targeting the default branch. |
+| `main` protection | push: **No one**; merge: **Maintainers**; force push: **off** | "Accepts no direct pushes" is a setting, not a convention. |
+| Squash commits | **Always** | The MR title becomes the single commit subject on the default branch. |
+| Merge method | Merge commit | Group convention, for one review model everywhere. |
+| Delete source branch | on | |
+| All discussions resolved | required | |
+| Pipelines must succeed | required — **only where a pipeline exists** | GitLab treats "no pipeline" as "not successful", so enabling this on a repository without `.gitlab-ci.yml` blocks every merge. Turn it on with the pipeline, not before. |
+
+Check them with `glab api "projects/<encoded-path>"` and `glab api "projects/<encoded-path>/protected_branches"` rather than assuming.
 
 ## Definition of Done
 
