@@ -2,8 +2,9 @@
 //!
 //! All identifiers are opaque 128-bit values so a store backend may use UUIDs
 //! without this crate depending on a uuid library; 64-bit backends simply use
-//! the low half. `FencingToken` and `Generation` are ordered u64 sequences —
-//! their ordering is the mechanism behind INVARIANTS.md #4.
+//! the low half. `FencingToken` and `Generation` are ordered u64 sequences,
+//! but they serve different contracts: a fencing token identifies one lease
+//! capability, while a generation rejects older account snapshots.
 
 use core::fmt;
 
@@ -67,9 +68,13 @@ id128!(
     Principal
 );
 
-/// Strictly monotonic per-account sequence stamped on every lease. A store
-/// rejects any operation carrying a token older than the newest it has issued
-/// for that account, which is what fences out a stale or partitioned holder.
+/// One lease's capability token, drawn from a strictly increasing per-account
+/// allocation sequence.
+///
+/// The ordering supplies an audit trail; it is not an account-wide validity
+/// epoch. A newer token does not invalidate an older active lease. Stores
+/// require this token to match the record named by the accompanying lease ID
+/// (and account ID for usage ingest; INVARIANTS.md #4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(transparent))]

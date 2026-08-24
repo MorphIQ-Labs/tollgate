@@ -31,8 +31,9 @@
 //!
 //! What a release refusal *means* differs by variant (issue #42): a storage
 //! error or timeout is retried next tick, a settled lease is dropped, a
-//! fenced release also clears the slot so a superseded holder stops serving
-//! at once, and an invalid release — the store rejecting the claim as an
+//! fenced release also clears the slot because the store rejected a
+//! capability copied from the grant and local lease identity can no longer be
+//! trusted, and an invalid release — the store rejecting the claim as an
 //! accounting bug — drops readiness, because local counts that disagree with
 //! the store's are not a safe basis for further spending.
 
@@ -624,10 +625,10 @@ async fn run(
 /// The allocator's answer decides what the refusal *means* (issue #42):
 /// storage errors and timeouts keep the lease parked for the next tick; a
 /// settled lease is dropped; a fenced release also closes the slot, because
-/// another holder has superseded this one and spending must stop now rather
-/// than at the next acquire; and an invalid release means local accounting
-/// disagrees with the store's, which is not a state in which continuing to
-/// spend is safe — readiness drops and stays down.
+/// rejection of the grant's own lease-scoped capability means local identity
+/// has diverged from the store and spending must stop; and an invalid release
+/// means local accounting disagrees with the store's, which is not a state in
+/// which continuing to spend is safe — readiness drops and stays down.
 async fn release_quiesced(
     allocator: &Arc<dyn LeaseAllocator>,
     parked: &mut Vec<Arc<LocalLease>>,
@@ -683,7 +684,7 @@ async fn release_quiesced(
                 counters.record_released();
                 tracing::warn!(
                     lease = lease_id,
-                    "fenced by a newer holder; clearing the slot so this instance stops serving"
+                    "store rejected this lease's capability; clearing the slot so this instance stops serving"
                 );
                 slot.take();
             }
@@ -1005,8 +1006,9 @@ mod tests {
         }
     }
 
-    /// A newer holder has superseded this one, so spending must stop now
-    /// rather than at the next acquire (issue #42).
+    /// The store rejected the capability copied from this grant, so local
+    /// lease identity is no longer trustworthy and spending must stop
+    /// (issue #42).
     #[tokio::test]
     async fn fenced_release_clears_the_slot() {
         let scripted = ScriptedAllocator::new([(LeaseId(3), Refusal::Fenced)]);
@@ -1017,10 +1019,10 @@ mod tests {
 
         harness.release_quiesced(&allocator, &mut parked).await;
 
-        assert!(parked.is_empty(), "a fenced lease is settled, not retried");
+        assert!(parked.is_empty(), "a rejected capability is not retried");
         assert!(
             harness.slot.load().is_none(),
-            "a fenced holder must stop serving immediately"
+            "an instance with divergent lease identity must stop serving"
         );
     }
 

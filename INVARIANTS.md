@@ -6,8 +6,9 @@ until it has one.
 
 1. **Bounded spend.** Total committed usage across all instances never exceeds
    the units allocated to the account, under any interleaving of concurrent
-   clients. Enforced by fenced leases: units are spent only from a lease, and a
-   lease's units were atomically debited from the account at allocation.
+   clients. Enforced by centrally allocated leases: units are spent only from
+   a lease, and a lease's units were atomically debited from the account at
+   allocation.
    *Tests:* `no_double_spend_across_instances` (memory and Postgres variants),
    `tollgate-core` reservation proptests.
 
@@ -21,16 +22,25 @@ until it has one.
    commit; a committed reservation reports its full charge to a late
    canceller. *Tests:* `reservation::tests::commit_cancel_race_one_winner`.
 
-4. **Fencing is absolute.** A lease holder with a stale fencing token is
-   rejected by the allocator, by renewal, and by the usage sink — regardless
-   of timing. Fencing tokens are strictly monotonic per account. A stored
-   fence outside the token domain is surfaced as a storage error, never
-   aliased to fence 0 — aliasing would misattribute corruption to the caller
-   and break the monotonic audit trail. A holder that learns it is fenced
-   while releasing clears its own slot, so it stops serving immediately
-   rather than at its next acquire.
-   *Tests:* `fenced_out_holder_rejected` (store suites),
-   `fenced_release_clears_the_slot`;
+4. **Lease capabilities are exact and lease-scoped.** Every acquired lease is
+   stamped with the next fencing token in its account's strictly increasing
+   sequence. The sequence is an allocation and audit order, not an
+   account-wide validity epoch: issuing a newer token does not invalidate an
+   older lease that is still active. Release accepts only the stored
+   `(lease_id, fencing_token)` pair; usage accepts only the stored
+   `(lease_id, account_id, fencing_token)` triple. Lease state and remaining
+   capacity are independent checks: a matching capability cannot revive a
+   reclaimed lease or exceed its accounting capacity. A stored fence outside
+   the token domain is surfaced as a storage error, never aliased to fence 0 —
+   aliasing would misattribute corruption to the caller and break the
+   monotonic audit trail. If release rejects the token attached to a grant the
+   client believed valid, the client clears its slot and fails closed because
+   its local lease identity can no longer be trusted relative to the store.
+   *Tests:* `newer_lease_does_not_invalidate_older_active_capability`,
+   `wrong_token_release_leaves_lease_reclaimable`, and
+   `usage_rejects_mismatched_lease_capability` (store suites);
+   `expired_lease_units_reclaimed`, `straggler_usage_after_release_is_billed`,
+   and `fenced_release_clears_the_slot`;
    `acquire_surfaces_negative_stored_fence` and
    `release_and_ingest_surface_negative_stored_fence` (Postgres suite; the
    memory backend stores tokens as `u64`, so the corrupt state is

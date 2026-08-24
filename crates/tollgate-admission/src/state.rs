@@ -40,8 +40,9 @@ impl LeaseSlot {
         self.0.swap(Some(lease))
     }
 
-    /// Drop the current lease (server told us we are fenced out, or shutdown
-    /// returned it). Subsequent requests deny until a new lease arrives.
+    /// Drop the current lease after the control plane invalidates local lease
+    /// state or shutdown returns it. Subsequent requests deny until a new
+    /// lease arrives.
     pub fn clear(&self) {
         self.0.store(None);
     }
@@ -479,9 +480,9 @@ mod tests {
     /// `state.rs` carried no tests at all, and the slot's whole job is to say
     /// whether this instance may spend. `clear` in particular could be
     /// replaced by a no-op with the entire suite still green (#43): the refill
-    /// plane happens to use `take` everywhere, so the documented
-    /// fenced-out path — "subsequent requests deny until a new lease arrives"
-    /// — had no witness at all.
+    /// plane happens to use `take` everywhere, so the documented invalidation
+    /// path — "subsequent requests deny until a new lease arrives" — had no
+    /// witness at all.
     #[test]
     fn a_cleared_slot_stops_the_instance_spending() {
         let slot = LeaseSlot::empty();
@@ -493,8 +494,7 @@ mod tests {
         slot.clear();
         assert!(
             slot.load().is_none(),
-            "a fenced-out instance must hold no lease, or it keeps spending \
-             against capacity the allocator may have re-granted"
+            "an instance with invalidated lease state must hold no lease"
         );
     }
 

@@ -173,50 +173,113 @@ async fn no_double_spend_across_instances() {
     assert_conserved(&store);
 }
 
-/// INVARIANTS.md #4: stale holders are rejected everywhere — wrong token,
-/// settled lease, and usage ingest alike.
+/// INVARIANTS.md #4: allocation order is not an account-wide validity epoch.
+/// Both simultaneously active leases retain their own capabilities.
 #[tokio::test]
-async fn fenced_out_holder_rejected() {
+async fn newer_lease_does_not_invalidate_older_active_capability() {
     let store = store_with_balance(full_grant_policy(), 1_000);
-    let stale = store
+    let older = store
+        .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap();
+    let newer = store
+        .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap();
+    assert!(newer.fencing_token > older.fencing_token);
+
+    let report = store
+        .ingest(&[usage(&older, 1, 50, 1)], t(1))
+        .await
+        .unwrap();
+    assert_eq!((report.accepted, report.rejected), (1, 0));
+    store
+        .release(older.lease_id, older.fencing_token, CostUnits(350), t(2))
+        .await
+        .unwrap();
+
+    let report = store
+        .ingest(&[usage(&newer, 2, 25, 2)], t(2))
+        .await
+        .unwrap();
+    assert_eq!((report.accepted, report.rejected), (1, 0));
+    store
+        .release(newer.lease_id, newer.fencing_token, CostUnits(375), t(3))
+        .await
+        .unwrap();
+
+    assert_eq!(store.balance(ACCOUNT), CostUnits(925));
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(75));
+    assert_conserved(&store);
+}
+
+/// A wrong token refuses release without changing the lease. The immediate
+/// sweep also witnesses that a failed store operation has completed before it
+/// returns; the PostgreSQL mirror protects the awaited-rollback regression.
+#[tokio::test]
+async fn wrong_token_release_leaves_lease_reclaimable() {
+    let store = store_with_balance(full_grant_policy(), 1_000);
+    let lease = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
         .await
         .unwrap();
 
-    // Wrong token on release: fenced.
     assert_eq!(
         store
-            .release(stale.lease_id, FencingToken(999), CostUnits(400), t(1))
+            .release(lease.lease_id, FencingToken(999), CostUnits(400), t(1))
             .await
             .unwrap_err(),
         AllocateError::Fenced
     );
 
-    // The holder partitions; its lease expires and is reclaimed; a
-    // replacement lease carries a strictly newer token.
     let reclaimed = store.reclaim_expired(t(61)).await.unwrap();
     assert_eq!(reclaimed.len(), 1);
-    let replacement = store
-        .acquire(ACCOUNT, CostUnits(400), TTL, t(61))
-        .await
-        .unwrap();
-    assert!(replacement.fencing_token > stale.fencing_token);
-
-    // The stale holder reappears: release and usage are both refused.
-    assert_eq!(
-        store
-            .release(stale.lease_id, stale.fencing_token, CostUnits(400), t(62))
-            .await
-            .unwrap_err(),
-        AllocateError::LeaseNotActive
-    );
-    let report = store
-        .ingest(&[usage(&stale, 1, 50, 62)], t(62))
-        .await
-        .unwrap();
-    assert_eq!(report.rejected, 1);
+    assert_eq!(reclaimed[0].lease_id, lease.lease_id);
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits::ZERO);
     assert_conserved(&store);
+}
+
+/// Usage identifies a lease with the full `(lease, account, token)`
+/// capability. Token and account mismatches are distinct rejection witnesses.
+#[tokio::test]
+async fn usage_rejects_mismatched_lease_capability() {
+    const OTHER: AccountId = AccountId(2);
+    let store = store_with_balance(full_grant_policy(), 1_000);
+    AdminStore::create_account(
+        &*store,
+        AccountConfig {
+            account_id: OTHER,
+            initial_balance: CostUnits(100),
+            active: true,
+        },
+    )
+    .await
+    .unwrap();
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap();
+
+    let mut wrong_token = usage(&lease, 1, 10, 1);
+    wrong_token.fencing_token = FencingToken(lease.fencing_token.0.checked_add(1).unwrap());
+    let report = store.ingest(&[wrong_token], t(1)).await.unwrap();
+    assert_eq!(
+        (report.accepted, report.duplicate, report.rejected),
+        (0, 0, 1)
+    );
+
+    let mut wrong_account = usage(&lease, 2, 10, 1);
+    wrong_account.account_id = OTHER;
+    let report = store.ingest(&[wrong_account], t(1)).await.unwrap();
+    assert_eq!(
+        (report.accepted, report.duplicate, report.rejected),
+        (0, 0, 1)
+    );
+
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits::ZERO);
+    assert_eq!(store.usage_recorded(OTHER), CostUnits::ZERO);
+    assert_conserved(&store);
+    assert!(store.conservation(OTHER).unwrap().holds());
 }
 
 /// INVARIANTS.md #9: a crashed holder's unspent units return at TTL.

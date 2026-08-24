@@ -221,19 +221,60 @@ async fn no_double_spend_across_instances() {
 }
 
 #[tokio::test]
-async fn fenced_out_holder_rejected() {
+async fn newer_lease_does_not_invalidate_older_active_capability() {
     let _guard = DB_LOCK.lock().await;
     let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
         return;
     };
-    let stale = store
+    let older = store
+        .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap();
+    let newer = store
+        .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap();
+    assert!(newer.fencing_token > older.fencing_token);
+
+    let report = store
+        .ingest(&[usage(&older, 1, 50, 1)], t(1))
+        .await
+        .unwrap();
+    assert_eq!((report.accepted, report.rejected), (1, 0));
+    store
+        .release(older.lease_id, older.fencing_token, CostUnits(350), t(2))
+        .await
+        .unwrap();
+
+    let report = store
+        .ingest(&[usage(&newer, 2, 25, 2)], t(2))
+        .await
+        .unwrap();
+    assert_eq!((report.accepted, report.rejected), (1, 0));
+    store
+        .release(newer.lease_id, newer.fencing_token, CostUnits(375), t(3))
+        .await
+        .unwrap();
+
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(925));
+    assert_eq!(store.usage_recorded(ACCOUNT).await.unwrap(), CostUnits(75));
+    assert_conserved(&store).await;
+}
+
+#[tokio::test]
+async fn wrong_token_release_leaves_lease_reclaimable() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    let lease = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
         .await
         .unwrap();
 
     assert_eq!(
         store
-            .release(stale.lease_id, FencingToken(999), CostUnits(400), t(1))
+            .release(lease.lease_id, FencingToken(999), CostUnits(400), t(1))
             .await
             .unwrap_err(),
         AllocateError::Fenced
@@ -244,29 +285,59 @@ async fn fenced_out_holder_rejected() {
     // immediately following sweep miss the stale lease intermittently.
     let reclaimed = store.reclaim_expired(t(61)).await.unwrap();
     assert_eq!(reclaimed.len(), 1);
-    let replacement = store
-        .acquire(ACCOUNT, CostUnits(400), TTL, t(61))
-        .await
-        .unwrap();
-    assert!(replacement.fencing_token > stale.fencing_token);
-
-    assert_eq!(
-        store
-            .release(stale.lease_id, stale.fencing_token, CostUnits(400), t(62))
-            .await
-            .unwrap_err(),
-        AllocateError::LeaseNotActive
-    );
-    let report = store
-        .ingest(&[usage(&stale, 1, 50, 62)], t(62))
-        .await
-        .unwrap();
-    assert_eq!(report.rejected, 1);
+    assert_eq!(reclaimed[0].lease_id, lease.lease_id);
     assert_eq!(
         store.usage_recorded(ACCOUNT).await.unwrap(),
         CostUnits::ZERO
     );
     assert_conserved(&store).await;
+}
+
+#[tokio::test]
+async fn usage_rejects_mismatched_lease_capability() {
+    const OTHER: AccountId = AccountId(2);
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    AdminStore::create_account(
+        &*store,
+        AccountConfig {
+            account_id: OTHER,
+            initial_balance: CostUnits(100),
+            active: true,
+        },
+    )
+    .await
+    .unwrap();
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap();
+
+    let mut wrong_token = usage(&lease, 1, 10, 1);
+    wrong_token.fencing_token = FencingToken(lease.fencing_token.0.checked_add(1).unwrap());
+    let report = store.ingest(&[wrong_token], t(1)).await.unwrap();
+    assert_eq!(
+        (report.accepted, report.duplicate, report.rejected),
+        (0, 0, 1)
+    );
+
+    let mut wrong_account = usage(&lease, 2, 10, 1);
+    wrong_account.account_id = OTHER;
+    let report = store.ingest(&[wrong_account], t(1)).await.unwrap();
+    assert_eq!(
+        (report.accepted, report.duplicate, report.rejected),
+        (0, 0, 1)
+    );
+
+    assert_eq!(
+        store.usage_recorded(ACCOUNT).await.unwrap(),
+        CostUnits::ZERO
+    );
+    assert_eq!(store.usage_recorded(OTHER).await.unwrap(), CostUnits::ZERO);
+    assert_conserved(&store).await;
+    assert!(store.conservation(OTHER).await.unwrap().unwrap().holds());
 }
 
 #[tokio::test]
