@@ -46,6 +46,18 @@ enum Action {
 }
 
 proptest! {
+    /// The complete u128 domain has one fixed-width textual representation;
+    /// parsing never narrows through a JavaScript-sized integer
+    /// (INVARIANTS.md #21).
+    #[test]
+    fn identifier_text_round_trips_the_full_u128_domain(value in any::<u128>()) {
+        let id = AccountId(value);
+        let text = id.to_string();
+        prop_assert_eq!(text.len(), 32);
+        prop_assert!(text.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        prop_assert_eq!(text.parse::<AccountId>(), Ok(id));
+    }
+
     /// Quotes match exact u128 arithmetic or refuse with Overflow — never a
     /// wrapped value (INVARIANTS.md #11).
     #[test]

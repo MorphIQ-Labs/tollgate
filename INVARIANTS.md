@@ -315,6 +315,27 @@ until it has one.
     `denied_requests_add_no_units`, `concurrent_increments_are_not_lost`, and
     `metrics_separate_admissions_from_each_kind_of_refusal`.
 
+21. **Every 128-bit identifier has one portable wire spelling.** `AccountId`,
+    `KeyId`, `LeaseId`, `RequestId`, and `Principal` are exactly 32 lowercase
+    hexadecimal characters without a prefix in human-readable serialization
+    and URL paths. A malformed path is a structured `invalid-id`, never an
+    unknown principal; only a structured `404 unknown-principal` is negative
+    evidence that may enter the authorization cache. The pre-public v1
+    contract is updated in place; numeric identifiers are rejected rather than
+    silently reinterpreted. PostgreSQL's storage-local snapshot JSON
+    deliberately retains numeric ids in the legacy u64 range and uses
+    canonical text for values the old codec could not represent. The owning
+    conversion keeps pre-existing rows and ordinary writes rollback-safe while
+    extending storage to the full u128 domain. *Tests:*
+    `every_id_uses_the_same_fixed_width_lowercase_hexadecimal_text`,
+    `identifier_text_round_trips_the_full_u128_domain`,
+    `high_bit_ids_are_portable_text_in_an_untyped_json_consumer`,
+    `identifier_failures_are_structured_and_never_unknown`,
+    `an_unstructured_route_404_is_not_a_confirmed_unknown_principal`,
+    `full_stack_over_loopback_http`,
+    `snapshot_json_preserves_legacy_numbers_and_encodes_high_ids_exactly`, and
+    `malformed_storage_id_explains_both_accepted_representations`.
+
 Ledger roles (context for 1 and 7): leases **bound** spend; usage events **are**
 the billing record; reconciliation compares the two and steady-state drift is
 zero.

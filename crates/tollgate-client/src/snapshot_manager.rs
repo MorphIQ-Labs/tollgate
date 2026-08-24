@@ -838,7 +838,7 @@ async fn refresh_all_cancellable(
             Err(error) => {
                 counters.record_failure();
                 tracing::warn!(
-                    principal = principal.0,
+                    %principal,
                     %error,
                     "snapshot fetch failed; principal keeps its previous resolution"
                 );

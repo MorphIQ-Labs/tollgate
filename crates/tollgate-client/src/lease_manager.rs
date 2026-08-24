@@ -351,7 +351,7 @@ impl LeaseManager {
                 crate::signal(&health_tx, false, "lease-manager health");
                 report
             }
-            .instrument(tracing::info_span!("lease_manager", account = account.0)),
+            .instrument(tracing::info_span!("lease_manager", %account)),
         );
         Ok(LeaseManager {
             shutdown,
@@ -598,7 +598,7 @@ async fn run(
                 report.released += 1;
                 counters.record_released();
                 tracing::warn!(
-                    lease = grant.lease_id.0,
+                    lease = %grant.lease_id,
                     %error,
                     "lease refused at shutdown; the store considers it settled"
                 );
@@ -607,7 +607,7 @@ async fn run(
                 report.abandoned += 1;
                 counters.record_abandoned();
                 tracing::warn!(
-                    lease = grant.lease_id.0,
+                    lease = %grant.lease_id,
                     units = lease.remaining().get(),
                     "shutdown budget expired with a lease unreturned; \
                      its units settle at TTL reclaim"
@@ -657,16 +657,16 @@ async fn release_quiesced(
             ),
         )
         .await;
-        let lease_id = grant.lease_id.0;
+        let lease_id = grant.lease_id;
         match outcome {
             // Unfinished or unreachable: nothing was settled, try next tick.
             Err(_) => {
-                tracing::debug!(lease = lease_id, "release timed out; retrying next tick");
+                tracing::debug!(lease = %lease_id, "release timed out; retrying next tick");
                 retry.push(lease);
             }
             Ok(Err(AllocateError::Storage(error))) => {
                 tracing::warn!(
-                    lease = lease_id,
+                    lease = %lease_id,
                     %error,
                     "release failed against the store; retrying next tick"
                 );
@@ -678,12 +678,12 @@ async fn release_quiesced(
             Ok(Ok(())) => counters.record_released(),
             Ok(Err(error @ (AllocateError::LeaseNotActive | AllocateError::UnknownLease))) => {
                 counters.record_released();
-                tracing::debug!(lease = lease_id, %error, "lease was already settled");
+                tracing::debug!(lease = %lease_id, %error, "lease was already settled");
             }
             Ok(Err(AllocateError::Fenced)) => {
                 counters.record_released();
                 tracing::warn!(
-                    lease = lease_id,
+                    lease = %lease_id,
                     "store rejected this lease's capability; clearing the slot so this instance stops serving"
                 );
                 slot.take();
@@ -691,7 +691,7 @@ async fn release_quiesced(
             Ok(Err(AllocateError::InvalidRelease)) => {
                 counters.record_released();
                 tracing::error!(
-                    lease = lease_id,
+                    lease = %lease_id,
                     units = lease.remaining().get(),
                     "the store rejected this release as an accounting error; \
                      local counts disagree with the ledger and readiness is dropping"
@@ -703,7 +703,7 @@ async fn release_quiesced(
             Ok(Err(error)) => {
                 counters.record_released();
                 tracing::error!(
-                    lease = lease_id,
+                    lease = %lease_id,
                     %error,
                     "allocator returned an acquire-only refusal to a release"
                 );

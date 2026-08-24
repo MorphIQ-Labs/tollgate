@@ -24,17 +24,18 @@ use tollgate_client::{
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, FencingToken,
-    Generation, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, Principal,
+    Generation, KeyId, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, Principal,
     PublishableSnapshot, RequestId, ResolvedLimits,
 };
+use tollgate_store::wire::API_PREFIX;
 use tollgate_store::{
     AccountConfig, GrantPolicy, MemoryStore, SnapshotResolution, SnapshotSource as _,
 };
 
 use tollgate_server::{ServerState, serve};
 
-const ACCOUNT: AccountId = AccountId(1);
-const PRINCIPAL: Principal = Principal(7);
+const ACCOUNT: AccountId = AccountId((1u128 << 127) | 1);
+const PRINCIPAL: Principal = Principal((1u128 << 127) | 7);
 const DEPOSIT: u64 = 5_000;
 const COST_PER_REQUEST: u64 = 51;
 
@@ -67,7 +68,7 @@ impl OpIndex for PriceOp {
 fn snapshot() -> Arc<AccountSnapshot> {
     Arc::new(AccountSnapshot {
         account_id: ACCOUNT,
-        key_id: None,
+        key_id: Some(KeyId((1u128 << 127) | 2)),
         generation: Generation(1),
         status: AccountStatus::Active,
         valid_until: Timestamp::from_second(4_102_444_800).unwrap(),
@@ -98,7 +99,7 @@ async fn http_store_rejects_invalid_snapshot_from_legacy_server() {
     invalid.limits.rate_burst_units = 113;
     let invalid = Arc::new(invalid);
     let app = axum::Router::new().route(
-        "/v1/snapshots/{principal}",
+        &format!("{API_PREFIX}/snapshots/{{principal}}"),
         get(move || {
             let invalid = Arc::clone(&invalid);
             async move { Json(invalid) }
@@ -120,6 +121,32 @@ async fn http_store_rejects_invalid_snapshot_from_legacy_server() {
     let error = http.snapshot(PRINCIPAL).await.unwrap_err();
     assert!(
         error.0.contains("invalid snapshot from server") && error.0.contains("exceeding the burst"),
+        "unexpected error: {error}"
+    );
+
+    let _ = stop_tx.send(());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn an_unstructured_route_404_is_not_a_confirmed_unknown_principal() {
+    let app = axum::Router::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = stop_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let http = HttpStore::new(format!("http://{address}"));
+    let error = http.snapshot(PRINCIPAL).await.unwrap_err();
+    assert!(
+        error.0.contains("unstructured 404") && !error.0.contains("unknown-principal response"),
         "unexpected error: {error}"
     );
 

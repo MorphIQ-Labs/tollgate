@@ -2471,6 +2471,7 @@ dependencies = [
  "async-trait",
  "criterion",
  "jiff",
+ "serde",
  "serde_json",
  "sqlx",
  "tokio",

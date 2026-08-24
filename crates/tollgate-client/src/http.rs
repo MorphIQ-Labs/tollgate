@@ -23,7 +23,7 @@ use tollgate_core::{
     PublishableSnapshot, UsageEvent,
 };
 use tollgate_store::wire::{
-    AcquireRequest, IngestRequestRef, PrincipalsResponse, Problem, ReleaseRequest,
+    API_PREFIX, AcquireRequest, IngestRequestRef, PrincipalsResponse, Problem, ReleaseRequest,
 };
 use tollgate_store::{
     AllocateError, IngestReport, LeaseAllocator, ReclaimBatch, SnapshotPush, SnapshotResolution,
@@ -64,8 +64,8 @@ impl HttpStore {
         })
     }
 
-    fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.base)
+    fn api_url(&self, path: &str) -> String {
+        format!("{}{API_PREFIX}{path}", self.base)
     }
 }
 
@@ -114,7 +114,7 @@ impl LeaseAllocator for HttpStore {
         let ttl_seconds = u32::try_from(ttl.as_secs().max(0)).unwrap_or(u32::MAX);
         let response = self
             .client
-            .post(self.url("/v1/leases/acquire"))
+            .post(self.api_url("/leases/acquire"))
             .json(&AcquireRequest {
                 account_id: account,
                 requested,
@@ -138,7 +138,7 @@ impl LeaseAllocator for HttpStore {
     ) -> Result<(), AllocateError> {
         let response = self
             .client
-            .post(self.url("/v1/leases/release"))
+            .post(self.api_url("/leases/release"))
             .json(&ReleaseRequest {
                 lease_id,
                 fencing_token,
@@ -171,12 +171,23 @@ impl SnapshotSource for HttpStore {
     async fn snapshot(&self, principal: Principal) -> Result<SnapshotResolution, StoreError> {
         let response = self
             .client
-            .get(self.url(&format!("/v1/snapshots/{}", principal.0)))
+            .get(self.api_url(&format!("/snapshots/{principal}")))
             .send()
             .await
             .map_err(|e| StoreError(format!("http: {e}")))?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(SnapshotResolution::Unknown);
+            let problem: Problem = response.json().await.map_err(|e| {
+                StoreError(format!(
+                    "snapshot endpoint returned an unstructured 404, not a confirmed unknown principal: {e}"
+                ))
+            })?;
+            if problem.code == "unknown-principal" {
+                return Ok(SnapshotResolution::Unknown);
+            }
+            return Err(StoreError(format!(
+                "snapshot endpoint returned 404 with code {} instead of unknown-principal",
+                problem.code
+            )));
         }
         if response.status() == reqwest::StatusCode::GONE {
             let problem: Problem = response
@@ -222,7 +233,7 @@ impl SnapshotSource for HttpStore {
     async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
         let response = self
             .client
-            .get(self.url("/v1/snapshots"))
+            .get(self.api_url("/snapshots"))
             .send()
             .await
             .map_err(|e| StoreError(format!("http: {e}")))?;
@@ -249,7 +260,7 @@ impl UsageSink for HttpStore {
     ) -> Result<IngestReport, StoreError> {
         let response = self
             .client
-            .post(self.url("/v1/usage/ingest"))
+            .post(self.api_url("/usage/ingest"))
             .json(&IngestRequestRef { events })
             .send()
             .await

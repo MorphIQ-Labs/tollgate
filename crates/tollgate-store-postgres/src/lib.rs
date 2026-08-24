@@ -17,7 +17,9 @@
 //!   value is refused, not clamped) and schema-level CHECK constraints
 //!   keeping every unit column non-negative;
 //! - timestamps as `BIGINT` microseconds since the Unix epoch;
-//! - snapshots as `JSONB` of the wire serialization.
+//! - snapshots as storage-local `JSONB`: ids in the legacy u64 range remain
+//!   numeric for rollback, larger ids use canonical text, and the public
+//!   HTTP/Serde contract always uses text.
 //!
 //! Snapshot pushes broadcast in-process only; cross-process push
 //! (LISTEN/NOTIFY or the server's future SSE) is a documented seam in
@@ -28,13 +30,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
+use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId,
-    Principal, PublishableSnapshot, UsageEvent,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
+    LeaseGrant, LeaseId, PermissionBits, Principal, PublishableSnapshot, ResolvedLimits,
+    UsageEvent,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, Conservation, CreateAccountError, GrantPolicy,
@@ -45,6 +49,130 @@ use tollgate_store::{
 const STATE_ACTIVE: i16 = 0;
 const STATE_RELEASED: i16 = 1;
 const STATE_EXPIRED: i16 = 2;
+
+/// One storage-local identifier. Values the previous codec could represent
+/// stay numeric for rollback; the rest of the promised u128 domain uses
+/// canonical text because serde_json's default number type rejects it.
+#[derive(Debug, Clone, Copy)]
+struct StoredId(u128);
+
+impl Serialize for StoredId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match u64::try_from(self.0) {
+            Ok(value) => serializer.serialize_u64(value),
+            Err(_) => serializer.collect_str(&format_args!("{:032x}", self.0)),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StoredId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StoredIdVisitor;
+
+        impl serde::de::Visitor<'_> for StoredIdVisitor {
+            type Value = StoredId;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a legacy u64 number or a canonical 128-bit identifier string")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(StoredId(u128::from(value)))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                value
+                    .parse::<AccountId>()
+                    .map(|id| StoredId(id.0))
+                    .map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_any(StoredIdVisitor)
+    }
+}
+
+#[cfg(test)]
+mod stored_id_tests {
+    use super::StoredId;
+
+    #[test]
+    fn malformed_storage_id_explains_both_accepted_representations() {
+        let error = serde_json::from_value::<StoredId>(serde_json::Value::Bool(true)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("a legacy u64 number or a canonical 128-bit identifier string"),
+            "unexpected diagnostic: {error}"
+        );
+    }
+}
+
+/// PostgreSQL's snapshot JSON predates the portable HTTP identifier contract.
+/// Keep this boundary explicit so existing rows remain readable and ordinary
+/// legacy-range writes remain rollback-safe while high-bit ids finally work.
+#[derive(Serialize)]
+struct StoredSnapshotRef<'a> {
+    account_id: StoredId,
+    key_id: Option<StoredId>,
+    generation: &'a Generation,
+    status: &'a AccountStatus,
+    valid_until: &'a Timestamp,
+    permissions: &'a PermissionBits,
+    limits: &'a ResolvedLimits,
+    cost_table: &'a Arc<CostTable>,
+}
+
+impl<'a> From<&'a AccountSnapshot> for StoredSnapshotRef<'a> {
+    fn from(snapshot: &'a AccountSnapshot) -> Self {
+        StoredSnapshotRef {
+            account_id: StoredId(snapshot.account_id.0),
+            key_id: snapshot.key_id.map(|id| StoredId(id.0)),
+            generation: &snapshot.generation,
+            status: &snapshot.status,
+            valid_until: &snapshot.valid_until,
+            permissions: &snapshot.permissions,
+            limits: &snapshot.limits,
+            cost_table: &snapshot.cost_table,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct StoredSnapshot {
+    account_id: StoredId,
+    key_id: Option<StoredId>,
+    generation: Generation,
+    status: AccountStatus,
+    valid_until: Timestamp,
+    permissions: PermissionBits,
+    limits: ResolvedLimits,
+    cost_table: Arc<CostTable>,
+}
+
+impl From<StoredSnapshot> for AccountSnapshot {
+    fn from(snapshot: StoredSnapshot) -> Self {
+        AccountSnapshot {
+            account_id: AccountId(snapshot.account_id.0),
+            key_id: snapshot.key_id.map(|id| tollgate_core::KeyId(id.0)),
+            generation: snapshot.generation,
+            status: snapshot.status,
+            valid_until: snapshot.valid_until,
+            permissions: snapshot.permissions,
+            limits: snapshot.limits,
+            cost_table: snapshot.cost_table,
+        }
+    }
+}
 
 /// The reconciliation query's active-lease sum, named because two callers must
 /// agree on it: `conservation` runs it, and `explain_active_lease_sum` asks the
@@ -237,7 +365,7 @@ impl PostgresStore {
         let principal = push.principal;
         let subscribers = self.push.send(push).unwrap_or(0);
         tracing::debug!(
-            principal = principal.0,
+            %principal,
             subscribers,
             "snapshot pushed to subscribers"
         );
@@ -1065,10 +1193,10 @@ impl SnapshotSource for PostgresStore {
             }
             Some(row) => {
                 let value: serde_json::Value = row.get(1);
-                let snapshot: AccountSnapshot = serde_json::from_value(value)
+                let snapshot: StoredSnapshot = serde_json::from_value(value)
                     .map_err(|e| StoreError(format!("snapshot decode: {e}")))?;
                 let snapshot =
-                    PublishableSnapshot::try_new(Arc::new(snapshot)).map_err(|error| {
+                    PublishableSnapshot::try_new(Arc::new(snapshot.into())).map_err(|error| {
                         StoreError(format!(
                             "invalid stored snapshot for principal {:#034x}: {error}",
                             principal.0
@@ -1174,7 +1302,7 @@ impl AdminStore for PostgresStore {
         let generation = i64::try_from(snapshot.generation.0).map_err(|_| {
             StoreError("snapshot generation exceeds PostgreSQL BIGINT range".into())
         })?;
-        let value = serde_json::to_value(snapshot.as_snapshot())
+        let value = serde_json::to_value(StoredSnapshotRef::from(snapshot.as_snapshot()))
             .map_err(|e| StoreError(format!("snapshot encode: {e}")))?;
         let result = sqlx::query(
             "INSERT INTO tollgate_snapshots (principal, generation, snapshot, deleted)
