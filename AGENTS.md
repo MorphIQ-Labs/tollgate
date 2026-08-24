@@ -24,6 +24,7 @@ git config core.hooksPath .githooks
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+./scripts/check_advisories.sh
 
 cargo test -p tollgate-client
 cargo test -p tollgate-core reservation::tests::commit_cancel_race_one_winner
@@ -38,7 +39,7 @@ cargo run -p pricing-api
 cargo run -p tollgate-server
 ```
 
-CI uses `check`, `test`, `assurance`, and `release`: format, Clippy, title convention, all-feature workspace tests, the PostgreSQL suite, and benchmark compilation run on every merge request; mutation and formal gates run only for merge requests targeting the default branch; release-plz runs only after merge. Performance and load threshold lanes are explicit, non-gating assurance jobs because absolute latency is calibrated only on a controlled host; overhead ratios are portable, so their shared-CI reports remain useful evidence. The `production` profile (fat LTO, `panic=abort`) is for deployment and the load gate; Criterion retains the default release profile. Keep `rust-toolchain.toml` and the GitLab CI Rust image in lockstep.
+CI uses `check`, `test`, `assurance`, and `release`: format, Clippy, title convention, all-feature workspace tests, the PostgreSQL suite, and benchmark compilation run on every merge request; the blocking dependency-advisory scan runs on merge requests and the default branch; mutation and formal gates run only for merge requests targeting the default branch; release-plz runs only after merge. Performance and load threshold verdicts are explicit, non-gating assurance because shared-host measurements are not trusted to decide a merge; the automatic load job records threshold misses as evidence while still failing on build, configuration, execution, or report errors. The `production` profile (fat LTO, `panic=abort`) is for deployment and the load gate; Criterion retains the default release profile. Keep `rust-toolchain.toml` and the GitLab CI Rust image in lockstep.
 
 ## Design Constraints
 

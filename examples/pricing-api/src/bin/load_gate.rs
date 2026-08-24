@@ -3,7 +3,7 @@
 //! `testing/load_thresholds.json`. It reports the original sequential
 //! scenario and concurrent connections contending on one account.
 //!
-//! Usage: `load_gate <thresholds.json> <report.json>`
+//! Usage: `load_gate [--evidence] <thresholds.json> <report.json>`
 //!
 //! Each client is a raw blocking `TcpStream` speaking minimal HTTP/1.1, so the
 //! measurement mirrors ferro-risk's persistent-loopback gate and adds no
@@ -166,16 +166,39 @@ impl RunContext {
 
 const BODY: &str =
     r#"{"contracts":[{"spot":100.0,"strike":105.0,"rate":0.05,"vol":0.2,"tte_years":0.25}]}"#;
-const USAGE: &str = "usage: load_gate <thresholds.json> <report.json>";
+const USAGE: &str = "usage: load_gate [--evidence] <thresholds.json> <report.json>";
 
 #[derive(Debug, PartialEq)]
 enum Command {
     Run {
         thresholds_path: PathBuf,
         report_path: PathBuf,
+        verdict_mode: VerdictMode,
     },
     Help,
     Version,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum VerdictMode {
+    Gate,
+    Evidence,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MeasurementVerdict {
+    Passed,
+    EvidenceMiss,
+    GateFailure,
+}
+
+impl MeasurementVerdict {
+    fn exit_code(self) -> u8 {
+        match self {
+            Self::Passed | Self::EvidenceMiss => 0,
+            Self::GateFailure => 1,
+        }
+    }
 }
 
 fn parse_args(args: &[String]) -> Result<Command, String> {
@@ -185,12 +208,22 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         match arg.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
             "-V" | "--version" => return Ok(Command::Version),
-            value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
             _ => {}
         }
     }
 
-    let mut positional = args[..option_end].to_vec();
+    let mut verdict_mode = VerdictMode::Gate;
+    let mut positional = Vec::with_capacity(args.len());
+    for arg in &args[..option_end] {
+        match arg.as_str() {
+            "--evidence" if verdict_mode == VerdictMode::Gate => {
+                verdict_mode = VerdictMode::Evidence;
+            }
+            "--evidence" => return Err("--evidence may be specified only once".to_owned()),
+            value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
+            _ => positional.push(arg.clone()),
+        }
+    }
     if let Some(index) = separator {
         positional.extend_from_slice(&args[index + 1..]);
     }
@@ -198,8 +231,17 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         [thresholds_path, report_path] => Ok(Command::Run {
             thresholds_path: PathBuf::from(thresholds_path),
             report_path: PathBuf::from(report_path),
+            verdict_mode,
         }),
         _ => Err(USAGE.to_owned()),
+    }
+}
+
+fn measurement_verdict(passed: bool, verdict_mode: VerdictMode) -> MeasurementVerdict {
+    match (passed, verdict_mode) {
+        (true, _) => MeasurementVerdict::Passed,
+        (false, VerdictMode::Evidence) => MeasurementVerdict::EvidenceMiss,
+        (false, VerdictMode::Gate) => MeasurementVerdict::GateFailure,
     }
 }
 
@@ -494,11 +536,12 @@ fn all_scenarios_passed(sequential: bool, concurrent: bool) -> bool {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (thresholds_path, report_path) = match parse_args(&args) {
+    let (thresholds_path, report_path, verdict_mode) = match parse_args(&args) {
         Ok(Command::Run {
             thresholds_path,
             report_path,
-        }) => (thresholds_path, report_path),
+            verdict_mode,
+        }) => (thresholds_path, report_path, verdict_mode),
         Ok(Command::Help) => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -655,13 +698,18 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    if passed {
-        println!("load-gate: PASS");
-        ExitCode::SUCCESS
-    } else {
-        eprintln!("load-gate: FAIL — see {}", report_path.display());
-        ExitCode::FAILURE
+    let verdict = measurement_verdict(passed, verdict_mode);
+    match verdict {
+        MeasurementVerdict::Passed => println!("load-gate: PASS"),
+        MeasurementVerdict::EvidenceMiss => eprintln!(
+            "load-gate: THRESHOLD MISS (non-gating evidence) — see {}",
+            report_path.display()
+        ),
+        MeasurementVerdict::GateFailure => {
+            eprintln!("load-gate: FAIL — see {}", report_path.display());
+        }
     }
+    ExitCode::from(verdict.exit_code())
 }
 
 #[cfg(test)]
@@ -707,6 +755,7 @@ mod tests {
             Ok(Command::Run {
                 thresholds_path: PathBuf::from("--help"),
                 report_path: PathBuf::from("report.json"),
+                verdict_mode: VerdictMode::Gate,
             })
         );
     }
@@ -723,8 +772,43 @@ mod tests {
             Ok(Command::Run {
                 thresholds_path: PathBuf::from("thresholds.json"),
                 report_path: PathBuf::from("report.json"),
+                verdict_mode: VerdictMode::Gate,
             })
         );
+        assert_eq!(
+            parse_args(&strings(&["thresholds.json", "--evidence", "report.json"])),
+            Ok(Command::Run {
+                thresholds_path: PathBuf::from("thresholds.json"),
+                report_path: PathBuf::from("report.json"),
+                verdict_mode: VerdictMode::Evidence,
+            })
+        );
+        assert_eq!(
+            parse_args(&strings(&[
+                "--evidence",
+                "--evidence",
+                "thresholds.json",
+                "report.json"
+            ])),
+            Err("--evidence may be specified only once".to_owned())
+        );
+    }
+
+    #[test]
+    fn evidence_mode_keeps_only_measurement_misses_non_gating() {
+        let passed_gate = measurement_verdict(true, VerdictMode::Gate);
+        let passed_evidence = measurement_verdict(true, VerdictMode::Evidence);
+        let gate_failure = measurement_verdict(false, VerdictMode::Gate);
+        let evidence_miss = measurement_verdict(false, VerdictMode::Evidence);
+
+        assert_eq!(passed_gate, MeasurementVerdict::Passed);
+        assert_eq!(passed_evidence, MeasurementVerdict::Passed);
+        assert_eq!(gate_failure, MeasurementVerdict::GateFailure);
+        assert_eq!(evidence_miss, MeasurementVerdict::EvidenceMiss);
+        assert_eq!(passed_gate.exit_code(), 0);
+        assert_eq!(passed_evidence.exit_code(), 0);
+        assert_eq!(gate_failure.exit_code(), 1);
+        assert_eq!(evidence_miss.exit_code(), 0);
     }
 
     #[test]
