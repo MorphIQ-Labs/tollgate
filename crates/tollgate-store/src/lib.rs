@@ -30,6 +30,7 @@ pub use memory::{MemoryStore, StoredRecords};
 pub use traits::{
     AccountConfig, AdminStore, AllocateError, Conservation, CreateAccountError,
     DEFAULT_RECLAIM_BATCH_LIMIT, GrantPolicy, GrantPolicyError, IngestReport, LeaseAllocator,
-    ReclaimBatch, ReclaimedLease, SnapshotPush, SnapshotResolution, SnapshotSource, StoreError,
-    StoreHealth, UsageSink,
+    PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease, SetStatusError,
+    SnapshotPush, SnapshotResolution, SnapshotSource, StatusChange, StoreError, StoreHealth,
+    UsageSink, pushes_exceed_capacity,
 };

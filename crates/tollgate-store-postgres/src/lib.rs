@@ -42,8 +42,9 @@ use tollgate_core::{
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, Conservation, CreateAccountError, GrantPolicy,
-    IngestReport, LeaseAllocator, ReclaimBatch, ReclaimedLease, SnapshotPush, SnapshotResolution,
-    SnapshotSource, StoreError, StoreHealth, UsageSink,
+    IngestReport, LeaseAllocator, PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch,
+    ReclaimedLease, SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource, StatusChange,
+    StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
 };
 
 const STATE_ACTIVE: i16 = 0;
@@ -221,47 +222,33 @@ fn alloc_storage(e: sqlx::Error) -> AllocateError {
     AllocateError::Storage(storage(e))
 }
 
-/// Finish a store transaction before making its result observable.
+/// Finish a transaction before making its result observable.
 ///
-/// `sqlx::Transaction` only queues a rollback when it is dropped. A caller
-/// can therefore start a competing transaction after this future returns but
+/// `sqlx::Transaction` only queues a rollback when it is dropped. A caller can
+/// therefore start a competing transaction after this future returns but
 /// before PostgreSQL has released the first transaction's row locks. That is
 /// especially visible to reclaim's `SKIP LOCKED` query, which may otherwise
 /// miss a lease owned by an operation that has already reported failure.
-async fn finish_store_transaction<T>(
+///
+/// Generic over the error type rather than duplicated per error: this crate
+/// now finishes transactions that fail with `StoreError`, `AllocateError` and
+/// `SetStatusError`, and three copies of the rollback-and-report logic would
+/// be three places for it to drift.
+async fn finish_transaction<T, E>(
     tx: Transaction<'_, Postgres>,
-    result: Result<T, StoreError>,
-) -> Result<T, StoreError> {
+    result: Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<StoreError> + std::fmt::Display,
+{
     match result {
         Ok(value) => {
-            tx.commit().await.map_err(storage)?;
+            tx.commit().await.map_err(|e| E::from(storage(e)))?;
             Ok(value)
         }
         Err(error) => {
             if let Err(rollback_error) = tx.rollback().await {
-                return Err(StoreError(format!(
-                    "operation failed ({error}); transaction rollback failed ({})",
-                    storage(rollback_error)
-                )));
-            }
-            Err(error)
-        }
-    }
-}
-
-/// Allocator-error counterpart to [`finish_store_transaction`].
-async fn finish_allocate_transaction<T>(
-    tx: Transaction<'_, Postgres>,
-    result: Result<T, AllocateError>,
-) -> Result<T, AllocateError> {
-    match result {
-        Ok(value) => {
-            tx.commit().await.map_err(alloc_storage)?;
-            Ok(value)
-        }
-        Err(error) => {
-            if let Err(rollback_error) = tx.rollback().await {
-                return Err(AllocateError::Storage(StoreError(format!(
+                return Err(E::from(StoreError(format!(
                     "operation failed ({error}); transaction rollback failed ({})",
                     storage(rollback_error)
                 ))));
@@ -346,7 +333,7 @@ impl PostgresStore {
             .run(&pool)
             .await
             .map_err(|e| StoreError(format!("migrate: {e}")))?;
-        let (push, _) = broadcast::channel(256);
+        let (push, _) = broadcast::channel(PUSH_CHANNEL_CAPACITY);
         Ok(Arc::new(PostgresStore {
             pool,
             policy,
@@ -519,7 +506,7 @@ impl LeaseAllocator for PostgresStore {
         let mut tx = self.pool.begin().await.map_err(alloc_storage)?;
         let result = async {
             let row = sqlx::query(
-                "SELECT balance, active, next_fence FROM tollgate_accounts
+                "SELECT balance, status, next_fence FROM tollgate_accounts
                  WHERE account_id = $1 FOR UPDATE",
             )
             .bind(id_bytes(account.0))
@@ -528,7 +515,12 @@ impl LeaseAllocator for PostgresStore {
             .map_err(alloc_storage)?
             .ok_or(AllocateError::UnknownAccount)?;
 
-            if !row.get::<bool, _>(1) {
+            // Suspended and Closed both refuse, under one deny reason: no
+            // client acts on the distinction, and splitting it would widen
+            // `AllocateError`'s per-reason tally for nothing (#51).
+            if decode_status(row.get::<String, _>(1)).map_err(AllocateError::Storage)?
+                != AccountStatus::Active
+            {
                 return Err(AllocateError::AccountInactive);
             }
             let balance = to_units(row.get::<i64, _>(0), "account balance")
@@ -588,7 +580,7 @@ impl LeaseAllocator for PostgresStore {
             })
         }
         .await;
-        finish_allocate_transaction(tx, result).await
+        finish_transaction(tx, result).await
     }
 
     async fn release(
@@ -657,7 +649,7 @@ impl LeaseAllocator for PostgresStore {
             Ok(())
         }
         .await;
-        finish_allocate_transaction(tx, result).await
+        finish_transaction(tx, result).await
     }
 
     async fn reclaim_expired_batch(
@@ -795,7 +787,7 @@ impl LeaseAllocator for PostgresStore {
             Ok(batch)
         }
         .await;
-        finish_store_transaction(tx, result).await
+        finish_transaction(tx, result).await
     }
 }
 
@@ -1187,8 +1179,44 @@ impl UsageSink for PostgresStore {
             Ok(report)
         }
         .await;
-        finish_store_transaction(tx, result).await
+        finish_transaction(tx, result).await
     }
+}
+
+/// Decode a stored status column into the enum, refusing anything the
+/// vocabulary does not contain.
+///
+/// Never defaults to `Active`. A value the `CHECK` constraint should have made
+/// impossible means the row was written outside this code, and admitting it as
+/// "active" would turn corruption into service (the rule INVARIANTS.md #11
+/// applies to the ledger's numbers, applied to its status).
+fn decode_status(stored: String) -> Result<AccountStatus, StoreError> {
+    match stored.as_str() {
+        s if s == AccountStatus::Active.as_str() => Ok(AccountStatus::Active),
+        s if s == AccountStatus::Suspended.as_str() => Ok(AccountStatus::Suspended),
+        s if s == AccountStatus::Closed.as_str() => Ok(AccountStatus::Closed),
+        other => Err(StoreError(format!("unrecognized account status {other:?}"))),
+    }
+}
+
+/// Decode one stored snapshot row into the publication proof.
+///
+/// Shared by `SnapshotSource::snapshot` and the status republish so the latter
+/// reads back what it wrote through exactly the reader's path -- a row this
+/// refuses is one the request path would refuse too, and finding that out at
+/// write time is the point.
+fn decode_publishable(
+    principal: Principal,
+    value: serde_json::Value,
+) -> Result<PublishableSnapshot, StoreError> {
+    let snapshot: StoredSnapshot =
+        serde_json::from_value(value).map_err(|e| StoreError(format!("snapshot decode: {e}")))?;
+    PublishableSnapshot::try_new(Arc::new(snapshot.into())).map_err(|error| {
+        StoreError(format!(
+            "invalid stored snapshot for principal {:#034x}: {error}",
+            principal.0
+        ))
+    })
 }
 
 #[async_trait]
@@ -1210,16 +1238,9 @@ impl SnapshotSource for PostgresStore {
             }
             Some(row) => {
                 let value: serde_json::Value = row.get(1);
-                let snapshot: StoredSnapshot = serde_json::from_value(value)
-                    .map_err(|e| StoreError(format!("snapshot decode: {e}")))?;
-                let snapshot =
-                    PublishableSnapshot::try_new(Arc::new(snapshot.into())).map_err(|error| {
-                        StoreError(format!(
-                            "invalid stored snapshot for principal {:#034x}: {error}",
-                            principal.0
-                        ))
-                    })?;
-                Ok(SnapshotResolution::Present(snapshot))
+                Ok(SnapshotResolution::Present(decode_publishable(
+                    principal, value,
+                )?))
             }
             None => Ok(SnapshotResolution::Unknown),
         }
@@ -1265,13 +1286,13 @@ impl AdminStore for PostgresStore {
     async fn create_account(&self, config: AccountConfig) -> Result<(), CreateAccountError> {
         let result = sqlx::query(
             "INSERT INTO tollgate_accounts
-             (account_id, balance, deposited, active, next_fence, usage_recorded, settlement_loss)
+             (account_id, balance, deposited, status, next_fence, usage_recorded, settlement_loss)
              VALUES ($1, $2, $2, $3, 1, 0, 0)
              ON CONFLICT (account_id) DO NOTHING",
         )
         .bind(id_bytes(config.account_id.0))
         .bind(to_i64(config.initial_balance, "balance").map_err(CreateAccountError::Storage)?)
-        .bind(config.active)
+        .bind(config.status.as_str())
         .execute(&self.pool)
         .await
         .map_err(|e| CreateAccountError::Storage(storage(e)))?;
@@ -1298,43 +1319,196 @@ impl AdminStore for PostgresStore {
         Ok(())
     }
 
-    async fn set_active(&self, account: AccountId, active: bool) -> Result<(), AllocateError> {
-        let result = sqlx::query("UPDATE tollgate_accounts SET active = $2 WHERE account_id = $1")
+    async fn set_account_status(
+        &self,
+        account: AccountId,
+        status: AccountStatus,
+    ) -> Result<StatusChange, SetStatusError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let result = async {
+            // The account row first, and its lock is the serialization point:
+            // two concurrent status changes cannot interleave their snapshot
+            // updates, so "ledger says Active, snapshots say Suspended" is
+            // unrepresentable rather than merely unlikely.
+            let row = sqlx::query(
+                "SELECT status FROM tollgate_accounts WHERE account_id = $1 FOR UPDATE",
+            )
             .bind(id_bytes(account.0))
-            .bind(active)
-            .execute(&self.pool)
+            .fetch_optional(&mut *tx)
             .await
-            .map_err(alloc_storage)?;
-        if result.rows_affected() == 0 {
-            return Err(AllocateError::UnknownAccount);
+            .map_err(storage)?
+            .ok_or(SetStatusError::UnknownAccount)?;
+
+            if decode_status(row.get::<String, _>(0))? == AccountStatus::Closed
+                && status != AccountStatus::Closed
+            {
+                // Terminal, and the refusal changes nothing: no ledger write,
+                // no generation bump. Rolling back here is what makes that so.
+                return Err(SetStatusError::AccountClosed);
+            }
+
+            sqlx::query("UPDATE tollgate_accounts SET status = $2 WHERE account_id = $1")
+                .bind(id_bytes(account.0))
+                .bind(status.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?;
+
+            // `jsonb_set` rather than read-modify-write in Rust, for three
+            // reasons any one of which decides it:
+            //
+            // 1. RMW reintroduces this issue's own bug. A concurrent
+            //    `publish_snapshot` landing between the read and the write
+            //    makes `generation + 1` no longer greater than stored, and the
+            //    monotonic guard then *silently drops the status change* for
+            //    that principal.
+            // 2. RMW loses fields. `StoredSnapshot` has no `flatten`, so
+            //    decoding and re-serialising a row written by a newer binary
+            //    discards what this one does not know about.
+            // 3. RMW fails whole on one bad row. A safety operation must not
+            //    be blockable by one unrelated corrupt credential.
+            //
+            // Both `generation` references in SET see the old row value, so
+            // the column and the JSONB copy land on the same number -- they
+            // must, because `snapshot()` reads the generation from the JSONB
+            // while the tombstone path and the monotonic upsert read the
+            // column.
+            //
+            // `deleted = FALSE` leaves tombstones alone: republishing one
+            // would resurrect a revoked principal (INVARIANTS.md #15), and
+            // revocation stays its own per-credential mechanism.
+            // `IS DISTINCT FROM` makes a repeat converge, bumping nothing.
+            let rows = sqlx::query(
+                "UPDATE tollgate_snapshots
+                    SET generation = generation + 1,
+                        snapshot   = jsonb_set(
+                                         jsonb_set(snapshot, '{status}', to_jsonb($2::text)),
+                                         '{generation}', to_jsonb(generation + 1))
+                  WHERE account_id = $1
+                    AND deleted = FALSE
+                    AND snapshot ->> 'status' IS DISTINCT FROM $2::text
+                RETURNING principal, snapshot",
+            )
+            .bind(id_bytes(account.0))
+            .bind(status.as_str())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(storage)?;
+
+            let mut republished = Vec::with_capacity(rows.len());
+            let mut unreadable = 0usize;
+            for row in rows {
+                let principal = Principal(id_from(row.get::<Vec<u8>, _>(0).as_slice()));
+                match decode_publishable(principal, row.get::<serde_json::Value, _>(1)) {
+                    Ok(snapshot) => republished.push((principal, snapshot)),
+                    // Skipped for push, not fatal: this row was already
+                    // unreadable before the status change touched it, and
+                    // refusing to suspend an account because one of its
+                    // credentials is corrupt is the worse outcome. Reported,
+                    // never silent (INVARIANTS.md #19).
+                    // Counted as well as logged: the row changed durably but
+                    // will not be pushed, so those principals converge only at
+                    // their next refresh. Reported to the caller rather than
+                    // absorbed into a log line nobody is reading.
+                    Err(error) => {
+                        unreadable += 1;
+                        tracing::warn!(
+                            %principal,
+                            %error,
+                            "restamped snapshot could not be decoded for push"
+                        );
+                    }
+                }
+            }
+            // Ordered, so both backends emit the same sequence and a mirrored
+            // test need not assert on incidental ordering.
+            republished.sort_unstable_by_key(|(principal, _)| *principal);
+            Ok((republished, unreadable))
         }
-        Ok(())
+        .await;
+
+        let (republished, unreadable) = finish_transaction(tx, result).await?;
+        // After commit. `publish_snapshot` gets away with pushing before only
+        // because it is a single autocommit statement.
+        if pushes_exceed_capacity(republished.len()) {
+            tracing::warn!(
+                %account,
+                principals = republished.len(),
+                capacity = PUSH_CHANNEL_CAPACITY,
+                "status change emitted more pushes than the channel holds; subscribers will resync"
+            );
+        }
+        let count = republished.len();
+        for (principal, snapshot) in republished {
+            self.push_to_subscribers(SnapshotPush {
+                principal,
+                resolution: SnapshotResolution::Present(snapshot),
+            });
+        }
+        Ok(StatusChange {
+            // Rows that changed durably: the ones pushed, plus any that could
+            // not be decoded to push. The caller is told both numbers.
+            republished: count + unreadable,
+            unreadable,
+        })
     }
 
     async fn publish_snapshot(
         &self,
         principal: Principal,
         snapshot: PublishableSnapshot,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), PublishSnapshotError> {
         let generation = i64::try_from(snapshot.generation.0).map_err(|_| {
             StoreError("snapshot generation exceeds PostgreSQL BIGINT range".into())
         })?;
         let value = serde_json::to_value(StoredSnapshotRef::from(snapshot.as_snapshot()))
             .map_err(|e| StoreError(format!("snapshot encode: {e}")))?;
-        let result = sqlx::query(
-            "INSERT INTO tollgate_snapshots (principal, generation, snapshot, deleted)
-             VALUES ($1, $2, $3, FALSE)
-             ON CONFLICT (principal) DO UPDATE
-             SET generation = EXCLUDED.generation, snapshot = EXCLUDED.snapshot, deleted = FALSE
-             WHERE tollgate_snapshots.generation < EXCLUDED.generation",
-        )
-        .bind(id_bytes(principal.0))
-        .bind(generation)
-        .bind(value)
-        .execute(&self.pool)
-        .await
-        .map_err(storage)?;
-        if result.rows_affected() > 0 {
+
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let result = async {
+            // The ledger decides an account's status; a publish may carry it
+            // but not change it, or the two records `set_account_status`
+            // unified could be pulled apart again one principal at a time
+            // (#51). FOR SHARE, not FOR UPDATE: this only has to hold the
+            // status still, and a status change takes FOR UPDATE on the same
+            // row, so the two serialize without publishes blocking each other.
+            let ledger =
+                sqlx::query("SELECT status FROM tollgate_accounts WHERE account_id = $1 FOR SHARE")
+                    .bind(id_bytes(snapshot.account_id.0))
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(storage)?;
+            // An account the ledger does not hold publishes unchanged: this
+            // adds no account-existence requirement to publication.
+            if let Some(row) = ledger {
+                let ledger = decode_status(row.get::<String, _>(0))?;
+                if ledger != snapshot.status {
+                    return Err(PublishSnapshotError::StatusMismatch {
+                        ledger,
+                        submitted: snapshot.status,
+                    });
+                }
+            }
+
+            let result = sqlx::query(
+                "INSERT INTO tollgate_snapshots (principal, generation, snapshot, deleted)
+                 VALUES ($1, $2, $3, FALSE)
+                 ON CONFLICT (principal) DO UPDATE
+                 SET generation = EXCLUDED.generation, snapshot = EXCLUDED.snapshot,
+                     deleted = FALSE
+                 WHERE tollgate_snapshots.generation < EXCLUDED.generation",
+            )
+            .bind(id_bytes(principal.0))
+            .bind(generation)
+            .bind(value)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+            Ok(result.rows_affected() > 0)
+        }
+        .await;
+
+        if finish_transaction(tx, result).await? {
             self.push_to_subscribers(SnapshotPush {
                 principal,
                 resolution: SnapshotResolution::Present(snapshot),

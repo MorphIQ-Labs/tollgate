@@ -17,7 +17,7 @@ use std::time::Duration;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use jiff::{SignedDuration, Timestamp};
 
-use tollgate_core::{AccountId, CostUnits, RequestId, UsageEvent};
+use tollgate_core::{AccountId, AccountStatus, CostUnits, RequestId, UsageEvent};
 use tollgate_store::{AccountConfig, AdminStore, GrantPolicy, LeaseAllocator, UsageSink};
 use tollgate_store_postgres::PostgresStore;
 
@@ -66,7 +66,7 @@ fn bench_ingest(c: &mut Criterion) {
                 AccountConfig {
                     account_id,
                     initial_balance: CostUnits(1_000_000_000),
-                    active: true,
+                    status: AccountStatus::Active,
                 },
             )
             .await

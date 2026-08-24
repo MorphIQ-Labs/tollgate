@@ -11,7 +11,7 @@ use jiff::Timestamp;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use tollgate_core::{AccountId, CostUnits, Principal};
+use tollgate_core::{AccountId, AccountStatus, CostUnits, Principal};
 use tollgate_store::wire::API_PREFIX;
 use tollgate_store::{AccountConfig, GrantPolicy, ManualClock, MemoryStore};
 
@@ -74,7 +74,7 @@ async fn lease_lifecycle_over_http() {
     store.create_account(AccountConfig {
         account_id: AccountId(1),
         initial_balance: CostUnits(1_000),
-        active: true,
+        status: AccountStatus::Active,
     });
 
     let (status, grant) = call(
@@ -123,7 +123,7 @@ async fn problem_codes_are_stable() {
     store.create_account(AccountConfig {
         account_id: AccountId(8),
         initial_balance: CostUnits(100),
-        active: true,
+        status: AccountStatus::Active,
     });
     let (status, problem) = call(
         &router,
@@ -140,7 +140,7 @@ async fn problem_codes_are_stable() {
     store.create_account(AccountConfig {
         account_id: AccountId(1),
         initial_balance: CostUnits(100),
-        active: true,
+        status: AccountStatus::Active,
     });
     let (_, grant) = call(
         &router,
@@ -203,7 +203,7 @@ async fn admin_snapshot_roundtrip_and_probes() {
         &router,
         "POST",
         &api("/admin/accounts"),
-        Some(json!({"account_id": id(1), "initial_balance": 500, "active": true})),
+        Some(json!({"account_id": id(1), "initial_balance": 500, "status": "Active"})),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -217,14 +217,18 @@ async fn admin_snapshot_roundtrip_and_probes() {
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     let status_path = api(&format!("/admin/accounts/{}/status", AccountId(1)));
-    let (status, _) = call(
+    let (status, body) = call(
         &router,
         "POST",
         &status_path,
-        Some(json!({"active": false})),
+        Some(json!({"status": "Suspended"})),
     )
     .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["republished"], 0,
+        "this account has no snapshots yet, and the response says so"
+    );
     let (status, problem) = call(
         &router,
         "POST",
@@ -234,8 +238,14 @@ async fn admin_snapshot_roundtrip_and_probes() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(problem["code"], "account-inactive");
-    let (status, _) = call(&router, "POST", &status_path, Some(json!({"active": true}))).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = call(
+        &router,
+        "POST",
+        &status_path,
+        Some(json!({"status": "Active"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 
     // Recreating an existing account is a surfaced conflict, never a silent
     // overwrite or no-op (review finding #7).
@@ -243,7 +253,7 @@ async fn admin_snapshot_roundtrip_and_probes() {
         &router,
         "POST",
         &api("/admin/accounts"),
-        Some(json!({"account_id": id(1), "initial_balance": 999, "active": true})),
+        Some(json!({"account_id": id(1), "initial_balance": 999, "status": "Active"})),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
@@ -352,4 +362,75 @@ async fn admin_refuses_snapshot_whose_batch_quote_exceeds_burst() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(problem["code"], "unknown-principal");
+}
+
+/// The admin status endpoint speaks the `AccountStatus` vocabulary, and the
+/// wire break is loud in both directions (#51).
+///
+/// The last assertion is the one worth having: `{"active": false}` used to be
+/// a valid suspension, and now that the same call also republishes every
+/// snapshot of the account, silently reinterpreting it would be the
+/// changed-the-meaning-of-an-existing-value failure the guidelines forbid. A
+/// stale runbook must fail, not half-work.
+#[tokio::test]
+async fn account_status_endpoint_speaks_the_status_vocabulary() {
+    let (_store, router) = state();
+    let (status, _) = call(
+        &router,
+        "POST",
+        &api("/admin/accounts"),
+        Some(json!({"account_id": id(1), "initial_balance": 500, "status": "Active"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let status_path = api(&format!("/admin/accounts/{}/status", AccountId(1)));
+
+    let (status, body) = call(
+        &router,
+        "POST",
+        &status_path,
+        Some(json!({"status": "Closed"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["republished"], 0);
+    assert_eq!(body["unreadable"], 0);
+
+    // Terminal, and it says so in the deny vocabulary rather than a 500.
+    let (status, problem) = call(
+        &router,
+        "POST",
+        &status_path,
+        Some(json!({"status": "Active"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(problem["code"], "account-closed");
+
+    // An unknown account is still a 404, whichever status is asked for --
+    // the contract #27 pinned, carried across the rename.
+    let (status, problem) = call(
+        &router,
+        "POST",
+        &api(&format!("/admin/accounts/{}/status", AccountId(9))),
+        Some(json!({"status": "Suspended"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(problem["code"], "unknown-account");
+
+    // The old body no longer means anything, and fails loudly.
+    let (status, problem) = call(
+        &router,
+        "POST",
+        &status_path,
+        Some(json!({"active": false})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a pre-#51 body must be refused, never reinterpreted"
+    );
+    assert_eq!(problem["code"], "invalid-json");
 }

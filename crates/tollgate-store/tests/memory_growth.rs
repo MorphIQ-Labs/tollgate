@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use jiff::{SignedDuration, Timestamp};
 
-use tollgate_core::{AccountId, CostUnits};
+use tollgate_core::{AccountId, AccountStatus, CostUnits};
 use tollgate_store::{
     AccountConfig, GrantPolicy, LeaseAllocator, MemoryStore, StoredRecords, UsageSink,
 };
@@ -102,7 +102,7 @@ fn store() -> Arc<MemoryStore> {
     store.create_account(AccountConfig {
         account_id: ACCOUNT,
         initial_balance: CostUnits(1_000_000),
-        active: true,
+        status: AccountStatus::Active,
     });
     store
 }

@@ -275,7 +275,7 @@ async fn full_stack_over_loopback_http() {
     store.create_account(AccountConfig {
         account_id: ACCOUNT,
         initial_balance: CostUnits(DEPOSIT),
-        active: true,
+        status: AccountStatus::Active,
     });
     store.publish_snapshot(PRINCIPAL, publishable(snapshot()));
 
@@ -433,7 +433,7 @@ async fn http_instance_discovers_a_principal_published_after_it_started() {
     store.create_account(AccountConfig {
         account_id: ACCOUNT,
         initial_balance: CostUnits(1_000_000),
-        active: true,
+        status: AccountStatus::Active,
     });
     store.publish_snapshot(PRINCIPAL, publishable(snapshot()));
 

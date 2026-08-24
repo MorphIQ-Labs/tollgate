@@ -36,6 +36,7 @@ use tollgate_core::{AccountId, CostUnits, Principal, PublishableSnapshot};
 use tollgate_store::wire::{
     API_PREFIX, AcquireRequest, AcquireResponse, CreateAccountRequest, DepositRequest,
     IngestRequest, PrincipalsResponse, PublishSnapshotRequest, ReleaseRequest, SetStatusRequest,
+    SetStatusResponse,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, Clock, DEFAULT_RECLAIM_BATCH_LIMIT, IngestReport, LeaseAllocator,
@@ -351,7 +352,7 @@ async fn create_account<S: Backend>(
         .create_account(AccountConfig {
             account_id: request.account_id,
             initial_balance: request.initial_balance,
-            active: request.active,
+            status: request.status,
         })
         .await?;
     Ok(StatusCode::CREATED)
@@ -376,9 +377,18 @@ async fn set_status<S: Backend>(
     State(state): State<ServerState<S>>,
     ApiPath(account): ApiPath<AccountId>,
     ApiJson(request): ApiJson<SetStatusRequest>,
-) -> Result<StatusCode, ApiError> {
-    state.store.set_active(account, request.active).await?;
-    Ok(StatusCode::NO_CONTENT)
+) -> Result<Json<SetStatusResponse>, ApiError> {
+    // 200 with the blast radius, not 204: the ledger half is one row, but the
+    // snapshot half is however many credentials the account has, and an
+    // operator has no other way to learn which (#51).
+    let change = state
+        .store
+        .set_account_status(account, request.status)
+        .await?;
+    Ok(Json(SetStatusResponse {
+        republished: change.republished,
+        unreadable: change.unreadable,
+    }))
 }
 
 async fn publish_snapshot<S: Backend>(

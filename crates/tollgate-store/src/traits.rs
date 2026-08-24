@@ -7,7 +7,7 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId, Principal,
+    AccountId, AccountStatus, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId, Principal,
     PublishableSnapshot, UsageEvent,
 };
 
@@ -119,13 +119,26 @@ impl std::fmt::Display for AllocateError {
 
 impl std::error::Error for AllocateError {}
 
+impl From<StoreError> for AllocateError {
+    fn from(error: StoreError) -> Self {
+        AllocateError::Storage(error)
+    }
+}
+
 /// Admin-side inputs when creating an account.
 #[derive(Debug, Clone, Copy)]
 pub struct AccountConfig {
     pub account_id: AccountId,
     pub initial_balance: CostUnits,
-    /// Inactive accounts refuse leases but keep their ledger.
-    pub active: bool,
+    /// The account's administrative status at birth. Anything but
+    /// [`AccountStatus::Active`] refuses leases while keeping the ledger, and
+    /// `Closed` is terminal from creation onwards (INVARIANTS.md #22).
+    ///
+    /// An [`AccountStatus`] rather than a bool so creation and
+    /// [`AdminStore::set_account_status`] speak one vocabulary about one
+    /// column; the bool could not express `Closed`, which is what let
+    /// terminality be a convention instead of a check (#51).
+    pub status: AccountStatus,
 }
 
 /// Per-account conservation view for reconciliation.
@@ -408,6 +421,32 @@ pub enum SnapshotResolution {
     Unknown,
 }
 
+/// Slots in a backend's snapshot push channel.
+///
+/// Shared so the two backends cannot drift, and named rather than inlined
+/// because two things must agree on it: the channel, and the warning that
+/// fires when one operation would out-run it. Each slot retains an
+/// `Arc<AccountSnapshot>`, so this is also a bound on how much snapshot memory
+/// one slow subscriber can pin.
+pub const PUSH_CHANNEL_CAPACITY: usize = 256;
+
+/// Whether pushing `principals` updates at once will out-run the push channel.
+///
+/// A status change republishes every live snapshot of an account (#51), so a
+/// wide account can exceed the channel in one operation. Past this point every
+/// subscriber lags and resyncs its whole tracked set — correct, and bounded by
+/// the client's `max_concurrent_fetches`, but expensive enough that an
+/// operator should not have to infer it from a latency graph.
+///
+/// Strictly greater: a batch that exactly fills the channel is delivered, so
+/// warning at equality would cry wolf on the largest successful case. Pure, so
+/// the boundary is pinned by a test rather than by whichever backend is being
+/// read.
+#[must_use]
+pub fn pushes_exceed_capacity(principals: usize) -> bool {
+    principals > PUSH_CHANNEL_CAPACITY
+}
+
 /// One pushed snapshot update.
 #[derive(Debug, Clone)]
 pub struct SnapshotPush {
@@ -481,6 +520,113 @@ impl std::fmt::Display for CreateAccountError {
 
 impl std::error::Error for CreateAccountError {}
 
+/// What a status transition actually did.
+///
+/// The blast radius of the operation, returned rather than logged, because an
+/// operator suspending an account has no other way to learn it: the ledger
+/// half is one row, but the snapshot half is however many credentials that
+/// account has, and 204 says nothing.
+///
+/// `republished == 0` is the interesting value. It means the account had no
+/// live snapshots to change — either it has no credentials yet, or the ones it
+/// has are all revoked, or a status change was repeated and everything was
+/// already at the target. All three are worth knowing at the moment of the
+/// call rather than from a later denial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StatusChange {
+    /// Live snapshots republished with the new status, at `generation + 1`.
+    /// Excludes tombstones, which are never republished, and snapshots already
+    /// carrying the target status, which are not rewritten.
+    pub republished: usize,
+    /// Rows that changed durably but could not be decoded well enough to push.
+    ///
+    /// Always zero in `MemoryStore`, which holds validated snapshots rather
+    /// than encoded ones. In a stored backend a row can be undecodable — it
+    /// already was before the transition touched it, and the request path
+    /// already refuses it — and the transition deliberately does not fail
+    /// whole over one corrupt credential. But it is not silently absorbed
+    /// either: those principals did not get a push, so they will not converge
+    /// until their next refresh.
+    pub unreadable: usize,
+}
+
+/// Refusals from an account-status transition (#51).
+///
+/// Deliberately not an [`AllocateError`]: that enum's `NAMES`/`COUNT`/`index`
+/// are the width of `LeaseCounters`' per-reason tally, and a status refusal
+/// can never come out of `acquire`, so widening it would export a slot that
+/// is permanently zero in every deployment. [`CreateAccountError`] is the
+/// existing precedent for this shape — domain refusals plus `Storage`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetStatusError {
+    /// No such account. Never a silent no-op, and the same answer whichever
+    /// status was asked for.
+    UnknownAccount,
+    /// [`AccountStatus::Closed`] is terminal: an account enters it from any
+    /// status and leaves it never. The refusal changes nothing — not the
+    /// ledger, not one snapshot, not one generation.
+    AccountClosed,
+    Storage(StoreError),
+}
+
+impl std::fmt::Display for SetStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetStatusError::UnknownAccount => f.write_str("unknown account"),
+            SetStatusError::AccountClosed => f.write_str("account is closed"),
+            SetStatusError::Storage(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for SetStatusError {}
+
+impl From<StoreError> for SetStatusError {
+    fn from(error: StoreError) -> Self {
+        SetStatusError::Storage(error)
+    }
+}
+
+/// Refusals from publishing a snapshot (#51).
+///
+/// `publish_snapshot` used to return a bare [`StoreError`], which left it free
+/// to write a status contradicting the ledger and recreate the divergence
+/// [`AdminStore::set_account_status`] exists to abolish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishSnapshotError {
+    /// The snapshot's status disagrees with the account ledger. An account's
+    /// status is changed through [`AdminStore::set_account_status`], which
+    /// republishes; a publish may carry the current status but may not change
+    /// it.
+    StatusMismatch {
+        ledger: AccountStatus,
+        submitted: AccountStatus,
+    },
+    Storage(StoreError),
+}
+
+impl std::fmt::Display for PublishSnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PublishSnapshotError::StatusMismatch { ledger, submitted } => write!(
+                f,
+                "snapshot status {} contradicts account status {}",
+                submitted.as_str(),
+                ledger.as_str()
+            ),
+            PublishSnapshotError::Storage(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for PublishSnapshotError {}
+
+impl From<StoreError> for PublishSnapshotError {
+    fn from(error: StoreError) -> Self {
+        PublishSnapshotError::Storage(error)
+    }
+}
+
 /// Administrative writes: the control plane's mutation surface. Kept apart
 /// from the data-plane traits so a read-only replica can implement those
 /// without this.
@@ -488,16 +634,46 @@ impl std::error::Error for CreateAccountError {}
 pub trait AdminStore: Send + Sync {
     async fn create_account(&self, config: AccountConfig) -> Result<(), CreateAccountError>;
     async fn deposit(&self, account: AccountId, units: CostUnits) -> Result<(), AllocateError>;
-    /// Set whether an existing account is active.
+    /// Set an existing account's administrative status, in one transaction:
+    /// the ledger's status, and a republication of every *live* snapshot of
+    /// that account carrying the new status at `generation + 1`.
     ///
-    /// A missing account is [`AllocateError::UnknownAccount`], never a silent
-    /// no-op; both activation and deactivation obey the same contract.
-    async fn set_active(&self, account: AccountId, active: bool) -> Result<(), AllocateError>;
+    /// This is the whole operator action. Before #51 the ledger flag and the
+    /// published `AccountStatus` were two records with two propagation paths
+    /// and nothing checking them against each other, so "deactivate" returned
+    /// success while the request path kept admitting.
+    ///
+    /// Rules, all enforced here rather than by caller discipline:
+    /// - A missing account is [`SetStatusError::UnknownAccount`], never a
+    ///   silent no-op, whichever status was asked for.
+    /// - [`AccountStatus::Closed`] is terminal
+    ///   ([`SetStatusError::AccountClosed`]); `Closed` → `Closed` is a no-op.
+    /// - Revoked principals are never republished: resurrecting a tombstone
+    ///   is what INVARIANTS.md #15 forbids, and revocation stays a separate
+    ///   per-credential mechanism.
+    /// - Snapshots already at the target status are not rewritten, so a
+    ///   repeat converges and bumps no generation.
+    /// - Outstanding leases are **not** reclaimed. Lease acquisition refuses
+    ///   at once, but admission stops only when the new snapshot installs —
+    ///   one `SnapshotManager` refresh interval, and already-debited units
+    ///   settle at release or TTL reclaim (#9).
+    async fn set_account_status(
+        &self,
+        account: AccountId,
+        status: AccountStatus,
+    ) -> Result<StatusChange, SetStatusError>;
+    /// Publish a principal's compiled snapshot.
+    ///
+    /// Refused with [`PublishSnapshotError::StatusMismatch`] when the
+    /// snapshot's status contradicts the account ledger, so the two records
+    /// [`set_account_status`](AdminStore::set_account_status) unifies cannot
+    /// be pulled apart again one principal at a time. A snapshot whose
+    /// account the ledger does not hold publishes unchanged, as before.
     async fn publish_snapshot(
         &self,
         principal: Principal,
         snapshot: PublishableSnapshot,
-    ) -> Result<(), StoreError>;
+    ) -> Result<(), PublishSnapshotError>;
     async fn remove_snapshot(&self, principal: Principal) -> Result<(), StoreError>;
 }
 
@@ -715,5 +891,30 @@ mod tests {
         assert!(error.0.contains("256 leases"));
         assert!(error.0.contains("256 units"));
         assert_eq!(allocator.calls.load(Ordering::Acquire), 2);
+    }
+
+    /// The push-capacity boundary, pinned where both backends read it.
+    ///
+    /// Strictly greater is the whole content of the rule: a batch that exactly
+    /// fills the channel is delivered, so warning at equality would fire on the
+    /// largest successful case and train an operator to ignore it. Mutation
+    /// testing found this untested — the comparison could be flipped to `<`,
+    /// `<=` or `>=` and every scenario stayed green, because nothing observed
+    /// the warning at all (#51).
+    #[test]
+    fn the_push_capacity_warning_fires_only_above_the_channel() {
+        assert!(
+            !pushes_exceed_capacity(0),
+            "an empty batch is not a capacity problem"
+        );
+        assert!(!pushes_exceed_capacity(PUSH_CHANNEL_CAPACITY - 1));
+        assert!(
+            !pushes_exceed_capacity(PUSH_CHANNEL_CAPACITY),
+            "a batch that exactly fills the channel is still delivered"
+        );
+        assert!(
+            pushes_exceed_capacity(PUSH_CHANNEL_CAPACITY + 1),
+            "one more than the channel holds is what makes a subscriber lag"
+        );
     }
 }

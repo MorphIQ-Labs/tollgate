@@ -14,7 +14,8 @@ use tollgate_core::{
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, CreateAccountError, GrantPolicy, LeaseAllocator,
-    MemoryStore, ReclaimBatch, ReclaimedLease, SnapshotResolution, SnapshotSource, UsageSink,
+    MemoryStore, PublishSnapshotError, ReclaimBatch, ReclaimedLease, SetStatusError,
+    SnapshotResolution, SnapshotSource, UsageSink,
 };
 
 fn t(secs: i64) -> Timestamp {
@@ -69,7 +70,7 @@ fn store_with_balance(policy: GrantPolicy, balance: u64) -> Arc<MemoryStore> {
     store.create_account(AccountConfig {
         account_id: ACCOUNT,
         initial_balance: CostUnits(balance),
-        active: true,
+        status: AccountStatus::Active,
     });
     store
 }
@@ -250,7 +251,7 @@ async fn usage_rejects_mismatched_lease_capability() {
         AccountConfig {
             account_id: OTHER,
             initial_balance: CostUnits(100),
-            active: true,
+            status: AccountStatus::Active,
         },
     )
     .await
@@ -328,7 +329,7 @@ async fn expired_backlog_is_reclaimed_in_bounded_batches() {
         AccountConfig {
             account_id: OTHER,
             initial_balance: CostUnits(400),
-            active: true,
+            status: AccountStatus::Active,
         },
     )
     .await
@@ -433,7 +434,7 @@ async fn mixed_usage_batch_preserves_partial_acceptance() {
         AccountConfig {
             account_id: OTHER,
             initial_balance: CostUnits(400),
-            active: true,
+            status: AccountStatus::Active,
         },
     )
     .await
@@ -646,7 +647,7 @@ async fn recreate_account_is_refused_and_nondestructive() {
             AccountConfig {
                 account_id: ACCOUNT,
                 initial_balance: CostUnits(5),
-                active: true,
+                status: AccountStatus::Active,
             },
         )
         .await
@@ -667,37 +668,45 @@ async fn recreate_account_is_refused_and_nondestructive() {
 }
 
 #[tokio::test]
-async fn inactive_account_refuses_leases() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
-    // Through `AdminStore`, matching the PostgreSQL mirror. The two had
-    // drifted: this side called the inherent method, so the trait
-    // implementation could be replaced by `Ok(())` — suspending an account
-    // and still serving it — with the whole suite green (#43).
-    AdminStore::set_active(&*store, ACCOUNT, false)
-        .await
-        .unwrap();
-    assert_eq!(
-        store
-            .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
+async fn a_non_active_account_refuses_leases() {
+    // Both non-Active statuses refuse, under one deny reason: no client acts
+    // on the distinction (#51).
+    for status in [AccountStatus::Suspended, AccountStatus::Closed] {
+        let store = store_with_balance(GrantPolicy::default(), 1_000);
+        // Through `AdminStore`, matching the PostgreSQL mirror. The two had
+        // drifted: this side called the inherent method, so the trait
+        // implementation could be replaced by `Ok(())` — suspending an account
+        // and still serving it — with the whole suite green (#43).
+        AdminStore::set_account_status(&*store, ACCOUNT, status)
             .await
-            .unwrap_err(),
-        AllocateError::AccountInactive
-    );
+            .unwrap();
+        assert_eq!(
+            store
+                .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
+                .await
+                .unwrap_err(),
+            AllocateError::AccountInactive,
+            "{status:?} must refuse leases"
+        );
+    }
 }
 
 #[tokio::test]
-async fn unknown_account_activity_update_is_refused() {
+async fn unknown_account_status_update_is_refused() {
     let store = store_with_balance(GrantPolicy::default(), 1_000);
     let unknown = AccountId(999);
 
-    for active in [false, true] {
+    for status in [
+        AccountStatus::Active,
+        AccountStatus::Suspended,
+        AccountStatus::Closed,
+    ] {
         assert_eq!(
-            AdminStore::set_active(&*store, unknown, active)
+            AdminStore::set_account_status(&*store, unknown, status)
                 .await
                 .unwrap_err(),
-            AllocateError::UnknownAccount,
-            "an unknown account cannot be {}",
-            if active { "activated" } else { "deactivated" }
+            SetStatusError::UnknownAccount,
+            "an unknown account cannot be set to {status:?}"
         );
     }
 
@@ -705,6 +714,27 @@ async fn unknown_account_activity_update_is_refused() {
         .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
         .await
         .expect("refusing the unknown account leaves existing accounts active");
+}
+
+#[tokio::test]
+async fn creating_a_suspended_account_denies_from_birth() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    store
+        .try_create_account(AccountConfig {
+            account_id: ACCOUNT,
+            initial_balance: CostUnits(1_000),
+            status: AccountStatus::Suspended,
+        })
+        .expect("creation succeeds");
+
+    assert_eq!(
+        store
+            .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
+            .await
+            .unwrap_err(),
+        AllocateError::AccountInactive,
+        "a suspended account refuses from creation, not only after a transition"
+    );
 }
 
 /// #48's enumeration seam, and the detail the whole removal-vs-revocation
@@ -919,4 +949,470 @@ async fn snapshot_publish_fetch_and_push() {
         panic!("newer snapshot must supersede revocation");
     };
     assert_eq!(fetched.generation, Generation(4));
+}
+
+// ---- unified account suspension (#51) -------------------------------------
+//
+// The reference implementation of INVARIANTS.md #22. Every scenario drives
+// `AdminStore` rather than an inherent helper: this pair of suites has already
+// caught one divergence where the memory trait body could have been `Ok(())`
+// with everything green (#43), and a status change that quietly did nothing is
+// exactly the failure being fixed.
+
+/// A snapshot for `account`, so a test can give one account several
+/// principals and a second account one of its own.
+fn account_snapshot(account: AccountId, generation: u64, status: AccountStatus) -> AccountSnapshot {
+    AccountSnapshot {
+        account_id: account,
+        key_id: None,
+        generation: Generation(generation),
+        status,
+        valid_until: t(10_000),
+        permissions: PermissionBits::ALL,
+        limits: ResolvedLimits {
+            max_items_per_request: 64,
+            rate_units_per_second: 1_000,
+            rate_burst_units: 1_000,
+        },
+        cost_table: Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+    }
+}
+
+async fn status_of(store: &MemoryStore, principal: Principal) -> (AccountStatus, Generation) {
+    let SnapshotResolution::Present(snapshot) = store.snapshot(principal).await.unwrap() else {
+        panic!("principal {principal} must be present");
+    };
+    (snapshot.status, snapshot.generation)
+}
+
+/// **The one that matters.** One operator action moves both records: the
+/// ledger stops granting leases *and* every live snapshot of the account
+/// carries the new status, at a higher generation.
+///
+/// Before #51 the first happened and the second did not, so an operator who
+/// deactivated an account watched it keep serving.
+#[tokio::test]
+async fn suspending_an_account_stops_leases_and_republishes_its_snapshots() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let first = Principal(10);
+    let second = Principal(11);
+    for principal in [first, second] {
+        AdminStore::publish_snapshot(
+            &*store,
+            principal,
+            publishable(Arc::new(account_snapshot(
+                ACCOUNT,
+                3,
+                AccountStatus::Active,
+            ))),
+        )
+        .await
+        .unwrap();
+    }
+
+    let change = AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
+        .await
+        .unwrap();
+    assert_eq!(
+        (change.republished, change.unreadable),
+        (2, 0),
+        "the reported blast radius is both live principals"
+    );
+
+    assert_eq!(
+        store
+            .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
+            .await
+            .unwrap_err(),
+        AllocateError::AccountInactive,
+        "the ledger half"
+    );
+    for principal in [first, second] {
+        assert_eq!(
+            status_of(&store, principal).await,
+            (AccountStatus::Suspended, Generation(4)),
+            "the snapshot half, for {principal}"
+        );
+    }
+}
+
+/// The account predicate earns its place: a status change is scoped to one
+/// account and must not touch a bystander's snapshots or bump their
+/// generations.
+#[tokio::test]
+async fn suspension_republishes_only_the_suspended_accounts_snapshots() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let other_account = AccountId(2);
+    store.create_account(AccountConfig {
+        account_id: other_account,
+        initial_balance: CostUnits(1_000),
+        status: AccountStatus::Active,
+    });
+    let mine = Principal(10);
+    let theirs = Principal(20);
+    AdminStore::publish_snapshot(
+        &*store,
+        mine,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            3,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+    AdminStore::publish_snapshot(
+        &*store,
+        theirs,
+        publishable(Arc::new(account_snapshot(
+            other_account,
+            7,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+
+    AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        status_of(&store, mine).await,
+        (AccountStatus::Suspended, Generation(4))
+    );
+    assert_eq!(
+        status_of(&store, theirs).await,
+        (AccountStatus::Active, Generation(7)),
+        "another account's snapshot is untouched, generation included"
+    );
+    store
+        .acquire(other_account, CostUnits(100), TTL, t(0))
+        .await
+        .expect("and it can still lease");
+}
+
+/// Revocation stays a separate mechanism. Republishing a tombstone would
+/// resurrect a revoked credential, which INVARIANTS.md #15 forbids, so a
+/// status change must leave it revoked *at its original generation* — a bump
+/// would shadow a later legitimate republish.
+#[tokio::test]
+async fn suspending_an_account_does_not_resurrect_revoked_principals() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let live = Principal(10);
+    let revoked = Principal(11);
+    for principal in [live, revoked] {
+        AdminStore::publish_snapshot(
+            &*store,
+            principal,
+            publishable(Arc::new(account_snapshot(
+                ACCOUNT,
+                3,
+                AccountStatus::Active,
+            ))),
+        )
+        .await
+        .unwrap();
+    }
+    AdminStore::remove_snapshot(&*store, revoked).await.unwrap();
+
+    AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        status_of(&store, live).await,
+        (AccountStatus::Suspended, Generation(4))
+    );
+    assert!(
+        matches!(
+            store.snapshot(revoked).await.unwrap(),
+            SnapshotResolution::Revoked {
+                generation: Generation(3)
+            }
+        ),
+        "a tombstone stays revoked, at its own generation"
+    );
+}
+
+/// The return path, and the reason the transition is not one-way for
+/// `Suspended`: reactivation restores admission and bumps again.
+#[tokio::test]
+async fn reactivating_an_account_restores_admission_and_bumps_generations() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let principal = Principal(10);
+    AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            3,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+
+    AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
+        .await
+        .unwrap();
+    AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Active)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        status_of(&store, principal).await,
+        (AccountStatus::Active, Generation(5)),
+        "each transition is its own generation; they never move backward"
+    );
+    store
+        .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
+        .await
+        .expect("reactivation restores leasing");
+}
+
+/// `Closed` is terminal, and the refusal changes *nothing* — not the ledger,
+/// not one snapshot, not one generation. A refusal that half-applied would be
+/// the divergence this whole mechanism exists to abolish.
+#[tokio::test]
+async fn a_closed_account_cannot_be_reactivated() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let principal = Principal(10);
+    AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            3,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+    AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Closed)
+        .await
+        .unwrap();
+    let after_close = status_of(&store, principal).await;
+
+    for status in [AccountStatus::Active, AccountStatus::Suspended] {
+        assert_eq!(
+            AdminStore::set_account_status(&*store, ACCOUNT, status)
+                .await
+                .unwrap_err(),
+            SetStatusError::AccountClosed,
+            "a closed account cannot become {status:?}"
+        );
+        assert_eq!(
+            status_of(&store, principal).await,
+            after_close,
+            "and the refusal moved nothing"
+        );
+        assert_eq!(
+            store
+                .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
+                .await
+                .unwrap_err(),
+            AllocateError::AccountInactive,
+            "including the ledger"
+        );
+    }
+
+    AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Closed)
+        .await
+        .expect("Closed -> Closed is a no-op, not a refusal");
+}
+
+/// Convergent, not merely idempotent: a repeat rewrites nothing, so it bumps
+/// no generation and emits no push. Generation churn on every retry would
+/// invalidate every instance's cache for no change.
+#[tokio::test]
+async fn repeating_a_status_change_publishes_nothing_new() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let principal = Principal(10);
+    AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            3,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+    AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
+        .await
+        .unwrap();
+
+    let mut updates = store.subscribe();
+    let change = AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
+        .await
+        .unwrap();
+    assert_eq!(
+        change.republished, 0,
+        "a repeat reports zero, which is how an operator sees it changed nothing"
+    );
+
+    assert_eq!(
+        status_of(&store, principal).await,
+        (AccountStatus::Suspended, Generation(4)),
+        "already at the target status, so not rewritten"
+    );
+    assert!(
+        updates.try_recv().is_err(),
+        "and nothing was pushed for a change that did not happen"
+    );
+}
+
+/// Every republished principal is pushed, so an in-process instance learns in
+/// milliseconds rather than at the refresh interval.
+#[tokio::test]
+async fn a_status_change_pushes_every_republished_principal() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let first = Principal(10);
+    let second = Principal(11);
+    let revoked = Principal(12);
+    for principal in [first, second, revoked] {
+        AdminStore::publish_snapshot(
+            &*store,
+            principal,
+            publishable(Arc::new(account_snapshot(
+                ACCOUNT,
+                3,
+                AccountStatus::Active,
+            ))),
+        )
+        .await
+        .unwrap();
+    }
+    AdminStore::remove_snapshot(&*store, revoked).await.unwrap();
+
+    let mut updates = store.subscribe();
+    let change = AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
+        .await
+        .unwrap();
+    assert_eq!(
+        change.republished, 2,
+        "the tombstone is not republished, so it is not counted either"
+    );
+
+    let mut pushed = Vec::new();
+    while let Ok(push) = updates.try_recv() {
+        let SnapshotResolution::Present(snapshot) = push.resolution else {
+            panic!("a status change republishes; it never revokes");
+        };
+        assert_eq!(snapshot.status, AccountStatus::Suspended);
+        pushed.push(push.principal);
+    }
+    assert_eq!(
+        pushed,
+        vec![first, second],
+        "one push per live principal, ordered, and none for the tombstone"
+    );
+}
+
+/// The door the unification would otherwise leave open: publishing a snapshot
+/// whose status contradicts the ledger would recreate the two-record
+/// disagreement one principal at a time.
+#[tokio::test]
+async fn publishing_a_snapshot_that_contradicts_the_ledger_is_refused() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let principal = Principal(10);
+    AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        AdminStore::publish_snapshot(
+            &*store,
+            principal,
+            publishable(Arc::new(account_snapshot(
+                ACCOUNT,
+                3,
+                AccountStatus::Active,
+            ))),
+        )
+        .await
+        .unwrap_err(),
+        PublishSnapshotError::StatusMismatch {
+            ledger: AccountStatus::Suspended,
+            submitted: AccountStatus::Active,
+        },
+    );
+    assert!(
+        matches!(
+            store.snapshot(principal).await.unwrap(),
+            SnapshotResolution::Unknown
+        ),
+        "and the refusal wrote nothing"
+    );
+
+    AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            3,
+            AccountStatus::Suspended,
+        ))),
+    )
+    .await
+    .expect("a publish carrying the ledger's status is fine");
+
+    // An account the ledger does not hold publishes unchanged: this adds no
+    // account-existence requirement to publication.
+    AdminStore::publish_snapshot(
+        &*store,
+        Principal(99),
+        publishable(Arc::new(account_snapshot(
+            AccountId(4_242),
+            1,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .expect("an unknown account is not a mismatch");
+}
+
+/// A refusal moves *nothing*, including when it comes from the snapshot half.
+///
+/// A snapshot already at `Generation(u64::MAX)` cannot be republished, and the
+/// tempting shape — write the ledger, then loop the snapshots — would leave the
+/// account suspended with `Active` snapshots behind that overflow. That is the
+/// divergence INVARIANTS.md #22 forbids, reachable from inside the mechanism
+/// meant to prevent it, so the transition plans every write before applying
+/// any.
+#[tokio::test]
+async fn a_status_change_that_cannot_republish_moves_neither_record() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let principal = Principal(10);
+    AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            u64::MAX,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+
+    let error = AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, SetStatusError::Storage(_)),
+        "an unrepublishable snapshot surfaces, rather than being skipped: {error:?}"
+    );
+
+    assert_eq!(
+        status_of(&store, principal).await,
+        (AccountStatus::Active, Generation(u64::MAX)),
+        "the snapshot half did not move"
+    );
+    store
+        .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
+        .await
+        .expect("and neither did the ledger half");
 }

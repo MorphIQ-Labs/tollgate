@@ -356,6 +356,45 @@ until it has one.
     `snapshot_json_preserves_legacy_numbers_and_encodes_high_ids_exactly`, and
     `malformed_storage_id_explains_both_accepted_representations`.
 
+22. **An account's status has one writer and one propagation path.** The
+    ledger's `tollgate_accounts.status` and the `AccountStatus` inside every
+    live snapshot of that account are written by a single transactional
+    operation, `AdminStore::set_account_status`, and cannot be observed
+    disagreeing: either the ledger moved *and* every live snapshot of the
+    account was republished carrying it at `generation + 1`, or nothing moved.
+    Snapshots already at the target status are not rewritten, so a repeat
+    converges and bumps no generation. Revoked principals are never
+    republished — resurrecting a tombstone is what #15 forbids, and revocation
+    stays a separate per-credential mechanism. A snapshot published directly
+    with a status contradicting the ledger is refused, not accepted and
+    reconciled later. `Closed` is terminal: an account enters it from any
+    status and leaves it never, and the refusal changes nothing. Suspension
+    does **not** reclaim outstanding leases — their units were debited at
+    grant and #9 already bounds them — so the bound on "requests stop" is one
+    `SnapshotManager` refresh interval, not zero. The operation reports what it
+    changed: how many snapshots it republished, and how many changed durably
+    but could not be decoded to push, so a partial result is surfaced rather
+    than absorbed. *Tests:*
+    `suspending_an_account_stops_leases_and_republishes_its_snapshots`,
+    `suspension_republishes_only_the_suspended_accounts_snapshots`,
+    `suspending_an_account_does_not_resurrect_revoked_principals`,
+    `reactivating_an_account_restores_admission_and_bumps_generations`,
+    `a_closed_account_cannot_be_reactivated`,
+    `repeating_a_status_change_publishes_nothing_new`,
+    `a_status_change_pushes_every_republished_principal`,
+    `a_non_active_account_refuses_leases`,
+    `creating_a_suspended_account_denies_from_birth`,
+    `unknown_account_status_update_is_refused`, and
+    `publishing_a_snapshot_that_contradicts_the_ledger_is_refused`, and
+    `a_status_change_that_cannot_republish_moves_neither_record` (all
+    mirrored across both backend suites);
+    `the_account_column_is_derived_for_both_stored_id_spellings` and
+    `an_unrecognized_status_column_is_a_storage_error` (PostgreSQL);
+    `account_status_transitions_keep_the_two_records_equal` (property);
+    `account_status_text_matches_its_serde_spelling` and
+    `restamping_preserves_everything_validation_depends_on` (core);
+    `account_status_endpoint_speaks_the_status_vocabulary` (server).
+
 Ledger roles (context for 1 and 7): leases **bound** spend; usage events **are**
 the billing record; reconciliation compares the two and steady-state drift is
 zero.

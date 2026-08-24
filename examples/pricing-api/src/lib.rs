@@ -288,7 +288,7 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
     store.create_account(AccountConfig {
         account_id: DEMO_ACCOUNT,
         initial_balance: CostUnits(deposit),
-        active: true,
+        status: AccountStatus::Active,
     });
 
     // Startup compilation: the service's schedule and entitlements become a

@@ -12,8 +12,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId,
-    UsageEvent,
+    AccountId, AccountSnapshot, AccountStatus, CostUnits, FencingToken, Generation, LeaseGrant,
+    LeaseId, UsageEvent,
 };
 
 /// Current HTTP wire-contract prefix.
@@ -64,7 +64,7 @@ pub struct IngestRequestRef<'a> {
 pub struct CreateAccountRequest {
     pub account_id: AccountId,
     pub initial_balance: CostUnits,
-    pub active: bool,
+    pub status: AccountStatus,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -73,8 +73,30 @@ pub struct DepositRequest {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// The one operator action for an account's administrative status (#51).
+///
+/// An [`AccountStatus`] rather than the `active` bool this carried before:
+/// the bool named only the ledger flag, while the request now also republishes
+/// every live snapshot of the account. Changing what an existing field means
+/// would have been the silent-semantics change the repository guidelines
+/// forbid, so the field is renamed and an old body fails loudly.
 pub struct SetStatusRequest {
-    pub active: bool,
+    pub status: AccountStatus,
+}
+
+/// What a status change did, so an operator learns its blast radius at the
+/// moment of the call rather than from a later denial (#51).
+///
+/// `republished: 0` means the account had no live snapshot to change — no
+/// credentials, all of them revoked, or the change was a repeat. All three are
+/// worth seeing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SetStatusResponse {
+    pub republished: usize,
+    /// Rows that changed durably but could not be decoded well enough to push,
+    /// so those principals converge only at their next refresh. Always zero on
+    /// an in-memory backend.
+    pub unreadable: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

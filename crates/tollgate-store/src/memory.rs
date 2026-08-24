@@ -48,23 +48,27 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId, Principal,
+    AccountId, AccountStatus, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId, Principal,
     PublishableSnapshot, UsageEvent,
 };
 
 use crate::leases::{LeaseRecord, Leases, Settled};
-pub use crate::traits::{AccountConfig, Conservation};
+pub use crate::traits::{AccountConfig, Conservation, StatusChange};
 use crate::traits::{
     AdminStore, AllocateError, CreateAccountError, GrantPolicy, GrantPolicyError, IngestReport,
-    LeaseAllocator, ReclaimBatch, ReclaimedLease, SnapshotPush, SnapshotResolution, SnapshotSource,
-    StoreError, StoreHealth, UsageSink,
+    LeaseAllocator, PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease,
+    SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource, StoreError, StoreHealth,
+    UsageSink, pushes_exceed_capacity,
 };
 
 #[derive(Debug)]
 struct AccountRecord {
     balance: CostUnits,
     deposited: CostUnits,
-    active: bool,
+    /// Mirrors `tollgate_accounts.status`. An [`AccountStatus`] rather than a
+    /// bool so `Closed` is representable and terminality can be checked here
+    /// instead of inferred from snapshots (#51).
+    status: AccountStatus,
     next_fence: u64,
     /// Usage accepted into the billing ledger.
     usage_recorded: CostUnits,
@@ -117,7 +121,7 @@ pub struct MemoryStore {
 impl MemoryStore {
     pub fn new(policy: GrantPolicy) -> Result<Arc<Self>, GrantPolicyError> {
         policy.validate()?;
-        let (push, _) = broadcast::channel(256);
+        let (push, _) = broadcast::channel(PUSH_CHANNEL_CAPACITY);
         Ok(Arc::new(MemoryStore {
             inner: Mutex::new(Inner::default()),
             policy,
@@ -153,7 +157,7 @@ impl MemoryStore {
             AccountRecord {
                 balance: config.initial_balance,
                 deposited: config.initial_balance,
-                active: config.active,
+                status: config.status,
                 next_fence: 1,
                 usage_recorded: CostUnits::ZERO,
                 settlement_loss: CostUnits::ZERO,
@@ -344,7 +348,7 @@ impl LeaseAllocator for MemoryStore {
             .accounts
             .get_mut(&account)
             .ok_or(AllocateError::UnknownAccount)?;
-        if !record.active {
+        if record.status != AccountStatus::Active {
             return Err(AllocateError::AccountInactive);
         }
         let granted = policy
@@ -495,6 +499,82 @@ impl LeaseAllocator for MemoryStore {
     }
 }
 
+/// Plan the re-stamping of every live snapshot of `account` to `status`,
+/// under a lock the caller already holds. Mutates nothing: the caller applies
+/// the plan only once every fallible step has succeeded.
+///
+/// **Two-phase on purpose.** Every new generation is computed, and every
+/// overflow surfaced, *before* a single record is touched. A loop that
+/// mutated as it went would leave an account half-republished behind a `u64`
+/// overflow — one ledger status, two different snapshot statuses — which is
+/// precisely the divergence #51 exists to abolish, reintroduced in the
+/// backend that serves as the executable reference.
+///
+/// Tombstones are skipped: `snapshot: None` is a revoked principal, and
+/// republishing it would resurrect it (INVARIANTS.md #15). Note this backend
+/// skips them because the tombstone has *lost* its account attribution, while
+/// PostgreSQL skips them by `deleted = FALSE` with the JSON still present —
+/// different mechanisms, identical behaviour, which is what the mirrored
+/// tests pin.
+///
+/// Rows already at the target status are left alone, so a repeated call
+/// converges and bumps no generation.
+///
+/// Returned sorted by principal so both backends emit pushes in the same
+/// order and a mirrored test need not assert on incidental ordering.
+fn plan_republish(
+    inner: &Inner,
+    account: AccountId,
+    status: AccountStatus,
+) -> Result<Vec<(Principal, PublishableSnapshot, Generation)>, SetStatusError> {
+    let mut planned = Vec::new();
+    for (principal, record) in &inner.snapshots {
+        let Some(snapshot) = record.snapshot.as_ref() else {
+            continue;
+        };
+        if snapshot.account_id != account || snapshot.status == status {
+            continue;
+        }
+        let generation = record
+            .generation
+            .0
+            .checked_add(1)
+            .map(Generation)
+            .ok_or_else(|| {
+                SetStatusError::Storage(StoreError("snapshot generation overflow".into()))
+            })?;
+        planned.push((
+            *principal,
+            snapshot.restamped(status, generation),
+            generation,
+        ));
+    }
+    planned.sort_unstable_by_key(|(principal, _, _)| *principal);
+    Ok(planned)
+}
+
+/// Apply a plan from [`plan_republish`]. Infallible by construction: every
+/// value it writes was computed and checked before the first mutation, which
+/// is what keeps the ledger and the snapshots from parting company when a
+/// generation is about to overflow.
+fn apply_republish(
+    inner: &mut Inner,
+    planned: Vec<(Principal, PublishableSnapshot, Generation)>,
+) -> Vec<(Principal, PublishableSnapshot)> {
+    let mut pushes = Vec::with_capacity(planned.len());
+    for (principal, snapshot, generation) in planned {
+        inner.snapshots.insert(
+            principal,
+            SnapshotRecord {
+                generation,
+                snapshot: Some(snapshot.clone()),
+            },
+        );
+        pushes.push((principal, snapshot));
+    }
+    pushes
+}
+
 #[async_trait]
 impl StoreHealth for MemoryStore {
     async fn ping(&self) -> Result<(), StoreError> {
@@ -512,21 +592,87 @@ impl AdminStore for MemoryStore {
         MemoryStore::deposit(self, account, units)
     }
 
-    async fn set_active(&self, account: AccountId, active: bool) -> Result<(), AllocateError> {
-        let mut inner = self.lock();
-        let record = inner
-            .accounts
-            .get_mut(&account)
-            .ok_or(AllocateError::UnknownAccount)?;
-        record.active = active;
-        Ok(())
+    async fn set_account_status(
+        &self,
+        account: AccountId,
+        status: AccountStatus,
+    ) -> Result<StatusChange, SetStatusError> {
+        // One lock for both records. The inherent `publish_snapshot` takes the
+        // lock itself, so it cannot be reused here: the whole point is that no
+        // observer sees the ledger moved and the snapshots not.
+        let republished = {
+            let mut inner = self.lock();
+            // Phase 1, read-only: every refusal happens before anything moves.
+            let record = inner
+                .accounts
+                .get(&account)
+                .ok_or(SetStatusError::UnknownAccount)?;
+            if record.status == AccountStatus::Closed && status != AccountStatus::Closed {
+                return Err(SetStatusError::AccountClosed);
+            }
+            // Phase 2, still read-only: plan every snapshot write, so a
+            // generation overflow surfaces here rather than after the ledger
+            // has already moved. Writing the ledger first and failing here
+            // would leave the account suspended with Active snapshots -- the
+            // divergence INVARIANTS.md #22 forbids, in the very backend that
+            // serves as its reference.
+            let planned = plan_republish(&inner, account, status)?;
+            // Phase 3: apply. Nothing below this line can fail.
+            inner
+                .accounts
+                .get_mut(&account)
+                .expect("the account was found under this same guard")
+                .status = status;
+            apply_republish(&mut inner, planned)
+        };
+        // Outside the guard: `push_to_subscribers` must not run under it, and
+        // a subscriber must never observe a push for a transition that is
+        // still mid-flight.
+        if pushes_exceed_capacity(republished.len()) {
+            tracing::warn!(
+                %account,
+                principals = republished.len(),
+                capacity = PUSH_CHANNEL_CAPACITY,
+                "status change emitted more pushes than the channel holds; subscribers will resync"
+            );
+        }
+        let planned_pushes = republished;
+        let republished = planned_pushes.len();
+        for (principal, snapshot) in planned_pushes {
+            self.push_to_subscribers(SnapshotPush {
+                principal,
+                resolution: SnapshotResolution::Present(snapshot),
+            });
+        }
+        Ok(StatusChange {
+            republished,
+            // This backend holds validated snapshots rather than encoded ones,
+            // so there is nothing here that can fail to decode.
+            unreadable: 0,
+        })
     }
 
     async fn publish_snapshot(
         &self,
         principal: Principal,
         snapshot: PublishableSnapshot,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), PublishSnapshotError> {
+        {
+            // The ledger decides an account's status; a publish may carry it
+            // but not change it, or the two records this trait just unified
+            // could be pulled apart again one principal at a time (#51).
+            // An account the ledger does not hold publishes unchanged: this
+            // adds no account-existence requirement.
+            let inner = self.lock();
+            if let Some(record) = inner.accounts.get(&snapshot.account_id)
+                && record.status != snapshot.status
+            {
+                return Err(PublishSnapshotError::StatusMismatch {
+                    ledger: record.status,
+                    submitted: snapshot.status,
+                });
+            }
+        }
         MemoryStore::publish_snapshot(self, principal, snapshot);
         Ok(())
     }
@@ -659,7 +805,7 @@ mod tests {
         store.create_account(AccountConfig {
             account_id: ACCOUNT,
             initial_balance: CostUnits(balance),
-            active: true,
+            status: AccountStatus::Active,
         });
         store
     }

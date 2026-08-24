@@ -12,7 +12,7 @@ use tollgate_admission::LeaseSlot;
 use tollgate_client::{
     Clock, LeaseManager, LeaseManagerConfig, ManualClock, UsageWriter, UsageWriterConfig,
 };
-use tollgate_core::{AccountId, CostUnits, DenyReason, RequestId, UsageEvent};
+use tollgate_core::{AccountId, AccountStatus, CostUnits, DenyReason, RequestId, UsageEvent};
 use tollgate_store::{
     AccountConfig, GrantPolicy, IngestReport, LeaseAllocator, MemoryStore, ReclaimBatch,
     StoreError, UsageSink,
@@ -35,7 +35,7 @@ fn store(balance: u64) -> Arc<MemoryStore> {
     store.create_account(AccountConfig {
         account_id: ACCOUNT,
         initial_balance: CostUnits(balance),
-        active: true,
+        status: AccountStatus::Active,
     });
     store
 }
@@ -166,7 +166,7 @@ async fn adaptive_tail_grant_does_not_rotate_while_unspent() {
     store.create_account(AccountConfig {
         account_id: ACCOUNT,
         initial_balance: CostUnits(50),
-        active: true,
+        status: AccountStatus::Active,
     });
     let clock = Arc::new(ManualClock::new(t(0)));
     let slot = LeaseSlot::empty();
@@ -283,7 +283,7 @@ async fn usability_window_rollover_returns_unspent_capacity() {
     store.create_account(AccountConfig {
         account_id: ACCOUNT,
         initial_balance: CostUnits(1_000),
-        active: true,
+        status: AccountStatus::Active,
     });
     let slot = LeaseSlot::empty();
     let clock = Arc::new(ManualClock::new(t(0)));
