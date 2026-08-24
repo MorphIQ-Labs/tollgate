@@ -7,9 +7,12 @@
 # records the load test's like-for-like sequential and contended ratios as
 # non-gating evidence.
 #
-# Cache: cargo registry/git only (not target/) — meaningful download savings
-# without multi-GB archive churn. GitLab manages cache storage and expiry;
-# nothing to clean up manually.
+# Cache: Cargo sources and target artifacts are keyed by Cargo.lock plus the
+# pinned toolchain. Clippy is the sole writer; later build jobs pull read-only,
+# so parallel jobs cannot replace one another's archive. This self-managed
+# runner has no distributed cache endpoint: runner operations own expiry and
+# cleanup. Caching target/ restores the cross-job sharing lost with Woodpecker
+# at the cost of one archive upload per merge-request pipeline.
 
 image: rust:1.97.1-slim
 
@@ -21,17 +24,28 @@ workflow:
 
 stages: [check, test, assurance, release]
 
-default:
-  cache:
-    key: cargo-registry
-    paths:
-      - .cargo/registry
-      - .cargo/git
-
 variables:
-  CARGO_HOME: $CI_PROJECT_DIR/.cargo
-  CARGO_INSTALL_ROOT: $CI_PROJECT_DIR/.ci-tools
+  CARGO_HOME: "$CI_PROJECT_DIR/.ci-cargo"
+  CARGO_INSTALL_ROOT: "$CI_PROJECT_DIR/.ci-tools"
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "3"
+  CARGO_TERM_COLOR: "always"
   RELEASE_PLZ_VERSION: "0.3.160"
+
+# The policy lives in one mapping so pull-only is the default for every
+# consumer. The sole producer overrides only policy after inheriting the same
+# key and paths.
+.cargo-build-cache: &cargo-build-cache
+  key:
+    files:
+      - Cargo.lock
+      - rust-toolchain.toml
+  paths:
+    - .ci-cargo/registry/cache/
+    - .ci-cargo/registry/index/
+    - .ci-cargo/git/db/
+    - target/
+  policy: pull
 
 .merge-request:
   rules:
@@ -125,6 +139,9 @@ clippy:
   extends: .merge-request
   stage: check
   interruptible: true
+  cache:
+    <<: *cargo-build-cache
+    policy: pull-push
   script:
     - rustc --version
     - cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
@@ -164,6 +181,7 @@ test:
   extends: .merge-request
   stage: test
   interruptible: true
+  cache: *cargo-build-cache
   script:
     - cargo test --locked --workspace --all-features
 
@@ -174,6 +192,7 @@ test-no-default-features:
   extends: .merge-request
   stage: test
   interruptible: true
+  cache: *cargo-build-cache
   script:
     - |
       dependency_tree="$(cargo tree --locked -p tollgate-server --no-default-features)"
@@ -191,6 +210,7 @@ test-postgres:
   extends: [.merge-request, .postgres-service]
   stage: test
   interruptible: true
+  cache: *cargo-build-cache
   before_script: !reference [.postgres-wait, before_script]
   script:
     - test -n "$TOLLGATE_PG_URL" || { echo "TOLLGATE_PG_URL is unset; this gate must not pass without a database" >&2; exit 1; }
@@ -200,6 +220,7 @@ bench-compile:
   extends: .merge-request
   stage: test
   interruptible: true
+  cache: *cargo-build-cache
   script:
     - cargo bench --locked --workspace --no-run
 
@@ -228,6 +249,7 @@ mutation:
   stage: assurance
   timeout: 90 minutes
   interruptible: true
+  cache: *cargo-build-cache
   before_script:
     - !reference [.postgres-wait, before_script]
     # The slim Rust image does not include git; diff-scoped mutation selection
@@ -252,6 +274,7 @@ perf-thresholds:
   stage: assurance
   allow_failure: true
   timeout: 45 minutes
+  cache: *cargo-build-cache
   script:
     - ./scripts/check_perf_thresholds.sh
   artifacts:
@@ -264,6 +287,7 @@ load-thresholds:
   stage: assurance
   interruptible: true
   timeout: 45 minutes
+  cache: *cargo-build-cache
   # Mutation and formal assurance are CPU- and memory-intensive. This job
   # measures paired latencies on the same group-runner host, so wait for both
   # instead of letting our own pipeline contaminate its denominator/numerator.
@@ -300,8 +324,9 @@ release:
   cache:
     key: "release-plz-$RELEASE_PLZ_VERSION"
     paths:
-      - .cargo/registry
-      - .cargo/git
+      - .ci-cargo/registry/cache/
+      - .ci-cargo/registry/index/
+      - .ci-cargo/git/db/
       - .ci-tools/
   before_script:
     - export PATH="$CARGO_INSTALL_ROOT/bin:$PATH"
