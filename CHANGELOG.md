@@ -5,6 +5,17 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.3.1...v0.4.0) - 2026-08-24
+
+### Other
+
+- Merge branch 'perf/52-churned-catalogue-sweep' into 'main'
+- *(client)* [**breaking**] #52 stop refetching churned principals every sweep
+- release v0.3.1
+- update Cargo.lock dependencies
+- Merge branch 'test/27-set-active-parity' into 'main'
+- *(postgres)* baseline existing mutation surface
+
 ## [0.3.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.3.0...v0.3.1) - 2026-08-24
 
 ### Other
