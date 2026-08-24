@@ -5,6 +5,17 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.4.0...v0.5.0) - 2026-08-24
+
+### Fixed
+
+- reject only the publish registry list, and restore the manifest guard
+
+### Other
+
+- Merge branch 'refactor/51-unify-account-suspension' into 'main'
+- *(store)* [**breaking**] #51 unify account suspension into one status
+
 ## [0.4.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.3.1...v0.4.0) - 2026-08-24
 
 ### Other
