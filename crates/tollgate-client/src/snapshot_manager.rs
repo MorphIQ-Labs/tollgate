@@ -33,7 +33,10 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::Instrument as _;
 
-use tollgate_admission::{LeaseSlot, SnapshotMap, SnapshotUpdate};
+use tollgate_admission::{
+    LeaseSlot, SnapshotMap, SnapshotUpdate, Watermark, accept_positive, accept_revoked,
+    accept_unknown,
+};
 use tollgate_core::{AccountId, Generation, Principal};
 use tollgate_store::{Clock, SnapshotResolution, SnapshotSource, StoreError};
 
@@ -385,7 +388,13 @@ enum Resolution {
     Negative {
         deadline: jiff::Timestamp,
         next_refetch: jiff::Timestamp,
-        generation: Option<Generation>,
+        /// The durable generation this principal carries, and why it is
+        /// durable — the same [`Watermark`] the admission map stores.
+        ///
+        /// It used to be a bare `Option<Generation>`, which could not say
+        /// whether the number came from a published revocation or merely from
+        /// the positive this negative replaced. That conflation is #53.
+        watermark: Option<Watermark>,
     },
 }
 
@@ -403,10 +412,16 @@ impl Resolution {
         }
     }
 
-    fn generation(self) -> Option<Generation> {
+    /// The durable watermark this resolution carries.
+    ///
+    /// A live snapshot's own generation is a [`Watermark::Positive`]: it orders
+    /// snapshots, but it asserts nothing about that generation being dead, so
+    /// the same generation arriving again is a re-observation rather than a
+    /// resurrection (#53).
+    fn watermark(self) -> Option<Watermark> {
         match self {
-            Resolution::Present { generation, .. } => Some(generation),
-            Resolution::Negative { generation, .. } => generation,
+            Resolution::Present { generation, .. } => Some(Watermark::Positive(generation)),
+            Resolution::Negative { watermark, .. } => watermark,
         }
     }
 }
@@ -501,11 +516,52 @@ impl Resolutions {
         self.tracked = discovered;
     }
 
-    /// The generation watermark, if this principal has ever been resolved.
-    fn generation_of(&self, principal: Principal) -> Option<Generation> {
+    /// The durable watermark, if this principal has ever been resolved.
+    fn watermark_of(&self, principal: Principal) -> Option<Watermark> {
         self.by_principal
             .get(&principal)
-            .and_then(|resolution| resolution.generation())
+            .and_then(|resolution| resolution.watermark())
+    }
+
+    /// Whether an incoming positive at `generation` may replace what this
+    /// principal holds.
+    ///
+    /// Delegates to the admission layer's decision function rather than
+    /// restating the comparison. The manager gates *before* the map is ever
+    /// called, so a second copy of the rule here would decide the outcome on
+    /// its own — which is how #53 survived a fix to the map alone.
+    ///
+    /// Whether an incoming positive at `generation` may replace what this
+    /// principal holds — the admission layer's rule, called rather than
+    /// restated, since the manager gates before the map is ever reached.
+    ///
+    /// Visibility comes from this resolution, and the two alternatives were
+    /// both tried and are both worse:
+    ///
+    /// - Asking the map makes every sweep record a synthetic read against
+    ///   every tracked principal. On a `moka` cache that feeds the frequency
+    ///   sketch and biases eviction toward whatever the sweep touched.
+    /// - Passing `false` accepts an equal generation, so an *unchanged*
+    ///   catalogue yields an update per principal per sweep: a slot lookup and
+    ///   a limiter resolution each, and on the copy-on-write map a clone of the
+    ///   whole map — a batch that previously did not exist at all.
+    ///
+    /// The cost of using this resolution is that a map which evicts a
+    /// *present* entry behind the manager's back will not be repaired by a
+    /// same-generation refetch. `ArcSwapSnapshotMap` never does: it evicts only
+    /// negatives, by expiry or by the negative cap. `MokaSnapshotMap` can, when
+    /// `max_capacity` is below the tracked set — a configuration that is
+    /// already denying live principals on the request path, and one that no
+    /// pre-#53 version repaired either, since the equal generation was refused
+    /// outright.
+    fn accepts_positive(&self, principal: Principal, generation: Generation) -> bool {
+        let current = self.by_principal.get(&principal).copied();
+        let (_, accepted) = accept_positive(
+            current.and_then(Resolution::watermark),
+            generation,
+            current.is_some_and(|resolution| matches!(resolution, Resolution::Present { .. })),
+        );
+        accepted
     }
 
     /// Record a resolution, replacing whatever this principal held.
@@ -792,23 +848,6 @@ fn negative_deadline(
     now.checked_add(ttl).unwrap_or(jiff::Timestamp::MAX)
 }
 
-/// Merge a negative resolution with the locally observed generation. `None`
-/// rejects an older revocation; `Some(None)` accepts an unversioned unknown.
-fn merge_negative_generation(
-    local: Option<Generation>,
-    incoming: Option<Generation>,
-) -> Option<Option<Generation>> {
-    if matches!((local, incoming), (Some(current), Some(incoming)) if incoming < current) {
-        return None;
-    }
-    Some(match (local, incoming) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    })
-}
-
 /// Refresh a set of principals with bounded concurrency, then apply every
 /// positive and negative result in one logical map write. A shutdown signal
 /// aborts outstanding source futures immediately.
@@ -880,10 +919,28 @@ async fn refresh_all_cancellable(
         counters.record_attempt();
         match result {
             Ok(SnapshotResolution::Present(snapshot)) => {
-                if resolutions
-                    .generation_of(principal)
-                    .is_some_and(|generation| snapshot.generation <= generation)
-                {
+                if !resolutions.accepts_positive(principal, snapshot.generation) {
+                    // Refused, and deliberately left out of `completed` so it
+                    // lands in the returned set that drives `back_off`.
+                    //
+                    // An earlier cut marked it completed instead, reasoning
+                    // that a refusal is not a failed fetch. It is not — but
+                    // that set is what re-arms `next_refetch`, and without it
+                    // a negative's deadline stays in the past, so the control
+                    // wakeup re-fires at zero delay and refetches at source
+                    // latency: 410 fetches in 600 ms against a replica serving
+                    // a stale generation, where the back-off gives three. #53's
+                    // severity came from the refusal being *permanent*, not
+                    // from the throttle; removing the throttle made it worse.
+                    //
+                    // What that cut was right about is visibility, so the
+                    // refusal is now said out loud rather than absorbed.
+                    tracing::warn!(
+                        %principal,
+                        offered = snapshot.generation.0,
+                        "source offered a snapshot this instance already refuses; \
+                         retrying with backoff"
+                    );
                     continue;
                 }
                 let snapshot = snapshot.into_inner();
@@ -906,11 +963,19 @@ async fn refresh_all_cancellable(
                 generation: incoming,
             }) => {
                 let now = clock.now();
-                let local_generation = resolutions.generation_of(principal);
-                let Some(generation) = merge_negative_generation(local_generation, Some(incoming))
-                else {
+                let (watermark, accepted) =
+                    accept_revoked(resolutions.watermark_of(principal), incoming);
+                if !accepted {
+                    // Refused, and left out of `completed` for the reason the
+                    // positive arm above spells out: that set is the throttle.
+                    tracing::warn!(
+                        %principal,
+                        offered = incoming.0,
+                        "source offered a revocation older than this instance holds; \
+                         retrying with backoff"
+                    );
                     continue;
-                };
+                }
                 let until = negative_deadline(now, config, NegativeKind::Revoked);
                 completed.insert(principal);
                 resolutions.insert(
@@ -918,33 +983,33 @@ async fn refresh_all_cancellable(
                     Resolution::Negative {
                         deadline: until,
                         next_refetch: until,
-                        generation,
+                        watermark,
                     },
                 );
-                updates.push(SnapshotUpdate::Negative {
+                updates.push(SnapshotUpdate::Revoked {
                     principal,
                     until,
-                    generation: Some(incoming),
+                    generation: incoming,
                 });
             }
             Ok(SnapshotResolution::Unknown) => {
                 completed.insert(principal);
                 let now = clock.now();
-                let generation = resolutions.generation_of(principal);
+                // The watermark passes through untouched. The source said
+                // nothing about any generation, so there is nothing here to
+                // raise or re-tag -- and re-tagging it as a revocation is what
+                // stranded the principal at its own generation (#53).
+                let (watermark, _) = accept_unknown(resolutions.watermark_of(principal));
                 let until = negative_deadline(now, config, NegativeKind::Unknown);
                 resolutions.insert(
                     principal,
                     Resolution::Negative {
                         deadline: until,
                         next_refetch: until,
-                        generation,
+                        watermark,
                     },
                 );
-                updates.push(SnapshotUpdate::Negative {
-                    principal,
-                    until,
-                    generation: None,
-                });
+                updates.push(SnapshotUpdate::Unknown { principal, until });
             }
             // The principal keeps whatever resolution it already had and
             // stays pending for the next sweep. Without this event a source
@@ -1091,8 +1156,8 @@ async fn run(
                     if resolutions.is_tracked(push.principal) {
                         match push.resolution {
                             SnapshotResolution::Present(snapshot) => {
-                                if resolutions.generation_of(push.principal)
-                                    .is_some_and(|generation| snapshot.generation <= generation)
+                                if !resolutions
+                                    .accepts_positive(push.principal, snapshot.generation)
                                 {
                                     continue;
                                 }
@@ -1116,19 +1181,22 @@ async fn run(
                             }
                             resolution @ (SnapshotResolution::Revoked { .. }
                             | SnapshotResolution::Unknown) => {
-                                let (incoming, kind) = match resolution {
+                                let current = resolutions.watermark_of(push.principal);
+                                let (watermark, accepted, kind, update) = match resolution {
                                     SnapshotResolution::Revoked { generation } => {
-                                        (Some(generation), NegativeKind::Revoked)
+                                        let (watermark, accepted) =
+                                            accept_revoked(current, generation);
+                                        (watermark, accepted, NegativeKind::Revoked, Some(generation))
                                     }
-                                    SnapshotResolution::Unknown => (None, NegativeKind::Unknown),
+                                    SnapshotResolution::Unknown => {
+                                        let (watermark, accepted) = accept_unknown(current);
+                                        (watermark, accepted, NegativeKind::Unknown, None)
+                                    }
                                     SnapshotResolution::Present(_) => unreachable!(),
                                 };
-                                let local_generation = resolutions.generation_of(push.principal);
-                                let Some(generation) =
-                                    merge_negative_generation(local_generation, incoming)
-                                else {
+                                if !accepted {
                                     continue;
-                                };
+                                }
                                 let now = clock.now();
                                 let until = negative_deadline(now, &config, kind);
                                 resolutions.insert(
@@ -1136,17 +1204,21 @@ async fn run(
                                     Resolution::Negative {
                                         deadline: until,
                                         next_refetch: until,
-                                        generation,
+                                        watermark,
                                     },
                                 );
-                                map.apply_many_at(
-                                    vec![SnapshotUpdate::Negative {
+                                let update = match update {
+                                    Some(generation) => SnapshotUpdate::Revoked {
                                         principal: push.principal,
                                         until,
-                                        generation: incoming,
-                                    }],
-                                    now,
-                                );
+                                        generation,
+                                    },
+                                    None => SnapshotUpdate::Unknown {
+                                        principal: push.principal,
+                                        until,
+                                    },
+                                };
+                                map.apply_many_at(vec![update], now);
                             }
                         }
                         update_ready(&ready, &mut resolutions, &clock, &counters, &config.principals);
@@ -1266,7 +1338,7 @@ mod tests {
             Resolution::Negative {
                 deadline: t(15),
                 next_refetch: t(15),
-                generation: None,
+                watermark: None,
             },
         );
         assert_eq!(
@@ -1430,7 +1502,7 @@ mod tests {
                         let resolution = Resolution::Negative {
                             deadline: t(deadline),
                             next_refetch: t(deadline),
-                            generation: None,
+                            watermark: None,
                         };
                         indexed.insert(principal, resolution);
                         reference.insert(principal, resolution);
@@ -1530,7 +1602,7 @@ mod tests {
             Resolution::Negative {
                 deadline: t(30),
                 next_refetch: t(30),
-                generation: None,
+                watermark: None,
             },
         );
         resolutions.insert(
@@ -1568,7 +1640,7 @@ mod tests {
                 Resolution::Negative {
                     deadline: t(10 + offset as i64),
                     next_refetch: t(10 + offset as i64),
-                    generation: Some(Generation(9)),
+                    watermark: Some(Watermark::Revoked(Generation(9))),
                 },
             );
         }
@@ -1609,7 +1681,7 @@ mod tests {
             Resolution::Negative {
                 deadline: t(3_600),
                 next_refetch: t(3_600),
-                generation: Some(Generation(9)),
+                watermark: Some(Watermark::Revoked(Generation(9))),
             },
         );
 
@@ -1636,14 +1708,14 @@ mod tests {
             Resolution::Negative {
                 deadline: t(30),
                 next_refetch: t(30),
-                generation: Some(Generation(7)),
+                watermark: Some(Watermark::Revoked(Generation(7))),
             },
         );
         assert_eq!(resolutions.unresolved(t(100)), 1, "expired");
         assert_eq!(
-            resolutions.generation_of(Principal(0)),
-            Some(Generation(7)),
-            "the watermark must survive the expiry"
+            resolutions.watermark_of(Principal(0)),
+            Some(Watermark::Revoked(Generation(7))),
+            "the watermark must survive the expiry, provenance included"
         );
     }
 
@@ -1674,26 +1746,5 @@ mod tests {
             t(3_610)
         );
         assert_eq!(after_std(t(10), config.retry_backoff), t(12));
-    }
-
-    #[test]
-    fn negative_generation_merge_rejects_only_older_revocations() {
-        assert_eq!(
-            merge_negative_generation(Some(Generation(5)), Some(Generation(4))),
-            None
-        );
-        assert_eq!(
-            merge_negative_generation(Some(Generation(5)), Some(Generation(5))),
-            Some(Some(Generation(5)))
-        );
-        assert_eq!(
-            merge_negative_generation(Some(Generation(5)), Some(Generation(6))),
-            Some(Some(Generation(6)))
-        );
-        assert_eq!(
-            merge_negative_generation(Some(Generation(5)), None),
-            Some(Some(Generation(5)))
-        );
-        assert_eq!(merge_negative_generation(None, None), Some(None));
     }
 }

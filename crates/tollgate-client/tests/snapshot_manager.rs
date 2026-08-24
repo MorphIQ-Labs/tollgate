@@ -769,6 +769,19 @@ async fn a_revoked_principal_stays_tracked_and_cannot_be_resurrected() {
         "the tombstone's watermark outranks the replay"
     );
 
+    // Nor at the tombstone's *own* generation. This is the case #53 must not
+    // loosen: an absence lets its generation back because nothing declared it
+    // dead, but a revocation declared exactly this one dead. Nothing pinned
+    // equality here before — every recovery test stepped strictly over the
+    // watermark — so the accept side had never been exercised at it.
+    store.publish_snapshot(PRINCIPAL, publishable(snapshot(5, PermissionBits::bit(0))));
+    settle().await;
+    assert_eq!(
+        admit_as(&fixture, PRINCIPAL),
+        Err(DenyReason::UnknownPrincipal),
+        "a replay at the tombstone's own generation stays dead"
+    );
+
     // A genuinely newer one does.
     store.publish_snapshot(PRINCIPAL, publishable(snapshot(6, PermissionBits::bit(0))));
     settle().await;
@@ -1242,17 +1255,19 @@ async fn a_live_principal_that_goes_absent_recovers_on_the_unknown_ttl() {
     .await
     .expect("a sweep must observe the absence");
 
-    // The source comes back, at a higher generation: a same-generation
-    // republish is refused as a stale positive, which is its own defect and
-    // not what this test pins.
-    source.set(MutableMode::Present(snapshot(2, PermissionBits::bit(0))));
+    // The source comes back with the *same* snapshot it always had. Nothing
+    // changed while the row was missing, so nothing bumped the generation --
+    // that is what a transient absence looks like, and it must be enough to
+    // restore the principal (#53). Requiring a higher generation here would
+    // mean a customer stays denied until someone happens to republish.
+    source.set(MutableMode::Present(snapshot(1, PermissionBits::bit(0))));
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         while !matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(_))) {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
     })
     .await
-    .expect("an absent row must recover on unknown_ttl, not revoked_ttl");
+    .expect("an absent row must recover at its own generation, not only above it");
 
     manager.shutdown().await;
 }
@@ -1312,6 +1327,244 @@ async fn a_reinstated_principal_comes_back_on_the_revoked_ttl() {
     })
     .await
     .expect("revoked_ttl must schedule the refetch that finds the reinstatement");
+
+    manager.shutdown().await;
+}
+
+/// A snapshot whose validity lapses at `valid_until`, for tests that care what
+/// deadline the manager adopts rather than what generation it serves.
+fn expiring_snapshot(generation: u64, valid_until: Timestamp) -> Arc<AccountSnapshot> {
+    let mut snapshot = AccountSnapshot::clone(&snapshot(generation, PermissionBits::bit(0)));
+    snapshot.valid_until = valid_until;
+    Arc::new(snapshot)
+}
+
+/// A stale positive cannot drag readiness down.
+///
+/// It is tempting to think the manager's generation gate is redundant, since
+/// the map refuses a rolled-back generation anyway and admission is therefore
+/// safe either way. It is not redundant: the manager *also* records the
+/// accepted snapshot's `valid_until` as its own deadline, and readiness is
+/// computed from those deadlines. Accepting a stale snapshot adopts a stale
+/// deadline, so an instance that is serving perfectly well from the newer
+/// snapshot would withdraw itself from rotation.
+///
+/// Mutation testing is what surfaced this: `Resolutions::accepts_positive`
+/// could be replaced with `true` and every other test stayed green, because
+/// they all observe the *map*, which protects itself.
+#[tokio::test]
+async fn a_stale_positive_cannot_drop_readiness() {
+    let source = MutableNoPushSource::new();
+    source.set(MutableMode::Present(snapshot(5, PermissionBits::bit(0))));
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let map = Arc::new(ArcSwapSnapshotMap::new());
+    let manager = SnapshotManager::spawn(
+        source.clone(),
+        map.clone(),
+        SlotRegistry::new(),
+        clock,
+        SnapshotManagerConfig {
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
+            refresh_interval: std::time::Duration::from_millis(10),
+            unknown_ttl: SignedDuration::from_secs(30),
+            revoked_ttl: SignedDuration::from_secs(3_600),
+            retry_backoff: std::time::Duration::from_millis(5),
+            max_concurrent_fetches: 1,
+        },
+    )
+    .unwrap();
+
+    let mut ready = manager.ready();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !*ready.borrow() {
+            ready.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the live snapshot must make the instance ready");
+
+    // An older generation whose validity has *already* lapsed at the manual
+    // clock's instant. Refusing it keeps the generation-5 deadline; accepting
+    // it would adopt an expired one.
+    source.set(MutableMode::Present(expiring_snapshot(4, t(0))));
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    assert!(
+        *manager.ready().borrow(),
+        "a refused stale snapshot must not unready an instance that is still serving"
+    );
+    assert!(
+        matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(_))),
+        "and the newer snapshot is still installed"
+    );
+
+    manager.shutdown().await;
+}
+
+/// A source whose pulls are fixed and whose pushes the test drives directly.
+///
+/// The #53 regression tests all use `MutableNoPushSource`, so they exercise the
+/// *sweep*. Pushes are the primary propagation path for an in-process store,
+/// with the sweep as fallback — and the manager applies the same generation
+/// rule at both. This source is what lets the push half be pinned.
+struct DrivenPushSource {
+    pull: Mutex<SnapshotResolution>,
+    push: tokio::sync::broadcast::Sender<SnapshotPush>,
+}
+
+impl DrivenPushSource {
+    fn new(pull: SnapshotResolution) -> Arc<Self> {
+        let (push, _) = tokio::sync::broadcast::channel(8);
+        Arc::new(Self {
+            pull: Mutex::new(pull),
+            push,
+        })
+    }
+
+    fn send(&self, principal: Principal, resolution: SnapshotResolution) {
+        // Zero receivers is not a failure here either -- the manager may not
+        // have subscribed yet -- but the count is the difference between a
+        // push landing and the test silently retesting the sweep, so it is
+        // asserted rather than discarded.
+        let delivered = self
+            .push
+            .send(SnapshotPush {
+                principal,
+                resolution,
+            })
+            .expect("the manager must be subscribed");
+        assert_eq!(delivered, 1, "exactly one subscriber must receive the push");
+    }
+}
+
+#[async_trait]
+impl SnapshotSource for DrivenPushSource {
+    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
+        Ok(self.pull.lock().expect("pull mode poisoned").clone())
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
+        self.push.subscribe()
+    }
+}
+
+/// #53 on the **push** path: a principal that goes absent and is then
+/// reinstated by a push at its original generation must come back.
+///
+/// The sweep half is pinned by
+/// `a_live_principal_that_goes_absent_recovers_on_the_unknown_ttl`. This is its
+/// counterpart, and it exists because mutation probing showed the push site's
+/// `visible` read could be replaced with `true` — reinstating #53 on the path
+/// most deployments actually use — with the whole suite still green.
+#[tokio::test]
+async fn a_push_reinstates_an_absent_principal_at_its_own_generation() {
+    let live = SnapshotResolution::Present(publishable(snapshot(5, PermissionBits::bit(0))));
+    let source = DrivenPushSource::new(live.clone());
+    let map = Arc::new(ArcSwapSnapshotMap::new());
+    let manager = SnapshotManager::spawn(
+        source.clone(),
+        map.clone(),
+        SlotRegistry::new(),
+        Arc::new(ManualClock::new(t(0))),
+        SnapshotManagerConfig {
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
+            // Long: the sweep must not be what carries either transition, or
+            // this would silently retest the sweep path.
+            refresh_interval: std::time::Duration::from_secs(3_600),
+            unknown_ttl: SignedDuration::from_secs(3_600),
+            revoked_ttl: SignedDuration::from_secs(3_600),
+            retry_backoff: std::time::Duration::from_secs(3_600),
+            max_concurrent_fetches: 1,
+        },
+    )
+    .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(_))) {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the initial load must install the principal");
+
+    // The row disappears, announced by push rather than discovered by a sweep.
+    source.send(PRINCIPAL, SnapshotResolution::Unknown);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(_))) {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the absence must reach the map");
+
+    // And comes back, unchanged, at the generation it always had.
+    source.send(PRINCIPAL, live);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(_))) {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("a push must reinstate an absent principal at its own generation");
+
+    manager.shutdown().await;
+}
+
+/// A refused answer must stay *throttled*.
+///
+/// Refusing is correct when a source offers a generation this instance already
+/// holds a revocation for — a lagging replica, say. What must not happen is
+/// refusing at source latency: the refusal has to re-arm the retry deadline, or
+/// the control wakeup re-fires at zero delay and the client hammers the store
+/// for as long as the replica lags.
+///
+/// This exists because that is exactly what a fix for a *reporting* complaint
+/// did: moving refusals out of the set that drives `back_off` made a throttled
+/// retry unthrottled — 410 fetches in this window instead of 3. Nothing caught
+/// it, because the suite pinned what the refusal *decided* and never how often
+/// it was retried.
+#[tokio::test]
+async fn a_refused_answer_is_retried_with_backoff_not_at_source_latency() {
+    let source = MutableNoPushSource::new();
+    source.set(MutableMode::Revoked);
+    let map = Arc::new(ArcSwapSnapshotMap::new());
+    let manager = SnapshotManager::spawn(
+        source.clone(),
+        map.clone(),
+        SlotRegistry::new(),
+        Arc::new(SystemClock),
+        SnapshotManagerConfig {
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
+            // Only the tombstone's own schedule may drive a refetch here.
+            refresh_interval: std::time::Duration::from_secs(3_600),
+            unknown_ttl: SignedDuration::from_secs(3_600),
+            revoked_ttl: SignedDuration::from_millis(40),
+            retry_backoff: std::time::Duration::from_millis(200),
+            max_concurrent_fetches: 1,
+        },
+    )
+    .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // A lagging replica answers with the very generation the tombstone holds.
+    source.set(MutableMode::Present(snapshot(9, PermissionBits::bit(0))));
+    let before = source.calls.load(Ordering::Acquire);
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let fetches = source.calls.load(Ordering::Acquire) - before;
+
+    // 600ms / 200ms of backoff is a handful; the unthrottled loop was ~400.
+    assert!(
+        fetches <= 12,
+        "a refused answer must be retried on the backoff, not spun: {fetches} fetches"
+    );
+    assert!(
+        matches!(
+            map.get(&PRINCIPAL),
+            Some(MapEntry::NegativeUntil { .. }) | None
+        ),
+        "and the refusal still holds: the revoked principal is not resurrected"
+    );
 
     manager.shutdown().await;
 }

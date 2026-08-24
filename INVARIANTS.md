@@ -219,7 +219,17 @@ until it has one.
     positive at or below a tombstone cannot resurrect a principal, and a
     delayed older tombstone cannot revoke a newer positive snapshot. The
     source stores tombstones durably so the rule survives instance restarts;
-    evicting a request-visible entry does not evict its generation watermark.
+    evicting a request-visible entry does not evict its revocation watermark.
+    The rule is about **tombstones**, and the implementation now says so: only
+    a generation the source published a revocation at may refuse that same
+    generation back. A generation this instance merely observed orders
+    snapshots — a strictly older one is still refused — but asserts nothing
+    about being dead, so the same generation arriving again is a
+    re-observation. Conflating the two stranded any principal whose row went
+    briefly absent, since the absence inherited the positive's generation and
+    then refused it back forever; that is #17's rule — keyed on what the source
+    answered, never on what the instance remembers — applied to admission
+    rather than to TTL selection.
     *Tests:* both snapshot-map contract tests,
     `negative_eviction_preserves_generation_monotonicity`,
     `revoked_generation_rejects_replay_after_visible_entry_is_evicted`,
@@ -228,7 +238,14 @@ until it has one.
     `snapshot_publish_fetch_and_generation_monotonicity`, and
     `a_vestigial_jsonb_generation_is_ignored_in_favour_of_the_column` (which
     pins *which* stored number the watermark is, now that a backend keeps only
-    one). *Proof:*
+    one), `a_generation_survives_an_absence_and_returns_unchanged`,
+    `a_revocation_refuses_its_own_generation_back`,
+    `a_visible_snapshot_refuses_its_own_generation_again`,
+    `an_absence_never_makes_a_generation_dead`, and
+    `a_live_principal_that_goes_absent_recovers_on_the_unknown_ttl` together
+    with `a_revoked_principal_stays_tracked_and_cannot_be_resurrected` — the
+    pair that separates an absence from a revocation at *equality*, which is
+    the only generation where the two rules differ. *Proof:*
     `formal/lean/Tollgate/SnapshotCache.lean`.
 
 16. **Unsafe configuration never becomes authoritative.** Nonpositive lease
