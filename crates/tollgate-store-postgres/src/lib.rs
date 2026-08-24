@@ -6,8 +6,9 @@
 //! control is row-level: `SELECT ... FOR UPDATE` on the account funds
 //! acquire; on the lease it serializes release/ingest/reclaim against each
 //! other. Fencing tokens come from the account row's `next_fence` counter,
-//! so they are strictly monotonic per account across any number of servers
-//! sharing the database.
+//! so allocation is strictly monotonic per account across any number of
+//! servers sharing the database. Each token remains a capability for its own
+//! lease record; the sequence is not an account-wide validity epoch.
 //!
 //! Representation choices (PoC-pragmatic, documented):
 //! - u128 ids as 16-byte `BYTEA` (big-endian);
@@ -675,7 +676,7 @@ impl UsageSink for PostgresStore {
         // Encode each ID and timestamp exactly once before opening the
         // transaction. The prepared values are reused by the lock, dedup,
         // classification, insert, and aggregate-update phases. Units are
-        // checked once later, after duplicate and fencing classification, to
+        // checked once later, after duplicate and capability classification, to
         // preserve the partial-acceptance ordering.
         struct PreparedEvent<'a> {
             source: &'a UsageEvent,
@@ -766,8 +767,8 @@ impl UsageSink for PostgresStore {
             .collect();
 
             // Classify in memory against the locked rows (identical rules to
-            // MemoryStore: fencing triple, then the conservation fit that also
-            // converts a released lease's provisional loss into billed usage).
+            // MemoryStore: capability triple, then the conservation fit that
+            // also converts a released lease's provisional loss into billed usage).
             struct Accepted {
                 event_index: usize,
                 settled: bool,

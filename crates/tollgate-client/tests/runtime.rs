@@ -608,10 +608,11 @@ async fn rejected_events_are_visible_while_running() {
     let clock = Arc::new(ManualClock::new(t(0)));
     let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(64)).unwrap();
 
-    // A fencing token the allocator never issued: the sink refuses it.
-    let mut stale = event(1, 10, &lease);
-    stale.fencing_token = tollgate_core::FencingToken(lease.fencing_token.0 + 99);
-    recorder.try_reserve().unwrap().record(stale);
+    // A capability token the allocator never attached to this lease: the
+    // sink refuses the mismatch.
+    let mut mismatched = event(1, 10, &lease);
+    mismatched.fencing_token = tollgate_core::FencingToken(lease.fencing_token.0 + 99);
+    recorder.try_reserve().unwrap().record(mismatched);
     settle().await;
 
     let health = recorder.health();
@@ -1152,9 +1153,9 @@ async fn final_flush_counts_duplicates_and_rejections() {
 
     recorder.try_reserve().unwrap().record(event(1, 10, &lease));
     recorder.try_reserve().unwrap().record(event(1, 10, &lease));
-    let mut fenced = event(2, 10, &lease);
-    fenced.fencing_token = tollgate_core::FencingToken(999);
-    recorder.try_reserve().unwrap().record(fenced);
+    let mut mismatched = event(2, 10, &lease);
+    mismatched.fencing_token = tollgate_core::FencingToken(999);
+    recorder.try_reserve().unwrap().record(mismatched);
 
     let stats = writer.shutdown().await.unwrap();
     assert_eq!(stats.accepted, 1);

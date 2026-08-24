@@ -38,8 +38,9 @@ pub enum AllocateError {
     /// A lease must have a strictly positive lifetime.
     InvalidTtl,
     UnknownLease,
-    /// The fencing token does not match the lease — a stale or partitioned
-    /// holder (INVARIANTS.md #4).
+    /// The fencing token does not match the lease record named by `lease_id`.
+    /// Token ordering across different active leases is irrelevant
+    /// (INVARIANTS.md #4).
     Fenced,
     /// The lease exists but is no longer active (already released, expired,
     /// or reclaimed).
@@ -324,7 +325,9 @@ impl ReclaimBatch {
 pub trait LeaseAllocator: Send + Sync {
     /// Atomically debit a grant from the account. The granted size follows
     /// the backend's [`GrantPolicy`] and may be smaller than `requested`;
-    /// the fencing token is strictly monotonic per account.
+    /// the fencing token comes from a strictly increasing per-account
+    /// sequence. It remains a capability for this lease only; allocating a
+    /// newer token does not invalidate another active lease.
     async fn acquire(
         &self,
         account: AccountId,
@@ -333,9 +336,10 @@ pub trait LeaseAllocator: Send + Sync {
         now: Timestamp,
     ) -> Result<LeaseGrant, AllocateError>;
 
-    /// Graceful return: credit `unspent` back and close the lease. The
-    /// holder must flush usage for this lease *before* releasing — events
-    /// arriving for a settled lease are rejected.
+    /// Graceful return: require the stored `(lease_id, fencing_token)` pair,
+    /// credit `unspent` back, and close the lease. Callers should flush usage
+    /// first when possible; events arriving after release are accepted only
+    /// when they fit its provisional settlement loss.
     async fn release(
         &self,
         lease_id: LeaseId,
@@ -481,16 +485,19 @@ pub struct IngestReport {
     /// Events whose `request_id` was already recorded (idempotent replay —
     /// INVARIANTS.md #7).
     pub duplicate: u64,
-    /// Events refused: unknown lease, fencing mismatch, or settled lease.
-    /// These are bounded billing loss, visible to reconciliation.
+    /// Events refused: unknown lease, lease-capability mismatch, or no
+    /// remaining accounting capacity. These are bounded billing loss,
+    /// visible to reconciliation.
     pub rejected: u64,
 }
 
 /// The billing ledger's write side.
 #[async_trait]
 pub trait UsageSink: Send + Sync {
-    /// Record a batch. Idempotent on `request_id`; fencing-checked per event.
-    /// Partial acceptance is normal — the report says what happened.
+    /// Record a batch. Idempotent on `request_id`; every event must match its
+    /// stored `(lease_id, account_id, fencing_token)` capability before lease
+    /// state and accounting capacity are checked. Partial acceptance is
+    /// normal — the report says what happened.
     async fn ingest(
         &self,
         events: &[UsageEvent],

@@ -333,7 +333,7 @@ async fn usage_sink_outage_and_recovery_are_reported() {
     );
 }
 
-/// An allocator that grants normally and refuses every release as fenced.
+/// An allocator that grants normally and rejects every release capability.
 struct FencedReleaseAllocator {
     inner: Arc<MemoryStore>,
 }
@@ -371,7 +371,8 @@ impl LeaseAllocator for FencedReleaseAllocator {
 
 /// `LeaseManagerReport` counts a refused release as released — the store is
 /// no longer holding it — so *which* refusal happened has no channel but the
-/// event. A `Fenced` at shutdown means another holder superseded this one.
+/// event. A `Fenced` at shutdown means the store rejected the capability the
+/// manager copied from its grant.
 #[tokio::test(start_paused = true)]
 async fn refused_release_at_shutdown_is_reported() {
     let (captor, _guard) = capture();

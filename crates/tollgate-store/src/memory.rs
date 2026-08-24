@@ -24,8 +24,9 @@
 //!   needs a dedup-window retention decision rather than a deletion — see the
 //!   deferred list in `docs/DESIGN.md`.
 //! - `leases` keeps settled records, so it grows with lease rotations. They
-//!   are retained because a straggling usage event may still have to be
-//!   fenced and rejected against one (see [`UsageSink::ingest`]).
+//!   are retained because a straggling usage event must still be matched to
+//!   its lease capability and checked against settlement capacity (see
+//!   [`UsageSink::ingest`]).
 //! - `snapshots` keeps revoked principals as tombstones, deliberately: that is
 //!   INVARIANTS.md #15's anti-resurrection watermark, and the population is
 //!   bounded by the number of principals rather than by traffic.
@@ -569,8 +570,8 @@ impl UsageSink for MemoryStore {
                 report.duplicate += 1;
                 continue;
             }
-            // Fencing check: the (lease, token, account) triple must name a
-            // known lease. Then the conservation check: the event must fit in
+            // Capability check: the (lease, token, account) triple must name
+            // a known lease. Then the conservation check: the event must fit in
             // `granted - used - credited`. For an active lease `credited` is
             // zero (plain capacity check). For a released lease the gap is
             // exactly the provisional settlement loss, so a straggler that

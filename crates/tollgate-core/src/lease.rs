@@ -4,8 +4,10 @@
 //! returns after atomically debiting an account's balance. A [`LocalLease`]
 //! is the instance-side runtime form: one atomic counter. Requests reserve
 //! units from it with a CAS loop — no lock, no I/O — which is how one
-//! database transaction amortizes across thousands of requests while fencing
-//! (INVARIANTS.md #4) keeps two instances from spending the same units.
+//! database transaction amortizes across thousands of requests. Central
+//! allocation bounds spend; the grant's lease-scoped capability prevents
+//! release or usage from being attributed to a different lease
+//! (INVARIANTS.md #1, #4).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -25,6 +27,7 @@ use crate::units::CostUnits;
 pub struct LeaseGrant {
     pub lease_id: LeaseId,
     pub account_id: AccountId,
+    /// Capability token for this lease record, not an account-wide epoch.
     pub fencing_token: FencingToken,
     pub units: CostUnits,
     pub expires_at: Timestamp,
@@ -104,7 +107,7 @@ impl LocalLease {
     ) -> Self {
         let usable_until = if margin < jiff::SignedDuration::ZERO {
             // A negative margin would extend local use past allocator expiry
-            // and invert the fencing protocol. Fail closed even if a caller
+            // and invert the expiry-safety protocol. Fail closed even if a caller
             // bypasses the validated LeaseManager configuration.
             Timestamp::MIN
         } else {

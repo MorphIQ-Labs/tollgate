@@ -510,8 +510,8 @@ pub struct Metrics {
     /// counter exists. Ordered, so two scrapes diff cleanly.
     pub denials: BTreeMap<&'static str, u64>,
     /// Units left on the installed lease, absent when no lease is installed
-    /// (cold start, or fenced out). Read off the shared slot, never from the
-    /// request path.
+    /// (cold start, expiry, or control-plane invalidation). Read off the
+    /// shared slot, never from the request path.
     pub lease_remaining: Option<u64>,
     /// How long the installed lease may still be spent against — the
     /// `expires_at - safety_margin` bound of INVARIANTS.md #12, not the raw
@@ -572,8 +572,9 @@ pub struct Accounting {
     /// Events whose request id the sink had already recorded — idempotent
     /// replay, not loss (INVARIANTS.md #7).
     pub duplicate: u64,
-    /// Events the sink *refused*: unknown lease, fencing mismatch, settled
-    /// lease. Bounded billing loss, and the number reconciliation watches.
+    /// Events the sink *refused*: unknown lease, lease-capability mismatch,
+    /// or no remaining lease capacity. Bounded billing loss, and the number
+    /// reconciliation watches.
     pub rejected: u64,
     /// Events a final flush could not deliver. Note this stays zero while the
     /// process runs — the steady-state path retries a failing sink forever, so

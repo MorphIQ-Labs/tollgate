@@ -250,7 +250,7 @@ mod tests {
         );
 
         // The record survives: a straggling usage event still has to be
-        // fenced and rejected against it.
+        // matched to its capability and checked against settlement capacity.
         let record = leases.get(lease_id).expect("record retained");
         assert!(!record.is_active());
         assert_eq!(record.credited(), CostUnits(40));

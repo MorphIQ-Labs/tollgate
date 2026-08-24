@@ -23,8 +23,9 @@ pub struct UsageEvent {
     /// The lease the units were spent from, for lease-vs-usage
     /// reconciliation.
     pub lease_id: LeaseId,
-    /// The spender's fencing token; a sink rejects tokens older than the
-    /// newest it has accepted for the account (INVARIANTS.md #4).
+    /// The referenced lease's capability token. A sink requires the stored
+    /// `(lease_id, account_id, fencing_token)` triple to match; token age
+    /// relative to another active lease is irrelevant (INVARIANTS.md #4).
     pub fencing_token: FencingToken,
     pub units: CostUnits,
     pub occurred_at: Timestamp,
