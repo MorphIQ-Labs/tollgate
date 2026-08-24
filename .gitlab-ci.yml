@@ -119,14 +119,56 @@ repository-hygiene:
         exit 1
       fi
     - |
-      # The registry guard lives in release-plz.toml, never in manifests:
-      # release-plz derives `cargo package --registry <name>` from a manifest
-      # publish list, and an undefined registry breaks the release job (#46).
-      publish_keys="$(git grep -n '^[[:space:]]*publish' -- '*Cargo.toml' || true)"
-      if [ -n "$publish_keys" ]; then
-        printf 'Cargo manifests must not carry a publish key (see AGENTS.md, issue #46):\n%s\n' "$publish_keys" >&2
+      # #46 was a registry *list* — `publish = ["private-registry"]` — from which
+      # release-plz derives `cargo package --registry <name>`; the name resolved
+      # nowhere and every main pipeline failed. The plain `publish = false` is a
+      # different thing and is required: it is what refuses a stray
+      # `cargo publish`, and release-plz tags private packages under
+      # `git_only = true` (0.3.152, PR #2603). Reject only the list form, in any
+      # manifest — a member inheriting it would evade a workspace-only check.
+      publish_lists="$(git grep -n '^[[:space:]]*publish[[:space:]]*=[[:space:]]*\[' -- '*Cargo.toml' || true)"
+      if [ -n "$publish_lists" ]; then
+        printf 'Cargo manifests must not carry a publish registry list (see AGENTS.md, issue #46):\n%s\n' "$publish_lists" >&2
         exit 1
       fi
+
+# #46 stayed latent for ten hours because the release job runs only on main, so
+# no merge-request pipeline could reach the packaging step. `update` computes the
+# next version and changelog locally — no forge token, no tags, nothing committed
+# — which exercises release-plz.toml and the manifests it reads, on the merge
+# request that changes them.
+release-config:
+  stage: check
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - "**/Cargo.toml"
+        - Cargo.lock
+        - release-plz.toml
+    - when: never
+  image: rust:1.97.1-bookworm
+  interruptible: true
+  variables:
+    GIT_DEPTH: "0"
+    RUSTUP_TOOLCHAIN: "1.97.1"
+  cache:
+    key: "release-plz-$RELEASE_PLZ_VERSION"
+    paths:
+      - .ci-cargo/registry/cache/
+      - .ci-cargo/registry/index/
+      - .ci-cargo/git/db/
+      - .ci-tools/
+  before_script:
+    - export PATH="$CARGO_INSTALL_ROOT/bin:$PATH"
+    - cargo install --locked release-plz --version "$RELEASE_PLZ_VERSION" --root "$CARGO_INSTALL_ROOT"
+    # GitLab checks out a detached commit; release-plz resolves the release
+    # history from the current branch and its upstream. Same preamble the
+    # release job uses, which also makes this a faithful dry-run of it.
+    - git fetch origin "$CI_DEFAULT_BRANCH"
+    - git checkout -B "$CI_DEFAULT_BRANCH" "$CI_COMMIT_SHA"
+    - git branch --set-upstream-to="origin/$CI_DEFAULT_BRANCH" "$CI_DEFAULT_BRANCH"
+  script:
+    - release-plz update --config release-plz.toml
 
 fmt:
   extends: .merge-request
@@ -317,10 +359,6 @@ release:
   variables:
     GIT_DEPTH: "0"
     RUSTUP_TOOLCHAIN: "1.97.1"
-    # Cargo requires every name in workspace.package.publish to resolve during
-    # `cargo package`. This crates.io index alias is packaging metadata only:
-    # release-plz remains git-only with publication disabled.
-    CARGO_REGISTRIES_MORPHIQ_INTERNAL_INDEX: "sparse+https://index.crates.io/"
   cache:
     key: "release-plz-$RELEASE_PLZ_VERSION"
     paths:

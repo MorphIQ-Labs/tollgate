@@ -20,6 +20,12 @@ edition = "2024"
 rust-version = "1.89"
 authors = ["MorphIQ Labs"]
 repository = "https://github.com/MorphIQ-Labs/tollgate"
+# Refuses a stray `cargo publish` whatever tooling is driving. This is the plain
+# `false`, never a registry list: a list makes release-plz run
+# `cargo package --registry <name>`, which is what broke every main pipeline in
+# #46. release-plz still tags private packages under `git_only = true`
+# (0.3.152, PR #2603), so the guard costs nothing here.
+publish = false
 
 [workspace.dependencies]
 # Time: jiff, not chrono/time — matches ferro-risk. The core crate takes
