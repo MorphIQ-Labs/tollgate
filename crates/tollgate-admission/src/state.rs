@@ -457,3 +457,68 @@ impl<T: SnapshotMap + ?Sized> SnapshotMap for Arc<T> {
         (**self).apply_many_at(updates, now);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tollgate_core::{AccountId, CostUnits, FencingToken, LeaseGrant, LeaseId};
+
+    fn lease(units: u64) -> Arc<LocalLease> {
+        Arc::new(LocalLease::new(
+            LeaseGrant {
+                lease_id: LeaseId(1),
+                account_id: AccountId(1),
+                fencing_token: FencingToken(1),
+                units: CostUnits(units),
+                expires_at: Timestamp::from_second(10_000).unwrap(),
+            },
+            CostUnits::ZERO,
+        ))
+    }
+
+    /// `state.rs` carried no tests at all, and the slot's whole job is to say
+    /// whether this instance may spend. `clear` in particular could be
+    /// replaced by a no-op with the entire suite still green (#43): the refill
+    /// plane happens to use `take` everywhere, so the documented
+    /// fenced-out path — "subsequent requests deny until a new lease arrives"
+    /// — had no witness at all.
+    #[test]
+    fn a_cleared_slot_stops_the_instance_spending() {
+        let slot = LeaseSlot::empty();
+        assert!(slot.load().is_none(), "a cold slot denies");
+
+        slot.install(lease(100));
+        assert!(slot.load().is_some());
+
+        slot.clear();
+        assert!(
+            slot.load().is_none(),
+            "a fenced-out instance must hold no lease, or it keeps spending \
+             against capacity the allocator may have re-granted"
+        );
+    }
+
+    /// `replace` hands back the superseded grant so the refill plane can
+    /// release it; `take` removes and returns in one step. Losing either
+    /// return value strands units until TTL reclaim.
+    #[test]
+    fn superseding_a_lease_hands_back_the_old_one() {
+        let slot = LeaseSlot::empty();
+        assert!(
+            slot.replace(lease(100)).is_none(),
+            "nothing was installed, so there is nothing to give back"
+        );
+
+        let superseded = slot.replace(lease(200)).expect("the first lease");
+        assert_eq!(superseded.remaining(), CostUnits(100));
+        assert_eq!(
+            slot.load().expect("the second lease").remaining(),
+            CostUnits(200)
+        );
+
+        let taken = slot.take().expect("the second lease");
+        assert_eq!(taken.remaining(), CostUnits(200));
+        assert!(slot.load().is_none(), "take leaves the slot empty");
+        assert!(slot.take().is_none(), "and taking again yields nothing");
+    }
+}

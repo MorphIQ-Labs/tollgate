@@ -42,6 +42,9 @@ docker compose up -d
 TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate cargo test -p tollgate-store-postgres
 TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate ./scripts/check_mutations.sh --diff main
 
+# One crate's whole surface, rather than only what a branch changed:
+./scripts/check_mutations.sh --package tollgate-core
+
 # Run the example service:
 cargo run -p pricing-api
 curl -s -H 'Authorization: Bearer demo-key-1' -H 'Content-Type: application/json' \

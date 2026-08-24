@@ -98,4 +98,20 @@ mod tests {
         assert_eq!(CostUnits(u64::MAX).checked_mul(2), None);
         assert_eq!(CostUnits(3).checked_mul(4), Some(CostUnits(12)));
     }
+
+    /// The `From` impl carried no test, so it could be replaced by one
+    /// returning zero without a failure anywhere (#43). That is not a cosmetic
+    /// survivor: every `.into()` in a caller's cost schedule would silently
+    /// become free, and free work is admitted, charged nothing, and
+    /// reconciles cleanly.
+    #[test]
+    fn converting_from_u64_preserves_the_quantity() {
+        for raw in [0, 1, 50, u64::MAX] {
+            assert_eq!(CostUnits::from(raw), CostUnits(raw));
+            assert_eq!(CostUnits::from(raw).get(), raw);
+        }
+        let inferred: CostUnits = 7u64.into();
+        assert_eq!(inferred, CostUnits(7));
+        assert!(!inferred.is_zero(), "a converted charge must not read free");
+    }
 }
