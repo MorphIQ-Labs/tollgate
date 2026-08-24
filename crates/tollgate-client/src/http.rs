@@ -22,7 +22,7 @@ use tollgate_core::{
     AccountId, AccountSnapshot, CostUnits, FencingToken, LeaseGrant, LeaseId, Principal,
     PublishableSnapshot, UsageEvent,
 };
-use tollgate_store::wire::{AcquireRequest, IngestRequest, Problem, ReleaseRequest};
+use tollgate_store::wire::{AcquireRequest, IngestRequestRef, Problem, ReleaseRequest};
 use tollgate_store::{
     AllocateError, IngestReport, LeaseAllocator, ReclaimBatch, SnapshotPush, SnapshotResolution,
     SnapshotSource, StoreError, UsageSink,
@@ -221,9 +221,7 @@ impl UsageSink for HttpStore {
         let response = self
             .client
             .post(self.url("/v1/usage/ingest"))
-            .json(&IngestRequest {
-                events: events.to_vec(),
-            })
+            .json(&IngestRequestRef { events })
             .send()
             .await
             .map_err(|e| StoreError(format!("http: {e}")))?;
