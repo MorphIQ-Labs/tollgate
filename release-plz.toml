@@ -2,6 +2,11 @@
 # the workspace tag; no package is published to a registry.
 
 [workspace]
+# This is release-plz's own switch, not the Cargo manifest key of the same name.
+# Both are set: the manifest `publish = false` refuses a stray `cargo publish`,
+# and release-plz still tags private packages under `git_only = true` (0.3.152,
+# PR #2603). What must never appear in a manifest is a registry *list*, which is
+# what broke the release job in #46 — `repository-hygiene` rejects that form.
 publish = false
 git_only = true
 # One-time migration: force release-plz to open the 0.1.1 release MR from the
