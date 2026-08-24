@@ -291,7 +291,7 @@ until it has one.
     the build unless an `#[allow]` states why there is nothing to say.
     *Tests:* `refill_failure_with_an_empty_slot_warns`,
     `healthy_refill_emits_no_warning` (the converse: a healthy plane stays
-    quiet, or the signal is worthless), and
+    quiet, or the signal is worthless), `ping_surfaces_a_closed_pool`, and
     `usage_sink_outage_and_recovery_are_reported`.
 
 20. **Every admission outcome is counted, exactly once, under its own reason.**

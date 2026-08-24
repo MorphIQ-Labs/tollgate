@@ -468,12 +468,24 @@ impl PostgresStore {
     }
 }
 
-/// Lock one lease row. Returns (account_id, fencing_token, granted, used,
-/// credited, expires_at_us, state).
+/// One locked lease row, named so its accounting fields cannot be confused at
+/// the call site and tooling does not manufacture a Cartesian product of
+/// arbitrary replacements for an anonymous seven-field tuple.
+struct LockedLeaseRow {
+    account_id: Vec<u8>,
+    fencing_token: i64,
+    granted: i64,
+    used: i64,
+    credited: i64,
+    expires_at_us: i64,
+    state: i16,
+}
+
+/// Lock one lease row for a settlement transition.
 async fn lock_lease(
     tx: &mut Transaction<'_, Postgres>,
     lease_id: LeaseId,
-) -> Result<Option<(Vec<u8>, i64, i64, i64, i64, i64, i16)>, sqlx::Error> {
+) -> Result<Option<LockedLeaseRow>, sqlx::Error> {
     let row = sqlx::query(
         "SELECT account_id, fencing_token, granted, used, credited, expires_at_us, state
          FROM tollgate_leases WHERE lease_id = $1 FOR UPDATE",
@@ -481,16 +493,14 @@ async fn lock_lease(
     .bind(id_bytes(lease_id.0))
     .fetch_optional(&mut **tx)
     .await?;
-    Ok(row.map(|r| {
-        (
-            r.get(0),
-            r.get(1),
-            r.get(2),
-            r.get(3),
-            r.get(4),
-            r.get(5),
-            r.get(6),
-        )
+    Ok(row.map(|row| LockedLeaseRow {
+        account_id: row.get(0),
+        fencing_token: row.get(1),
+        granted: row.get(2),
+        used: row.get(3),
+        credited: row.get(4),
+        expires_at_us: row.get(5),
+        state: row.get(6),
     }))
 }
 
@@ -590,11 +600,18 @@ impl LeaseAllocator for PostgresStore {
     ) -> Result<(), AllocateError> {
         let mut tx = self.pool.begin().await.map_err(alloc_storage)?;
         let result = async {
-            let (account_id, fence, granted, used, _credited, expires_at_us, state) =
-                lock_lease(&mut tx, lease_id)
-                    .await
-                    .map_err(alloc_storage)?
-                    .ok_or(AllocateError::UnknownLease)?;
+            let LockedLeaseRow {
+                account_id,
+                fencing_token: fence,
+                granted,
+                used,
+                credited: _credited,
+                expires_at_us,
+                state,
+            } = lock_lease(&mut tx, lease_id)
+                .await
+                .map_err(alloc_storage)?
+                .ok_or(AllocateError::UnknownLease)?;
 
             let stored_fence = u64::try_from(fence).map_err(|_| {
                 AllocateError::Storage(StoreError(format!(
@@ -1345,5 +1362,29 @@ impl AdminStore for PostgresStore {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A readiness probe is evidence that PostgreSQL answered, not merely that
+    /// a store object exists (INVARIANTS.md #19).
+    #[tokio::test]
+    async fn ping_surfaces_a_closed_pool() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/tollgate")
+            .unwrap();
+        pool.close().await;
+        let (push, _) = broadcast::channel(1);
+        let store = PostgresStore {
+            pool,
+            policy: GrantPolicy::default(),
+            reclaim_grace_us: 0,
+            push,
+        };
+
+        assert!(store.ping().await.is_err());
     }
 }
