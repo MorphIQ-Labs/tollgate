@@ -858,6 +858,50 @@ async fn inactive_account_refuses_leases() {
     );
 }
 
+/// Mirrors `store_suite::enumerating_principals_includes_revoked_ones`.
+#[tokio::test]
+async fn enumerating_principals_includes_revoked_ones() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    assert_eq!(
+        store.principals().await.unwrap(),
+        Some(Vec::new()),
+        "an empty catalogue is Some(empty), never None"
+    );
+
+    let snapshot = || {
+        publishable(Arc::new(AccountSnapshot {
+            account_id: ACCOUNT,
+            key_id: None,
+            generation: Generation(1),
+            status: AccountStatus::Active,
+            valid_until: t(10_000),
+            permissions: PermissionBits::ALL,
+            limits: ResolvedLimits {
+                max_items_per_request: 64,
+                rate_units_per_second: 1_000,
+                rate_burst_units: 1_000,
+            },
+            cost_table: Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+        }))
+    };
+    let live = Principal(1);
+    let revoked = Principal(2);
+    AdminStore::publish_snapshot(&*store, live, snapshot())
+        .await
+        .unwrap();
+    AdminStore::publish_snapshot(&*store, revoked, snapshot())
+        .await
+        .unwrap();
+    AdminStore::remove_snapshot(&*store, revoked).await.unwrap();
+
+    let mut listed = store.principals().await.unwrap().expect("enumerable");
+    listed.sort_by_key(|principal| principal.0);
+    assert_eq!(listed, vec![live, revoked]);
+}
+
 /// Mirrors `store_suite::a_ttl_beyond_the_policy_maximum_is_clamped`.
 #[tokio::test]
 async fn a_ttl_beyond_the_policy_maximum_is_clamped() {

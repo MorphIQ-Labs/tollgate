@@ -73,6 +73,14 @@ pub struct PublishSnapshotRequest {
     pub snapshot: Arc<AccountSnapshot>,
 }
 
+/// The catalogue of principals a control plane knows, revoked ones included
+/// (#48). An instance serving any customer needs this to learn the set that
+/// already exists; pushes only carry what changes after it subscribes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrincipalsResponse {
+    pub principals: Vec<tollgate_core::Principal>,
+}
+
 /// RFC-7807-shaped error body with a stable machine `code`, mirrored back
 /// into domain errors by the HTTP transport.
 #[derive(Debug, Clone, Serialize, Deserialize)]

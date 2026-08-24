@@ -13,6 +13,7 @@ use tollgate_admission::{
 };
 use tollgate_client::{
     ManualClock, SlotRegistry, SnapshotManager, SnapshotManagerConfig, SystemClock,
+    TrackedPrincipals,
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, FencingToken,
@@ -80,7 +81,7 @@ fn fixture(store: Arc<MemoryStore>) -> Fixture {
         Arc::clone(&slots),
         Arc::new(ManualClock::new(t(0))),
         SnapshotManagerConfig {
-            principals: vec![PRINCIPAL],
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
             refresh_interval: std::time::Duration::from_millis(20),
             negative_ttl: SignedDuration::from_secs(30),
             retry_backoff: std::time::Duration::from_millis(5),
@@ -277,7 +278,7 @@ async fn negative_ttl_retry_is_backed_off_and_recovers_without_push() {
         SlotRegistry::new(),
         Arc::new(SystemClock),
         SnapshotManagerConfig {
-            principals: vec![PRINCIPAL],
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
             refresh_interval: std::time::Duration::from_secs(60),
             negative_ttl: SignedDuration::from_millis(40),
             retry_backoff: std::time::Duration::from_millis(80),
@@ -372,7 +373,7 @@ async fn readiness_falls_when_snapshot_expires_during_outage() {
         slots,
         Arc::clone(&clock) as _,
         SnapshotManagerConfig {
-            principals: vec![PRINCIPAL],
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
             refresh_interval: std::time::Duration::from_millis(20),
             negative_ttl: SignedDuration::from_secs(30),
             retry_backoff: std::time::Duration::from_millis(5),
@@ -409,7 +410,7 @@ async fn snapshot_counters_track_failures_and_the_unresolved_gauge() {
         slots,
         Arc::clone(&clock) as _,
         SnapshotManagerConfig {
-            principals: vec![PRINCIPAL],
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
             refresh_interval: std::time::Duration::from_millis(20),
             negative_ttl: SignedDuration::from_secs(30),
             retry_backoff: std::time::Duration::from_millis(5),
@@ -492,7 +493,7 @@ async fn readiness_falls_if_refresh_hangs_across_snapshot_expiry() {
         SlotRegistry::new(),
         Arc::new(SystemClock),
         SnapshotManagerConfig {
-            principals: vec![PRINCIPAL],
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
             refresh_interval: std::time::Duration::from_millis(5),
             negative_ttl: SignedDuration::from_secs(30),
             retry_backoff: std::time::Duration::from_millis(5),
@@ -540,7 +541,7 @@ async fn shutdown_cancels_in_flight_snapshot_fetches() {
         SlotRegistry::new(),
         Arc::new(ManualClock::new(t(0))),
         SnapshotManagerConfig {
-            principals: (0..64).map(Principal).collect(),
+            principals: TrackedPrincipals::Fixed((0..64).map(Principal).collect()),
             refresh_interval: std::time::Duration::from_secs(1),
             negative_ttl: SignedDuration::from_secs(30),
             retry_backoff: std::time::Duration::from_millis(5),
@@ -586,7 +587,7 @@ async fn a_panicking_fetch_does_not_kill_the_manager() {
         SlotRegistry::new(),
         Arc::new(ManualClock::new(t(0))),
         SnapshotManagerConfig {
-            principals: vec![PRINCIPAL],
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
             refresh_interval: std::time::Duration::from_millis(10),
             negative_ttl: SignedDuration::from_secs(30),
             retry_backoff: std::time::Duration::from_millis(5),
@@ -606,11 +607,448 @@ async fn a_panicking_fetch_does_not_kill_the_manager() {
 #[test]
 fn invalid_snapshot_manager_intervals_are_rejected() {
     let config = SnapshotManagerConfig {
-        principals: vec![PRINCIPAL],
+        principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
         refresh_interval: std::time::Duration::ZERO,
         negative_ttl: SignedDuration::from_secs(30),
         retry_backoff: std::time::Duration::from_millis(5),
         max_concurrent_fetches: 4,
     };
     assert!(config.validate().is_err());
+}
+
+// ---- dynamic principal discovery (#48) ------------------------------------
+
+const LATER_PRINCIPAL: Principal = Principal(8);
+
+/// A discovering fixture, seeded with nothing: the set comes from the source.
+fn discovering_fixture(store: Arc<MemoryStore>) -> Fixture {
+    let map = Arc::new(ArcSwapSnapshotMap::new());
+    let engine = AdmissionEngine::new(Arc::clone(&map));
+    let slots = SlotRegistry::new();
+    let manager = SnapshotManager::spawn(
+        store.clone(),
+        map,
+        Arc::clone(&slots),
+        Arc::new(ManualClock::new(t(0))),
+        SnapshotManagerConfig {
+            principals: TrackedPrincipals::All { seed: Vec::new() },
+            refresh_interval: std::time::Duration::from_millis(20),
+            negative_ttl: SignedDuration::from_secs(30),
+            retry_backoff: std::time::Duration::from_millis(5),
+            max_concurrent_fetches: 4,
+        },
+    )
+    .unwrap();
+    Fixture {
+        engine,
+        slots,
+        manager,
+    }
+}
+
+fn admit_as(fixture: &Fixture, principal: Principal) -> Result<(), DenyReason> {
+    fixture
+        .engine
+        .admit(
+            AdmissionRequest {
+                principal,
+                required: PermissionBits::bit(0),
+                op: &PriceOp,
+                items: 1,
+            },
+            t(1),
+        )
+        .map(|admitted| {
+            admitted.reservation.cancel();
+        })
+}
+
+/// The point of #48: a principal published *after* the instance started is
+/// served without a restart. Before this, the tracked set was fixed at
+/// construction and a newly provisioned customer was denied until a redeploy.
+#[tokio::test(start_paused = true)]
+async fn a_principal_published_after_start_is_discovered_and_served() {
+    let store = base_store();
+    store.publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))));
+    let fixture = discovering_fixture(store.clone());
+    stock_slot(&fixture);
+    settle().await;
+    assert_eq!(admit_as(&fixture, PRINCIPAL), Ok(()));
+    assert_eq!(
+        admit_as(&fixture, LATER_PRINCIPAL),
+        Err(DenyReason::UnknownPrincipal),
+        "not published yet, so denied fail-closed"
+    );
+
+    store.publish_snapshot(
+        LATER_PRINCIPAL,
+        publishable(snapshot(1, PermissionBits::bit(0))),
+    );
+    settle().await;
+
+    assert_eq!(
+        admit_as(&fixture, LATER_PRINCIPAL),
+        Ok(()),
+        "a principal this instance was never configured with must now be served"
+    );
+    assert_eq!(
+        admit_as(&fixture, PRINCIPAL),
+        Ok(()),
+        "and the original still is"
+    );
+}
+
+/// Discovery is opt-in: a `Fixed` instance must not pick the new principal up,
+/// so upgrading changes no existing deployment's behaviour.
+#[tokio::test(start_paused = true)]
+async fn a_fixed_instance_ignores_principals_it_was_not_configured_with() {
+    let store = base_store();
+    store.publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))));
+    let fixture = fixture(store.clone());
+    stock_slot(&fixture);
+    settle().await;
+
+    store.publish_snapshot(
+        LATER_PRINCIPAL,
+        publishable(snapshot(1, PermissionBits::bit(0))),
+    );
+    settle().await;
+
+    assert_eq!(
+        admit_as(&fixture, LATER_PRINCIPAL),
+        Err(DenyReason::UnknownPrincipal),
+        "Fixed means fixed: this instance serves its configured slice only"
+    );
+    assert_eq!(admit_as(&fixture, PRINCIPAL), Ok(()));
+}
+
+/// Revocation and removal-from-the-catalogue are different things, and
+/// conflating them is how a revoked principal gets resurrected
+/// (INVARIANTS.md #15).
+///
+/// `remove_snapshot` leaves a tombstone, so the principal stays *enumerated*
+/// and therefore stays tracked. It is denied because its resolution is
+/// negative, not because it was forgotten — and the generation watermark it
+/// keeps is what makes a replayed older snapshot a no-op.
+#[tokio::test(start_paused = true)]
+async fn a_revoked_principal_stays_tracked_and_cannot_be_resurrected() {
+    let store = base_store();
+    store.publish_snapshot(PRINCIPAL, publishable(snapshot(5, PermissionBits::bit(0))));
+    let fixture = discovering_fixture(store.clone());
+    stock_slot(&fixture);
+    settle().await;
+    assert_eq!(admit_as(&fixture, PRINCIPAL), Ok(()));
+
+    store.remove_snapshot(PRINCIPAL);
+    settle().await;
+    assert_eq!(
+        admit_as(&fixture, PRINCIPAL),
+        Err(DenyReason::UnknownPrincipal),
+        "revocation reaches a running instance"
+    );
+
+    // A delayed publish at an older generation must not bring it back.
+    store.publish_snapshot(PRINCIPAL, publishable(snapshot(4, PermissionBits::bit(0))));
+    settle().await;
+    assert_eq!(
+        admit_as(&fixture, PRINCIPAL),
+        Err(DenyReason::UnknownPrincipal),
+        "the tombstone's watermark outranks the replay"
+    );
+
+    // A genuinely newer one does.
+    store.publish_snapshot(PRINCIPAL, publishable(snapshot(6, PermissionBits::bit(0))));
+    settle().await;
+    assert_eq!(admit_as(&fixture, PRINCIPAL), Ok(()));
+}
+
+/// A source that enumerates two principals but can only answer for one.
+///
+/// A *revoked* principal is not unresolvable — it resolves negatively, and a
+/// negative resolution counts as resolved. The only thing that genuinely
+/// leaves a principal unresolved is a fetch that errors, so that is what this
+/// injects.
+struct OneUnanswerableSource {
+    good: Arc<AccountSnapshot>,
+}
+
+#[async_trait]
+impl SnapshotSource for OneUnanswerableSource {
+    async fn snapshot(&self, principal: Principal) -> Result<SnapshotResolution, StoreError> {
+        if principal == PRINCIPAL {
+            Ok(SnapshotResolution::Present(publishable(Arc::clone(
+                &self.good,
+            ))))
+        } else {
+            Err(StoreError("injected permanent fetch failure".into()))
+        }
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
+        let (sender, receiver) = tokio::sync::broadcast::channel(1);
+        drop(sender);
+        receiver
+    }
+
+    async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
+        Ok(Some(vec![PRINCIPAL, LATER_PRINCIPAL]))
+    }
+}
+
+/// Readiness under `All` means "I can serve someone", not "I can serve
+/// everyone": one principal the source cannot answer for must not hold an
+/// otherwise healthy instance out of rotation (INVARIANTS.md #10). Under
+/// `Fixed` the strict all-resolved reading is kept, and this same source
+/// leaves that instance unready — the two readings are asserted against one
+/// fixture so the difference is the rule, not the setup.
+#[tokio::test(start_paused = true)]
+async fn one_unanswerable_principal_unreadies_only_a_fixed_instance() {
+    fn spawn(mode: TrackedPrincipals) -> Fixture {
+        let source = Arc::new(OneUnanswerableSource {
+            good: snapshot(1, PermissionBits::bit(0)),
+        });
+        let map = Arc::new(ArcSwapSnapshotMap::new());
+        let engine = AdmissionEngine::new(Arc::clone(&map));
+        let slots = SlotRegistry::new();
+        let manager = SnapshotManager::spawn(
+            source,
+            map,
+            Arc::clone(&slots),
+            Arc::new(ManualClock::new(t(0))),
+            SnapshotManagerConfig {
+                principals: mode,
+                refresh_interval: std::time::Duration::from_millis(20),
+                negative_ttl: SignedDuration::from_secs(30),
+                retry_backoff: std::time::Duration::from_millis(5),
+                max_concurrent_fetches: 4,
+            },
+        )
+        .unwrap();
+        Fixture {
+            engine,
+            slots,
+            manager,
+        }
+    }
+
+    let discovering = spawn(TrackedPrincipals::All { seed: Vec::new() });
+    stock_slot(&discovering);
+    settle().await;
+    assert!(
+        *discovering.manager.ready().borrow(),
+        "one of two principals is serviceable, so the instance belongs in rotation"
+    );
+    assert_eq!(admit_as(&discovering, PRINCIPAL), Ok(()));
+    assert_eq!(
+        admit_as(&discovering, LATER_PRINCIPAL),
+        Err(DenyReason::UnknownPrincipal),
+        "and the unanswerable one is still denied, fail-closed"
+    );
+
+    let fixed = spawn(TrackedPrincipals::Fixed(vec![PRINCIPAL, LATER_PRINCIPAL]));
+    stock_slot(&fixed);
+    settle().await;
+    assert!(
+        !*fixed.manager.ready().borrow(),
+        "a configured slice is small and hand-picked, so an unanswerable \
+         member is a real gap and readiness still says so"
+    );
+}
+
+/// A source with no catalogue at all — it does not override `principals`, so
+/// it takes the trait's default.
+struct NoCatalogueSource {
+    snapshot: Arc<AccountSnapshot>,
+}
+
+#[async_trait]
+impl SnapshotSource for NoCatalogueSource {
+    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
+        Ok(SnapshotResolution::Present(publishable(Arc::clone(
+            &self.snapshot,
+        ))))
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
+        let (sender, receiver) = tokio::sync::broadcast::channel(1);
+        drop(sender);
+        receiver
+    }
+}
+
+/// A source that enumerates but always fails to.
+struct FailingCatalogueSource {
+    snapshot: Arc<AccountSnapshot>,
+    failures: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl SnapshotSource for FailingCatalogueSource {
+    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
+        Ok(SnapshotResolution::Present(publishable(Arc::clone(
+            &self.snapshot,
+        ))))
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
+        let (sender, receiver) = tokio::sync::broadcast::channel(1);
+        drop(sender);
+        receiver
+    }
+
+    async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
+        self.failures.fetch_add(1, Ordering::AcqRel);
+        Err(StoreError("injected catalogue outage".into()))
+    }
+}
+
+fn spawn_with(source: Arc<dyn SnapshotSource>, config: SnapshotManagerConfig) -> Fixture {
+    let map = Arc::new(ArcSwapSnapshotMap::new());
+    let engine = AdmissionEngine::new(Arc::clone(&map));
+    let slots = SlotRegistry::new();
+    let manager = SnapshotManager::spawn(
+        source,
+        map,
+        Arc::clone(&slots),
+        Arc::new(ManualClock::new(t(0))),
+        config,
+    )
+    .unwrap();
+    Fixture {
+        engine,
+        slots,
+        manager,
+    }
+}
+
+fn discovering_config(refresh_ms: u64) -> SnapshotManagerConfig {
+    SnapshotManagerConfig {
+        principals: TrackedPrincipals::All {
+            seed: vec![PRINCIPAL],
+        },
+        refresh_interval: std::time::Duration::from_millis(refresh_ms),
+        negative_ttl: SignedDuration::from_secs(30),
+        retry_backoff: std::time::Duration::from_millis(5),
+        max_concurrent_fetches: 4,
+    }
+}
+
+/// "Cannot enumerate" and "the catalogue is empty" lead an instance to
+/// opposite conclusions, and the trait's default must mean the first: keep
+/// the configured set. Returning `Some(vec![])` instead would untrack
+/// everyone and serve nobody — from a source whose only failing is that it
+/// predates the seam.
+#[tokio::test(start_paused = true)]
+async fn a_source_that_cannot_enumerate_keeps_the_configured_set() {
+    let fixture = spawn_with(
+        Arc::new(NoCatalogueSource {
+            snapshot: snapshot(1, PermissionBits::bit(0)),
+        }),
+        discovering_config(20),
+    );
+    stock_slot(&fixture);
+    settle().await;
+
+    assert_eq!(
+        admit_as(&fixture, PRINCIPAL),
+        Ok(()),
+        "the seed must survive a source with no catalogue"
+    );
+    assert!(*fixture.manager.ready().borrow());
+}
+
+/// A failing enumeration is not a silent no-op: it keeps the current set —
+/// so everything already known carries on working — and says so in its own
+/// counter, because that is the only place it is visible. `unresolved` cannot
+/// show it: nothing became unresolved, new principals just stopped arriving.
+#[tokio::test(start_paused = true)]
+async fn a_failing_enumeration_is_counted_and_keeps_the_current_set() {
+    let failures = Arc::new(AtomicUsize::new(0));
+    let fixture = spawn_with(
+        Arc::new(FailingCatalogueSource {
+            snapshot: snapshot(1, PermissionBits::bit(0)),
+            failures: Arc::clone(&failures),
+        }),
+        discovering_config(20),
+    );
+    stock_slot(&fixture);
+    settle().await;
+
+    assert!(failures.load(Ordering::Acquire) > 0, "it was attempted");
+    assert_eq!(
+        admit_as(&fixture, PRINCIPAL),
+        Ok(()),
+        "the seeded principal keeps being served through the outage"
+    );
+    let stats = fixture.manager.counters().snapshot();
+    assert!(
+        stats.discovery_failures > 0,
+        "a frozen tracked set must be visible somewhere: {stats:?}"
+    );
+    assert_eq!(
+        stats.unresolved, 0,
+        "and it is not visible in `unresolved`, which is why it needs its own counter"
+    );
+}
+
+/// A push is discovery in its own right: the principal it names is tracked and
+/// installed without waiting for the next enumeration. The refresh interval
+/// here is longer than the test, so only the push can explain the result.
+#[tokio::test(start_paused = true)]
+async fn a_push_discovers_the_principal_it_names() {
+    let store = base_store();
+    store.publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))));
+    let fixture = spawn_with(store.clone(), discovering_config(600_000));
+    stock_slot(&fixture);
+    settle().await;
+    assert_eq!(
+        admit_as(&fixture, LATER_PRINCIPAL),
+        Err(DenyReason::UnknownPrincipal)
+    );
+
+    store.publish_snapshot(
+        LATER_PRINCIPAL,
+        publishable(snapshot(1, PermissionBits::bit(0))),
+    );
+    settle().await;
+
+    assert_eq!(
+        admit_as(&fixture, LATER_PRINCIPAL),
+        Ok(()),
+        "the push carried the principal; the next refresh is ten minutes away"
+    );
+}
+
+/// The other half of the readiness rule: `All` falls unready when *nothing*
+/// resolves. "Serving someone" is the bar, and an instance serving nobody is
+/// below it however many principals it tracks.
+#[tokio::test(start_paused = true)]
+async fn a_discovering_instance_with_nothing_resolvable_is_unready() {
+    struct AllFail;
+
+    #[async_trait]
+    impl SnapshotSource for AllFail {
+        async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
+            Err(StoreError("injected total source outage".into()))
+        }
+
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
+            let (sender, receiver) = tokio::sync::broadcast::channel(1);
+            drop(sender);
+            receiver
+        }
+
+        async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
+            Ok(Some(vec![PRINCIPAL, LATER_PRINCIPAL]))
+        }
+    }
+
+    let fixture = spawn_with(Arc::new(AllFail), discovering_config(20));
+    stock_slot(&fixture);
+    settle().await;
+
+    assert!(
+        !*fixture.manager.ready().borrow(),
+        "two principals tracked and neither resolvable: this instance serves nobody"
+    );
 }

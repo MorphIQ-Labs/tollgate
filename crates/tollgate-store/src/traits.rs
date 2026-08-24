@@ -427,6 +427,27 @@ pub trait SnapshotSource: Send + Sync {
     /// contract is that a fresh `snapshot()` fetch after a lag error
     /// observes at least the newest generation.
     fn subscribe(&self) -> broadcast::Receiver<SnapshotPush>;
+
+    /// Every principal this source knows, including revoked ones — a
+    /// tombstone is still a principal an instance must track, so that it
+    /// knows the revocation (INVARIANTS.md #15).
+    ///
+    /// For instances that serve any customer rather than a configured slice
+    /// (#48). Pushes alone cannot answer this: they carry deltas from the
+    /// moment of subscribing, so a cold instance has no way to learn the set
+    /// that already exists.
+    ///
+    /// `Ok(None)` means this source cannot enumerate, and the manager stays
+    /// on its configured set — exactly today's behaviour. `Err` means
+    /// enumeration *failed* and is retried. The two are deliberately
+    /// distinct: collapsing them would let a broken source look like a
+    /// limited one, and an instance would quietly serve a stale set forever.
+    ///
+    /// Defaulted so a source that has no catalogue — a test double, an
+    /// embedder's own adapter — is unaffected.
+    async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
+        Ok(None)
+    }
 }
 
 /// Liveness of the backing store, for readiness probes: a server must not

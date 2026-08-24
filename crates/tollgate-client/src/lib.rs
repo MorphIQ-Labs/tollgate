@@ -41,7 +41,7 @@ pub use lease_manager::{
 };
 pub use snapshot_manager::{
     SlotRegistry, SnapshotCounters, SnapshotManager, SnapshotManagerConfig,
-    SnapshotManagerConfigError, SnapshotManagerReport, SnapshotStats,
+    SnapshotManagerConfigError, SnapshotManagerReport, SnapshotStats, TrackedPrincipals,
 };
 pub use usage_writer::{
     UsagePermit, UsageRecorder, UsageWriter, UsageWriterConfig, UsageWriterConfigError,

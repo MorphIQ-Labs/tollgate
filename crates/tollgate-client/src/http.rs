@@ -22,7 +22,9 @@ use tollgate_core::{
     AccountId, AccountSnapshot, CostUnits, FencingToken, LeaseGrant, LeaseId, Principal,
     PublishableSnapshot, UsageEvent,
 };
-use tollgate_store::wire::{AcquireRequest, IngestRequestRef, Problem, ReleaseRequest};
+use tollgate_store::wire::{
+    AcquireRequest, IngestRequestRef, PrincipalsResponse, Problem, ReleaseRequest,
+};
 use tollgate_store::{
     AllocateError, IngestReport, LeaseAllocator, ReclaimBatch, SnapshotPush, SnapshotResolution,
     SnapshotSource, StoreError, UsageSink,
@@ -208,6 +210,33 @@ impl SnapshotSource for HttpStore {
         let (sender, receiver) = broadcast::channel(1);
         drop(sender);
         receiver
+    }
+
+    /// Over HTTP this is the *only* way an instance learns the principal set:
+    /// `subscribe` above is a closed channel, so there are no deltas to
+    /// accumulate and the periodic refresh carries everything (#48).
+    ///
+    /// A server whose backend cannot enumerate answers 501, which maps back
+    /// to `None` — "stay on your configured set" — rather than to an empty
+    /// catalogue, which would mean "forget everyone".
+    async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
+        let response = self
+            .client
+            .get(self.url("/v1/snapshots"))
+            .send()
+            .await
+            .map_err(|e| StoreError(format!("http: {e}")))?;
+        if response.status() == reqwest::StatusCode::NOT_IMPLEMENTED {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(StoreError(format!("server returned {}", response.status())));
+        }
+        let body: PrincipalsResponse = response
+            .json()
+            .await
+            .map_err(|e| StoreError(format!("http: {e}")))?;
+        Ok(Some(body.principals))
     }
 }
 
