@@ -685,6 +685,28 @@ async fn inactive_account_refuses_leases() {
     );
 }
 
+#[tokio::test]
+async fn unknown_account_activity_update_is_refused() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let unknown = AccountId(999);
+
+    for active in [false, true] {
+        assert_eq!(
+            AdminStore::set_active(&*store, unknown, active)
+                .await
+                .unwrap_err(),
+            AllocateError::UnknownAccount,
+            "an unknown account cannot be {}",
+            if active { "activated" } else { "deactivated" }
+        );
+    }
+
+    store
+        .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
+        .await
+        .expect("refusing the unknown account leaves existing accounts active");
+}
+
 /// #48's enumeration seam, and the detail the whole removal-vs-revocation
 /// distinction rests on: a revoked principal stays in the catalogue. Its
 /// tombstone *is* the record of the revocation, so an instance must keep
