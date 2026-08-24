@@ -5,6 +5,12 @@ merge request titles.
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.14...v0.3.0) - 2026-08-24
+
+### Other
+
+- *(wire)* [**breaking**] standardize 128-bit ID encoding
+
 ## [0.2.14](https://github.com/MorphIQ-Labs/tollgate/compare/v0.2.13...v0.2.14) - 2026-08-24
 
 ### Added
