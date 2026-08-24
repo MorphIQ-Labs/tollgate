@@ -37,8 +37,8 @@ use subtle::ConstantTimeEq;
 use tollgate_admission::{AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot};
 use tollgate_client::{
     ChargeGuard, Clock, LeaseCounters, LeaseManager, LeaseManagerConfig, SlotRegistry,
-    SnapshotCounters, SnapshotManager, SnapshotManagerConfig, SystemClock, UsageRecorder,
-    UsageWriter, UsageWriterConfig,
+    SnapshotCounters, SnapshotManager, SnapshotManagerConfig, SystemClock, TrackedPrincipals,
+    UsageRecorder, UsageWriter, UsageWriterConfig,
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, Generation,
@@ -348,7 +348,14 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
             Arc::clone(&slots),
             clock.clone(),
             SnapshotManagerConfig {
-                principals: vec![principal],
+                // Stateless: any instance may serve any customer, so this
+                // one tracks everything the store knows rather than a list
+                // fixed at boot (#48). Seeded with the demo key so the
+                // example still works against a source that cannot
+                // enumerate.
+                principals: TrackedPrincipals::All {
+                    seed: vec![principal],
+                },
                 refresh_interval: std::time::Duration::from_secs(30),
                 negative_ttl: SignedDuration::from_secs(60),
                 retry_backoff: std::time::Duration::from_millis(200),
@@ -557,6 +564,12 @@ pub struct Snapshots {
     pub refresh_attempts: u64,
     /// Fetches the source could not answer.
     pub refresh_failures: u64,
+    /// Enumerations the source could not answer (#48). Its own counter
+    /// because its consequence is different: fetch failures make known
+    /// principals stale, which `unresolved` shows, while enumeration failures
+    /// mean *new* principals never appear — invisible in every other number,
+    /// since everything already tracked keeps working.
+    pub discovery_failures: u64,
     /// Principals with no currently valid resolution — the gauge that makes
     /// readiness false, and the disambiguator for an `unknown_principal`
     /// spike: nonzero means distribution, zero means credentials.
@@ -646,6 +659,7 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Json<Metrics> {
             Snapshots {
                 refresh_attempts: stats.refresh_attempts,
                 refresh_failures: stats.refresh_failures,
+                discovery_failures: stats.discovery_failures,
                 unresolved: stats.unresolved,
             }
         }),

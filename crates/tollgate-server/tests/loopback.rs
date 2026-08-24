@@ -20,7 +20,7 @@ use tollgate_admission::{
 };
 use tollgate_client::{
     HttpStore, LeaseManager, LeaseManagerConfig, SlotRegistry, SnapshotManager,
-    SnapshotManagerConfig, SystemClock, UsageWriter, UsageWriterConfig,
+    SnapshotManagerConfig, SystemClock, TrackedPrincipals, UsageWriter, UsageWriterConfig,
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, FencingToken,
@@ -155,7 +155,7 @@ async fn http_negative_ttl_refetches_without_push() {
         Arc::clone(&slots),
         Arc::new(SystemClock),
         SnapshotManagerConfig {
-            principals: vec![PRINCIPAL],
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
             refresh_interval: std::time::Duration::from_secs(60),
             negative_ttl: SignedDuration::from_millis(100),
             retry_backoff: std::time::Duration::from_millis(20),
@@ -391,4 +391,84 @@ async fn full_stack_over_loopback_http() {
     let conservation = store.conservation(ACCOUNT).unwrap();
     assert!(conservation.holds(), "conservation: {conservation:?}");
     assert_eq!(conservation.settlement_loss, CostUnits::ZERO);
+}
+
+/// #48 over the transport that needs it most. `HttpStore::subscribe` is a
+/// closed channel — cross-process push is a deferred seam — so the periodic
+/// refresh is the *only* way a new customer reaches an HTTP-transport
+/// instance, and `GET /v1/snapshots` is the only way it learns the set exists.
+#[tokio::test]
+async fn http_instance_discovers_a_principal_published_after_it_started() {
+    const LATER: Principal = Principal(8);
+
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    store.create_account(AccountConfig {
+        account_id: ACCOUNT,
+        initial_balance: CostUnits(1_000_000),
+        active: true,
+    });
+    store.publish_snapshot(PRINCIPAL, publishable(snapshot()));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerState {
+            store: Arc::clone(&store),
+            clock: Arc::new(SystemClock),
+        },
+        std::time::Duration::from_secs(60),
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
+
+    let http = HttpStore::new(format!("http://{address}"));
+    let map = Arc::new(ArcSwapSnapshotMap::new());
+    let slots = SlotRegistry::new();
+    let manager = SnapshotManager::spawn(
+        http.clone(),
+        Arc::clone(&map) as Arc<dyn SnapshotMap>,
+        Arc::clone(&slots),
+        Arc::new(SystemClock),
+        SnapshotManagerConfig {
+            // Nothing seeded: everything this instance serves is discovered.
+            principals: TrackedPrincipals::All { seed: Vec::new() },
+            refresh_interval: std::time::Duration::from_millis(50),
+            negative_ttl: SignedDuration::from_secs(30),
+            retry_backoff: std::time::Duration::from_millis(20),
+            max_concurrent_fetches: 4,
+        },
+    )
+    .unwrap();
+
+    let mut ready = manager.ready();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !*ready.borrow() {
+            ready.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the enumerated principal must resolve");
+    assert!(
+        map.get(&PRINCIPAL).is_some(),
+        "discovered through GET /v1/snapshots, not configuration"
+    );
+    assert!(map.get(&LATER).is_none(), "not published yet");
+
+    // Provision a customer against the running control plane.
+    store.publish_snapshot(LATER, publishable(snapshot()));
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while map.get(&LATER).is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a principal published after start must reach an HTTP instance");
+
+    manager.shutdown().await;
+    let _ = stop_tx.send(());
+    server.await.unwrap().unwrap();
 }

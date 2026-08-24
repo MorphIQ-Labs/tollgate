@@ -9,6 +9,7 @@
 //! Surface (`/v1`):
 //! - `POST /v1/leases/acquire`, `POST /v1/leases/release`,
 //!   `POST /v1/leases/reclaim` — fenced lease lifecycle.
+//! - `GET /v1/snapshots` — the principal catalogue (#48).
 //! - `GET /v1/snapshots/{principal}` — compiled snapshot fetch.
 //! - `POST /v1/usage/ingest` — idempotent usage batches.
 //! - `POST /v1/admin/accounts`, `POST /v1/admin/accounts/{id}/deposit`,
@@ -34,7 +35,7 @@ use tracing::Instrument as _;
 use tollgate_core::{AccountId, CostUnits, Principal, PublishableSnapshot};
 use tollgate_store::wire::{
     AcquireRequest, AcquireResponse, CreateAccountRequest, DepositRequest, IngestRequest,
-    PublishSnapshotRequest, ReleaseRequest, SetStatusRequest,
+    PrincipalsResponse, PublishSnapshotRequest, ReleaseRequest, SetStatusRequest,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, Clock, DEFAULT_RECLAIM_BATCH_LIMIT, IngestReport, LeaseAllocator,
@@ -84,6 +85,7 @@ pub fn router<S: Backend>(state: ServerState<S>) -> Router {
         .route("/v1/leases/acquire", post(acquire::<S>))
         .route("/v1/leases/release", post(release::<S>))
         .route("/v1/leases/reclaim", post(reclaim::<S>))
+        .route("/v1/snapshots", get(list_principals::<S>))
         .route("/v1/snapshots/{principal}", get(fetch_snapshot::<S>))
         .route("/v1/usage/ingest", post(ingest::<S>))
         .route("/v1/admin/accounts", post(create_account::<S>))
@@ -302,6 +304,25 @@ async fn fetch_snapshot<S: Backend>(
         SnapshotResolution::Present(snapshot) => Ok(Json(snapshot.into_inner())),
         SnapshotResolution::Revoked { generation } => Err(ApiError::revoked(generation)),
         SnapshotResolution::Unknown => Err(ApiError::not_found("unknown-principal", "no snapshot")),
+    }
+}
+
+/// The principal catalogue, for instances that track every customer rather
+/// than a configured slice (#48).
+///
+/// A backend that cannot enumerate answers 501 rather than an empty list: an
+/// empty catalogue and an unsupported one lead an instance to opposite
+/// conclusions — forget everything, or keep what you were configured with —
+/// and conflating them would silently strand it on a stale set.
+async fn list_principals<S: Backend>(
+    State(state): State<ServerState<S>>,
+) -> Result<Json<PrincipalsResponse>, ApiError> {
+    match state.store.principals().await? {
+        Some(principals) => Ok(Json(PrincipalsResponse { principals })),
+        None => Err(ApiError::not_implemented(
+            "enumeration-unsupported",
+            "this backend cannot list principals",
+        )),
     }
 }
 

@@ -1083,6 +1083,25 @@ impl SnapshotSource for PostgresStore {
     fn subscribe(&self) -> broadcast::Receiver<SnapshotPush> {
         self.push.subscribe()
     }
+
+    /// Tombstones included, for the reason `MemoryStore::principals` gives:
+    /// forgetting a revoked principal is how one gets resurrected.
+    ///
+    /// A primary-key scan, so no new index — the table holds one row per
+    /// principal, not per request, and `ORDER BY` makes the result stable so
+    /// a caller diffing two enumerations sees real changes rather than
+    /// storage order.
+    async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
+        let rows = sqlx::query("SELECT principal FROM tollgate_snapshots ORDER BY principal")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)?;
+        Ok(Some(
+            rows.iter()
+                .map(|row| Principal(id_from(row.get::<Vec<u8>, _>(0).as_slice())))
+                .collect(),
+        ))
+    }
 }
 
 #[async_trait]

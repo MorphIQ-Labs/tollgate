@@ -554,6 +554,14 @@ impl SnapshotSource for MemoryStore {
     fn subscribe(&self) -> broadcast::Receiver<SnapshotPush> {
         self.push.subscribe()
     }
+
+    /// Tombstones included: a revoked principal is one an instance must keep
+    /// tracking so it keeps *knowing* about the revocation. Dropping it from
+    /// the catalogue would make it indistinguishable from a principal that
+    /// never existed, which is the resurrection INVARIANTS.md #15 forbids.
+    async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
+        Ok(Some(self.lock().snapshots.keys().copied().collect()))
+    }
 }
 
 #[async_trait]

@@ -64,11 +64,48 @@ impl SlotRegistry {
     }
 }
 
+/// Which principals an instance serves.
+///
+/// A shape rather than a flag beside a list, so there is no boolean that can
+/// disagree with the data it governs (#16's lesson, applied to #48).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackedPrincipals {
+    /// Exactly these, fixed for the process's life. Onboarding a principal
+    /// needs a restart, and readiness means every one of them is resolved.
+    Fixed(Vec<Principal>),
+    /// Every principal the source knows, re-enumerated each refresh — the
+    /// stateless topology, where any instance may serve any customer.
+    ///
+    /// Falls back to `seed` for a source that cannot enumerate, so an
+    /// embedder whose adapter predates
+    /// [`SnapshotSource::principals`](tollgate_store::SnapshotSource::principals)
+    /// keeps the old behaviour rather than silently tracking nothing.
+    All {
+        /// Tracked until the first successful enumeration, and the permanent
+        /// set if the source cannot enumerate at all. Usually empty.
+        seed: Vec<Principal>,
+    },
+}
+
+impl TrackedPrincipals {
+    /// The set to start from, before any discovery has happened.
+    fn initial(&self) -> &[Principal] {
+        match self {
+            TrackedPrincipals::Fixed(principals) => principals,
+            TrackedPrincipals::All { seed } => seed,
+        }
+    }
+
+    fn discovers(&self) -> bool {
+        matches!(self, TrackedPrincipals::All { .. })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SnapshotManagerConfig {
-    /// The principals this instance serves. Static for the PoC; a dynamic
-    /// discovery seam is documented in docs/DESIGN.md.
-    pub principals: Vec<Principal>,
+    /// The principals this instance serves — a fixed list, or everything the
+    /// source knows (#48).
+    pub principals: TrackedPrincipals,
     /// Full refetch cadence — also the revocation propagation bound.
     pub refresh_interval: std::time::Duration,
     /// How long a confirmed-negative principal stays valid before the
@@ -109,8 +146,9 @@ impl SnapshotManagerConfig {
                 "max_concurrent_fetches must be positive",
             ));
         }
-        let distinct: HashSet<_> = self.principals.iter().copied().collect();
-        if distinct.len() != self.principals.len() {
+        let initial = self.principals.initial();
+        let distinct: HashSet<_> = initial.iter().copied().collect();
+        if distinct.len() != initial.len() {
             return Err(SnapshotManagerConfigError(
                 "principals must not contain duplicates",
             ));
@@ -143,6 +181,7 @@ pub struct SnapshotManagerReport {
 pub struct SnapshotCounters {
     refresh_attempts: AtomicU64,
     refresh_failures: AtomicU64,
+    discovery_failures: AtomicU64,
     unresolved: AtomicU64,
 }
 
@@ -152,6 +191,7 @@ impl SnapshotCounters {
         SnapshotCounters {
             refresh_attempts: AtomicU64::new(0),
             refresh_failures: AtomicU64::new(0),
+            discovery_failures: AtomicU64::new(0),
             unresolved: AtomicU64::new(0),
         }
     }
@@ -169,6 +209,17 @@ impl SnapshotCounters {
         self.refresh_failures.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Enumeration failed, so the tracked set is whatever it already was.
+    ///
+    /// Counted apart from `refresh_failures` because it is a different
+    /// failure with a different consequence: fetches failing means known
+    /// principals go stale, while enumeration failing means *new* principals
+    /// never appear at all — and that one is otherwise invisible, since
+    /// everything already tracked keeps working perfectly (#48).
+    fn record_discovery_failure(&self) {
+        self.discovery_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn set_unresolved(&self, principals: u64) {
         self.unresolved.store(principals, Ordering::Relaxed);
     }
@@ -178,6 +229,7 @@ impl SnapshotCounters {
         SnapshotStats {
             refresh_attempts: self.refresh_attempts.load(Ordering::Relaxed),
             refresh_failures: self.refresh_failures.load(Ordering::Relaxed),
+            discovery_failures: self.discovery_failures.load(Ordering::Relaxed),
             unresolved: self.unresolved.load(Ordering::Relaxed),
         }
     }
@@ -196,6 +248,10 @@ pub struct SnapshotStats {
     pub refresh_attempts: u64,
     /// Fetches the source could not answer.
     pub refresh_failures: u64,
+    /// Principal enumerations the source could not answer. Nonzero means the
+    /// tracked set is frozen: everything already known keeps being refreshed,
+    /// and nothing new is ever discovered.
+    pub discovery_failures: u64,
     /// Principals with no currently valid resolution — a gauge, not a total.
     /// Nonzero is exactly the condition that makes `ready` false, and the
     /// count says how much of the tracked set is affected.
@@ -221,7 +277,7 @@ impl SnapshotManager {
         config.validate()?;
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (ready_tx, ready) = watch::channel(false);
-        let principals = config.principals.len();
+        let principals = config.principals.initial().len();
         let counters = Arc::new(SnapshotCounters::new());
         let task_counters = Arc::clone(&counters);
         let handle = tokio::spawn(
@@ -352,9 +408,13 @@ const IDLE_WAKEUP: std::time::Duration = std::time::Duration::from_secs(3_600);
 /// `Ord`, so two principals sharing an instant cannot collide.
 #[derive(Debug)]
 struct Resolutions {
-    /// How many principals this instance tracks. Config forbids duplicates,
-    /// so this is exactly the denominator readiness is measured against.
-    tracked: usize,
+    /// The principals this instance tracks — the denominator readiness is
+    /// measured against.
+    ///
+    /// A set rather than #22's `usize` because discovery can change it (#48),
+    /// and a count alone cannot answer "is this one still ours?" when a push
+    /// arrives or an enumeration drops someone.
+    tracked: HashSet<Principal>,
     /// Authoritative per-principal state. Never shrinks: an expired
     /// resolution keeps its generation watermark, which must outlive it or a
     /// replayed older generation could resurrect a revoked principal
@@ -371,14 +431,48 @@ struct Resolutions {
 }
 
 impl Resolutions {
-    fn new(tracked: usize) -> Self {
+    fn new(tracked: impl IntoIterator<Item = Principal>) -> Self {
+        let tracked: HashSet<Principal> = tracked.into_iter().collect();
         Resolutions {
+            by_principal: HashMap::with_capacity(tracked.len()),
             tracked,
-            by_principal: HashMap::with_capacity(tracked),
             present: BTreeSet::new(),
             negative: BTreeSet::new(),
             refetch: BTreeSet::new(),
         }
+    }
+
+    fn is_tracked(&self, principal: Principal) -> bool {
+        self.tracked.contains(&principal)
+    }
+
+    /// Start tracking one principal, learned from a push rather than an
+    /// enumeration. Idempotent, and leaves an existing resolution alone.
+    fn track(&mut self, principal: Principal) {
+        self.tracked.insert(principal);
+    }
+
+    /// Adopt a discovered set.
+    ///
+    /// Untracking drops the resolution and its deadline-index entries, but
+    /// **keeps nothing behind** — which is safe only because a principal
+    /// leaves this set by disappearing from the source's catalogue, not by
+    /// being revoked. A revoked principal is still enumerated (its tombstone
+    /// is the record of the revocation), so it stays tracked and negative;
+    /// conflating the two would drop a generation watermark and let a
+    /// replayed older snapshot resurrect it (INVARIANTS.md #15).
+    fn retain(&mut self, discovered: HashSet<Principal>) {
+        let removed: Vec<Principal> = self
+            .tracked
+            .difference(&discovered)
+            .copied()
+            .collect::<Vec<_>>();
+        for principal in removed {
+            if let Some(previous) = self.by_principal.remove(&principal) {
+                self.forget(principal, previous);
+            }
+        }
+        self.tracked = discovered;
     }
 
     /// The generation watermark, if this principal has ever been resolved.
@@ -472,7 +566,7 @@ impl Resolutions {
     /// leaving `ready` false with `unresolved` at zero and nothing to explain.
     fn unresolved(&mut self, now: jiff::Timestamp) -> usize {
         self.expire_through(now);
-        self.tracked - self.present.len() - self.negative.len()
+        self.tracked.len() - self.present.len() - self.negative.len()
     }
 
     /// How long until the earliest resolution lapses — when readiness could
@@ -525,15 +619,46 @@ fn until(deadline: jiff::Timestamp, now: jiff::Timestamp) -> std::time::Duration
         .unwrap_or(std::time::Duration::MAX)
 }
 
+/// Whether the instance should be in rotation, and why the answer differs by
+/// mode (INVARIANTS.md #10).
+///
+/// Under [`TrackedPrincipals::Fixed`] readiness is unchanged: every tracked
+/// principal resolved. The set is small and hand-configured, so anything less
+/// is a real gap.
+///
+/// Under [`TrackedPrincipals::All`] that rule inverts into a fault. The set is
+/// the whole customer base, so it would hold an instance serving 15,999 of
+/// 16,000 principals out of rotation for the one the source cannot answer for
+/// — fail-closed correctness masquerading as *un*availability, which is the
+/// same error #10 exists to prevent, pointed the other way. Per-principal
+/// admissibility does not need readiness to enforce it: the map already denies
+/// fail-closed for anything unresolved.
+///
+/// So under `All`, unready means **every** tracked principal is unresolved —
+/// the point at which the instance can serve nobody and belongs out of
+/// rotation. That still catches the case that matters (a source unreachable
+/// long enough for snapshots to lapse), and it degenerates correctly for an
+/// empty catalogue: an instance tracking nobody is healthy, not broken.
+///
+/// Both readings come from the same pass that sets the `unresolved` gauge, so
+/// the bit and the number cannot drift.
+fn ready_now(mode: &TrackedPrincipals, outstanding: usize, tracked: usize) -> bool {
+    match mode {
+        TrackedPrincipals::Fixed(_) => outstanding == 0,
+        TrackedPrincipals::All { .. } => tracked == 0 || outstanding < tracked,
+    }
+}
+
 fn update_ready(
     ready: &watch::Sender<bool>,
     resolutions: &mut Resolutions,
     clock: &Arc<dyn Clock>,
     counters: &SnapshotCounters,
+    mode: &TrackedPrincipals,
 ) {
     let outstanding = resolutions.unresolved(clock.now());
     counters.set_unresolved(outstanding as u64);
-    let now_ready = outstanding == 0;
+    let now_ready = ready_now(mode, outstanding, resolutions.tracked.len());
     // Readiness transitions are the operator-visible half of INVARIANTS #10;
     // report the edges, not every recomputation.
     if ready.borrow().ne(&now_ready) {
@@ -627,7 +752,7 @@ async fn refresh_all_cancellable(
                 }
             }
             _ = &mut readiness_check => {
-                update_ready(ready, resolutions, clock, counters);
+                update_ready(ready, resolutions, clock, counters, &config.principals);
             }
         }
     }
@@ -732,6 +857,40 @@ async fn refresh_all_cancellable(
     )
 }
 
+/// Re-enumerate the tracked set.
+///
+/// A source that cannot enumerate (`Ok(None)`) leaves the set alone — that is
+/// the configured-set behaviour, not an empty catalogue. A source that *fails*
+/// also leaves it alone, but counts as a refresh failure, because an instance
+/// quietly narrowing to nothing on a transient error would deny every request
+/// while reporting itself perfectly healthy (#48).
+async fn discover(
+    source: &Arc<dyn SnapshotSource>,
+    resolutions: &mut Resolutions,
+    counters: &SnapshotCounters,
+) {
+    match source.principals().await {
+        Ok(Some(discovered)) => resolutions.retain(discovered.into_iter().collect()),
+        // Cannot enumerate: keep the configured set. Deliberately not the same
+        // as an empty catalogue, which would mean "forget everyone".
+        Ok(None) => {}
+        Err(error) => {
+            counters.record_discovery_failure();
+            tracing::warn!(%error, "principal enumeration failed; keeping the current set");
+        }
+    }
+}
+
+/// Everything currently tracked, as the slice `refresh_all_cancellable` takes.
+///
+/// Ordered, so a sweep visits principals the same way twice running and a
+/// truncated one resumes predictably rather than by hash order.
+fn sweep_set(resolutions: &Resolutions) -> Vec<Principal> {
+    let mut principals: Vec<Principal> = resolutions.tracked.iter().copied().collect();
+    principals.sort_unstable();
+    principals
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run(
     source: Arc<dyn SnapshotSource>,
@@ -744,13 +903,20 @@ async fn run(
     counters: Arc<SnapshotCounters>,
 ) {
     let mut updates = source.subscribe();
-    let tracked: HashSet<Principal> = config.principals.iter().copied().collect();
-    let mut resolutions = Resolutions::new(config.principals.len());
+    let mut resolutions = Resolutions::new(config.principals.initial().iter().copied());
+
+    // Discover before the initial load, so a stateless instance starts from
+    // the real set rather than its (usually empty) seed. Enumeration failure
+    // is not fatal: the retry loop below covers it, and the seed keeps the
+    // instance serving whatever it was told about meanwhile.
+    if config.principals.discovers() {
+        discover(&source, &mut resolutions, &counters).await;
+    }
 
     // Initial load: retry until every tracked principal is resolved, then
     // report ready. The map denies (fail closed) for anything unresolved in
     // the meantime.
-    let mut pending: Vec<Principal> = config.principals.clone();
+    let mut pending: Vec<Principal> = resolutions.tracked.iter().copied().collect();
     while !pending.is_empty() {
         if *shutdown.borrow() {
             return;
@@ -772,7 +938,13 @@ async fn run(
             return;
         };
         pending = failed;
-        update_ready(&ready, &mut resolutions, &clock, &counters);
+        update_ready(
+            &ready,
+            &mut resolutions,
+            &clock,
+            &counters,
+            &config.principals,
+        );
         if !pending.is_empty() {
             tokio::select! {
                 _ = tokio::time::sleep(config.retry_backoff) => {}
@@ -784,7 +956,13 @@ async fn run(
             }
         }
     }
-    update_ready(&ready, &mut resolutions, &clock, &counters);
+    update_ready(
+        &ready,
+        &mut resolutions,
+        &clock,
+        &counters,
+        &config.principals,
+    );
 
     let mut tick = tokio::time::interval(config.refresh_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -799,7 +977,14 @@ async fn run(
         tokio::select! {
             push = updates.recv(), if !updates_closed => match push {
                 Ok(push) => {
-                    if tracked.contains(&push.principal) {
+                    // Under discovery every push is ours: a push for a
+                    // principal we have not enumerated yet *is* the discovery,
+                    // and dropping it was how a newly provisioned customer
+                    // stayed invisible until a restart (#48).
+                    if config.principals.discovers() {
+                        resolutions.track(push.principal);
+                    }
+                    if resolutions.is_tracked(push.principal) {
                         match push.resolution {
                             SnapshotResolution::Present(snapshot) => {
                                 if resolutions.generation_of(push.principal)
@@ -858,21 +1043,21 @@ async fn run(
                                 );
                             }
                         }
-                        update_ready(&ready, &mut resolutions, &clock, &counters);
+                        update_ready(&ready, &mut resolutions, &clock, &counters, &config.principals);
                     }
                 }
                 // Lagged: missed pushes — refetch everything rather than
                 // guess what was dropped.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     if refresh_all_cancellable(
-                        &source, &map, &slots, &clock, &config, &config.principals,
+                        &source, &map, &slots, &clock, &config, &sweep_set(&resolutions),
                         &mut resolutions, &mut shutdown,
                         &ready,
                         &counters,
                     ).await.is_none() {
                         return;
                     }
-                    update_ready(&ready, &mut resolutions, &clock, &counters);
+                    update_ready(&ready, &mut resolutions, &clock, &counters, &config.principals);
                 }
                 // Push stream gone (e.g. HTTP transport): periodic refresh
                 // remains the freshness path.
@@ -881,19 +1066,26 @@ async fn run(
                 }
             },
             _ = tick.tick() => {
+                // Re-enumerate first: the sweep should cover principals added
+                // since the last one, and stop covering any the source has
+                // dropped. Over HTTP this is the only propagation path there
+                // is, because `subscribe` is a closed channel.
+                if config.principals.discovers() {
+                    discover(&source, &mut resolutions, &counters).await;
+                }
                 if refresh_all_cancellable(
-                    &source, &map, &slots, &clock, &config, &config.principals,
+                    &source, &map, &slots, &clock, &config, &sweep_set(&resolutions),
                     &mut resolutions, &mut shutdown,
                     &ready,
                     &counters,
                 ).await.is_none() {
                     return;
                 }
-                update_ready(&ready, &mut resolutions, &clock, &counters);
+                update_ready(&ready, &mut resolutions, &clock, &counters, &config.principals);
             }
             _ = &mut control_wakeup => {
                 let now = clock.now();
-                update_ready(&ready, &mut resolutions, &clock, &counters);
+                update_ready(&ready, &mut resolutions, &clock, &counters, &config.principals);
                 let due = resolutions.due_for_refetch(now);
                 if !due.is_empty() {
                     let Some(failed) = refresh_all_cancellable(
@@ -906,7 +1098,7 @@ async fn run(
                     for principal in failed {
                         resolutions.back_off(principal, retry_at);
                     }
-                    update_ready(&ready, &mut resolutions, &clock, &counters);
+                    update_ready(&ready, &mut resolutions, &clock, &counters, &config.principals);
                 }
             }
             changed = shutdown.changed() => {
@@ -931,7 +1123,7 @@ mod tests {
     #[test]
     fn control_wakeup_tracks_future_positive_deadline_once() {
         let principal = Principal(1);
-        let mut resolutions = Resolutions::new(1);
+        let mut resolutions = Resolutions::new([Principal(1)]);
         resolutions.insert(
             principal,
             Resolution::Present {
@@ -960,7 +1152,7 @@ mod tests {
     #[test]
     fn control_wakeup_tracks_negative_refetch_deadline() {
         let principal = Principal(1);
-        let mut resolutions = Resolutions::new(1);
+        let mut resolutions = Resolutions::new([Principal(1)]);
         resolutions.insert(
             principal,
             Resolution::Negative {
@@ -1101,7 +1293,7 @@ mod tests {
         ) {
             let principals: Vec<Principal> =
                 (0..TRACKED as u128).map(Principal).collect();
-            let mut indexed = Resolutions::new(TRACKED);
+            let mut indexed = Resolutions::new(principals.iter().copied());
             let mut reference: HashMap<Principal, Resolution> = HashMap::new();
             let mut now = t(0);
 
@@ -1171,7 +1363,7 @@ mod tests {
     /// it never enters the live index, so nothing has to expire it later.
     #[test]
     fn a_resolution_inserted_expired_is_never_live() {
-        let mut resolutions = Resolutions::new(1);
+        let mut resolutions = Resolutions::new([Principal(0)]);
         resolutions.insert(
             Principal(0),
             Resolution::Present {
@@ -1189,7 +1381,7 @@ mod tests {
     /// one: the live count is per principal, not per insert.
     #[test]
     fn re_resolving_a_principal_does_not_double_count_it() {
-        let mut resolutions = Resolutions::new(2);
+        let mut resolutions = Resolutions::new([Principal(0), Principal(1)]);
         for deadline in [t(50), t(60), t(60), t(70)] {
             resolutions.insert(
                 Principal(0),
@@ -1211,7 +1403,7 @@ mod tests {
     /// deadline nor a stale refetch behind.
     #[test]
     fn a_positive_replacing_a_negative_clears_both_of_its_indexes() {
-        let mut resolutions = Resolutions::new(1);
+        let mut resolutions = Resolutions::new([Principal(0)]);
         resolutions.insert(
             Principal(0),
             Resolution::Negative {
@@ -1241,7 +1433,7 @@ mod tests {
     /// (INVARIANTS.md #15).
     #[test]
     fn an_expired_resolution_keeps_its_generation() {
-        let mut resolutions = Resolutions::new(1);
+        let mut resolutions = Resolutions::new([Principal(0)]);
         resolutions.insert(
             Principal(0),
             Resolution::Negative {
@@ -1265,7 +1457,7 @@ mod tests {
     #[test]
     fn deadline_helpers_are_exact_in_the_supported_domain() {
         let config = SnapshotManagerConfig {
-            principals: vec![Principal(1)],
+            principals: TrackedPrincipals::Fixed(vec![Principal(1)]),
             refresh_interval: std::time::Duration::from_secs(60),
             negative_ttl: SignedDuration::from_secs(30),
             retry_backoff: std::time::Duration::from_secs(2),

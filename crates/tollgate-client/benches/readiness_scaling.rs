@@ -18,7 +18,9 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use jiff::{SignedDuration, Timestamp};
 
 use tollgate_admission::{MapEntry, SnapshotMap};
-use tollgate_client::{SlotRegistry, SnapshotManager, SnapshotManagerConfig, SystemClock};
+use tollgate_client::{
+    SlotRegistry, SnapshotManager, SnapshotManagerConfig, SystemClock, TrackedPrincipals,
+};
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, Generation, OpIndex,
     PermissionBits, Principal, PublishableSnapshot,
@@ -106,8 +108,20 @@ fn source(principals: usize) -> Arc<MemoryStore> {
 }
 
 fn config(principals: usize) -> SnapshotManagerConfig {
+    config_for(TrackedPrincipals::Fixed(
+        (0..principals as u128).map(Principal).collect(),
+    ))
+}
+
+/// The same cadence with the tracked set discovered rather than configured
+/// (#48), so the two benchmarks differ only in where the set comes from.
+fn discovering_config() -> SnapshotManagerConfig {
+    config_for(TrackedPrincipals::All { seed: Vec::new() })
+}
+
+fn config_for(principals: TrackedPrincipals) -> SnapshotManagerConfig {
     SnapshotManagerConfig {
-        principals: (0..principals as u128).map(Principal).collect(),
+        principals,
         // Short, so a refresh sweep follows the initial load immediately:
         // the refresh is what this benchmark times.
         refresh_interval: std::time::Duration::from_millis(1),
@@ -139,41 +153,48 @@ fn bench_refresh(c: &mut Criterion) {
 
     for principals in [512usize, 4_096, 16_384] {
         let store: Arc<dyn tollgate_store::SnapshotSource> = source(principals);
-        let config = config(principals);
-        group.bench_function(format!("refresh_{principals}"), |b| {
-            b.iter_batched(
-                || {
-                    // Setup, untimed: a manager that has completed its initial
-                    // load, so the map below is full when the sweep runs.
-                    runtime.block_on(async {
-                        let manager = SnapshotManager::spawn(
-                            Arc::clone(&store),
-                            Arc::new(NullMap),
-                            SlotRegistry::new(),
-                            Arc::new(SystemClock),
-                            config.clone(),
-                        )
-                        .unwrap();
-                        let mut ready = manager.ready();
-                        while !*ready.borrow() {
-                            ready.changed().await.unwrap();
-                        }
-                        manager
-                    })
-                },
-                |manager| {
-                    runtime.block_on(async {
-                        let counters = manager.counters();
-                        let target = counters.snapshot().refresh_attempts + principals as u64;
-                        while counters.snapshot().refresh_attempts < target {
-                            tokio::task::yield_now().await;
-                        }
-                        black_box(manager.shutdown().await)
-                    })
-                },
-                BatchSize::PerIteration,
-            );
-        });
+        for (label, config) in [
+            (format!("refresh_{principals}"), config(principals)),
+            (
+                format!("refresh_discovering_{principals}"),
+                discovering_config(),
+            ),
+        ] {
+            group.bench_function(label, |b| {
+                b.iter_batched(
+                    || {
+                        // Setup, untimed: a manager that has completed its initial
+                        // load, so the map below is full when the sweep runs.
+                        runtime.block_on(async {
+                            let manager = SnapshotManager::spawn(
+                                Arc::clone(&store),
+                                Arc::new(NullMap),
+                                SlotRegistry::new(),
+                                Arc::new(SystemClock),
+                                config.clone(),
+                            )
+                            .unwrap();
+                            let mut ready = manager.ready();
+                            while !*ready.borrow() {
+                                ready.changed().await.unwrap();
+                            }
+                            manager
+                        })
+                    },
+                    |manager| {
+                        runtime.block_on(async {
+                            let counters = manager.counters();
+                            let target = counters.snapshot().refresh_attempts + principals as u64;
+                            while counters.snapshot().refresh_attempts < target {
+                                tokio::task::yield_now().await;
+                            }
+                            black_box(manager.shutdown().await)
+                        })
+                    },
+                    BatchSize::PerIteration,
+                );
+            });
+        }
     }
     group.finish();
 }

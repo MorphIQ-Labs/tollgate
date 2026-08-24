@@ -47,6 +47,18 @@ impl ApiError {
             generation: None,
         }
     }
+
+    /// The backend cannot answer this at all, as opposed to answering
+    /// "nothing" — a distinction a caller must be able to act on differently
+    /// (#48).
+    pub fn not_implemented(code: &'static str, title: impl Into<String>) -> Self {
+        ApiError {
+            status: StatusCode::NOT_IMPLEMENTED,
+            code,
+            title: title.into(),
+            generation: None,
+        }
+    }
 }
 
 impl From<AllocateError> for ApiError {

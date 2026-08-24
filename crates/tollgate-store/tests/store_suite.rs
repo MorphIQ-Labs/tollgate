@@ -685,6 +685,47 @@ async fn inactive_account_refuses_leases() {
     );
 }
 
+/// #48's enumeration seam, and the detail the whole removal-vs-revocation
+/// distinction rests on: a revoked principal stays in the catalogue. Its
+/// tombstone *is* the record of the revocation, so an instance must keep
+/// tracking it — dropping it would make it indistinguishable from a principal
+/// that never existed, which is the resurrection INVARIANTS.md #15 forbids.
+#[tokio::test]
+async fn enumerating_principals_includes_revoked_ones() {
+    let store = store_with_balance(full_grant_policy(), 1_000);
+    assert_eq!(
+        store.principals().await.unwrap(),
+        Some(Vec::new()),
+        "an empty catalogue is Some(empty), never None"
+    );
+
+    let snapshot = || {
+        publishable(Arc::new(AccountSnapshot {
+            account_id: ACCOUNT,
+            key_id: None,
+            generation: Generation(1),
+            status: AccountStatus::Active,
+            valid_until: t(10_000),
+            permissions: PermissionBits::ALL,
+            limits: ResolvedLimits {
+                max_items_per_request: 64,
+                rate_units_per_second: 1_000,
+                rate_burst_units: 1_000,
+            },
+            cost_table: Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+        }))
+    };
+    let live = Principal(1);
+    let revoked = Principal(2);
+    store.publish_snapshot(live, snapshot());
+    store.publish_snapshot(revoked, snapshot());
+    store.remove_snapshot(revoked);
+
+    let mut listed = store.principals().await.unwrap().expect("enumerable");
+    listed.sort_by_key(|principal| principal.0);
+    assert_eq!(listed, vec![live, revoked]);
+}
+
 /// `max_ttl` is the allocator's hard cap on how long any one lease may hold
 /// units, which is what bounds the time a crashed holder can strand them
 /// (INVARIANTS.md #9). Nothing asserted the clamp: a request for an hour

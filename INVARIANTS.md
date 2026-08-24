@@ -138,20 +138,37 @@ until it has one.
    `one_scheduled_sweep_drains_every_saturated_batch` (server suite).
 
 10. **Ready means currently admissible.** An instance reports ready only while
-    every tracked principal has a fresh positive or negative resolution, its
-    lease remains inside the local usability window, and its snapshot and
-    refill/accounting tasks are alive. Readiness falls again on exhaustion,
-    expiry, or task exit;
-    fail-closed correctness must not masquerade as availability. Readiness is
-    a single bit, so it says *that* an instance is unready and never *how
-    much* is unresolved; the count of principals without a valid resolution is
-    exported alongside it and is derived from the same pass that decides the
-    bit, so the two cannot disagree — a separate predicate would be free to
-    drift, leaving readiness false with nothing to explain it. *Tests:*
+    its snapshot resolutions meet the bar below, its lease remains inside the
+    local usability window, and its snapshot and refill/accounting tasks are
+    alive. Readiness falls again on exhaustion, expiry, or task exit;
+    fail-closed correctness must not masquerade as availability.
+
+    The snapshot bar depends on how the tracked set is chosen, because the
+    same rule means opposite things at the two scales (#48). For a
+    `Fixed` set — hand-configured, small — ready requires **every** tracked
+    principal to hold a fresh positive or negative resolution: the set was
+    chosen deliberately, so any gap in it is a real one. For an `All` set —
+    every principal the source knows, which is the whole customer base — that
+    rule inverts into a fault, holding an instance serving 15,999 of 16,000
+    principals out of rotation for the one its source cannot answer for. There
+    ready requires only that **some** tracked principal is resolved, falling
+    when none is; per-principal admissibility needs no help from readiness,
+    because the map already denies fail-closed for anything unresolved. An
+    instance tracking nobody is healthy, not broken.
+
+    Readiness is a single bit either way, so it says *that* an instance is
+    unready and never *how much* is unresolved; the count of principals
+    without a valid resolution is exported alongside it and is derived from
+    the same pass that decides the bit, so the two cannot disagree — a
+    separate predicate would be free to drift, leaving readiness false with
+    nothing to explain it. Enumeration failures are counted apart from fetch
+    failures, since they freeze the tracked set rather than staling it and are
+    otherwise invisible. *Tests:*
     `initial_load_gates_readiness_and_installs`,
     `readiness_falls_when_snapshot_expires_during_outage`,
     `readiness_falls_if_refresh_hangs_across_snapshot_expiry`,
-    `readiness_falls_when_background_planes_stop`, and
+    `readiness_falls_when_background_planes_stop`,
+    `one_unanswerable_principal_unreadies_only_a_fixed_instance`, and
     `snapshot_counters_track_failures_and_the_unresolved_gauge`.
 
 11. **Checked arithmetic only.** Cost and lease arithmetic never wraps; any
