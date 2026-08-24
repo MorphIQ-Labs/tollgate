@@ -184,7 +184,8 @@ async fn http_negative_ttl_refetches_without_push() {
         SnapshotManagerConfig {
             principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
             refresh_interval: std::time::Duration::from_secs(60),
-            negative_ttl: SignedDuration::from_millis(100),
+            unknown_ttl: SignedDuration::from_millis(100),
+            revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(20),
             max_concurrent_fetches: 1,
         },
@@ -463,7 +464,8 @@ async fn http_instance_discovers_a_principal_published_after_it_started() {
             // Nothing seeded: everything this instance serves is discovered.
             principals: TrackedPrincipals::All { seed: Vec::new() },
             refresh_interval: std::time::Duration::from_millis(50),
-            negative_ttl: SignedDuration::from_secs(30),
+            unknown_ttl: SignedDuration::from_secs(30),
+            revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(20),
             max_concurrent_fetches: 4,
         },

@@ -257,12 +257,32 @@ until it has one.
     expired negatives during control writes, and evicts the earliest expiry
     first. Expiry schedules a targeted source pull even when push is
     unavailable and the full refresh interval is much longer; source errors
-    retry with backoff. Pruning visible negatives never weakens invariant #15.
+    retry with backoff. In the routine case that targeted pull is the only
+    thing that reresolves a negative: the full sweep covers principals an
+    instance can serve and skips negatives, which already carry a deadline of
+    their own. Broadcast lag is the exception and refetches the unfiltered
+    tracked set, because a dropped push is most often a reinstatement, and
+    filtering by local resolution would skip exactly what recovery is for.
+    Which TTL applies is keyed on **what the source answered**, never on the
+    generation the instance remembers: an absent row takes `unknown_ttl`, a
+    published revocation tombstone takes `revoked_ttl`. Conflating them
+    strands a live principal for the reinstatement TTL whenever a source is
+    merely rebuilding or failing over, while readiness still reports healthy.
+    Pruning visible negatives never weakens invariant #15, and neither does
+    skipping them in the sweep: a live principal is always swept, so
+    withdrawing one still propagates within `refresh_interval`; what the
+    longer TTL bounds is the Negative → Present direction only.
     *Tests:* `arc_swap_negative_cache_is_bounded_and_evicts_oldest_deadline_first`,
     `arc_swap_control_write_drops_expired_negatives`,
-    `many_unknowns_leave_only_the_configured_number_visible`, and
-    `http_negative_ttl_refetches_without_push`, and
-    `negative_ttl_retry_is_backed_off_and_recovers_without_push`.
+    `many_unknowns_leave_only_the_configured_number_visible`,
+    `http_negative_ttl_refetches_without_push`,
+    `negative_ttl_retry_is_backed_off_and_recovers_without_push`,
+    `the_sweep_does_not_refetch_tombstones`,
+    `revocation_still_propagates_within_the_refresh_interval`,
+    `a_live_principal_that_goes_absent_recovers_on_the_unknown_ttl`,
+    `a_reinstated_principal_comes_back_on_the_revoked_ttl`,
+    `lag_recovery_covers_the_negatives_a_sweep_skips`, and
+    `deadline_helpers_are_exact_in_the_supported_domain`.
 
 18. **Background store calls are wall-clock bounded.** No background task may
     be parked by a backend that hangs rather than answering: every allocator

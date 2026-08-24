@@ -83,7 +83,8 @@ fn fixture(store: Arc<MemoryStore>) -> Fixture {
         SnapshotManagerConfig {
             principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
             refresh_interval: std::time::Duration::from_millis(20),
-            negative_ttl: SignedDuration::from_secs(30),
+            unknown_ttl: SignedDuration::from_secs(30),
+            revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 4,
         },
@@ -226,6 +227,7 @@ async fn unknown_principal_resolves_once_published() {
 #[derive(Clone)]
 enum MutableMode {
     Unknown,
+    Revoked,
     Present(Arc<AccountSnapshot>),
     Failing,
 }
@@ -254,6 +256,9 @@ impl SnapshotSource for MutableNoPushSource {
         self.calls.fetch_add(1, Ordering::AcqRel);
         match self.mode.lock().expect("source mode poisoned").clone() {
             MutableMode::Unknown => Ok(SnapshotResolution::Unknown),
+            MutableMode::Revoked => Ok(SnapshotResolution::Revoked {
+                generation: Generation(9),
+            }),
             MutableMode::Present(snapshot) => {
                 Ok(SnapshotResolution::Present(publishable(snapshot)))
             }
@@ -280,7 +285,8 @@ async fn negative_ttl_retry_is_backed_off_and_recovers_without_push() {
         SnapshotManagerConfig {
             principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
             refresh_interval: std::time::Duration::from_secs(60),
-            negative_ttl: SignedDuration::from_millis(40),
+            unknown_ttl: SignedDuration::from_millis(40),
+            revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(80),
             max_concurrent_fetches: 1,
         },
@@ -375,7 +381,8 @@ async fn readiness_falls_when_snapshot_expires_during_outage() {
         SnapshotManagerConfig {
             principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
             refresh_interval: std::time::Duration::from_millis(20),
-            negative_ttl: SignedDuration::from_secs(30),
+            unknown_ttl: SignedDuration::from_secs(30),
+            revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 2,
         },
@@ -412,7 +419,8 @@ async fn snapshot_counters_track_failures_and_the_unresolved_gauge() {
         SnapshotManagerConfig {
             principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
             refresh_interval: std::time::Duration::from_millis(20),
-            negative_ttl: SignedDuration::from_secs(30),
+            unknown_ttl: SignedDuration::from_secs(30),
+            revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 2,
         },
@@ -495,7 +503,8 @@ async fn readiness_falls_if_refresh_hangs_across_snapshot_expiry() {
         SnapshotManagerConfig {
             principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
             refresh_interval: std::time::Duration::from_millis(5),
-            negative_ttl: SignedDuration::from_secs(30),
+            unknown_ttl: SignedDuration::from_secs(30),
+            revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 1,
         },
@@ -543,7 +552,8 @@ async fn shutdown_cancels_in_flight_snapshot_fetches() {
         SnapshotManagerConfig {
             principals: TrackedPrincipals::Fixed((0..64).map(Principal).collect()),
             refresh_interval: std::time::Duration::from_secs(1),
-            negative_ttl: SignedDuration::from_secs(30),
+            unknown_ttl: SignedDuration::from_secs(30),
+            revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 4,
         },
@@ -589,7 +599,8 @@ async fn a_panicking_fetch_does_not_kill_the_manager() {
         SnapshotManagerConfig {
             principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
             refresh_interval: std::time::Duration::from_millis(10),
-            negative_ttl: SignedDuration::from_secs(30),
+            unknown_ttl: SignedDuration::from_secs(30),
+            revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 1,
         },
@@ -609,7 +620,8 @@ fn invalid_snapshot_manager_intervals_are_rejected() {
     let config = SnapshotManagerConfig {
         principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
         refresh_interval: std::time::Duration::ZERO,
-        negative_ttl: SignedDuration::from_secs(30),
+        unknown_ttl: SignedDuration::from_secs(30),
+        revoked_ttl: SignedDuration::from_secs(3_600),
         retry_backoff: std::time::Duration::from_millis(5),
         max_concurrent_fetches: 4,
     };
@@ -633,7 +645,8 @@ fn discovering_fixture(store: Arc<MemoryStore>) -> Fixture {
         SnapshotManagerConfig {
             principals: TrackedPrincipals::All { seed: Vec::new() },
             refresh_interval: std::time::Duration::from_millis(20),
-            negative_ttl: SignedDuration::from_secs(30),
+            unknown_ttl: SignedDuration::from_secs(30),
+            revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 4,
         },
@@ -818,7 +831,8 @@ async fn one_unanswerable_principal_unreadies_only_a_fixed_instance() {
             SnapshotManagerConfig {
                 principals: mode,
                 refresh_interval: std::time::Duration::from_millis(20),
-                negative_ttl: SignedDuration::from_secs(30),
+                unknown_ttl: SignedDuration::from_secs(30),
+                revoked_ttl: SignedDuration::from_secs(3_600),
                 retry_backoff: std::time::Duration::from_millis(5),
                 max_concurrent_fetches: 4,
             },
@@ -927,7 +941,8 @@ fn discovering_config(refresh_ms: u64) -> SnapshotManagerConfig {
             seed: vec![PRINCIPAL],
         },
         refresh_interval: std::time::Duration::from_millis(refresh_ms),
-        negative_ttl: SignedDuration::from_secs(30),
+        unknown_ttl: SignedDuration::from_secs(30),
+        revoked_ttl: SignedDuration::from_secs(3_600),
         retry_backoff: std::time::Duration::from_millis(5),
         max_concurrent_fetches: 4,
     }
@@ -1051,4 +1066,252 @@ async fn a_discovering_instance_with_nothing_resolvable_is_unready() {
         !*fixture.manager.ready().borrow(),
         "two principals tracked and neither resolvable: this instance serves nobody"
     );
+}
+
+// ---- churned catalogues (#52) ---------------------------------------------
+
+/// A source that counts fetches per principal and can be flipped between
+/// serving and revoking, so a test can watch what a sweep actually asks for.
+struct CountingSource {
+    revoked: AtomicBool,
+    live_calls: AtomicUsize,
+    dead_calls: AtomicUsize,
+    snapshot: Arc<AccountSnapshot>,
+}
+
+impl CountingSource {
+    fn new() -> Arc<Self> {
+        Arc::new(CountingSource {
+            revoked: AtomicBool::new(false),
+            live_calls: AtomicUsize::new(0),
+            dead_calls: AtomicUsize::new(0),
+            snapshot: snapshot(1, PermissionBits::bit(0)),
+        })
+    }
+}
+
+#[async_trait]
+impl SnapshotSource for CountingSource {
+    async fn snapshot(&self, principal: Principal) -> Result<SnapshotResolution, StoreError> {
+        if principal == LATER_PRINCIPAL {
+            // The permanently-dead half of the catalogue.
+            self.dead_calls.fetch_add(1, Ordering::AcqRel);
+            return Ok(SnapshotResolution::Revoked {
+                generation: Generation(9),
+            });
+        }
+        self.live_calls.fetch_add(1, Ordering::AcqRel);
+        if self.revoked.load(Ordering::Acquire) {
+            Ok(SnapshotResolution::Revoked {
+                generation: Generation(9),
+            })
+        } else {
+            Ok(SnapshotResolution::Present(publishable(Arc::clone(
+                &self.snapshot,
+            ))))
+        }
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
+        let (sender, receiver) = tokio::sync::broadcast::channel(1);
+        drop(sender);
+        receiver
+    }
+
+    async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
+        Ok(Some(vec![PRINCIPAL, LATER_PRINCIPAL]))
+    }
+}
+
+fn churn_config(revoked_ttl: SignedDuration) -> SnapshotManagerConfig {
+    SnapshotManagerConfig {
+        principals: TrackedPrincipals::All { seed: Vec::new() },
+        refresh_interval: std::time::Duration::from_millis(10),
+        unknown_ttl: SignedDuration::from_millis(10),
+        revoked_ttl,
+        retry_backoff: std::time::Duration::from_millis(5),
+        max_concurrent_fetches: 4,
+    }
+}
+
+/// **The one that matters.** Withdrawing a principal must still propagate
+/// within `refresh_interval`, however long `revoked_ttl` is — a live principal
+/// is always swept, so revocation never rides the tombstone schedule. If this
+/// is wrong, #52 traded away the wrong direction.
+#[tokio::test(start_paused = true)]
+async fn revocation_still_propagates_within_the_refresh_interval() {
+    let source = CountingSource::new();
+    let fixture = spawn_with(
+        Arc::clone(&source) as Arc<dyn SnapshotSource>,
+        // A revoked TTL far longer than the test could ever wait.
+        churn_config(SignedDuration::from_secs(86_400)),
+    );
+    stock_slot(&fixture);
+    settle().await;
+    assert_eq!(admit_as(&fixture, PRINCIPAL), Ok(()));
+
+    source.revoked.store(true, Ordering::Release);
+    settle().await;
+
+    assert_eq!(
+        admit_as(&fixture, PRINCIPAL),
+        Err(DenyReason::UnknownPrincipal),
+        "a live principal is swept every refresh, so withdrawing it lands there"
+    );
+}
+
+/// The saving: a tombstone is fetched on its own schedule, not on every sweep
+/// as well. With a revoked TTL longer than the test, the dead half of the
+/// catalogue is fetched once — during the initial load — while the live half
+/// keeps being refreshed.
+#[tokio::test(start_paused = true)]
+async fn the_sweep_does_not_refetch_tombstones() {
+    let source = CountingSource::new();
+    let fixture = spawn_with(
+        Arc::clone(&source) as Arc<dyn SnapshotSource>,
+        churn_config(SignedDuration::from_secs(86_400)),
+    );
+    stock_slot(&fixture);
+    settle().await;
+
+    let dead = source.dead_calls.load(Ordering::Acquire);
+    let live = source.live_calls.load(Ordering::Acquire);
+    assert_eq!(
+        dead, 1,
+        "the tombstone is resolved once and then left to its own TTL"
+    );
+    assert!(
+        live > dead,
+        "while the live principal keeps being swept: {live} live vs {dead} dead"
+    );
+}
+
+/// A principal the instance has served, whose row then goes *absent*, must
+/// recover on `unknown_ttl` — not sit stranded for `revoked_ttl`.
+///
+/// `Unknown` is not a withdrawal. A source that is restarting, failing over,
+/// or serving a lagging replica reports principals it has served for years as
+/// absent, and an earlier cut of #52 keyed the TTL on the locally remembered
+/// generation, so exactly those principals inherited the hour-long
+/// reinstatement TTL. With the sweep no longer covering negatives and
+/// `subscribe` closed on the HTTP transport, nothing else would have repaired
+/// them: the instance denies every request for an hour while readiness still
+/// reports healthy, because a negative counts as resolved.
+///
+/// The refresh interval here is far longer than the wait, so passing requires
+/// the *targeted* refetch to have fired on the short TTL.
+#[tokio::test]
+async fn a_live_principal_that_goes_absent_recovers_on_the_unknown_ttl() {
+    let source = MutableNoPushSource::new();
+    source.set(MutableMode::Present(snapshot(1, PermissionBits::bit(0))));
+    let map = Arc::new(ArcSwapSnapshotMap::new());
+    let manager = SnapshotManager::spawn(
+        source.clone(),
+        map.clone(),
+        SlotRegistry::new(),
+        Arc::new(SystemClock),
+        SnapshotManagerConfig {
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
+            // Short enough to carry Present -> Unknown, long enough that it
+            // cannot be what carries Unknown -> Present back.
+            refresh_interval: std::time::Duration::from_millis(30),
+            unknown_ttl: SignedDuration::from_millis(40),
+            // An hour: if the absence took this TTL, the test would time out.
+            revoked_ttl: SignedDuration::from_secs(3_600),
+            retry_backoff: std::time::Duration::from_millis(5),
+            max_concurrent_fetches: 1,
+        },
+    )
+    .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(_))) {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the principal must be served before its row disappears");
+
+    // The source loses the row without ever publishing a tombstone.
+    source.set(MutableMode::Unknown);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(_))) {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("a sweep must observe the absence");
+
+    // The source comes back, at a higher generation: a same-generation
+    // republish is refused as a stale positive, which is its own defect and
+    // not what this test pins.
+    source.set(MutableMode::Present(snapshot(2, PermissionBits::bit(0))));
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(_))) {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("an absent row must recover on unknown_ttl, not revoked_ttl");
+
+    manager.shutdown().await;
+}
+
+/// `revoked_ttl` must actually drive a refetch, so a reinstated principal
+/// comes back without a restart.
+///
+/// The sibling tests pin the sweep *filter* under a `ManualClock` that never
+/// advances, so no TTL elapses in them and `revoked_ttl` could have been wired
+/// to nothing at all. This is the end-to-end half: a real clock, a tombstone,
+/// and a reinstatement that only the tombstone's own schedule can deliver.
+#[tokio::test]
+async fn a_reinstated_principal_comes_back_on_the_revoked_ttl() {
+    let source = MutableNoPushSource::new();
+    source.set(MutableMode::Revoked);
+    let map = Arc::new(ArcSwapSnapshotMap::new());
+    let manager = SnapshotManager::spawn(
+        source.clone(),
+        map.clone(),
+        SlotRegistry::new(),
+        Arc::new(SystemClock),
+        SnapshotManagerConfig {
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
+            // Longer than the wait below: the sweep cannot be what recovers it,
+            // and it would skip this principal anyway once it is negative.
+            refresh_interval: std::time::Duration::from_secs(60),
+            // Longer than the wait too, so passing pins `revoked_ttl`
+            // specifically rather than whichever TTL happens to be shorter.
+            unknown_ttl: SignedDuration::from_secs(60),
+            revoked_ttl: SignedDuration::from_millis(40),
+            retry_backoff: std::time::Duration::from_millis(5),
+            max_concurrent_fetches: 1,
+        },
+    )
+    .unwrap();
+
+    let mut ready = manager.ready();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !*ready.borrow() {
+            ready.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the tombstone must resolve the initial load");
+    assert!(
+        !matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(_))),
+        "a revoked principal is not served"
+    );
+
+    // Above the tombstone's generation: reinstatement is a *higher* publish,
+    // and INVARIANTS #15 refuses anything at or below it.
+    source.set(MutableMode::Present(snapshot(10, PermissionBits::bit(0))));
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(_))) {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("revoked_ttl must schedule the refetch that finds the reinstatement");
+
+    manager.shutdown().await;
 }
