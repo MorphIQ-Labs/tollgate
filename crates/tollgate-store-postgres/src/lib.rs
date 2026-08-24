@@ -121,11 +121,22 @@ mod stored_id_tests {
 /// PostgreSQL's snapshot JSON predates the portable HTTP identifier contract.
 /// Keep this boundary explicit so existing rows remain readable and ordinary
 /// legacy-range writes remain rollback-safe while high-bit ids finally work.
+///
+/// **Two facts in this table follow opposite rules, deliberately.** The
+/// generation is *not* here — it lives only in the `generation` column, because
+/// that column is what the `ON CONFLICT ... WHERE` monotonicity guard compares
+/// and what a tombstone reports after its snapshot is gone (#54). `account_id`
+/// *is* here and must stay: its column is `GENERATED ALWAYS AS` a function of
+/// this JSON (migration 0006), so deleting it here would silently NULL that
+/// column, unmatch the partial index, and make an account-wide status change
+/// republish nothing.
+///
+/// Both rules say "one writer per fact". They differ on which copy survives
+/// because the generation needs a BIGINT comparison the JSON cannot give.
 #[derive(Serialize)]
 struct StoredSnapshotRef<'a> {
     account_id: StoredId,
     key_id: Option<StoredId>,
-    generation: &'a Generation,
     status: &'a AccountStatus,
     valid_until: &'a Timestamp,
     permissions: &'a PermissionBits,
@@ -138,7 +149,6 @@ impl<'a> From<&'a AccountSnapshot> for StoredSnapshotRef<'a> {
         StoredSnapshotRef {
             account_id: StoredId(snapshot.account_id.0),
             key_id: snapshot.key_id.map(|id| StoredId(id.0)),
-            generation: &snapshot.generation,
             status: &snapshot.status,
             valid_until: &snapshot.valid_until,
             permissions: &snapshot.permissions,
@@ -148,11 +158,13 @@ impl<'a> From<&'a AccountSnapshot> for StoredSnapshotRef<'a> {
     }
 }
 
+/// Rows written before #54 still carry a `generation` key. Serde ignores
+/// unknown fields, so those rows decode unchanged and the vestigial key is
+/// simply not read — which is why this needed no backfill.
 #[derive(Deserialize)]
 struct StoredSnapshot {
     account_id: StoredId,
     key_id: Option<StoredId>,
-    generation: Generation,
     status: AccountStatus,
     valid_until: Timestamp,
     permissions: PermissionBits,
@@ -160,17 +172,22 @@ struct StoredSnapshot {
     cost_table: Arc<CostTable>,
 }
 
-impl From<StoredSnapshot> for AccountSnapshot {
-    fn from(snapshot: StoredSnapshot) -> Self {
+impl StoredSnapshot {
+    /// Rebuild the snapshot around a generation the JSON no longer carries.
+    ///
+    /// Deliberately not a `From` impl: the generation has to come from the
+    /// row's column, and a conversion that could be written without it would
+    /// be a conversion someone writes without it.
+    fn into_snapshot(self, generation: Generation) -> AccountSnapshot {
         AccountSnapshot {
-            account_id: AccountId(snapshot.account_id.0),
-            key_id: snapshot.key_id.map(|id| tollgate_core::KeyId(id.0)),
-            generation: snapshot.generation,
-            status: snapshot.status,
-            valid_until: snapshot.valid_until,
-            permissions: snapshot.permissions,
-            limits: snapshot.limits,
-            cost_table: snapshot.cost_table,
+            account_id: AccountId(self.account_id.0),
+            key_id: self.key_id.map(|id| tollgate_core::KeyId(id.0)),
+            generation,
+            status: self.status,
+            valid_until: self.valid_until,
+            permissions: self.permissions,
+            limits: self.limits,
+            cost_table: self.cost_table,
         }
     }
 }
@@ -1205,18 +1222,42 @@ fn decode_status(stored: String) -> Result<AccountStatus, StoreError> {
 /// reads back what it wrote through exactly the reader's path -- a row this
 /// refuses is one the request path would refuse too, and finding that out at
 /// write time is the point.
+///
+/// Since #54 that is literally true of the generation as well: both callers
+/// hand this the row's `generation` column, so a live read and a republish
+/// resolve it identically. Before, the JSON carried a second copy that only the
+/// live path consulted.
 fn decode_publishable(
     principal: Principal,
+    generation: i64,
     value: serde_json::Value,
 ) -> Result<PublishableSnapshot, StoreError> {
+    let generation = generation_from(generation)?;
     let snapshot: StoredSnapshot =
         serde_json::from_value(value).map_err(|e| StoreError(format!("snapshot decode: {e}")))?;
-    PublishableSnapshot::try_new(Arc::new(snapshot.into())).map_err(|error| {
+    PublishableSnapshot::try_new(Arc::new(snapshot.into_snapshot(generation))).map_err(|error| {
         StoreError(format!(
             "invalid stored snapshot for principal {:#034x}: {error}",
             principal.0
         ))
     })
+}
+
+/// Read a stored generation column.
+///
+/// Takes the raw `i64` and converts here rather than at each call site, so
+/// every caller shares one refusal. That matters for the republish
+/// specifically: it must not fail an account-wide status change over one
+/// unreadable row, and a caller-side conversion is one `?` away from doing
+/// exactly that.
+///
+/// A negative value is corruption to surface, never to clamp (INVARIANTS #11).
+/// Migration 0007's CHECK is what keeps it from being written in the first
+/// place; this is the read-side backstop.
+fn generation_from(column: i64) -> Result<Generation, StoreError> {
+    u64::try_from(column)
+        .map(Generation)
+        .map_err(|_| StoreError("stored snapshot generation is negative".into()))
 }
 
 #[async_trait]
@@ -1230,18 +1271,19 @@ impl SnapshotSource for PostgresStore {
         .await
         .map_err(storage)?;
         match row {
-            Some(row) if row.get::<bool, _>(2) => {
-                let generation = u64::try_from(row.get::<i64, _>(0))
-                    .map(Generation)
-                    .map_err(|_| StoreError("stored snapshot generation is negative".into()))?;
-                Ok(SnapshotResolution::Revoked { generation })
-            }
-            Some(row) => {
-                let value: serde_json::Value = row.get(1);
-                Ok(SnapshotResolution::Present(decode_publishable(
-                    principal, value,
-                )?))
-            }
+            // Both branches now resolve the generation from the same column.
+            // They did not before: the tombstone read it here while a live read
+            // decoded a second copy out of the JSON, so one row could answer
+            // two different generations depending on which branch you reached
+            // (#54).
+            Some(row) if row.get::<bool, _>(2) => Ok(SnapshotResolution::Revoked {
+                generation: generation_from(row.get::<i64, _>(0))?,
+            }),
+            Some(row) => Ok(SnapshotResolution::Present(decode_publishable(
+                principal,
+                row.get::<i64, _>(0),
+                row.get(1),
+            )?)),
             None => Ok(SnapshotResolution::Unknown),
         }
     }
@@ -1368,11 +1410,10 @@ impl AdminStore for PostgresStore {
             // 3. RMW fails whole on one bad row. A safety operation must not
             //    be blockable by one unrelated corrupt credential.
             //
-            // Both `generation` references in SET see the old row value, so
-            // the column and the JSONB copy land on the same number -- they
-            // must, because `snapshot()` reads the generation from the JSONB
-            // while the tombstone path and the monotonic upsert read the
-            // column.
+            // Only `status` is patched into the JSON. The generation lives in
+            // the column alone (#54), so this no longer has to keep a second
+            // copy in step -- and `RETURNING generation` is what carries the
+            // new value out to the push.
             //
             // `deleted = FALSE` leaves tombstones alone: republishing one
             // would resurrect a revoked principal (INVARIANTS.md #15), and
@@ -1381,13 +1422,11 @@ impl AdminStore for PostgresStore {
             let rows = sqlx::query(
                 "UPDATE tollgate_snapshots
                     SET generation = generation + 1,
-                        snapshot   = jsonb_set(
-                                         jsonb_set(snapshot, '{status}', to_jsonb($2::text)),
-                                         '{generation}', to_jsonb(generation + 1))
+                        snapshot   = jsonb_set(snapshot, '{status}', to_jsonb($2::text))
                   WHERE account_id = $1
                     AND deleted = FALSE
                     AND snapshot ->> 'status' IS DISTINCT FROM $2::text
-                RETURNING principal, snapshot",
+                RETURNING principal, generation, snapshot",
             )
             .bind(id_bytes(account.0))
             .bind(status.as_str())
@@ -1399,7 +1438,11 @@ impl AdminStore for PostgresStore {
             let mut unreadable = 0usize;
             for row in rows {
                 let principal = Principal(id_from(row.get::<Vec<u8>, _>(0).as_slice()));
-                match decode_publishable(principal, row.get::<serde_json::Value, _>(1)) {
+                match decode_publishable(
+                    principal,
+                    row.get::<i64, _>(1),
+                    row.get::<serde_json::Value, _>(2),
+                ) {
                     Ok(snapshot) => republished.push((principal, snapshot)),
                     // Skipped for push, not fatal: this row was already
                     // unreadable before the status change touched it, and
@@ -1527,9 +1570,7 @@ impl AdminStore for PostgresStore {
         .await
         .map_err(storage)?;
         if let Some(row) = row {
-            let generation = u64::try_from(row.get::<i64, _>(0))
-                .map(Generation)
-                .map_err(|_| StoreError("stored snapshot generation is negative".into()))?;
+            let generation = generation_from(row.get::<i64, _>(0))?;
             self.push_to_subscribers(SnapshotPush {
                 principal,
                 resolution: SnapshotResolution::Revoked { generation },

@@ -78,10 +78,42 @@ struct AccountRecord {
     settlement_loss: CostUnits,
 }
 
+/// A principal's stored snapshot state.
+///
+/// An enum rather than `{ generation, snapshot: Option<_> }` so the generation
+/// is stored exactly once (#54). The struct held it twice whenever a snapshot
+/// was present — once in the field and once inside the snapshot — with nothing
+/// but caller discipline keeping them equal, the same shape PostgreSQL had
+/// between its column and its JSONB.
+///
+/// The field could not simply be deleted: revoking sets the snapshot aside, and
+/// its generation is then the only surviving watermark, without which
+/// INVARIANTS.md #15's anti-resurrection rule would be unimplementable here. So
+/// each state carries the generation in exactly one place instead.
+///
+/// Variants named for the [`SnapshotResolution`] they map onto, since
+/// `SnapshotSource::snapshot` is the only place a reader meets them.
+///
+/// Note this makes memory's inability to un-revoke structural, where a
+/// PostgreSQL tombstone keeps its JSON and could in principle be resurrected.
+/// Identical behaviour today; if un-revoking is ever added, this is the backend
+/// that changes shape.
 #[derive(Debug)]
-struct SnapshotRecord {
-    generation: Generation,
-    snapshot: Option<PublishableSnapshot>,
+enum SnapshotRecord {
+    /// Live: the generation is the snapshot's own.
+    Present(PublishableSnapshot),
+    /// Revoked: the snapshot is gone and the watermark is all that remains.
+    Revoked(Generation),
+}
+
+impl SnapshotRecord {
+    /// The record's generation, wherever this state keeps it.
+    fn generation(&self) -> Generation {
+        match self {
+            SnapshotRecord::Present(snapshot) => snapshot.generation,
+            SnapshotRecord::Revoked(generation) => *generation,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -193,17 +225,13 @@ impl MemoryStore {
         {
             let mut inner = self.lock();
             if let Some(existing) = inner.snapshots.get(&principal)
-                && existing.generation >= snapshot.generation
+                && existing.generation() >= snapshot.generation
             {
                 return;
             }
-            inner.snapshots.insert(
-                principal,
-                SnapshotRecord {
-                    generation: snapshot.generation,
-                    snapshot: Some(snapshot.clone()),
-                },
-            );
+            inner
+                .snapshots
+                .insert(principal, SnapshotRecord::Present(snapshot.clone()));
         }
         self.push_to_subscribers(SnapshotPush {
             principal,
@@ -232,11 +260,17 @@ impl MemoryStore {
             let Some(record) = inner.snapshots.get_mut(&principal) else {
                 return;
             };
-            if record.snapshot.is_none() {
+            // Already revoked: return without pushing. Dropping this arm would
+            // emit a second `Revoked` push for an unchanged record — harmless
+            // to a generation-monotonic subscriber, but it is a push for a
+            // change that did not happen.
+            let SnapshotRecord::Present(snapshot) = record else {
                 return;
-            }
-            record.snapshot = None;
-            record.generation
+            };
+            // Read the watermark before the snapshot holding it is replaced.
+            let generation = snapshot.generation;
+            *record = SnapshotRecord::Revoked(generation);
+            generation
         };
         self.push_to_subscribers(SnapshotPush {
             principal,
@@ -526,16 +560,18 @@ fn plan_republish(
     inner: &Inner,
     account: AccountId,
     status: AccountStatus,
-) -> Result<Vec<(Principal, PublishableSnapshot, Generation)>, SetStatusError> {
+) -> Result<Vec<(Principal, PublishableSnapshot)>, SetStatusError> {
     let mut planned = Vec::new();
     for (principal, record) in &inner.snapshots {
-        let Some(snapshot) = record.snapshot.as_ref() else {
+        // Revoked principals are skipped: republishing one would resurrect it,
+        // which INVARIANTS.md #15 forbids.
+        let SnapshotRecord::Present(snapshot) = record else {
             continue;
         };
         if snapshot.account_id != account || snapshot.status == status {
             continue;
         }
-        let generation = record
+        let generation = snapshot
             .generation
             .0
             .checked_add(1)
@@ -543,13 +579,11 @@ fn plan_republish(
             .ok_or_else(|| {
                 SetStatusError::Storage(StoreError("snapshot generation overflow".into()))
             })?;
-        planned.push((
-            *principal,
-            snapshot.restamped(status, generation),
-            generation,
-        ));
+        // The restamped snapshot carries the new generation; the plan does not
+        // carry a second copy of it (#54).
+        planned.push((*principal, snapshot.restamped(status, generation)));
     }
-    planned.sort_unstable_by_key(|(principal, _, _)| *principal);
+    planned.sort_unstable_by_key(|(principal, _)| *principal);
     Ok(planned)
 }
 
@@ -559,17 +593,13 @@ fn plan_republish(
 /// generation is about to overflow.
 fn apply_republish(
     inner: &mut Inner,
-    planned: Vec<(Principal, PublishableSnapshot, Generation)>,
+    planned: Vec<(Principal, PublishableSnapshot)>,
 ) -> Vec<(Principal, PublishableSnapshot)> {
     let mut pushes = Vec::with_capacity(planned.len());
-    for (principal, snapshot, generation) in planned {
-        inner.snapshots.insert(
-            principal,
-            SnapshotRecord {
-                generation,
-                snapshot: Some(snapshot.clone()),
-            },
-        );
+    for (principal, snapshot) in planned {
+        inner
+            .snapshots
+            .insert(principal, SnapshotRecord::Present(snapshot.clone()));
         pushes.push((principal, snapshot));
     }
     pushes
@@ -687,11 +717,11 @@ impl AdminStore for MemoryStore {
 impl SnapshotSource for MemoryStore {
     async fn snapshot(&self, principal: Principal) -> Result<SnapshotResolution, StoreError> {
         Ok(match self.lock().snapshots.get(&principal) {
-            Some(record) => match &record.snapshot {
-                Some(snapshot) => SnapshotResolution::Present(snapshot.clone()),
-                None => SnapshotResolution::Revoked {
-                    generation: record.generation,
-                },
+            Some(SnapshotRecord::Present(snapshot)) => {
+                SnapshotResolution::Present(snapshot.clone())
+            }
+            Some(SnapshotRecord::Revoked(generation)) => SnapshotResolution::Revoked {
+                generation: *generation,
             },
             None => SnapshotResolution::Unknown,
         })

@@ -1158,6 +1158,14 @@ async fn snapshot_json_preserves_legacy_numbers_and_encodes_high_ids_exactly() {
     let stored: serde_json::Value = sqlx::Row::get(&row, 0);
     assert_eq!(stored["account_id"], serde_json::json!(ACCOUNT.0));
     assert_eq!(stored["key_id"], serde_json::json!(key.to_string()));
+    // The generation lives in the column and nowhere else (#54). This is the
+    // witness that matters: a test that only pins *which* copy wins would keep
+    // passing if a second copy came back, and the duplication would be
+    // restored with a green suite.
+    assert!(
+        stored.get("generation").is_none(),
+        "the column is the only stored copy of the generation: {stored}"
+    );
 
     let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
         panic!("the storage-local representation must decode");
@@ -2275,5 +2283,75 @@ async fn a_status_change_reports_rows_it_changed_but_could_not_push() {
     assert!(
         store.snapshot(undecodable).await.is_err(),
         "the corrupt row is still refused on read, as it was before the change"
+    );
+}
+
+/// A row whose column and JSONB generation disagree resolves from the column,
+/// on both branches (#54).
+///
+/// No writer in this repository can produce such a row — the copies were kept
+/// equal by caller discipline, not by construction — so this plants one the way
+/// the corruption block plants every other impossible state. It is what an
+/// existing database's rows look like from the reader's point of view once the
+/// writer stops maintaining the JSONB copy: a vestigial key that must be
+/// ignored.
+///
+/// Before #54 the same row answered *two different generations* depending on
+/// which branch you reached: the live read decoded 1 from the JSONB, while
+/// revoking it reported 7 from the column. Making the two branches agree is the
+/// point of the change, and this is the test that says so.
+#[tokio::test]
+async fn a_vestigial_jsonb_generation_is_ignored_in_favour_of_the_column() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    let principal = Principal(70);
+    let pool = corruption_pool().await;
+    sqlx::query(
+        "INSERT INTO tollgate_snapshots (principal, generation, snapshot, deleted)
+         VALUES ($1, 7, $2, FALSE)",
+    )
+    .bind(principal.0.to_be_bytes().to_vec())
+    .bind(serde_json::json!({
+        "account_id": ACCOUNT.0,
+        "key_id": null,
+        "generation": 1,
+        "status": "Active",
+        "valid_until": "2100-01-01T00:00:00Z",
+        "permissions": 1,
+        "limits": {
+            "max_items_per_request": 64,
+            "rate_units_per_second": 1000,
+            "rate_burst_units": 1000
+        },
+        "cost_table": { "fixed_request": 50, "minimum_charge": 50, "weights": [1] }
+    }))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let SnapshotResolution::Present(live) = store.snapshot(principal).await.unwrap() else {
+        panic!("the planted row is live");
+    };
+    assert_eq!(
+        live.generation,
+        Generation(7),
+        "the live read resolves from the column, not the vestigial JSONB key"
+    );
+
+    // And the tombstone branch, which always read the column, still agrees --
+    // that agreement is what did not exist before.
+    AdminStore::remove_snapshot(&*store, principal)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            store.snapshot(principal).await.unwrap(),
+            SnapshotResolution::Revoked {
+                generation: Generation(7)
+            }
+        ),
+        "both branches report the same generation for the same row"
     );
 }

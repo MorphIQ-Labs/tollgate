@@ -1,0 +1,56 @@
+-- Issue #54 moved the generation column across a trust boundary, and its
+-- write-side guard has to move with it.
+--
+-- 1. `generation >= 0`. Migrations 0003 and 0004 added a non-negative CHECK to
+--    every other BIGINT counter in this schema -- balance, deposited,
+--    usage_recorded, settlement_loss, next_fence, fencing_token, granted, used,
+--    credited. `tollgate_snapshots.generation` was the sole survivor, and
+--    `next_fence` is the identical shape: a monotonic u64 stored as BIGINT.
+--
+--    That gap was invisible while the live read path never touched the column:
+--    a negative value only ever reached the tombstone branch. After #54 every
+--    read of such a row fails on `u64::try_from`, so the value is now load
+--    bearing for live traffic and belongs refused at write time, where 0003's
+--    stated policy and INVARIANTS.md #11 put it. `generation_from` remains as
+--    the read-side backstop.
+--
+-- 2. `jsonb_typeof(snapshot) = 'object'`. A scalar in this column is a live
+--    hazard rather than a theoretical one: `snapshot ->> 'status'` on a scalar
+--    yields NULL, which `IS DISTINCT FROM $2` *admits*, so the row is selected
+--    by an account-wide status change -- and then `jsonb_set` raises "cannot
+--    set path in scalar" and aborts the whole statement. One malformed row
+--    would block suspending an account, which is precisely what
+--    `set_account_status` is written not to allow (it tolerates a row it cannot
+--    decode; it cannot tolerate one it cannot patch). #54 halves the exposure
+--    by deleting the inner `jsonb_set`; this removes it.
+--
+-- Both are plain ADD CONSTRAINT, following 0003 and 0004's note: this table
+-- holds one row per principal, so the ACCESS EXCLUSIVE validating scan is
+-- trivial. Validated rather than NOT VALID, because unlike 0006's derivable
+-- check there is no legitimate pre-existing row these can reject -- a negative
+-- generation or a scalar snapshot has never been writable through the API.
+--
+-- Recovery: one transaction, so a failure leaves nothing behind. If either
+-- constraint rejects an existing row, that row is corruption predating this
+-- migration; find it with
+--     SELECT encode(principal,'hex'), generation, jsonb_typeof(snapshot)
+--       FROM tollgate_snapshots
+--      WHERE generation < 0 OR jsonb_typeof(snapshot) <> 'object';
+-- and remove it rather than weakening the constraint. To undo:
+--     ALTER TABLE tollgate_snapshots
+--         DROP CONSTRAINT tollgate_snapshots_generation_nonneg,
+--         DROP CONSTRAINT tollgate_snapshots_snapshot_is_object;
+--     DELETE FROM _sqlx_migrations WHERE version = 7;
+--
+-- One-way note for #54 itself, which is a code change with no migration of its
+-- own to carry it: from that change onwards the stored JSON no longer contains
+-- a `generation` key, and a pre-#54 binary cannot decode a row written after
+-- it. Rolling the binary back degrades availability -- every live read for an
+-- affected principal returns a store error -- but not authorization safety:
+-- the tombstone path reads the column, so revocation keeps working, and a
+-- failed decode denies rather than admits. Roll forward.
+
+ALTER TABLE tollgate_snapshots
+    ADD CONSTRAINT tollgate_snapshots_generation_nonneg CHECK (generation >= 0),
+    ADD CONSTRAINT tollgate_snapshots_snapshot_is_object
+        CHECK (jsonb_typeof(snapshot) = 'object');
