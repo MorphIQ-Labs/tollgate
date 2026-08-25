@@ -1,0 +1,29 @@
+[package]
+name = "tollgate-auth"
+description = "Credential verification for latency-critical services: digests at rest, and a session-scoped cache that removes the per-request digest without widening the revocation window."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tollgate-core = { path = "../tollgate-core", version = "=0.7.0" }
+arc-swap = { workspace = true }
+jiff = { workspace = true }
+zeroize = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+sha2 = { workspace = true }
+
+[[bench]]
+name = "credential_verification"
+harness = false

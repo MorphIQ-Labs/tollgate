@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! Authorization: Bearer <key>
-//!   → HMAC-SHA256 verify (constant-time), derive Principal fingerprint
+//!   → connection-cache hit or HMAC-SHA256 verify, derive Principal
 //!   → reserve usage-writer permit          (shed on backpressure, #8)
 //!   → AdmissionEngine::admit               (snapshot/permissions/rate/lease)
 //!   → commit_at_execution_start
@@ -20,23 +20,21 @@
 //! loopback test in tollgate-server). Readiness reports 503 until the account's
 //! lease slot is stocked (INVARIANTS.md #10).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State, connect_info::Connected};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use hmac::{Hmac, Mac};
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use subtle::ConstantTimeEq;
 
 use tollgate_admission::{
     AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot, MapEntry, SnapshotMap,
 };
+use tollgate_auth::{CredentialVerifier, HmacRegistry, SessionCredential};
 use tollgate_client::{
     ChargeGuard, Clock, LeaseCounters, LeaseManager, LeaseManagerConfig, SlotRegistry,
     SnapshotCounters, SnapshotManager, SnapshotManagerConfig, SystemClock, TrackedPrincipals,
@@ -48,8 +46,6 @@ use tollgate_core::{
     ResolvedLimits,
 };
 use tollgate_store::{AccountConfig, GrantPolicy, MemoryStore};
-
-type HmacSha256 = Hmac<Sha256>;
 
 // ---- the service's own vocabulary, mapped onto the abstract product ----
 
@@ -68,44 +64,41 @@ const PERMISSION_PRICE: PermissionBits = PermissionBits(1);
 
 // ---- credential verification (the auth seam) ---------------------------
 
-/// API keys verified by HMAC-SHA256 under a server secret. The truncated MAC
-/// is the [`Principal`] fingerprint the admission layer is keyed by; the
-/// full MAC is compared in constant time so truncation can never be the
-/// deciding comparison.
-struct AuthRegistry {
-    secret: Vec<u8>,
-    keys: HashMap<u128, [u8; 32]>,
+/// Per-connection authentication state, bound to an accepted TCP connection
+/// by Axum's `ConnectInfo`.
+///
+/// The whole of the mechanism lives in `tollgate-auth`; what an embedder
+/// supplies is the two transport-specific parts the library deliberately does
+/// not know about — what a "session" is here (one accepted connection) and how
+/// to get credential bytes out of the wire format (strip `Bearer `).
+#[derive(Clone, Default)]
+pub struct PricingConnection {
+    session: SessionCredential,
 }
 
-impl AuthRegistry {
-    fn mac(&self, api_key: &str) -> [u8; 32] {
-        let mut mac = HmacSha256::new_from_slice(&self.secret).expect("any key length works");
-        mac.update(api_key.as_bytes());
-        mac.finalize().into_bytes().into()
+impl Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>> for PricingConnection {
+    fn connect_info(_stream: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
+        Self::default()
     }
+}
 
-    fn fingerprint(mac: &[u8; 32]) -> u128 {
-        let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&mac[..16]);
-        u128::from_be_bytes(bytes)
-    }
-
-    fn register(&mut self, api_key: &str) -> Principal {
-        let mac = self.mac(api_key);
-        let fingerprint = Self::fingerprint(&mac);
-        self.keys.insert(fingerprint, mac);
-        Principal(fingerprint)
-    }
-
-    fn verify(&self, api_key: &str) -> Option<Principal> {
-        let mac = self.mac(api_key);
-        let fingerprint = Self::fingerprint(&mac);
-        let stored = self.keys.get(&fingerprint)?;
-        if stored.ct_eq(&mac).into() {
-            Some(Principal(fingerprint))
-        } else {
-            None
-        }
+impl PricingConnection {
+    /// Resolve an `Authorization` header to a principal for this connection.
+    ///
+    /// The bearer prefix is stripped *before* the library sees anything, so
+    /// what is cached and what is verified are the same bytes by construction.
+    fn authenticate(
+        &self,
+        authorization: Option<&axum::http::HeaderValue>,
+        verifier: &HmacRegistry,
+        now: Timestamp,
+    ) -> Option<Principal> {
+        let credential = authorization
+            .map(axum::http::HeaderValue::as_bytes)
+            .and_then(|value| value.strip_prefix(b"Bearer "));
+        // A header that is present but not a bearer token authenticates as
+        // nobody *and* clears any prior proof, which `None` is exactly.
+        self.session.authenticate(credential, verifier, now)
     }
 }
 
@@ -150,7 +143,7 @@ struct Problem {
 // ---- app ---------------------------------------------------------------
 
 struct AppState {
-    auth: AuthRegistry,
+    auth: HmacRegistry,
     /// Built in both configurations and honest to read in either: the engine's
     /// counters and the slot's contents say what actually happened, which is
     /// why neither ever needed an `expect`.
@@ -382,11 +375,8 @@ fn build_app_with(
         }
     };
 
-    let mut auth = AuthRegistry {
-        secret: b"demo-server-secret-rotate-me".to_vec(),
-        keys: HashMap::new(),
-    };
-    let principal = auth.register(DEMO_API_KEY);
+    let mut auth = HmacRegistry::new(b"demo-server-secret-rotate-me");
+    let principal = auth.register(DEMO_API_KEY.as_bytes());
     store.publish_snapshot(principal, compile_snapshot(1));
 
     let map = Arc::new(ArcSwapSnapshotMap::with_sharding(sharding));
@@ -576,7 +566,13 @@ fn quota_usable(slot: &LeaseSlot, mode: EnforcementMode, now: Timestamp) -> bool
 /// answering from a stale copy is precisely the disagreement between
 /// readiness and admission that INVARIANTS.md #10 forbids.
 fn enforcement_mode(state: &AppState) -> EnforcementMode {
-    let Some(principal) = state.auth.verify(DEMO_API_KEY) else {
+    // `CredentialVerifier::verify` takes the credential bytes, and returns
+    // the validity alongside the identity; readiness only needs the identity.
+    let Some(principal) = state
+        .auth
+        .verify(DEMO_API_KEY.as_bytes())
+        .map(|verified| verified.principal)
+    else {
         return EnforcementMode::Strict;
     };
     match state.engine.map().get(&principal) {
@@ -831,6 +827,7 @@ fn deny_response(reason: DenyReason) -> Response {
 
 async fn price(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(connection): ConnectInfo<PricingConnection>,
     headers: HeaderMap,
     Json(request): Json<PriceRequest>,
 ) -> Response {
@@ -850,13 +847,17 @@ async fn price(
         .into_response();
     };
 
-    // 1. Credential → principal (verification happens here, once; the
-    //    admission engine only ever sees the fingerprint).
-    let Some(principal) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .and_then(|key| state.auth.verify(key))
+    // 1. Credential → principal. Exact bytes verified earlier on this
+    //    connection reuse their principal; any change clears the slot and
+    //    verifies again. Admission still consults the loaded snapshot below on
+    //    every request, so caching cannot extend authorization.
+    //
+    //    One clock read serves both this and admission, so the credential's
+    //    validity and the snapshot's staleness are judged at the same instant
+    //    rather than at two that could straddle an expiry.
+    let now = Timestamp::now();
+    let Some(principal) =
+        connection.authenticate(headers.get(header::AUTHORIZATION), &state.auth, now)
     else {
         // Also recorded here: a credential that fails verification is refused
         // before the engine is reached, and an operator watching
@@ -890,7 +891,7 @@ async fn price(
             op: &Op::Price,
             items,
         },
-        Timestamp::now(),
+        now,
     ) {
         Ok(admitted) => admitted,
         Err(reason) => return deny_response(reason),
@@ -956,6 +957,12 @@ mod tests {
     use super::*;
     use tollgate_core::{FencingToken, LeaseGrant, LeaseId, LocalLease};
     use tollgate_store::{SnapshotResolution, SnapshotSource};
+
+    // The cache's own behaviour — verify-once, per-session isolation,
+    // invalidation ordering — is tested in `tollgate-auth`, where it now
+    // lives. What remains this crate's to prove is the wiring: that the
+    // connection factory is installed, and that a cached principal is still
+    // subject to admission on every request.
 
     fn healthy() -> Readiness {
         Readiness {

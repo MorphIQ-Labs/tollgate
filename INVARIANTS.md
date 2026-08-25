@@ -518,6 +518,56 @@ until it has one.
     `restamping_preserves_everything_validation_depends_on` (core);
     `account_status_endpoint_speaks_the_status_vocabulary` (server).
 
+23. **A cached credential proves identity, never authorization, and never
+    outlives its own validity.** A `SessionCredential` may reuse a `Principal`
+    only within the session it verified in, only when the presented credential
+    is byte-for-byte equal under a constant-time comparison to the one whose
+    verification produced it, and only while that verification is still
+    reusable at the caller's `now`. A missing or different credential clears
+    that session's proof *before* any replacement is verified, so a failed
+    verification can never leave the previous principal reusable; failed and
+    already-expired verifications are never cached.
+
+    The validity bound is what makes the verifier seam safe to open. Schemes
+    the seam invites — PASETO, JWT, client certificates — carry expiry, and a
+    cache that ignored it would honour a dead token for as long as a session
+    stayed open, with admission unable to compensate because expiry is a
+    property of the credential and not of the account snapshot.
+    `Verified::reusable_until` carries it, `HmacRegistry` returns `None`
+    because a server-issued key expires only by withdrawal, and withdrawal
+    travels by snapshot.
+
+    A cache hit skips the credential check and **nothing else**: every request
+    still enters `AdmissionEngine::admit` and consults the current snapshot, so
+    status, staleness, permissions, rate and quota are decided fresh and
+    revocation stays bounded by snapshot refresh exactly as it is with no cache
+    at all. That is why this lives in `tollgate-auth` rather than in each
+    embedder: the ordering above is a security convention, and conventions
+    upheld by caller discipline at many call sites drift.
+
+    The credential bytes live only in that session-scoped cache — never in the
+    verifier, durable state, or logs — and are wiped on drop rather than merely
+    freed, so a core dump cannot recover credentials from sessions that have
+    closed. `Drop` for `VerifiedCredential` is what enforces that, and it *is*
+    witnessed: reading the buffer after the drop would be undefined behaviour,
+    so the wipe is observed from inside the drop instead — the last instant
+    those bytes are still defined to read.
+    *Tests:* `an_unchanged_credential_is_verified_once_per_session`,
+    `the_cache_is_isolated_per_session`,
+    `a_failed_replacement_does_not_leave_the_previous_principal_usable`,
+    `a_changed_credential_revalidates_as_the_new_principal`,
+    `a_prefix_or_extension_of_the_cached_credential_is_not_accepted`,
+    `no_credential_is_retained_in_the_registry`,
+    `the_cache_works_with_an_arbitrary_verifier`,
+    `a_cached_answer_does_not_outlive_the_validity_it_was_given`,
+    `an_already_expired_answer_is_refused_and_not_cached`,
+    `an_expired_answer_that_no_longer_verifies_denies`,
+    `a_dropped_cache_entry_is_wiped_not_merely_freed`, and
+    `every_forwarding_impl_reaches_the_verifier` (tollgate-auth);
+    `price_route_requires_connection_context` and
+    `cached_principal_still_observes_snapshot_revocation` (pricing-api, the
+    wiring).
+
 Ledger roles (context for 1 and 7): leases **bound** spend; usage events **are**
 the billing record; reconciliation compares the two and steady-state drift is
 zero. Per account, exactly:

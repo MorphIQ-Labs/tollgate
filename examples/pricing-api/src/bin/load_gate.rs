@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use pricing_api::build_app_with_sharding;
+use pricing_api::{PricingConnection, build_app_with_sharding};
 use tollgate_core::LocalSharding;
 
 #[derive(Clone, Deserialize)]
@@ -305,11 +305,14 @@ async fn run_scenario(
         build_app_with_sharding(u64::MAX / 4, admission, LocalSharding::new(connections));
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async {
-                let _ = stop_rx.await;
-            })
-            .await
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<PricingConnection>(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = stop_rx.await;
+        })
+        .await
     });
 
     let samples = async {

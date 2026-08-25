@@ -2,13 +2,42 @@
 //! product's guarantees become user-visible HTTP behavior.
 
 use axum::body::Body;
+use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use pricing_api::{DEMO_ACCOUNT, DEMO_API_KEY, build_app, build_app_with_mode};
+use pricing_api::{
+    AppRuntime, DEMO_ACCOUNT, DEMO_API_KEY, PricingConnection, build_app, build_app_with_mode,
+};
 use tollgate_core::{CostUnits, DenyReason, EnforcementMode};
+use tollgate_store::SnapshotSource;
+
+/// Every test router needs a connection to authenticate against, because the
+/// price route takes `ConnectInfo<PricingConnection>` — that requirement is
+/// deliberate (#2), and `price_route_requires_connection_context` is the test
+/// that keeps it from being quietly optional.
+fn build_test_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRuntime) {
+    let (router, runtime) = build_app(deposit, admission_enabled);
+    (
+        router.layer(MockConnectInfo(PricingConnection::default())),
+        runtime,
+    )
+}
+
+/// The same, for the enforcement-mode tests #1 added.
+fn build_test_app_with_mode(
+    deposit: u64,
+    admission_enabled: bool,
+    mode: EnforcementMode,
+) -> (axum::Router, AppRuntime) {
+    let (router, runtime) = build_app_with_mode(deposit, admission_enabled, mode);
+    (
+        router.layer(MockConnectInfo(PricingConnection::default())),
+        runtime,
+    )
+}
 
 fn price_body(contracts: usize) -> Value {
     let contract =
@@ -77,7 +106,7 @@ async fn wait_ready(router: &axum::Router) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authorized_request_prices_and_charges() {
-    let (router, runtime) = build_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true);
     wait_ready(&router).await;
 
     let (status, body) = call(&router, Some(DEMO_API_KEY), price_body(14)).await;
@@ -97,7 +126,7 @@ async fn authorized_request_prices_and_charges() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn billing_ledger_matches_charges_after_shutdown() {
-    let (router, runtime) = build_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true);
     wait_ready(&router).await;
 
     let mut charged = 0u64;
@@ -116,7 +145,7 @@ async fn billing_ledger_matches_charges_after_shutdown() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_or_bad_credentials_deny() {
-    let (router, runtime) = build_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true);
     wait_ready(&router).await;
 
     let (status, body) = call(&router, None, price_body(1)).await;
@@ -132,9 +161,78 @@ async fn missing_or_bad_credentials_deny() {
     assert_eq!(store.usage_recorded(DEMO_ACCOUNT), CostUnits::ZERO);
 }
 
+/// The optimization is part of server construction, not an optional handler
+/// fast path. Omitting connection-scoped state must be visible immediately
+/// instead of silently restoring per-request verification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn price_route_requires_connection_context() {
+    let (router, runtime) = build_app(100_000, true);
+    wait_ready(&router).await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/price")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {DEMO_API_KEY}"))
+                .body(Body::from(price_body(1).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    runtime.shutdown().await;
+}
+
+/// Issue #2: caching proves only credential identity. Authorization remains a
+/// fresh snapshot-map decision on every request, so revocation still reaches
+/// an already-authenticated persistent connection through the normal push
+/// path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cached_principal_still_observes_snapshot_revocation() {
+    let (router, runtime) = build_test_app(100_000, true);
+    wait_ready(&router).await;
+
+    for _ in 0..2 {
+        let (status, _) = call(&router, Some(DEMO_API_KEY), price_body(1)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let principals = runtime
+        .store
+        .principals()
+        .await
+        .expect("memory snapshot enumeration")
+        .expect("memory store supports enumeration");
+    let [principal] = principals.as_slice() else {
+        panic!("the demo must publish exactly one principal: {principals:?}");
+    };
+    runtime.store.remove_snapshot(*principal);
+
+    let mut revoked = false;
+    for _ in 0..200 {
+        let (status, body) = call(&router, Some(DEMO_API_KEY), price_body(1)).await;
+        if status == StatusCode::UNAUTHORIZED {
+            assert_eq!(body["code"], "unknown-principal");
+            revoked = true;
+            break;
+        }
+        assert_eq!(status, StatusCode::OK, "unexpected response: {body}");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        revoked,
+        "cached credential identity must not outlive snapshot authorization"
+    );
+
+    runtime.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_cap_denies_with_zero_charge() {
-    let (router, runtime) = build_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true);
     wait_ready(&router).await;
 
     let (status, body) = call(&router, Some(DEMO_API_KEY), price_body(1_025)).await;
@@ -148,7 +246,7 @@ async fn batch_cap_denies_with_zero_charge() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exhausted_quota_returns_429_and_never_overspends() {
     // Tiny deposit: 200 units funds at most three 51-unit requests.
-    let (router, runtime) = build_app(200, true);
+    let (router, runtime) = build_test_app(200, true);
     wait_ready(&router).await;
 
     let mut ok = 0;
@@ -183,7 +281,7 @@ async fn an_elastic_account_serves_past_its_deposit_and_bills_the_overage() {
     // items), or publication refuses it; 1_074 is exactly that bound, which
     // makes it 21 whole 51-unit requests of credit.
     const CAP: u64 = 1_074;
-    let (router, runtime) = build_app_with_mode(
+    let (router, runtime) = build_test_app_with_mode(
         200,
         true,
         EnforcementMode::Elastic {
@@ -263,7 +361,7 @@ async fn an_elastic_account_serves_past_its_deposit_and_bills_the_overage() {
 /// scrape has to distinguish the two — and attribute each refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metrics_separate_admissions_from_each_kind_of_refusal() {
-    let (router, runtime) = build_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true);
     wait_ready(&router).await;
 
     let before = metrics(&router).await;
@@ -316,7 +414,7 @@ async fn metrics_separate_admissions_from_each_kind_of_refusal() {
 /// other.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metrics_report_accounting_health_while_running() {
-    let (router, runtime) = build_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true);
     wait_ready(&router).await;
 
     let before = metrics(&router).await;
@@ -378,7 +476,7 @@ async fn metrics_report_accounting_health_while_running() {
 /// callers presenting keys nobody published.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metrics_report_refill_and_snapshot_health() {
-    let (router, runtime) = build_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true);
     wait_ready(&router).await;
 
     let body = metrics(&router).await;
@@ -415,7 +513,7 @@ async fn metrics_report_refill_and_snapshot_health() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn not_ready_until_lease_arrives() {
-    let (router, runtime) = build_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true);
     // Immediately after boot the slot may be empty: readiness must reflect
     // it rather than serving guaranteed denials (INVARIANTS.md #10). We only
     // assert the transition completes.
@@ -426,7 +524,7 @@ async fn not_ready_until_lease_arrives() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn readiness_falls_when_background_planes_stop() {
-    let (router, runtime) = build_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true);
     wait_ready(&router).await;
     runtime.shutdown().await;
     assert_eq!(ready(&router).await, StatusCode::SERVICE_UNAVAILABLE);
@@ -438,7 +536,7 @@ async fn readiness_falls_when_background_planes_stop() {
 /// required, because there is no admission to present one to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn baseline_prices_without_admission() {
-    let (router, runtime) = build_app(100_000, false);
+    let (router, runtime) = build_test_app(100_000, false);
 
     let (status, body) = call(&router, None, price_body(14)).await;
     assert_eq!(status, StatusCode::OK);
@@ -460,7 +558,7 @@ async fn baseline_prices_without_admission() {
 /// `readiness_falls_when_background_planes_stop`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn baseline_is_ready_before_any_lease() {
-    let (router, runtime) = build_app(100_000, false);
+    let (router, runtime) = build_test_app(100_000, false);
     assert_eq!(ready(&router).await, StatusCode::OK);
     runtime.shutdown().await;
     assert_eq!(ready(&router).await, StatusCode::OK);
@@ -472,7 +570,7 @@ async fn baseline_is_ready_before_any_lease() {
 /// construction site; #16 made it one `Option`, and this is its witness.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn baseline_metrics_omit_the_uninstalled_planes() {
-    let (router, runtime) = build_app(100_000, false);
+    let (router, runtime) = build_test_app(100_000, false);
     let (status, _) = call(&router, None, price_body(1)).await;
     assert_eq!(status, StatusCode::OK);
 

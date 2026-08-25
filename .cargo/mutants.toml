@@ -26,6 +26,11 @@ exclude_re = [
   # proves that a non-default value survives dynamic dispatch. No input can
   # distinguish these two bodies.
   "replace SnapshotMap::local_sharding -> LocalSharding with Default::default\\(\\)",
+  # `Connected::connect_info` must create the default empty per-connection
+  # cache (INVARIANTS.md #23). Replacing the explicit `Self::default()` with
+  # inferred `Default::default()` calls the same implementation and returns
+  # the same type; no request or connection can distinguish the spellings.
+  "replace <impl Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>> for PricingConnection>::connect_info -> Self with Default::default\\(\\)",
   # A binary's `main` is process wiring — env parsing, subscriber install,
   # and a call into library code that has its own tests. Nothing running
   # in-process can observe its body being replaced, so a mutant there is

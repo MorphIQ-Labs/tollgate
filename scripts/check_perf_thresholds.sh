@@ -17,12 +17,17 @@ REPORT="reports/perf_gate_report.json"
 # Wipe only the groups this gate owns, so unrelated criterion output (if any)
 # cannot satisfy the checker.
 rm -rf "$CRITERION_ROOT/cost_table" "$CRITERION_ROOT/snapshot" "$CRITERION_ROOT/lease" \
-       "$CRITERION_ROOT/admission"
+       "$CRITERION_ROOT/admission" "$CRITERION_ROOT/credential" \
+       "$CRITERION_ROOT/credential_digest"
 mkdir -p "$(dirname "$MARKER")"
 touch "$MARKER"
 
 cargo bench --locked -p tollgate-core --bench core_hot_path
 cargo bench --locked -p tollgate-admission --bench admission_hot_path
+# Every id in the manifest must be produced by a benchmark this script runs, or
+# `evaluate` reports it missing-or-stale and the gate fails whatever the code
+# does. Adding a manifest entry without a run here is how that happens (#2).
+cargo bench --locked -p tollgate-auth --bench credential_verification
 
 # Read the load average here rather than in the gate binary: there is no
 # portable way to ask for it from std, and capturing the environment is the
