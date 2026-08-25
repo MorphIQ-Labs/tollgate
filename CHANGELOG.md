@@ -7,6 +7,17 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.6.0...v0.7.0) - 2026-08-25
+
+### Added
+
+- *(core)* [**breaking**] #1 elastic enforcement mode
+- *(ci)* restore the version-bump half of the release mechanism
+
+### Fixed
+
+- *(ci)* stage only the files prepare-release edits
+
 ## [0.6.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.5.0...v0.6.0) - 2026-08-24
 
 ### Fixed
