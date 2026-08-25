@@ -244,7 +244,14 @@ git config user.name "release-bot"
 git remote set-url origin "https://oauth2:${RELEASE_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
 
 git checkout -B "$RELEASE_BRANCH"
-git add -A
+
+# Stage only the files this script edits. `git add -A` sweeps in whatever else
+# the job left in the working tree — CARGO_HOME is inside CI_PROJECT_DIR in
+# these projects, so the first run committed 330 files of restored registry
+# cache alongside a three-line version bump.
+git add CHANGELOG.md Cargo.lock
+git ls-files -z '*Cargo.toml' | xargs -0 git add --
+
 git commit -q -m "chore: release v$next"
 git push -q --force origin "refs/heads/$RELEASE_BRANCH"
 
