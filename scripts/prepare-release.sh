@@ -210,8 +210,9 @@ if [ "$DRY_RUN" = "1" ]; then
 fi
 
 # --- rewrite the manifests ------------------------------------------------
-# The workspace version and every internal `=<current>` pin move together; a pin
-# left behind fails resolution rather than silently building something stale.
+# The workspace version and every matching internal path requirement move
+# together; a stale compatible requirement can still resolve locally and hide
+# the defect until packaging or a downstream git consumer evaluates it.
 awk -v cur="$current" -v nxt="$next" '
   /^\[/ { sect = $0 }
   !done && (sect == "[workspace.package]" || sect == "[package]") && $0 ~ ("^version *= *\"" cur "\"") {
@@ -222,8 +223,16 @@ awk -v cur="$current" -v nxt="$next" '
 ' Cargo.toml > Cargo.toml.next || { echo "prepare-release: could not bump Cargo.toml" >&2; exit 1; }
 mv Cargo.toml.next Cargo.toml
 
-for f in $(git ls-files '*Cargo.toml'); do
-  sed "s/version = \"=$current\"/version = \"=$next\"/g" "$f" > "$f.next"
+git ls-files '*Cargo.toml' | while IFS= read -r f; do
+  awk -v cur="$current" -v nxt="$next" '
+    /path[ \t]*=/ && /version[ \t]*=/ {
+      exact = "version[ \t]*=[ \t]*\"=" cur "\""
+      compatible = "version[ \t]*=[ \t]*\"" cur "\""
+      if ($0 ~ exact) sub(exact, "version = \"=" nxt "\"")
+      else if ($0 ~ compatible) sub(compatible, "version = \"" nxt "\"")
+    }
+    { print }
+  ' "$f" > "$f.next"
   if cmp -s "$f" "$f.next"; then rm -f "$f.next"; else mv "$f.next" "$f"; echo "  pin bumped: $f"; fi
 done
 
