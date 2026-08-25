@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.8.0...v0.8.1) - 2026-08-25
+
+### Fixed
+
+- *(ci)* synchronize release preparation
+
 ## [0.8.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.7.0...v0.8.0) - 2026-08-25
 
 ### Added
