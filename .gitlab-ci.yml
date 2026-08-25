@@ -26,9 +26,9 @@ workflow:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-    # The release-preparation schedule. Nothing else runs on it: the
-    # `.default-branch` rule excludes scheduled pipelines, so a schedule
-    # cannot silently re-run the gates or re-enter `tag-release`.
+    # Scheduled pipelines are a recovery lane for release preparation.
+    # `.default-branch` excludes them, so a schedule cannot re-run the gates
+    # or re-enter `tag-release`.
     - if: $CI_PIPELINE_SOURCE == "schedule"
     - when: never
 
@@ -77,10 +77,13 @@ variables:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "schedule"'
     - when: never
 
-# The release-preparation lane: the schedule that opens the release merge
-# request, plus a manual button on the default branch for cutting one now.
+# Prepare a release after every merge to the protected default branch. The
+# schedule is recovery-only, and a web pipeline retains an explicit manual
+# button. `prepare-release.sh` recognizes the release merge itself and exits
+# without proposing the following version.
 .release-prep:
   rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - if: '$CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       when: manual
@@ -349,10 +352,9 @@ load-thresholds:
 # breaking — `tag-release` reported "already exists; nothing to do" on every
 # push and the repository looked healthy while releasing nothing.
 #
-# Idempotent: with no releasable commits it exits 0 having done nothing, so the
-# schedule is quiet until there is something to release. It keeps one long-lived
-# `chore/release` branch and refreshes the open merge request in place, so the
-# proposed version always reflects the current tip of the default branch.
+# Idempotent: every post-merge run opens or refreshes one long-lived
+# `chore/release` merge request, while a recovery schedule with nothing new is
+# quiet. The proposal therefore always reflects the current default-branch tip.
 prepare-release:
   dependencies: []
   extends: .release-prep
