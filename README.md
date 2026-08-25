@@ -16,12 +16,13 @@ permission bits — never plan names, FCUs, or SQL.
 |---|---|
 | `crates/tollgate-core` | Zero-I/O, clock-free hot path: `CostUnits` (checked), `CostTable` (direct-indexed), `AccountSnapshot`, `LocalLease` (fenced, CAS), `Reservation` (pending → committed-at-execution-start \| released) |
 | `crates/tollgate-admission` | One-call pipeline: snapshot map (arc-swap and moka candidates) → permissions → quote → weighted `governor` rate token → lease reservation |
+| `crates/tollgate-auth` | Credential verification: `CredentialVerifier` scheme seam, `HmacRegistry` (digests at rest), `SessionCredential` session cache with a validity bound |
 | `crates/tollgate-store` | `LeaseAllocator` / `SnapshotSource` / `UsageSink` / `AdminStore` traits, `GrantPolicy`, `MemoryStore` reference backend, wire DTOs, `Clock` |
 | `crates/tollgate-store-postgres` | Transactional Postgres backend (row-locked acquire, set-wise usage ingest, bounded set-wise SKIP LOCKED reclaim) |
 | `crates/tollgate-server` | Axum control plane over any backend; RFC-7807 errors with stable codes |
 | `crates/tollgate-client` | Instance runtime: `LeaseManager` (background refill, quiescence-gated release), `UsageWriter` (permit-based shed-on-overflow batching), `HttpStore` transport |
 | `crates/tollgate-perf-gate` | Benchmark threshold checker (criterion estimates vs manifest, staleness-guarded) |
-| `examples/pricing-api` | Concrete API embedding the stack: HMAC-verified keys, admission, commit-at-execution-start, billing |
+| `examples/pricing-api` | Concrete API embedding the stack: connection-cached HMAC-verified keys, admission, commit-at-execution-start, billing |
 
 Contract: [`INVARIANTS.md`](INVARIANTS.md). Architecture and findings:
 [`docs/DESIGN.md`](docs/DESIGN.md).
@@ -83,7 +84,11 @@ The retained single-counter diagnostic was **~106 ns** uncontended and
 development-host production-profile loopback repetitions, the paired admitted
 vs no-admission p50 ratio was **×0.997–×1.101** for one persistent connection
 and **×1.015–×1.104** for 10 persistent connections contending on one account.
-The load gate retains both scenarios and separate ratio ceilings. One lease
+Those ranges predate the session-cached credential verification in #2. Its
+recalibration is **still outstanding**: the ratios are only meaningful from a
+controlled host, and none has been run since the change, so the numbers below
+still describe a stack that verified a credential on every request. The load gate retains both
+scenarios and separate ratio ceilings. One lease
 acquire funds thousands of requests; two instances draining one account over
 HTTP finish with **zero drift** between admission's committed units and the
 billing ledger. Gate manifests live in `testing/`; recalibrate on a controlled

@@ -13,7 +13,7 @@
 
 use std::num::NonZeroUsize;
 
-use pricing_api::build_app_with_sharding;
+use pricing_api::{PricingConnection, build_app_with_sharding};
 use tollgate_core::LocalSharding;
 
 #[tokio::main]
@@ -52,11 +52,18 @@ async fn main() -> std::io::Result<()> {
     let (router, runtime) = build_app_with_sharding(deposit, true, sharding);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(%bind, deposit, local_shards = sharding.get(), "pricing-api listening");
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    // `into_make_service_with_connect_info` is what gives each accepted
+    // connection its own `PricingConnection`, and therefore its own credential
+    // cache. Serving the router directly would silently fall back to
+    // per-request HMAC (#2).
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<PricingConnection>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
     // Flush billing, then release leases (order matters — INVARIANTS.md).
     runtime.shutdown().await;
     Ok(())

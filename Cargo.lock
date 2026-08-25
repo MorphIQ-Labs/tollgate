@@ -1476,15 +1476,13 @@ name = "pricing-api"
 version = "0.7.0"
 dependencies = [
  "axum",
- "hmac",
  "http-body-util",
  "jiff",
  "serde",
  "serde_json",
- "sha2",
- "subtle",
  "tokio",
  "tollgate-admission",
+ "tollgate-auth",
  "tollgate-client",
  "tollgate-core",
  "tollgate-store",
@@ -2389,6 +2387,20 @@ dependencies = [
  "moka",
  "proptest",
  "tollgate-core",
+]
+
+[[package]]
+name = "tollgate-auth"
+version = "0.7.0"
+dependencies = [
+ "arc-swap",
+ "criterion",
+ "hmac",
+ "jiff",
+ "sha2",
+ "subtle",
+ "tollgate-core",
+ "zeroize",
 ]
 
 [[package]]

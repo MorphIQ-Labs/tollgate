@@ -4,7 +4,7 @@
 
 ## Purpose and Architecture
 
-Tollgate provides quota admission and usage accounting for latency-critical services. Centrally allocated, fenced quota leases are spent through local atomic counters; immutable account snapshots drive admission; idempotent, batched usage events drive billing.
+Tollgate provides credential verification, quota admission, and usage accounting for latency-critical services. Centrally allocated, fenced quota leases are spent through local atomic counters; immutable account snapshots drive admission; idempotent, batched usage events drive billing.
 
 The system has two strictly separated planes:
 
@@ -15,7 +15,7 @@ The system has two strictly separated planes:
 
 ## Project Structure
 
-Workspace crates live in `crates/`. `tollgate-store` defines `LeaseAllocator`, `SnapshotSource`, `UsageSink`, and `AdminStore`. Its `MemoryStore` is the executable reference implementation; `PostgresStore` and client-side `HttpStore` must preserve those semantics. `LeaseManager` and `UsageWriter` run over direct or HTTP backends. `examples/pricing-api` embeds the full stack. Unit tests stay beside source, integration tests in each crate's `tests/`, Criterion benchmarks in `benches/`, PostgreSQL migrations in `crates/tollgate-store-postgres/migrations/`, and performance manifests/reports in `testing/` and `reports/`.
+Workspace crates live in `crates/`. `tollgate-auth` owns the credential step: `CredentialVerifier` is the pluggable scheme seam, `HmacRegistry` is the implementation in the box, and `SessionCredential` is the session-scoped cache that keeps a digest off the per-request path. It is in the library rather than in an embedder because the credential check is the *largest* cost in front of admission — roughly 800 ns against admission's ~107 ns — and because getting its invalidation ordering right is a security convention that drifts when every embedder writes it again. `tollgate-store` defines `LeaseAllocator`, `SnapshotSource`, `UsageSink`, and `AdminStore`. Its `MemoryStore` is the executable reference implementation; `PostgresStore` and client-side `HttpStore` must preserve those semantics. `LeaseManager` and `UsageWriter` run over direct or HTTP backends. `examples/pricing-api` embeds the full stack. Unit tests stay beside source, integration tests in each crate's `tests/`, Criterion benchmarks in `benches/`, PostgreSQL migrations in `crates/tollgate-store-postgres/migrations/`, and performance manifests/reports in `testing/` and `reports/`.
 
 ## Build, Test, and Development Commands
 

@@ -5,6 +5,7 @@
 resolver = "3"
 members = [
     "crates/tollgate-admission",
+    "crates/tollgate-auth",
     "crates/tollgate-client",
     "crates/tollgate-core",
     "crates/tollgate-perf-gate",
@@ -41,6 +42,9 @@ proptest = "1.7"
 # Later members (admission/store/server/client) — declared centrally so every
 # crate resolves the same versions.
 arc-swap = "1"
+# Wipes cached credential bytes on drop. Hand-rolled zeroing is what this
+# crate exists to replace: a plain loop is dead-store-eliminable.
+zeroize = "1"
 async-trait = "0.1"
 # The refill wake (#10). A single-purpose, dependency-free leaf crate already
 # in the lockfile via hyper, so taking it directly compiles nothing new. It is

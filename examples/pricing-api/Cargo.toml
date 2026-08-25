@@ -1,6 +1,6 @@
 [package]
 name = "pricing-api"
-description = "Example concrete web service built on the tollgate stack: HMAC-verified API keys, one-call admission, commit-at-execution-start charging, and batched usage accounting around a toy pricing kernel."
+description = "Example concrete web service built on the tollgate stack: connection-cached HMAC-verified API keys, one-call admission, commit-at-execution-start charging, and batched usage accounting around a toy pricing kernel."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,13 +13,11 @@ tollgate-core = { path = "../../crates/tollgate-core", version = "=0.7.0" }
 tollgate-admission = { path = "../../crates/tollgate-admission", version = "=0.7.0" }
 tollgate-client = { path = "../../crates/tollgate-client", version = "=0.7.0" }
 tollgate-store = { path = "../../crates/tollgate-store", version = "=0.7.0" }
+tollgate-auth = { path = "../../crates/tollgate-auth", version = "=0.7.0" }
 axum = { workspace = true }
-hmac = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
-subtle = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

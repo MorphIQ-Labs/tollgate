@@ -74,6 +74,12 @@
       "id": "admission/full_check_lease_exhausted_elastic",
       "target_ns": 110.0,
       "threshold_ns": 230.0
+    },
+    {
+      "_comment": "Added by #2, and measured in `tollgate-auth` where the mechanism lives. The credential step after a cache hit: one atomic load and one constant-time comparison. Gated because a regression here is otherwise invisible \u2014 if the cache stops being consulted every test still passes and only the clock changes, while the uncached path measures ~800ns, 50x this. The threshold catches that collapse, not tens of nanoseconds. Laptop numbers, provisional like every other absolute here.",
+      "id": "credential/verify_cached",
+      "target_ns": 25.0,
+      "threshold_ns": 120.0
     }
   ],
   "ratios": [
