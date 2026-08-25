@@ -9,13 +9,14 @@ use std::sync::Arc;
 use jiff::{SignedDuration, Timestamp};
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
-    LeaseId, PermissionBits, Principal, PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, FencingToken,
+    Generation, LeaseId, PermissionBits, Principal, PublishableSnapshot, RequestId, ResolvedLimits,
+    UsageEvent, UsageSource,
 };
 use tollgate_store::{
-    AccountConfig, AdminStore, AllocateError, CreateAccountError, GrantPolicy, LeaseAllocator,
-    MemoryStore, PublishSnapshotError, ReclaimBatch, ReclaimedLease, SetStatusError,
-    SnapshotResolution, SnapshotSource, UsageSink,
+    AccountConfig, AdminStore, AllocateError, Conservation, CreateAccountError, GrantPolicy,
+    LeaseAllocator, MemoryStore, PublishSnapshotError, ReclaimBatch, ReclaimedLease,
+    SetStatusError, SnapshotResolution, SnapshotSource, UsageSink,
 };
 
 fn t(secs: i64) -> Timestamp {
@@ -100,8 +101,21 @@ fn usage(lease: &tollgate_core::LeaseGrant, request: u128, units: u64, at: i64) 
     UsageEvent {
         request_id: RequestId(request),
         account_id: lease.account_id,
-        lease_id: lease.lease_id,
-        fencing_token: lease.fencing_token,
+        source: UsageSource::Leased {
+            lease_id: lease.lease_id,
+            fencing_token: lease.fencing_token,
+        },
+        units: CostUnits(units),
+        occurred_at: t(at),
+    }
+}
+
+/// A charge with no lease behind it, as elastic admission produces.
+fn overage_usage(account: AccountId, request: u128, units: u64, at: i64) -> UsageEvent {
+    UsageEvent {
+        request_id: RequestId(request),
+        account_id: account,
+        source: UsageSource::Overage,
         units: CostUnits(units),
         occurred_at: t(at),
     }
@@ -262,7 +276,10 @@ async fn usage_rejects_mismatched_lease_capability() {
         .unwrap();
 
     let mut wrong_token = usage(&lease, 1, 10, 1);
-    wrong_token.fencing_token = FencingToken(lease.fencing_token.0.checked_add(1).unwrap());
+    wrong_token.source = UsageSource::Leased {
+        lease_id: lease.lease_id,
+        fencing_token: FencingToken(lease.fencing_token.0.checked_add(1).unwrap()),
+    };
     let report = store.ingest(&[wrong_token], t(1)).await.unwrap();
     assert_eq!(
         (report.accepted, report.duplicate, report.rejected),
@@ -468,9 +485,15 @@ async fn mixed_usage_batch_preserves_partial_acceptance() {
     replay_with_unrepresentable_units.units = CostUnits(u64::MAX);
     let repeated = usage(&other, 4, 40, 6);
     let mut wrong_fence = usage(&other, 6, 10, 6);
-    wrong_fence.fencing_token = FencingToken(other.fencing_token.0.checked_add(1).unwrap());
+    wrong_fence.source = UsageSource::Leased {
+        lease_id: other.lease_id,
+        fencing_token: FencingToken(other.fencing_token.0.checked_add(1).unwrap()),
+    };
     let mut unknown_lease = usage(&other, 7, 10, 6);
-    unknown_lease.lease_id = LeaseId(u128::MAX);
+    unknown_lease.source = UsageSource::Leased {
+        lease_id: LeaseId(u128::MAX),
+        fencing_token: other.fencing_token,
+    };
     let batch = [
         usage(&active, 2, 20, 6),
         replay_with_unrepresentable_units,
@@ -480,18 +503,29 @@ async fn mixed_usage_batch_preserves_partial_acceptance() {
         repeated,
         repeated,
         usage(&active, 5, 15, 6),
+        // Two overage events in the same batch as every other class, because
+        // INVARIANTS.md #7 is about a *mixed* batch classifying each input
+        // exactly once: one on a real account, one naming an account the
+        // ledger has never heard of.
+        overage_usage(ACCOUNT, 8, 25, 6),
+        overage_usage(AccountId(u128::MAX), 9, 25, 6),
     ];
 
     let report = store.ingest(&batch, t(6)).await.unwrap();
     assert_eq!(
         (report.accepted, report.duplicate, report.rejected),
-        (4, 2, 2)
+        (5, 2, 3)
     );
-    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(75));
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(100));
     assert_eq!(store.usage_recorded(OTHER), CostUnits(40));
     assert_eq!(
         store.conservation(ACCOUNT).unwrap().settlement_loss,
         CostUnits::ZERO
+    );
+    assert_eq!(
+        store.conservation(ACCOUNT).unwrap().overage_recorded,
+        CostUnits(25),
+        "the overage event funds the units it billed"
     );
     assert_conserved(&store);
     let other_conservation = store.conservation(OTHER).unwrap();
@@ -757,6 +791,7 @@ async fn enumerating_principals_includes_revoked_ones() {
             key_id: None,
             generation: Generation(1),
             status: AccountStatus::Active,
+            enforcement_mode: EnforcementMode::Strict,
             valid_until: t(10_000),
             permissions: PermissionBits::ALL,
             limits: ResolvedLimits {
@@ -866,6 +901,7 @@ async fn snapshot_publish_fetch_and_push() {
         key_id: None,
         generation: Generation(3),
         status: AccountStatus::Active,
+        enforcement_mode: EnforcementMode::Strict,
         valid_until: t(10_000),
         permissions: PermissionBits::ALL,
         limits: ResolvedLimits {
@@ -967,6 +1003,7 @@ fn account_snapshot(account: AccountId, generation: u64, status: AccountStatus) 
         key_id: None,
         generation: Generation(generation),
         status,
+        enforcement_mode: EnforcementMode::Strict,
         valid_until: t(10_000),
         permissions: PermissionBits::ALL,
         limits: ResolvedLimits {
@@ -1415,4 +1452,179 @@ async fn a_status_change_that_cannot_republish_moves_neither_record() {
         .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
         .await
         .expect("and neither did the ledger half");
+}
+
+/// Overage bills and funds in the same transaction. Without the funding half
+/// the equation would fail by exactly the overage, so the negative control is
+/// the point of the test rather than decoration.
+#[tokio::test]
+async fn overage_usage_is_billed_and_funds_itself() {
+    let store = store_with_balance(full_grant_policy(), 1_000);
+    let before = store.conservation(ACCOUNT).unwrap();
+    assert_eq!(before.overage_recorded, CostUnits::ZERO);
+
+    let report = store
+        .ingest(&[overage_usage(ACCOUNT, 1, 40, 1)], t(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.accepted, report.duplicate, report.rejected),
+        (1, 0, 0)
+    );
+
+    let after = store.conservation(ACCOUNT).unwrap();
+    assert_eq!(after.overage_recorded, CostUnits(40));
+    assert_eq!(after.settled_usage, CostUnits(40));
+    assert_eq!(after.deposited, before.deposited, "no deposit was made");
+    assert_eq!(after.balance, before.balance, "and no balance was spent");
+    assert!(after.holds(), "conservation violated: {after:?}");
+    assert!(
+        !Conservation {
+            overage_recorded: CostUnits::ZERO,
+            ..after
+        }
+        .holds(),
+        "the funding term must be what closes the equation"
+    );
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(40));
+}
+
+/// The one thing an overage event is checked against. It has no capability to
+/// verify and no lease capacity to fit inside, so an account that does not
+/// exist is the only way it can be wrong.
+#[tokio::test]
+async fn overage_usage_for_an_unknown_account_is_rejected() {
+    let store = store_with_balance(full_grant_policy(), 1_000);
+    let report = store
+        .ingest(&[overage_usage(AccountId(u128::MAX), 1, 40, 1)], t(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.accepted, report.duplicate, report.rejected),
+        (0, 0, 1)
+    );
+    assert_conserved(&store);
+}
+
+/// `request_id` is the only idempotency axis and is independent of how the
+/// units were funded, which is what lets INVARIANTS.md #7 survive the leaseless
+/// event unchanged.
+#[tokio::test]
+async fn an_overage_replay_is_idempotent() {
+    let store = store_with_balance(full_grant_policy(), 1_000);
+    let event = overage_usage(ACCOUNT, 1, 40, 1);
+    assert_eq!(store.ingest(&[event], t(1)).await.unwrap().accepted, 1);
+    let report = store.ingest(&[event, event], t(2)).await.unwrap();
+    assert_eq!(
+        (report.accepted, report.duplicate, report.rejected),
+        (0, 2, 0)
+    );
+    assert_eq!(
+        store.conservation(ACCOUNT).unwrap().overage_recorded,
+        CostUnits(40),
+        "a replay bills once, so it funds once"
+    );
+    assert_conserved(&store);
+}
+
+/// INVARIANTS.md #11 for the funding term: a total that cannot be represented
+/// is surfaced, never wrapped and never quietly dropped. Both columns move
+/// together or neither does, so an overflow in either is the same refusal.
+///
+/// Mirrored by `overage_accounting_overflow_is_surfaced` in the Postgres
+/// suite, which reaches the same verdict through its own arithmetic.
+#[tokio::test]
+async fn overage_accounting_overflow_is_surfaced() {
+    let store = store_with_balance(full_grant_policy(), 1_000);
+    // Fill the funding term to the top of its domain, which an accepted event
+    // is allowed to do.
+    assert_eq!(
+        store
+            .ingest(&[overage_usage(ACCOUNT, 1, u64::MAX, 1)], t(1))
+            .await
+            .unwrap()
+            .accepted,
+        1
+    );
+    let before = store.conservation(ACCOUNT).unwrap();
+    assert_eq!(before.overage_recorded, CostUnits(u64::MAX));
+
+    let error = store
+        .ingest(&[overage_usage(ACCOUNT, 2, 1, 2)], t(2))
+        .await
+        .expect_err("a total that cannot be represented must be surfaced");
+    assert!(
+        error.to_string().contains("overage accounting overflow"),
+        "unexpected error: {error}"
+    );
+
+    let after = store.conservation(ACCOUNT).unwrap();
+    assert_eq!(
+        (after.overage_recorded, after.settled_usage),
+        (before.overage_recorded, before.settled_usage),
+        "a refused event moves neither column"
+    );
+}
+
+/// The regression this whole leaseless design exists to prevent. Attributing
+/// overage to a real lease would drive `used` past `granted`, and settlement
+/// would then compute a negative credit — a panic here and a permanently
+/// failing sweep in Postgres. Release and reclaim must stay ordinary on an
+/// account that has spent overage.
+#[tokio::test]
+async fn settlement_is_unaffected_by_an_account_carrying_overage() {
+    let store = store_with_balance(full_grant_policy(), 1_000);
+    let released = store
+        .acquire(ACCOUNT, CostUnits(300), TTL, t(0))
+        .await
+        .unwrap();
+    let expired = store
+        .acquire(ACCOUNT, CostUnits(200), TTL, t(0))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .ingest(
+                &[
+                    overage_usage(ACCOUNT, 1, 90, 1),
+                    usage(&released, 2, 100, 1),
+                ],
+                t(1)
+            )
+            .await
+            .unwrap()
+            .accepted,
+        2
+    );
+
+    // A graceful release still returns exactly the unspent units.
+    store
+        .release(
+            released.lease_id,
+            released.fencing_token,
+            CostUnits(200),
+            t(2),
+        )
+        .await
+        .unwrap();
+
+    // And reclaim still credits `granted - used` for the expired one.
+    let reclaimed = store
+        .reclaim_expired(
+            expired
+                .expires_at
+                .checked_add(SignedDuration::from_secs(3_600))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reclaimed.len(), 1);
+
+    let conservation = store.conservation(ACCOUNT).unwrap();
+    assert_eq!(conservation.overage_recorded, CostUnits(90));
+    assert!(
+        conservation.holds(),
+        "conservation violated: {conservation:?}"
+    );
 }

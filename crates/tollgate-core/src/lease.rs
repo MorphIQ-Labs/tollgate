@@ -35,6 +35,124 @@ pub struct LeaseGrant {
     pub expires_at: Timestamp,
 }
 
+/// An account's unfunded spend on this instance, under
+/// [`EnforcementMode::Elastic`].
+///
+/// One atomic counter, shaped exactly like [`LocalLease`]'s: a CAS loop, no
+/// lock, no I/O, no clock. It answers a different question, though. A lease
+/// counts *down* through units someone already paid for; this counts *up*
+/// through units nobody has. The ledger settles the difference by treating
+/// overage as a second funding term, so per-account conservation still closes
+/// exactly (INVARIANTS.md #1).
+///
+/// **The cap is a parameter, not a field.** It arrives from the snapshot the
+/// request has already read, which means two things: a republished cap takes
+/// effect on the very next request with no reconciliation step, and — the
+/// load-bearing half — the cap comparison happens *inside* the same
+/// compare-exchange that claims the units. Checking a cap and then claiming
+/// against it in two steps would let two cores each observe room for a request
+/// that only one of them can have.
+///
+/// **Its lifetime is the account's, not a lease's.** It hangs off the
+/// per-account lease slot, which is created on first use and held for the
+/// life of the process. That is deliberate and is the difference between this
+/// and the rate-limiter registry: a limiter rebuilt after eviction costs a
+/// full bucket, but an overage counter rebuilt after eviction silently resets
+/// a spend cap.
+///
+/// [`EnforcementMode::Elastic`]: crate::snapshot::EnforcementMode::Elastic
+#[derive(Debug)]
+pub struct AccountOverage {
+    account_id: AccountId,
+    spent: AtomicU64,
+}
+
+impl AccountOverage {
+    #[must_use]
+    pub fn new(account_id: AccountId) -> Self {
+        AccountOverage {
+            account_id,
+            spent: AtomicU64::new(0),
+        }
+    }
+
+    #[must_use]
+    pub fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
+    /// Unfunded units extended on this instance so far.
+    #[must_use]
+    pub fn spent(&self) -> CostUnits {
+        CostUnits(self.spent.load(Ordering::Acquire))
+    }
+
+    /// Units still extendable under `cap`, saturating at zero.
+    ///
+    /// Read by readiness: an elastic account with headroom here is admissible
+    /// even when its lease is empty or absent, which is the whole point of the
+    /// mode (INVARIANTS.md #10).
+    #[must_use]
+    pub fn headroom(&self, cap: CostUnits) -> CostUnits {
+        CostUnits(cap.get().saturating_sub(self.spent.load(Ordering::Acquire)))
+    }
+
+    /// Extend `units` of unfunded credit if `cap` has room. Lock-free; the CAS
+    /// loop retries only under concurrent overage on the same account.
+    ///
+    /// Fails closed on both boundaries: a total that exceeds the cap and a
+    /// total that cannot be represented are the same refusal, because a
+    /// wrapped total would read as a tiny spend and reopen the cap
+    /// (INVARIANTS.md #11).
+    #[inline]
+    pub fn try_debit(&self, units: CostUnits, cap: CostUnits) -> Result<(), DenyReason> {
+        let want = units.get();
+        let mut current = self.spent.load(Ordering::Acquire);
+        loop {
+            let refused = || DenyReason::OverageCapExhausted {
+                spent: CostUnits(current),
+                overage_cap: cap,
+            };
+            let Some(next) = current.checked_add(want) else {
+                return Err(refused());
+            };
+            if next > cap.get() {
+                return Err(refused());
+            }
+            match self.spent.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Withdraw previously extended units (release of an uncommitted overage
+    /// reservation). Callers must return only units they extended, exactly
+    /// once — the reservation state machine guarantees this.
+    ///
+    /// Plain `fetch_sub`, and the choice of what happens if that contract were
+    /// ever broken is deliberate rather than accidental. Underflow wraps the
+    /// counter to near `u64::MAX`, which makes every later request exceed the
+    /// cap and deny: wrong, but wrong in the fail-closed direction. Clamping
+    /// to zero would be the fail-*open* direction — it would under-report
+    /// spend and hand the account a fresh cap — so the safer-looking
+    /// arithmetic is the more dangerous one here.
+    #[inline]
+    pub(crate) fn credit(&self, units: CostUnits) {
+        let prior = self.spent.fetch_sub(units.get(), Ordering::AcqRel);
+        debug_assert!(
+            prior >= units.get(),
+            "overage credit of {} exceeds recorded spend {prior}",
+            units.get()
+        );
+    }
+}
+
 /// Somewhere for a draining lease to say so, without this crate learning what
 /// a task, a runtime, or a waker is.
 ///
@@ -496,6 +614,93 @@ mod tests {
 
     fn t(secs: i64) -> Timestamp {
         Timestamp::from_second(secs).unwrap()
+    }
+
+    fn overage() -> AccountOverage {
+        AccountOverage::new(AccountId(1))
+    }
+
+    #[test]
+    fn overage_accumulates_up_to_the_cap_and_then_refuses() {
+        let o = overage();
+        o.try_debit(CostUnits(40), CostUnits(100)).unwrap();
+        o.try_debit(CostUnits(60), CostUnits(100)).unwrap();
+        assert_eq!(o.spent(), CostUnits(100));
+        assert_eq!(o.headroom(CostUnits(100)), CostUnits::ZERO);
+        assert_eq!(
+            o.try_debit(CostUnits(1), CostUnits(100)),
+            Err(DenyReason::OverageCapExhausted {
+                spent: CostUnits(100),
+                overage_cap: CostUnits(100),
+            })
+        );
+        assert_eq!(o.spent(), CostUnits(100), "a refusal claims nothing");
+    }
+
+    /// The cap is a parameter, so lowering it below what an account has
+    /// already spent refuses immediately rather than waiting for the counter
+    /// to catch up — and `headroom` saturates instead of underflowing.
+    #[test]
+    fn lowering_the_cap_below_current_spend_refuses_at_once() {
+        let o = overage();
+        o.try_debit(CostUnits(80), CostUnits(100)).unwrap();
+        assert_eq!(o.headroom(CostUnits(50)), CostUnits::ZERO);
+        assert!(o.try_debit(CostUnits(1), CostUnits(50)).is_err());
+        o.try_debit(CostUnits(1), CostUnits(100)).unwrap();
+    }
+
+    /// A total that cannot be represented is the same refusal as one that
+    /// exceeds the cap: never a wrap to a small spend, which would reopen the
+    /// cap (INVARIANTS.md #11).
+    #[test]
+    fn an_unrepresentable_total_refuses_rather_than_wrapping() {
+        let o = overage();
+        o.try_debit(CostUnits(u64::MAX - 1), CostUnits(u64::MAX))
+            .unwrap();
+        assert!(o.try_debit(CostUnits(2), CostUnits(u64::MAX)).is_err());
+        assert_eq!(o.spent(), CostUnits(u64::MAX - 1));
+    }
+
+    #[test]
+    fn credit_returns_headroom_to_the_cap() {
+        let o = overage();
+        o.try_debit(CostUnits(100), CostUnits(100)).unwrap();
+        o.credit(CostUnits(30));
+        assert_eq!(o.spent(), CostUnits(70));
+        assert_eq!(o.headroom(CostUnits(100)), CostUnits(30));
+        o.try_debit(CostUnits(30), CostUnits(100)).unwrap();
+        assert!(o.try_debit(CostUnits(1), CostUnits(100)).is_err());
+    }
+
+    /// Concurrent debits that individually fit the cap must not jointly
+    /// exceed it. The cap comparison lives inside the compare-exchange for
+    /// exactly this reason; a check-then-claim would let both threads through.
+    #[test]
+    fn concurrent_debits_never_exceed_the_cap() {
+        const THREADS: usize = 8;
+        const EACH: usize = 500;
+        const CAP: u64 = 1_000;
+        let o = Arc::new(overage());
+        let admitted = Arc::new(AtomicU64::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                let o = Arc::clone(&o);
+                let admitted = Arc::clone(&admitted);
+                scope.spawn(move || {
+                    for _ in 0..EACH {
+                        if o.try_debit(CostUnits(1), CostUnits(CAP)).is_ok() {
+                            admitted.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(o.spent(), CostUnits(CAP));
+        assert_eq!(
+            admitted.load(Ordering::Relaxed),
+            CAP,
+            "every admitted unit is one the counter recorded, and vice versa"
+        );
     }
 
     fn lease(units: u64, expires: i64, low_water: u64) -> LocalLease {

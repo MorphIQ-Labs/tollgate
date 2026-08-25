@@ -20,14 +20,6 @@ exclude_re = [
   # suites. Memory was baselined by #43 and PostgreSQL by #50.
   "replace > with >= in <impl LeaseAllocator for MemoryStore>::acquire",
   "replace > with >= in <impl LeaseAllocator for PostgresStore>::acquire",
-  # `LeaseSlot::empty` builds an empty slot two indistinguishable ways.
-  # `LeaseSlot` derives `Default`, and `ArcSwapOption::default()` is the same
-  # empty slot `ArcSwapOption::const_empty()` produces — `const_empty` is
-  # usable in const context, which nothing here needs. No test can separate
-  # them because there is nothing to separate: both satisfy the documented
-  # contract that a fresh slot is `None` and denies (INVARIANTS.md #5, #10),
-  # which `a_cleared_slot_stops_the_instance_spending` pins. Baselined by #43.
-  "replace LeaseSlot::empty -> Arc<Self> with Arc::new\\(Default::default\\(\\)\\)",
   # `SnapshotMap`'s compatibility default spells the same value as
   # `LocalSharding::default()`: both are `LocalSharding::SINGLE`. Sharded maps
   # override the method, and `the_arc_delegation_forwards_every_bulk_write`

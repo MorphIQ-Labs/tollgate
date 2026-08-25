@@ -34,15 +34,17 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
-use tollgate_admission::{AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot};
+use tollgate_admission::{
+    AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot, MapEntry, SnapshotMap,
+};
 use tollgate_client::{
     ChargeGuard, Clock, LeaseCounters, LeaseManager, LeaseManagerConfig, SlotRegistry,
     SnapshotCounters, SnapshotManager, SnapshotManagerConfig, SystemClock, TrackedPrincipals,
     UsageRecorder, UsageWriter, UsageWriterConfig,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, Generation,
-    LocalSharding, OpIndex, PermissionBits, Principal, PublishableSnapshot, RequestId,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, EnforcementMode,
+    Generation, LocalSharding, OpIndex, PermissionBits, Principal, PublishableSnapshot, RequestId,
     ResolvedLimits,
 };
 use tollgate_store::{AccountConfig, GrantPolicy, MemoryStore};
@@ -285,7 +287,32 @@ fn refill_sizing(deposit: u64) -> (CostUnits, CostUnits) {
 /// Build the service. `deposit` funds the demo account; `admission_enabled:
 /// false` is the load-gate baseline.
 pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRuntime) {
-    build_app_with_sharding(deposit, admission_enabled, LocalSharding::SINGLE)
+    build_app_with(
+        deposit,
+        admission_enabled,
+        EnforcementMode::Strict,
+        LocalSharding::SINGLE,
+    )
+}
+
+/// The demo stack with the account's enforcement mode chosen by the caller.
+///
+/// Exists because an example that can only ever be `Strict` cannot show what
+/// `Elastic` does — and, less obviously, cannot *test* the wiring that reads
+/// the mode: a `enforcement_mode()` that ignored the snapshot entirely and
+/// returned `Strict` would satisfy every assertion. The mutation gate found
+/// exactly that.
+pub fn build_app_with_mode(
+    deposit: u64,
+    admission_enabled: bool,
+    enforcement_mode: EnforcementMode,
+) -> (axum::Router, AppRuntime) {
+    build_app_with(
+        deposit,
+        admission_enabled,
+        enforcement_mode,
+        LocalSharding::SINGLE,
+    )
 }
 
 /// Build the service with an explicit instance-local hot-path shard count.
@@ -293,6 +320,23 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
 pub fn build_app_with_sharding(
     deposit: u64,
     admission_enabled: bool,
+    sharding: LocalSharding,
+) -> (axum::Router, AppRuntime) {
+    build_app_with(
+        deposit,
+        admission_enabled,
+        EnforcementMode::Strict,
+        sharding,
+    )
+}
+
+/// Both knobs at once. Each public builder above fixes one of them, because
+/// every current caller varies one and takes the default for the other; the
+/// body lives here so neither knob's default is written twice.
+fn build_app_with(
+    deposit: u64,
+    admission_enabled: bool,
+    enforcement_mode: EnforcementMode,
     sharding: LocalSharding,
 ) -> (axum::Router, AppRuntime) {
     let store = MemoryStore::new(GrantPolicy::default()).expect("default grant policy is valid");
@@ -316,6 +360,7 @@ pub fn build_app_with_sharding(
                 key_id: None,
                 generation: Generation(generation),
                 status: AccountStatus::Active,
+                enforcement_mode,
                 valid_until: clock
                     .now()
                     .checked_add(SignedDuration::from_secs(3_600))
@@ -461,7 +506,11 @@ async fn readyz(State(state): State<Arc<AppState>>) -> StatusCode {
     };
     let readiness = Readiness {
         snapshots_fresh: plane_healthy(&admission.snapshots_ready),
-        lease_usable: lease_usable(&state.slot, Timestamp::now()),
+        lease_usable: quota_usable(
+            &state.slot,
+            enforcement_mode(state.as_ref()),
+            Timestamp::now(),
+        ),
         refill_healthy: plane_healthy(&admission.lease_manager_health),
         writer_healthy: !admission.recorder.is_closed(),
     };
@@ -499,14 +548,41 @@ fn plane_healthy(health: &tokio::sync::watch::Receiver<bool>) -> bool {
     health.has_changed().is_ok() && *health.borrow()
 }
 
-/// Whether the installed lease can still fund work — the same comparison
-/// `LocalLease::try_debit` makes, so readiness and the request path cannot
+/// Whether this instance can still fund work for the demo account — the same
+/// comparisons the request path makes, so readiness and admission cannot
 /// disagree about the boundary. "Usable *through* `expires_at - margin`"
 /// (INVARIANTS.md #12) is `now < usable_until`: at that instant exactly, the
 /// request path already denies, and readiness must not still be advertising.
-fn lease_usable(slot: &LeaseSlot, now: Timestamp) -> bool {
-    slot.load()
-        .is_some_and(|lease| now < lease.usable_until() && !lease.remaining().is_zero())
+///
+/// Under `EnforcementMode::Elastic` an empty or absent lease is not the end of
+/// the answer. An elastic account with overage headroom *is* admissible, and
+/// reporting it unready would pull from rotation exactly the instances the
+/// mode exists to keep serving — turning a feature that prevents false denials
+/// into one that causes them (INVARIANTS.md #10).
+fn quota_usable(slot: &LeaseSlot, mode: EnforcementMode, now: Timestamp) -> bool {
+    let lease_usable = slot
+        .load()
+        .is_some_and(|lease| now < lease.usable_until() && !lease.remaining().is_zero());
+    lease_usable
+        || mode
+            .overage_cap()
+            .is_some_and(|cap| !slot.overage().headroom(cap).is_zero())
+}
+
+/// The demo account's currently published enforcement mode, read from the
+/// snapshot the request path itself would read.
+///
+/// Not cached beside the slot: a republish changes the mode, and readiness
+/// answering from a stale copy is precisely the disagreement between
+/// readiness and admission that INVARIANTS.md #10 forbids.
+fn enforcement_mode(state: &AppState) -> EnforcementMode {
+    let Some(principal) = state.auth.verify(DEMO_API_KEY) else {
+        return EnforcementMode::Strict;
+    };
+    match state.engine.map().get(&principal) {
+        Some(MapEntry::Present(admission)) => admission.snapshot.enforcement_mode,
+        _ => EnforcementMode::Strict,
+    }
 }
 
 /// What this instance admitted, refused, and has left to spend.
@@ -532,6 +608,24 @@ pub struct Metrics {
     /// (cold start, expiry, or control-plane invalidation). Read off the
     /// shared slot, never from the request path.
     pub lease_remaining: Option<u64>,
+    /// Requests admitted with no lease behind them, and the units they were
+    /// quoted. Included in `admitted` / `units_admitted`, never instead of
+    /// them.
+    ///
+    /// The pair an operator watches for an elastic account: it climbing is
+    /// credit being extended, and it is a leading indicator of an invoice the
+    /// way `accounting.rejected` is a leading indicator of billing loss.
+    pub admitted_overage: u64,
+    pub units_admitted_overage: u64,
+    /// Unfunded units currently outstanding on this instance, and the cap
+    /// bounding them.
+    ///
+    /// **Per instance.** Fleet exposure is this cap times the number of
+    /// instances, because the counter behind it is a local atomic — the same
+    /// scope every other local mechanism here has. `null` for a strict
+    /// account, which extends no credit at all.
+    pub overage_spent: u64,
+    pub overage_cap: Option<u64>,
     /// How long the installed lease may still be spent against — the
     /// `expires_at - safety_margin` bound of INVARIANTS.md #12, not the raw
     /// expiry. Paired with `lease_remaining`, since a lease can be refused
@@ -638,6 +732,12 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Json<Metrics> {
         denied: counters.denied(),
         denials: counters.denials_by_name().collect(),
         lease_remaining: lease.as_ref().map(|lease| lease.remaining().get()),
+        admitted_overage: counters.admitted_overage,
+        units_admitted_overage: counters.units_admitted_overage,
+        overage_spent: state.slot.overage().spent().get(),
+        overage_cap: enforcement_mode(state.as_ref())
+            .overage_cap()
+            .map(CostUnits::get),
         lease_usable_until: lease.map(|lease| lease.usable_until().to_string()),
         accounting: admission.map(|admission| {
             let health = admission.recorder.health();
@@ -716,6 +816,14 @@ fn deny_response(reason: DenyReason) -> Response {
             (StatusCode::SERVICE_UNAVAILABLE, "quota-unavailable")
         }
         DenyReason::LeaseExhausted { .. } => (StatusCode::TOO_MANY_REQUESTS, "quota-exhausted"),
+        // 402, not 429, and for the same reason `unpriceable-under-limits` is
+        // not 429: an exhausted overage cap does not refill on its own. The
+        // lease behind `quota-exhausted` does, so telling this caller to retry
+        // would point it at a wall. Payment is the remedy, and the status code
+        // says so.
+        DenyReason::OverageCapExhausted { .. } => {
+            (StatusCode::PAYMENT_REQUIRED, "overage-cap-exhausted")
+        }
         DenyReason::AccountingBackpressure => (StatusCode::SERVICE_UNAVAILABLE, "accounting-busy"),
     };
     problem(status, code, reason.to_string())
@@ -925,8 +1033,11 @@ mod tests {
     #[test]
     fn readiness_closes_the_lease_window_exactly_when_debits_do() {
         let now = Timestamp::now();
-        let slot = LeaseSlot::empty();
-        assert!(!lease_usable(&slot, now), "an empty slot funds nothing");
+        let slot = LeaseSlot::for_account(DEMO_ACCOUNT);
+        assert!(
+            !quota_usable(&slot, EnforcementMode::Strict, now),
+            "an empty slot funds nothing"
+        );
 
         let lease = lease_expiring_at(now, 100);
         slot.install(Arc::clone(&lease));
@@ -935,7 +1046,7 @@ mod tests {
             "the request path denies at the boundary",
         );
         assert!(
-            !lease_usable(&slot, now),
+            !quota_usable(&slot, EnforcementMode::Strict, now),
             "so readiness must not still be advertising at it",
         );
 
@@ -943,16 +1054,60 @@ mod tests {
             now.checked_add(SignedDuration::from_secs(60)).unwrap(),
             100,
         ));
-        assert!(lease_usable(&slot, now));
+        assert!(quota_usable(&slot, EnforcementMode::Strict, now));
 
         slot.install(lease_expiring_at(
             now.checked_add(SignedDuration::from_secs(60)).unwrap(),
             0,
         ));
         assert!(
-            !lease_usable(&slot, now),
+            !quota_usable(&slot, EnforcementMode::Strict, now),
             "a live lease with nothing left funds nothing either",
         );
+    }
+
+    /// The mode's whole purpose, stated as a readiness property: an elastic
+    /// account with headroom keeps its instance in rotation on exactly the
+    /// states a strict one is withdrawn for, and leaves rotation when the
+    /// headroom is gone (INVARIANTS.md #10).
+    #[test]
+    fn readiness_counts_overage_headroom_for_an_elastic_account() {
+        let now = Timestamp::now();
+        let elastic = EnforcementMode::Elastic {
+            overage_cap: CostUnits(100),
+        };
+        let slot = LeaseSlot::for_account(DEMO_ACCOUNT);
+
+        // No lease at all, and a live lease with nothing left: both deny under
+        // `Strict`, and both are exactly what elastic mode serves through.
+        assert!(!quota_usable(&slot, EnforcementMode::Strict, now));
+        assert!(quota_usable(&slot, elastic, now));
+
+        slot.install(lease_expiring_at(
+            now.checked_add(SignedDuration::from_secs(60)).unwrap(),
+            0,
+        ));
+        assert!(!quota_usable(&slot, EnforcementMode::Strict, now));
+        assert!(quota_usable(&slot, elastic, now));
+
+        // Spending the cap withdraws the instance, because at that point it
+        // really cannot admit anything.
+        slot.overage()
+            .try_debit(CostUnits(100), CostUnits(100))
+            .unwrap();
+        assert!(
+            !quota_usable(&slot, elastic, now),
+            "a spent cap is not admissible, and readiness must say so"
+        );
+
+        // A cap raised by a republish restores readiness with no other change.
+        assert!(quota_usable(
+            &slot,
+            EnforcementMode::Elastic {
+                overage_cap: CostUnits(200)
+            },
+            now
+        ));
     }
 
     /// Early refill only means something while `low_water` sits below the
@@ -990,6 +1145,7 @@ mod tests {
                 key_id: None,
                 generation: Generation(generation),
                 status: AccountStatus::Active,
+                enforcement_mode: EnforcementMode::Strict,
                 valid_until: Timestamp::now()
                     .checked_add(SignedDuration::from_secs(3_600))
                     .unwrap(),

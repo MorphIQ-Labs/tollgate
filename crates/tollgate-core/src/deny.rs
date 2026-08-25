@@ -59,6 +59,21 @@ pub enum DenyReason {
         /// Units still available on the lease at the time of refusal.
         remaining: CostUnits,
     },
+    /// An elastic account has extended as much unfunded credit as its
+    /// `overage_cap` allows on this instance.
+    ///
+    /// Deliberately not [`LeaseExhausted`](Self::LeaseExhausted), which the
+    /// transient/terminal split (#40) makes a "wait for refill" signal. A
+    /// lease refills on its own; an exhausted overage cap does not, and will
+    /// keep refusing until the account is funded or an operator raises the
+    /// cap. Reporting it as transient would tell the caller to retry into a
+    /// wall.
+    OverageCapExhausted {
+        /// Unfunded units already extended on this instance.
+        spent: CostUnits,
+        /// The account's whole per-instance allowance at the time of refusal.
+        overage_cap: CostUnits,
+    },
     /// Cost arithmetic overflowed. A quote that cannot be represented is
     /// refused rather than wrapped (INVARIANTS.md #11).
     CostOverflow,
@@ -71,8 +86,8 @@ impl DenyReason {
     /// Stable metric labels, in [`index`](DenyReason::index) order.
     ///
     /// These are the *variant* names, not [`Display`](fmt::Display) output.
-    /// Three variants interpolate runtime values into their message
-    /// (`max_items`, `weight`/`burst_units`, `remaining`), so using the
+    /// Four variants interpolate runtime values into their message
+    /// (`max_items`, `weight`/`burst_units`, `remaining`, `spent`), so using the
     /// rendered text as a label would mint a fresh time series per distinct
     /// value — unbounded cardinality from a fixed enum. The label says which
     /// reason; the payload belongs in the response to the caller.
@@ -89,16 +104,17 @@ impl DenyReason {
         "lease_unavailable",
         "lease_expired",
         "lease_exhausted",
+        "overage_cap_exhausted",
         "cost_overflow",
         "accounting_backpressure",
     ];
 
     /// How many distinct reasons exist — the width of any per-reason array.
-    pub const COUNT: usize = 14;
+    pub const COUNT: usize = 15;
 
     /// This reason's dense slot, for direct-indexed per-reason tallies.
     ///
-    /// Three variants carry data, so there is no discriminant to cast: the
+    /// Four variants carry data, so there is no discriminant to cast: the
     /// mapping is written out, and the match is exhaustive on purpose. A new
     /// variant fails to compile until it is given a slot, which is what stops
     /// a reason from silently landing in another's bucket — the same forcing
@@ -118,8 +134,9 @@ impl DenyReason {
             DenyReason::LeaseUnavailable => 9,
             DenyReason::LeaseExpired => 10,
             DenyReason::LeaseExhausted { .. } => 11,
-            DenyReason::CostOverflow => 12,
-            DenyReason::AccountingBackpressure => 13,
+            DenyReason::OverageCapExhausted { .. } => 12,
+            DenyReason::CostOverflow => 13,
+            DenyReason::AccountingBackpressure => 14,
         }
     }
 
@@ -156,6 +173,11 @@ impl fmt::Display for DenyReason {
             DenyReason::LeaseExhausted { remaining } => {
                 write!(f, "quota lease exhausted ({remaining} units remaining)")
             }
+            DenyReason::OverageCapExhausted { spent, overage_cap } => write!(
+                f,
+                "overage cap reached ({spent} of {overage_cap} unfunded units extended \
+                 on this instance); retrying cannot help until the account is funded"
+            ),
             DenyReason::CostOverflow => f.write_str("cost arithmetic overflow"),
             DenyReason::AccountingBackpressure => f.write_str("usage accounting backpressure"),
         }
@@ -186,6 +208,10 @@ mod tests {
         DenyReason::LeaseExpired,
         DenyReason::LeaseExhausted {
             remaining: CostUnits(3),
+        },
+        DenyReason::OverageCapExhausted {
+            spent: CostUnits(20),
+            overage_cap: CostUnits(20),
         },
         DenyReason::CostOverflow,
         DenyReason::AccountingBackpressure,

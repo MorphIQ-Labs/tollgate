@@ -9,22 +9,47 @@ use governor::{Quota, RateLimiter};
 use jiff::Timestamp;
 
 use tollgate_core::{
-    AccountSnapshot, CostUnits, Generation, LocalLease, LocalSharding, Locality,
-    PublishableSnapshot, ResolvedLimits,
+    AccountId, AccountOverage, AccountSnapshot, CostUnits, Generation, LocalLease, LocalSharding,
+    Locality, PublishableSnapshot, ResolvedLimits,
 };
 
 pub use tollgate_core::Principal;
 
-/// The slot a background refill task installs leases into. Shared between
-/// the request path (load) and the refill plane (store); per account, and
-/// shared by every principal of that account.
+/// The slot a background refill task installs leases into, and the account's
+/// overage counter. Shared between the request path (load) and the refill
+/// plane (store); per account, and shared by every principal of that account.
 ///
-/// A `None` slot is the cold-start / lost-lease state and denies
-/// (`LeaseUnavailable`), keeping INVARIANTS.md #5 and #10 honest.
+/// A `None` lease is the cold-start / lost-lease state. Under
+/// [`EnforcementMode::Strict`] it denies (`LeaseUnavailable`), keeping
+/// INVARIANTS.md #5 and #10 honest; under `Elastic` it is one of the states
+/// the overage counter answers for.
+///
+/// **The overage counter lives here, and that is a decision worth stating.**
+/// It has to outlive individual leases — the account is elastic precisely when
+/// it has no usable lease — so it cannot hang off `LocalLease`. It also has to
+/// outlive snapshot installs, which rules out `AccountAdmissionState`, rebuilt
+/// on every publish. And it must not live beside the rate-limiter registry,
+/// whose entries are `Weak` and swept: that is safe only because a rebuilt
+/// limiter costs a full bucket, whereas a rebuilt overage counter silently
+/// resets a spend cap. This slot is held by a strong `Arc` in the client's
+/// `SlotRegistry`, created on first use and never reclaimed, which is exactly
+/// the lifetime a spend cap needs.
+///
+/// **The counter stays unsharded while the lease views shard**, and that is
+/// also deliberate. Sharding the lease splits a *grant* N ways, which is
+/// sound because the shards' remainders sum to the grant. A spend cap is not
+/// divisible the same way: N per-locality caps summing to the configured cap
+/// would refuse an elastic request on a saturated core while headroom sat
+/// unreachable on another, and one cap of `N × cap` would silently raise it.
+/// The counter is therefore one atomic per account, contended only on the
+/// path that by definition has no usable lease to spend from.
+///
+/// [`EnforcementMode::Strict`]: tollgate_core::EnforcementMode::Strict
 #[derive(Debug)]
 pub struct LeaseSlot {
     current: LeaseSlotCurrent,
     sharding: LocalSharding,
+    overage: Arc<AccountOverage>,
 }
 
 #[derive(Debug)]
@@ -59,26 +84,44 @@ impl LeaseSlotCurrent {
 }
 
 impl LeaseSlot {
+    /// An empty single-view slot for `account`, with its overage counter at
+    /// zero.
+    ///
+    /// Takes the account id because the overage counter is the billing
+    /// identity for spend that has no lease to borrow one from: an overage
+    /// usage event names this account and nothing else.
     #[must_use]
-    pub fn empty() -> Arc<Self> {
-        Self::with_sharding(LocalSharding::SINGLE)
+    pub fn for_account(account: AccountId) -> Arc<Self> {
+        Self::with_sharding(account, LocalSharding::SINGLE)
     }
 
-    /// Create an empty slot whose refill manager will install leases with the
-    /// selected instance-local layout.
+    /// Create an empty slot for `account` whose refill manager will install
+    /// leases with the selected instance-local layout.
     #[must_use]
-    pub fn with_sharding(sharding: LocalSharding) -> Arc<Self> {
+    pub fn with_sharding(account: AccountId, sharding: LocalSharding) -> Arc<Self> {
         let current = if sharding == LocalSharding::SINGLE {
             LeaseSlotCurrent::Single(ArcSwapOption::const_empty())
         } else {
             LeaseSlotCurrent::sharded(sharding.get())
         };
-        Arc::new(Self { current, sharding })
+        Arc::new(Self {
+            current,
+            sharding,
+            overage: Arc::new(AccountOverage::new(account)),
+        })
     }
 
     #[must_use]
     pub fn sharding(&self) -> LocalSharding {
         self.sharding
+    }
+
+    /// The account's unfunded-spend counter, shared by every principal of the
+    /// account, by every lease that passes through this slot, and by every
+    /// locality this slot publishes to.
+    #[must_use]
+    pub fn overage(&self) -> &Arc<AccountOverage> {
+        &self.overage
     }
 
     /// Install a fresh lease. The old lease (if any) is dropped here — never
@@ -97,6 +140,10 @@ impl LeaseSlot {
     /// Drop the current lease after the control plane invalidates local lease
     /// state or shutdown returns it. Subsequent requests deny until a new
     /// lease arrives.
+    ///
+    /// The overage counter is deliberately untouched: losing a lease is not a
+    /// funding event, and clearing spend here would hand an elastic account a
+    /// fresh cap on every control-plane hiccup.
     pub fn clear(&self) {
         let _ = self.publish(None);
     }
@@ -165,15 +212,6 @@ impl LeaseSlot {
             LeaseSlotCurrent::Sharded { views, .. } => {
                 views[locality.index(self.sharding)].load_full()
             }
-        }
-    }
-}
-
-impl Default for LeaseSlot {
-    fn default() -> Self {
-        Self {
-            current: LeaseSlotCurrent::Single(ArcSwapOption::const_empty()),
-            sharding: LocalSharding::SINGLE,
         }
     }
 }
@@ -957,7 +995,7 @@ mod tests {
     /// witness at all.
     #[test]
     fn a_cleared_slot_stops_the_instance_spending() {
-        let slot = LeaseSlot::empty();
+        let slot = LeaseSlot::for_account(AccountId(1));
         assert!(slot.load().is_none(), "a cold slot denies");
 
         slot.install(lease(100));
@@ -975,7 +1013,7 @@ mod tests {
     /// return value strands units until TTL reclaim.
     #[test]
     fn superseding_a_lease_hands_back_the_old_one() {
-        let slot = LeaseSlot::empty();
+        let slot = LeaseSlot::for_account(AccountId(1));
         assert!(
             slot.replace(lease(100)).is_none(),
             "nothing was installed, so there is nothing to give back"
@@ -1002,7 +1040,7 @@ mod tests {
     fn racing_mutators_never_leave_a_slot_holding_two_answers() {
         let sharding = LocalSharding::new(NonZeroUsize::new(8).unwrap());
         for round in 0..500 {
-            let slot = LeaseSlot::with_sharding(sharding);
+            let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
             slot.install(identified_lease(LeaseId(1), 100));
 
             let replacer = {
@@ -1031,7 +1069,7 @@ mod tests {
     #[test]
     fn sharded_slot_keeps_release_parked_while_any_local_view_is_held() {
         let sharding = LocalSharding::new(NonZeroUsize::new(4).unwrap());
-        let slot = LeaseSlot::with_sharding(sharding);
+        let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
         slot.install(lease(100));
         let sibling = match &slot.current {
             LeaseSlotCurrent::Sharded { views, .. } => views[1].load_full().unwrap(),

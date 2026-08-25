@@ -74,7 +74,7 @@ impl SlotRegistry {
                 .lock()
                 .expect("slot registry poisoned")
                 .entry(account)
-                .or_insert_with(|| LeaseSlot::with_sharding(self.sharding)),
+                .or_insert_with(|| LeaseSlot::with_sharding(account, self.sharding)),
         )
     }
 

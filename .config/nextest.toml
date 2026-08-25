@@ -15,3 +15,19 @@ postgres = { max-threads = 1 }
 [[profile.mutants.overrides]]
 filter = 'package(tollgate-store-postgres)'
 test-group = 'postgres'
+# The 10s cap above is a *hang* detector, and it was set (#14, 2026-08-22)
+# before this suite's slowest legitimate test existed (#12, 2026-08-23).
+# `the_account_filter_is_answered_by_an_index_not_by_discarding_rows` seeds
+# ~1525 leases through sequential `acquire` calls so the planner sees a table
+# shape that makes an index scan the cheaper plan; the row counts are what the
+# assertion rests on, so they cannot be trimmed without testing something else.
+# It measures ~4s against loopback Docker and exceeded 10s on a shared CI
+# runner talking to a service container -- so the cap refused a test that was
+# working, and the baseline failed before a single mutant ran.
+#
+# 45s is the worst case above plus room for a slow shared runner, which is the
+# rule limits are supposed to follow: justified against the largest legitimate
+# input, not a comfortable constant. Hang detection is not given up, only moved
+# — cargo-mutants' own auto-set timeout (~62s here) still bounds a mutant that
+# never terminates, and every non-PostgreSQL test keeps the tight 10s cap.
+slow-timeout = { period = "45s", terminate-after = 1, grace-period = "1s" }

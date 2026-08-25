@@ -24,9 +24,9 @@ use tollgate_admission::{
     SnapshotMap,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
-    LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex, PermissionBits, PublishableSnapshot,
-    ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, FencingToken,
+    Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex, PermissionBits,
+    PublishableSnapshot, ResolvedLimits,
 };
 
 #[derive(Clone, Copy)]
@@ -47,6 +47,7 @@ fn snapshot() -> Arc<AccountSnapshot> {
         key_id: None,
         generation: Generation(1),
         status: AccountStatus::Active,
+        enforcement_mode: EnforcementMode::Strict,
         valid_until: far_future(),
         permissions: PermissionBits::bit(0),
         limits: ResolvedLimits {
@@ -88,11 +89,26 @@ fn big_lease(sharding: LocalSharding) -> Arc<LocalLease> {
     ))
 }
 
+/// A live lease with nothing left: the `LeaseExhausted` case, and the one
+/// elastic mode is most often reached through.
+fn empty_lease() -> Arc<LocalLease> {
+    Arc::new(LocalLease::new(
+        LeaseGrant {
+            lease_id: LeaseId(7),
+            account_id: AccountId(1),
+            fencing_token: FencingToken(1),
+            units: CostUnits::ZERO,
+            expires_at: far_future(),
+        },
+        CostUnits::ZERO,
+    ))
+}
+
 fn populate(map: &impl SnapshotMap) {
     // A realistic working set: the benched principal among hundreds.
     let sharding = map.local_sharding();
     for i in 0..512u128 {
-        let slot = LeaseSlot::with_sharding(sharding);
+        let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
         slot.install(big_lease(sharding));
         map.install_publishable(
             Principal(i),
@@ -249,7 +265,71 @@ fn bench_full_check(c: &mut Criterion) {
         })
     });
 
+    // The lease-exhausted path, which nothing measured before #1: `admit_once`
+    // deliberately uses a giant lease and cancels, so the quota step's failure
+    // branch never ran under a benchmark. Elastic mode adds a branch there, so
+    // it would otherwise land on the one path the perf gate does not watch.
+    //
+    // Two functions, one shape. `strict` is the regression guard — the added
+    // match must not cost a strict account anything — and `elastic` is what
+    // the new work actually costs, an atomic compare-exchange on a counter
+    // that is warm in the same cache line as the slot the lookup just read.
+    let strict = exhausted_engine(EnforcementMode::Strict);
+    group.bench_function("full_check_lease_exhausted_strict", |b| {
+        b.iter(|| {
+            let denied = strict.admit(
+                AdmissionRequest {
+                    principal: black_box(Principal(97)),
+                    required: PermissionBits::bit(0),
+                    op: &PriceOp,
+                    items: 64,
+                },
+                now,
+            );
+            black_box(denied.unwrap_err())
+        })
+    });
+
+    let elastic = exhausted_engine(EnforcementMode::Elastic {
+        overage_cap: CostUnits(u64::MAX),
+    });
+    group.bench_function("full_check_lease_exhausted_elastic", |b| {
+        b.iter(|| {
+            let admitted = elastic
+                .admit(
+                    AdmissionRequest {
+                        principal: black_box(Principal(97)),
+                        required: PermissionBits::bit(0),
+                        op: &PriceOp,
+                        items: 64,
+                    },
+                    now,
+                )
+                .unwrap();
+            // Cancel, as `admit_once` does, so the cap never drains: this
+            // measures the debit-and-refund pair, not a one-shot admission.
+            black_box(admitted.reservation.cancel());
+        })
+    });
+
     group.finish();
+}
+
+/// A populated map whose benched principal holds a live but *empty* lease, so
+/// every admission reaches the quota step and fails it.
+fn exhausted_engine(mode: EnforcementMode) -> AdmissionEngine<ArcSwapSnapshotMap> {
+    let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+    let mut snapshot = AccountSnapshot::clone(&snapshot());
+    snapshot.enforcement_mode = mode;
+    let snapshot = Arc::new(snapshot);
+    for i in 0..512u128 {
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(empty_lease());
+        engine
+            .map()
+            .install(Principal(i), Arc::clone(&snapshot), slot);
+    }
+    engine
 }
 
 /// Control-plane write amplification (review finding #9): loading 512
@@ -264,7 +344,7 @@ fn bench_bulk_install(c: &mut Criterion) {
     let entries = || {
         (0..512u128)
             .map(|i| {
-                let slot = LeaseSlot::empty();
+                let slot = LeaseSlot::for_account(AccountId(1));
                 (Principal(i), snapshot(), slot)
             })
             .collect::<Vec<_>>()
@@ -301,7 +381,13 @@ fn bench_bulk_install(c: &mut Criterion) {
     for accounts in [512u128, 2_048] {
         let distinct = move || {
             (0..accounts)
-                .map(|i| (Principal(i), snapshot_for_account(i), LeaseSlot::empty()))
+                .map(|i| {
+                    (
+                        Principal(i),
+                        snapshot_for_account(i),
+                        LeaseSlot::for_account(AccountId(i)),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         group.bench_function(format!("install_many_{accounts}_distinct_accounts"), |b| {
@@ -318,7 +404,13 @@ fn bench_bulk_install(c: &mut Criterion) {
     group.bench_function("install_loop_512_distinct_accounts", |b| {
         let distinct = || {
             (0..512u128)
-                .map(|i| (Principal(i), snapshot_for_account(i), LeaseSlot::empty()))
+                .map(|i| {
+                    (
+                        Principal(i),
+                        snapshot_for_account(i),
+                        LeaseSlot::for_account(AccountId(i)),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         b.iter_batched(

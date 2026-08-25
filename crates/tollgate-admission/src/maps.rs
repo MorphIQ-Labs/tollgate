@@ -650,6 +650,8 @@ mod tests {
     use super::*;
     use std::hash::BuildHasher;
     use std::num::NonZeroUsize;
+
+    use tollgate_core::EnforcementMode;
     use tollgate_core::{
         AccountId, AccountStatus, CostTable, CostUnits, OpIndex, PermissionBits, ResolvedLimits,
     };
@@ -779,6 +781,7 @@ mod tests {
             key_id: None,
             generation: Generation(generation),
             status: AccountStatus::Active,
+            enforcement_mode: EnforcementMode::Strict,
             valid_until: t(10_000),
             permissions: PermissionBits::ALL,
             limits: ResolvedLimits {
@@ -839,12 +842,16 @@ mod tests {
         assert_eq!(map.local_sharding(), LocalSharding::SINGLE);
 
         let publishable = PublishableSnapshot::try_new(snapshot(1)).unwrap();
-        map.install_publishable(Principal(1), publishable.clone(), LeaseSlot::empty());
+        map.install_publishable(
+            Principal(1),
+            publishable.clone(),
+            LeaseSlot::for_account(AccountId(1)),
+        );
         map.apply_publishable_many(vec![
             PublishableSnapshotUpdate::Present {
                 principal: Principal(2),
                 snapshot: publishable.clone(),
-                lease: LeaseSlot::empty(),
+                lease: LeaseSlot::for_account(AccountId(1)),
             },
             PublishableSnapshotUpdate::Unknown {
                 principal: Principal(3),
@@ -855,7 +862,7 @@ mod tests {
             vec![PublishableSnapshotUpdate::Present {
                 principal: Principal(4),
                 snapshot: publishable,
-                lease: LeaseSlot::empty(),
+                lease: LeaseSlot::for_account(AccountId(1)),
             }],
             t(3),
         );
@@ -875,9 +882,9 @@ mod tests {
         assert!(map.get(&p).is_none());
 
         // Install, then attempt a rollback to an older generation: no-op.
-        map.install(p, snapshot(5), LeaseSlot::empty());
+        map.install(p, snapshot(5), LeaseSlot::for_account(AccountId(1)));
         assert_eq!(generation_of(&map, &p), Some(5));
-        map.install(p, snapshot(3), LeaseSlot::empty());
+        map.install(p, snapshot(3), LeaseSlot::for_account(AccountId(1)));
         assert_eq!(generation_of(&map, &p), Some(5));
         // Same generation is also a no-op (idempotent replay) -- and it must
         // be observed as *the same entry*, not merely the same generation.
@@ -889,7 +896,7 @@ mod tests {
             Some(MapEntry::Present(state)) => state,
             other => panic!("expected a present entry, got {other:?}"),
         };
-        map.install(p, snapshot(5), LeaseSlot::empty());
+        map.install(p, snapshot(5), LeaseSlot::for_account(AccountId(1)));
         assert_eq!(generation_of(&map, &p), Some(5));
         let after = match map.get(&p) {
             Some(MapEntry::Present(state)) => state,
@@ -900,7 +907,7 @@ mod tests {
             "a duplicate publish of a visible snapshot must not reinstall it"
         );
         // Newer generation replaces.
-        map.install(p, snapshot(6), LeaseSlot::empty());
+        map.install(p, snapshot(6), LeaseSlot::for_account(AccountId(1)));
         assert_eq!(generation_of(&map, &p), Some(6));
 
         // An absent row denies, and a *delayed older* push still cannot roll
@@ -914,15 +921,15 @@ mod tests {
         // below, against an actual revocation.
         map.install_unknown(p, t(100));
         assert!(matches!(map.get(&p), Some(MapEntry::NegativeUntil { .. })));
-        map.install(p, snapshot(1), LeaseSlot::empty());
+        map.install(p, snapshot(1), LeaseSlot::for_account(AccountId(1)));
         assert!(matches!(map.get(&p), Some(MapEntry::NegativeUntil { .. })));
 
         // And the principal returns at the generation it already had: an
         // absence is not a statement that generation 6 is dead (#53).
-        map.install(p, snapshot(6), LeaseSlot::empty());
+        map.install(p, snapshot(6), LeaseSlot::for_account(AccountId(1)));
         assert_eq!(generation_of(&map, &p), Some(6));
 
-        map.install(p, snapshot(7), LeaseSlot::empty());
+        map.install(p, snapshot(7), LeaseSlot::for_account(AccountId(1)));
         assert_eq!(generation_of(&map, &p), Some(7));
 
         // The symmetric reorder is safe too: an old revocation cannot revoke a
@@ -934,7 +941,7 @@ mod tests {
 
         // A real revocation *does* refuse its own generation back -- the half
         // that must not loosen (INVARIANTS.md #15).
-        map.install(p, snapshot(7), LeaseSlot::empty());
+        map.install(p, snapshot(7), LeaseSlot::for_account(AccountId(1)));
         assert!(
             matches!(map.get(&p), Some(MapEntry::NegativeUntil { .. })),
             "a replay at the tombstone's generation stays dead"
@@ -945,9 +952,9 @@ mod tests {
         // The watermark here is a *revocation* at 7, so 7 stays refused.
         map.remove(&p);
         assert!(map.get(&p).is_none());
-        map.install(p, snapshot(7), LeaseSlot::empty());
+        map.install(p, snapshot(7), LeaseSlot::for_account(AccountId(1)));
         assert!(map.get(&p).is_none());
-        map.install(p, snapshot(8), LeaseSlot::empty());
+        map.install(p, snapshot(8), LeaseSlot::for_account(AccountId(1)));
         assert_eq!(generation_of(&map, &p), Some(8));
 
         // The other half of `remove`, which nothing pinned before #53 and
@@ -958,25 +965,41 @@ mod tests {
         // until someone publishes a higher generation.
         map.remove(&p);
         assert!(map.get(&p).is_none());
-        map.install(p, snapshot(8), LeaseSlot::empty());
+        map.install(p, snapshot(8), LeaseSlot::for_account(AccountId(1)));
         assert_eq!(
             generation_of(&map, &p),
             Some(8),
             "an evicted entry is repaired by re-fetching the generation it had"
         );
         // Ordering still holds across the eviction: older is still refused.
-        map.install(p, snapshot(7), LeaseSlot::empty());
+        map.install(p, snapshot(7), LeaseSlot::for_account(AccountId(1)));
         assert_eq!(generation_of(&map, &p), Some(8));
     }
 
     #[test]
     fn install_many_respects_generations_in_one_write() {
         let map = ArcSwapSnapshotMap::new();
-        map.install(Principal(1), snapshot(5), LeaseSlot::empty());
+        map.install(
+            Principal(1),
+            snapshot(5),
+            LeaseSlot::for_account(AccountId(1)),
+        );
         map.install_many(vec![
-            (Principal(1), snapshot(3), LeaseSlot::empty()), // rollback: discarded
-            (Principal(2), snapshot(1), LeaseSlot::empty()),
-            (Principal(3), snapshot(1), LeaseSlot::empty()),
+            (
+                Principal(1),
+                snapshot(3),
+                LeaseSlot::for_account(AccountId(1)),
+            ), // rollback: discarded
+            (
+                Principal(2),
+                snapshot(1),
+                LeaseSlot::for_account(AccountId(1)),
+            ),
+            (
+                Principal(3),
+                snapshot(1),
+                LeaseSlot::for_account(AccountId(1)),
+            ),
         ]);
         assert_eq!(generation_of(&map, &Principal(1)), Some(5));
         assert_eq!(generation_of(&map, &Principal(2)), Some(1));
@@ -995,7 +1018,7 @@ mod tests {
         map.install_publishable(
             Principal(1),
             PublishableSnapshot::try_new(snapshot(1)).unwrap(),
-            LeaseSlot::with_sharding(sharding),
+            LeaseSlot::with_sharding(AccountId(1), sharding),
         );
 
         assert_eq!(map.local_sharding(), sharding);
@@ -1015,7 +1038,7 @@ mod tests {
         map.install_publishable(
             Principal(1),
             PublishableSnapshot::try_new(snapshot(1)).unwrap(),
-            LeaseSlot::with_sharding(sharding),
+            LeaseSlot::with_sharding(AccountId(1), sharding),
         );
 
         let seen: Vec<_> = (0..8)
@@ -1097,7 +1120,7 @@ mod tests {
         map.install_publishable(
             Principal(1),
             publishable.clone(),
-            LeaseSlot::with_sharding(sharding),
+            LeaseSlot::with_sharding(AccountId(1), sharding),
         );
 
         match map.map.load().get(&Principal(1)).unwrap() {
@@ -1121,13 +1144,13 @@ mod tests {
         map.apply_publishable_many(vec![PublishableSnapshotUpdate::Present {
             principal: Principal(2),
             snapshot: publishable.clone(),
-            lease: LeaseSlot::with_sharding(sharding),
+            lease: LeaseSlot::with_sharding(AccountId(1), sharding),
         }]);
         map.apply_publishable_many_at(
             vec![PublishableSnapshotUpdate::Present {
                 principal: Principal(3),
                 snapshot: publishable,
-                lease: LeaseSlot::with_sharding(sharding),
+                lease: LeaseSlot::with_sharding(AccountId(1), sharding),
             }],
             t(1),
         );
@@ -1144,7 +1167,7 @@ mod tests {
             vec![SnapshotUpdate::Present {
                 principal: Principal(1),
                 snapshot: snapshot(1),
-                lease: LeaseSlot::empty(),
+                lease: LeaseSlot::for_account(AccountId(1)),
             }],
             t(10),
         );
@@ -1167,7 +1190,7 @@ mod tests {
         map.install_publishable(
             Principal(0),
             PublishableSnapshot::try_new(snapshot(1)).unwrap(),
-            LeaseSlot::with_sharding(sharding),
+            LeaseSlot::with_sharding(AccountId(1), sharding),
         );
         assert_eq!(map.local_sharding(), sharding);
         assert!(matches!(
@@ -1176,8 +1199,16 @@ mod tests {
         ));
 
         map.install_many(vec![
-            (Principal(1), snapshot(1), LeaseSlot::empty()),
-            (Principal(2), snapshot(1), LeaseSlot::empty()),
+            (
+                Principal(1),
+                snapshot(1),
+                LeaseSlot::for_account(AccountId(1)),
+            ),
+            (
+                Principal(2),
+                snapshot(1),
+                LeaseSlot::for_account(AccountId(1)),
+            ),
         ]);
         assert_eq!(generation_of(&map, &Principal(1)), Some(1));
         assert_eq!(generation_of(&map, &Principal(2)), Some(1));
@@ -1186,7 +1217,7 @@ mod tests {
             SnapshotUpdate::Present {
                 principal: Principal(1),
                 snapshot: snapshot(2),
-                lease: LeaseSlot::empty(),
+                lease: LeaseSlot::for_account(AccountId(1)),
             },
             SnapshotUpdate::Revoked {
                 principal: Principal(2),
@@ -1203,14 +1234,14 @@ mod tests {
         map.apply_publishable_many(vec![PublishableSnapshotUpdate::Present {
             principal: Principal(3),
             snapshot: PublishableSnapshot::try_new(snapshot(1)).unwrap(),
-            lease: LeaseSlot::empty(),
+            lease: LeaseSlot::for_account(AccountId(1)),
         }]);
         assert_eq!(generation_of(&map, &Principal(3)), Some(1));
         map.apply_publishable_many_at(
             vec![PublishableSnapshotUpdate::Present {
                 principal: Principal(3),
                 snapshot: PublishableSnapshot::try_new(snapshot(2)).unwrap(),
-                lease: LeaseSlot::empty(),
+                lease: LeaseSlot::for_account(AccountId(1)),
             }],
             t(10),
         );
@@ -1223,7 +1254,11 @@ mod tests {
     #[test]
     fn arc_swap_negative_cache_is_bounded_and_evicts_oldest_deadline_first() {
         let map = ArcSwapSnapshotMap::with_max_negative_entries(2);
-        map.install(Principal(1), snapshot(1), LeaseSlot::empty());
+        map.install(
+            Principal(1),
+            snapshot(1),
+            LeaseSlot::for_account(AccountId(1)),
+        );
         map.install_unknown(Principal(2), t(30));
         map.install_unknown(Principal(3), t(10));
         map.install_unknown(Principal(4), t(20));
@@ -1259,17 +1294,17 @@ mod tests {
     fn negative_eviction_preserves_generation_monotonicity() {
         let map = ArcSwapSnapshotMap::with_max_negative_entries(0);
         let principal = Principal(1);
-        map.install(principal, snapshot(5), LeaseSlot::empty());
+        map.install(principal, snapshot(5), LeaseSlot::for_account(AccountId(1)));
         map.install_revoked(principal, t(10), Generation(5));
         assert!(map.get(&principal).is_none(), "zero-cap cache must evict");
 
-        map.install(principal, snapshot(4), LeaseSlot::empty());
-        map.install(principal, snapshot(5), LeaseSlot::empty());
+        map.install(principal, snapshot(4), LeaseSlot::for_account(AccountId(1)));
+        map.install(principal, snapshot(5), LeaseSlot::for_account(AccountId(1)));
         assert!(
             map.get(&principal).is_none(),
             "eviction must not admit a stale or replayed snapshot"
         );
-        map.install(principal, snapshot(6), LeaseSlot::empty());
+        map.install(principal, snapshot(6), LeaseSlot::for_account(AccountId(1)));
         assert_eq!(generation_of(&map, &principal), Some(6));
     }
 
@@ -1310,7 +1345,11 @@ mod tests {
         // sweep never ran at all.
         for account in 0..1_000u128 {
             let principal = Principal(account);
-            map.install(principal, snapshot_for(account, 1), LeaseSlot::empty());
+            map.install(
+                principal,
+                snapshot_for(account, 1),
+                LeaseSlot::for_account(AccountId(1)),
+            );
             map.remove(&principal);
         }
 
@@ -1339,7 +1378,7 @@ mod tests {
             map.install(
                 Principal(account),
                 snapshot_for(account, 1),
-                LeaseSlot::empty(),
+                LeaseSlot::for_account(AccountId(1)),
             );
         }
 
@@ -1362,7 +1401,11 @@ mod tests {
     #[test]
     fn sweeping_never_reclaims_a_live_account() {
         let map = ArcSwapSnapshotMap::new();
-        map.install(Principal(0), snapshot_for(7, 1), LeaseSlot::empty());
+        map.install(
+            Principal(0),
+            snapshot_for(7, 1),
+            LeaseSlot::for_account(AccountId(1)),
+        );
         let before = match map.get(&Principal(0)).unwrap() {
             MapEntry::Present(state) => state.limiter.clone(),
             MapEntry::NegativeUntil { .. } => unreachable!(),
@@ -1371,11 +1414,19 @@ mod tests {
         // Enough churn to force several sweeps past the growth watermark.
         for account in 100..300u128 {
             let principal = Principal(account);
-            map.install(principal, snapshot_for(account, 1), LeaseSlot::empty());
+            map.install(
+                principal,
+                snapshot_for(account, 1),
+                LeaseSlot::for_account(AccountId(1)),
+            );
             map.remove(&principal);
         }
 
-        map.install(Principal(1), snapshot_for(7, 1), LeaseSlot::empty());
+        map.install(
+            Principal(1),
+            snapshot_for(7, 1),
+            LeaseSlot::for_account(AccountId(1)),
+        );
         let after = match map.get(&Principal(1)).unwrap() {
             MapEntry::Present(state) => state.limiter.clone(),
             MapEntry::NegativeUntil { .. } => unreachable!(),
@@ -1408,12 +1459,12 @@ mod tests {
                 SnapshotUpdate::Present {
                     principal: Principal(1),
                     snapshot: snapshot(3),
-                    lease: LeaseSlot::empty(),
+                    lease: LeaseSlot::for_account(AccountId(1)),
                 },
                 SnapshotUpdate::Present {
                     principal: Principal(2),
                     snapshot: faster,
-                    lease: LeaseSlot::empty(),
+                    lease: LeaseSlot::for_account(AccountId(1)),
                 },
             ];
             if reversed {
@@ -1454,8 +1505,16 @@ mod tests {
     #[test]
     fn principals_of_one_account_share_the_limiter() {
         let map = ArcSwapSnapshotMap::new();
-        map.install(Principal(1), snapshot(1), LeaseSlot::empty());
-        map.install(Principal(2), snapshot(1), LeaseSlot::empty());
+        map.install(
+            Principal(1),
+            snapshot(1),
+            LeaseSlot::for_account(AccountId(1)),
+        );
+        map.install(
+            Principal(2),
+            snapshot(1),
+            LeaseSlot::for_account(AccountId(1)),
+        );
         let (a, b) = match (
             map.get(&Principal(1)).unwrap(),
             map.get(&Principal(2)).unwrap(),
@@ -1476,12 +1535,12 @@ mod tests {
     fn limiter_survives_same_limit_reinstall() {
         let map = ArcSwapSnapshotMap::new();
         let p = Principal(1);
-        map.install(p, snapshot(1), LeaseSlot::empty());
+        map.install(p, snapshot(1), LeaseSlot::for_account(AccountId(1)));
         let first = match map.get(&p).unwrap() {
             MapEntry::Present(s) => s,
             _ => unreachable!(),
         };
-        map.install(p, snapshot(2), LeaseSlot::empty());
+        map.install(p, snapshot(2), LeaseSlot::for_account(AccountId(1)));
         let second = match map.get(&p).unwrap() {
             MapEntry::Present(s) => s,
             _ => unreachable!(),
@@ -1491,7 +1550,7 @@ mod tests {
 
         let mut changed = (*snapshot(3)).clone();
         changed.limits.rate_units_per_second = 2_000;
-        map.install(p, Arc::new(changed), LeaseSlot::empty());
+        map.install(p, Arc::new(changed), LeaseSlot::for_account(AccountId(1)));
         let third = match map.get(&p).unwrap() {
             MapEntry::Present(s) => s,
             _ => unreachable!(),
@@ -1503,8 +1562,16 @@ mod tests {
     #[test]
     fn limit_change_updates_every_principal_of_the_account() {
         let map = ArcSwapSnapshotMap::new();
-        map.install(Principal(1), snapshot(1), LeaseSlot::empty());
-        map.install(Principal(2), snapshot(1), LeaseSlot::empty());
+        map.install(
+            Principal(1),
+            snapshot(1),
+            LeaseSlot::for_account(AccountId(1)),
+        );
+        map.install(
+            Principal(2),
+            snapshot(1),
+            LeaseSlot::for_account(AccountId(1)),
+        );
         let before = match map.get(&Principal(2)).unwrap() {
             MapEntry::Present(state) => state.limiter.current(),
             _ => unreachable!(),
@@ -1512,7 +1579,11 @@ mod tests {
 
         let mut changed = (*snapshot(2)).clone();
         changed.limits.rate_units_per_second = 2_000;
-        map.install(Principal(1), Arc::new(changed), LeaseSlot::empty());
+        map.install(
+            Principal(1),
+            Arc::new(changed),
+            LeaseSlot::for_account(AccountId(1)),
+        );
 
         let (a, b) = match (
             map.get(&Principal(1)).unwrap(),
@@ -1530,13 +1601,21 @@ mod tests {
         let map = ArcSwapSnapshotMap::new();
         let mut current = (*snapshot(5)).clone();
         current.limits.rate_units_per_second = 2_000;
-        map.install(Principal(1), Arc::new(current), LeaseSlot::empty());
+        map.install(
+            Principal(1),
+            Arc::new(current),
+            LeaseSlot::for_account(AccountId(1)),
+        );
         let installed = match map.get(&Principal(1)).unwrap() {
             MapEntry::Present(state) => state.limiter.current(),
             _ => unreachable!(),
         };
 
-        map.install(Principal(1), snapshot(3), LeaseSlot::empty());
+        map.install(
+            Principal(1),
+            snapshot(3),
+            LeaseSlot::for_account(AccountId(1)),
+        );
         let after_stale = match map.get(&Principal(1)).unwrap() {
             MapEntry::Present(state) => state.limiter.current(),
             _ => unreachable!(),

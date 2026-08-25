@@ -14,6 +14,7 @@ use tollgate_client::{
 };
 use tollgate_core::{
     AccountId, AccountStatus, CostUnits, DenyReason, LocalSharding, RequestId, UsageEvent,
+    UsageSource,
 };
 use tollgate_store::{
     AccountConfig, GrantPolicy, IngestReport, LeaseAllocator, MemoryStore, ReclaimBatch,
@@ -64,7 +65,7 @@ async fn settle() {
 #[tokio::test(start_paused = true)]
 async fn refill_installs_lease_on_cold_start() {
     let store = store(10_000);
-    let slot = LeaseSlot::empty();
+    let slot = LeaseSlot::for_account(ACCOUNT);
     let clock = Arc::new(ManualClock::new(t(0)));
     let manager =
         LeaseManager::spawn(store.clone(), Arc::clone(&slot), clock, manager_config()).unwrap();
@@ -82,7 +83,7 @@ async fn refill_installs_lease_on_cold_start() {
 #[tokio::test(start_paused = true)]
 async fn refill_begins_on_the_crossing_debit_not_the_next_tick() {
     let store = store(10_000);
-    let slot = LeaseSlot::empty();
+    let slot = LeaseSlot::for_account(ACCOUNT);
     let clock = Arc::new(ManualClock::new(t(0)));
     let manager = LeaseManager::spawn(
         store.clone(),
@@ -124,7 +125,7 @@ async fn refill_begins_on_the_crossing_debit_not_the_next_tick() {
 #[tokio::test(start_paused = true)]
 async fn a_burst_across_a_rotation_never_denies_a_funded_account() {
     let store = store(1_000_000);
-    let slot = LeaseSlot::empty();
+    let slot = LeaseSlot::for_account(ACCOUNT);
     let clock = Arc::new(ManualClock::new(t(0)));
     let manager = LeaseManager::spawn(
         store.clone(),
@@ -171,7 +172,7 @@ async fn adaptive_tail_grant_does_not_rotate_while_unspent() {
         status: AccountStatus::Active,
     });
     let clock = Arc::new(ManualClock::new(t(0)));
-    let slot = LeaseSlot::empty();
+    let slot = LeaseSlot::for_account(ACCOUNT);
     let manager = LeaseManager::spawn(
         store.clone(),
         Arc::clone(&slot),
@@ -197,7 +198,7 @@ async fn adaptive_tail_grant_does_not_rotate_while_unspent() {
 #[tokio::test(start_paused = true)]
 async fn rotation_at_low_water_installs_fresh_lease() {
     let store = store(10_000);
-    let slot = LeaseSlot::with_sharding(LocalSharding::new(NonZeroUsize::new(8).unwrap()));
+    let slot = LeaseSlot::with_sharding(ACCOUNT, LocalSharding::new(NonZeroUsize::new(8).unwrap()));
     let clock = Arc::new(ManualClock::new(t(0)));
     let manager =
         LeaseManager::spawn(store.clone(), Arc::clone(&slot), clock, manager_config()).unwrap();
@@ -233,7 +234,7 @@ async fn expired_slot_fails_closed_then_recovers() {
     // 2000 units: the manager's 1000 grant plus 1000 for the drain lease
     // that starves re-acquisition.
     let store = store(2_000);
-    let slot = LeaseSlot::empty();
+    let slot = LeaseSlot::for_account(ACCOUNT);
     let clock = Arc::new(ManualClock::new(t(0)));
     let manager = LeaseManager::spawn(
         store.clone(),
@@ -287,7 +288,7 @@ async fn usability_window_rollover_returns_unspent_capacity() {
         initial_balance: CostUnits(1_000),
         status: AccountStatus::Active,
     });
-    let slot = LeaseSlot::empty();
+    let slot = LeaseSlot::for_account(ACCOUNT);
     let clock = Arc::new(ManualClock::new(t(0)));
     let mut config = manager_config();
     config.expiry_safety_margin = SignedDuration::from_secs(5);
@@ -323,7 +324,7 @@ fn invalid_lease_manager_durations_are_rejected() {
 #[tokio::test(start_paused = true)]
 async fn shutdown_releases_unspent_units() {
     let store = store(10_000);
-    let slot = LeaseSlot::with_sharding(LocalSharding::new(NonZeroUsize::new(8).unwrap()));
+    let slot = LeaseSlot::with_sharding(ACCOUNT, LocalSharding::new(NonZeroUsize::new(8).unwrap()));
     let clock = Arc::new(ManualClock::new(t(0)));
     let manager =
         LeaseManager::spawn(store.clone(), Arc::clone(&slot), clock, manager_config()).unwrap();
@@ -347,8 +348,10 @@ fn event(request: u128, units: u64, lease: &tollgate_core::LeaseGrant) -> UsageE
     UsageEvent {
         request_id: RequestId(request),
         account_id: lease.account_id,
-        lease_id: lease.lease_id,
-        fencing_token: lease.fencing_token,
+        source: UsageSource::Leased {
+            lease_id: lease.lease_id,
+            fencing_token: lease.fencing_token,
+        },
         units: CostUnits(units),
         occurred_at: t(0),
     }
@@ -374,7 +377,7 @@ async fn refill_counters_attribute_refusals_to_their_reason() {
     // An account that does not exist: every acquire is refused, always the
     // same way.
     let store = MemoryStore::new(GrantPolicy::default()).unwrap();
-    let slot = LeaseSlot::empty();
+    let slot = LeaseSlot::for_account(ACCOUNT);
     let clock = Arc::new(ManualClock::new(t(0)));
     let manager =
         LeaseManager::spawn(store.clone(), Arc::clone(&slot), clock, manager_config()).unwrap();
@@ -409,7 +412,7 @@ async fn refill_counters_attribute_refusals_to_their_reason() {
 #[tokio::test(start_paused = true)]
 async fn refill_counters_record_grants_and_releases() {
     let store = store(10_000);
-    let slot = LeaseSlot::empty();
+    let slot = LeaseSlot::for_account(ACCOUNT);
     let clock = Arc::new(ManualClock::new(t(0)));
     let manager =
         LeaseManager::spawn(store.clone(), Arc::clone(&slot), clock, manager_config()).unwrap();
@@ -613,7 +616,10 @@ async fn rejected_events_are_visible_while_running() {
     // A capability token the allocator never attached to this lease: the
     // sink refuses the mismatch.
     let mut mismatched = event(1, 10, &lease);
-    mismatched.fencing_token = tollgate_core::FencingToken(lease.fencing_token.0 + 99);
+    mismatched.source = UsageSource::Leased {
+        lease_id: lease.lease_id,
+        fencing_token: tollgate_core::FencingToken(lease.fencing_token.0 + 99),
+    };
     recorder.try_reserve().unwrap().record(mismatched);
     settle().await;
 
@@ -1156,7 +1162,10 @@ async fn final_flush_counts_duplicates_and_rejections() {
     recorder.try_reserve().unwrap().record(event(1, 10, &lease));
     recorder.try_reserve().unwrap().record(event(1, 10, &lease));
     let mut mismatched = event(2, 10, &lease);
-    mismatched.fencing_token = tollgate_core::FencingToken(999);
+    mismatched.source = UsageSource::Leased {
+        lease_id: lease.lease_id,
+        fencing_token: tollgate_core::FencingToken(999),
+    };
     recorder.try_reserve().unwrap().record(mismatched);
 
     let stats = writer.shutdown().await.unwrap();
@@ -1504,7 +1513,7 @@ impl LeaseAllocator for HangingAcquireAllocator {
 /// lease was not granted, which this client cannot know.
 #[tokio::test(start_paused = true)]
 async fn a_hung_acquire_is_counted_as_a_timeout_not_a_refusal() {
-    let slot = LeaseSlot::empty();
+    let slot = LeaseSlot::for_account(ACCOUNT);
     let clock = Arc::new(ManualClock::new(t(0)));
     let manager = LeaseManager::spawn(
         Arc::new(HangingAcquireAllocator) as Arc<dyn LeaseAllocator>,
@@ -1577,7 +1586,7 @@ impl LeaseAllocator for HangingReleaseAllocator {
 #[tokio::test(start_paused = true)]
 async fn shutdown_reports_released_leases() {
     let store = store(10_000);
-    let slot = LeaseSlot::empty();
+    let slot = LeaseSlot::for_account(ACCOUNT);
     let clock = Arc::new(ManualClock::new(t(0)));
     let manager =
         LeaseManager::spawn(store.clone(), Arc::clone(&slot), clock, manager_config()).unwrap();
@@ -1596,7 +1605,7 @@ async fn shutdown_reports_released_leases() {
 #[tokio::test(start_paused = true)]
 async fn hung_release_cannot_stall_shutdown() {
     let store = store(10_000);
-    let slot = LeaseSlot::empty();
+    let slot = LeaseSlot::for_account(ACCOUNT);
     let clock = Arc::new(ManualClock::new(t(0)));
     let allocator = Arc::new(HangingReleaseAllocator {
         inner: store.clone(),

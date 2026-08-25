@@ -37,12 +37,12 @@ pub use deny::DenyReason;
 pub use ids::{
     AccountId, FencingToken, Generation, KeyId, LeaseId, ParseIdError, Principal, RequestId,
 };
-pub use lease::{LeaseGrant, LocalLease, RefillSignal};
+pub use lease::{AccountOverage, LeaseGrant, LocalLease, RefillSignal};
 pub use reservation::{CancelOutcome, CommitError, Reservation};
 pub use sharding::{LocalSharding, Locality};
 pub use snapshot::{
-    AccountSnapshot, AccountStatus, PermissionBits, PublishableSnapshot, ResolvedLimits,
-    SnapshotValidationError,
+    AccountSnapshot, AccountStatus, EnforcementMode, PermissionBits, PublishableSnapshot,
+    ResolvedLimits, SnapshotValidationError,
 };
 pub use units::CostUnits;
-pub use usage::UsageEvent;
+pub use usage::{UsageEvent, UsageSource};

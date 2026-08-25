@@ -14,8 +14,8 @@ use tollgate_client::{
     LeaseManager, LeaseManagerConfig, ManualClock, UsageRecorder, UsageWriter, UsageWriterConfig,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, Generation,
-    OpIndex, PermissionBits, Principal, RequestId, ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, EnforcementMode,
+    Generation, OpIndex, PermissionBits, Principal, RequestId, ResolvedLimits,
 };
 use tollgate_store::{AccountConfig, GrantPolicy, MemoryStore};
 
@@ -43,6 +43,7 @@ fn snapshot() -> Arc<AccountSnapshot> {
         key_id: None,
         generation: Generation(1),
         status: AccountStatus::Active,
+        enforcement_mode: EnforcementMode::Strict,
         valid_until: t(1_000_000),
         permissions: PermissionBits::bit(0),
         limits: ResolvedLimits {
@@ -67,7 +68,7 @@ struct Instance {
 }
 
 fn spawn_instance(store: &Arc<MemoryStore>, clock: &Arc<ManualClock>) -> Instance {
-    let slot = LeaseSlot::empty();
+    let slot = LeaseSlot::for_account(ACCOUNT);
     let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
     engine
         .map()

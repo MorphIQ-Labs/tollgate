@@ -71,6 +71,8 @@ impl Padded {
 pub struct AdmissionCounters {
     admitted: Padded,
     units_admitted: Padded,
+    admitted_overage: Padded,
+    units_admitted_overage: Padded,
     denials: [Padded; DenyReason::COUNT],
     shards: Option<Box<[CounterShard]>>,
 }
@@ -102,6 +104,8 @@ impl AdmissionCounters {
         AdmissionCounters {
             admitted: Padded::zero(),
             units_admitted: Padded::zero(),
+            admitted_overage: Padded::zero(),
+            units_admitted_overage: Padded::zero(),
             denials: [const { Padded::zero() }; DenyReason::COUNT],
             shards: None,
         }
@@ -117,6 +121,8 @@ impl AdmissionCounters {
         Self {
             admitted: Padded::zero(),
             units_admitted: Padded::zero(),
+            admitted_overage: Padded::zero(),
+            units_admitted_overage: Padded::zero(),
             denials: [const { Padded::zero() }; DenyReason::COUNT],
             shards: Some(
                 (0..sharding.get())
@@ -147,6 +153,37 @@ impl AdmissionCounters {
         }
         self.admitted.bump(1);
         self.units_admitted.bump(units.get());
+    }
+
+    /// Record an admission that no lease funded.
+    ///
+    /// A *subset* of `admitted`, not a sibling of it: the request is counted
+    /// in both, so `admitted` remains the total and needs no reader to add two
+    /// numbers to get it. `admitted_overage` answers a different question —
+    /// how much of that total the account is being trusted for — and it is the
+    /// number an operator watches climb before an invoice does.
+    ///
+    /// Deliberately not a `DenyReason`-style dense outcome table. There is one
+    /// admit outcome plus one qualifier, and building the mirror of
+    /// [`DenyReason::index`] for two counters would add the machinery without
+    /// the forcing function that justifies it there.
+    ///
+    /// The qualifier pair stays unsharded while `admitted` shards. Sharding
+    /// buys nothing here: this path runs only when the account had no lease
+    /// able to fund the quote, and it already serializes on the overage
+    /// counter's own compare-exchange one step earlier. Two more relaxed
+    /// bumps on that path add no contention class that the cap has not
+    /// already imposed.
+    #[inline]
+    pub fn record_admit_overage(&self, units: CostUnits) {
+        self.record_admit_overage_at(units, Locality::current());
+    }
+
+    #[inline]
+    pub(crate) fn record_admit_overage_at(&self, units: CostUnits, locality: Locality) {
+        self.record_admit_at(units, locality);
+        self.admitted_overage.bump(1);
+        self.units_admitted_overage.bump(units.get());
     }
 
     /// Record a refusal against its reason's slot.
@@ -188,6 +225,11 @@ impl AdmissionCounters {
             let mut snapshot = CountersSnapshot {
                 admitted: 0,
                 units_admitted: 0,
+                // Not summed from the shards: the overage qualifier is one
+                // inline pair under every layout, because the path that bumps
+                // it is the one with no lease to shard.
+                admitted_overage: self.admitted_overage.get(),
+                units_admitted_overage: self.units_admitted_overage.get(),
                 denials: [0; DenyReason::COUNT],
             };
             for shard in shards {
@@ -206,6 +248,8 @@ impl AdmissionCounters {
         CountersSnapshot {
             admitted: self.admitted.get(),
             units_admitted: self.units_admitted.get(),
+            admitted_overage: self.admitted_overage.get(),
+            units_admitted_overage: self.units_admitted_overage.get(),
             denials: std::array::from_fn(|slot| self.denials[slot].get()),
         }
     }
@@ -229,6 +273,17 @@ pub struct CountersSnapshot {
     /// are billing truth. Reading this as revenue would over-count every
     /// request that was admitted and then cancelled before execution.
     pub units_admitted: u64,
+    /// Admitted requests that no lease funded, under
+    /// [`EnforcementMode::Elastic`]. Included in `admitted`, never instead of
+    /// it.
+    ///
+    /// [`EnforcementMode::Elastic`]: tollgate_core::EnforcementMode::Elastic
+    pub admitted_overage: u64,
+    /// Units quoted by those requests — unfunded credit this instance has
+    /// extended, before any commit or cancellation. The billed figure is
+    /// `Conservation::overage_recorded`, which lags this one and is smaller by
+    /// whatever was cancelled before execution.
+    pub units_admitted_overage: u64,
     /// Refusals per [`DenyReason::index`] slot.
     pub denials: [u64; DenyReason::COUNT],
 }
@@ -317,6 +372,57 @@ mod tests {
         assert_eq!(snapshot.admitted, 2);
         assert_eq!(snapshot.units_admitted, 115);
         assert_eq!(snapshot.denied(), 1);
+    }
+
+    /// The overage qualifier is a *subset* of `admitted`, so one call has to
+    /// move both pairs. Recording it as a sibling instead would make
+    /// `admitted` stop being the total, and every dashboard that reads it
+    /// would quietly under-count elastic traffic.
+    ///
+    /// This also covers the public wrapper itself. `record_admit`,
+    /// `record_deny`, and `record_admit_overage` are three
+    /// `Locality::current()` wrappers over their `_at` forms; the first two
+    /// are exercised by the tests above, and this one was not once the engine
+    /// started calling `record_admit_overage_at` directly. A wrapper with no
+    /// caller and no test is a wrapper that can be a no-op, which is what the
+    /// mutation gate reported (!96).
+    #[test]
+    fn an_overage_admission_counts_in_both_the_total_and_the_qualifier() {
+        let counters = AdmissionCounters::new();
+        counters.record_admit(CostUnits(51));
+        counters.record_admit_overage(CostUnits(64));
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.admitted, 2, "the qualifier is not a sibling");
+        assert_eq!(snapshot.units_admitted, 115);
+        assert_eq!(snapshot.admitted_overage, 1);
+        assert_eq!(snapshot.units_admitted_overage, 64);
+    }
+
+    /// The qualifier stays unsharded while `admitted` shards, so a sharded
+    /// snapshot has to read the two pairs from different places: `admitted`
+    /// summed across shards, the qualifier from the inline counters. Reading
+    /// the qualifier out of the shards — the obvious symmetry — would report
+    /// zero overage on every sharded instance.
+    #[test]
+    fn a_sharded_snapshot_still_reports_the_unsharded_overage_qualifier() {
+        let counters = AdmissionCounters::with_sharding(LocalSharding::new(
+            std::num::NonZeroUsize::new(8).unwrap(),
+        ));
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| counters.record_admit_overage(CostUnits(10)));
+            }
+        });
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.admitted, 4, "sharded totals still sum");
+        assert_eq!(snapshot.units_admitted, 40);
+        assert_eq!(
+            snapshot.admitted_overage, 4,
+            "the qualifier survives a layout that does not shard it"
+        );
+        assert_eq!(snapshot.units_admitted_overage, 40);
     }
 
     /// Concurrent increments must not lose updates — the one guarantee

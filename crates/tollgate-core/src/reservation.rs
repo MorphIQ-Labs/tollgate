@@ -19,11 +19,11 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use jiff::Timestamp;
 
 use crate::deny::DenyReason;
-use crate::ids::RequestId;
-use crate::lease::{LeaseDebit, LocalLease};
+use crate::ids::{AccountId, RequestId};
+use crate::lease::{AccountOverage, LeaseDebit, LocalLease};
 use crate::sharding::Locality;
 use crate::units::CostUnits;
-use crate::usage::UsageEvent;
+use crate::usage::{UsageEvent, UsageSource};
 
 const PENDING: u8 = 0;
 const COMMITTED: u8 = 1;
@@ -56,17 +56,44 @@ pub enum CommitError {
     LeaseExpired,
 }
 
+/// What a reservation debited, and therefore what a release must refund.
+///
+/// A reservation cannot hold a plain `Arc<LocalLease>` any more, because the
+/// case elastic mode exists to serve includes *having no lease at all* — a
+/// cold start, or an instance whose lease lapsed before refill replaced it.
+/// The discriminant is what lets a release find its way back to the counter it
+/// came from without either counter having to know about the other.
+#[derive(Debug)]
+enum ChargeSource {
+    /// Units debited from a lease the allocator granted, with the evidence
+    /// naming the shard counter they came from: a release must return them to
+    /// that counter, not merely to the lease.
+    Lease {
+        lease: Arc<LocalLease>,
+        debit: LeaseDebit,
+    },
+    /// Unfunded units extended under [`EnforcementMode::Elastic`].
+    ///
+    /// [`EnforcementMode::Elastic`]: crate::snapshot::EnforcementMode::Elastic
+    Overage(Arc<AccountOverage>),
+}
+
 /// One request's debited-but-not-yet-committed units.
 ///
-/// Created by [`Reservation::reserve`]; resolved by exactly one of
+/// Created by [`Reservation::reserve`] or
+/// [`Reservation::reserve_overage`]; resolved by exactly one of
 /// [`commit_at_execution_start`](Reservation::commit_at_execution_start),
 /// [`cancel`](Reservation::cancel), or drop (which releases a pending
 /// reservation — INVARIANTS.md #2).
+///
+/// The charging rules are identical whichever funded it: zero charge before
+/// execution, full charge from execution start, and one compare-exchange
+/// deciding the commit/cancel race. Elastic mode changes *whether* a request
+/// is admitted, never how the units it consumes are accounted for.
 #[derive(Debug)]
 pub struct Reservation {
-    lease: Arc<LocalLease>,
+    source: ChargeSource,
     units: CostUnits,
-    debit: LeaseDebit,
     phase: AtomicU8,
 }
 
@@ -96,9 +123,34 @@ impl Reservation {
     ) -> Result<Reservation, DenyReason> {
         let debit = lease.try_reserve_at(units, now, locality)?;
         Ok(Reservation {
-            lease: Arc::clone(lease),
+            source: ChargeSource::Lease {
+                lease: Arc::clone(lease),
+                debit,
+            },
             units,
-            debit,
+            phase: AtomicU8::new(PENDING),
+        })
+    }
+
+    /// Extend `units` of unfunded credit against `cap` and open a pending
+    /// reservation, for an account whose lease could not fund the quote.
+    ///
+    /// Takes no `now`, and the absence is the design rather than an omission.
+    /// A lease has a usability window because the allocator will reclaim and
+    /// re-grant its units, so work committed outside that window could never
+    /// be billed. Overage was never granted and is never reclaimed: there is
+    /// no window to race. Staleness and status are still enforced — by the
+    /// snapshot checks that run before this step, under every mode.
+    #[inline]
+    pub fn reserve_overage(
+        overage: &Arc<AccountOverage>,
+        units: CostUnits,
+        cap: CostUnits,
+    ) -> Result<Reservation, DenyReason> {
+        overage.try_debit(units, cap)?;
+        Ok(Reservation {
+            source: ChargeSource::Overage(Arc::clone(overage)),
+            units,
             phase: AtomicU8::new(PENDING),
         })
     }
@@ -108,9 +160,37 @@ impl Reservation {
         self.units
     }
 
+    /// True when these units were extended as overage rather than debited
+    /// from a lease — the one bit an embedder needs to count the outcome
+    /// separately (INVARIANTS.md #20).
     #[must_use]
-    pub fn lease(&self) -> &Arc<LocalLease> {
-        &self.lease
+    pub fn is_overage(&self) -> bool {
+        matches!(self.source, ChargeSource::Overage(_))
+    }
+
+    fn account_id(&self) -> AccountId {
+        match &self.source {
+            ChargeSource::Lease { lease, .. } => lease.grant().account_id,
+            ChargeSource::Overage(overage) => overage.account_id(),
+        }
+    }
+
+    /// Whether the funding source's local usability window has lapsed.
+    ///
+    /// Only a lease has one. See [`reserve_overage`](Self::reserve_overage).
+    fn window_lapsed(&self, now: Timestamp) -> bool {
+        match &self.source {
+            ChargeSource::Lease { lease, .. } => now >= lease.usable_until(),
+            ChargeSource::Overage(_) => false,
+        }
+    }
+
+    /// Return the units to whichever counter they came from.
+    fn refund(&self) {
+        match &self.source {
+            ChargeSource::Lease { lease, debit } => lease.credit(debit),
+            ChargeSource::Overage(overage) => overage.credit(self.units),
+        }
     }
 
     /// Commit the charge because execution is starting. From this point the
@@ -123,7 +203,7 @@ impl Reservation {
     /// [`CommitError::LeaseExpired`]; the caller must not execute.
     #[inline]
     pub fn commit_at_execution_start(&self, now: Timestamp) -> Result<CostUnits, CommitError> {
-        if now >= self.lease.usable_until() {
+        if self.window_lapsed(now) {
             return match self.phase.compare_exchange(
                 PENDING,
                 RELEASED,
@@ -131,7 +211,7 @@ impl Reservation {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    self.lease.credit(&self.debit);
+                    self.refund();
                     Err(CommitError::LeaseExpired)
                 }
                 // Someone else already resolved it; report that outcome.
@@ -160,7 +240,7 @@ impl Reservation {
             .compare_exchange(PENDING, RELEASED, Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => {
-                self.lease.credit(&self.debit);
+                self.refund();
                 CancelOutcome::ZeroCharged
             }
             Err(COMMITTED) => CancelOutcome::AlreadyCommitted { units: self.units },
@@ -176,12 +256,20 @@ impl Reservation {
         if self.phase.load(Ordering::Acquire) != COMMITTED {
             return None;
         }
-        let grant = self.lease.grant();
+        let source = match &self.source {
+            ChargeSource::Lease { lease, .. } => {
+                let grant = lease.grant();
+                UsageSource::Leased {
+                    lease_id: grant.lease_id,
+                    fencing_token: grant.fencing_token,
+                }
+            }
+            ChargeSource::Overage(_) => UsageSource::Overage,
+        };
         Some(UsageEvent {
             request_id,
-            account_id: grant.account_id,
-            lease_id: grant.lease_id,
-            fencing_token: grant.fencing_token,
+            account_id: self.account_id(),
+            source,
             units: self.units,
             occurred_at: now,
         })
@@ -197,7 +285,7 @@ impl Drop for Reservation {
             .compare_exchange(PENDING, RELEASED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            self.lease.credit(&self.debit);
+            self.refund();
         }
     }
 }
@@ -207,9 +295,85 @@ mod tests {
     use super::*;
     use crate::ids::{AccountId, FencingToken, LeaseId};
     use crate::lease::LeaseGrant;
+    use crate::usage::UsageSource;
 
     fn t(secs: i64) -> Timestamp {
         Timestamp::from_second(secs).unwrap()
+    }
+
+    fn overage() -> Arc<AccountOverage> {
+        Arc::new(AccountOverage::new(AccountId(1)))
+    }
+
+    /// An overage charge bills like any other, and says so on the wire: the
+    /// event names the account and carries no lease capability, because there
+    /// is no lease to name.
+    #[test]
+    fn a_committed_overage_bills_against_no_lease() {
+        let o = overage();
+        let r = Reservation::reserve_overage(&o, CostUnits(30), CostUnits(100)).unwrap();
+        assert!(r.is_overage());
+        assert_eq!(o.spent(), CostUnits(30));
+        assert_eq!(r.commit_at_execution_start(t(1)).unwrap(), CostUnits(30));
+        let event = r.usage_event(RequestId(7), t(1)).unwrap();
+        assert_eq!(event.account_id, AccountId(1));
+        assert_eq!(event.units, CostUnits(30));
+        assert_eq!(event.source, UsageSource::Overage);
+        assert_eq!(event.source.lease_id(), None);
+        assert_eq!(event.source.fencing_token(), None);
+    }
+
+    /// Zero charge before execution applies identically to credit: the units
+    /// go back to the counter they came from, not to some lease.
+    #[test]
+    fn cancelling_an_overage_returns_the_credit() {
+        let o = overage();
+        let r = Reservation::reserve_overage(&o, CostUnits(30), CostUnits(100)).unwrap();
+        assert_eq!(r.cancel(), CancelOutcome::ZeroCharged);
+        assert_eq!(o.spent(), CostUnits::ZERO);
+        assert_eq!(r.usage_event(RequestId(7), t(1)), None);
+    }
+
+    #[test]
+    fn dropping_a_pending_overage_returns_the_credit() {
+        let o = overage();
+        drop(Reservation::reserve_overage(&o, CostUnits(30), CostUnits(100)).unwrap());
+        assert_eq!(o.spent(), CostUnits::ZERO);
+    }
+
+    /// A lease reservation cannot commit past its usability window because the
+    /// allocator may reclaim and re-grant those units. Overage was never
+    /// granted and is never reclaimed, so there is no window to race — and a
+    /// commit arbitrarily far past the timestamp it was reserved at still
+    /// stands.
+    #[test]
+    fn overage_has_no_usability_window_to_lapse() {
+        let leased = Reservation::reserve(&lease(100), CostUnits(30), t(0)).unwrap();
+        assert_eq!(
+            leased.commit_at_execution_start(t(1_000)),
+            Err(CommitError::LeaseExpired)
+        );
+
+        let o = overage();
+        let r = Reservation::reserve_overage(&o, CostUnits(30), CostUnits(100)).unwrap();
+        assert_eq!(
+            r.commit_at_execution_start(t(1_000_000)).unwrap(),
+            CostUnits(30)
+        );
+        assert_eq!(o.spent(), CostUnits(30), "a commit keeps the credit spent");
+    }
+
+    #[test]
+    fn an_overage_beyond_the_cap_is_refused_and_claims_nothing() {
+        let o = overage();
+        assert_eq!(
+            Reservation::reserve_overage(&o, CostUnits(101), CostUnits(100)).unwrap_err(),
+            DenyReason::OverageCapExhausted {
+                spent: CostUnits::ZERO,
+                overage_cap: CostUnits(100),
+            }
+        );
+        assert_eq!(o.spent(), CostUnits::ZERO);
     }
 
     fn lease(units: u64) -> Arc<LocalLease> {

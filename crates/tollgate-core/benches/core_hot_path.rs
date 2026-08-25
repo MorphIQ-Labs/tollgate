@@ -11,8 +11,9 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use jiff::Timestamp;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
-    KeyId, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, Reservation, ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, FencingToken,
+    Generation, KeyId, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, Reservation,
+    ResolvedLimits,
 };
 
 #[derive(Clone, Copy)]
@@ -42,6 +43,7 @@ fn snapshot() -> AccountSnapshot {
         key_id: Some(KeyId(2)),
         generation: Generation(1),
         status: AccountStatus::Active,
+        enforcement_mode: EnforcementMode::Strict,
         valid_until: Timestamp::from_second(4_102_444_800).unwrap(), // 2100-01-01
         permissions: PermissionBits::bit(0).union(PermissionBits::bit(1)),
         limits: ResolvedLimits {
