@@ -9,9 +9,9 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-tollgate-core = { path = "../tollgate-core", version = "=0.7.0" }
-tollgate-admission = { path = "../tollgate-admission", version = "=0.7.0" }
-tollgate-store = { path = "../tollgate-store", version = "=0.7.0" }
+tollgate-core = { path = "../tollgate-core", version = "=0.8.0" }
+tollgate-admission = { path = "../tollgate-admission", version = "=0.8.0" }
+tollgate-store = { path = "../tollgate-store", version = "=0.8.0" }
 async-trait = { workspace = true }
 atomic-waker = { workspace = true }
 jiff = { workspace = true }
