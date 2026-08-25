@@ -17,9 +17,9 @@ use tollgate_client::{
     TrackedPrincipals,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, FencingToken,
-    Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex, PermissionBits, Principal,
-    PublishableSnapshot, ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, EnforcementMode,
+    FencingToken, Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex,
+    PermissionBits, Principal, PublishableSnapshot, ResolvedLimits,
 };
 use tollgate_store::{
     AccountConfig, GrantPolicy, MemoryStore, SnapshotPush, SnapshotResolution, SnapshotSource,
@@ -47,6 +47,7 @@ fn snapshot(generation: u64, permissions: PermissionBits) -> Arc<AccountSnapshot
         key_id: None,
         generation: Generation(generation),
         status: AccountStatus::Active,
+        enforcement_mode: EnforcementMode::Strict,
         valid_until: t(100_000),
         permissions,
         limits: ResolvedLimits {

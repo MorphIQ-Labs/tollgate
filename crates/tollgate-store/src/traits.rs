@@ -142,21 +142,51 @@ pub struct AccountConfig {
 }
 
 /// Per-account conservation view for reconciliation.
+///
+/// Read the equation as a funding statement: the left side is everything the
+/// account was ever funded with, the right side is where those units now sit.
+/// The two sources of funding are money in ([`deposited`](Self::deposited))
+/// and credit extended ([`overage_recorded`](Self::overage_recorded)); the
+/// three resting places are unspent balance, capacity currently out on lease,
+/// and units already consumed or written off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Conservation {
     pub deposited: CostUnits,
+    /// Unfunded units billed under [`EnforcementMode::Elastic`]: spend no
+    /// deposit paid for and no lease debited.
+    ///
+    /// A *funding* term, on the left of the equation beside `deposited`, not
+    /// a bucket on the right. Overage usage also lands in `settled_usage`, so
+    /// without a matching term on the left the equation would fail by exactly
+    /// the overage — which is the whole reason this field exists rather than
+    /// the ledger simply recording the usage and saying nothing else.
+    ///
+    /// [`EnforcementMode::Elastic`]: tollgate_core::EnforcementMode::Elastic
+    pub overage_recorded: CostUnits,
     pub balance: CostUnits,
     pub active_lease_grants: CostUnits,
-    /// Usage billed against leases that have settled (released or expired).
-    /// Usage on active leases is inside `active_lease_grants`.
+    /// Usage billed against leases that have settled (released or expired),
+    /// plus all overage usage — which belongs to no lease and is therefore
+    /// settled the moment it is recorded. Usage on active leases is inside
+    /// `active_lease_grants`.
     pub settled_usage: CostUnits,
     pub settlement_loss: CostUnits,
 }
 
 impl Conservation {
-    /// `deposited == balance + active grants + settled usage + loss`, exactly.
+    /// `deposited + overage == balance + active grants + settled usage + loss`,
+    /// exactly.
+    ///
+    /// Both sides accumulate with checked arithmetic and an overflow answers
+    /// `false`, never a wrap or a panic: this function exists to *detect*
+    /// corrupt ledger state, so arithmetic that could not represent the state
+    /// must report a violation rather than quietly produce a total that
+    /// happens to match (INVARIANTS.md #11).
     #[must_use]
     pub fn holds(&self) -> bool {
+        let Some(funded) = self.deposited.checked_add(self.overage_recorded) else {
+            return false;
+        };
         let mut sum = self.balance;
         for part in [
             self.active_lease_grants,
@@ -168,7 +198,7 @@ impl Conservation {
                 None => return false,
             }
         }
-        sum == self.deposited
+        sum == funded
     }
 }
 
@@ -833,6 +863,7 @@ mod tests {
     fn conservation_requires_an_exact_equation_without_overflow() {
         let balanced = Conservation {
             deposited: CostUnits(10),
+            overage_recorded: CostUnits::ZERO,
             balance: CostUnits(1),
             active_lease_grants: CostUnits(2),
             settled_usage: CostUnits(3),
@@ -848,8 +879,49 @@ mod tests {
 
         let overflowing = Conservation {
             deposited: CostUnits(u64::MAX),
+            overage_recorded: CostUnits::ZERO,
             balance: CostUnits(u64::MAX),
             active_lease_grants: CostUnits(1),
+            settled_usage: CostUnits::ZERO,
+            settlement_loss: CostUnits::ZERO,
+        };
+        assert!(!overflowing.holds());
+    }
+
+    /// Overage funds the left side, so usage it paid for closes the equation
+    /// rather than breaking it — and the same numbers without the funding term
+    /// must *not* balance, or the field would be decorative.
+    #[test]
+    fn overage_funds_the_usage_it_bills() {
+        let elastic = Conservation {
+            deposited: CostUnits(10),
+            overage_recorded: CostUnits(5),
+            balance: CostUnits(1),
+            active_lease_grants: CostUnits(2),
+            settled_usage: CostUnits(8),
+            settlement_loss: CostUnits(4),
+        };
+        assert!(elastic.holds());
+        assert!(
+            !Conservation {
+                overage_recorded: CostUnits::ZERO,
+                ..elastic
+            }
+            .holds(),
+            "the same ledger without the funding term must fail by exactly the overage"
+        );
+    }
+
+    /// The left side is checked too. Overflowing the funding sum answers
+    /// `false` rather than wrapping to a total that might coincidentally match
+    /// the right side (INVARIANTS.md #11).
+    #[test]
+    fn overflowing_the_funding_sum_is_a_violation_not_a_wrap() {
+        let overflowing = Conservation {
+            deposited: CostUnits(u64::MAX),
+            overage_recorded: CostUnits(1),
+            balance: CostUnits::ZERO,
+            active_lease_grants: CostUnits::ZERO,
             settled_usage: CostUnits::ZERO,
             settlement_loss: CostUnits::ZERO,
         };

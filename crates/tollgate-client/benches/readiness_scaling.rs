@@ -22,8 +22,8 @@ use tollgate_client::{
     SlotRegistry, SnapshotManager, SnapshotManagerConfig, SystemClock, TrackedPrincipals,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, Generation, OpIndex,
-    PermissionBits, Principal, PublishableSnapshot,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, Generation,
+    OpIndex, PermissionBits, Principal, PublishableSnapshot,
 };
 use tollgate_store::{GrantPolicy, MemoryStore};
 
@@ -84,6 +84,7 @@ fn source(principals: usize) -> Arc<MemoryStore> {
             key_id: None,
             generation: Generation(1),
             status: AccountStatus::Active,
+            enforcement_mode: EnforcementMode::Strict,
             valid_until: far_future(),
             permissions: PermissionBits::bit(0),
             limits: tollgate_core::ResolvedLimits {

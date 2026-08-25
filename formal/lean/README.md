@@ -1,6 +1,6 @@
 # Tollgate Formal Models
 
-This Lean package contains exact models for three critical contracts:
+This Lean package contains exact models for four critical contracts:
 
 - `LeaseShards` models the aggregate of cache-isolated lease counters and
   exact-total debit/refund receipts. It proves conservation through reserve, cancel,
@@ -18,6 +18,13 @@ This Lean package contains exact models for three critical contracts:
   principal after eviction. It also proves the converse the distinction exists
   for: a principal whose row went absent is admitted again at the generation it
   already had, while a duplicate publish of a visible snapshot stays a no-op.
+- `Conservation` models the per-account ledger equation
+  `deposited + overage = balance + activeGrants + settledUsage + loss` and
+  proves each transition preserves it: deposit, acquire, release, reclaim, a
+  straggler on a settled lease, and the overage ingest issue #1 adds. It also
+  proves the negative that earns the funding column — billing overage without
+  funding it *always* breaks the equation, by exactly the overage — and that an
+  accepted debit never carries the counter past its cap.
 - `SnapshotLimits` proves that checking the largest registered operation
   weight at the configured batch cap bounds every registered operation at
   every permitted item count. Consequently, a worst-case quote at or below
@@ -32,5 +39,9 @@ Run from the repository root:
 The models use exact natural-number arithmetic and atomic transitions. Rust
 property, cache, manager, HTTP, and backend-parity tests establish the
 proof-to-code argument. The proofs do not model scheduling, data-structure
-internals, the sharded CAS/fixed-receipt algorithm, the maximum-weight scan, or
-finite-width overflow; those remain separate Rust obligations.
+internals, the sharded CAS/fixed-receipt algorithm, the maximum-weight scan,
+finite-width overflow, SQL, or the derivation of settled usage from recorded
+usage and active lease usage; those remain separate Rust obligations. In
+particular a green `formal` job says the equation closes under each modeled
+transition — not that either backend performs them atomically, nor that the
+client applies the same rules the admission map does.

@@ -129,13 +129,16 @@ mod tests {
     use super::*;
     use jiff::Timestamp;
     use tollgate_core::RequestId;
+    use tollgate_core::UsageSource;
 
     fn event(seq: u128) -> UsageEvent {
         UsageEvent {
             request_id: RequestId(seq),
             account_id: AccountId(7),
-            lease_id: LeaseId(11),
-            fencing_token: FencingToken(3),
+            source: UsageSource::Leased {
+                lease_id: LeaseId(11),
+                fencing_token: FencingToken(3),
+            },
             units: CostUnits(64),
             occurred_at: Timestamp::from_second(1_755_600_000).unwrap(),
         }
@@ -189,19 +192,23 @@ mod tests {
         let high = (1u128 << 127) | 0x2a;
         let mut event = event(high);
         event.account_id = AccountId(high + 1);
-        event.lease_id = LeaseId(high + 2);
+        event.source = UsageSource::Leased {
+            lease_id: LeaseId(high + 2),
+            fencing_token: FencingToken(3),
+        };
         let events = [event];
         let value = serde_json::to_value(IngestRequestRef { events: &events }).unwrap();
         let event = &value["events"][0];
+        let leased = &event["source"]["Leased"];
 
-        for (field, expected) in [
-            ("request_id", high),
-            ("account_id", high + 1),
-            ("lease_id", high + 2),
+        for (field, node, expected) in [
+            ("request_id", event, high),
+            ("account_id", event, high + 1),
+            ("lease_id", leased, high + 2),
         ] {
-            let text = event[field]
+            let text = node[field]
                 .as_str()
-                .unwrap_or_else(|| panic!("{field} must be JSON text, got {}", event[field]));
+                .unwrap_or_else(|| panic!("{field} must be JSON text, got {}", node[field]));
             assert_eq!(text.len(), 32);
             assert_eq!(u128::from_str_radix(text, 16).unwrap(), expected);
         }

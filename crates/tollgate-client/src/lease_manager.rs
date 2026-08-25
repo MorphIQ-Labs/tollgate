@@ -905,7 +905,7 @@ mod tests {
                     store_call_timeout: std::time::Duration::from_millis(50),
                     shutdown_release_deadline: std::time::Duration::from_secs(10),
                 },
-                slot: LeaseSlot::empty(),
+                slot: LeaseSlot::for_account(AccountId(1)),
                 health,
                 healthy,
             }

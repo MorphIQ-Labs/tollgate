@@ -49,7 +49,7 @@ use tokio::sync::broadcast;
 
 use tollgate_core::{
     AccountId, AccountStatus, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId, Principal,
-    PublishableSnapshot, UsageEvent,
+    PublishableSnapshot, UsageEvent, UsageSource,
 };
 
 use crate::leases::{LeaseRecord, Leases, Settled};
@@ -72,6 +72,11 @@ struct AccountRecord {
     next_fence: u64,
     /// Usage accepted into the billing ledger.
     usage_recorded: CostUnits,
+    /// Unfunded units billed under elastic enforcement: the second funding
+    /// term of the conservation equation. Monotonic, like `deposited` and
+    /// `usage_recorded`; only a deposit settles it, and settling it does not
+    /// reduce it.
+    overage_recorded: CostUnits,
     /// Billing lost at settlement: usage that had not arrived when a lease
     /// was released/reclaimed. Bounded by construction; reconciliation
     /// watches it.
@@ -192,6 +197,7 @@ impl MemoryStore {
                 status: config.status,
                 next_fence: 1,
                 usage_recorded: CostUnits::ZERO,
+                overage_recorded: CostUnits::ZERO,
                 settlement_loss: CostUnits::ZERO,
             },
         );
@@ -301,6 +307,7 @@ impl MemoryStore {
         }
         Some(Conservation {
             deposited: record.deposited,
+            overage_recorded: record.overage_recorded,
             balance: record.balance,
             active_lease_grants: active_grants,
             settled_usage: record
@@ -754,6 +761,54 @@ impl UsageSink for MemoryStore {
                 report.duplicate += 1;
                 continue;
             }
+            // Overage has no lease, so it has neither a capability to verify
+            // nor lease capacity to fit inside. It is recorded against the
+            // account directly, moving two columns at once: `usage_recorded`,
+            // so it is billed, and `overage_recorded`, so it is funded. Moving
+            // only the first would break conservation by exactly these units.
+            //
+            // Deliberately not conditioned on the account's current
+            // enforcement mode. The ledger does not carry the mode the
+            // request was admitted under, and an account switched back to
+            // `Strict` between admission and flush would otherwise have this
+            // charge discarded — fail-open on accounting, to protect a
+            // fail-closed decision that was already made correctly. The work
+            // happened; it gets billed.
+            let UsageSource::Leased {
+                lease_id,
+                fencing_token,
+            } = event.source
+            else {
+                let Some(record) = inner.accounts.get_mut(&event.account_id) else {
+                    report.rejected += 1;
+                    continue;
+                };
+                // Both terms must move or neither does, or the equation is
+                // left open (INVARIANTS.md #11). A total that cannot be
+                // represented is corruption of a monotonic column rather than
+                // a problem with this event, so it is surfaced as a store
+                // error and the whole batch fails — which is what
+                // `PostgresStore` does for the same overflow, and what keeps
+                // the two backends' behaviour mirrored.
+                let (Some(usage_recorded), Some(overage_recorded)) = (
+                    record.usage_recorded.checked_add(event.units),
+                    record.overage_recorded.checked_add(event.units),
+                ) else {
+                    return Err(StoreError(format!(
+                        "overage accounting overflow for account {:#034x}: recorded usage {} \
+                         and overage {} cannot absorb {}",
+                        event.account_id.0,
+                        record.usage_recorded,
+                        record.overage_recorded,
+                        event.units
+                    )));
+                };
+                record.usage_recorded = usage_recorded;
+                record.overage_recorded = overage_recorded;
+                inner.usage.insert(event.request_id, *event);
+                report.accepted += 1;
+                continue;
+            };
             // Capability check: the (lease, token, account) triple must name
             // a known lease. Then the conservation check: the event must fit in
             // `granted - used - credited`. For an active lease `credited` is
@@ -762,11 +817,11 @@ impl UsageSink for MemoryStore {
             // was committed before release converts loss into billed usage.
             // For an expired lease the reclaim credited the full remainder —
             // nothing fits, so stragglers stay rejected (they'd double-count).
-            let Some(lease) = inner.leases.get_mut(event.lease_id) else {
+            let Some(lease) = inner.leases.get_mut(lease_id) else {
                 report.rejected += 1;
                 continue;
             };
-            if lease.fencing_token != event.fencing_token || lease.account_id != event.account_id {
+            if lease.fencing_token != fencing_token || lease.account_id != event.account_id {
                 report.rejected += 1;
                 continue;
             }

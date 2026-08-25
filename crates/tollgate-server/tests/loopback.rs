@@ -23,9 +23,9 @@ use tollgate_client::{
     SnapshotManagerConfig, SystemClock, TrackedPrincipals, UsageWriter, UsageWriterConfig,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, FencingToken,
-    Generation, KeyId, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, Principal,
-    PublishableSnapshot, RequestId, ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, EnforcementMode,
+    FencingToken, Generation, KeyId, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits,
+    Principal, PublishableSnapshot, RequestId, ResolvedLimits,
 };
 use tollgate_store::wire::API_PREFIX;
 use tollgate_store::{
@@ -71,6 +71,7 @@ fn snapshot() -> Arc<AccountSnapshot> {
         key_id: Some(KeyId((1u128 << 127) | 2)),
         generation: Generation(1),
         status: AccountStatus::Active,
+        enforcement_mode: EnforcementMode::Strict,
         valid_until: Timestamp::from_second(4_102_444_800).unwrap(),
         permissions: PermissionBits::bit(0),
         limits: ResolvedLimits {
@@ -309,7 +310,7 @@ async fn full_stack_over_loopback_http() {
         SnapshotResolution::Unknown
     ));
 
-    let slot = LeaseSlot::empty();
+    let slot = LeaseSlot::for_account(ACCOUNT);
     let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
     engine
         .map()

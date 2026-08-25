@@ -14,7 +14,7 @@ use jiff::{SignedDuration, Timestamp};
 
 use tollgate_admission::LeaseSlot;
 use tollgate_client::{LeaseManager, LeaseManagerConfig, ManualClock, UsageWriter};
-use tollgate_core::{AccountId, AccountStatus, CostUnits, UsageEvent};
+use tollgate_core::{AccountId, AccountStatus, CostUnits, UsageEvent, UsageSource};
 use tollgate_store::{
     AccountConfig, AllocateError, GrantPolicy, IngestReport, LeaseAllocator, MemoryStore,
     ReclaimBatch, StoreError, UsageSink,
@@ -178,7 +178,7 @@ async fn refill_failure_with_an_empty_slot_warns() {
     let (captor, _guard) = capture();
     let manager = LeaseManager::spawn(
         Arc::new(RefusingAllocator) as Arc<dyn LeaseAllocator>,
-        LeaseSlot::empty(),
+        LeaseSlot::for_account(ACCOUNT),
         Arc::new(ManualClock::new(t(0))),
         manager_config(),
     )
@@ -208,7 +208,7 @@ async fn healthy_refill_emits_no_warning() {
     let (captor, _guard) = capture();
     let manager = LeaseManager::spawn(
         store(10_000),
-        LeaseSlot::empty(),
+        LeaseSlot::for_account(ACCOUNT),
         Arc::new(ManualClock::new(t(0))),
         manager_config(),
     )
@@ -288,8 +288,10 @@ async fn usage_sink_outage_and_recovery_are_reported() {
     recorder.try_reserve().unwrap().record(UsageEvent {
         request_id: tollgate_core::RequestId(1),
         account_id: lease.account_id,
-        lease_id: lease.lease_id,
-        fencing_token: lease.fencing_token,
+        source: UsageSource::Leased {
+            lease_id: lease.lease_id,
+            fencing_token: lease.fencing_token,
+        },
         units: CostUnits(25),
         occurred_at: t(0),
     });
@@ -380,7 +382,7 @@ async fn refused_release_at_shutdown_is_reported() {
         Arc::new(FencedReleaseAllocator {
             inner: store(10_000),
         }) as Arc<dyn LeaseAllocator>,
-        LeaseSlot::empty(),
+        LeaseSlot::for_account(ACCOUNT),
         Arc::new(ManualClock::new(t(0))),
         manager_config(),
     )

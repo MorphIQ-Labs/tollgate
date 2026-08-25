@@ -49,6 +49,68 @@ impl AccountStatus {
     }
 }
 
+/// What an account does when its local lease cannot fund a quote.
+///
+/// This is the one axis of the fail-closed rule that is per-account rather than
+/// absolute. Unknown principals, stale snapshots, cost overflow and accounting
+/// backpressure deny under every mode; only *lease cannot fund this request*
+/// is negotiable, because only that condition says something about funding
+/// rather than about validity (INVARIANTS.md #1, #5).
+///
+/// **The cap is per service instance.** The counter it bounds is a local
+/// atomic, like every other local mechanism here, so a fleet of `N` instances
+/// can extend up to `N * overage_cap` units of credit for one account before
+/// any of them refuses. That multiplication is a property of the design, not
+/// an oversight: aggregating it would require the synchronous coordination the
+/// request path exists to avoid. Size the cap against the fleet, not against
+/// one process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum EnforcementMode {
+    /// Deny with zero charge when the lease cannot fund the quote. The
+    /// behaviour every account had before elastic mode existed, and the
+    /// default a snapshot decodes to when it carries no mode at all.
+    #[default]
+    Strict,
+    /// Admit past the lease and record the spend as overage, up to
+    /// `overage_cap` units **per service instance**.
+    ///
+    /// Overage is unfunded spend: units consumed that no deposit paid for and
+    /// no lease debited. It is billed like any other usage — the resulting
+    /// event carries no lease capability, and the ledger records it as a
+    /// second funding term so per-account conservation still closes exactly.
+    Elastic { overage_cap: CostUnits },
+}
+
+impl EnforcementMode {
+    /// The one spelling of each mode's *tag*: serde's, the ledger column's,
+    /// and the operator-facing one.
+    ///
+    /// Deliberately the tag alone, never the cap. This string labels metrics
+    /// and log lines, and interpolating a per-account number into a label is
+    /// how a bounded label set becomes an unbounded one — the same rule
+    /// `payload_does_not_affect_the_slot` pins for [`DenyReason`]. Exhaustive
+    /// by construction: a new variant fails to compile until it has a
+    /// spelling, and `enforcement_mode_text_matches_its_serde_tag` pins these
+    /// against serde.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EnforcementMode::Strict => "Strict",
+            EnforcementMode::Elastic { .. } => "Elastic",
+        }
+    }
+
+    /// The overage allowance, or `None` under [`EnforcementMode::Strict`].
+    #[must_use]
+    pub const fn overage_cap(self) -> Option<CostUnits> {
+        match self {
+            EnforcementMode::Strict => None,
+            EnforcementMode::Elastic { overage_cap } => Some(overage_cap),
+        }
+    }
+}
+
 /// Up to 64 permission slots, compiled from whatever entitlement vocabulary
 /// the consumer uses. Admission is a superset test — one AND and one compare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -109,6 +171,17 @@ pub struct AccountSnapshot {
     /// Monotonic snapshot version; see [`Generation`].
     pub generation: Generation,
     pub status: AccountStatus,
+    /// What this account does when its lease cannot fund a quote. Lands in
+    /// the struct's existing tail padding beside `status`, and is read on the
+    /// same cache line the request path already touches for it.
+    ///
+    /// Defaults on the wire as well as in storage, so a control plane that
+    /// predates elastic mode keeps publishing successfully instead of getting
+    /// a 422 for a field it has never heard of. The default is
+    /// [`EnforcementMode::Strict`]: an unstated mode enforces, it does not
+    /// extend credit.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub enforcement_mode: EnforcementMode,
     /// Hard staleness bound: past this instant the snapshot denies
     /// (INVARIANTS.md #5) until the control plane delivers a successor.
     pub valid_until: Timestamp,
@@ -135,6 +208,19 @@ pub enum SnapshotValidationError {
         max_quote: CostUnits,
         burst_units: CostUnits,
     },
+    /// An elastic account's overage cap cannot fund even one worst-case
+    /// request, so the mode would admit nothing it was configured to admit.
+    ///
+    /// Refused rather than silently tolerated, for the same reason
+    /// [`QuoteExceedsBurst`](Self::QuoteExceedsBurst) is: a configuration
+    /// value is an operator contract, and a cap that reads as "extend credit"
+    /// while behaving as `Strict` is the silent-semantics failure the
+    /// repository guidelines forbid.
+    OverageCapBelowMaxQuote {
+        operation_index: usize,
+        max_quote: CostUnits,
+        overage_cap: CostUnits,
+    },
 }
 
 impl std::fmt::Display for SnapshotValidationError {
@@ -154,6 +240,14 @@ impl std::fmt::Display for SnapshotValidationError {
             } => write!(
                 f,
                 "operation {operation_index} can quote {max_quote} units, exceeding the burst of {burst_units} units"
+            ),
+            SnapshotValidationError::OverageCapBelowMaxQuote {
+                operation_index,
+                max_quote,
+                overage_cap,
+            } => write!(
+                f,
+                "operation {operation_index} can quote {max_quote} units, exceeding the overage cap of {overage_cap} units"
             ),
         }
     }
@@ -199,6 +293,15 @@ impl PublishableSnapshot {
                 burst_units,
             });
         }
+        if let Some(overage_cap) = snapshot.enforcement_mode.overage_cap()
+            && max_quote > overage_cap
+        {
+            return Err(SnapshotValidationError::OverageCapBelowMaxQuote {
+                operation_index,
+                max_quote,
+                overage_cap,
+            });
+        }
         Ok(PublishableSnapshot {
             snapshot,
             maximum_quote: Some(max_quote),
@@ -227,10 +330,16 @@ impl PublishableSnapshot {
     ///
     /// Sound without revalidating, and the reason is worth keeping next to the
     /// code rather than at the call site: [`try_new`](Self::try_new) checks
-    /// exactly one thing — that `cost_table`'s worst quote at
-    /// `limits.max_items_per_request` fits `limits.rate_burst_units`. Neither
-    /// `status` nor `generation` participates, so a snapshot that was
-    /// publishable stays publishable under any value of either.
+    /// `cost_table`'s worst quote at `limits.max_items_per_request` against
+    /// two ceilings — `limits.rate_burst_units`, and an elastic account's
+    /// `overage_cap`. Neither `status` nor `generation` is one of the five
+    /// fields those checks read, so a snapshot that was publishable stays
+    /// publishable under any value of either.
+    ///
+    /// Note what this method therefore must not grow: re-stamping the
+    /// enforcement mode would change a value validation *does* depend on, and
+    /// would need a fallible signature. An account-wide mode change goes
+    /// through publication, not through here.
     ///
     /// This is what an account-wide status change needs (#22): the ledger and
     /// every live snapshot move together, and re-deriving a proof that cannot
@@ -315,6 +424,104 @@ mod tests {
         }
     }
 
+    /// The same rule `AccountStatus` follows, for the same reason: the mode's
+    /// tag is compared as text by the ledger column, the JSONB predicate that
+    /// selects which snapshots a mode change rewrites, and the admin wire DTO.
+    #[test]
+    #[cfg(feature = "serde")]
+    fn enforcement_mode_text_matches_its_serde_tag() {
+        for mode in [
+            EnforcementMode::Strict,
+            EnforcementMode::Elastic {
+                overage_cap: CostUnits(1_000),
+            },
+        ] {
+            let value = serde_json::to_value(mode).expect("a mode serializes");
+            let tag = match &value {
+                serde_json::Value::String(tag) => tag.clone(),
+                serde_json::Value::Object(map) => {
+                    map.keys().next().expect("one variant key").clone()
+                }
+                other => panic!("unexpected encoding {other}"),
+            };
+            assert_eq!(tag, mode.as_str(), "{mode:?} disagrees with its serde tag");
+        }
+    }
+
+    /// The cap must never reach a label. A per-account number in a metric
+    /// label turns a fixed enum into unbounded cardinality — the rule
+    /// `DenyReason`'s `payload_does_not_affect_the_slot` pins one layer down.
+    #[test]
+    fn the_cap_does_not_affect_the_mode_label() {
+        assert_eq!(
+            EnforcementMode::Elastic {
+                overage_cap: CostUnits(1)
+            }
+            .as_str(),
+            EnforcementMode::Elastic {
+                overage_cap: CostUnits(u64::MAX)
+            }
+            .as_str()
+        );
+    }
+
+    /// An unstated mode enforces. This is the value every pre-existing stored
+    /// row and every older control plane decodes to, so it is the one that
+    /// must not extend credit.
+    #[test]
+    fn the_default_mode_is_strict() {
+        assert_eq!(EnforcementMode::default(), EnforcementMode::Strict);
+        assert_eq!(EnforcementMode::Strict.overage_cap(), None);
+    }
+
+    /// A cap that cannot fund one worst-case request would read as "extend
+    /// credit" and behave as `Strict`. Refused at publication, where the
+    /// burst check already refuses its analogue.
+    #[test]
+    fn a_cap_below_the_worst_quote_is_unpublishable() {
+        // Worst quote is 10 fixed + 7 x 10 items = 80, equal to the burst, so
+        // only the overage cap can be what refuses these.
+        let elastic = |overage_cap: u64| {
+            let mut snapshot = AccountSnapshot::clone(&priced_snapshot(10, 1, &[(0, 7)], 10, 80));
+            snapshot.enforcement_mode = EnforcementMode::Elastic {
+                overage_cap: CostUnits(overage_cap),
+            };
+            PublishableSnapshot::try_new(Arc::new(snapshot))
+        };
+
+        assert!(
+            elastic(80).is_ok(),
+            "a cap that funds exactly one worst case is publishable"
+        );
+        assert_eq!(
+            elastic(79).unwrap_err(),
+            SnapshotValidationError::OverageCapBelowMaxQuote {
+                operation_index: 0,
+                max_quote: CostUnits(80),
+                overage_cap: CostUnits(79),
+            }
+        );
+    }
+
+    /// The mode participates in validation, unlike status and generation, so
+    /// `restamped` must not be able to change it — otherwise it would carry a
+    /// proof forward over a value that proof depended on.
+    #[test]
+    fn restamping_cannot_change_the_enforcement_mode() {
+        let mut snapshot = snapshot(AccountStatus::Active, t(1_000));
+        snapshot.enforcement_mode = EnforcementMode::Elastic {
+            overage_cap: CostUnits(5_000),
+        };
+        let publishable = PublishableSnapshot::try_new(Arc::new(snapshot)).unwrap();
+        let restamped = publishable.restamped(AccountStatus::Suspended, Generation(9));
+        assert_eq!(
+            restamped.as_snapshot().enforcement_mode,
+            EnforcementMode::Elastic {
+                overage_cap: CostUnits(5_000)
+            }
+        );
+    }
+
     /// Re-stamping carries the publication proof because neither field it
     /// touches participates in validation. Pinned against a snapshot whose
     /// margin is exact: if `restamped` ever rebuilt the proof from scratch
@@ -360,6 +567,7 @@ mod tests {
             key_id: Some(KeyId(2)),
             generation: Generation(1),
             status,
+            enforcement_mode: EnforcementMode::Strict,
             valid_until,
             permissions: PermissionBits::bit(0).union(PermissionBits::bit(3)),
             limits: ResolvedLimits {

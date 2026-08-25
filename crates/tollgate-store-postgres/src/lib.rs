@@ -36,9 +36,9 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
-    LeaseGrant, LeaseId, PermissionBits, Principal, PublishableSnapshot, ResolvedLimits,
-    UsageEvent,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, FencingToken,
+    Generation, LeaseGrant, LeaseId, PermissionBits, Principal, PublishableSnapshot,
+    ResolvedLimits, UsageEvent,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, Conservation, CreateAccountError, GrantPolicy,
@@ -138,6 +138,7 @@ struct StoredSnapshotRef<'a> {
     account_id: StoredId,
     key_id: Option<StoredId>,
     status: &'a AccountStatus,
+    enforcement_mode: &'a EnforcementMode,
     valid_until: &'a Timestamp,
     permissions: &'a PermissionBits,
     limits: &'a ResolvedLimits,
@@ -150,6 +151,7 @@ impl<'a> From<&'a AccountSnapshot> for StoredSnapshotRef<'a> {
             account_id: StoredId(snapshot.account_id.0),
             key_id: snapshot.key_id.map(|id| StoredId(id.0)),
             status: &snapshot.status,
+            enforcement_mode: &snapshot.enforcement_mode,
             valid_until: &snapshot.valid_until,
             permissions: &snapshot.permissions,
             limits: &snapshot.limits,
@@ -166,6 +168,18 @@ struct StoredSnapshot {
     account_id: StoredId,
     key_id: Option<StoredId>,
     status: AccountStatus,
+    /// Absent from every row written before elastic mode existed, and those
+    /// rows are the overwhelming majority the first time this ships.
+    ///
+    /// `default` rather than a required field, because the alternative is not
+    /// a loud failure but a silent outage: a required field makes every
+    /// pre-existing row fail to decode, `SnapshotSource::snapshot` returns a
+    /// store error for each, and the request path denies every principal until
+    /// someone republishes the whole catalogue. Defaulting to
+    /// [`EnforcementMode::Strict`] is also the safe direction — an
+    /// undecided account enforces, it does not extend credit.
+    #[serde(default)]
+    enforcement_mode: EnforcementMode,
     valid_until: Timestamp,
     permissions: PermissionBits,
     limits: ResolvedLimits,
@@ -184,6 +198,7 @@ impl StoredSnapshot {
             key_id: self.key_id.map(|id| tollgate_core::KeyId(id.0)),
             generation,
             status: self.status,
+            enforcement_mode: self.enforcement_mode,
             valid_until: self.valid_until,
             permissions: self.permissions,
             limits: self.limits,
@@ -443,7 +458,7 @@ impl PostgresStore {
         account: AccountId,
     ) -> Result<Option<Conservation>, StoreError> {
         let Some(row) = sqlx::query(
-            "SELECT deposited, balance, usage_recorded, settlement_loss
+            "SELECT deposited, balance, usage_recorded, settlement_loss, overage_recorded
              FROM tollgate_accounts WHERE account_id = $1",
         )
         .bind(id_bytes(account.0))
@@ -462,6 +477,7 @@ impl PostgresStore {
         let active_used = to_units(lease_row.get::<i64, _>(1), "active lease usage")?;
         Ok(Some(Conservation {
             deposited: to_units(row.get::<i64, _>(0), "deposited")?,
+            overage_recorded: to_units(row.get::<i64, _>(4), "overage_recorded")?,
             balance: to_units(row.get::<i64, _>(1), "balance")?,
             active_lease_grants: active_grants,
             settled_usage: to_units(row.get::<i64, _>(2), "usage_recorded")?
@@ -833,20 +849,23 @@ impl UsageSink for PostgresStore {
         // checked once later, after duplicate and capability classification, to
         // preserve the partial-acceptance ordering.
         struct PreparedEvent<'a> {
-            source: &'a UsageEvent,
+            event: &'a UsageEvent,
             request_id: Vec<u8>,
             account_id: Vec<u8>,
-            lease_id: Vec<u8>,
+            /// `None` for overage, which names no lease. Every phase below
+            /// keys off this rather than re-matching on the source, so a lease
+            /// id can never be conjured for an event that has none.
+            lease_id: Option<Vec<u8>>,
             occurred_at_us: i64,
         }
         let prepared: Vec<PreparedEvent<'_>> = events
             .iter()
             .map(|event| {
                 Ok(PreparedEvent {
-                    source: event,
+                    event,
                     request_id: id_bytes(event.request_id.0),
                     account_id: id_bytes(event.account_id.0),
-                    lease_id: id_bytes(event.lease_id.0),
+                    lease_id: event.source.lease_id().map(|id| id_bytes(id.0)),
                     occurred_at_us: ts_micros(event.occurred_at),
                 })
             })
@@ -859,7 +878,7 @@ impl UsageSink for PostgresStore {
             // lease-writing transaction now agrees on this order.
             let lease_ids: Vec<Vec<u8>> = prepared
                 .iter()
-                .map(|event| event.lease_id.clone())
+                .filter_map(|event| event.lease_id.clone())
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect();
@@ -920,6 +939,44 @@ impl UsageSink for PostgresStore {
             .map(|row| row.get::<Vec<u8>, _>(0))
             .collect();
 
+            // Which accounts referenced by *overage* events actually exist.
+            //
+            // A leased event proves its account exists by resolving a lease
+            // row, whose `account_id` is a foreign key. An overage event has
+            // no such proof, and the memory backend rejects one naming an
+            // unknown account -- so this backend must too, or the two
+            // classify the same batch differently.
+            //
+            // Read without `FOR UPDATE`, deliberately. The accounts these
+            // events touch are locked in account order further down, after
+            // the leases, and taking that lock here instead would invert the
+            // lease-then-account order every writing transaction agrees on.
+            // A row that vanished between this probe and that lock would fail
+            // the lock's own count check and roll the batch back, which is the
+            // fail-closed outcome; nothing in this store deletes accounts.
+            let overage_account_ids: Vec<Vec<u8>> = prepared
+                .iter()
+                .filter(|event| event.lease_id.is_none())
+                .map(|event| event.account_id.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let known_overage_accounts: std::collections::HashSet<Vec<u8>> =
+                if overage_account_ids.is_empty() {
+                    std::collections::HashSet::new()
+                } else {
+                    sqlx::query(
+                        "SELECT account_id FROM tollgate_accounts WHERE account_id = ANY($1)",
+                    )
+                    .bind(&overage_account_ids)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(storage)?
+                    .into_iter()
+                    .map(|row| row.get::<Vec<u8>, _>(0))
+                    .collect()
+                };
+
             // Classify in memory against the locked rows (identical rules to
             // MemoryStore: capability triple, then the conservation fit that
             // also converts a released lease's provisional loss into billed usage).
@@ -929,7 +986,11 @@ impl UsageSink for PostgresStore {
                 /// The lease's stored fence, already validated non-negative;
                 /// acceptance required the event's token to equal it, so this
                 /// is the event's fence in storage form with no reconversion.
-                fence: i64,
+                /// `None` for overage, whose row carries no capability.
+                fence: Option<i64>,
+                /// True when these units were extended as unfunded credit, so
+                /// they fund the ledger as well as bill it.
+                overage: bool,
                 /// Checked once during classification and reused by every
                 /// aggregate and insert array.
                 units: i64,
@@ -940,7 +1001,35 @@ impl UsageSink for PostgresStore {
                     report.duplicate += 1;
                     continue;
                 }
-                let Some(lease) = leases.get_mut(event.lease_id.as_slice()) else {
+                let Some(lease_key) = event.lease_id.as_deref() else {
+                    // Overage: no capability to verify and no lease capacity
+                    // to fit inside, so the only question is whether the
+                    // account exists. It is accepted regardless of the
+                    // account's current enforcement mode -- the ledger does
+                    // not record which mode a request was admitted under, and
+                    // discarding a charge because the account was switched
+                    // back to `Strict` after the work ran would be fail-open
+                    // on accounting.
+                    if !known_overage_accounts.contains(event.account_id.as_slice()) {
+                        report.rejected += 1;
+                        continue;
+                    }
+                    let units = to_i64(event.event.units, "units")?;
+                    seen.insert(event.request_id.clone());
+                    accepted.push(Accepted {
+                        event_index,
+                        // Overage belongs to no lease, so there is no
+                        // provisional settlement loss for it to convert and
+                        // it is settled the moment it is recorded.
+                        settled: false,
+                        fence: None,
+                        overage: true,
+                        units,
+                    });
+                    report.accepted += 1;
+                    continue;
+                };
+                let Some(lease) = leases.get_mut(lease_key) else {
                     report.rejected += 1;
                     continue;
                 };
@@ -950,13 +1039,13 @@ impl UsageSink for PostgresStore {
                         lease.fence
                     ))
                 })?;
-                if stored_fence != event.source.fencing_token.0
+                if Some(stored_fence) != event.event.source.fencing_token().map(|token| token.0)
                     || lease.account_id.as_slice() != event.account_id.as_slice()
                 {
                     report.rejected += 1;
                     continue;
                 }
-                let units = to_i64(event.source.units, "units")?;
+                let units = to_i64(event.event.units, "units")?;
                 to_units(lease.granted, "lease granted")?;
                 to_units(lease.used, "lease used")?;
                 to_units(lease.credited, "lease credited")?;
@@ -967,13 +1056,13 @@ impl UsageSink for PostgresStore {
                     .ok_or_else(|| {
                         StoreError(format!(
                             "lease accounting overflow for {:#034x}",
-                            event.source.lease_id.0
+                            id_from(lease_key)
                         ))
                     })?;
                 let remaining = lease.granted.checked_sub(committed).ok_or_else(|| {
                     StoreError(format!(
                         "lease accounting exceeds grant for {:#034x}: granted {}, committed {committed}",
-                        event.source.lease_id.0, lease.granted
+                        id_from(lease_key), lease.granted
                     ))
                 })?;
                 if units > remaining {
@@ -987,7 +1076,7 @@ impl UsageSink for PostgresStore {
                     .ok_or_else(|| {
                         StoreError(format!(
                             "lease usage delta overflow for {:#034x}",
-                            event.source.lease_id.0
+                            id_from(lease_key)
                         ))
                     })?;
                 lease.used_delta = NonZeroI64::new(used_delta);
@@ -995,7 +1084,8 @@ impl UsageSink for PostgresStore {
                 accepted.push(Accepted {
                     event_index,
                     settled: lease.settled,
-                    fence: lease.fence,
+                    fence: Some(lease.fence),
+                    overage: false,
                     units,
                 });
                 report.accepted += 1;
@@ -1009,6 +1099,10 @@ impl UsageSink for PostgresStore {
             struct AccountDelta {
                 usage: i64,
                 loss: i64,
+                /// Units that fund themselves: overage bills and funds in the
+                /// same transaction, so the equation closes by construction
+                /// rather than by a later reconciliation step.
+                overage: i64,
             }
 
             // Bulk insert the accepted events.
@@ -1030,21 +1124,36 @@ impl UsageSink for PostgresStore {
                 fence.push(accepted_event.fence);
                 units.push(accepted_event.units);
                 at.push(event.occurred_at_us);
+                if accepted_event.overage {
+                    debug_assert!(
+                        event.lease_id.is_none() && accepted_event.fence.is_none(),
+                        "an overage row must carry neither half of a capability"
+                    );
+                }
 
                 let entry = account_deltas.entry(event.account_id.clone()).or_default();
                 entry.usage = entry.usage.checked_add(accepted_event.units).ok_or_else(|| {
                     StoreError(format!(
                         "usage delta overflow for account {:#034x}",
-                        event.source.account_id.0
+                        event.event.account_id.0
                     ))
                 })?;
                 if accepted_event.settled {
                     entry.loss = entry.loss.checked_add(accepted_event.units).ok_or_else(|| {
                         StoreError(format!(
                             "settlement loss delta overflow for account {:#034x}",
-                            event.source.account_id.0
+                            event.event.account_id.0
                         ))
                     })?;
+                }
+                if accepted_event.overage {
+                    entry.overage =
+                        entry.overage.checked_add(accepted_event.units).ok_or_else(|| {
+                            StoreError(format!(
+                                "overage delta overflow for account {:#034x}",
+                                event.event.account_id.0
+                            ))
+                        })?;
                 }
             }
             let inserted = sqlx::query(
@@ -1107,10 +1216,12 @@ impl UsageSink for PostgresStore {
             let mut account_ids = Vec::with_capacity(account_deltas.len());
             let mut account_usage_deltas = Vec::with_capacity(account_deltas.len());
             let mut account_loss_deltas = Vec::with_capacity(account_deltas.len());
+            let mut account_overage_deltas = Vec::with_capacity(account_deltas.len());
             for (account_id, delta) in &account_deltas {
                 account_ids.push(account_id.clone());
                 account_usage_deltas.push(delta.usage);
                 account_loss_deltas.push(delta.loss);
+                account_overage_deltas.push(delta.overage);
             }
 
             // A set-wise UPDATE does not promise row-lock order. Lock every
@@ -1119,7 +1230,7 @@ impl UsageSink for PostgresStore {
             // order and preventing concurrent multi-account batches from
             // forming a deadlock cycle.
             let locked_accounts = sqlx::query(
-                "SELECT account_id, usage_recorded, settlement_loss
+                "SELECT account_id, usage_recorded, settlement_loss, overage_recorded
                  FROM tollgate_accounts
                  WHERE account_id = ANY($1)
                  ORDER BY account_id FOR UPDATE",
@@ -1144,8 +1255,10 @@ impl UsageSink for PostgresStore {
                 let account_id: Vec<u8> = row.get(0);
                 let usage_recorded: i64 = row.get(1);
                 let settlement_loss: i64 = row.get(2);
+                let overage_recorded: i64 = row.get(3);
                 to_units(usage_recorded, "account usage_recorded")?;
                 to_units(settlement_loss, "account settlement_loss")?;
+                to_units(overage_recorded, "account overage_recorded")?;
                 let delta = account_deltas.get(&account_id).ok_or_else(|| {
                     StoreError(format!(
                         "ingest locked unexpected account {:#034x}",
@@ -1155,6 +1268,15 @@ impl UsageSink for PostgresStore {
                 usage_recorded.checked_add(delta.usage).ok_or_else(|| {
                     StoreError(format!(
                         "usage_recorded overflow for account {:#034x}",
+                        id_from(&account_id)
+                    ))
+                })?;
+                // The funding half of the same units. Both terms must be
+                // representable or neither may move, or the batch would bill
+                // overage it did not fund and leave the equation open.
+                overage_recorded.checked_add(delta.overage).ok_or_else(|| {
+                    StoreError(format!(
+                        "overage_recorded overflow for account {:#034x}",
                         id_from(&account_id)
                     ))
                 })?;
@@ -1171,15 +1293,17 @@ impl UsageSink for PostgresStore {
             let updated_accounts = sqlx::query(
                 "UPDATE tollgate_accounts AS account
                  SET usage_recorded = account.usage_recorded + delta.usage,
-                     settlement_loss = account.settlement_loss - delta.loss
-                 FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[])
-                      AS delta(account_id, usage, loss)
+                     settlement_loss = account.settlement_loss - delta.loss,
+                     overage_recorded = account.overage_recorded + delta.overage
+                 FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[], $4::bigint[])
+                      AS delta(account_id, usage, loss, overage)
                  WHERE account.account_id = delta.account_id
                    AND account.settlement_loss >= delta.loss",
             )
             .bind(&account_ids)
             .bind(&account_usage_deltas)
             .bind(&account_loss_deltas)
+            .bind(&account_overage_deltas)
             .execute(&mut *tx)
             .await
             .map_err(storage)?;
@@ -1328,8 +1452,9 @@ impl AdminStore for PostgresStore {
     async fn create_account(&self, config: AccountConfig) -> Result<(), CreateAccountError> {
         let result = sqlx::query(
             "INSERT INTO tollgate_accounts
-             (account_id, balance, deposited, status, next_fence, usage_recorded, settlement_loss)
-             VALUES ($1, $2, $2, $3, 1, 0, 0)
+             (account_id, balance, deposited, status, next_fence, usage_recorded,
+              settlement_loss, overage_recorded)
+             VALUES ($1, $2, $2, $3, 1, 0, 0, 0)
              ON CONFLICT (account_id) DO NOTHING",
         )
         .bind(id_bytes(config.account_id.0))

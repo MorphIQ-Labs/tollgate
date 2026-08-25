@@ -1,5 +1,5 @@
 {
-  "_comment": "target_ns is aspirational; threshold_ns fails the gate. Values are provisional laptop bounds — recalibrate on the controlled host before treating them as the contract.",
+  "_comment": "target_ns is aspirational; threshold_ns fails the gate. Values are provisional laptop bounds \u2014 recalibrate on the controlled host before treating them as the contract.",
   "benchmarks": [
     {
       "id": "cost_table/quote",
@@ -22,7 +22,7 @@
       "threshold_ns": 80.0
     },
     {
-      "_comment": "Retightened for the foldhash principal hasher (#9). Paired A/B in one session: SipHash 23.6/23.6/23.7ns, foldhash 13.9/13.8ns — a 41% cut, and the largest single saving on the request path.",
+      "_comment": "Retightened for the foldhash principal hasher (#9). Paired A/B in one session: SipHash 23.6/23.6/23.7ns, foldhash 13.9/13.8ns \u2014 a 41% cut, and the largest single saving on the request path.",
       "id": "admission/snapshot_lookup_arc_swap",
       "target_ns": 20.0,
       "threshold_ns": 45.0
@@ -62,6 +62,18 @@
       "id": "admission/full_check_denied",
       "target_ns": 18.0,
       "threshold_ns": 40.0
+    },
+    {
+      "_comment": "Added by #1. The lease-exhausted path had no benchmark at all: `admit_once` uses a giant lease and cancels, so the quota step's failure branch never ran under measurement \u2014 and elastic mode adds a branch exactly there. This is the strict regression guard: the added match must cost a strict account nothing, and a refusal here is dearer than `full_check_denied` because it has already paid for the quote and the rate token.",
+      "id": "admission/full_check_lease_exhausted_strict",
+      "target_ns": 40.0,
+      "threshold_ns": 90.0
+    },
+    {
+      "_comment": "Added by #1. What elastic mode actually costs on the path it exists for: a compare-exchange debit against the cap, a reservation, and the matching refund on cancel. Comparable to `full_check` because it is the same work with a different counter \u2014 the overage counter sits in the lease slot the lookup has already pulled into cache.",
+      "id": "admission/full_check_lease_exhausted_elastic",
+      "target_ns": 110.0,
+      "threshold_ns": 230.0
     }
   ],
   "ratios": [

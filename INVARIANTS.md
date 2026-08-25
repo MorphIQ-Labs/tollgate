@@ -4,27 +4,54 @@ A change that violates one of these is a defect even when every test passes.
 Each invariant names the test(s) that enforce it; a new invariant is not "done"
 until it has one.
 
-1. **Bounded spend.** Total committed usage across all instances never exceeds
-   the units allocated to the account, under any interleaving of concurrent
-   clients. Enforced by centrally allocated leases: units are spent only from
-   a lease, and a lease's units were atomically debited from the account at
-   allocation. Opt-in local shards partition that one grant exactly; a debit
-   first uses its sticky local counter, then siblings, and fragmented debits
-   carry a fixed-size exact-total receipt. Sharding never creates capacity and
-   never leaves a positive aggregate unspendable at exhaustion. A *live*
-   aggregate read is an estimate — the walk is not one atomic instant and a
-   refund may concentrate on a shard it has passed or not yet reached — so it
-   is clamped to the grant, never asserted against it; settlement reads it
-   only at quiescence, where it is exact.
+1. **Bounded spend.** Under `EnforcementMode::Strict`, total committed usage
+   across all instances never exceeds the units allocated to the account, under
+   any interleaving of concurrent clients. Enforced by centrally allocated
+   leases: units are spent only from a lease, and a lease's units were
+   atomically debited from the account at allocation. Opt-in local shards
+   partition that one grant exactly; a debit first uses its sticky local
+   counter, then siblings, and fragmented debits carry a fixed-size exact-total
+   receipt. Sharding never creates capacity and never leaves a positive
+   aggregate unspendable at exhaustion. A *live* aggregate read is an estimate —
+   the walk is not one atomic instant and a refund may concentrate on a shard it
+   has passed or not yet reached — so it is clamped to the grant, never asserted
+   against it; settlement reads it only at quiescence, where it is exact.
+
+   Under `EnforcementMode::Elastic { overage_cap }` an account may spend beyond
+   its allocation, and the bound becomes a different one: **at most
+   `overage_cap` unfunded units per service instance**, so a fleet of `N`
+   instances can extend up to `N * overage_cap`. That multiplication is
+   deliberate — the counter is a local atomic, like every other local mechanism
+   here, and aggregating it would need the synchronous coordination the request
+   path exists to avoid (1). Size the cap against the fleet, not one process.
+   The cap is *not* sharded the way the grant is: a grant divides because its
+   shards sum back to it, while N per-locality caps would either refuse an
+   elastic request while headroom sat unreachable on another core, or silently
+   raise the cap to `N × overage_cap` on the instance.
+
+   What the mode does *not* relax: every unfunded unit is recorded. Overage is
+   billed as ordinary usage and funded by its own ledger term, so per-account
+   conservation stays exact (see *Ledger roles*) and no unit is ever spent without being
+   accounted for. Elastic mode changes whether a request is admitted; it
+   changes nothing about whether its units are counted.
    *Tests:* `no_double_spend_across_instances` (memory and Postgres variants),
-   `lease_units_are_conserved` and `concurrent_commit_conservation` across
-   sharded layouts, `sharded_grant_and_low_water_partitions_are_exact`,
+   `tollgate-core` reservation proptests; `lease_units_are_conserved` and
+   `concurrent_commit_conservation` across sharded layouts,
+   `sharded_grant_and_low_water_partitions_are_exact`,
    `a_whole_sibling_is_used_before_fragmenting`,
    `sharded_lease_spends_to_exact_exhaustion_without_stranding`,
    `failed_fragmented_debit_reports_true_remaining_and_rolls_back`,
    `a_torn_aggregate_above_the_grant_reads_as_the_grant`,
    `a_fragmenting_rollback_never_panics_a_concurrent_aggregate_read`, and the
-   exact aggregate model in `formal/lean/Tollgate/LeaseShards.lean`.
+   exact aggregate model in `formal/lean/Tollgate/LeaseShards.lean`;
+   `elastic_refuses_terminally_once_the_cap_is_spent`,
+   `every_principal_of_an_account_shares_one_cap`,
+   `republishing_a_snapshot_does_not_reset_the_cap`,
+   `concurrent_debits_never_exceed_the_cap`,
+   `a_sharded_slot_does_not_multiply_the_overage_cap` and
+   `a_sharded_slot_still_prefers_the_lease_that_can_fund_the_quote` (the cap
+   and the sharded lease views sharing one slot), and
+   `Tollgate.Conservation.an_accepted_debit_stays_within_the_cap`.
 
 2. **Zero charge before execution.** A reservation that never reaches
    `commit_at_execution_start` charges zero units, and its units return to the
@@ -65,8 +92,12 @@ until it has one.
    unrepresentable there).
 
 5. **Fail closed, zero I/O.** Unknown principal, suspended/closed account,
-   expired snapshot, missing permission, exhausted or expired lease: all deny
-   locally. The request path performs no database, file, lock-file, or network
+   expired snapshot, missing permission, cost overflow, accounting
+   backpressure: all deny locally, under every enforcement mode. A lease that
+   cannot fund the quote — absent, expired, or exhausted — also denies locally
+   under `Strict`; it is the one condition `Elastic` may admit past, because it
+   is the one that says something about *funding* rather than about validity
+   (1). Nothing else in this list is mode-dependent. The request path performs no database, file, lock-file, or network
    access — not even on a miss. A deny also says which kind it is: a request
    that can *never* be admitted under the account's current schedule — its
    quote exceeds the whole burst — is `UnpriceableUnderLimits`, never
@@ -78,7 +109,10 @@ until it has one.
    `zero_burst_denies_every_priced_request`,
    `quote_beyond_the_bucket_domain_is_unpriceable`, and
    `rate_limiter_weights_by_cost` (the converse: genuine throttling stays
-   `RateLimited`).
+   `RateLimited`); and
+   `elastic_does_not_relax_any_refusal_that_is_not_about_funding`, which pins
+   that an elastic account still denies every non-funding refusal *and* claims
+   no credit while doing so.
    An opt-in sharded limiter partitions (never copies) the instance-local
    account rate and burst; publication's already-validated maximum quote
    limits the shard count so every shard can admit the largest legitimate
@@ -191,10 +225,20 @@ until it has one.
    `one_scheduled_sweep_drains_every_saturated_batch` (server suite).
 
 10. **Ready means currently admissible.** An instance reports ready only while
-    its snapshot resolutions meet the bar below, its lease remains inside the
-    local usability window, and its snapshot and refill/accounting tasks are
-    alive. Readiness falls again on exhaustion, expiry, or task exit;
-    fail-closed correctness must not masquerade as availability.
+    its snapshot resolutions meet the bar below, it can still fund work, and
+    its snapshot and refill/accounting tasks are alive. Readiness falls again
+    on exhaustion, expiry, or task exit; fail-closed correctness must not
+    masquerade as availability.
+
+    "Can still fund work" is the same question admission asks, and it is
+    mode-dependent for the same reason (1). Under `Strict` it is a lease inside
+    the local usability window with units left. Under `Elastic` an empty or
+    absent lease is not the end of the answer: an account with overage headroom
+    *is* admissible, and reporting it unready would withdraw from rotation
+    exactly the instances the mode exists to keep serving — availability
+    masquerading as fail-closed correctness, the same error in the other
+    direction. Readiness reads the mode from the snapshot the request path
+    reads, never a copy, so the two cannot disagree after a republish.
 
     The snapshot bar depends on how the tracked set is chosen, because the
     same rule means opposite things at the two scales (#48). For a
@@ -221,8 +265,10 @@ until it has one.
     `readiness_falls_when_snapshot_expires_during_outage`,
     `readiness_falls_if_refresh_hangs_across_snapshot_expiry`,
     `readiness_falls_when_background_planes_stop`,
-    `one_unanswerable_principal_unreadies_only_a_fixed_instance`, and
-    `snapshot_counters_track_failures_and_the_unresolved_gauge`.
+    `one_unanswerable_principal_unreadies_only_a_fixed_instance`,
+    `snapshot_counters_track_failures_and_the_unresolved_gauge`,
+    `readiness_closes_the_lease_window_exactly_when_debits_do`, and
+    `readiness_counts_overage_headroom_for_an_elastic_account`.
 
 11. **Checked arithmetic only.** Cost and lease arithmetic never wraps; any
     overflow is an explicit error that denies (fail closed), never a wrap to a
@@ -401,12 +447,16 @@ until it has one.
     what was billed — usage events remain the billing record. Refusals decided
     before the engine is reached (accounting backpressure, 8) are recorded by
     the embedder against the same tally, so no reason exports a permanent zero
-    that reads as "never happens". *Tests:*
+    that reads as "never happens". An admission that no lease funded is counted
+    under `admitted` *and* under `admitted_overage`, a qualifier rather than a
+    sibling, so a reader of `admitted` never has to add two numbers to get the
+    total. *Tests:*
     `indices_cover_every_slot_exactly_once`,
     `labels_are_distinct_and_payload_free`, `payload_does_not_affect_the_slot`,
     `counters_attribute_every_outcome`, `each_reason_reaches_its_own_slot`,
-    `denied_requests_add_no_units`, `concurrent_increments_are_not_lost`, and
-    `metrics_separate_admissions_from_each_kind_of_refusal`.
+    `denied_requests_add_no_units`, `concurrent_increments_are_not_lost`,
+    `metrics_separate_admissions_from_each_kind_of_refusal`, and
+    `an_overage_admission_is_counted_twice_over_and_a_refusal_once`.
 
 21. **Every 128-bit identifier has one portable wire spelling.** `AccountId`,
     `KeyId`, `LeaseId`, `RequestId`, and `Principal` are exactly 32 lowercase
@@ -470,4 +520,25 @@ until it has one.
 
 Ledger roles (context for 1 and 7): leases **bound** spend; usage events **are**
 the billing record; reconciliation compares the two and steady-state drift is
-zero.
+zero. Per account, exactly:
+
+```
+deposited + overage_recorded
+    == balance + active lease grants + settled usage + settlement loss
+```
+
+Read it as a funding statement: the left side is everything the account was
+ever funded with — money in, and credit extended under `Elastic` (1) — and the
+right side is where those units now sit. `overage_recorded` is a *funding*
+term, not a bucket: overage usage also lands in settled usage, so without it
+the equation would fail by exactly the overage and reconciliation would report
+corruption on a correctly working ledger. Both sides use checked arithmetic and
+an overflow answers "violated" rather than wrapping (11), because this equation
+exists to detect corrupt state and must not be able to launder it.
+*Tests:* `conservation_requires_an_exact_equation_without_overflow`,
+`overage_funds_the_usage_it_bills`,
+`overflowing_the_funding_sum_is_a_violation_not_a_wrap`,
+`overage_usage_is_billed_and_funds_itself` and
+`settlement_is_unaffected_by_an_account_carrying_overage` (both store suites);
+`Tollgate.Conservation.overage_preserves_conservation` and
+`unfunded_overage_always_breaks_conservation`.

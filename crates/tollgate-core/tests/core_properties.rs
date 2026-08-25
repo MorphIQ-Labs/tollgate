@@ -7,9 +7,10 @@ use jiff::Timestamp;
 use proptest::prelude::*;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CancelOutcome, CostTable, CostUnits, FencingToken,
-    Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex, PermissionBits,
-    PublishableSnapshot, QuoteError, Reservation, ResolvedLimits, SnapshotValidationError,
+    AccountId, AccountSnapshot, AccountStatus, CancelOutcome, CostTable, CostUnits,
+    EnforcementMode, FencingToken, Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding,
+    OpIndex, PermissionBits, PublishableSnapshot, QuoteError, Reservation, ResolvedLimits,
+    SnapshotValidationError,
 };
 
 struct Op(usize);
@@ -107,6 +108,7 @@ proptest! {
             key_id: None,
             generation: Generation(1),
             status: AccountStatus::Active,
+            enforcement_mode: EnforcementMode::Strict,
             valid_until: t(10_000),
             permissions: PermissionBits::ALL,
             limits: ResolvedLimits {

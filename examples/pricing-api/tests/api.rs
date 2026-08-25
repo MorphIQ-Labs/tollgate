@@ -7,8 +7,8 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use pricing_api::{DEMO_ACCOUNT, DEMO_API_KEY, build_app};
-use tollgate_core::CostUnits;
+use pricing_api::{DEMO_ACCOUNT, DEMO_API_KEY, build_app, build_app_with_mode};
+use tollgate_core::{CostUnits, DenyReason, EnforcementMode};
 
 fn price_body(contracts: usize) -> Value {
     let contract =
@@ -168,6 +168,96 @@ async fn exhausted_quota_returns_429_and_never_overspends() {
     assert!(store.usage_recorded(DEMO_ACCOUNT).get() <= 200);
 }
 
+/// The elastic twin of `exhausted_quota_returns_429_and_never_overspends`,
+/// end to end over HTTP. The same tiny deposit, and the same requests — but
+/// the account keeps serving past what it paid for, every unfunded unit is
+/// recorded, and the refusal when the cap runs out is a 402 that says so
+/// rather than a 429 inviting a retry that cannot help.
+///
+/// This is also the test that pins the wiring reading the mode: a
+/// `enforcement_mode()` that ignored the published snapshot would report no
+/// cap here, admit nothing on credit, and fail on the first assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_elastic_account_serves_past_its_deposit_and_bills_the_overage() {
+    // The cap must fund at least one worst-case request (50 fixed + 1 x 1024
+    // items), or publication refuses it; 1_074 is exactly that bound, which
+    // makes it 21 whole 51-unit requests of credit.
+    const CAP: u64 = 1_074;
+    let (router, runtime) = build_app_with_mode(
+        200,
+        true,
+        EnforcementMode::Elastic {
+            overage_cap: CostUnits(CAP),
+        },
+    );
+    wait_ready(&router).await;
+
+    assert_eq!(
+        metrics(&router).await["overage_cap"],
+        json!(CAP),
+        "the published mode must reach the operator surface"
+    );
+
+    let mut ok = 0;
+    let mut payment_required = 0;
+    for _ in 0..40 {
+        let (status, body) = call(&router, Some(DEMO_API_KEY), price_body(1)).await;
+        match status {
+            StatusCode::OK => ok += 1,
+            StatusCode::PAYMENT_REQUIRED => {
+                assert_eq!(body["code"], "overage-cap-exhausted");
+                payment_required += 1;
+            }
+            other => panic!("unexpected status {other}: {body}"),
+        }
+    }
+
+    // Strict would have stopped when the lease ran out. 200 units funds only
+    // a handful of 51-unit requests — and fewer than three, because the grant
+    // policy shrinks near exhaustion — so anything past that was served on
+    // credit.
+    assert!(ok > 3, "elastic must serve past the deposit, admitted {ok}");
+    assert!(
+        payment_required > 0,
+        "the cap must eventually refuse, and terminally"
+    );
+
+    let after = metrics(&router).await;
+    let admitted = after["admitted"].as_u64().unwrap();
+    let on_credit = after["admitted_overage"].as_u64().unwrap();
+    assert_eq!(admitted, ok, "every 200 the caller saw is an admission");
+    assert!(on_credit > 0, "some requests were served on credit");
+    assert!(
+        admitted > on_credit,
+        "the lease funded the first requests, so `admitted` is the total and \
+         `admitted_overage` a qualifier inside it — never a sibling to add"
+    );
+    assert!(after["overage_spent"].as_u64().unwrap() <= CAP);
+    assert_eq!(
+        after["denials"]["overage_cap_exhausted"],
+        json!(payment_required)
+    );
+
+    let store = runtime.store.clone();
+    runtime.shutdown().await;
+
+    // The point of the whole design: spend beyond the deposit is *recorded*,
+    // and the ledger still balances because overage funds what it bills.
+    let conservation = store.conservation(DEMO_ACCOUNT).unwrap();
+    assert!(
+        conservation.overage_recorded > CostUnits::ZERO,
+        "unfunded spend must be recorded, not forgiven"
+    );
+    assert!(
+        store.usage_recorded(DEMO_ACCOUNT).get() > 200,
+        "the account was billed past its deposit"
+    );
+    assert!(
+        conservation.holds(),
+        "conservation violated: {conservation:?}"
+    );
+}
+
 /// Issue #37: an instance that is refusing everything must not look like one
 /// serving nothing. The counters are the request path's only voice, so the
 /// scrape has to distinguish the two — and attribute each refusal.
@@ -183,7 +273,7 @@ async fn metrics_separate_admissions_from_each_kind_of_refusal() {
     // rather than "no such counter".
     assert_eq!(
         before["denials"].as_object().unwrap().len(),
-        14,
+        DenyReason::COUNT,
         "every reason must be exported, including the ones at zero"
     );
 
@@ -404,7 +494,10 @@ async fn baseline_metrics_omit_the_uninstalled_planes() {
     // configurations, and a baseline request simply never reaches it.
     assert_eq!(body["admitted"], 0);
     assert_eq!(body["denied"], 0);
-    assert_eq!(body["denials"].as_object().unwrap().len(), 14);
+    assert_eq!(
+        body["denials"].as_object().unwrap().len(),
+        DenyReason::COUNT
+    );
 
     runtime.shutdown().await;
 }

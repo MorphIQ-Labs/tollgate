@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, Generation, PermissionBits,
-    Principal, PublishableSnapshot, ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, Generation,
+    PermissionBits, Principal, PublishableSnapshot, ResolvedLimits,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, GrantPolicy, MemoryStore, SetStatusError, SnapshotResolution,
@@ -26,6 +26,7 @@ fn snapshot(account: AccountId, status: AccountStatus) -> PublishableSnapshot {
         key_id: None,
         generation: Generation(1),
         status,
+        enforcement_mode: EnforcementMode::Strict,
         valid_until: jiff::Timestamp::from_second(10_000).unwrap(),
         permissions: PermissionBits::ALL,
         limits: ResolvedLimits {

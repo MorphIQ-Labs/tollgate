@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use jiff::{SignedDuration, Timestamp};
 
-use tollgate_core::{AccountId, AccountStatus, CostUnits};
+use tollgate_core::{AccountId, AccountStatus, CostUnits, UsageSource};
 use tollgate_store::{
     AccountConfig, GrantPolicy, LeaseAllocator, MemoryStore, StoredRecords, UsageSink,
 };
@@ -191,8 +191,10 @@ async fn holdings_climb_with_traffic_while_the_live_count_returns_to_zero() {
                 &[tollgate_core::UsageEvent {
                     request_id: tollgate_core::RequestId(request),
                     account_id: ACCOUNT,
-                    lease_id: lease.lease_id,
-                    fencing_token: lease.fencing_token,
+                    source: UsageSource::Leased {
+                        lease_id: lease.lease_id,
+                        fencing_token: lease.fencing_token,
+                    },
                     units: CostUnits(3),
                     occurred_at: t(1),
                 }],
