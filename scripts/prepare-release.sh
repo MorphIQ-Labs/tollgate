@@ -11,9 +11,10 @@
 #
 # The model, matching what release-plz did here:
 #
-#   * one long-lived release branch, recreated from the default branch on every
-#     run, so the open release merge request always reflects the current tip
-#     rather than whatever the first run happened to see;
+#   * one long-lived release branch, updated from the default branch whenever
+#     the generated proposal changes, so the open release merge request always
+#     reflects the current tip rather than whatever the first run happened to
+#     see;
 #   * the version derived from the conventional-commit subjects since the last
 #     tag, not from a human's judgement at merge time;
 #   * the CHANGELOG section written from those same subjects, so the notes
@@ -31,8 +32,9 @@
 #
 # Runs automatically after every merge to the default branch. It is idempotent:
 # with no releasable commits it exits 0, including when the merge being examined
-# is the release merge itself. A schedule remains a recovery lane, and re-running
-# only force-updates the release branch to match the default branch again.
+# is the release merge itself. A schedule remains a recovery lane; re-running
+# leaves an identical proposal commit untouched and only force-updates the
+# release branch when the generated release files have actually changed.
 #
 # Depends on git, curl, jq and a POSIX awk — the same set `tag-release.sh` needs,
 # deliberately. No gawk extensions, no python: the release path must not acquire
@@ -57,6 +59,11 @@ fi
 
 server_host="${CI_SERVER_HOST:-gitlab.com}"
 project_path="${CI_PROJECT_PATH:-}"
+
+[ -f CHANGELOG.md ] || {
+  echo "prepare-release: CHANGELOG.md is required; add a root changelog before enabling releases" >&2
+  exit 1
+}
 
 # --- what is released now -------------------------------------------------
 current=$(awk '
@@ -270,21 +277,38 @@ emit_section() {
 mv CHANGELOG.md.next CHANGELOG.md
 
 # --- one long-lived release branch ---------------------------------------
+# A recovery schedule commonly sees the same default-branch tip as the
+# post-merge run. Do not manufacture a new commit timestamp and force-push an
+# identical proposal: besides being needless churn, that write can turn a
+# transient GitLab pre-receive failure into a red recovery pipeline. Fetch into
+# FETCH_HEAD so this comparison does not depend on a local tracking ref.
+release_branch_current=0
+if git fetch -q --no-tags origin "refs/heads/$RELEASE_BRANCH" 2>/dev/null; then
+  if git diff --quiet FETCH_HEAD -- \
+      CHANGELOG.md Cargo.lock ':(glob)**/Cargo.toml'; then
+    release_branch_current=1
+  fi
+fi
+
 git config user.email "release-bot@noreply.$CI_SERVER_HOST"
 git config user.name "release-bot"
 git remote set-url origin "https://oauth2:${RELEASE_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
 
-git checkout -B "$RELEASE_BRANCH"
+if [ "$release_branch_current" = "1" ]; then
+  echo "prepare-release: $RELEASE_BRANCH already matches v$next; leaving its commit unchanged"
+else
+  git checkout -B "$RELEASE_BRANCH"
 
-# Stage only the files this script edits. `git add -A` sweeps in whatever else
-# the job left in the working tree — CARGO_HOME is inside CI_PROJECT_DIR in
-# these projects, so the first run committed 330 files of restored registry
-# cache alongside a three-line version bump.
-git add CHANGELOG.md Cargo.lock
-git ls-files -z '*Cargo.toml' | xargs -0 git add --
+  # Stage only the files this script edits. `git add -A` sweeps in whatever else
+  # the job left in the working tree — CARGO_HOME is inside CI_PROJECT_DIR in
+  # these projects, so the first run committed 330 files of restored registry
+  # cache alongside a three-line version bump.
+  git add CHANGELOG.md Cargo.lock
+  git ls-files -z '*Cargo.toml' | xargs -0 git add --
 
-git commit -q -m "chore: release v$next"
-git push -q --force origin "refs/heads/$RELEASE_BRANCH"
+  git commit -q -m "chore: release v$next"
+  git push -q --force origin "refs/heads/$RELEASE_BRANCH"
+fi
 
 # --- create the merge request, or refresh the open one --------------------
 api="$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests"
