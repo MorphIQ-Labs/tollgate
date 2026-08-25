@@ -29,9 +29,10 @@
 #     0.x      | minor    | patch | patch
 #     >= 1.0   | major    | minor | patch
 #
-# Idempotent and safe to run on a schedule: with no releasable commits it exits
-# 0 having done nothing, and re-running only force-updates the release branch to
-# match the default branch again.
+# Runs automatically after every merge to the default branch. It is idempotent:
+# with no releasable commits it exits 0, including when the merge being examined
+# is the release merge itself. A schedule remains a recovery lane, and re-running
+# only force-updates the release branch to match the default branch again.
 #
 # Depends on git, curl, jq and a POSIX awk — the same set `tag-release.sh` needs,
 # deliberately. No gawk extensions, no python: the release path must not acquire
@@ -67,12 +68,42 @@ current=$(awk '
 [ -n "$current" ] || { echo "prepare-release: no version in Cargo.toml" >&2; exit 1; }
 
 last_tag=$(git tag -l 'v*' --sort=-v:refname | head -n 1 || true)
-if [ -n "$last_tag" ]; then range="$last_tag..HEAD"; else range="HEAD"; fi
+
+# A release merge advances the manifest before `tag-release` creates its tag.
+# If preparation blindly keeps using the previous tag as its range, the release
+# merge immediately proposes another bump from the same commits. Anchor at the
+# untagged release commit instead. This also handles a later merge arriving
+# before the tag job finishes: only commits after the pending release contribute
+# to the following version.
+release_commit=""
+if ! git rev-parse -q --verify "refs/tags/v$current" >/dev/null 2>&1; then
+  release_commit=$(git log --no-merges --format='%H %s' HEAD | awk -v wanted="chore: release v$current" '
+    {
+      hash = $1
+      sub(/^[^ ]+ /, "")
+      if ($0 == wanted) { print hash; exit }
+    }
+  ')
+fi
+
+if [ -n "$release_commit" ]; then
+  range="$release_commit..HEAD"
+  range_start="pending release v$current"
+  comparison_tag="v$current"
+elif [ -n "$last_tag" ]; then
+  range="$last_tag..HEAD"
+  range_start="$last_tag"
+  comparison_tag="$last_tag"
+else
+  range="HEAD"
+  range_start="the first commit"
+  comparison_tag=""
+fi
 
 # The release commit itself is not a reason to release again.
 subjects=$(git log --no-merges --format='%s' "$range" | grep -v '^chore: release v' || true)
 if [ -z "$subjects" ]; then
-  echo "prepare-release: no releasable commits since ${last_tag:-the first commit}; nothing to do."
+  echo "prepare-release: no releasable commits since $range_start; nothing to do."
   exit 0
 fi
 
@@ -156,14 +187,14 @@ entries=$(printf '%s\n' "$subjects" | awk '
   }
 ')
 
-if [ -n "$last_tag" ] && [ -n "$project_path" ]; then
-  heading="## [$next](https://$server_host/$project_path/compare/$last_tag...v$next) - $(date -u +%Y-%m-%d)"
+if [ -n "$comparison_tag" ] && [ -n "$project_path" ]; then
+  heading="## [$next](https://$server_host/$project_path/compare/$comparison_tag...v$next) - $(date -u +%Y-%m-%d)"
 else
   heading="## [$next] - $(date -u +%Y-%m-%d)"
 fi
 
 if [ "$DRY_RUN" = "1" ]; then
-  echo "prepare-release: $current -> $next (breaking=$breaking feat=$feat) since ${last_tag:-the first commit}"
+  echo "prepare-release: $current -> $next (breaking=$breaking feat=$feat) since $range_start"
   echo "---"
   echo "$heading"
   echo
@@ -260,7 +291,7 @@ api="$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests"
 existing=$(curl --fail-with-body -sS -H "PRIVATE-TOKEN: $RELEASE_TOKEN" \
   "$api?state=opened&source_branch=$RELEASE_BRANCH" | jq -r '.[0].iid // empty')
 
-body="Prepared by \`prepare-release\` from the conventional commits since ${last_tag:-the first commit}.
+body="Prepared by \`prepare-release\` from the conventional commits since $range_start.
 
 Merging this bumps the workspace to **$next**; \`tag-release\` then cuts \`v$next\` and the GitLab release from the CHANGELOG section below.
 

@@ -16,20 +16,49 @@
 # dependency to resolve on a registry.
 set -eu
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+DRY_RUN="${TAG_RELEASE_DRY_RUN:-0}"
+
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
 
-: "${RELEASE_TOKEN:?RELEASE_TOKEN must be set (Maintainer, api + write_repository)}"
-: "${CI_SERVER_HOST:?}" "${CI_PROJECT_PATH:?}" "${CI_PROJECT_ID:?}" "${CI_API_V4_URL:?}" "${CI_COMMIT_SHA:?}"
+if [ "$DRY_RUN" != "1" ]; then
+  : "${RELEASE_TOKEN:?RELEASE_TOKEN must be set (Maintainer, api + write_repository)}"
+  : "${CI_SERVER_HOST:?}" "${CI_PROJECT_PATH:?}" "${CI_PROJECT_ID:?}" "${CI_API_V4_URL:?}"
+fi
 
 version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
 [ -n "$version" ] || { echo "tag-release: no [workspace.package] version in Cargo.toml" >&2; exit 1; }
 tag="v$version"
 
-if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+if git rev-parse -q --verify "refs/tags/$tag" >/dev/null 2>&1 \
+   || git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
   echo "tag-release: $tag already exists; nothing to do."
   exit 0
 fi
+
+# The release commit is the squashed second parent of the merge commit under
+# the group-enforced merge method. Find that merge on the first-parent history
+# rather than tagging CI_COMMIT_SHA: another merge can land while the release
+# pipeline waits for a runner, and its checkout must not become the release.
+release_commit=$(git log --no-merges --format='%H %s' HEAD | awk -v wanted="chore: release $tag" '
+  {
+    hash = $1
+    sub(/^[^ ]+ /, "")
+    if ($0 == wanted) { print hash; exit }
+  }
+')
+[ -n "$release_commit" ] || {
+  echo "tag-release: no 'chore: release $tag' commit found; refusing to tag HEAD" >&2
+  exit 1
+}
+
+release_ref=$(git log --first-parent --merges --format='%H %P' HEAD | awk -v release="$release_commit" '
+  $3 == release { print $1; exit }
+')
+[ -n "$release_ref" ] || {
+  echo "tag-release: no first-parent merge introduces $release_commit; refusing to tag HEAD" >&2
+  exit 1
+}
 
 # Headings in this repo look like `## [0.5.0](https://...)`; the pattern also
 # accepts `## v0.5.0` and `## 0.5.0` so it survives a changelog style change
@@ -46,13 +75,18 @@ if [ -z "$(printf '%s' "$notes" | tr -d '[:space:]')" ]; then
   exit 1
 fi
 
+if [ "$DRY_RUN" = "1" ]; then
+  echo "tag-release: would release $tag at $release_ref"
+  exit 0
+fi
+
 git config user.email "release-bot@noreply.$CI_SERVER_HOST"
 git config user.name "release-bot"
 git remote set-url origin "https://oauth2:${RELEASE_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
-git tag -a "$tag" -m "$tag" "$CI_COMMIT_SHA"
+git tag -a "$tag" -m "$tag" "$release_ref"
 git push origin "refs/tags/$tag"
 
-jq -n --arg tag "$tag" --arg ref "$CI_COMMIT_SHA" --arg desc "$notes" \
+jq -n --arg tag "$tag" --arg ref "$release_ref" --arg desc "$notes" \
   '{tag_name:$tag, ref:$ref, description:$desc}' \
 | curl --fail-with-body -sS -X POST \
     -H "PRIVATE-TOKEN: $RELEASE_TOKEN" -H "Content-Type: application/json" \
