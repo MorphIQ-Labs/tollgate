@@ -7,6 +7,16 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.7.0...v0.8.0) - 2026-08-25
+
+### Added
+
+- *(auth)* [**breaking**] #2 credential verification in the library, cached per session
+
+### Fixed
+
+- *(ci)* prepare releases after every merge
+
 ## [0.7.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.6.0...v0.7.0) - 2026-08-25
 
 ### Added
