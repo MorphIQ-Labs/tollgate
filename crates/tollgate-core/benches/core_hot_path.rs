@@ -6,14 +6,16 @@
 
 use std::hint::black_box;
 use std::sync::Arc;
+use std::sync::Barrier;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use jiff::Timestamp;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, FencingToken,
-    Generation, KeyId, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, Reservation,
-    ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, CancelOutcome, CommitError, CostTable, CostUnits,
+    EnforcementMode, FencingToken, Generation, KeyId, LeaseGrant, LeaseId, LocalLease, OpIndex,
+    PermissionBits, Reservation, ResolvedLimits,
 };
 
 #[derive(Clone, Copy)]
@@ -25,6 +27,15 @@ enum Op {
 impl OpIndex for Op {
     fn index(&self) -> usize {
         *self as usize
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DenseOp(usize);
+
+impl OpIndex for DenseOp {
+    fn index(&self) -> usize {
+        self.0
     }
 }
 
@@ -71,9 +82,24 @@ fn big_lease() -> Arc<LocalLease> {
 
 fn bench_cost_table(c: &mut Criterion) {
     let table = cost_table();
+    let dense_table = (0..4_096).fold(
+        CostTable::builder(CostUnits(50), CostUnits(50)),
+        |builder, index| builder.weight(&DenseOp(index), CostUnits(5)),
+    );
+    let dense_table = dense_table.build();
     let mut group = c.benchmark_group("cost_table");
     group.bench_function("quote", |b| {
         b.iter(|| table.quote(black_box(&Op::Greeks), black_box(64)).unwrap())
+    });
+    // Quoting the last entry of a 4,096-class table must cost the same as the
+    // two-class table above. A scan introduced into the request path makes
+    // this same-run ratio fail by orders of magnitude.
+    group.bench_function("quote_4096_classes", |b| {
+        b.iter(|| {
+            dense_table
+                .quote(black_box(&DenseOp(4_095)), black_box(64))
+                .unwrap()
+        })
     });
     group.finish();
 }
@@ -111,8 +137,189 @@ fn bench_lease(c: &mut Criterion) {
             r.cancel()
         })
     });
+
+    let contended = LeaseContended::new(now);
+    let mut commit = false;
+    group.bench_function("reserve_commit_contended_8", |b| {
+        b.iter(|| {
+            commit = !commit;
+            reserve_and_resolve(black_box(&contended.lease), now, commit)
+        })
+    });
     group.finish();
 }
 
-criterion_group!(benches, bench_cost_table, bench_snapshot, bench_lease);
+fn reserve_and_resolve(lease: &Arc<LocalLease>, now: Timestamp, commit: bool) {
+    let reservation = Reservation::reserve(lease, CostUnits(100), now).unwrap();
+    if commit {
+        black_box(reservation.commit_at_execution_start(now).unwrap());
+    } else {
+        black_box(reservation.cancel());
+    }
+}
+
+struct LeaseContended {
+    lease: Arc<LocalLease>,
+    stop: Arc<AtomicBool>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl LeaseContended {
+    fn new(now: Timestamp) -> Self {
+        let lease = big_lease();
+        let stop = Arc::new(AtomicBool::new(false));
+        let workers = (0..7)
+            .map(|worker| {
+                let lease = Arc::clone(&lease);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut commit = worker % 2 == 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        reserve_and_resolve(&lease, now, commit);
+                        commit = !commit;
+                    }
+                })
+            })
+            .collect();
+        Self {
+            lease,
+            stop,
+            workers,
+        }
+    }
+}
+
+impl Drop for LeaseContended {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for worker in self.workers.drain(..) {
+            worker.join().unwrap();
+        }
+    }
+}
+
+const RACE_BATCH: usize = 4_096;
+
+fn pending_batch(lease: &Arc<LocalLease>, now: Timestamp) -> Vec<Reservation> {
+    (0..RACE_BATCH)
+        .map(|_| Reservation::reserve(lease, CostUnits(1), now).unwrap())
+        .collect()
+}
+
+fn run_commit_cancel_race(reservations: &[Reservation], now: Timestamp) -> (usize, usize) {
+    let start = Barrier::new(3);
+    let (commit_wins, cancel_saw_committed) = std::thread::scope(|scope| {
+        let commit = scope.spawn(|| {
+            start.wait();
+            reservations
+                .iter()
+                .filter(|reservation| reservation.commit_at_execution_start(now).is_ok())
+                .count()
+        });
+        let cancel = scope.spawn(|| {
+            start.wait();
+            reservations
+                .iter()
+                .filter(|reservation| {
+                    matches!(reservation.cancel(), CancelOutcome::AlreadyCommitted { .. })
+                })
+                .count()
+        });
+        start.wait();
+        (commit.join().unwrap(), cancel.join().unwrap())
+    });
+    assert_eq!(commit_wins, cancel_saw_committed);
+    (commit_wins, reservations.len() - commit_wins)
+}
+
+fn run_atomic_race(phases: &[AtomicU8]) -> (usize, usize) {
+    let start = Barrier::new(3);
+    let (first_wins, second_wins) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            start.wait();
+            phases
+                .iter()
+                .filter(|phase| {
+                    phase
+                        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                })
+                .count()
+        });
+        let second = scope.spawn(|| {
+            start.wait();
+            phases
+                .iter()
+                .filter(|phase| {
+                    phase
+                        .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                })
+                .count()
+        });
+        start.wait();
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    assert_eq!(first_wins + second_wins, phases.len());
+    (first_wins, second_wins)
+}
+
+fn bench_reservation(c: &mut Criterion) {
+    let now = Timestamp::from_second(1_755_600_000).unwrap();
+    let lease = big_lease();
+    let mut group = c.benchmark_group("reservation");
+
+    group.bench_function("cancel_after_commit", |b| {
+        b.iter_batched(
+            || Reservation::reserve(&lease, CostUnits(1), now).unwrap(),
+            |reservation| {
+                reservation.commit_at_execution_start(now).unwrap();
+                black_box(reservation.cancel())
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("commit_after_cancel", |b| {
+        b.iter_batched(
+            || Reservation::reserve(&lease, CostUnits(1), now).unwrap(),
+            |reservation| {
+                assert_eq!(reservation.cancel(), CancelOutcome::ZeroCharged);
+                assert_eq!(
+                    black_box(reservation.commit_at_execution_start(now)),
+                    Err(CommitError::AlreadyReleased)
+                );
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.throughput(Throughput::Elements(RACE_BATCH as u64));
+    group.bench_function("commit_cancel_race_control_2", |b| {
+        b.iter_batched(
+            || {
+                (0..RACE_BATCH)
+                    .map(|_| AtomicU8::new(0))
+                    .collect::<Vec<_>>()
+            },
+            |phases| black_box(run_atomic_race(&phases)),
+            BatchSize::LargeInput,
+        )
+    });
+    group.bench_function("commit_cancel_race_contended_2", |b| {
+        b.iter_batched(
+            || pending_batch(&lease, now),
+            |reservations| black_box(run_commit_cancel_race(&reservations, now)),
+            BatchSize::LargeInput,
+        )
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_cost_table,
+    bench_snapshot,
+    bench_lease,
+    bench_reservation
+);
 criterion_main!(benches);

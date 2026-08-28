@@ -1,7 +1,8 @@
 //! Compares Criterion benchmark means against a threshold manifest.
 //!
 //! Usage:
-//!   check_benchmark_thresholds <manifest.json> <criterion-root> <report.json> <freshness-marker>
+//!   check_benchmark_thresholds [--ratios-only] [--baseline <baseline.json>]
+//!     <manifest.json> <criterion-root> <report.json> <freshness-marker>
 //!
 //! Mirrors ferro-risk's gate semantics:
 //! - `target_ns` is aspirational, `threshold_ns` is the failing bound;
@@ -10,10 +11,14 @@
 //!   whose `mean.point_estimate` (nanoseconds) is compared to `threshold_ns`.
 //! - Optional ratio bounds compare two measurements from the same run, so a
 //!   contention budget is portable across otherwise different hosts.
+//! - An optional recorded baseline enforces per-row regressions only when
+//!   `TOLLGATE_PERF_HOST` matches its host id and the run is trusted.
+//! - `--ratios-only` still requires every fresh row but deliberately skips
+//!   absolute thresholds and recorded-baseline decisions for shared CI.
 //! - Estimates older than the freshness marker are rejected: the gate must
 //!   never pass on stale output left by a previous run.
-//! - A JSON report is always written; the exit code is nonzero when any
-//!   benchmark is missing, stale, or over threshold.
+//! - A JSON report is always written; the exit code is nonzero when required
+//!   data is missing/stale or any active bound is exceeded.
 //!
 //! It also decides whether the run is worth believing at all (#49). A gate
 //! that only ever answers PASS or FAIL cannot distinguish a regression from a
@@ -33,6 +38,28 @@ use serde::{Deserialize, Serialize};
 /// from FAILURE so a caller can tell "your change is slow" from "ask me
 /// again on a quiet machine".
 const UNTRUSTED_EXIT: u8 = 3;
+const USAGE: &str = "usage: check_benchmark_thresholds [--ratios-only] [--baseline <baseline.json>] <manifest.json> <criterion-root> <report.json> <freshness-marker>";
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum GateMode {
+    Full,
+    RatiosOnly,
+}
+
+#[derive(Debug, PartialEq)]
+enum Command {
+    Run {
+        manifest_path: PathBuf,
+        criterion_root: PathBuf,
+        report_path: PathBuf,
+        marker_path: PathBuf,
+        baseline_path: Option<PathBuf>,
+        mode: GateMode,
+    },
+    Help,
+    Version,
+}
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -55,6 +82,36 @@ struct Entry {
     id: String,
     target_ns: f64,
     threshold_ns: f64,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct BaselineHost {
+    id: String,
+    architecture: String,
+    cpu: String,
+    os: String,
+    rustc: String,
+}
+
+#[derive(Deserialize)]
+struct Baseline {
+    host: BaselineHost,
+    recorded_at: String,
+    git_revision: String,
+    profile: String,
+    benchmarks: Vec<BaselineEntry>,
+}
+
+#[derive(Deserialize)]
+struct BaselineEntry {
+    id: String,
+    mean_ns: f64,
+    #[serde(default = "default_max_regression")]
+    max_regression: f64,
+}
+
+fn default_max_regression() -> f64 {
+    0.05
 }
 
 /// When to stop believing a run.
@@ -187,8 +244,16 @@ fn all_passed(rows: &[ReportRow]) -> bool {
 ///
 /// Keep this aggregation outside `main` so its fail-closed conjunction is a
 /// directly testable contract rather than process wiring.
-fn all_results_passed(rows: &[ReportRow], ratios: &[RatioRow]) -> bool {
-    all_passed(rows) && ratios.iter().all(|ratio| ratio.status == "pass")
+fn all_results_passed(
+    rows: &[ReportRow],
+    ratios: &[RatioRow],
+    regressions: &[RegressionRow],
+) -> bool {
+    all_passed(rows)
+        && ratios.iter().all(|ratio| ratio.status == "pass")
+        && regressions
+            .iter()
+            .all(|regression| regression.status != "regressed")
 }
 
 fn evaluate_ratio(bound: &RatioBound, means: &BTreeMap<String, f64>) -> RatioRow {
@@ -255,9 +320,11 @@ fn evaluate(
     measured: Option<Measurement>,
     previous_ns: Option<f64>,
     policy: &TrustPolicy,
+    mode: GateMode,
 ) -> ReportRow {
     let status = match measured {
         None => "missing-or-stale",
+        Some(_) if mode == GateMode::RatiosOnly => "pass",
         Some(m) if m.mean_ns <= entry.threshold_ns => "pass",
         Some(_) => "over-threshold",
     };
@@ -273,6 +340,146 @@ fn evaluate(
         unstable: measured
             .and_then(|m| m.ci_width)
             .is_some_and(|w| w > policy.max_ci_width),
+    }
+}
+
+fn parse_args(args: &[String]) -> Result<Command, String> {
+    let separator = args.iter().position(|arg| arg == "--");
+    let option_end = separator.unwrap_or(args.len());
+    for arg in &args[..option_end] {
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "-V" | "--version" => return Ok(Command::Version),
+            _ => {}
+        }
+    }
+
+    let mut mode = GateMode::Full;
+    let mut baseline_path = None;
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while index < option_end {
+        match args[index].as_str() {
+            "--ratios-only" if mode == GateMode::Full => mode = GateMode::RatiosOnly,
+            "--ratios-only" => return Err("--ratios-only may be specified only once".to_owned()),
+            "--baseline" if baseline_path.is_none() => {
+                index += 1;
+                if index >= option_end || args[index].starts_with('-') {
+                    return Err("--baseline requires a path".to_owned());
+                }
+                baseline_path = Some(PathBuf::from(&args[index]));
+            }
+            "--baseline" => return Err("--baseline may be specified only once".to_owned()),
+            value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
+            _ => positional.push(args[index].clone()),
+        }
+        index += 1;
+    }
+    if let Some(separator) = separator {
+        positional.extend_from_slice(&args[separator + 1..]);
+    }
+
+    match positional.as_slice() {
+        [manifest, criterion, report, marker] => Ok(Command::Run {
+            manifest_path: PathBuf::from(manifest),
+            criterion_root: PathBuf::from(criterion),
+            report_path: PathBuf::from(report),
+            marker_path: PathBuf::from(marker),
+            baseline_path,
+            mode,
+        }),
+        _ => Err(USAGE.to_owned()),
+    }
+}
+
+fn baseline_entries(baseline: &Baseline) -> Result<BTreeMap<String, &BaselineEntry>, String> {
+    if baseline.host.id.is_empty() {
+        return Err("baseline host id must not be empty".to_owned());
+    }
+    if baseline.recorded_at.is_empty()
+        || baseline.git_revision.is_empty()
+        || baseline.profile.is_empty()
+    {
+        return Err("baseline metadata must not be empty".to_owned());
+    }
+    if baseline.benchmarks.is_empty() {
+        return Err("baseline lists no benchmarks".to_owned());
+    }
+    let mut entries = BTreeMap::new();
+    for entry in &baseline.benchmarks {
+        if entry.id.is_empty()
+            || !entry.mean_ns.is_finite()
+            || entry.mean_ns <= 0.0
+            || !entry.max_regression.is_finite()
+            || entry.max_regression < 0.0
+        {
+            return Err(format!("invalid baseline entry for {:?}", entry.id));
+        }
+        if entries.insert(entry.id.clone(), entry).is_some() {
+            return Err(format!("duplicate baseline entry for {}", entry.id));
+        }
+    }
+    Ok(entries)
+}
+
+fn evaluate_regression(
+    id: &str,
+    measured_ns: Option<f64>,
+    baseline: Option<&BaselineEntry>,
+    enforced: bool,
+) -> RegressionRow {
+    let (baseline_ns, max_regression) = baseline
+        .map(|entry| (Some(entry.mean_ns), Some(entry.max_regression)))
+        .unwrap_or((None, None));
+    // `baseline_entries` validated a positive denominator before this point.
+    let ratio = measured_ns
+        .zip(baseline_ns)
+        .map(|(measured, baseline)| measured / baseline);
+    let status = match (enforced, measured_ns, baseline) {
+        (false, _, _) => "baseline-skipped",
+        (true, _, None) => "no-baseline",
+        (true, None, Some(_)) => "missing-measurement",
+        (true, Some(measured), Some(entry))
+            if measured <= entry.mean_ns * (1.0 + entry.max_regression) =>
+        {
+            "pass"
+        }
+        (true, Some(_), Some(_)) => "regressed",
+    };
+    RegressionRow {
+        id: id.to_owned(),
+        measured_ns,
+        baseline_ns,
+        ratio,
+        max_regression,
+        status,
+    }
+}
+
+fn should_enforce_baseline(
+    mode: GateMode,
+    configured_host: Option<&str>,
+    active_host: Option<&str>,
+    untrusted: bool,
+) -> bool {
+    baseline_skip_reason(mode, configured_host, active_host, untrusted).is_none()
+}
+
+fn baseline_skip_reason(
+    mode: GateMode,
+    configured_host: Option<&str>,
+    active_host: Option<&str>,
+    untrusted: bool,
+) -> Option<&'static str> {
+    match (configured_host, mode, active_host, untrusted) {
+        (None, _, _, _) => Some("no-baseline-file"),
+        (Some(_), GateMode::RatiosOnly, _, _) => Some("ratios-only"),
+        (Some(_), GateMode::Full, None, _) => Some("host-unset"),
+        (Some(configured), GateMode::Full, Some(active), _) if configured != active => {
+            Some("host-mismatch")
+        }
+        (Some(_), GateMode::Full, Some(_), true) => Some("untrusted-run"),
+        (Some(_), GateMode::Full, Some(_), false) => None,
     }
 }
 
@@ -304,6 +511,64 @@ struct RatioRow {
     status: &'static str,
 }
 
+#[derive(Serialize)]
+struct RegressionRow {
+    id: String,
+    measured_ns: Option<f64>,
+    baseline_ns: Option<f64>,
+    ratio: Option<f64>,
+    max_regression: Option<f64>,
+    status: &'static str,
+}
+
+fn benchmark_line(
+    mode: GateMode,
+    entry: &Entry,
+    measurement: Measurement,
+    row: &ReportRow,
+) -> String {
+    let note = if row.unstable {
+        " — UNSTABLE spread"
+    } else {
+        ""
+    };
+    match mode {
+        GateMode::RatiosOnly => format!(
+            "perf-gate: {}: mean {:.1} ns — absolute threshold skipped{note}",
+            entry.id, measurement.mean_ns
+        ),
+        GateMode::Full => format!(
+            "perf-gate: {}: mean {:.1} ns (target {:.1}, threshold {:.1}) — {}{note}",
+            entry.id,
+            measurement.mean_ns,
+            entry.target_ns,
+            entry.threshold_ns,
+            verdict_label(measurement.mean_ns, entry.target_ns, entry.threshold_ns)
+        ),
+    }
+}
+
+fn regression_line(row: &RegressionRow) -> Option<String> {
+    (row.status == "regressed").then(|| {
+        format!(
+            "perf-gate: {}: {:.1} ns / {:.1} ns baseline = x{:.3}, max x{:.3} — REGRESSED",
+            row.id,
+            row.measured_ns.unwrap_or_default(),
+            row.baseline_ns.unwrap_or_default(),
+            row.ratio.unwrap_or_default(),
+            1.0 + row.max_regression.unwrap_or_default(),
+        )
+    })
+}
+
+#[derive(Serialize)]
+struct BaselineReport {
+    configured_host: Option<BaselineHost>,
+    active_host: Option<String>,
+    enforced: bool,
+    skip_reason: Option<&'static str>,
+}
+
 /// What the machine looked like while measuring, so a suspect result can be
 /// diagnosed after the fact instead of re-litigated.
 #[derive(Serialize)]
@@ -332,7 +597,10 @@ impl RunContext {
 struct Report {
     rows: Vec<ReportRow>,
     ratios: Vec<RatioRow>,
+    regressions: Vec<RegressionRow>,
     passed: bool,
+    mode: GateMode,
+    baseline: BaselineReport,
     trust: Trust,
     policy: TrustPolicy,
     run: RunContext,
@@ -351,14 +619,33 @@ fn fail(msg: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [manifest_path, criterion_root, report_path, marker_path] = match args.as_slice() {
-        [a, b, c, d] => [a, b, c, d].map(PathBuf::from),
-        _ => {
-            return fail(
-                "usage: check_benchmark_thresholds <manifest.json> <criterion-root> <report.json> <freshness-marker>",
-            );
-        }
-    };
+    let (manifest_path, criterion_root, report_path, marker_path, baseline_path, mode) =
+        match parse_args(&args) {
+            Ok(Command::Run {
+                manifest_path,
+                criterion_root,
+                report_path,
+                marker_path,
+                baseline_path,
+                mode,
+            }) => (
+                manifest_path,
+                criterion_root,
+                report_path,
+                marker_path,
+                baseline_path,
+                mode,
+            ),
+            Ok(Command::Help) => {
+                println!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            Ok(Command::Version) => {
+                println!("check_benchmark_thresholds {}", env!("CARGO_PKG_VERSION"));
+                return ExitCode::SUCCESS;
+            }
+            Err(error) => return fail(&error),
+        };
     // Beside the report, not beside the manifest: it is generated output that
     // describes this host, never a checked-in expectation.
     let history_path = report_path.with_file_name("perf_gate_history.json");
@@ -378,6 +665,23 @@ fn main() -> ExitCode {
     if manifest.benchmarks.is_empty() {
         return fail("manifest lists no benchmarks");
     }
+
+    let baseline: Option<Baseline> = match baseline_path.as_ref() {
+        None => None,
+        Some(path) => match std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
+        {
+            Ok(baseline) => Some(baseline),
+            Err(error) => {
+                return fail(&format!("cannot read baseline {}: {error}", path.display()));
+            }
+        },
+    };
+    let baseline_by_id = match baseline.as_ref().map(baseline_entries).transpose() {
+        Ok(entries) => entries,
+        Err(error) => return fail(&format!("invalid baseline: {error}")),
+    };
 
     let marker_mtime = match std::fs::metadata(&marker_path).and_then(|m| m.modified()) {
         Ok(t) => t,
@@ -427,23 +731,11 @@ fn main() -> ExitCode {
             }
         };
         let previous_ns = previous.get(&entry.id).copied();
-        let row = evaluate(entry, measured, previous_ns, &manifest.trust);
+        let row = evaluate(entry, measured, previous_ns, &manifest.trust, mode);
 
         if let Some(m) = measured {
             current.insert(entry.id.clone(), m.mean_ns);
-            let note = if row.unstable {
-                " — UNSTABLE spread"
-            } else {
-                ""
-            };
-            println!(
-                "perf-gate: {}: mean {:.1} ns (target {:.1}, threshold {:.1}) — {}{note}",
-                entry.id,
-                m.mean_ns,
-                entry.target_ns,
-                entry.threshold_ns,
-                verdict_label(m.mean_ns, entry.target_ns, entry.threshold_ns)
-            );
+            println!("{}", benchmark_line(mode, entry, m, &row));
         }
         rows.push(row);
     }
@@ -465,13 +757,55 @@ fn main() -> ExitCode {
             ),
         }
     }
-    let passed = all_results_passed(&rows, &ratios);
     let trust = assess_trust(&current, &previous, &manifest.trust);
+
+    let active_host = std::env::var("TOLLGATE_PERF_HOST").ok();
+    let untrusted = matches!(trust, Trust::Untrusted { .. });
+    let baseline_enforced = should_enforce_baseline(
+        mode,
+        baseline.as_ref().map(|baseline| baseline.host.id.as_str()),
+        active_host.as_deref(),
+        untrusted,
+    );
+    let regressions: Vec<_> = manifest
+        .benchmarks
+        .iter()
+        .map(|entry| {
+            evaluate_regression(
+                &entry.id,
+                current.get(&entry.id).copied(),
+                baseline_by_id
+                    .as_ref()
+                    .and_then(|entries| entries.get(&entry.id).copied()),
+                baseline_enforced,
+            )
+        })
+        .collect();
+    for regression in &regressions {
+        if let Some(line) = regression_line(regression) {
+            eprintln!("{line}");
+        }
+    }
+    let passed = all_results_passed(&rows, &ratios, &regressions);
+    let skip_reason = baseline_skip_reason(
+        mode,
+        baseline.as_ref().map(|baseline| baseline.host.id.as_str()),
+        active_host.as_deref(),
+        untrusted,
+    );
 
     let report = Report {
         rows,
         ratios,
+        regressions,
         passed,
+        mode,
+        baseline: BaselineReport {
+            configured_host: baseline.as_ref().map(|baseline| baseline.host.clone()),
+            active_host,
+            enforced: baseline_enforced,
+            skip_reason,
+        },
         trust: trust.clone(),
         policy: manifest.trust,
         run: RunContext::capture(),
@@ -550,6 +884,10 @@ fn read_estimates(path: &Path, marker_mtime: SystemTime) -> Result<Measurement, 
 mod tests {
     use super::*;
 
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
     fn means(pairs: &[(&str, f64)]) -> BTreeMap<String, f64> {
         pairs
             .iter()
@@ -571,6 +909,312 @@ mod tests {
             ("admission/full_check_contended_8", 2684.0),
             ("admission/full_check_denied", 20.3),
         ])
+    }
+
+    #[test]
+    fn cli_handles_modes_baselines_help_version_and_separator() {
+        assert_eq!(parse_args(&strings(&["bad", "--help"])), Ok(Command::Help));
+        assert_eq!(parse_args(&strings(&["-V", "extra"])), Ok(Command::Version));
+        assert_eq!(
+            parse_args(&strings(&[
+                "--ratios-only",
+                "--baseline",
+                "baseline.json",
+                "manifest.json",
+                "criterion",
+                "report.json",
+                "marker"
+            ])),
+            Ok(Command::Run {
+                manifest_path: PathBuf::from("manifest.json"),
+                criterion_root: PathBuf::from("criterion"),
+                report_path: PathBuf::from("report.json"),
+                marker_path: PathBuf::from("marker"),
+                baseline_path: Some(PathBuf::from("baseline.json")),
+                mode: GateMode::RatiosOnly,
+            })
+        );
+        assert_eq!(
+            parse_args(&strings(&[
+                "--",
+                "--manifest",
+                "criterion",
+                "report.json",
+                "marker"
+            ])),
+            Ok(Command::Run {
+                manifest_path: PathBuf::from("--manifest"),
+                criterion_root: PathBuf::from("criterion"),
+                report_path: PathBuf::from("report.json"),
+                marker_path: PathBuf::from("marker"),
+                baseline_path: None,
+                mode: GateMode::Full,
+            })
+        );
+    }
+
+    #[test]
+    fn cli_rejects_duplicate_or_incomplete_options() {
+        assert_eq!(
+            parse_args(&strings(&["--ratios-only", "--ratios-only"])),
+            Err("--ratios-only may be specified only once".to_owned())
+        );
+        assert_eq!(
+            parse_args(&strings(&["--baseline"])),
+            Err("--baseline requires a path".to_owned())
+        );
+        assert_eq!(
+            parse_args(&strings(&[
+                "--baseline",
+                "first.json",
+                "--baseline",
+                "second.json",
+                "manifest.json",
+                "criterion",
+                "report.json",
+                "marker"
+            ])),
+            Err("--baseline may be specified only once".to_owned())
+        );
+        assert_eq!(
+            parse_args(&strings(&["--wat"])),
+            Err("unknown option: --wat".to_owned())
+        );
+        assert_eq!(parse_args(&[]), Err(USAGE.to_owned()));
+    }
+
+    #[test]
+    fn controlled_baseline_boundary_is_inclusive_and_defaults_to_five_percent() {
+        let baseline: BaselineEntry =
+            serde_json::from_str(r#"{"id":"admission/full_check","mean_ns":100.0}"#).unwrap();
+        assert_eq!(baseline.max_regression, 0.05);
+        let boundary = evaluate_regression(&baseline.id, Some(105.0), Some(&baseline), true);
+        assert_eq!(boundary.baseline_ns, Some(100.0));
+        assert_eq!(boundary.ratio, Some(1.05));
+        assert_eq!(boundary.max_regression, Some(0.05));
+        assert_eq!(boundary.status, "pass");
+        assert_eq!(
+            evaluate_regression(&baseline.id, Some(105.000_1), Some(&baseline), true).status,
+            "regressed"
+        );
+    }
+
+    #[test]
+    fn checked_in_baseline_is_a_valid_pre_change_subset_of_the_manifest() {
+        let manifest: Manifest =
+            serde_json::from_str(include_str!("../../../testing/perf_thresholds.json")).unwrap();
+        let baseline: Baseline =
+            serde_json::from_str(include_str!("../../../testing/perf_baseline.json")).unwrap();
+        let entries = baseline_entries(&baseline).unwrap();
+        let manifest_ids: std::collections::BTreeSet<_> =
+            manifest.benchmarks.iter().map(|entry| &entry.id).collect();
+
+        assert_eq!(baseline.host.id, "mistral-apple-m1-pro");
+        assert_eq!(entries.len(), 14);
+        assert!(
+            entries.keys().all(|id| manifest_ids.contains(id)),
+            "a baseline row must name a benchmark the gate still runs"
+        );
+        assert!(
+            entries.len() < manifest.benchmarks.len(),
+            "#90's new rows deliberately have no pre-change measurement"
+        );
+    }
+
+    #[test]
+    fn invalid_or_duplicate_baseline_rows_are_rejected() {
+        let parse = |benchmarks| Baseline {
+            host: BaselineHost {
+                id: "host".to_owned(),
+                architecture: "arch".to_owned(),
+                cpu: "cpu".to_owned(),
+                os: "os".to_owned(),
+                rustc: "rustc".to_owned(),
+            },
+            recorded_at: "time".to_owned(),
+            git_revision: "revision".to_owned(),
+            profile: "release".to_owned(),
+            benchmarks,
+        };
+        let entry = || BaselineEntry {
+            id: "a".to_owned(),
+            mean_ns: 100.0,
+            max_regression: 0.05,
+        };
+        assert!(baseline_entries(&parse(vec![entry()])).is_ok());
+        assert!(baseline_entries(&parse(vec![entry(), entry()])).is_err());
+
+        let mut missing_host = parse(vec![entry()]);
+        missing_host.host.id.clear();
+        assert!(baseline_entries(&missing_host).is_err());
+        let mut missing_recorded_at = parse(vec![entry()]);
+        missing_recorded_at.recorded_at.clear();
+        assert!(baseline_entries(&missing_recorded_at).is_err());
+        let mut missing_revision = parse(vec![entry()]);
+        missing_revision.git_revision.clear();
+        assert!(baseline_entries(&missing_revision).is_err());
+        let mut missing_profile = parse(vec![entry()]);
+        missing_profile.profile.clear();
+        assert!(baseline_entries(&missing_profile).is_err());
+        assert!(baseline_entries(&parse(Vec::new())).is_err());
+
+        let mut invalid = entry();
+        invalid.id.clear();
+        assert!(baseline_entries(&parse(vec![invalid])).is_err());
+        let mut invalid = entry();
+        invalid.mean_ns = 0.0;
+        assert!(baseline_entries(&parse(vec![invalid])).is_err());
+        let mut invalid = entry();
+        invalid.mean_ns = f64::NAN;
+        assert!(baseline_entries(&parse(vec![invalid])).is_err());
+        let mut invalid = entry();
+        invalid.max_regression = -0.01;
+        assert!(baseline_entries(&parse(vec![invalid])).is_err());
+        let mut invalid = entry();
+        invalid.max_regression = f64::INFINITY;
+        assert!(baseline_entries(&parse(vec![invalid])).is_err());
+
+        let mut zero_regression = entry();
+        zero_regression.max_regression = 0.0;
+        assert!(baseline_entries(&parse(vec![zero_regression])).is_ok());
+    }
+
+    #[test]
+    fn host_mismatch_untrusted_and_ratio_only_runs_skip_the_baseline() {
+        assert!(should_enforce_baseline(
+            GateMode::Full,
+            Some("controlled"),
+            Some("controlled"),
+            false
+        ));
+        assert!(!should_enforce_baseline(
+            GateMode::Full,
+            Some("controlled"),
+            Some("another-host"),
+            false
+        ));
+        assert!(!should_enforce_baseline(
+            GateMode::Full,
+            Some("controlled"),
+            Some("controlled"),
+            true
+        ));
+        assert!(!should_enforce_baseline(
+            GateMode::RatiosOnly,
+            Some("controlled"),
+            Some("controlled"),
+            false
+        ));
+
+        let entry = BaselineEntry {
+            id: "a".to_owned(),
+            mean_ns: 100.0,
+            max_regression: 0.05,
+        };
+        assert_eq!(
+            evaluate_regression("a", Some(1_000.0), Some(&entry), false).status,
+            "baseline-skipped"
+        );
+        assert_eq!(
+            baseline_skip_reason(GateMode::Full, None, Some("controlled"), false),
+            Some("no-baseline-file")
+        );
+        assert_eq!(
+            baseline_skip_reason(
+                GateMode::RatiosOnly,
+                Some("controlled"),
+                Some("controlled"),
+                false
+            ),
+            Some("ratios-only")
+        );
+        assert_eq!(
+            baseline_skip_reason(GateMode::Full, Some("controlled"), None, false),
+            Some("host-unset")
+        );
+        assert_eq!(
+            baseline_skip_reason(
+                GateMode::Full,
+                Some("controlled"),
+                Some("another-host"),
+                false
+            ),
+            Some("host-mismatch")
+        );
+        assert_eq!(
+            baseline_skip_reason(GateMode::Full, Some("controlled"), Some("controlled"), true),
+            Some("untrusted-run")
+        );
+        assert_eq!(
+            baseline_skip_reason(
+                GateMode::Full,
+                Some("controlled"),
+                Some("controlled"),
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn human_lines_distinguish_gate_modes_instability_and_regressions() {
+        let policy = TrustPolicy::default();
+        let measurement = Measurement {
+            mean_ns: 120.0,
+            ci_width: Some(0.01),
+        };
+        let stable = evaluate(&entry(), Some(measurement), None, &policy, GateMode::Full);
+        let full = benchmark_line(GateMode::Full, &entry(), measurement, &stable);
+        let ratios = benchmark_line(GateMode::RatiosOnly, &entry(), measurement, &stable);
+        assert!(full.contains("target 110.0, threshold 250.0"));
+        assert!(!full.contains("absolute threshold skipped"));
+        assert!(ratios.contains("absolute threshold skipped"));
+
+        let unstable_measurement = Measurement {
+            mean_ns: 120.0,
+            ci_width: Some(0.50),
+        };
+        let unstable = evaluate(
+            &entry(),
+            Some(unstable_measurement),
+            None,
+            &policy,
+            GateMode::Full,
+        );
+        assert!(
+            benchmark_line(GateMode::Full, &entry(), unstable_measurement, &unstable)
+                .contains("UNSTABLE spread")
+        );
+
+        let baseline = BaselineEntry {
+            id: entry().id,
+            mean_ns: 100.0,
+            max_regression: 0.05,
+        };
+        let passing = evaluate_regression(&baseline.id, Some(104.0), Some(&baseline), true);
+        let regressed = evaluate_regression(&baseline.id, Some(106.0), Some(&baseline), true);
+        assert!(regression_line(&passing).is_none());
+        assert!(regression_line(&regressed).unwrap().contains("REGRESSED"));
+    }
+
+    #[test]
+    fn ratio_only_mode_still_requires_fresh_rows_but_ignores_absolute_bounds() {
+        let policy = TrustPolicy::default();
+        assert_eq!(
+            evaluate(
+                &entry(),
+                measured(9_999.0, None),
+                None,
+                &policy,
+                GateMode::RatiosOnly
+            )
+            .status,
+            "pass"
+        );
+        assert_eq!(
+            evaluate(&entry(), None, None, &policy, GateMode::RatiosOnly).status,
+            "missing-or-stale"
+        );
     }
 
     /// !40, reproduced: every `tollgate-core` benchmark inflated ~2.6x while
@@ -754,8 +1398,26 @@ mod tests {
         ));
 
         // Exactly the interval-width tolerance: not "unstable".
-        assert!(!evaluate(&entry(), measured(120.0, Some(0.10)), None, &policy).unstable);
-        assert!(evaluate(&entry(), measured(120.0, Some(0.11)), None, &policy).unstable);
+        assert!(
+            !evaluate(
+                &entry(),
+                measured(120.0, Some(0.10)),
+                None,
+                &policy,
+                GateMode::Full
+            )
+            .unstable
+        );
+        assert!(
+            evaluate(
+                &entry(),
+                measured(120.0, Some(0.11)),
+                None,
+                &policy,
+                GateMode::Full
+            )
+            .unstable
+        );
     }
 
     /// One bad row is enough to fail the run, and only "pass" counts as good
@@ -763,9 +1425,21 @@ mod tests {
     #[test]
     fn the_run_passes_only_when_every_row_did() {
         let policy = TrustPolicy::default();
-        let good = evaluate(&entry(), measured(120.0, None), None, &policy);
-        let slow = evaluate(&entry(), measured(9_999.0, None), None, &policy);
-        let absent = evaluate(&entry(), None, None, &policy);
+        let good = evaluate(
+            &entry(),
+            measured(120.0, None),
+            None,
+            &policy,
+            GateMode::Full,
+        );
+        let slow = evaluate(
+            &entry(),
+            measured(9_999.0, None),
+            None,
+            &policy,
+            GateMode::Full,
+        );
+        let absent = evaluate(&entry(), None, None, &policy, GateMode::Full);
 
         assert!(all_passed(std::slice::from_ref(&good)));
         assert!(!all_passed(&[good, slow]));
@@ -817,8 +1491,20 @@ mod tests {
     #[test]
     fn absolute_and_ratio_verdicts_must_both_pass() {
         let policy = TrustPolicy::default();
-        let passing_row = evaluate(&entry(), measured(120.0, None), None, &policy);
-        let failing_row = evaluate(&entry(), measured(9_999.0, None), None, &policy);
+        let passing_row = evaluate(
+            &entry(),
+            measured(120.0, None),
+            None,
+            &policy,
+            GateMode::Full,
+        );
+        let failing_row = evaluate(
+            &entry(),
+            measured(9_999.0, None),
+            None,
+            &policy,
+            GateMode::Full,
+        );
         let ratio = |status| RatioRow {
             numerator: "contended".to_string(),
             denominator: "uncontended".to_string(),
@@ -828,11 +1514,40 @@ mod tests {
             max_ratio: 3.0,
             status,
         };
+        let regression = |status| RegressionRow {
+            id: "admission/full_check".to_owned(),
+            measured_ns: Some(120.0),
+            baseline_ns: Some(100.0),
+            ratio: Some(1.2),
+            max_regression: Some(0.05),
+            status,
+        };
 
-        assert!(all_results_passed(&[passing_row], &[ratio("pass")]));
-        let passing_row = evaluate(&entry(), measured(120.0, None), None, &policy);
-        assert!(!all_results_passed(&[failing_row], &[ratio("pass")]));
-        assert!(!all_results_passed(&[passing_row], &[ratio("over-ratio")]));
+        assert!(all_results_passed(&[passing_row], &[ratio("pass")], &[]));
+        let passing_row = evaluate(
+            &entry(),
+            measured(120.0, None),
+            None,
+            &policy,
+            GateMode::Full,
+        );
+        assert!(!all_results_passed(&[failing_row], &[ratio("pass")], &[]));
+        assert!(!all_results_passed(
+            &[passing_row],
+            &[ratio("over-ratio")],
+            &[]
+        ));
+        assert!(!all_results_passed(
+            &[evaluate(
+                &entry(),
+                measured(120.0, None),
+                None,
+                &policy,
+                GateMode::Full,
+            )],
+            &[ratio("pass")],
+            &[regression("regressed")]
+        ));
     }
 
     fn entry() -> Entry {
@@ -853,15 +1568,29 @@ mod tests {
     fn the_threshold_is_the_failing_bound_and_includes_its_own_value() {
         let policy = TrustPolicy::default();
         assert_eq!(
-            evaluate(&entry(), measured(250.0, None), None, &policy).status,
+            evaluate(
+                &entry(),
+                measured(250.0, None),
+                None,
+                &policy,
+                GateMode::Full
+            )
+            .status,
             "pass"
         );
         assert_eq!(
-            evaluate(&entry(), measured(250.1, None), None, &policy).status,
+            evaluate(
+                &entry(),
+                measured(250.1, None),
+                None,
+                &policy,
+                GateMode::Full
+            )
+            .status,
             "over-threshold"
         );
         assert_eq!(
-            evaluate(&entry(), None, None, &policy).status,
+            evaluate(&entry(), None, None, &policy, GateMode::Full).status,
             "missing-or-stale"
         );
     }
@@ -871,7 +1600,13 @@ mod tests {
     #[test]
     fn the_target_colours_the_reading_but_never_the_verdict() {
         let policy = TrustPolicy::default();
-        let over_target = evaluate(&entry(), measured(200.0, None), None, &policy);
+        let over_target = evaluate(
+            &entry(),
+            measured(200.0, None),
+            None,
+            &policy,
+            GateMode::Full,
+        );
         assert_eq!(over_target.status, "pass", "aspiration is not a bound");
 
         assert_eq!(verdict_label(100.0, 110.0, 250.0), "within target");
@@ -908,14 +1643,32 @@ mod tests {
     #[test]
     fn a_wide_interval_marks_a_row_unstable_without_failing_it() {
         let policy = TrustPolicy::default();
-        let wobbly = evaluate(&entry(), measured(120.0, Some(0.5)), None, &policy);
+        let wobbly = evaluate(
+            &entry(),
+            measured(120.0, Some(0.5)),
+            None,
+            &policy,
+            GateMode::Full,
+        );
         assert!(wobbly.unstable);
         assert_eq!(wobbly.status, "pass");
 
-        let steady = evaluate(&entry(), measured(120.0, Some(0.01)), None, &policy);
+        let steady = evaluate(
+            &entry(),
+            measured(120.0, Some(0.01)),
+            None,
+            &policy,
+            GateMode::Full,
+        );
         assert!(!steady.unstable);
 
-        let unknown = evaluate(&entry(), measured(120.0, None), None, &policy);
+        let unknown = evaluate(
+            &entry(),
+            measured(120.0, None),
+            None,
+            &policy,
+            GateMode::Full,
+        );
         assert!(
             !unknown.unstable,
             "a missing interval is unknown, not unstable"
