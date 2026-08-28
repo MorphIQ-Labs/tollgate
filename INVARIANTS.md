@@ -568,6 +568,45 @@ until it has one.
     `cached_principal_still_observes_snapshot_revocation` (pricing-api, the
     wiring).
 
+24. **Steady-state embedding admission allocates nothing it owns and performs
+    exactly one snapshot lookup.** After the measuring thread has initialised
+    dependency-owned thread-local state and the bounded usage queue has a
+    reusable block, cached authentication through usage-slot reservation,
+    admission, commit or cancellation, and usage recording performs no heap
+    allocation or reallocation attributable to Tollgate. Every admission
+    invokes `SnapshotMap::get_at` exactly once and never calls `get`
+    separately; an implementation may still satisfy `get_at` through the
+    trait's compatibility default. Body decoding or later execution must
+    consume the evidence that lookup produced rather than retrieve policy
+    again.
+
+    This is an enforcement-ladder rung 3 convention because it spans four
+    crates and neither Rust's type system nor any one owning component can
+    express process allocation or map-call cardinality. A test-only global
+    allocator scopes counts to the current thread, while a forwarding map
+    decorator counts the observable lookup calls. Cold first-touch allocation
+    by dependencies, Tokio queue-block acquisition, caller-owned request
+    buffers, and the consumer executor's job object are not hidden: the gate
+    reports them under separate attribution lines. Moka and governor's
+    internal monotonic reads likewise do not become policy time; snapshot and
+    lease decisions continue to use the caller's `Timestamp`.
+
+    *Tests:* `a_box_inside_the_scope_is_counted`,
+    `alloc_zeroed_and_realloc_are_both_visible`,
+    `a_pure_scope_is_zero_and_outside_work_is_excluded`,
+    `another_threads_allocations_are_excluded`, and
+    `nested_scopes_compose_and_panics_restore_the_depth`, and
+    `report_rows_are_appended_as_valid_json_lines`
+    (`tollgate-alloc-count`); `core_hot_path_allocates_nothing` (core);
+    `a_cached_credential_allocates_nothing` (auth);
+    `admission_allocates_nothing_on_the_arc_swap_default`,
+    `moka_reads_are_allocation_free_after_current_thread_warmup`, and
+    `admit_consults_the_map_exactly_once` (admission); and
+    `embedding_path_allocates_nothing_after_warmup` (client). The required
+    `allocation-assertions` CI job runs them through
+    `scripts/check_allocations.sh` and proves the counter crate has no normal
+    reverse dependency from a release binary.
+
 Ledger roles (context for 1 and 7): leases **bound** spend; usage events **are**
 the billing record; reconciliation compares the two and steady-state drift is
 zero. Per account, exactly:

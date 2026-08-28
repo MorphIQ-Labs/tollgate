@@ -8,7 +8,7 @@ Tollgate provides credential verification, quota admission, and usage accounting
 
 The system has two strictly separated planes:
 
-- The request path (`tollgate-core` and `tollgate-admission`) performs no I/O, takes no locks, and reads no clock. Callers pass `jiff` timestamps explicitly. Its pipeline is `SnapshotMap` lookup (arc-swap or moka), `AccountSnapshot` status/permissions, direct-indexed `CostTable` quote, weighted `governor` token, lease debit, then `Reservation`.
+- The request path (`tollgate-core` and `tollgate-admission`) performs no I/O, takes no blocking locks, and reads no wall/business clock for policy decisions. Callers pass `jiff` timestamps explicitly. Moka maintenance and governor's bucket arithmetic read their own monotonic clocks; those are measured mechanism costs, never sources of snapshot or lease truth. Its pipeline is `SnapshotMap` lookup (arc-swap or moka), `AccountSnapshot` status/permissions, direct-indexed `CostTable` quote, weighted `governor` token, lease debit, then `Reservation`.
 - The control plane (`tollgate-client`, `tollgate-server`, and a store backend) handles leases, snapshot distribution, usage ingestion, and expiry reclamation in background tasks.
 
 `INVARIANTS.md` is the testable contract; `docs/DESIGN.md` records architecture and rationale. Read both before behavioral changes. Violating an invariant is a defect even if tests pass, and a new invariant must name its enforcing test.
@@ -35,6 +35,7 @@ TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
 
 ./scripts/check_perf_thresholds.sh
 ./scripts/check_load_thresholds.sh
+./scripts/check_allocations.sh
 cargo run -p pricing-api
 cargo run -p tollgate-server
 ```
@@ -49,7 +50,7 @@ CI uses `check`, `test`, `assurance`, and `release`: format, Clippy, title conve
 - Leases bound spend; usage events are billing truth. Backends must enforce `deposited + overage recorded == balance + active grants + settled usage + loss`. Overage is a funding term, not a bucket: an elastic admission moves it and settled usage together in one transaction, or the equation reports corruption on a correct ledger.
 - Leases are usable only through `expires_at - safety_margin`; allocation reclaims them only after `expires_at + grace`. Validate timing configuration before starting tasks or debiting balances. Readiness remains continuous across snapshot freshness, usable leases, and background-task health.
 - Keep standards documents current-state only; put discovery history in `docs/DESIGN.md`. Crates remain unpublished and are distributed deliberately by Git tag.
-- **Performance**: the request path is the hot path, and its budget is structural — no I/O, no locks, no clock reads. That is what makes the rest defensible: `SnapshotMap` lookup through arc-swap/moka, direct-indexed `CostTable` quoting that must stay O(1) in the cost table's size, a weighted token, a lease debit, a `Reservation`. A scan where an index belongs, or an allocation per admission, is a defect rather than a slow path. `./scripts/check_perf_thresholds.sh` and `./scripts/check_load_thresholds.sh` are the gates, and the `production` profile (fat LTO, `panic=abort`) is what the load gate measures. Absolute-latency thresholds are calibrated on a controlled host and meaningful only there; overhead ratios are portable, so compare like for like, and a threshold change lands with measured evidence and a deliberate manifest update.
+- **Performance**: the request path is the hot path, and its budget is structural — no I/O, no blocking locks, and no wall/business-clock reads for policy decisions. Moka and governor's internal monotonic reads are explicit measured costs, not an excuse to read time for admission truth. That is what makes the rest defensible: `SnapshotMap` lookup through arc-swap/moka, direct-indexed `CostTable` quoting that must stay O(1) in the cost table's size, a weighted token, a lease debit, a `Reservation`. A scan where an index belongs, or an allocation per admission, is a defect rather than a slow path. `./scripts/check_perf_thresholds.sh`, `./scripts/check_load_thresholds.sh`, and `./scripts/check_allocations.sh` are the gates, and the `production` profile (fat LTO, `panic=abort`) is what the load gate measures. Absolute-latency thresholds are calibrated on a controlled host and meaningful only there; overhead ratios are portable, so compare like for like, and a threshold change lands with measured evidence and a deliberate manifest update.
 
 ## Compatibility, Migrations, and Operations
 

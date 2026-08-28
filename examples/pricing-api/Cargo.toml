@@ -36,3 +36,9 @@ path = "src/main.rs"
 [[bin]]
 name = "load_gate"
 path = "src/bin/load_gate.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+let_underscore_must_use = "allow"

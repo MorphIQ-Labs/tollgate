@@ -30,6 +30,8 @@ tokio = { workspace = true, features = ["test-util"] }
 # Event capture: the tests assert that a failure is reported, so the events
 # are behavior rather than decoration. Subscribers stay out of the library.
 tracing-subscriber = { workspace = true }
+tollgate-alloc-count = { workspace = true }
+tollgate-auth = { path = "../tollgate-auth", version = "=0.8.3" }
 uuid = { version = "1", features = ["v4"] }
 
 [features]

@@ -19,6 +19,7 @@ jiff = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
+tollgate-alloc-count = { workspace = true }
 
 [[bench]]
 name = "admission_hot_path"

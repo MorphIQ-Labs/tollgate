@@ -12,6 +12,12 @@ publish.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+let_underscore_must_use = "allow"
+
 [[bin]]
 name = "check_benchmark_thresholds"
 path = "src/main.rs"

@@ -23,6 +23,7 @@ subtle = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 sha2 = { workspace = true }
+tollgate-alloc-count = { workspace = true }
 
 [[bench]]
 name = "credential_verification"

@@ -2386,7 +2386,16 @@ dependencies = [
  "jiff",
  "moka",
  "proptest",
+ "tollgate-alloc-count",
  "tollgate-core",
+]
+
+[[package]]
+name = "tollgate-alloc-count"
+version = "0.8.3"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2399,6 +2408,7 @@ dependencies = [
  "jiff",
  "sha2",
  "subtle",
+ "tollgate-alloc-count",
  "tollgate-core",
  "zeroize",
 ]
@@ -2415,6 +2425,8 @@ dependencies = [
  "reqwest",
  "tokio",
  "tollgate-admission",
+ "tollgate-alloc-count",
+ "tollgate-auth",
  "tollgate-core",
  "tollgate-store",
  "tracing",
@@ -2431,6 +2443,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "tollgate-alloc-count",
 ]
 
 [[package]]
