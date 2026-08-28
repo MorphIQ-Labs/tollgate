@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.8.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.8.2...v0.8.3) - 2026-08-28
+
+### Other
+
+- *(design)* #96 fix the staged admission interface shape
+
 ## [0.8.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.8.1...v0.8.2) - 2026-08-25
 
 ### Fixed
