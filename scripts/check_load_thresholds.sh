@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Loopback load gate: pricing-api with admission on vs off, under the
 # production profile (fat LTO, codegen-units 1 — the deployed configuration).
-# Absolute numbers gate on a controlled host; the sequential and configured
-# same-account-concurrency overhead ratios are portable like-for-like.
+# Absolute latency and throughput gate on a controlled host; the sequential
+# and configured same-account-concurrency overhead ratios are portable only
+# like-for-like and remain shared-runner evidence under #49.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

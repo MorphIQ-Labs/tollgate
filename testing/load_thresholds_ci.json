@@ -1,10 +1,12 @@
 {
-  "_comment": "Automated, non-gating shared-CI evidence for examples/pricing-api. Workload and ratio ceilings intentionally match load_thresholds.json. Absolute p50/p99 ceilings are explicitly disabled because shared-runner latency is not calibrated; evidence mode records ratio misses without failing the job, while null values are reported as disabled rather than treated as passing measurements.",
+  "_comment": "Automated, non-gating shared-CI evidence for examples/pricing-api. Workload and ratio ceilings intentionally match load_thresholds.json. Absolute p50/p99 ceilings and throughput floors are explicitly disabled because shared-runner performance is not calibrated; evidence mode records ratio misses without failing the job, while null values are reported as disabled rather than treated as passing measurements.",
   "warmup_requests": 1000,
   "measured_requests": 5000,
   "concurrent_connections": 10,
   "max_p50_overhead_ratio": 1.15,
   "max_concurrent_p50_overhead_ratio": 1.2,
   "max_p50_ns": null,
-  "max_p99_ns": null
+  "max_p99_ns": null,
+  "min_throughput_requests_per_second": null,
+  "min_concurrent_throughput_requests_per_second": null
 }

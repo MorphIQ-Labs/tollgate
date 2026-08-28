@@ -3,9 +3,9 @@
 #
 # The image tag matches rust-toolchain.toml; keep them in lockstep so rustup
 # never downloads a second toolchain inside CI. Criterion and absolute-latency
-# thresholds stay on a controlled host; shared CI compiles every benchmark and
-# records the load test's like-for-like sequential and contended ratios as
-# non-gating evidence.
+# thresholds stay on a controlled host; shared CI blocks on portable Criterion
+# ratios and records the load test's like-for-like sequential and contended
+# ratios as non-gating evidence.
 #
 # Every job carries `dependencies: []`. No job consumes another job's artifacts,
 # and left implicit GitLab makes each later-stage job download every
@@ -337,6 +337,29 @@ perf-thresholds:
     paths:
       - reports/perf_gate_report.json
 
+# Same-run Criterion ratios are portable and required. Run after the two
+# CPU-heavy assurance jobs so this pipeline does not contaminate its own
+# denominator; absolute thresholds and the recorded host baseline are
+# explicitly skipped by the mode rather than weakened for shared hardware.
+perf-ratios:
+  dependencies: []
+  extends: .main-merge-request
+  stage: assurance
+  interruptible: true
+  timeout: 45 minutes
+  cache: *cargo-build-cache
+  needs:
+    - job: mutation
+      artifacts: false
+    - job: formal
+      artifacts: false
+  script:
+    - ./scripts/check_perf_thresholds.sh --ratios-only
+  artifacts:
+    when: always
+    paths:
+      - reports/perf_ratio_gate_report.json
+
 load-thresholds:
   dependencies: []
   extends: .main-merge-request
@@ -348,9 +371,7 @@ load-thresholds:
   # measures paired latencies on the same group-runner host, so wait for both
   # instead of letting our own pipeline contaminate its denominator/numerator.
   needs:
-    - job: mutation
-      artifacts: false
-    - job: formal
+    - job: perf-ratios
       artifacts: false
   script:
     # The CI manifest explicitly disables host-dependent absolute ceilings;

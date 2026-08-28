@@ -1,0 +1,28 @@
+{
+  "host": {
+    "id": "mistral-apple-m1-pro",
+    "architecture": "aarch64-apple-darwin",
+    "cpu": "Apple M1 Pro (10 logical CPUs)",
+    "os": "macOS 26.6.2 (Darwin 25.6.0)",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+  },
+  "recorded_at": "2026-08-28T17:47:14Z",
+  "git_revision": "c5276af872206a9bc42abc73bbbcf5ee4204c252",
+  "profile": "criterion release",
+  "benchmarks": [
+    { "id": "cost_table/quote", "mean_ns": 1.644683181381798 },
+    { "id": "snapshot/admit", "mean_ns": 1.1141647525192535 },
+    { "id": "lease/reserve_commit", "mean_ns": 42.556500009403855 },
+    { "id": "lease/reserve_cancel", "mean_ns": 43.1188167614307 },
+    { "id": "admission/snapshot_lookup_arc_swap", "mean_ns": 13.92596089091371, "max_regression": 0.10 },
+    { "id": "admission/snapshot_lookup_moka", "mean_ns": 69.50818215782044, "max_regression": 0.10 },
+    { "id": "admission/full_check", "mean_ns": 102.337526216979 },
+    { "id": "admission/full_check_contended_8", "mean_ns": 3172.120738407224 },
+    { "id": "admission/full_check_sharded", "mean_ns": 135.09470225601694 },
+    { "id": "admission/full_check_contended_8_sharded", "mean_ns": 759.8504259996355 },
+    { "id": "admission/full_check_denied", "mean_ns": 14.97831796602542 },
+    { "id": "admission/full_check_lease_exhausted_strict", "mean_ns": 43.96753303089814 },
+    { "id": "admission/full_check_lease_exhausted_elastic", "mean_ns": 113.8393179503188 },
+    { "id": "credential/verify_cached", "mean_ns": 15.775386827416485 }
+  ]
+}

@@ -8,8 +8,9 @@
 //! nearly every deployment runs — and their `_sharded` counterparts repeat
 //! them under the opt-in eight-shard layout, so the manifest gates the
 //! default and prices the option separately rather than confusing the two.
-//! `full_check_denied` measures the refusal path, which none of the others
-//! take.
+//! The `distinct_accounts` pair separates account-local contention from the
+//! engine-global counter line that #99 will remove. `full_check_denied`
+//! measures the refusal path, which none of the others take.
 
 use std::hint::black_box;
 use std::num::NonZeroUsize;
@@ -65,20 +66,40 @@ fn snapshot() -> Arc<AccountSnapshot> {
     })
 }
 
+/// The sustained contention fixture keeps the weighted-token mechanism in
+/// the measured path, but quotes one unit so it cannot consume governor's
+/// maximum bucket faster than its one-nanosecond replenishment quantum on a
+/// fast CI host. The regular single-thread and refusal fixtures retain their
+/// original 114-unit quote, preserving their recorded baseline.
+fn contention_snapshot() -> Arc<AccountSnapshot> {
+    Arc::new(AccountSnapshot {
+        cost_table: Arc::new(
+            CostTable::builder(CostUnits(1), CostUnits(1))
+                .weight(&PriceOp, CostUnits(0))
+                .build(),
+        ),
+        ..(*snapshot()).clone()
+    })
+}
+
 /// The same snapshot under a named account, so a benchmark can put N
 /// principals across N accounts rather than all under `AccountId(1)`.
 fn snapshot_for_account(account: u128) -> Arc<AccountSnapshot> {
     Arc::new(AccountSnapshot {
         account_id: AccountId(account),
-        ..(*snapshot()).clone()
+        ..(*contention_snapshot()).clone()
     })
 }
 
 fn big_lease(sharding: LocalSharding) -> Arc<LocalLease> {
+    big_lease_for(AccountId(1), sharding)
+}
+
+fn big_lease_for(account_id: AccountId, sharding: LocalSharding) -> Arc<LocalLease> {
     Arc::new(LocalLease::with_sharding(
         LeaseGrant {
-            lease_id: LeaseId(7),
-            account_id: AccountId(1),
+            lease_id: LeaseId(account_id.0 + 7),
+            account_id,
             fencing_token: FencingToken(1),
             units: CostUnits(u64::MAX / 2),
             expires_at: far_future(),
@@ -118,6 +139,33 @@ fn populate(map: &impl SnapshotMap) {
     }
 }
 
+fn populate_contention(map: &impl SnapshotMap) {
+    let sharding = map.local_sharding();
+    for i in 0..512u128 {
+        let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
+        slot.install(big_lease(sharding));
+        map.install_publishable(
+            Principal(i),
+            PublishableSnapshot::try_new(contention_snapshot()).unwrap(),
+            slot,
+        );
+    }
+}
+
+fn populate_distinct(map: &impl SnapshotMap) {
+    let sharding = map.local_sharding();
+    for i in 0..512u128 {
+        let account_id = AccountId(i + 1);
+        let slot = LeaseSlot::with_sharding(account_id, sharding);
+        slot.install(big_lease_for(account_id, sharding));
+        map.install_publishable(
+            Principal(i),
+            PublishableSnapshot::try_new(snapshot_for_account(account_id.0)).unwrap(),
+            slot,
+        );
+    }
+}
+
 fn bench_lookup(c: &mut Criterion) {
     let mut group = c.benchmark_group("admission");
     let principal = Principal(97);
@@ -140,6 +188,18 @@ fn bench_lookup(c: &mut Criterion) {
 fn engine(sharding: LocalSharding) -> AdmissionEngine<ArcSwapSnapshotMap> {
     let engine = AdmissionEngine::new(ArcSwapSnapshotMap::with_sharding(sharding));
     populate(engine.map());
+    engine
+}
+
+fn distinct_engine(sharding: LocalSharding) -> AdmissionEngine<ArcSwapSnapshotMap> {
+    let engine = AdmissionEngine::new(ArcSwapSnapshotMap::with_sharding(sharding));
+    populate_distinct(engine.map());
+    engine
+}
+
+fn contention_engine(sharding: LocalSharding) -> AdmissionEngine<ArcSwapSnapshotMap> {
+    let engine = AdmissionEngine::new(ArcSwapSnapshotMap::with_sharding(sharding));
+    populate_contention(engine.map());
     engine
 }
 
@@ -183,17 +243,21 @@ impl Drop for Contended {
     }
 }
 
-fn contended_engine(sharding: LocalSharding) -> Contended {
+fn spawn_contenders(
+    engine: AdmissionEngine<ArcSwapSnapshotMap>,
+    principals: impl IntoIterator<Item = Principal>,
+) -> Contended {
     let now = Timestamp::from_second(1_755_600_000).unwrap();
-    let engine = Arc::new(engine(sharding));
+    let engine = Arc::new(engine);
     let stop = Arc::new(AtomicBool::new(false));
-    let workers = (0..7)
-        .map(|_| {
+    let workers = principals
+        .into_iter()
+        .map(|principal| {
             let engine = Arc::clone(&engine);
             let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    admit_once(&engine, Principal(97), now);
+                    admit_once(&engine, principal, now);
                 }
             })
         })
@@ -203,6 +267,20 @@ fn contended_engine(sharding: LocalSharding) -> Contended {
         stop,
         workers,
     }
+}
+
+fn contended_engine(sharding: LocalSharding) -> Contended {
+    spawn_contenders(
+        contention_engine(sharding),
+        std::iter::repeat_n(Principal(97), 7),
+    )
+}
+
+fn distinct_account_contended_engine(sharding: LocalSharding) -> Contended {
+    // Principal 0 is reserved for the measured foreground request. The seven
+    // background workers each hit a different account, so any shared line or
+    // lock here is engine-global rather than account-local.
+    spawn_contenders(distinct_engine(sharding), (1..=7).map(Principal))
 }
 
 fn bench_full_check(c: &mut Criterion) {
@@ -241,6 +319,22 @@ fn bench_full_check(c: &mut Criterion) {
         let contended = contended_engine(sharded);
         group.bench_function("full_check_contended_8_sharded", |b| {
             b.iter(|| admit_once(contended.engine(), black_box(Principal(97)), now))
+        });
+    }
+
+    // Eight simultaneous requests spread across eight accounts. The current
+    // engine-global AdmissionCounters still bounce one cache line here; #99
+    // moves them behind the map and must improve this preserved baseline.
+    {
+        let contended = distinct_account_contended_engine(LocalSharding::SINGLE);
+        group.bench_function("full_check_contended_8_distinct_accounts", |b| {
+            b.iter(|| admit_once(contended.engine(), black_box(Principal(0)), now))
+        });
+    }
+    {
+        let contended = distinct_account_contended_engine(sharded);
+        group.bench_function("full_check_contended_8_distinct_accounts_sharded", |b| {
+            b.iter(|| admit_once(contended.engine(), black_box(Principal(0)), now))
         });
     }
 

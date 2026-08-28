@@ -2,8 +2,9 @@
 # Runs the hot-path microbenchmarks and gates them against
 # testing/perf_thresholds.json.
 #
-# Absolute-latency gating belongs on a controlled host; on shared CI this
-# script's role is limited to proving the benches and the checker still run.
+# Absolute-latency and recorded-baseline gating belong on a controlled host.
+# `--ratios-only` is the required shared-CI mode: every fresh measurement must
+# exist, while only same-run ratios decide the performance verdict.
 # Mirrors ferro-risk's gate: stale Criterion output is wiped first and a
 # freshness marker rejects anything the current run did not produce.
 set -euo pipefail
@@ -13,11 +14,21 @@ cd "$(dirname "$0")/.."
 CRITERION_ROOT="target/criterion"
 MARKER="target/.perf-gate-fresh-run"
 REPORT="reports/perf_gate_report.json"
+gate_args=(--baseline testing/perf_baseline.json)
+if [ "${1:-}" = "--ratios-only" ]; then
+    REPORT="reports/perf_ratio_gate_report.json"
+    gate_args=(--ratios-only "${gate_args[@]}")
+    shift
+fi
+if [ "$#" -ne 0 ]; then
+    printf 'usage: %s [--ratios-only]\n' "$0" >&2
+    exit 2
+fi
 
 # Wipe only the groups this gate owns, so unrelated criterion output (if any)
 # cannot satisfy the checker.
 rm -rf "$CRITERION_ROOT/cost_table" "$CRITERION_ROOT/snapshot" "$CRITERION_ROOT/lease" \
-       "$CRITERION_ROOT/admission" "$CRITERION_ROOT/credential" \
+       "$CRITERION_ROOT/reservation" "$CRITERION_ROOT/admission" "$CRITERION_ROOT/credential" \
        "$CRITERION_ROOT/credential_digest"
 mkdir -p "$(dirname "$MARKER")"
 touch "$MARKER"
@@ -43,4 +54,4 @@ load_average() {
 
 TOLLGATE_GATE_LOAD="$(load_average)" \
     exec cargo run --locked -p tollgate-perf-gate --bin check_benchmark_thresholds -- \
-    testing/perf_thresholds.json "$CRITERION_ROOT" "$REPORT" "$MARKER"
+    "${gate_args[@]}" testing/perf_thresholds.json "$CRITERION_ROOT" "$REPORT" "$MARKER"

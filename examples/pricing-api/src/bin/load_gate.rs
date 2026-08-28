@@ -7,10 +7,10 @@
 //!
 //! Each client is a raw blocking `TcpStream` speaking minimal HTTP/1.1, so the
 //! measurement mirrors ferro-risk's persistent-loopback gate and adds no
-//! client-library noise. Percentiles are computed over the measured requests
-//! only (warmup excluded). Absolute numbers gate on the controlled host; each
-//! admitted-vs-baseline ratio is the meaningful figure everywhere when the
-//! configured connection count is held constant.
+//! client-library noise. Percentiles and aggregate throughput are computed
+//! over the measured requests only (warmup excluded). Absolute latency and
+//! throughput gate on the controlled host; each admitted-vs-baseline ratio is
+//! meaningful only when the configured connection count is held constant.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -43,6 +43,13 @@ struct Thresholds {
     max_p50_ns: Option<f64>,
     #[serde(deserialize_with = "deserialize_required_option")]
     max_p99_ns: Option<f64>,
+    /// Controlled-host admitted throughput floors (requests/second). These
+    /// are explicit `null` in shared CI for the same reason as the absolute
+    /// latency ceilings: scheduler and CPU ownership are not controlled.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    min_throughput_requests_per_second: Option<f64>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    min_concurrent_throughput_requests_per_second: Option<f64>,
 }
 
 fn deserialize_required_option<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
@@ -94,6 +101,25 @@ impl Thresholds {
                 return Err("max_p50_ns and max_p99_ns must both be set or both be null".to_owned());
             }
         }
+        match (
+            self.min_throughput_requests_per_second,
+            self.min_concurrent_throughput_requests_per_second,
+        ) {
+            (Some(sequential), Some(concurrent)) => {
+                for (name, value) in [
+                    ("min_throughput_requests_per_second", sequential),
+                    ("min_concurrent_throughput_requests_per_second", concurrent),
+                ] {
+                    if !value.is_finite() || value <= 0.0 {
+                        return Err(format!("{name} must be finite and positive"));
+                    }
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err("both throughput floors must be set or both must be null".to_owned());
+            }
+        }
         Ok(connections)
     }
 }
@@ -105,6 +131,22 @@ struct Percentiles {
     p99_ns: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ScenarioMeasurement {
+    latency: Percentiles,
+    throughput_requests_per_second: f64,
+}
+
+#[derive(Serialize)]
+struct ThroughputReport {
+    baseline_requests_per_second: f64,
+    admitted_requests_per_second: f64,
+    min_admitted_requests_per_second: Option<f64>,
+    /// `None` means the selected manifest deliberately disabled the
+    /// controlled-host throughput floor.
+    passed: Option<bool>,
+}
+
 #[derive(Serialize)]
 struct ConcurrentReport {
     connections: usize,
@@ -112,6 +154,7 @@ struct ConcurrentReport {
     admitted: Percentiles,
     p50_overhead_ratio: f64,
     max_p50_overhead_ratio: f64,
+    throughput: ThroughputReport,
     passed: bool,
 }
 
@@ -132,6 +175,7 @@ struct Report {
     p50_overhead_ratio: f64,
     sequential_passed: bool,
     absolute_latency: AbsoluteLatencyReport,
+    throughput: ThroughputReport,
     concurrent_same_account: ConcurrentReport,
     passed: bool,
     run: RunContext,
@@ -288,13 +332,14 @@ fn percentile(sorted: &[u64], q: f64) -> f64 {
     sorted[index] as f64
 }
 
-/// Run one scenario in-process; returns latency percentiles.
+/// Run one scenario in-process; returns latency percentiles and aggregate
+/// measured-window throughput.
 async fn run_scenario(
     admission: bool,
     connections: NonZeroUsize,
     warmup: usize,
     measured: usize,
-) -> Result<Percentiles, String> {
+) -> Result<ScenarioMeasurement, String> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|error| format!("bind load-gate server: {error}"))?;
@@ -332,7 +377,8 @@ async fn run_scenario(
     runtime.shutdown().await;
     server_result?;
 
-    let mut sorted = samples?;
+    let measured_samples = samples?;
+    let mut sorted = measured_samples.samples;
     if sorted.len() != measured {
         return Err(format!(
             "load-gate collected {} samples, expected {measured}",
@@ -340,11 +386,19 @@ async fn run_scenario(
         ));
     }
     sorted.sort_unstable();
-    Ok(Percentiles {
-        p50_ns: percentile(&sorted, 0.50),
-        p95_ns: percentile(&sorted, 0.95),
-        p99_ns: percentile(&sorted, 0.99),
+    Ok(ScenarioMeasurement {
+        latency: Percentiles {
+            p50_ns: percentile(&sorted, 0.50),
+            p95_ns: percentile(&sorted, 0.95),
+            p99_ns: percentile(&sorted, 0.99),
+        },
+        throughput_requests_per_second: measured_samples.throughput_requests_per_second,
     })
+}
+
+struct MeasuredSamples {
+    samples: Vec<u64>,
+    throughput_requests_per_second: f64,
 }
 
 async fn run_clients(
@@ -353,7 +407,7 @@ async fn run_clients(
     connections: NonZeroUsize,
     warmup: usize,
     measured: usize,
-) -> Result<Vec<u64>, String> {
+) -> Result<MeasuredSamples, String> {
     let warmup_work = distribute_requests(warmup, connections);
     let measured_work = distribute_requests(measured, connections);
     let gate = MeasurementGate::new();
@@ -377,6 +431,7 @@ async fn run_clients(
         ready += 1;
     }
     let all_ready = ready == connections.get();
+    let measured_started = Instant::now();
     gate.release(all_ready);
 
     let mut samples = Vec::with_capacity(measured);
@@ -387,6 +442,7 @@ async fn run_clients(
             Err(error) => client_errors.push(format!("load-gate client task failed: {error}")),
         }
     }
+    let measured_elapsed = measured_started.elapsed();
 
     let client_error = client_errors.into_iter().next();
     if !all_ready {
@@ -400,7 +456,18 @@ async fn run_clients(
     if let Some(error) = client_error {
         return Err(error);
     }
-    Ok(samples)
+    let throughput_requests_per_second = throughput_for_window(
+        samples.len(),
+        measured_elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
+    );
+    Ok(MeasuredSamples {
+        samples,
+        throughput_requests_per_second,
+    })
+}
+
+fn throughput_for_window(requests: usize, elapsed_seconds: f64) -> f64 {
+    (requests as f64) / elapsed_seconds
 }
 
 fn run_client(
@@ -517,21 +584,36 @@ fn absolute_latency_passed(thresholds: &Thresholds, admitted: Percentiles) -> Op
         })
 }
 
+fn throughput_passed(minimum: Option<f64>, measured: f64) -> Option<bool> {
+    minimum.map(|minimum| measured >= minimum)
+}
+
 fn sequential_passed(
     thresholds: &Thresholds,
-    baseline: Percentiles,
-    admitted: Percentiles,
+    baseline: ScenarioMeasurement,
+    admitted: ScenarioMeasurement,
 ) -> bool {
-    p50_overhead_ratio(baseline, admitted) <= thresholds.max_p50_overhead_ratio
-        && absolute_latency_passed(thresholds, admitted).unwrap_or(true)
+    p50_overhead_ratio(baseline.latency, admitted.latency) <= thresholds.max_p50_overhead_ratio
+        && absolute_latency_passed(thresholds, admitted.latency).unwrap_or(true)
+        && throughput_passed(
+            thresholds.min_throughput_requests_per_second,
+            admitted.throughput_requests_per_second,
+        )
+        .unwrap_or(true)
 }
 
 fn concurrent_passed(
     thresholds: &Thresholds,
-    baseline: Percentiles,
-    admitted: Percentiles,
+    baseline: ScenarioMeasurement,
+    admitted: ScenarioMeasurement,
 ) -> bool {
-    p50_overhead_ratio(baseline, admitted) <= thresholds.max_concurrent_p50_overhead_ratio
+    p50_overhead_ratio(baseline.latency, admitted.latency)
+        <= thresholds.max_concurrent_p50_overhead_ratio
+        && throughput_passed(
+            thresholds.min_concurrent_throughput_requests_per_second,
+            admitted.throughput_requests_per_second,
+        )
+        .unwrap_or(true)
 }
 
 fn all_scenarios_passed(sequential: bool, concurrent: bool) -> bool {
@@ -640,17 +722,26 @@ async fn main() -> ExitCode {
         }
     };
 
-    let ratio = p50_overhead_ratio(baseline, admitted);
-    let concurrent_ratio = p50_overhead_ratio(concurrent_baseline, concurrent_admitted);
-    let absolute_latency_passed = absolute_latency_passed(&thresholds, admitted);
+    let ratio = p50_overhead_ratio(baseline.latency, admitted.latency);
+    let concurrent_ratio =
+        p50_overhead_ratio(concurrent_baseline.latency, concurrent_admitted.latency);
+    let absolute_latency_passed = absolute_latency_passed(&thresholds, admitted.latency);
+    let sequential_throughput_passed = throughput_passed(
+        thresholds.min_throughput_requests_per_second,
+        admitted.throughput_requests_per_second,
+    );
+    let concurrent_throughput_passed = throughput_passed(
+        thresholds.min_concurrent_throughput_requests_per_second,
+        concurrent_admitted.throughput_requests_per_second,
+    );
     let sequential_passed = sequential_passed(&thresholds, baseline, admitted);
     let concurrent_passed =
         concurrent_passed(&thresholds, concurrent_baseline, concurrent_admitted);
     let passed = all_scenarios_passed(sequential_passed, concurrent_passed);
 
     let report = Report {
-        baseline,
-        admitted,
+        baseline: baseline.latency,
+        admitted: admitted.latency,
         p50_overhead_ratio: ratio,
         sequential_passed,
         absolute_latency: AbsoluteLatencyReport {
@@ -658,12 +749,25 @@ async fn main() -> ExitCode {
             max_p99_ns: thresholds.max_p99_ns,
             passed: absolute_latency_passed,
         },
+        throughput: ThroughputReport {
+            baseline_requests_per_second: baseline.throughput_requests_per_second,
+            admitted_requests_per_second: admitted.throughput_requests_per_second,
+            min_admitted_requests_per_second: thresholds.min_throughput_requests_per_second,
+            passed: sequential_throughput_passed,
+        },
         concurrent_same_account: ConcurrentReport {
             connections: concurrent_connections.get(),
-            baseline: concurrent_baseline,
-            admitted: concurrent_admitted,
+            baseline: concurrent_baseline.latency,
+            admitted: concurrent_admitted.latency,
             p50_overhead_ratio: concurrent_ratio,
             max_p50_overhead_ratio: thresholds.max_concurrent_p50_overhead_ratio,
+            throughput: ThroughputReport {
+                baseline_requests_per_second: concurrent_baseline.throughput_requests_per_second,
+                admitted_requests_per_second: concurrent_admitted.throughput_requests_per_second,
+                min_admitted_requests_per_second: thresholds
+                    .min_concurrent_throughput_requests_per_second,
+                passed: concurrent_throughput_passed,
+            },
             passed: concurrent_passed,
         },
         passed,
@@ -671,22 +775,42 @@ async fn main() -> ExitCode {
     };
     println!(
         "load-gate sequential: baseline p50 {:.1}us p99 {:.1}us | admitted p50 {:.1}us p99 {:.1}us | overhead x{:.3} (max x{:.3})",
-        baseline.p50_ns / 1_000.0,
-        baseline.p99_ns / 1_000.0,
-        admitted.p50_ns / 1_000.0,
-        admitted.p99_ns / 1_000.0,
+        baseline.latency.p50_ns / 1_000.0,
+        baseline.latency.p99_ns / 1_000.0,
+        admitted.latency.p50_ns / 1_000.0,
+        admitted.latency.p99_ns / 1_000.0,
         ratio,
         thresholds.max_p50_overhead_ratio,
     );
     println!(
+        "load-gate sequential throughput: baseline {:.0} req/s | admitted {:.0} req/s | floor {}",
+        baseline.throughput_requests_per_second,
+        admitted.throughput_requests_per_second,
+        thresholds.min_throughput_requests_per_second.map_or_else(
+            || "disabled".to_owned(),
+            |floor| format!("{floor:.0} req/s")
+        ),
+    );
+    println!(
         "load-gate concurrent same-account ({} connections): baseline p50 {:.1}us p99 {:.1}us | admitted p50 {:.1}us p99 {:.1}us | overhead x{:.3} (max x{:.3})",
         concurrent_connections,
-        concurrent_baseline.p50_ns / 1_000.0,
-        concurrent_baseline.p99_ns / 1_000.0,
-        concurrent_admitted.p50_ns / 1_000.0,
-        concurrent_admitted.p99_ns / 1_000.0,
+        concurrent_baseline.latency.p50_ns / 1_000.0,
+        concurrent_baseline.latency.p99_ns / 1_000.0,
+        concurrent_admitted.latency.p50_ns / 1_000.0,
+        concurrent_admitted.latency.p99_ns / 1_000.0,
         concurrent_ratio,
         thresholds.max_concurrent_p50_overhead_ratio,
+    );
+    println!(
+        "load-gate concurrent throughput: baseline {:.0} req/s | admitted {:.0} req/s | floor {}",
+        concurrent_baseline.throughput_requests_per_second,
+        concurrent_admitted.throughput_requests_per_second,
+        thresholds
+            .min_concurrent_throughput_requests_per_second
+            .map_or_else(
+                || "disabled".to_owned(),
+                |floor| format!("{floor:.0} req/s")
+            ),
     );
     if let Some(parent) = report_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -734,6 +858,8 @@ mod tests {
             max_concurrent_p50_overhead_ratio: 1.5,
             max_p50_ns: Some(200.0),
             max_p99_ns: Some(300.0),
+            min_throughput_requests_per_second: Some(1_000.0),
+            min_concurrent_throughput_requests_per_second: Some(2_000.0),
         }
     }
 
@@ -742,6 +868,26 @@ mod tests {
             p50_ns,
             p95_ns: p50_ns,
             p99_ns,
+        }
+    }
+
+    fn measurement(
+        p50_ns: f64,
+        p99_ns: f64,
+        throughput_requests_per_second: f64,
+    ) -> ScenarioMeasurement {
+        ScenarioMeasurement {
+            latency: timings(p50_ns, p99_ns),
+            throughput_requests_per_second,
+        }
+    }
+
+    fn throughput_report() -> ThroughputReport {
+        ThroughputReport {
+            baseline_requests_per_second: 1_000.0,
+            admitted_requests_per_second: 1_100.0,
+            min_admitted_requests_per_second: None,
+            passed: None,
         }
     }
 
@@ -871,6 +1017,14 @@ mod tests {
         let mut thresholds = valid_thresholds();
         thresholds.max_p99_ns = Some(f64::INFINITY);
         assert!(thresholds.validate().is_err());
+
+        let mut thresholds = valid_thresholds();
+        thresholds.min_throughput_requests_per_second = Some(0.0);
+        assert!(thresholds.validate().is_err());
+
+        let mut thresholds = valid_thresholds();
+        thresholds.min_concurrent_throughput_requests_per_second = Some(f64::NAN);
+        assert!(thresholds.validate().is_err());
     }
 
     #[test]
@@ -885,6 +1039,12 @@ mod tests {
 
         thresholds.max_p50_ns = None;
         assert_eq!(thresholds.validate().unwrap().get(), 4);
+
+        let mut thresholds = valid_thresholds();
+        thresholds.min_throughput_requests_per_second = None;
+        assert!(thresholds.validate().is_err());
+        thresholds.min_concurrent_throughput_requests_per_second = None;
+        assert_eq!(thresholds.validate().unwrap().get(), 4);
     }
 
     #[test]
@@ -896,8 +1056,16 @@ mod tests {
 
         assert!(local.max_p50_ns.is_some());
         assert!(local.max_p99_ns.is_some());
+        assert!(local.min_throughput_requests_per_second.is_some());
+        assert!(
+            local
+                .min_concurrent_throughput_requests_per_second
+                .is_some()
+        );
         assert!(ci.max_p50_ns.is_none());
         assert!(ci.max_p99_ns.is_none());
+        assert!(ci.min_throughput_requests_per_second.is_none());
+        assert!(ci.min_concurrent_throughput_requests_per_second.is_none());
         assert_eq!(local.warmup_requests, ci.warmup_requests);
         assert_eq!(local.measured_requests, ci.measured_requests);
         assert_eq!(local.concurrent_connections, ci.concurrent_connections);
@@ -910,9 +1078,17 @@ mod tests {
         assert!(ci.validate().is_ok());
 
         let missing_p50 = ci_json.replace("  \"max_p50_ns\": null,\n", "");
-        let missing_p99 = ci_json.replace("  \"max_p99_ns\": null\n", "");
+        let missing_p99 = ci_json.replace("  \"max_p99_ns\": null,\n", "");
+        let missing_throughput =
+            ci_json.replace("  \"min_throughput_requests_per_second\": null,\n", "");
+        let missing_concurrent_throughput = ci_json.replace(
+            "  \"min_concurrent_throughput_requests_per_second\": null\n",
+            "",
+        );
         assert!(serde_json::from_str::<Thresholds>(&missing_p50).is_err());
         assert!(serde_json::from_str::<Thresholds>(&missing_p99).is_err());
+        assert!(serde_json::from_str::<Thresholds>(&missing_throughput).is_err());
+        assert!(serde_json::from_str::<Thresholds>(&missing_concurrent_throughput).is_err());
     }
 
     #[test]
@@ -935,36 +1111,49 @@ mod tests {
     }
 
     #[test]
+    fn throughput_divides_completed_requests_by_the_measured_window() {
+        assert_eq!(throughput_for_window(100, 2.0), 50.0);
+        assert_eq!(throughput_for_window(1, 0.5), 2.0);
+    }
+
+    #[test]
     fn sequential_verdict_checks_ratio_and_both_absolute_ceilings() {
         let thresholds = valid_thresholds();
         assert!(sequential_passed(
             &thresholds,
-            timings(100.0, 100.0),
-            timings(120.0, 300.0)
+            measurement(100.0, 100.0, 1_500.0),
+            measurement(120.0, 300.0, 1_000.0)
         ));
         assert!(!sequential_passed(
             &thresholds,
-            timings(100.0, 100.0),
-            timings(121.0, 100.0)
+            measurement(100.0, 100.0, 1_500.0),
+            measurement(121.0, 100.0, 1_000.0)
         ));
         assert!(!sequential_passed(
             &thresholds,
-            timings(200.0, 100.0),
-            timings(201.0, 100.0)
+            measurement(200.0, 100.0, 1_500.0),
+            measurement(201.0, 100.0, 1_000.0)
         ));
         assert!(!sequential_passed(
             &thresholds,
-            timings(100.0, 100.0),
-            timings(100.0, 301.0)
+            measurement(100.0, 100.0, 1_500.0),
+            measurement(100.0, 301.0, 1_000.0)
+        ));
+        assert!(!sequential_passed(
+            &thresholds,
+            measurement(100.0, 100.0, 1_500.0),
+            measurement(100.0, 100.0, 999.0)
         ));
     }
 
     #[test]
-    fn ratio_only_verdict_disables_only_absolute_latency() {
+    fn shared_evidence_disables_absolute_latency_and_throughput_only() {
         let mut thresholds = valid_thresholds();
         thresholds.max_p50_ns = None;
         thresholds.max_p99_ns = None;
-        let baseline = timings(1_000.0, 1_000.0);
+        thresholds.min_throughput_requests_per_second = None;
+        thresholds.min_concurrent_throughput_requests_per_second = None;
+        let baseline = measurement(1_000.0, 1_000.0, 1.0);
 
         assert_eq!(
             absolute_latency_passed(&thresholds, timings(1_000_000.0, 2_000_000.0)),
@@ -973,12 +1162,12 @@ mod tests {
         assert!(sequential_passed(
             &thresholds,
             baseline,
-            timings(1_200.0, 2_000_000.0)
+            measurement(1_200.0, 2_000_000.0, 1.0)
         ));
         assert!(!sequential_passed(
             &thresholds,
             baseline,
-            timings(1_201.0, 1_201.0)
+            measurement(1_201.0, 1_201.0, 1.0)
         ));
     }
 
@@ -991,13 +1180,18 @@ mod tests {
         );
         assert!(concurrent_passed(
             &thresholds,
-            timings(100.0, 100.0),
-            timings(150.0, 100.0)
+            measurement(100.0, 100.0, 3_000.0),
+            measurement(150.0, 100.0, 2_000.0)
         ));
         assert!(!concurrent_passed(
             &thresholds,
-            timings(100.0, 100.0),
-            timings(151.0, 100.0)
+            measurement(100.0, 100.0, 3_000.0),
+            measurement(151.0, 100.0, 2_000.0)
+        ));
+        assert!(!concurrent_passed(
+            &thresholds,
+            measurement(100.0, 100.0, 3_000.0),
+            measurement(100.0, 100.0, 1_999.0)
         ));
     }
 
@@ -1010,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn report_keeps_sequential_fields_and_adds_concurrent_ratio() {
+    fn report_keeps_sequential_fields_and_adds_concurrency_and_throughput() {
         let report = Report {
             baseline: timings(10.0, 20.0),
             admitted: timings(11.0, 21.0),
@@ -1021,12 +1215,14 @@ mod tests {
                 max_p99_ns: None,
                 passed: None,
             },
+            throughput: throughput_report(),
             concurrent_same_account: ConcurrentReport {
                 connections: 4,
                 baseline: timings(20.0, 30.0),
                 admitted: timings(24.0, 34.0),
                 p50_overhead_ratio: 1.2,
                 max_p50_overhead_ratio: 1.5,
+                throughput: throughput_report(),
                 passed: true,
             },
             passed: true,
@@ -1043,6 +1239,7 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(json["absolute_latency"]["passed"], serde_json::Value::Null);
+        assert_eq!(json["throughput"]["admitted_requests_per_second"], 1_100.0);
         assert_eq!(json["concurrent_same_account"]["connections"], 4);
         assert_eq!(json["concurrent_same_account"]["p50_overhead_ratio"], 1.2);
         assert_eq!(json["passed"], true);
@@ -1053,9 +1250,10 @@ mod tests {
         let connections = NonZeroUsize::new(2).unwrap();
         for admission in [false, true] {
             let result = run_scenario(admission, connections, 4, 8).await.unwrap();
-            assert!(result.p50_ns > 0.0);
-            assert!(result.p50_ns <= result.p95_ns);
-            assert!(result.p95_ns <= result.p99_ns);
+            assert!(result.latency.p50_ns > 0.0);
+            assert!(result.latency.p50_ns <= result.latency.p95_ns);
+            assert!(result.latency.p95_ns <= result.latency.p99_ns);
+            assert!(result.throughput_requests_per_second > 0.0);
         }
     }
 
