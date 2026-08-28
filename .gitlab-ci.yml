@@ -216,6 +216,24 @@ test:
   script:
     - cargo test --locked --workspace --all-features
 
+# Scoped allocation counts and the one-lookup witness are deterministic on a
+# shared runner. Keep this separate from Criterion: allocation is a structural
+# contract, while latency needs controlled-host calibration.
+allocation-assertions:
+  dependencies: []
+  extends: .merge-request
+  stage: test
+  interruptible: true
+  cache: *cargo-build-cache
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends jq ripgrep
+  script:
+    - ./scripts/check_allocations.sh
+  artifacts:
+    when: always
+    paths:
+      - reports/allocation_report.json
+
 # The service library remains backend-generic when the binary's optional
 # Postgres backend is disabled. The tree check makes that architecture claim
 # executable; the test run covers the complete workspace in that feature mode.
