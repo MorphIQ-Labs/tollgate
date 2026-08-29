@@ -7,6 +7,13 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.8.4](https://github.com/MorphIQ-Labs/tollgate/compare/v0.8.3...v0.8.4) - 2026-08-28
+
+### Other
+
+- *(gates)* #90 establish embedding regression gates
+- *(gates)* #90 add allocation and structural assertions
+
 ## [0.8.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.8.2...v0.8.3) - 2026-08-28
 
 ### Other
