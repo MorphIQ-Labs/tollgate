@@ -23,9 +23,9 @@ use tollgate_client::{
     SnapshotManagerConfig, SystemClock, TrackedPrincipals, UsageWriter, UsageWriterConfig,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, EnforcementMode,
-    FencingToken, Generation, KeyId, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits,
-    Principal, PublishableSnapshot, RequestId, ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, FencingToken,
+    Generation, KeyId, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, Principal,
+    PublishableSnapshot, RequestId, ResolvedLimits,
 };
 use tollgate_store::wire::API_PREFIX;
 use tollgate_store::{
@@ -66,25 +66,23 @@ impl OpIndex for PriceOp {
 }
 
 fn snapshot() -> Arc<AccountSnapshot> {
-    Arc::new(AccountSnapshot {
-        account_id: ACCOUNT,
-        key_id: Some(KeyId((1u128 << 127) | 2)),
-        generation: Generation(1),
-        status: AccountStatus::Active,
-        enforcement_mode: EnforcementMode::Strict,
-        valid_until: Timestamp::from_second(4_102_444_800).unwrap(),
-        permissions: PermissionBits::bit(0),
-        limits: ResolvedLimits {
-            max_items_per_request: 64,
-            rate_units_per_second: u64::from(u32::MAX),
-            rate_burst_units: u64::from(u32::MAX),
-        },
-        cost_table: Arc::new(
-            CostTable::builder(CostUnits(50), CostUnits(50))
-                .weight(&PriceOp, CostUnits(1))
-                .build(),
-        ),
-    })
+    Arc::new(
+        AccountSnapshot::builder(
+            ACCOUNT,
+            Generation(1),
+            AccountStatus::Active,
+            Timestamp::from_second(4_102_444_800).unwrap(),
+            PermissionBits::bit(0),
+            ResolvedLimits::new(64).with_weighted_rate(u64::from(u32::MAX), u64::from(u32::MAX)),
+            Arc::new(
+                CostTable::builder(CostUnits(50), CostUnits(50))
+                    .weight(&PriceOp, CostUnits(1))
+                    .build(),
+            ),
+        )
+        .key_id(KeyId((1u128 << 127) | 2))
+        .build(),
+    )
 }
 
 fn publishable(snapshot: Arc<AccountSnapshot>) -> PublishableSnapshot {
@@ -97,7 +95,7 @@ async fn http_store_rejects_invalid_snapshot_from_legacy_server() {
     use axum::routing::get;
 
     let mut invalid = (*snapshot()).clone();
-    invalid.limits.rate_burst_units = 113;
+    invalid.limits = ResolvedLimits::new(64).with_weighted_rate(u64::from(u32::MAX), 113);
     let invalid = Arc::new(invalid);
     let app = axum::Router::new().route(
         &format!("{API_PREFIX}/snapshots/{{principal}}"),

@@ -651,7 +651,6 @@ mod tests {
     use std::hash::BuildHasher;
     use std::num::NonZeroUsize;
 
-    use tollgate_core::EnforcementMode;
     use tollgate_core::{
         AccountId, AccountStatus, CostTable, CostUnits, OpIndex, PermissionBits, ResolvedLimits,
     };
@@ -776,21 +775,18 @@ mod tests {
     }
 
     fn snapshot(generation: u64) -> Arc<AccountSnapshot> {
-        Arc::new(AccountSnapshot {
-            account_id: AccountId(1),
-            key_id: None,
-            generation: Generation(generation),
-            status: AccountStatus::Active,
-            enforcement_mode: EnforcementMode::Strict,
-            valid_until: t(10_000),
-            permissions: PermissionBits::ALL,
-            limits: ResolvedLimits {
-                max_items_per_request: 100,
-                rate_units_per_second: 1_000,
-                rate_burst_units: 5_000,
-            },
-            cost_table: Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
-        })
+        Arc::new(
+            AccountSnapshot::builder(
+                AccountId(1),
+                Generation(generation),
+                AccountStatus::Active,
+                t(10_000),
+                PermissionBits::ALL,
+                ResolvedLimits::new(100).with_weighted_rate(1_000, 5_000),
+                Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+            )
+            .build(),
+        )
     }
 
     #[derive(Default)]
@@ -1103,19 +1099,14 @@ mod tests {
         assert_eq!(align_of::<AccountSnapshot>(), 128);
         let sharding = LocalSharding::new(NonZeroUsize::new(8).unwrap());
         let map = ArcSwapSnapshotMap::with_sharding(sharding);
-        let priced = Arc::new(AccountSnapshot {
-            limits: ResolvedLimits {
-                max_items_per_request: 1,
-                rate_units_per_second: 8,
-                rate_burst_units: 800,
-            },
-            cost_table: Arc::new(
-                CostTable::builder(CostUnits(100), CostUnits(100))
-                    .weight(&PricedOp, CostUnits::ZERO)
-                    .build(),
-            ),
-            ..(*snapshot(1)).clone()
-        });
+        let mut priced = (*snapshot(1)).clone();
+        priced.limits = ResolvedLimits::new(1).with_weighted_rate(8, 800);
+        priced.cost_table = Arc::new(
+            CostTable::builder(CostUnits(100), CostUnits(100))
+                .weight(&PricedOp, CostUnits::ZERO)
+                .build(),
+        );
+        let priced = Arc::new(priced);
         let publishable = PublishableSnapshot::try_new(priced).unwrap();
         map.install_publishable(
             Principal(1),
@@ -1324,10 +1315,9 @@ mod tests {
     /// A snapshot for a named account, so a test can build the many-account
     /// workload the single-account `snapshot()` fixture cannot express.
     fn snapshot_for(account: u128, generation: u64) -> Arc<AccountSnapshot> {
-        Arc::new(AccountSnapshot {
-            account_id: AccountId(account),
-            ..(*snapshot(generation)).clone()
-        })
+        let mut snapshot = (*snapshot(generation)).clone();
+        snapshot.account_id = AccountId(account);
+        Arc::new(snapshot)
     }
 
     /// Issue #8 moved the dead-entry sweep off the per-lookup path, so the
@@ -1447,14 +1437,9 @@ mod tests {
             let map = ArcSwapSnapshotMap::new();
             // A larger burst, so which generation won is observable: the
             // rate alone is not, without waiting for the bucket to refill.
-            let faster = Arc::new(AccountSnapshot {
-                limits: ResolvedLimits {
-                    max_items_per_request: 100,
-                    rate_units_per_second: 1_000,
-                    rate_burst_units: 9_000,
-                },
-                ..(*snapshot(5)).clone()
-            });
+            let mut faster = (*snapshot(5)).clone();
+            faster.limits = ResolvedLimits::new(100).with_weighted_rate(1_000, 9_000);
+            let faster = Arc::new(faster);
             let mut updates = vec![
                 SnapshotUpdate::Present {
                     principal: Principal(1),
@@ -1549,7 +1534,7 @@ mod tests {
         let before_update = second.limiter.current();
 
         let mut changed = (*snapshot(3)).clone();
-        changed.limits.rate_units_per_second = 2_000;
+        changed.limits = ResolvedLimits::new(100).with_weighted_rate(2_000, 5_000);
         map.install(p, Arc::new(changed), LeaseSlot::for_account(AccountId(1)));
         let third = match map.get(&p).unwrap() {
             MapEntry::Present(s) => s,
@@ -1578,7 +1563,7 @@ mod tests {
         };
 
         let mut changed = (*snapshot(2)).clone();
-        changed.limits.rate_units_per_second = 2_000;
+        changed.limits = ResolvedLimits::new(100).with_weighted_rate(2_000, 5_000);
         map.install(
             Principal(1),
             Arc::new(changed),
@@ -1600,7 +1585,7 @@ mod tests {
     fn stale_snapshot_cannot_roll_back_shared_limiter() {
         let map = ArcSwapSnapshotMap::new();
         let mut current = (*snapshot(5)).clone();
-        current.limits.rate_units_per_second = 2_000;
+        current.limits = ResolvedLimits::new(100).with_weighted_rate(2_000, 5_000);
         map.install(
             Principal(1),
             Arc::new(current),

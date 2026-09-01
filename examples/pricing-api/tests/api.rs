@@ -297,14 +297,14 @@ async fn an_elastic_account_serves_past_its_deposit_and_bills_the_overage() {
     );
 
     let mut ok = 0;
-    let mut payment_required = 0;
+    let mut capacity_unavailable = 0;
     for _ in 0..40 {
         let (status, body) = call(&router, Some(DEMO_API_KEY), price_body(1)).await;
         match status {
             StatusCode::OK => ok += 1,
-            StatusCode::PAYMENT_REQUIRED => {
+            StatusCode::SERVICE_UNAVAILABLE => {
                 assert_eq!(body["code"], "overage-cap-exhausted");
-                payment_required += 1;
+                capacity_unavailable += 1;
             }
             other => panic!("unexpected status {other}: {body}"),
         }
@@ -316,8 +316,8 @@ async fn an_elastic_account_serves_past_its_deposit_and_bills_the_overage() {
     // credit.
     assert!(ok > 3, "elastic must serve past the deposit, admitted {ok}");
     assert!(
-        payment_required > 0,
-        "the cap must eventually refuse, and terminally"
+        capacity_unavailable > 0,
+        "the cap must eventually refuse when no refill is available"
     );
 
     let after = metrics(&router).await;
@@ -333,7 +333,7 @@ async fn an_elastic_account_serves_past_its_deposit_and_bills_the_overage() {
     assert!(after["overage_spent"].as_u64().unwrap() <= CAP);
     assert_eq!(
         after["denials"]["overage_cap_exhausted"],
-        json!(payment_required)
+        json!(capacity_unavailable)
     );
 
     let store = runtime.store.clone();

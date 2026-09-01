@@ -22,8 +22,8 @@ use tollgate_client::{
     SlotRegistry, SnapshotManager, SnapshotManagerConfig, SystemClock, TrackedPrincipals,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, Generation,
-    OpIndex, PermissionBits, Principal, PublishableSnapshot,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, Generation, OpIndex,
+    PermissionBits, Principal, PublishableSnapshot,
 };
 use tollgate_store::{GrantPolicy, MemoryStore};
 
@@ -79,21 +79,16 @@ fn source(principals: usize) -> Arc<MemoryStore> {
             .build(),
     );
     for index in 0..principals as u128 {
-        let snapshot = AccountSnapshot {
-            account_id: AccountId(index),
-            key_id: None,
-            generation: Generation(1),
-            status: AccountStatus::Active,
-            enforcement_mode: EnforcementMode::Strict,
-            valid_until: far_future(),
-            permissions: PermissionBits::bit(0),
-            limits: tollgate_core::ResolvedLimits {
-                max_items_per_request: 64,
-                rate_units_per_second: 1_000_000,
-                rate_burst_units: 1_000_000,
-            },
-            cost_table: Arc::clone(&cost_table),
-        };
+        let snapshot = AccountSnapshot::builder(
+            AccountId(index),
+            Generation(1),
+            AccountStatus::Active,
+            far_future(),
+            PermissionBits::bit(0),
+            tollgate_core::ResolvedLimits::new(64).with_weighted_rate(1_000_000, 1_000_000),
+            Arc::clone(&cost_table),
+        )
+        .build();
         store.publish_snapshot(
             Principal(index),
             PublishableSnapshot::try_new(Arc::new(snapshot)).expect("fixture snapshot is valid"),

@@ -10,7 +10,7 @@
 //! release or usage from being attributed to a different lease
 //! (INVARIANTS.md #1, #4).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use jiff::Timestamp;
@@ -38,12 +38,15 @@ pub struct LeaseGrant {
 /// An account's unfunded spend on this instance, under
 /// [`EnforcementMode::Elastic`].
 ///
-/// One atomic counter, shaped exactly like [`LocalLease`]'s: a CAS loop, no
-/// lock, no I/O, no clock. It answers a different question, though. A lease
-/// counts *down* through units someone already paid for; this counts *up*
-/// through units nobody has. The ledger settles the difference by treating
-/// overage as a second funding term, so per-account conservation still closes
-/// exactly (INVARIANTS.md #1).
+/// Three atomic counters, with the total shaped exactly like [`LocalLease`]'s:
+/// a CAS loop, no lock, no I/O, no clock. A lease counts *down* through units
+/// someone already paid for; `spent` counts *up* through units nobody has.
+/// `committed` distinguishes durable spend from pending reservations that can
+/// still be refunded. `commit_publications` closes the otherwise torn
+/// reservation-phase/occupancy transition, so a cap refusal never advertises
+/// irrevocable units as refundable. The ledger settles the difference by
+/// treating overage as a second funding term, so per-account conservation
+/// still closes exactly (INVARIANTS.md #1, #3).
 ///
 /// **The cap is a parameter, not a field.** It arrives from the snapshot the
 /// request has already read, which means two things: a republished cap takes
@@ -65,6 +68,43 @@ pub struct LeaseGrant {
 pub struct AccountOverage {
     account_id: AccountId,
     spent: AtomicU64,
+    committed: AtomicU64,
+    commit_publications: AtomicUsize,
+}
+
+/// Evidence that an overage commit publication is visible to cap observers.
+///
+/// The only way to publish committed occupancy is through this guard. Its
+/// lifetime surrounds the reservation's phase CAS and the occupancy update;
+/// dropping it is the release publication that makes the stable counters
+/// observable again.
+struct OverageCommitPublication<'a> {
+    overage: &'a AccountOverage,
+}
+
+impl OverageCommitPublication<'_> {
+    fn publish(self, units: CostUnits) {
+        let prior = self
+            .overage
+            .committed
+            .fetch_add(units.get(), Ordering::AcqRel);
+        debug_assert!(
+            prior
+                .checked_add(units.get())
+                .is_some_and(|committed| committed <= self.overage.spent.load(Ordering::Acquire)),
+            "committed overage exceeds total recorded spend"
+        );
+    }
+}
+
+impl Drop for OverageCommitPublication<'_> {
+    fn drop(&mut self) {
+        let prior = self
+            .overage
+            .commit_publications
+            .fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(prior > 0, "overage commit publication count underflowed");
+    }
 }
 
 impl AccountOverage {
@@ -73,6 +113,8 @@ impl AccountOverage {
         AccountOverage {
             account_id,
             spent: AtomicU64::new(0),
+            committed: AtomicU64::new(0),
+            commit_publications: AtomicUsize::new(0),
         }
     }
 
@@ -105,13 +147,38 @@ impl AccountOverage {
     /// wrapped total would read as a tiny spend and reopen the cap
     /// (INVARIANTS.md #11).
     #[inline]
-    pub fn try_debit(&self, units: CostUnits, cap: CostUnits) -> Result<(), DenyReason> {
+    pub(crate) fn try_debit(&self, units: CostUnits, cap: CostUnits) -> Result<(), DenyReason> {
         let want = units.get();
         let mut current = self.spent.load(Ordering::Acquire);
         loop {
-            let refused = || DenyReason::OverageCapExhausted {
-                spent: CostUnits(current),
-                overage_cap: cap,
+            let refused = || {
+                // A zero-delta RMW, rather than a load, places this observer
+                // in the marker's modification order. It therefore either
+                // precedes publication (when the reservation is still
+                // refundable), overlaps it, or acquires the completed
+                // committed update; a stale zero cannot skip an already
+                // linearized publication start.
+                if self.commit_publications.fetch_add(0, Ordering::AcqRel) != 0 {
+                    return DenyReason::OverageCommitInProgress {
+                        spent: CostUnits(current),
+                        overage_cap: cap,
+                    };
+                }
+                let committed = self.committed.load(Ordering::Acquire);
+                if committed
+                    .checked_add(want)
+                    .is_some_and(|next| next <= cap.get())
+                {
+                    DenyReason::OverageCapTemporarilyExhausted {
+                        spent: CostUnits(current),
+                        overage_cap: cap,
+                    }
+                } else {
+                    DenyReason::OverageCapExhausted {
+                        spent: CostUnits(current),
+                        overage_cap: cap,
+                    }
+                }
             };
             let Some(next) = current.checked_add(want) else {
                 return Err(refused());
@@ -128,6 +195,39 @@ impl AccountOverage {
                 Ok(_) => return Ok(()),
                 Err(observed) => current = observed,
             }
+        }
+    }
+
+    /// Publish the reservation's phase claim and committed occupancy as one
+    /// observer-safe transition.
+    ///
+    /// `claim` owns the single commit-vs-cancel CAS. The publication marker is
+    /// installed before that closure can run and removed only after a winning
+    /// claim has advanced `committed`. A cap observer that overlaps either
+    /// half therefore sees `OverageCommitInProgress`, never a stable claim
+    /// that the already-irrevocable units remain refundable.
+    #[inline]
+    pub(crate) fn publish_commit<T, E>(
+        &self,
+        units: CostUnits,
+        claim: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        // One marker belongs to one live call stack, so exhausting usize would
+        // require more simultaneously executing publications than the process
+        // can address. The fetch is the bounded, lock-free hot-path operation.
+        let prior = self.commit_publications.fetch_add(1, Ordering::AcqRel);
+        debug_assert_ne!(
+            prior,
+            usize::MAX,
+            "live overage commit publications exceed the address space"
+        );
+        let publication = OverageCommitPublication { overage: self };
+        match claim() {
+            Ok(value) => {
+                publication.publish(units);
+                Ok(value)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -621,10 +721,12 @@ mod tests {
     }
 
     #[test]
-    fn overage_accumulates_up_to_the_cap_and_then_refuses() {
+    fn committed_overage_accumulates_up_to_the_cap_and_then_refuses() {
         let o = overage();
         o.try_debit(CostUnits(40), CostUnits(100)).unwrap();
+        o.publish_commit(CostUnits(40), || Ok::<_, ()>(())).unwrap();
         o.try_debit(CostUnits(60), CostUnits(100)).unwrap();
+        o.publish_commit(CostUnits(60), || Ok::<_, ()>(())).unwrap();
         assert_eq!(o.spent(), CostUnits(100));
         assert_eq!(o.headroom(CostUnits(100)), CostUnits::ZERO);
         assert_eq!(
@@ -635,6 +737,36 @@ mod tests {
             })
         );
         assert_eq!(o.spent(), CostUnits(100), "a refusal claims nothing");
+    }
+
+    /// A pending debit changes which local overage state is reported when
+    /// returning all pending credit would make this request fit. A request
+    /// larger than the whole cap is stable local saturation, but it remains
+    /// retryable because a background lease grant can fund it.
+    #[test]
+    fn pending_overage_is_transient_only_when_its_refund_would_make_room() {
+        let o = overage();
+        o.try_debit(CostUnits(60), CostUnits(100)).unwrap();
+
+        let pending_saturation = o.try_debit(CostUnits(50), CostUnits(100)).unwrap_err();
+        assert_eq!(
+            pending_saturation,
+            DenyReason::OverageCapTemporarilyExhausted {
+                spent: CostUnits(60),
+                overage_cap: CostUnits(100),
+            }
+        );
+        assert_eq!(pending_saturation.retry(), crate::deny::Retry::Transient);
+
+        let request_exceeds_cap = o.try_debit(CostUnits(101), CostUnits(100)).unwrap_err();
+        assert_eq!(
+            request_exceeds_cap,
+            DenyReason::OverageCapExhausted {
+                spent: CostUnits(60),
+                overage_cap: CostUnits(100),
+            }
+        );
+        assert_eq!(request_exceeds_cap.retry(), crate::deny::Retry::Transient);
     }
 
     /// The cap is a parameter, so lowering it below what an account has

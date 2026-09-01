@@ -9,6 +9,24 @@ use core::fmt;
 
 use crate::units::CostUnits;
 
+/// Whether retrying a denied request can become useful without changing the
+/// request itself.
+///
+/// This classification belongs to the denial vocabulary so embedders cannot
+/// drift into contradictory retry policies for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retry {
+    /// The same request can become admissible when capacity or freshness
+    /// recovers, without an account funding change.
+    Transient,
+    /// Retry after a concurrent admission decision finishes publishing. This
+    /// does not promise admission: the stable retry may then report transient
+    /// capacity.
+    AfterInFlight,
+    /// Retrying the same request cannot make it admissible.
+    Never,
+}
+
 /// Why a request was refused admission. All refusals charge zero units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -37,6 +55,10 @@ pub enum DenyReason {
     /// The account's local rate limiter has no capacity for this request's
     /// weight *right now*. Transient: the bucket refills.
     RateLimited,
+    /// The account's request-count bucket has no token available right now.
+    RequestRateLimited,
+    /// An account or principal in-flight request ceiling is saturated.
+    ConcurrencyLimited,
     /// The request's quoted weight exceeds the account's entire burst
     /// capacity, so no amount of waiting can admit it. A schedule whose batch
     /// cap admits a quote larger than its burst is misconfigured, not
@@ -59,15 +81,13 @@ pub enum DenyReason {
         /// Units still available on the lease at the time of refusal.
         remaining: CostUnits,
     },
-    /// An elastic account has extended as much unfunded credit as its
-    /// `overage_cap` allows on this instance.
+    /// An elastic request cannot fit inside the account's `overage_cap` even
+    /// if every refundable pending reservation releases its credit.
     ///
-    /// Deliberately not [`LeaseExhausted`](Self::LeaseExhausted), which the
-    /// transient/terminal split (#40) makes a "wait for refill" signal. A
-    /// lease refills on its own; an exhausted overage cap does not, and will
-    /// keep refusing until the account is funded or an operator raises the
-    /// cap. Reporting it as transient would tell the caller to retry into a
-    /// wall.
+    /// This proves only that the instance's local overage allowance cannot
+    /// fund the request. It does not prove central account exhaustion: the
+    /// lease refusal that led to this fallback can recover through an ordinary
+    /// background grant, so the combined admission state remains transient.
     OverageCapExhausted {
         /// Unfunded units already extended on this instance.
         spent: CostUnits,
@@ -80,13 +100,40 @@ pub enum DenyReason {
     /// The usage-accounting queue is full; admitting more work would either
     /// drop billing events or block. Shedding here is INVARIANTS.md #8.
     AccountingBackpressure,
+    /// A staged workload contained no work after zero-count entries were
+    /// discarded.
+    EmptyWorkload,
+    /// The pinned lease expired after admission but before execution began.
+    FundingExpiredAtStart,
+    /// The execution-capacity class selected by the pinned snapshot has no
+    /// permit available.
+    CapacityUnavailable,
+    /// Pending overage reservations currently occupy enough of the account's
+    /// cap to refuse this request, but cancellation or drop can return that
+    /// credit without a funding or policy change.
+    OverageCapTemporarilyExhausted {
+        /// Unfunded units currently extended on this instance.
+        spent: CostUnits,
+        /// The account's whole per-instance allowance at the time of refusal.
+        overage_cap: CostUnits,
+    },
+    /// A reservation is atomically publishing its transition from refundable
+    /// pending overage to committed occupancy. The request is refused until
+    /// that publication settles; retrying then receives the stable temporary
+    /// or committed-saturation answer.
+    OverageCommitInProgress {
+        /// Unfunded units currently extended on this instance.
+        spent: CostUnits,
+        /// The account's whole per-instance allowance at the time of refusal.
+        overage_cap: CostUnits,
+    },
 }
 
 impl DenyReason {
     /// Stable metric labels, in [`index`](DenyReason::index) order.
     ///
     /// These are the *variant* names, not [`Display`](fmt::Display) output.
-    /// Four variants interpolate runtime values into their message
+    /// Six variants interpolate runtime values into their message
     /// (`max_items`, `weight`/`burst_units`, `remaining`, `spent`), so using the
     /// rendered text as a label would mint a fresh time series per distinct
     /// value — unbounded cardinality from a fixed enum. The label says which
@@ -100,6 +147,8 @@ impl DenyReason {
         "request_too_large",
         "unpriced_operation",
         "rate_limited",
+        "request_rate_limited",
+        "concurrency_limited",
         "unpriceable_under_limits",
         "lease_unavailable",
         "lease_expired",
@@ -107,14 +156,19 @@ impl DenyReason {
         "overage_cap_exhausted",
         "cost_overflow",
         "accounting_backpressure",
+        "empty_workload",
+        "funding_expired_at_start",
+        "capacity_unavailable",
+        "overage_cap_temporarily_exhausted",
+        "overage_commit_in_progress",
     ];
 
     /// How many distinct reasons exist — the width of any per-reason array.
-    pub const COUNT: usize = 15;
+    pub const COUNT: usize = 22;
 
     /// This reason's dense slot, for direct-indexed per-reason tallies.
     ///
-    /// Four variants carry data, so there is no discriminant to cast: the
+    /// Six variants carry data, so there is no discriminant to cast: the
     /// mapping is written out, and the match is exhaustive on purpose. A new
     /// variant fails to compile until it is given a slot, which is what stops
     /// a reason from silently landing in another's bucket — the same forcing
@@ -130,13 +184,20 @@ impl DenyReason {
             DenyReason::RequestTooLarge { .. } => 5,
             DenyReason::UnpricedOperation => 6,
             DenyReason::RateLimited => 7,
-            DenyReason::UnpriceableUnderLimits { .. } => 8,
-            DenyReason::LeaseUnavailable => 9,
-            DenyReason::LeaseExpired => 10,
-            DenyReason::LeaseExhausted { .. } => 11,
-            DenyReason::OverageCapExhausted { .. } => 12,
-            DenyReason::CostOverflow => 13,
-            DenyReason::AccountingBackpressure => 14,
+            DenyReason::RequestRateLimited => 8,
+            DenyReason::ConcurrencyLimited => 9,
+            DenyReason::UnpriceableUnderLimits { .. } => 10,
+            DenyReason::LeaseUnavailable => 11,
+            DenyReason::LeaseExpired => 12,
+            DenyReason::LeaseExhausted { .. } => 13,
+            DenyReason::OverageCapExhausted { .. } => 14,
+            DenyReason::CostOverflow => 15,
+            DenyReason::AccountingBackpressure => 16,
+            DenyReason::EmptyWorkload => 17,
+            DenyReason::FundingExpiredAtStart => 18,
+            DenyReason::CapacityUnavailable => 19,
+            DenyReason::OverageCapTemporarilyExhausted { .. } => 20,
+            DenyReason::OverageCommitInProgress { .. } => 21,
         }
     }
 
@@ -144,6 +205,35 @@ impl DenyReason {
     #[must_use]
     pub const fn name(&self) -> &'static str {
         Self::NAMES[self.index()]
+    }
+
+    /// The stable retry classification for this refusal.
+    #[must_use]
+    pub const fn retry(&self) -> Retry {
+        match self {
+            DenyReason::RateLimited
+            | DenyReason::RequestRateLimited
+            | DenyReason::ConcurrencyLimited
+            | DenyReason::SnapshotExpired
+            | DenyReason::LeaseUnavailable
+            | DenyReason::LeaseExpired
+            | DenyReason::LeaseExhausted { .. }
+            | DenyReason::AccountingBackpressure
+            | DenyReason::FundingExpiredAtStart
+            | DenyReason::CapacityUnavailable
+            | DenyReason::OverageCapExhausted { .. }
+            | DenyReason::OverageCapTemporarilyExhausted { .. } => Retry::Transient,
+            DenyReason::OverageCommitInProgress { .. } => Retry::AfterInFlight,
+            DenyReason::UnknownPrincipal
+            | DenyReason::AccountSuspended
+            | DenyReason::AccountClosed
+            | DenyReason::MissingPermission
+            | DenyReason::RequestTooLarge { .. }
+            | DenyReason::UnpricedOperation
+            | DenyReason::UnpriceableUnderLimits { .. }
+            | DenyReason::CostOverflow
+            | DenyReason::EmptyWorkload => Retry::Never,
+        }
     }
 }
 
@@ -160,6 +250,8 @@ impl fmt::Display for DenyReason {
             }
             DenyReason::UnpricedOperation => f.write_str("operation is not priced"),
             DenyReason::RateLimited => f.write_str("rate limited"),
+            DenyReason::RequestRateLimited => f.write_str("request rate limited"),
+            DenyReason::ConcurrencyLimited => f.write_str("concurrency limit reached"),
             DenyReason::UnpriceableUnderLimits {
                 weight,
                 burst_units,
@@ -176,10 +268,25 @@ impl fmt::Display for DenyReason {
             DenyReason::OverageCapExhausted { spent, overage_cap } => write!(
                 f,
                 "overage cap reached ({spent} of {overage_cap} unfunded units extended \
-                 on this instance); retrying cannot help until the account is funded"
+                 on this instance); a background lease refill may restore capacity"
             ),
             DenyReason::CostOverflow => f.write_str("cost arithmetic overflow"),
             DenyReason::AccountingBackpressure => f.write_str("usage accounting backpressure"),
+            DenyReason::EmptyWorkload => f.write_str("workload is empty"),
+            DenyReason::FundingExpiredAtStart => {
+                f.write_str("funding expired before execution started")
+            }
+            DenyReason::CapacityUnavailable => f.write_str("execution capacity unavailable"),
+            DenyReason::OverageCapTemporarilyExhausted { spent, overage_cap } => write!(
+                f,
+                "overage cap temporarily reached ({spent} of {overage_cap} unfunded units \
+                 extended on this instance); pending work may release credit"
+            ),
+            DenyReason::OverageCommitInProgress { spent, overage_cap } => write!(
+                f,
+                "overage commit publication in progress ({spent} of {overage_cap} unfunded \
+                 units extended on this instance)"
+            ),
         }
     }
 }
@@ -200,6 +307,8 @@ mod tests {
         DenyReason::RequestTooLarge { max_items: 64 },
         DenyReason::UnpricedOperation,
         DenyReason::RateLimited,
+        DenyReason::RequestRateLimited,
+        DenyReason::ConcurrencyLimited,
         DenyReason::UnpriceableUnderLimits {
             weight: CostUnits(9),
             burst_units: CostUnits(4),
@@ -215,6 +324,17 @@ mod tests {
         },
         DenyReason::CostOverflow,
         DenyReason::AccountingBackpressure,
+        DenyReason::EmptyWorkload,
+        DenyReason::FundingExpiredAtStart,
+        DenyReason::CapacityUnavailable,
+        DenyReason::OverageCapTemporarilyExhausted {
+            spent: CostUnits(20),
+            overage_cap: CostUnits(20),
+        },
+        DenyReason::OverageCommitInProgress {
+            spent: CostUnits(20),
+            overage_cap: CostUnits(20),
+        },
     ];
 
     /// The indices must be a permutation of `0..COUNT`. Two reasons sharing a
@@ -237,8 +357,8 @@ mod tests {
 
     /// A label is read by whatever scrapes the counters, so it is a contract:
     /// distinct per reason, and free of the runtime values `Display` carries.
-    /// Interpolating those would turn fourteen counters into an unbounded set
-    /// of time series.
+    /// Interpolating those would turn a fixed counter set into an unbounded
+    /// number of time series.
     #[test]
     fn labels_are_distinct_and_payload_free() {
         for (position, reason) in ALL.iter().enumerate() {
@@ -284,5 +404,60 @@ mod tests {
             }
             .index()
         );
+        assert_eq!(
+            DenyReason::OverageCapTemporarilyExhausted {
+                spent: CostUnits::ZERO,
+                overage_cap: CostUnits(1),
+            }
+            .index(),
+            DenyReason::OverageCapTemporarilyExhausted {
+                spent: CostUnits(u64::MAX),
+                overage_cap: CostUnits(u64::MAX),
+            }
+            .index()
+        );
+        assert_eq!(
+            DenyReason::OverageCommitInProgress {
+                spent: CostUnits::ZERO,
+                overage_cap: CostUnits(1),
+            }
+            .index(),
+            DenyReason::OverageCommitInProgress {
+                spent: CostUnits(u64::MAX),
+                overage_cap: CostUnits(u64::MAX),
+            }
+            .index()
+        );
+    }
+
+    #[test]
+    fn every_reason_has_the_expected_retry_class() {
+        for reason in ALL {
+            let expected = match reason {
+                DenyReason::OverageCommitInProgress { .. } => Retry::AfterInFlight,
+                DenyReason::RateLimited
+                | DenyReason::RequestRateLimited
+                | DenyReason::ConcurrencyLimited
+                | DenyReason::SnapshotExpired
+                | DenyReason::LeaseUnavailable
+                | DenyReason::LeaseExpired
+                | DenyReason::LeaseExhausted { .. }
+                | DenyReason::AccountingBackpressure
+                | DenyReason::FundingExpiredAtStart
+                | DenyReason::CapacityUnavailable
+                | DenyReason::OverageCapExhausted { .. }
+                | DenyReason::OverageCapTemporarilyExhausted { .. } => Retry::Transient,
+                DenyReason::UnknownPrincipal
+                | DenyReason::AccountSuspended
+                | DenyReason::AccountClosed
+                | DenyReason::MissingPermission
+                | DenyReason::RequestTooLarge { .. }
+                | DenyReason::UnpricedOperation
+                | DenyReason::UnpriceableUnderLimits { .. }
+                | DenyReason::CostOverflow
+                | DenyReason::EmptyWorkload => Retry::Never,
+            };
+            assert_eq!(reason.retry(), expected, "{reason}");
+        }
     }
 }

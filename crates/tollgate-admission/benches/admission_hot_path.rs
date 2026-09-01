@@ -43,27 +43,27 @@ fn far_future() -> Timestamp {
 }
 
 fn snapshot() -> Arc<AccountSnapshot> {
-    Arc::new(AccountSnapshot {
-        account_id: AccountId(1),
-        key_id: None,
-        generation: Generation(1),
-        status: AccountStatus::Active,
-        enforcement_mode: EnforcementMode::Strict,
-        valid_until: far_future(),
-        permissions: PermissionBits::bit(0),
-        limits: ResolvedLimits {
-            max_items_per_request: 4_096,
-            // Effectively unlimited so the bench measures mechanism cost,
-            // not deny paths.
-            rate_units_per_second: u64::from(u32::MAX),
-            rate_burst_units: u64::from(u32::MAX),
-        },
-        cost_table: Arc::new(
-            CostTable::builder(CostUnits(50), CostUnits(50))
-                .weight(&PriceOp, CostUnits(1))
-                .build(),
-        ),
-    })
+    Arc::new(
+        AccountSnapshot::builder(
+            AccountId(1),
+            Generation(1),
+            AccountStatus::Active,
+            far_future(),
+            PermissionBits::bit(0),
+            ResolvedLimits::new(4_096).with_weighted_rate(
+                // Effectively unlimited so the bench measures mechanism cost,
+                // not deny paths.
+                u64::from(u32::MAX),
+                u64::from(u32::MAX),
+            ),
+            Arc::new(
+                CostTable::builder(CostUnits(50), CostUnits(50))
+                    .weight(&PriceOp, CostUnits(1))
+                    .build(),
+            ),
+        )
+        .build(),
+    )
 }
 
 /// The sustained contention fixture keeps the weighted-token mechanism in
@@ -72,23 +72,21 @@ fn snapshot() -> Arc<AccountSnapshot> {
 /// fast CI host. The regular single-thread and refusal fixtures retain their
 /// original 114-unit quote, preserving their recorded baseline.
 fn contention_snapshot() -> Arc<AccountSnapshot> {
-    Arc::new(AccountSnapshot {
-        cost_table: Arc::new(
-            CostTable::builder(CostUnits(1), CostUnits(1))
-                .weight(&PriceOp, CostUnits(0))
-                .build(),
-        ),
-        ..(*snapshot()).clone()
-    })
+    let mut snapshot = (*snapshot()).clone();
+    snapshot.cost_table = Arc::new(
+        CostTable::builder(CostUnits(1), CostUnits(1))
+            .weight(&PriceOp, CostUnits(0))
+            .build(),
+    );
+    Arc::new(snapshot)
 }
 
 /// The same snapshot under a named account, so a benchmark can put N
 /// principals across N accounts rather than all under `AccountId(1)`.
 fn snapshot_for_account(account: u128) -> Arc<AccountSnapshot> {
-    Arc::new(AccountSnapshot {
-        account_id: AccountId(account),
-        ..(*contention_snapshot()).clone()
-    })
+    let mut snapshot = (*contention_snapshot()).clone();
+    snapshot.account_id = AccountId(account);
+    Arc::new(snapshot)
 }
 
 fn big_lease(sharding: LocalSharding) -> Arc<LocalLease> {

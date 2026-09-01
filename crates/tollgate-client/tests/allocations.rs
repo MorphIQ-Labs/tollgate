@@ -11,9 +11,9 @@ use tollgate_alloc_count::{AllocScope, Allocations};
 use tollgate_auth::{HmacRegistry, SessionCredential};
 use tollgate_client::{ChargeGuard, ManualClock, UsageRecorder, UsageWriter, UsageWriterConfig};
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, FencingToken,
-    Generation, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, RequestId,
-    ResolvedLimits, UsageEvent, UsageSource,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
+    LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, RequestId, ResolvedLimits,
+    UsageEvent, UsageSource,
 };
 use tollgate_store::{IngestReport, StoreError, UsageSink};
 
@@ -87,25 +87,22 @@ async fn wait_until_drained(recorder: &UsageRecorder) {
 
 fn install_admission(principal: Principal) -> AdmissionEngine<ArcSwapSnapshotMap> {
     let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
-    let snapshot = Arc::new(AccountSnapshot {
-        account_id: AccountId(1),
-        key_id: None,
-        generation: Generation(1),
-        status: AccountStatus::Active,
-        enforcement_mode: EnforcementMode::Strict,
-        valid_until: far_future(),
-        permissions: PermissionBits::bit(0),
-        limits: ResolvedLimits {
-            max_items_per_request: 4_096,
-            rate_units_per_second: u64::from(u32::MAX),
-            rate_burst_units: u64::from(u32::MAX),
-        },
-        cost_table: Arc::new(
-            CostTable::builder(CostUnits(50), CostUnits(50))
-                .weight(&PriceOp, CostUnits(1))
-                .build(),
-        ),
-    });
+    let snapshot = Arc::new(
+        AccountSnapshot::builder(
+            AccountId(1),
+            Generation(1),
+            AccountStatus::Active,
+            far_future(),
+            PermissionBits::bit(0),
+            ResolvedLimits::new(4_096).with_weighted_rate(u64::from(u32::MAX), u64::from(u32::MAX)),
+            Arc::new(
+                CostTable::builder(CostUnits(50), CostUnits(50))
+                    .weight(&PriceOp, CostUnits(1))
+                    .build(),
+            ),
+        )
+        .build(),
+    );
     let lease = Arc::new(LocalLease::new(
         LeaseGrant {
             lease_id: LeaseId(7),

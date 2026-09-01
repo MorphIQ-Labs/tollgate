@@ -10,8 +10,8 @@
 //!
 //! [`DenyReason`] is a closed enum, so the tally is a fixed array indexed by
 //! [`DenyReason::index`] — never a map, never a string key. That is what
-//! bounds both the cost (a direct index) and the cardinality (fourteen series,
-//! whatever the traffic).
+//! bounds both the cost (a direct index) and the cardinality
+//! ([`DenyReason::COUNT`] series, whatever the traffic).
 //!
 //! Scope is per engine instance, like the limiter registry in
 //! [`crate::state`]: these count what *this* process admitted and refused, and

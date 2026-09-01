@@ -437,10 +437,11 @@ struct RateParams {
 }
 
 fn rate_params(limits: &ResolvedLimits, sharding: LocalSharding, ceiling: usize) -> RateParams {
-    let rate = narrow(limits.rate_units_per_second);
+    let weighted = limits.legacy_weighted_rate();
+    let rate = narrow(weighted.units_per_second());
     RateParams {
         rate,
-        burst: narrow(limits.rate_burst_units),
+        burst: narrow(weighted.burst_units()),
         shards: shard_count(rate, sharding, ceiling),
     }
 }
@@ -470,7 +471,8 @@ fn shard_ceiling(limits: &ResolvedLimits, maximum_quote: Option<CostUnits>) -> u
     let Some(maximum_quote) = maximum_quote else {
         return 1;
     };
-    let capacity = narrow(limits.rate_burst_units) / narrow(maximum_quote.get());
+    let capacity =
+        narrow(limits.legacy_weighted_rate().burst_units()) / narrow(maximum_quote.get());
     usize::try_from(capacity).unwrap_or(usize::MAX).max(1)
 }
 
@@ -1085,11 +1087,7 @@ mod tests {
     #[test]
     fn rate_shards_partition_one_account_burst_without_multiplying_it() {
         assert_eq!(align_of::<RateShard>(), 128);
-        let limits = ResolvedLimits {
-            max_items_per_request: 1,
-            rate_units_per_second: 8,
-            rate_burst_units: 800,
-        };
+        let limits = ResolvedLimits::new(1).with_weighted_rate(8, 800);
         let limiter = AccountLimiter::new(
             Generation(1),
             &limits,
@@ -1119,11 +1117,7 @@ mod tests {
 
     #[test]
     fn maximum_quote_limits_shards_to_buckets_that_can_admit_it() {
-        let limits = ResolvedLimits {
-            max_items_per_request: 1,
-            rate_units_per_second: 8,
-            rate_burst_units: 500,
-        };
+        let limits = ResolvedLimits::new(1).with_weighted_rate(8, 500);
         let eight = LocalSharding::new(NonZeroUsize::new(8).unwrap());
 
         let ceiling = shard_ceiling(&limits, Some(CostUnits(300)));
@@ -1145,11 +1139,7 @@ mod tests {
     /// burst can hold, and one that was admitted before the split existed.
     #[test]
     fn a_heavier_principal_resplits_the_account_bucket_it_shares() {
-        let limits = ResolvedLimits {
-            max_items_per_request: 1,
-            rate_units_per_second: 800,
-            rate_burst_units: 800,
-        };
+        let limits = ResolvedLimits::new(1).with_weighted_rate(800, 800);
         let eight = LocalSharding::new(NonZeroUsize::new(8).unwrap());
 
         // A light principal installs first: eight buckets of 100 units.
@@ -1173,11 +1163,7 @@ mod tests {
     /// publishable sibling already split it.
     #[test]
     fn an_unproven_principal_collapses_the_account_split() {
-        let limits = ResolvedLimits {
-            max_items_per_request: 1,
-            rate_units_per_second: 800,
-            rate_burst_units: 800,
-        };
+        let limits = ResolvedLimits::new(1).with_weighted_rate(800, 800);
         let eight = LocalSharding::new(NonZeroUsize::new(8).unwrap());
         let limiter = AccountLimiter::new(Generation(1), &limits, Some(CostUnits(10)), eight);
         assert_eq!(limiter.current().shard_count(), 8);
@@ -1192,11 +1178,7 @@ mod tests {
     /// published last.
     #[test]
     fn an_equal_generation_does_not_reinstall_the_account_limits() {
-        let limits = ResolvedLimits {
-            max_items_per_request: 1,
-            rate_units_per_second: 800,
-            rate_burst_units: 800,
-        };
+        let limits = ResolvedLimits::new(1).with_weighted_rate(800, 800);
         let limiter = AccountLimiter::new(
             Generation(5),
             &limits,
@@ -1204,10 +1186,7 @@ mod tests {
             LocalSharding::SINGLE,
         );
 
-        let widened = ResolvedLimits {
-            rate_burst_units: 8_000,
-            ..limits
-        };
+        let widened = ResolvedLimits::new(1).with_weighted_rate(800, 8_000);
         limiter.update(
             Generation(5),
             &widened,
@@ -1227,20 +1206,13 @@ mod tests {
     /// split: that principal is admitting requests now.
     #[test]
     fn a_stale_snapshot_still_narrows_the_split_it_cannot_widen() {
-        let limits = ResolvedLimits {
-            max_items_per_request: 1,
-            rate_units_per_second: 800,
-            rate_burst_units: 800,
-        };
+        let limits = ResolvedLimits::new(1).with_weighted_rate(800, 800);
         let eight = LocalSharding::new(NonZeroUsize::new(8).unwrap());
         let limiter = AccountLimiter::new(Generation(9), &limits, Some(CostUnits(10)), eight);
 
         // Ten times the burst, but a quote so heavy that only two shards of
         // it could hold one: stale limits, binding evidence.
-        let stale = ResolvedLimits {
-            rate_burst_units: 8_000,
-            ..limits
-        };
+        let stale = ResolvedLimits::new(1).with_weighted_rate(800, 8_000);
         limiter.update(Generation(4), &stale, Some(CostUnits(4_000)), eight);
 
         let config = limiter.config.lock().unwrap();

@@ -7,6 +7,7 @@
 //! resolve: bitsets, integers, and a compiled cost table. Strings, JSON, and
 //! joins belong to the control plane.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use jiff::Timestamp;
@@ -143,18 +144,289 @@ impl PermissionBits {
     }
 }
 
+/// The cost-weighted token bucket carried by a snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WeightedRateLimit {
+    units_per_second: u64,
+    burst_units: u64,
+}
+
+impl WeightedRateLimit {
+    #[must_use]
+    pub const fn units_per_second(self) -> u64 {
+        self.units_per_second
+    }
+
+    #[must_use]
+    pub const fn burst_units(self) -> u64 {
+        self.burst_units
+    }
+}
+
+/// The request-count token bucket carried by a snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestRateLimit {
+    requests_per_second: NonZeroU32,
+    burst_requests: NonZeroU32,
+}
+
+impl RequestRateLimit {
+    #[must_use]
+    pub const fn requests_per_second(self) -> NonZeroU32 {
+        self.requests_per_second
+    }
+
+    #[must_use]
+    pub const fn burst_requests(self) -> NonZeroU32 {
+        self.burst_requests
+    }
+}
+
+/// Why resolved limits could not be constructed from a wire representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedLimitsError {
+    RequestRatePairIncomplete,
+    PrincipalConcurrencyWithoutAccount,
+    PrincipalConcurrencyExceedsAccount {
+        principal: NonZeroU32,
+        account: NonZeroU32,
+    },
+}
+
+impl std::fmt::Display for ResolvedLimitsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolvedLimitsError::RequestRatePairIncomplete => {
+                f.write_str("request_rate_per_second and request_burst must be supplied together")
+            }
+            ResolvedLimitsError::PrincipalConcurrencyWithoutAccount => {
+                f.write_str("principal_max_concurrent_requests requires max_concurrent_requests")
+            }
+            ResolvedLimitsError::PrincipalConcurrencyExceedsAccount { principal, account } => {
+                write!(
+                    f,
+                    "principal concurrency ceiling {principal} exceeds account ceiling {account}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResolvedLimitsError {}
+
 /// Resolved integer limits. These parameterize the admission layer's local
 /// rate limiting and request shaping; the snapshot only carries them.
+///
+/// Fields are private and construction is incremental so adding another
+/// optional policy dimension does not break every consumer's struct literal.
+/// The two concurrency limits can only be installed together in a valid
+/// narrowing relationship.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(try_from = "WireResolvedLimits", into = "WireResolvedLimits")
+)]
+#[non_exhaustive]
 pub struct ResolvedLimits {
-    /// Largest admissible item count in one request (batch cap).
-    pub max_items_per_request: u64,
-    /// Sustained refill rate of the account's local token bucket, in cost
-    /// units per second.
-    pub rate_units_per_second: u64,
-    /// Burst capacity of that bucket, in cost units.
-    pub rate_burst_units: u64,
+    max_items_per_request: u64,
+    weighted_rate: Option<WeightedRateLimit>,
+    legacy_weighted_rate: WeightedRateLimit,
+    request_rate: Option<RequestRateLimit>,
+    max_concurrent_requests: Option<NonZeroU32>,
+    principal_max_concurrent_requests: Option<NonZeroU32>,
+}
+
+impl ResolvedLimits {
+    const COMPATIBILITY_FALLBACK: WeightedRateLimit = WeightedRateLimit {
+        units_per_second: u32::MAX as u64,
+        burst_units: u32::MAX as u64,
+    };
+
+    /// Start with only request shaping enabled. The carried legacy weighted
+    /// pair is deliberately finite and valid for governor so an older reader
+    /// remains safe during a reader-first rollout.
+    #[must_use]
+    pub const fn new(max_items_per_request: u64) -> Self {
+        Self {
+            max_items_per_request,
+            weighted_rate: None,
+            legacy_weighted_rate: Self::COMPATIBILITY_FALLBACK,
+            request_rate: None,
+            max_concurrent_requests: None,
+            principal_max_concurrent_requests: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_weighted_rate(mut self, units_per_second: u64, burst_units: u64) -> Self {
+        let rate = WeightedRateLimit {
+            units_per_second,
+            burst_units,
+        };
+        self.weighted_rate = Some(rate);
+        self.legacy_weighted_rate = rate;
+        self
+    }
+
+    /// Select the values an older reader will enforce while the weighted
+    /// bucket is disabled for readers that understand the new wire flag.
+    #[must_use]
+    pub const fn with_weighted_rate_compatibility_fallback(
+        mut self,
+        units_per_second: u64,
+        burst_units: u64,
+    ) -> Self {
+        self.weighted_rate = None;
+        self.legacy_weighted_rate = WeightedRateLimit {
+            units_per_second,
+            burst_units,
+        };
+        self
+    }
+
+    #[must_use]
+    pub const fn with_request_rate(
+        mut self,
+        requests_per_second: NonZeroU32,
+        burst_requests: NonZeroU32,
+    ) -> Self {
+        self.request_rate = Some(RequestRateLimit {
+            requests_per_second,
+            burst_requests,
+        });
+        self
+    }
+
+    pub fn with_concurrency(
+        mut self,
+        max_concurrent_requests: NonZeroU32,
+        principal_max_concurrent_requests: Option<NonZeroU32>,
+    ) -> Result<Self, ResolvedLimitsError> {
+        if let Some(principal) = principal_max_concurrent_requests
+            && principal > max_concurrent_requests
+        {
+            return Err(ResolvedLimitsError::PrincipalConcurrencyExceedsAccount {
+                principal,
+                account: max_concurrent_requests,
+            });
+        }
+        self.max_concurrent_requests = Some(max_concurrent_requests);
+        self.principal_max_concurrent_requests = principal_max_concurrent_requests;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub const fn max_items_per_request(self) -> u64 {
+        self.max_items_per_request
+    }
+
+    #[must_use]
+    pub const fn weighted_rate(self) -> Option<WeightedRateLimit> {
+        self.weighted_rate
+    }
+
+    /// The pair understood by pre-#91 readers. During the reader-first phase
+    /// they continue enforcing it even when the new flag disables the bucket.
+    #[must_use]
+    pub const fn legacy_weighted_rate(self) -> WeightedRateLimit {
+        self.legacy_weighted_rate
+    }
+
+    #[must_use]
+    pub const fn request_rate(self) -> Option<RequestRateLimit> {
+        self.request_rate
+    }
+
+    #[must_use]
+    pub const fn max_concurrent_requests(self) -> Option<NonZeroU32> {
+        self.max_concurrent_requests
+    }
+
+    #[must_use]
+    pub const fn principal_max_concurrent_requests(self) -> Option<NonZeroU32> {
+        self.principal_max_concurrent_requests
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WireResolvedLimits {
+    max_items_per_request: u64,
+    rate_units_per_second: u64,
+    rate_burst_units: u64,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    weighted_rate_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_rate_per_second: Option<NonZeroU32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_burst: Option<NonZeroU32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_concurrent_requests: Option<NonZeroU32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    principal_max_concurrent_requests: Option<NonZeroU32>,
+}
+
+#[cfg(feature = "serde")]
+const fn default_true() -> bool {
+    true
+}
+
+#[cfg(feature = "serde")]
+const fn is_true(value: &bool) -> bool {
+    *value
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<WireResolvedLimits> for ResolvedLimits {
+    type Error = ResolvedLimitsError;
+
+    fn try_from(wire: WireResolvedLimits) -> Result<Self, Self::Error> {
+        let legacy_weighted_rate = WeightedRateLimit {
+            units_per_second: wire.rate_units_per_second,
+            burst_units: wire.rate_burst_units,
+        };
+        let mut limits = Self {
+            max_items_per_request: wire.max_items_per_request,
+            weighted_rate: wire.weighted_rate_enabled.then_some(legacy_weighted_rate),
+            legacy_weighted_rate,
+            request_rate: None,
+            max_concurrent_requests: None,
+            principal_max_concurrent_requests: None,
+        };
+        limits = match (wire.request_rate_per_second, wire.request_burst) {
+            (None, None) => limits,
+            (Some(requests_per_second), Some(burst_requests)) => {
+                limits.with_request_rate(requests_per_second, burst_requests)
+            }
+            _ => return Err(ResolvedLimitsError::RequestRatePairIncomplete),
+        };
+        match wire.max_concurrent_requests {
+            Some(account) => {
+                limits.with_concurrency(account, wire.principal_max_concurrent_requests)
+            }
+            None if wire.principal_max_concurrent_requests.is_some() => {
+                Err(ResolvedLimitsError::PrincipalConcurrencyWithoutAccount)
+            }
+            None => Ok(limits),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl From<ResolvedLimits> for WireResolvedLimits {
+    fn from(limits: ResolvedLimits) -> Self {
+        Self {
+            max_items_per_request: limits.max_items_per_request,
+            rate_units_per_second: limits.legacy_weighted_rate.units_per_second,
+            rate_burst_units: limits.legacy_weighted_rate.burst_units,
+            weighted_rate_enabled: limits.weighted_rate.is_some(),
+            request_rate_per_second: limits.request_rate.map(|rate| rate.requests_per_second),
+            request_burst: limits.request_rate.map(|rate| rate.burst_requests),
+            max_concurrent_requests: limits.max_concurrent_requests,
+            principal_max_concurrent_requests: limits.principal_max_concurrent_requests,
+        }
+    }
 }
 
 /// One account credential's compiled, immutable admission state.
@@ -164,6 +436,7 @@ pub struct ResolvedLimits {
 #[derive(Debug, Clone)]
 #[repr(align(128))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct AccountSnapshot {
     pub account_id: AccountId,
     /// The credential this snapshot was compiled for, when key-scoped.
@@ -190,6 +463,49 @@ pub struct AccountSnapshot {
     pub cost_table: Arc<CostTable>,
 }
 
+/// Builder for the optional parts of an immutable account snapshot.
+#[derive(Debug)]
+pub struct AccountSnapshotBuilder {
+    account_id: AccountId,
+    key_id: Option<KeyId>,
+    generation: Generation,
+    status: AccountStatus,
+    enforcement_mode: EnforcementMode,
+    valid_until: Timestamp,
+    permissions: PermissionBits,
+    limits: ResolvedLimits,
+    cost_table: Arc<CostTable>,
+}
+
+impl AccountSnapshotBuilder {
+    #[must_use]
+    pub const fn key_id(mut self, key_id: KeyId) -> Self {
+        self.key_id = Some(key_id);
+        self
+    }
+
+    #[must_use]
+    pub const fn enforcement_mode(mut self, enforcement_mode: EnforcementMode) -> Self {
+        self.enforcement_mode = enforcement_mode;
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> AccountSnapshot {
+        AccountSnapshot {
+            account_id: self.account_id,
+            key_id: self.key_id,
+            generation: self.generation,
+            status: self.status,
+            enforcement_mode: self.enforcement_mode,
+            valid_until: self.valid_until,
+            permissions: self.permissions,
+            limits: self.limits,
+            cost_table: self.cost_table,
+        }
+    }
+}
+
 /// Why a compiled snapshot cannot be published.
 ///
 /// The validation domain is the full `u64` configuration space. Arithmetic
@@ -197,6 +513,13 @@ pub struct AccountSnapshot {
 /// overflow is a refusal, never a wrapped low quote (INVARIANTS #11/#16).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotValidationError {
+    /// The carried compatibility pair cannot be represented by governor.
+    /// It is validated even when disabled because an older reader will still
+    /// enforce these values during a mixed-version rollout.
+    WeightedRateOutsideGovernorDomain {
+        units_per_second: u64,
+        burst_units: u64,
+    },
     /// The most expensive registered operation overflows at the batch cap.
     QuoteOverflow {
         operation_index: usize,
@@ -226,6 +549,13 @@ pub enum SnapshotValidationError {
 impl std::fmt::Display for SnapshotValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            SnapshotValidationError::WeightedRateOutsideGovernorDomain {
+                units_per_second,
+                burst_units,
+            } => write!(
+                f,
+                "weighted rate ({units_per_second}/s, burst {burst_units}) must fit governor's non-zero u32 domain"
+            ),
             SnapshotValidationError::QuoteOverflow {
                 operation_index,
                 max_items,
@@ -269,6 +599,17 @@ pub struct PublishableSnapshot {
 
 impl PublishableSnapshot {
     pub fn try_new(snapshot: Arc<AccountSnapshot>) -> Result<Self, SnapshotValidationError> {
+        let legacy_rate = snapshot.limits.legacy_weighted_rate();
+        if legacy_rate.units_per_second() == 0
+            || legacy_rate.units_per_second() > u64::from(u32::MAX)
+            || legacy_rate.burst_units() == 0
+            || legacy_rate.burst_units() > u64::from(u32::MAX)
+        {
+            return Err(SnapshotValidationError::WeightedRateOutsideGovernorDomain {
+                units_per_second: legacy_rate.units_per_second(),
+                burst_units: legacy_rate.burst_units(),
+            });
+        }
         let Some((operation_index, maximum_weight)) = snapshot.cost_table.maximum_weight() else {
             // With no registered operation the table cannot produce a quote,
             // so no request can witness a quote/burst inconsistency.
@@ -279,13 +620,13 @@ impl PublishableSnapshot {
         };
         let max_quote = snapshot
             .cost_table
-            .quote_weight(maximum_weight, snapshot.limits.max_items_per_request)
+            .quote_weight(maximum_weight, snapshot.limits.max_items_per_request())
             .map_err(|_| SnapshotValidationError::QuoteOverflow {
                 operation_index,
-                max_items: snapshot.limits.max_items_per_request,
+                max_items: snapshot.limits.max_items_per_request(),
             })?
             .total;
-        let burst_units = CostUnits(snapshot.limits.rate_burst_units);
+        let burst_units = CostUnits(legacy_rate.burst_units());
         if max_quote > burst_units {
             return Err(SnapshotValidationError::QuoteExceedsBurst {
                 operation_index,
@@ -330,11 +671,12 @@ impl PublishableSnapshot {
     ///
     /// Sound without revalidating, and the reason is worth keeping next to the
     /// code rather than at the call site: [`try_new`](Self::try_new) checks
-    /// `cost_table`'s worst quote at `limits.max_items_per_request` against
-    /// two ceilings — `limits.rate_burst_units`, and an elastic account's
-    /// `overage_cap`. Neither `status` nor `generation` is one of the five
-    /// fields those checks read, so a snapshot that was publishable stays
-    /// publishable under any value of either.
+    /// [`try_new`](Self::try_new) checks the carried weighted-rate pair's
+    /// domain, then checks `cost_table`'s worst quote at the batch cap against
+    /// the carried compatibility burst and an elastic account's
+    /// `overage_cap`. Neither `status` nor `generation` participates in those
+    /// checks, so a snapshot that was publishable stays publishable under any
+    /// value of either.
     ///
     /// Note what this method therefore must not grow: re-stamping the
     /// enforcement mode would change a value validation *does* depend on, and
@@ -379,6 +721,34 @@ impl TryFrom<Arc<AccountSnapshot>> for PublishableSnapshot {
 }
 
 impl AccountSnapshot {
+    /// Begin construction with the fields that have no meaningful default.
+    ///
+    /// `status` is deliberately required: inferring `Active` for an omitted
+    /// administrative state would turn incomplete control-plane data into an
+    /// authorization grant instead of failing closed (INVARIANTS.md #5).
+    #[must_use]
+    pub fn builder(
+        account_id: AccountId,
+        generation: Generation,
+        status: AccountStatus,
+        valid_until: Timestamp,
+        permissions: PermissionBits,
+        limits: ResolvedLimits,
+        cost_table: Arc<CostTable>,
+    ) -> AccountSnapshotBuilder {
+        AccountSnapshotBuilder {
+            account_id,
+            key_id: None,
+            generation,
+            status,
+            enforcement_mode: EnforcementMode::Strict,
+            valid_until,
+            permissions,
+            limits,
+            cost_table,
+        }
+    }
+
     /// The principal-level admission test: status, staleness, permissions.
     /// Pure and O(1); rate and quota checks come after, in the admission
     /// pipeline, because they consume state.
@@ -474,6 +844,147 @@ mod tests {
         assert_eq!(EnforcementMode::Strict.overage_cap(), None);
     }
 
+    #[test]
+    fn concurrency_construction_rejects_a_principal_ceiling_above_the_account() {
+        let account = NonZeroU32::new(4).unwrap();
+        assert!(
+            ResolvedLimits::new(64)
+                .with_concurrency(account, Some(account))
+                .is_ok(),
+            "a principal ceiling equal to the account ceiling is a valid narrowing"
+        );
+        let principal = NonZeroU32::new(5).unwrap();
+        assert_eq!(
+            ResolvedLimits::new(64)
+                .with_concurrency(account, Some(principal))
+                .unwrap_err(),
+            ResolvedLimitsError::PrincipalConcurrencyExceedsAccount { principal, account }
+        );
+    }
+
+    #[test]
+    fn configured_dimensions_are_visible_through_the_public_accessors() {
+        let requests_per_second = NonZeroU32::new(10).unwrap();
+        let burst_requests = NonZeroU32::new(20).unwrap();
+        let account = NonZeroU32::new(4).unwrap();
+        let principal = NonZeroU32::new(2).unwrap();
+        let limits = ResolvedLimits::new(64)
+            .with_request_rate(requests_per_second, burst_requests)
+            .with_concurrency(account, Some(principal))
+            .unwrap();
+
+        let request_rate = limits.request_rate().expect("request rate is configured");
+        assert_eq!(request_rate.requests_per_second(), requests_per_second);
+        assert_eq!(request_rate.burst_requests(), burst_requests);
+        assert_eq!(limits.max_concurrent_requests(), Some(account));
+        assert_eq!(limits.principal_max_concurrent_requests(), Some(principal));
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn pre_staged_limits_decode_as_weighted_and_round_trip_canonically() {
+        let old = serde_json::json!({
+            "max_items_per_request": 64,
+            "rate_units_per_second": 1_000,
+            "rate_burst_units": 2_000
+        });
+        let limits: ResolvedLimits = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(
+            limits.weighted_rate(),
+            Some(WeightedRateLimit {
+                units_per_second: 1_000,
+                burst_units: 2_000,
+            })
+        );
+        assert_eq!(serde_json::to_value(limits).unwrap(), old);
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn disabled_weighted_rate_preserves_the_legacy_fallback() {
+        let wire = serde_json::json!({
+            "max_items_per_request": 64,
+            "rate_units_per_second": 800,
+            "rate_burst_units": 1_600,
+            "weighted_rate_enabled": false
+        });
+        let limits: ResolvedLimits = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(limits.weighted_rate(), None);
+        assert_eq!(limits.legacy_weighted_rate().units_per_second(), 800);
+        assert_eq!(limits.legacy_weighted_rate().burst_units(), 1_600);
+        assert_eq!(serde_json::to_value(limits).unwrap(), wire);
+    }
+
+    #[test]
+    fn disabled_weighted_rate_still_validates_the_rollback_burst() {
+        let mut snapshot = (*priced_snapshot(50, 50, &[(0, 1)], 64, 114)).clone();
+        snapshot.limits =
+            ResolvedLimits::new(64).with_weighted_rate_compatibility_fallback(1_000, 113);
+        assert_eq!(
+            PublishableSnapshot::try_new(Arc::new(snapshot)).unwrap_err(),
+            SnapshotValidationError::QuoteExceedsBurst {
+                operation_index: 0,
+                max_quote: CostUnits(114),
+                burst_units: CostUnits(113),
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn wire_rejects_partial_rate_pairs_and_widening_principal_limits() {
+        let partial = serde_json::json!({
+            "max_items_per_request": 64,
+            "rate_units_per_second": 1_000,
+            "rate_burst_units": 2_000,
+            "request_rate_per_second": 10
+        });
+        assert!(serde_json::from_value::<ResolvedLimits>(partial).is_err());
+
+        let widening = serde_json::json!({
+            "max_items_per_request": 64,
+            "rate_units_per_second": 1_000,
+            "rate_burst_units": 2_000,
+            "max_concurrent_requests": 4,
+            "principal_max_concurrent_requests": 5
+        });
+        assert!(serde_json::from_value::<ResolvedLimits>(widening).is_err());
+
+        let orphaned_principal = serde_json::json!({
+            "max_items_per_request": 64,
+            "rate_units_per_second": 1_000,
+            "rate_burst_units": 2_000,
+            "principal_max_concurrent_requests": 4
+        });
+        assert!(serde_json::from_value::<ResolvedLimits>(orphaned_principal).is_err());
+
+        let equal = serde_json::json!({
+            "max_items_per_request": 64,
+            "rate_units_per_second": 1_000,
+            "rate_burst_units": 2_000,
+            "max_concurrent_requests": 4,
+            "principal_max_concurrent_requests": 4
+        });
+        assert!(serde_json::from_value::<ResolvedLimits>(equal).is_ok());
+    }
+
+    #[test]
+    fn publication_rejects_weighted_values_outside_governors_domain() {
+        for limits in [
+            ResolvedLimits::new(64).with_weighted_rate(0, 1),
+            ResolvedLimits::new(64).with_weighted_rate(1, 0),
+            ResolvedLimits::new(64).with_weighted_rate(u64::from(u32::MAX) + 1, 1),
+            ResolvedLimits::new(64).with_weighted_rate(1, u64::from(u32::MAX) + 1),
+        ] {
+            let mut snapshot = snapshot(AccountStatus::Active, t(1_000));
+            snapshot.limits = limits;
+            assert!(matches!(
+                PublishableSnapshot::try_new(Arc::new(snapshot)),
+                Err(SnapshotValidationError::WeightedRateOutsideGovernorDomain { .. })
+            ));
+        }
+    }
+
     /// A cap that cannot fund one worst-case request would read as "extend
     /// credit" and behave as `Strict`. Refused at publication, where the
     /// burst check already refuses its analogue.
@@ -544,12 +1055,12 @@ mod tests {
         assert_eq!(restamped.valid_until, original.valid_until);
         assert_eq!(restamped.permissions, original.permissions);
         assert_eq!(
-            restamped.limits.max_items_per_request,
-            original.limits.max_items_per_request
+            restamped.limits.max_items_per_request(),
+            original.limits.max_items_per_request()
         );
         assert_eq!(
-            restamped.limits.rate_burst_units,
-            original.limits.rate_burst_units
+            restamped.limits.legacy_weighted_rate().burst_units(),
+            original.limits.legacy_weighted_rate().burst_units()
         );
         assert!(
             Arc::ptr_eq(&restamped.cost_table, &original.cost_table),
@@ -562,25 +1073,39 @@ mod tests {
     }
 
     fn snapshot(status: AccountStatus, valid_until: Timestamp) -> AccountSnapshot {
-        AccountSnapshot {
-            account_id: AccountId(1),
-            key_id: Some(KeyId(2)),
-            generation: Generation(1),
+        AccountSnapshot::builder(
+            AccountId(1),
+            Generation(1),
             status,
-            enforcement_mode: EnforcementMode::Strict,
             valid_until,
-            permissions: PermissionBits::bit(0).union(PermissionBits::bit(3)),
-            limits: ResolvedLimits {
-                max_items_per_request: 1024,
-                rate_units_per_second: 10_000,
-                rate_burst_units: 50_000,
-            },
-            cost_table: Arc::new(CostTable::builder(CostUnits(50), CostUnits(50)).build()),
-        }
+            PermissionBits::bit(0).union(PermissionBits::bit(3)),
+            ResolvedLimits::new(1024).with_weighted_rate(10_000, 50_000),
+            Arc::new(CostTable::builder(CostUnits(50), CostUnits(50)).build()),
+        )
+        .key_id(KeyId(2))
+        .build()
     }
 
     fn t(secs: i64) -> Timestamp {
         Timestamp::from_second(secs).unwrap()
+    }
+
+    /// The administrative state is part of the constructor's type, not a
+    /// setter callers can forget. This signature witness fails to compile if
+    /// the builder ever regains a fail-open status default.
+    #[test]
+    fn builder_requires_account_status_at_construction() {
+        type Builder = fn(
+            AccountId,
+            Generation,
+            AccountStatus,
+            Timestamp,
+            PermissionBits,
+            ResolvedLimits,
+            Arc<CostTable>,
+        ) -> AccountSnapshotBuilder;
+
+        let _: Builder = AccountSnapshot::builder;
     }
 
     #[test]
@@ -648,15 +1173,19 @@ mod tests {
         for (index, weight) in weights {
             builder = builder.weight(&Op(*index), CostUnits(*weight));
         }
-        Arc::new(AccountSnapshot {
-            limits: ResolvedLimits {
-                max_items_per_request: max_items,
-                rate_units_per_second: 1_000,
-                rate_burst_units: burst,
-            },
-            cost_table: Arc::new(builder.build()),
-            ..snapshot(AccountStatus::Active, t(1_000))
-        })
+        Arc::new(
+            AccountSnapshot::builder(
+                AccountId(1),
+                Generation(1),
+                AccountStatus::Active,
+                t(1_000),
+                PermissionBits::bit(0).union(PermissionBits::bit(3)),
+                ResolvedLimits::new(max_items).with_weighted_rate(1_000, burst),
+                Arc::new(builder.build()),
+            )
+            .key_id(KeyId(2))
+            .build(),
+        )
     }
 
     #[test]
@@ -710,8 +1239,14 @@ mod tests {
     #[test]
     fn publication_rejects_worst_case_quote_overflow() {
         assert_eq!(
-            PublishableSnapshot::try_new(priced_snapshot(1, 0, &[(0, u64::MAX)], 2, u64::MAX,))
-                .unwrap_err(),
+            PublishableSnapshot::try_new(priced_snapshot(
+                1,
+                0,
+                &[(0, u64::MAX)],
+                2,
+                u64::from(u32::MAX),
+            ))
+            .unwrap_err(),
             SnapshotValidationError::QuoteOverflow {
                 operation_index: 0,
                 max_items: 2,
@@ -721,6 +1256,6 @@ mod tests {
 
     #[test]
     fn publication_allows_a_table_with_no_registered_operations() {
-        PublishableSnapshot::try_new(priced_snapshot(100, 100, &[], 64, 0)).unwrap();
+        PublishableSnapshot::try_new(priced_snapshot(100, 100, &[], 64, 1)).unwrap();
     }
 }

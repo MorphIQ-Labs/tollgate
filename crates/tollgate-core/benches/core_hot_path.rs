@@ -13,9 +13,9 @@ use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_mai
 use jiff::Timestamp;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CancelOutcome, CommitError, CostTable, CostUnits,
-    EnforcementMode, FencingToken, Generation, KeyId, LeaseGrant, LeaseId, LocalLease, OpIndex,
-    PermissionBits, Reservation, ResolvedLimits,
+    AccountId, AccountOverage, AccountSnapshot, AccountStatus, CancelOutcome, CommitError,
+    CostTable, CostUnits, FencingToken, Generation, KeyId, LeaseGrant, LeaseId, LocalLease,
+    OpIndex, PermissionBits, Reservation, ResolvedLimits,
 };
 
 #[derive(Clone, Copy)]
@@ -49,21 +49,17 @@ fn cost_table() -> Arc<CostTable> {
 }
 
 fn snapshot() -> AccountSnapshot {
-    AccountSnapshot {
-        account_id: AccountId(1),
-        key_id: Some(KeyId(2)),
-        generation: Generation(1),
-        status: AccountStatus::Active,
-        enforcement_mode: EnforcementMode::Strict,
-        valid_until: Timestamp::from_second(4_102_444_800).unwrap(), // 2100-01-01
-        permissions: PermissionBits::bit(0).union(PermissionBits::bit(1)),
-        limits: ResolvedLimits {
-            max_items_per_request: 1024,
-            rate_units_per_second: 100_000,
-            rate_burst_units: 500_000,
-        },
-        cost_table: cost_table(),
-    }
+    AccountSnapshot::builder(
+        AccountId(1),
+        Generation(1),
+        AccountStatus::Active,
+        Timestamp::from_second(4_102_444_800).unwrap(), // 2100-01-01
+        PermissionBits::bit(0).union(PermissionBits::bit(1)),
+        ResolvedLimits::new(1024).with_weighted_rate(100_000, 500_000),
+        cost_table(),
+    )
+    .key_id(KeyId(2))
+    .build()
 }
 
 fn big_lease() -> Arc<LocalLease> {
@@ -135,6 +131,39 @@ fn bench_lease(c: &mut Criterion) {
         b.iter(|| {
             let r = Reservation::reserve(black_box(&lease2), CostUnits(100), now).unwrap();
             r.cancel()
+        })
+    });
+
+    // The elastic commit transition includes the publication marker that
+    // prevents observers from treating an irrevocable debit as refundable.
+    // Committed units remain occupied, so the maximal cap keeps the fixture
+    // out of the refusal branch for any realistic sample count.
+    let overage = Arc::new(AccountOverage::new(AccountId(1)));
+    group.bench_function("overage_reserve_commit", |b| {
+        b.iter(|| {
+            let r = Reservation::reserve_overage(
+                black_box(&overage),
+                CostUnits(100),
+                CostUnits(u64::MAX),
+            )
+            .unwrap();
+            r.commit_at_execution_start(now).unwrap();
+            r
+        })
+    });
+
+    // The stable committed-saturation path is where cap classification
+    // performs its zero-delta publication RMW. Keep that synchronization cost
+    // visible independently of the successful elastic path above.
+    let full_overage = Arc::new(AccountOverage::new(AccountId(2)));
+    Reservation::reserve_overage(&full_overage, CostUnits(100), CostUnits(100))
+        .unwrap()
+        .commit_at_execution_start(now)
+        .unwrap();
+    group.bench_function("overage_refusal_committed", |b| {
+        b.iter(|| {
+            Reservation::reserve_overage(black_box(&full_overage), CostUnits(1), CostUnits(100))
+                .unwrap_err()
         })
     });
 

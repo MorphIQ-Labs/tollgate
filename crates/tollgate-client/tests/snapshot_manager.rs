@@ -17,9 +17,9 @@ use tollgate_client::{
     TrackedPrincipals,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, EnforcementMode,
-    FencingToken, Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex,
-    PermissionBits, Principal, PublishableSnapshot, ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, FencingToken,
+    Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex, PermissionBits, Principal,
+    PublishableSnapshot, ResolvedLimits,
 };
 use tollgate_store::{
     AccountConfig, GrantPolicy, MemoryStore, SnapshotPush, SnapshotResolution, SnapshotSource,
@@ -42,25 +42,22 @@ fn t(secs: i64) -> Timestamp {
 }
 
 fn snapshot(generation: u64, permissions: PermissionBits) -> Arc<AccountSnapshot> {
-    Arc::new(AccountSnapshot {
-        account_id: ACCOUNT,
-        key_id: None,
-        generation: Generation(generation),
-        status: AccountStatus::Active,
-        enforcement_mode: EnforcementMode::Strict,
-        valid_until: t(100_000),
-        permissions,
-        limits: ResolvedLimits {
-            max_items_per_request: 64,
-            rate_units_per_second: 1_000_000,
-            rate_burst_units: 1_000_000,
-        },
-        cost_table: Arc::new(
-            CostTable::builder(CostUnits(50), CostUnits(50))
-                .weight(&PriceOp, CostUnits(1))
-                .build(),
-        ),
-    })
+    Arc::new(
+        AccountSnapshot::builder(
+            ACCOUNT,
+            Generation(generation),
+            AccountStatus::Active,
+            t(100_000),
+            permissions,
+            ResolvedLimits::new(64).with_weighted_rate(1_000_000, 1_000_000),
+            Arc::new(
+                CostTable::builder(CostUnits(50), CostUnits(50))
+                    .weight(&PriceOp, CostUnits(1))
+                    .build(),
+            ),
+        )
+        .build(),
+    )
 }
 
 fn publishable(snapshot: Arc<AccountSnapshot>) -> PublishableSnapshot {

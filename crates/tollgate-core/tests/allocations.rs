@@ -4,9 +4,9 @@ use std::sync::Arc;
 use jiff::Timestamp;
 use tollgate_alloc_count::AllocScope;
 use tollgate_core::{
-    AccountId, AccountOverage, AccountSnapshot, AccountStatus, CostTable, CostUnits,
-    EnforcementMode, FencingToken, Generation, KeyId, LeaseGrant, LeaseId, LocalLease, Locality,
-    OpIndex, PermissionBits, RequestId, Reservation, ResolvedLimits,
+    AccountId, AccountOverage, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken,
+    Generation, KeyId, LeaseGrant, LeaseId, LocalLease, Locality, OpIndex, PermissionBits,
+    RequestId, Reservation, ResolvedLimits,
 };
 
 tollgate_alloc_count::install!();
@@ -41,21 +41,17 @@ fn cost_table() -> Arc<CostTable> {
 }
 
 fn snapshot(table: Arc<CostTable>) -> AccountSnapshot {
-    AccountSnapshot {
-        account_id: AccountId(1),
-        key_id: Some(KeyId(2)),
-        generation: Generation(1),
-        status: AccountStatus::Active,
-        enforcement_mode: EnforcementMode::Strict,
-        valid_until: far_future(),
-        permissions: PermissionBits::bit(0),
-        limits: ResolvedLimits {
-            max_items_per_request: 1_024,
-            rate_units_per_second: 100_000,
-            rate_burst_units: 500_000,
-        },
-        cost_table: table,
-    }
+    AccountSnapshot::builder(
+        AccountId(1),
+        Generation(1),
+        AccountStatus::Active,
+        far_future(),
+        PermissionBits::bit(0),
+        ResolvedLimits::new(1_024).with_weighted_rate(100_000, 500_000),
+        table,
+    )
+    .key_id(KeyId(2))
+    .build()
 }
 
 fn lease() -> Arc<LocalLease> {
