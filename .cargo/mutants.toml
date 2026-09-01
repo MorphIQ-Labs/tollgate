@@ -31,6 +31,20 @@ exclude_re = [
   # inferred `Default::default()` calls the same implementation and returns
   # the same type; no request or connection can distinguish the spellings.
   "replace <impl Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>> for PricingConnection>::connect_info -> Self with Default::default\\(\\)",
+  # `ConcurrencyGauge::release_shard` short-circuits on
+  # `decrement() == 0 && phase == DRAINING` before calling
+  # `promote_if_drained`, whose own guard — `phase == DRAINING &&
+  # shards.is_empty()`, over a compare-exchange — is where the transition's
+  # precondition actually lives. Widening the `&&` to `||` adds exactly two
+  # call cases, `decrement() != 0 && phase == DRAINING` and
+  # `decrement() == 0 && phase != DRAINING`, and both fail that precondition,
+  # so the extra calls are no-ops. Proved as
+  # `promote_outside_its_precondition_is_a_no_op` in
+  # `formal/lean/Tollgate/ConcurrencyGauge.lean`; no input separates the two
+  # spellings. The guard is a cost contract — it keeps the ordinary release
+  # path off an O(shards) scan — and cost is what the performance gates
+  # measure, not what a mutation test can observe.
+  "replace && with \\|\\| in ConcurrencyGauge::release_shard",
   # A binary's `main` is process wiring — env parsing, subscriber install,
   # and a call into library code that has its own tests. Nothing running
   # in-process can observe its body being replaced, so a mutant there is

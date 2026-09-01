@@ -163,6 +163,49 @@ until it has one.
    `an_unproven_principal_collapses_the_account_split`,
    `a_stale_snapshot_still_narrows_the_split_it_cannot_widen`, and
    `a_shared_split_bucket_never_wedges_a_principal_the_burst_can_hold`.
+   Tightening that safe split publishes one replacement through the account's
+   single `AccountPolicyState` indirection. Every subsequent request, from
+   every principal, loads that one current authority; no installed principal
+   retains an independently refillable old bucket. *Test:*
+   `shard_tightening_cannot_leave_two_spendable_account_buckets`.
+   Request-count rate is a second optional account bucket with unit weight;
+   it is checked before the optional cost-weighted bucket, and tokens from
+   either are never refunded after a later refusal. Each dimension binds its
+   immutable enforced parameters to its mutable bucket. Publishing a change
+   in one dimension, including inactive compatibility metadata, retains the
+   exact bucket and consumed state of every unchanged dimension. `RateState`
+   owns the exact `AccountRatePolicy` its buckets implement. Rate and account concurrency are
+   selected by the same accepted account-policy generation and published in
+   one `AccountPolicyState`; a request loads it once and uses it for every
+   account-wide decision. Principal snapshots remain the authorities for
+   status, permissions, request shaping, pricing, funding mode, and optional
+   principal concurrency. A divergent same-generation or older principal can
+   therefore neither bypass nor manufacture an account bucket or ceiling, and
+   a genuinely newer accepted account policy reaches every principal on its
+   next request. Omitting either bucket performs no governor operation for
+   that dimension.
+
+   Generation acceptance precedes runtime resolution in both snapshot maps.
+   A rejected replay, and a positive overwritten before an atomic batch is
+   published, cannot mutate the account policy registry. This ordering is the
+   enforcement boundary for authorization monotonicity (15), not a downstream
+   request-path check.
+   *Additional tests:* `request_rate_limiter_counts_requests_not_cost`,
+   `disabled_weighted_rate_performs_no_weighted_check`,
+   `changing_disabled_weighted_fallback_does_not_refill_request_rate`,
+   `enabling_request_rate_does_not_refill_weighted_rate`,
+   `divergent_enabled_snapshot_cannot_outlive_a_disabled_account_bucket`,
+   `divergent_disabled_snapshot_cannot_bypass_an_enabled_account_bucket`,
+   `resolved_account_authority_carries_the_generation_winners_policy`,
+   `moka_rejects_replays_before_resolving_account_state`,
+   `arc_swap_rejects_replays_before_resolving_account_state`,
+   `an_overwritten_batch_positive_never_becomes_account_authority`,
+   `a_later_funding_refusal_releases_concurrency_but_keeps_rate_tokens`,
+   `limit_change_is_one_account_authority_for_every_principal`, and
+   `one_batch_with_two_generations_keeps_the_newer`. *Proof:*
+   `formal/lean/Tollgate/RatePublication.lean`, including
+   `unchanged_weighted_authority_is_preserved` and
+   `unchanged_request_authority_is_preserved`.
 
 6. **Foreground isolation.** Lease refill and snapshot replacement never block
    an in-flight request, and the request path never waits on the plane that
@@ -328,15 +371,23 @@ until it has one.
     `reclaim_waits_for_grace_and_release_works_within_it` (both store suites).
 
 13. **A committed charge is always emitted.** Committing through
-    `ChargeGuard` binds the billing event to the pre-reserved queue permit;
-    normal completion, early return, panic unwind, and task abort all
-    enqueue it. The guarantee extends through shutdown: the writer's drain
-    waits for the permit, so the event is ingested or explicitly counted in
-    `WriterStats::unresolved` — never silently dropped. The safe lifecycle
+    `ChargeGuard` consumes the complete `Admitted` proof, binds the billing
+    event to the pre-reserved queue permit, and retains the resulting
+    `CommittedAdmission`; normal completion, early return, panic unwind, and
+    task abort all enqueue the event and release concurrency only when the
+    execution guard drops. `ChargeGuard::commit` returns that guard directly,
+    rather than hiding it in a tuple, and the guard type is `#[must_use]`, so
+    discarding execution-start evidence is rejected under
+    `unused_must_use`. The guarantee extends through shutdown: the
+    writer's drain waits for the permit, so the event is ingested or explicitly
+    counted in `WriterStats::unresolved` — never silently dropped. The safe lifecycle
     order is: stop admitting, quiesce request tasks holding permits or
     guards, shut the usage writer down, then release leases. A spent lease
     with no billing event requires losing the whole process. *Tests:*
-    `panic_after_commit_still_bills`, `shutdown_waits_for_committed_guard`.
+    `panic_after_commit_still_bills`, `shutdown_waits_for_committed_guard`,
+    `committed_charge_holds_concurrency_until_execution_guard_drops`, and
+    `failed_commit_releases_concurrency_and_accounting_capacity`, plus the
+    `ChargeGuard` discarded-result compile-fail doctest.
 
 14. **Account creation is never destructive.** Recreating an existing
     account is a surfaced `AlreadyExists` in every backend — never an
@@ -634,12 +685,110 @@ until it has one.
     (`tollgate-alloc-count`); `core_hot_path_allocates_nothing` (core);
     `a_cached_credential_allocates_nothing` (auth);
     `admission_allocates_nothing_on_the_arc_swap_default`,
+    `configured_and_disabled_guards_allocate_nothing_after_warmup`,
     `moka_reads_are_allocation_free_after_current_thread_warmup`, and
     `admit_consults_the_map_exactly_once` (admission); and
     `embedding_path_allocates_nothing_after_warmup` (client). The required
     `allocation-assertions` CI job runs them through
     `scripts/check_allocations.sh` and proves the counter crate has no normal
     reverse dependency from a release binary.
+
+25. **Concurrency ceilings are exact, per instance, and released once.** Each
+    stable account and principal gauge tracks every admitted request, including
+    while its optional ceiling is absent. Before first activation, occupancy
+    is direct-indexed by request locality so opt-in sharding does not recreate
+    a shared cache line. Activation publishes a `draining` phase before the
+    new policy. Draining seals the shards to new permits; it does not suspend
+    admission. An acquisition carrying no ceiling of its own is never refused
+    by another policy's activation, and one carrying the activated ceiling is
+    admitted on the central counter bounded by that ceiling less the undrained
+    shard residue — that residue is live work and occupies the ceiling being
+    published, so total occupancy never passes it. Enabling a ceiling therefore
+    narrows admission to that ceiling instead of closing the account for the
+    lifetime of the longest request already running. Exact shard permits
+    release to their owning counters, and only an all-zero shard set can
+    atomically promote to the central CAS-bounded counter. Once central, the
+    gauge never resets or returns to sharded tracking, so disabling and
+    re-enabling retains occupancy; a ceiling withdrawn while the handoff is
+    still draining, before any central work exists, does return the gauge to
+    sharded tracking. A successful bounded compare-exchange never
+    increments at or above the configured ceiling.
+
+    The account ceiling comes from the same canonical `AccountPolicyState`
+    every principal loads for rate policy. A configured principal ceiling is
+    validated not to widen its account ceiling, acquired first, and undone if
+    the account acquisition refuses. Both gauges are counted per service
+    instance, like local rate state rather than fleet-wide leased funding.
+
+    Occupancy survives snapshot replacement and cache eviction: account and
+    principal registries retain weak references, while installed state and an
+    in-flight RAII guard keep the exact gauges strongly reachable. The guard
+    is constructed only after both occupancy increments and owns the exact
+    state containing both gauges; it has no callable release operation. Every
+    field of `Admitted`, `CommittedAdmission`, and `ChargeGuard` is private.
+    `Admitted` exposes no raw `Reservation`: cancellation consumes it, while
+    commit consumes it into `CommittedAdmission`, and `ChargeGuard` owns that
+    committed proof throughout execution. The public commit result is the
+    must-use guard itself, not a tuple that suppresses its diagnostic. Safe
+    code therefore cannot retain committed funding while accidentally dropping
+    the concurrency authority.
+    The concurrency guard is the last admission field dropped and releases
+    account then principal exactly once on cancellation, refusal, panic
+    unwinding, or ordinary drop. The
+    unbounded path performs the same two occupancy transitions against its
+    locality shards without a limit comparison or scan; both paths remain
+    allocation-free. Shard scans are confined to the one-time activation
+    handoff: once when control publishes it, once more when a ceiling-carrying
+    request computes its headroom while that handoff is open, and then only
+    when a formerly nonempty shard releases its last old permit.
+
+    *Tests:* `account_concurrency_is_held_for_the_admitted_lifetime`,
+    `a_principal_ceiling_narrows_without_bypassing_the_account_ceiling`,
+    `every_principal_observes_the_canonical_account_concurrency_ceiling`,
+    `newer_account_concurrency_policy_reaches_existing_principals`,
+    `enabling_account_concurrency_counts_already_in_flight_work`,
+    `enabling_principal_concurrency_counts_already_in_flight_work`,
+    `reenabled_account_concurrency_counts_work_admitted_while_disabled`,
+    `a_later_funding_refusal_releases_concurrency_but_keeps_rate_tokens`,
+    `an_in_flight_principal_gauge_survives_removal_and_reinstall`, and
+    `concurrent_gauge_never_exceeds_its_ceiling_and_releases_exactly_once`,
+    `enabling_a_concurrency_ceiling_observes_unbounded_occupancy`,
+    `activation_admits_within_the_new_ceiling_while_old_work_drains`,
+    `publishing_a_ceiling_arms_the_gauge_before_the_policy_is_readable`,
+    `withdrawing_a_ceiling_mid_handoff_returns_the_gauge_to_sharded_tracking`,
+    `a_concurrent_activation_never_denies_an_unlimited_caller`,
+    `unbounded_gauge_fails_closed_at_its_representation_limit`,
+    `concurrency_guard_carries_the_exact_occupied_state`,
+    `committed_charge_holds_concurrency_until_execution_guard_drops`,
+    `failed_commit_releases_concurrency_and_accounting_capacity`, and the
+    `Admitted` raw-reservation compile-fail doctest — pinned to E0616 and
+    paired with a compiling companion, so it cannot pass for an unresolved
+    name or a vanished API;
+    formal witnesses
+    `Tollgate.ConcurrencyGauge.successful_acquire_never_exceeds_account`,
+    `successful_acquire_never_exceeds_principal`,
+    `principal_ceiling_cannot_bypass_account`,
+    `account_refusal_undoes_principal`, `release_restores_counts`,
+    `a_second_release_is_refused`,
+    `execution_start_transfers_without_releasing`,
+    `pending_cancel_releases_occupancy`,
+    `execution_finish_releases_occupancy`, and
+    `released_owner_cannot_release_twice`, plus
+    `publication_preserves_occupancy`,
+    `activation_with_existing_occupancy_enters_draining`,
+    `draining_admits_an_unlimited_acquisition`,
+    `draining_admits_below_the_activated_ceiling`,
+    `draining_acquire_never_exceeds_the_ceiling`,
+    `draining_refuses_a_ceiling_the_residue_already_fills`,
+    `nonempty_shards_cannot_promote`,
+    `drained_shards_promote_to_central`,
+    `central_disable_reenable_preserves_occupancy`,
+    `central_reenable_observes_existing_work`, and
+    `promote_outside_its_precondition_is_a_no_op`, which establishes that
+    promotion's precondition lives inside `promote_if_drained` rather than in
+    its callers — so `release_shard`'s guard is a cost short-circuit, and the
+    mutation excluded in `.cargo/mutants.toml` is equivalent rather than
+    untested.
 
 Ledger roles (context for 1 and 7): leases **bound** spend; usage events **are**
 the billing record; reconciliation compares the two and steady-state drift is

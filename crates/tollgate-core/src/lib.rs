@@ -41,8 +41,8 @@ pub use lease::{AccountOverage, LeaseGrant, LocalLease, RefillSignal};
 pub use reservation::{CancelOutcome, CommitError, Reservation};
 pub use sharding::{LocalSharding, Locality};
 pub use snapshot::{
-    AccountSnapshot, AccountSnapshotBuilder, AccountStatus, EnforcementMode, PermissionBits,
-    PublishableSnapshot, RequestRateLimit, ResolvedLimits, ResolvedLimitsError,
+    AccountRatePolicy, AccountSnapshot, AccountSnapshotBuilder, AccountStatus, EnforcementMode,
+    PermissionBits, PublishableSnapshot, RequestRateLimit, ResolvedLimits, ResolvedLimitsError,
     SnapshotValidationError, WeightedRateLimit,
 };
 pub use units::CostUnits;

@@ -1,6 +1,6 @@
 # Tollgate Formal Models
 
-This Lean package contains exact models for five critical contracts:
+This Lean package contains exact models for seven critical contracts:
 
 - `LeaseShards` models the aggregate of cache-isolated lease counters and
   exact-total debit/refund receipts. It proves conservation through reserve, cancel,
@@ -18,6 +18,14 @@ This Lean package contains exact models for five critical contracts:
   principal after eviction. It also proves the converse the distinction exists
   for: a principal whose row went absent is admitted again at the generation it
   already had, while a duplicate publish of a visible snapshot stays a no-op.
+- `ConcurrencyGauge` models principal-then-account acquisition, rollback when
+  the account is full, exact ceiling preservation, and single release. Rust's
+  ownership transition from `Admitted` to `CommittedAdmission`, and from there
+  into `ChargeGuard`, separately enforces that execution start transfers the
+  funding reservation without releasing its concurrency permit. The model
+  proves that transfer retains occupancy and that only finishing either the
+  pending or execution owner releases it; Rust's private fields, behavior
+  witness, and compile-fail witness connect that model to the API.
 - `Conservation` models the per-account ledger equation
   `deposited + overage = balance + activeGrants + settledUsage + loss` and
   proves each transition preserves it: deposit, acquire, release, reclaim, a
@@ -32,6 +40,11 @@ This Lean package contains exact models for five critical contracts:
   commit, cancellation, and a lost commit claim preserve occupancy bounds. It
   intentionally does not infer central account exhaustion from local cap
   saturation.
+- `RatePublication` models accepted account-policy publication. It proves that
+  a rejected snapshot cannot mutate account state, newer accepted generations
+  select their complete account-wide policy, same/older generations retain the
+  current policy, and every principal request reads the one current rate
+  authority rather than retaining a principal-local copy.
 - `SnapshotLimits` proves that checking the largest registered operation
   weight at the configured batch cap bounds every registered operation at
   every permitted item count. Consequently, a worst-case quote at or below

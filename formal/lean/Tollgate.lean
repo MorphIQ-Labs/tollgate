@@ -1,5 +1,7 @@
 import Tollgate.Conservation
+import Tollgate.ConcurrencyGauge
 import Tollgate.LeaseShards
 import Tollgate.OveragePublication
+import Tollgate.RatePublication
 import Tollgate.SnapshotCache
 import Tollgate.SnapshotLimits

@@ -137,7 +137,7 @@ fn admit(fixture: &Fixture) -> Result<(), DenyReason> {
             t(1),
         )
         .map(|admitted| {
-            admitted.reservation.cancel();
+            admitted.cancel();
         })
 }
 
@@ -698,7 +698,7 @@ fn admit_as(fixture: &Fixture, principal: Principal) -> Result<(), DenyReason> {
             t(1),
         )
         .map(|admitted| {
-            admitted.reservation.cancel();
+            admitted.cancel();
         })
 }
 

@@ -1,16 +1,18 @@
 //! Per-account admission state and the snapshot-map abstraction.
 
+use std::hash::Hash;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::{ArcSwap, ArcSwapOption, Guard};
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 use jiff::Timestamp;
 
 use tollgate_core::{
-    AccountId, AccountOverage, AccountSnapshot, CostUnits, Generation, LocalLease, LocalSharding,
-    Locality, PublishableSnapshot, ResolvedLimits,
+    AccountId, AccountOverage, AccountRatePolicy, AccountSnapshot, CostUnits, DenyReason,
+    Generation, LocalLease, LocalSharding, Locality, PublishableSnapshot, ResolvedLimits,
 };
 
 pub use tollgate_core::Principal;
@@ -223,13 +225,13 @@ type AccountRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 pub(crate) struct RateShard(AccountRateLimiter);
 
 #[derive(Debug)]
-pub(crate) enum AccountRateState {
+pub(crate) enum Buckets {
     Single(AccountRateLimiter),
     Sharded(Box<[RateShard]>),
 }
 
-impl AccountRateState {
-    fn check_n_at(
+impl Buckets {
+    pub(crate) fn check_n_at(
         &self,
         n: std::num::NonZeroU32,
         locality: Locality,
@@ -286,19 +288,370 @@ impl AccountRateState {
     }
 }
 
-/// Stable per-account indirection shared by every principal. Governor quotas
-/// are immutable, so a policy update swaps the inner limiter while all
-/// existing principal states keep pointing at this same object.
+/// One immutable rate configuration and its mutable governor buckets.
+///
+/// The account limiter publishes this behind one account-wide indirection.
+/// Every request loads that indirection once, so replacing an immutable
+/// governor quota cannot leave principals spending from independently
+/// refillable old and new buckets.
+#[derive(Debug)]
+pub(crate) struct RateState {
+    policy: AccountRatePolicy,
+    weighted: Option<Arc<ConfiguredBuckets>>,
+    requests: Option<Arc<ConfiguredBuckets>>,
+}
+
+/// One rate dimension's immutable parameters and mutable governor state.
+///
+/// Keeping these together lets publication retain the exact mutable bucket
+/// when, and only when, that dimension's enforced parameters are unchanged.
+#[derive(Debug)]
+struct ConfiguredBuckets {
+    params: BucketParams,
+    buckets: Buckets,
+}
+
+/// The account-wide policy authority loaded once by each request.
+///
+/// Rate configuration and the account concurrency ceiling share a generation
+/// winner and one publication point. Principal-local shaping and concurrency
+/// remain in the principal snapshot.
+#[derive(Debug)]
+pub(crate) struct AccountPolicyState {
+    rate: Arc<RateState>,
+    max_concurrent_requests: Option<std::num::NonZeroU32>,
+}
+
+impl AccountPolicyState {
+    pub(crate) fn rate(&self) -> &RateState {
+        &self.rate
+    }
+
+    pub(crate) fn max_concurrent_requests(&self) -> Option<std::num::NonZeroU32> {
+        self.max_concurrent_requests
+    }
+}
+
+impl RateState {
+    pub(crate) fn policy(&self) -> AccountRatePolicy {
+        self.policy
+    }
+
+    pub(crate) fn weighted(&self) -> Option<&Buckets> {
+        self.weighted
+            .as_deref()
+            .map(|configured| &configured.buckets)
+    }
+
+    pub(crate) fn requests(&self) -> Option<&Buckets> {
+        self.requests
+            .as_deref()
+            .map(|configured| &configured.buckets)
+    }
+}
+
+const CONCURRENCY_SHARDED: u8 = 0;
+const CONCURRENCY_DRAINING: u8 = 1;
+const CONCURRENCY_CENTRAL: u8 = 2;
+
+/// Exact release evidence for one concurrency acquisition.
+///
+/// `usize::MAX` denotes the central bounded counter; every other value is the
+/// locality shard incremented by an unbounded acquisition.
+#[derive(Debug, Clone, Copy)]
+struct GaugePermit(usize);
+
+impl GaugePermit {
+    const CENTRAL: Self = Self(usize::MAX);
+
+    const fn shard(index: usize) -> Self {
+        Self(index)
+    }
+
+    const fn shard_index(self) -> Option<usize> {
+        if self.0 == usize::MAX {
+            None
+        } else {
+            Some(self.0)
+        }
+    }
+}
+
+/// One cache-isolated occupancy counter.
+#[derive(Debug, Default)]
+#[repr(align(128))]
+struct ConcurrencyCounter(AtomicU32);
+
+impl ConcurrencyCounter {
+    fn try_increment(&self, limit: Option<std::num::NonZeroU32>) -> bool {
+        let mut current = self.0.load(Ordering::Relaxed);
+        loop {
+            if limit.is_some_and(|limit| current >= limit.get()) {
+                return false;
+            }
+            let Some(next) = current.checked_add(1) else {
+                return false;
+            };
+            match self
+                .0
+                .compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::Relaxed)
+            {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn decrement(&self) -> u32 {
+        let previous = self.0.fetch_sub(1, Ordering::SeqCst);
+        assert!(previous > 0, "a concurrency permit releases exactly once");
+        previous - 1
+    }
+
+    fn load(&self) -> u32 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Locality-partitioned occupancy used while no ceiling has ever activated.
+#[derive(Debug)]
+enum ConcurrencyShards {
+    Single(ConcurrencyCounter),
+    Sharded {
+        sharding: LocalSharding,
+        counters: Box<[ConcurrencyCounter]>,
+    },
+}
+
+impl ConcurrencyShards {
+    fn new(sharding: LocalSharding) -> Self {
+        if sharding == LocalSharding::SINGLE {
+            return Self::Single(ConcurrencyCounter::default());
+        }
+        Self::Sharded {
+            sharding,
+            counters: (0..sharding.get())
+                .map(|_| ConcurrencyCounter::default())
+                .collect(),
+        }
+    }
+
+    fn select(&self, locality: Locality) -> (usize, &ConcurrencyCounter) {
+        match self {
+            Self::Single(counter) => (0, counter),
+            Self::Sharded { sharding, counters } => {
+                let index = locality.index(*sharding);
+                (index, &counters[index])
+            }
+        }
+    }
+
+    fn get(&self, index: usize) -> &ConcurrencyCounter {
+        match self {
+            Self::Single(counter) => {
+                debug_assert_eq!(index, 0);
+                counter
+            }
+            Self::Sharded { counters, .. } => &counters[index],
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Single(counter) => counter.load() == 0,
+            Self::Sharded { counters, .. } => counters.iter().all(|counter| counter.load() == 0),
+        }
+    }
+
+    /// Outstanding permits across every shard.
+    ///
+    /// Only the activation handoff reads this: ordinary acquisition and
+    /// release stay direct-indexed on one counter.
+    fn total(&self) -> u32 {
+        match self {
+            Self::Single(counter) => counter.load(),
+            Self::Sharded { counters, .. } => counters
+                .iter()
+                .fold(0u32, |total, counter| total.saturating_add(counter.load())),
+        }
+    }
+}
+
+/// Stable occupancy with an explicit sharded-to-central activation handoff.
+///
+/// Unlimited traffic increments only its locality shard. First activation
+/// closes new *shard* acquisitions and admits centrally against the ceiling
+/// less the shard residue, so publishing a ceiling narrows admission to that
+/// ceiling instead of suspending it for the lifetime of the longest request
+/// already running. Draining those exact permits publishes the central
+/// CAS-bounded counter. Once central, disabling a limit keeps tracking there
+/// so re-enabling cannot manufacture a fresh zero.
+#[derive(Debug)]
+struct ConcurrencyGauge {
+    phase: AtomicU8,
+    shards: ConcurrencyShards,
+    central: ConcurrencyCounter,
+}
+
+impl ConcurrencyGauge {
+    fn new(sharding: LocalSharding, limited: bool) -> Self {
+        Self {
+            phase: AtomicU8::new(if limited {
+                CONCURRENCY_CENTRAL
+            } else {
+                CONCURRENCY_SHARDED
+            }),
+            shards: ConcurrencyShards::new(sharding),
+            central: ConcurrencyCounter::default(),
+        }
+    }
+
+    /// Prepare the stable gauge before publishing a newly enabled ceiling.
+    fn configure_limit(&self, limited: bool) {
+        if limited {
+            let _transition = self.phase.compare_exchange(
+                CONCURRENCY_SHARDED,
+                CONCURRENCY_DRAINING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            self.promote_if_drained();
+        } else {
+            // A gauge that reached central remains there: its count is the
+            // evidence a later re-enable must retain. Only an activation that
+            // has not admitted central work can return to sharded tracking.
+            let _transition = self.phase.compare_exchange(
+                CONCURRENCY_DRAINING,
+                CONCURRENCY_SHARDED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    fn promote_if_drained(&self) {
+        if self.phase.load(Ordering::SeqCst) == CONCURRENCY_DRAINING && self.shards.is_empty() {
+            let _transition = self.phase.compare_exchange(
+                CONCURRENCY_DRAINING,
+                CONCURRENCY_CENTRAL,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    fn try_acquire(
+        &self,
+        limit: Option<std::num::NonZeroU32>,
+        locality: Locality,
+    ) -> Option<GaugePermit> {
+        loop {
+            match self.phase.load(Ordering::SeqCst) {
+                CONCURRENCY_SHARDED if limit.is_none() => {
+                    let (index, counter) = self.shards.select(locality);
+                    if !counter.try_increment(None) {
+                        return None;
+                    }
+                    if self.phase.load(Ordering::SeqCst) == CONCURRENCY_SHARDED {
+                        return Some(GaugePermit::shard(index));
+                    }
+                    // An activation raced this increment, so the permit is not
+                    // one the handoff can account for. Undo it and re-enter
+                    // through the phase that is now published; a caller with
+                    // no ceiling of its own must not be denied by someone
+                    // else's activation.
+                    self.release_shard(index);
+                }
+                CONCURRENCY_SHARDED => {
+                    self.configure_limit(true);
+                }
+                CONCURRENCY_DRAINING => {
+                    // Activation is a handoff, not an outage. Work already
+                    // counted on the locality shards is real in-flight work
+                    // and occupies the ceiling being published; everything it
+                    // leaves over is admitted centrally. Shards only shrink
+                    // while draining, so a scan that races a release is
+                    // conservative and a bounded central counter plus the
+                    // scanned residue can never exceed the ceiling.
+                    let Some(limit) = limit else {
+                        return self
+                            .central
+                            .try_increment(None)
+                            .then_some(GaugePermit::CENTRAL);
+                    };
+                    let headroom = limit.get().saturating_sub(self.shards.total());
+                    return std::num::NonZeroU32::new(headroom)
+                        .is_some_and(|headroom| self.central.try_increment(Some(headroom)))
+                        .then_some(GaugePermit::CENTRAL);
+                }
+                CONCURRENCY_CENTRAL => {
+                    return self
+                        .central
+                        .try_increment(limit)
+                        .then_some(GaugePermit::CENTRAL);
+                }
+                _ => unreachable!("concurrency phase is internal"),
+            }
+        }
+    }
+
+    fn release(&self, permit: GaugePermit) {
+        match permit.shard_index() {
+            Some(index) => self.release_shard(index),
+            None => {
+                self.central.decrement();
+            }
+        }
+    }
+
+    fn release_shard(&self, index: usize) {
+        if self.shards.get(index).decrement() == 0
+            && self.phase.load(Ordering::SeqCst) == CONCURRENCY_DRAINING
+        {
+            // Only the last permit on each formerly active shard scans, and
+            // only during the one-time activation handoff. Ordinary request
+            // acquisition remains direct-indexed.
+            self.promote_if_drained();
+        }
+    }
+
+    #[cfg(test)]
+    fn in_flight(&self) -> u32 {
+        self.shards.total().saturating_add(self.central.load())
+    }
+}
+
+/// Stable principal-local occupancy. The map registry holds only a `Weak`;
+/// installed and in-flight states keep the gauge alive until occupancy is
+/// back at zero, including across cache eviction and reinstall.
+#[derive(Debug)]
+pub(crate) struct PrincipalGauge(ConcurrencyGauge);
+
+impl PrincipalGauge {
+    fn new(sharding: LocalSharding, limited: bool) -> Self {
+        Self(ConcurrencyGauge::new(sharding, limited))
+    }
+}
+
+/// Stable per-account indirection shared by every principal.
+///
+/// Rate state is replaced because governor quotas are immutable, while the
+/// concurrency gauge stays here so a publication cannot reset live occupancy.
 #[derive(Debug)]
 pub(crate) struct AccountLimiter {
-    current: ArcSwap<AccountRateState>,
+    current: ArcSwap<AccountPolicyState>,
     config: std::sync::Mutex<LimiterConfig>,
+    concurrency: ConcurrencyGauge,
 }
 
 #[derive(Debug)]
 struct LimiterConfig {
     /// Highest generation whose limits are installed below.
     generation: Generation,
+    /// Exact account-rate policy represented by `installed` and `current`.
+    policy: AccountRatePolicy,
+    /// Exact account-wide concurrency ceiling represented by `current`.
+    max_concurrent_requests: Option<std::num::NonZeroU32>,
     installed: RateParams,
     /// Finest split every principal of this account can still spend in.
     ///
@@ -330,13 +683,22 @@ impl AccountLimiter {
     ) -> Self {
         let shard_ceiling = shard_ceiling(limits, maximum_quote);
         let params = rate_params(limits, sharding, shard_ceiling);
+        let policy = limits.account_rate_policy();
+        let rate = Arc::new(build_rate_state(policy, params));
+        let max_concurrent_requests = limits.max_concurrent_requests();
         Self {
-            current: ArcSwap::from_pointee(build_rate_state(params)),
+            current: ArcSwap::from_pointee(AccountPolicyState {
+                rate,
+                max_concurrent_requests,
+            }),
             config: std::sync::Mutex::new(LimiterConfig {
                 generation,
+                policy,
+                max_concurrent_requests,
                 installed: params,
                 shard_ceiling,
             }),
+            concurrency: ConcurrencyGauge::new(sharding, max_concurrent_requests.is_some()),
         }
     }
 
@@ -346,103 +708,214 @@ impl AccountLimiter {
         limits: &ResolvedLimits,
         maximum_quote: Option<CostUnits>,
         sharding: LocalSharding,
-    ) {
+    ) -> Arc<AccountPolicyState> {
         let mut config = self.config.lock().expect("limiter config poisoned");
         config.shard_ceiling = config
             .shard_ceiling
             .min(shard_ceiling(limits, maximum_quote));
-        // Strictly newer, so the first snapshot installed at a generation
-        // owns its limits. Two principals of one account carry the same
-        // account limits by design; if a misconfiguration makes them differ,
-        // a stable answer beats one that oscillates with install order.
-        let params = if generation > config.generation {
+        // Strictly newer, so the first accepted snapshot installed at a
+        // generation owns its account policy. If another principal at that
+        // generation differs, one stable account answer beats oscillating
+        // with install order; every request loads that answer below.
+        let (policy, max_concurrent_requests, params) = if generation > config.generation {
             config.generation = generation;
-            rate_params(limits, sharding, config.shard_ceiling)
+            (
+                limits.account_rate_policy(),
+                limits.max_concurrent_requests(),
+                rate_params(limits, sharding, config.shard_ceiling),
+            )
         } else {
-            // Too old to install its limits, but its ceiling still applies:
-            // re-split the installed rate and burst, keeping their totals.
-            RateParams {
-                shards: shard_count(config.installed.rate, sharding, config.shard_ceiling),
-                ..config.installed
-            }
+            // Too old to install its policy, but its maximum quote is still
+            // valid safety evidence for a currently admitting principal. It
+            // may tighten the layout published for subsequent requests.
+            (
+                config.policy,
+                config.max_concurrent_requests,
+                RateParams {
+                    weighted: config.installed.weighted.map(|params| BucketParams {
+                        shards: shard_count(params.rate, sharding, config.shard_ceiling),
+                        ..params
+                    }),
+                    ..config.installed
+                },
+            )
         };
-        if params != config.installed {
-            self.current.store(Arc::new(build_rate_state(params)));
+        if policy != config.policy
+            || max_concurrent_requests != config.max_concurrent_requests
+            || params != config.installed
+        {
+            if max_concurrent_requests != config.max_concurrent_requests {
+                // Close or relax the stable occupancy state before publishing
+                // the policy that asks request threads to enforce it.
+                self.concurrency
+                    .configure_limit(max_concurrent_requests.is_some());
+            }
+            let current = self.current.load_full();
+            let rate = if policy == config.policy && params == config.installed {
+                Arc::clone(&current.rate)
+            } else {
+                Arc::new(update_rate_state(policy, params, &current.rate))
+            };
+            let next = Arc::new(AccountPolicyState {
+                rate,
+                max_concurrent_requests,
+            });
+            self.current.store(Arc::clone(&next));
+            config.policy = policy;
+            config.max_concurrent_requests = max_concurrent_requests;
             config.installed = params;
+            return next;
         }
+        self.current.load_full()
+    }
+
+    pub(crate) fn load(&self) -> Guard<Arc<AccountPolicyState>> {
+        self.current.load()
     }
 
     #[cfg(test)]
-    pub(crate) fn check_n(
-        &self,
-        n: std::num::NonZeroU32,
-    ) -> Result<
-        Result<(), governor::NotUntil<governor::clock::QuantaInstant>>,
-        governor::InsufficientCapacity,
-    > {
-        self.check_n_at(n, Locality::current())
-    }
-
-    pub(crate) fn check_n_at(
-        &self,
-        n: std::num::NonZeroU32,
-        locality: Locality,
-    ) -> Result<
-        Result<(), governor::NotUntil<governor::clock::QuantaInstant>>,
-        governor::InsufficientCapacity,
-    > {
-        self.current.load().check_n_at(n, locality)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn current(&self) -> Arc<AccountRateState> {
+    pub(crate) fn current(&self) -> Arc<AccountPolicyState> {
         self.current.load_full()
     }
 }
 
 /// Everything the request path needs for one principal, resolved to a single
-/// `Arc`: the compiled snapshot, the account's weighted rate limiter, and the
-/// account's lease slot.
+/// `Arc`: the compiled principal snapshot, stable account/principal state,
+/// and the account's lease slot.
 #[derive(Debug)]
 #[repr(align(128))]
 pub struct AccountAdmissionState {
     pub snapshot: Arc<AccountSnapshot>,
     pub(crate) limiter: Arc<AccountLimiter>,
+    pub(crate) principal_gauge: Arc<PrincipalGauge>,
     pub lease: Arc<LeaseSlot>,
 }
 
 impl AccountAdmissionState {
     /// Compile the runtime state for a snapshot. The limiter comes from the
     /// map's per-account registry, never per principal — see
-    /// [`AccountLimiters`].
+    /// [`AdmissionStateRegistry`]. Account-wide rate and concurrency policy is
+    /// deliberately not copied into this principal-pinned object: each request
+    /// loads the limiter's single current authority instead.
     #[must_use]
     pub(crate) fn new(
         snapshot: Arc<AccountSnapshot>,
         lease: Arc<LeaseSlot>,
         limiter: Arc<AccountLimiter>,
+        principal_gauge: Arc<PrincipalGauge>,
     ) -> Arc<Self> {
         Arc::new(AccountAdmissionState {
             snapshot,
             limiter,
+            principal_gauge,
             lease,
         })
+    }
+
+    /// Record principal occupancy followed by account occupancy, enforcing
+    /// either ceiling when configured. The returned guard owns this exact
+    /// state, keeping both gauges strongly reachable until its one `Drop`
+    /// releases them. Occupancy is also recorded while a ceiling is absent so
+    /// a later publication can enable it without overlooking existing work.
+    pub(crate) fn acquire_concurrency(
+        state: Arc<Self>,
+        account_limit: Option<std::num::NonZeroU32>,
+        locality: Locality,
+    ) -> Result<ConcurrencyGuard, DenyReason> {
+        let principal_limit = state.snapshot.limits.principal_max_concurrent_requests();
+
+        let Some(principal_permit) = state
+            .principal_gauge
+            .0
+            .try_acquire(principal_limit, locality)
+        else {
+            return Err(DenyReason::ConcurrencyLimited);
+        };
+        let Some(account_permit) = state
+            .limiter
+            .concurrency
+            .try_acquire(account_limit, locality)
+        else {
+            state.principal_gauge.0.release(principal_permit);
+            return Err(DenyReason::ConcurrencyLimited);
+        };
+
+        Ok(ConcurrencyGuard {
+            state,
+            principal_permit,
+            account_permit,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn account_concurrency_in_flight(&self) -> u32 {
+        self.limiter.concurrency.in_flight()
+    }
+}
+
+/// RAII proof that this admission owns any configured concurrency slots.
+///
+/// There is intentionally no public `release`: one owner and one `Drop` make
+/// a second decrement unrepresentable through the admission API.
+#[derive(Debug)]
+pub(crate) struct ConcurrencyGuard {
+    state: Arc<AccountAdmissionState>,
+    principal_permit: GaugePermit,
+    account_permit: GaugePermit,
+}
+
+impl ConcurrencyGuard {
+    pub(crate) fn state(&self) -> &AccountAdmissionState {
+        &self.state
+    }
+}
+
+impl Drop for ConcurrencyGuard {
+    fn drop(&mut self) {
+        // Construction succeeds only after both occupancy increments. The
+        // guard is therefore the complete release proof; no mutable policy
+        // lookup or detachable reservation can change what Drop must undo.
+        self.state.limiter.concurrency.release(self.account_permit);
+        self.state.principal_gauge.0.release(self.principal_permit);
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RateParams {
+struct BucketParams {
     rate: u32,
     burst: u32,
     shards: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RateParams {
+    weighted: Option<BucketParams>,
+    requests: Option<BucketParams>,
+}
+
 fn rate_params(limits: &ResolvedLimits, sharding: LocalSharding, ceiling: usize) -> RateParams {
-    let weighted = limits.legacy_weighted_rate();
-    let rate = narrow(weighted.units_per_second());
     RateParams {
-        rate,
-        burst: narrow(weighted.burst_units()),
-        shards: shard_count(rate, sharding, ceiling),
+        weighted: limits.weighted_rate().map(|weighted| {
+            let rate = narrow(weighted.units_per_second());
+            BucketParams {
+                rate,
+                burst: narrow(weighted.burst_units()),
+                shards: shard_count(rate, sharding, ceiling),
+            }
+        }),
+        requests: limits.request_rate().map(|requests| {
+            let rate = requests.requests_per_second().get();
+            let burst = requests.burst_requests().get();
+            BucketParams {
+                rate,
+                burst,
+                shards: shard_count(
+                    rate,
+                    sharding,
+                    shard_ceiling_for(burst, std::num::NonZeroU32::MIN),
+                ),
+            }
+        }),
     }
 }
 
@@ -471,35 +944,56 @@ fn shard_ceiling(limits: &ResolvedLimits, maximum_quote: Option<CostUnits>) -> u
     let Some(maximum_quote) = maximum_quote else {
         return 1;
     };
-    let capacity =
-        narrow(limits.legacy_weighted_rate().burst_units()) / narrow(maximum_quote.get());
-    usize::try_from(capacity).unwrap_or(usize::MAX).max(1)
+    shard_ceiling_for(
+        narrow(limits.legacy_weighted_rate().burst_units()),
+        std::num::NonZeroU32::new(narrow(maximum_quote.get()))
+            .expect("narrow always returns nonzero"),
+    )
 }
 
-/// Per-account limiter registry owned by each snapshot map.
+fn shard_ceiling_for(burst: u32, maximum_weight: std::num::NonZeroU32) -> usize {
+    usize::try_from(burst / maximum_weight.get())
+        .unwrap_or(usize::MAX)
+        .max(1)
+}
+
+/// Runtime-state registry owned by each snapshot map.
 ///
 /// The advertised limits are *account* limits: every principal (API key) of
 /// an account must draw from one bucket, or N keys would multiply the
 /// account's allowance N-fold (review finding #4). Reinstalling snapshots
-/// with unchanged rate parameters keeps the existing limiter — and its
-/// consumed-token state — while a genuine limit change swaps in a fresh
-/// limiter for the whole account (governor's `Quota` is immutable by
-/// design).
+/// with unchanged parameters keeps each existing dimension's bucket and
+/// consumed tokens. A genuine dimension change builds only that dimension's
+/// replacement; every principal loads the resulting account authority on its
+/// next request.
+/// Stable account and principal gauges keep separate weak-registry entries.
 ///
 /// Scope note: this registry is per admission-engine instance, so the limit
 /// is enforced *per service instance*, not aggregated across a fleet —
 /// consistent with every other local mechanism here (leases aggregate spend
-/// globally; rate limits do not). Entries live as long as the map: bounded
-/// by account count.
-pub(crate) struct AccountLimiters {
+/// globally; rate and concurrency limits do not). Dead weak entries are
+/// swept with amortized O(1) work; live entries are bounded by installed and
+/// in-flight accounts/principals.
+pub(crate) struct AdmissionStateRegistry {
     inner: std::sync::Mutex<Registry>,
     sharding: LocalSharding,
 }
 
 #[derive(Default)]
 struct Registry {
-    by_account:
-        std::collections::HashMap<tollgate_core::AccountId, std::sync::Weak<AccountLimiter>>,
+    accounts: WeakRegistry<AccountId, AccountLimiter>,
+    principals: WeakRegistry<Principal, PrincipalGauge>,
+}
+
+/// The stable runtime objects one installed principal retains.
+#[derive(Clone)]
+pub(crate) struct ResolvedAdmissionState {
+    pub(crate) limiter: Arc<AccountLimiter>,
+    pub(crate) principal_gauge: Arc<PrincipalGauge>,
+}
+
+struct WeakRegistry<K, V> {
+    entries: std::collections::HashMap<K, std::sync::Weak<V>>,
     /// Size at the last sweep, so dead entries are reclaimed in proportion to
     /// how many have accumulated rather than on every single lookup.
     swept_at: usize,
@@ -514,11 +1008,22 @@ struct Registry {
     swept_entries: usize,
 }
 
-/// Below this many accounts a sweep is too cheap to be worth deferring, and
+impl<K, V> Default for WeakRegistry<K, V> {
+    fn default() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            swept_at: 0,
+            #[cfg(test)]
+            swept_entries: 0,
+        }
+    }
+}
+
+/// Below this many entries a sweep is too cheap to be worth deferring, and
 /// deferring it would let a tiny registry hold dead entries indefinitely.
 const SWEEP_FLOOR: usize = 8;
 
-impl Registry {
+impl<K: Eq + Hash, V> WeakRegistry<K, V> {
     /// Reclaim dead entries, but only once the registry has grown enough since
     /// the last sweep to be worth walking.
     ///
@@ -535,46 +1040,75 @@ impl Registry {
         // N. The floor keeps a small registry from being walked repeatedly on
         // the way up from empty.
         let threshold = self.swept_at.saturating_mul(2).max(SWEEP_FLOOR);
-        if self.by_account.len() <= threshold {
+        if self.entries.len() <= threshold {
             return;
         }
         #[cfg(test)]
         {
-            self.swept_entries += self.by_account.len();
+            self.swept_entries += self.entries.len();
         }
-        self.by_account
-            .retain(|_, limiter| limiter.strong_count() > 0);
-        self.swept_at = self.by_account.len();
+        self.entries.retain(|_, value| value.strong_count() > 0);
+        self.swept_at = self.entries.len();
+    }
+
+    fn resolve_with(&mut self, key: K, build: impl FnOnce() -> Arc<V>) -> Arc<V> {
+        if let Some(value) = self.entries.get(&key).and_then(std::sync::Weak::upgrade) {
+            return value;
+        }
+        let value = build();
+        self.entries.insert(key, Arc::downgrade(&value));
+        value
+    }
+}
+
+impl Registry {
+    fn sweep_if_overgrown(&mut self) {
+        self.accounts.sweep_if_overgrown();
+        self.principals.sweep_if_overgrown();
     }
 
     fn resolve(
         &mut self,
-        account: tollgate_core::AccountId,
+        principal: Principal,
+        account: AccountId,
         generation: Generation,
         limits: &ResolvedLimits,
         maximum_quote: Option<CostUnits>,
         sharding: LocalSharding,
-    ) -> Arc<AccountLimiter> {
-        if let Some(limiter) = self
-            .by_account
+    ) -> ResolvedAdmissionState {
+        let existing = self
+            .accounts
+            .entries
             .get(&account)
-            .and_then(std::sync::Weak::upgrade)
-        {
+            .and_then(std::sync::Weak::upgrade);
+        let limiter = if let Some(limiter) = existing {
             limiter.update(generation, limits, maximum_quote, sharding);
-            return limiter;
+            limiter
+        } else {
+            let limiter = Arc::new(AccountLimiter::new(
+                generation,
+                limits,
+                maximum_quote,
+                sharding,
+            ));
+            self.accounts
+                .entries
+                .insert(account, Arc::downgrade(&limiter));
+            limiter
+        };
+        let principal_limited = limits.principal_max_concurrent_requests().is_some();
+        let principal_gauge = self.principals.resolve_with(principal, || {
+            Arc::new(PrincipalGauge::new(sharding, principal_limited))
+        });
+        principal_gauge.0.configure_limit(principal_limited);
+        ResolvedAdmissionState {
+            limiter,
+            principal_gauge,
         }
-        let limiter = Arc::new(AccountLimiter::new(
-            generation,
-            limits,
-            maximum_quote,
-            sharding,
-        ));
-        self.by_account.insert(account, Arc::downgrade(&limiter));
-        limiter
     }
 }
 
-impl AccountLimiters {
+impl AdmissionStateRegistry {
     pub(crate) fn new(sharding: LocalSharding) -> Self {
         Self {
             inner: std::sync::Mutex::new(Registry::default()),
@@ -582,19 +1116,26 @@ impl AccountLimiters {
         }
     }
 
-    /// Fetch the account's shared limiter, building or swapping it when the
-    /// snapshot's rate parameters differ from the installed ones. Called at
-    /// control-plane frequency only.
-    pub(crate) fn limiter_for(
+    /// Resolve stable account/principal state for one accepted snapshot.
+    /// Called at control-plane frequency only.
+    pub(crate) fn state_for(
         &self,
-        account: tollgate_core::AccountId,
+        principal: Principal,
+        account: AccountId,
         generation: Generation,
         limits: &ResolvedLimits,
         maximum_quote: Option<CostUnits>,
-    ) -> Arc<AccountLimiter> {
-        let mut inner = self.inner.lock().expect("limiter registry poisoned");
+    ) -> ResolvedAdmissionState {
+        let mut inner = self.inner.lock().expect("admission registry poisoned");
         inner.sweep_if_overgrown();
-        inner.resolve(account, generation, limits, maximum_quote, self.sharding)
+        inner.resolve(
+            principal,
+            account,
+            generation,
+            limits,
+            maximum_quote,
+            self.sharding,
+        )
     }
 
     /// Resolve a whole batch under one lock.
@@ -605,38 +1146,41 @@ impl AccountLimiters {
     /// different generations, and de-duplicating by account would silently
     /// drop one of them. What is shared is the lock and the sweep decision,
     /// not the update.
-    pub(crate) fn limiters_for<T>(
+    pub(crate) fn states_for<T>(
         &self,
         batch: impl IntoIterator<Item = T>,
-        mut key: impl FnMut(&T) -> (tollgate_core::AccountId, Generation),
+        mut key: impl FnMut(&T) -> (Principal, AccountId, Generation),
         mut limits: impl FnMut(&T) -> ResolvedLimits,
         mut maximum_quote: impl FnMut(&T) -> Option<CostUnits>,
-    ) -> Vec<(T, Arc<AccountLimiter>)> {
-        let mut inner = self.inner.lock().expect("limiter registry poisoned");
+    ) -> Vec<(T, ResolvedAdmissionState)> {
+        let mut inner = self.inner.lock().expect("admission registry poisoned");
         inner.sweep_if_overgrown();
         batch
             .into_iter()
             .map(|item| {
-                let (account, generation) = key(&item);
-                let limiter = inner.resolve(
+                let (principal, account, generation) = key(&item);
+                let state = inner.resolve(
+                    principal,
                     account,
                     generation,
                     &limits(&item),
                     maximum_quote(&item),
                     self.sharding,
                 );
-                (item, limiter)
+                (item, state)
             })
             .collect()
     }
 
-    /// How many accounts the registry is holding, live or not yet reclaimed.
+    /// How many account entries the registry is holding, live or not yet
+    /// reclaimed.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.inner
             .lock()
-            .expect("limiter registry poisoned")
-            .by_account
+            .expect("admission registry poisoned")
+            .accounts
+            .entries
             .len()
     }
 
@@ -644,14 +1188,12 @@ impl AccountLimiters {
     /// exists to bound.
     #[cfg(test)]
     pub(crate) fn swept_entries(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("limiter registry poisoned")
-            .swept_entries
+        let inner = self.inner.lock().expect("admission registry poisoned");
+        inner.accounts.swept_entries + inner.principals.swept_entries
     }
 }
 
-impl Default for AccountLimiters {
+impl Default for AdmissionStateRegistry {
     fn default() -> Self {
         Self::new(LocalSharding::SINGLE)
     }
@@ -665,19 +1207,29 @@ fn build_limiter(rate: u32, burst: u32) -> AccountRateLimiter {
     // These clamps decide bucket *construction* only, never a verdict. A
     // schedule whose burst cannot hold a request is refused upstream in
     // `AdmissionEngine::admit`, comparing the quote against
-    // `rate_burst_units` in full width — so `burst = 0` denies every priced
-    // request as `UnpriceableUnderLimits` rather than silently behaving like
-    // a burst of 1, and a burst above u32::MAX admits by the same comparison
-    // it was configured with (#40). The `max(1)` below exists because
-    // governor requires a nonzero quota, not to repair a configured value.
-    let quota = Quota::per_second(rate.try_into().expect("nonzero by max(1)"))
-        .allow_burst(burst.try_into().expect("nonzero by max(1)"));
+    // `rate_burst_units` in full width — so a burst above u32::MAX admits by
+    // the same comparison it was configured with (#40). `narrow` supplies the
+    // `max(1)` these conversions rely on because governor requires a nonzero
+    // quota, not to repair a configured value.
+    //
+    // `burst = 0` cannot arrive through publication: `PublishableSnapshot`
+    // rejects it as `WeightedRateOutsideGovernorDomain`. It reaches here only
+    // through the unvalidated `SnapshotMap::install` seam, and the full-width
+    // comparison denies every priced request as `UnpriceableUnderLimits`
+    // rather than letting the clamped bucket behave like a burst of one.
+    //
+    // Both arguments are nonzero before this call: the weighted dimension
+    // through `narrow`, the request dimension by its `NonZeroU32` type, and a
+    // shard's `partition` share because `shard_count` never exceeds the value
+    // it splits.
+    let quota = Quota::per_second(rate.try_into().expect("nonzero before this call"))
+        .allow_burst(burst.try_into().expect("nonzero before this call"));
     RateLimiter::direct(quota)
 }
 
-fn build_rate_state(params: RateParams) -> AccountRateState {
+fn build_buckets(params: BucketParams) -> Buckets {
     if params.shards == 1 {
-        return AccountRateState::Single(build_limiter(params.rate, params.burst));
+        return Buckets::Single(build_limiter(params.rate, params.burst));
     }
     let shards = (0..params.shards)
         .map(|index| {
@@ -689,7 +1241,45 @@ fn build_rate_state(params: RateParams) -> AccountRateState {
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    AccountRateState::Sharded(shards)
+    Buckets::Sharded(shards)
+}
+
+fn build_rate_state(policy: AccountRatePolicy, params: RateParams) -> RateState {
+    RateState {
+        policy,
+        weighted: params.weighted.map(build_configured_buckets),
+        requests: params.requests.map(build_configured_buckets),
+    }
+}
+
+fn update_rate_state(
+    policy: AccountRatePolicy,
+    params: RateParams,
+    current: &RateState,
+) -> RateState {
+    RateState {
+        policy,
+        weighted: update_rate_dimension(current.weighted.as_ref(), params.weighted),
+        requests: update_rate_dimension(current.requests.as_ref(), params.requests),
+    }
+}
+
+fn update_rate_dimension(
+    current: Option<&Arc<ConfiguredBuckets>>,
+    params: Option<BucketParams>,
+) -> Option<Arc<ConfiguredBuckets>> {
+    match (current, params) {
+        (Some(current), Some(params)) if current.params == params => Some(Arc::clone(current)),
+        (_, Some(params)) => Some(build_configured_buckets(params)),
+        (_, None) => None,
+    }
+}
+
+fn build_configured_buckets(params: BucketParams) -> Arc<ConfiguredBuckets> {
+    Arc::new(ConfiguredBuckets {
+        params,
+        buckets: build_buckets(params),
+    })
 }
 
 fn partition(total: u64, count: usize, index: usize) -> u64 {
@@ -969,6 +1559,7 @@ impl<T: SnapshotMap + ?Sized> SnapshotMap for Arc<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::num::{NonZeroU32, NonZeroUsize};
     use tollgate_core::{AccountId, CostUnits, FencingToken, LeaseGrant, LeaseId};
 
@@ -987,6 +1578,173 @@ mod tests {
             },
             CostUnits::ZERO,
         ))
+    }
+
+    proptest! {
+        /// Whatever account policy generation wins, the one request-loaded
+        /// authority carries its exact rate and concurrency policy.
+        #[test]
+        fn resolved_account_authority_carries_the_generation_winners_policy(
+            first_generation in any::<u64>(),
+            incoming_generation in any::<u64>(),
+            first_enabled in any::<bool>(),
+            incoming_enabled in any::<bool>(),
+            first_requests_enabled in any::<bool>(),
+            incoming_requests_enabled in any::<bool>(),
+            first_concurrency_enabled in any::<bool>(),
+            incoming_concurrency_enabled in any::<bool>(),
+            first_rate in 1u64..=u64::from(u32::MAX),
+            first_burst in 1u64..=u64::from(u32::MAX),
+            incoming_rate in 1u64..=u64::from(u32::MAX),
+            incoming_burst in 1u64..=u64::from(u32::MAX),
+            first_request_rate in any::<NonZeroU32>(),
+            first_request_burst in any::<NonZeroU32>(),
+            incoming_request_rate in any::<NonZeroU32>(),
+            incoming_request_burst in any::<NonZeroU32>(),
+            first_concurrency in any::<NonZeroU32>(),
+            incoming_concurrency in any::<NonZeroU32>(),
+        ) {
+            let policy = |weighted_enabled,
+                          requests_enabled,
+                          concurrency_enabled,
+                          rate,
+                          burst,
+                          request_rate,
+                          request_burst,
+                          concurrency| {
+                let limits = if weighted_enabled {
+                    ResolvedLimits::new(64).with_weighted_rate(rate, burst)
+                } else {
+                    ResolvedLimits::new(64)
+                        .with_weighted_rate_compatibility_fallback(rate, burst)
+                };
+                let limits = if requests_enabled {
+                    limits.with_request_rate(request_rate, request_burst)
+                } else {
+                    limits
+                };
+                if concurrency_enabled {
+                    limits.with_concurrency(concurrency, None).unwrap()
+                } else {
+                    limits
+                }
+            };
+            let first = policy(
+                first_enabled,
+                first_requests_enabled,
+                first_concurrency_enabled,
+                first_rate,
+                first_burst,
+                first_request_rate,
+                first_request_burst,
+                first_concurrency,
+            );
+            let incoming = policy(
+                incoming_enabled,
+                incoming_requests_enabled,
+                incoming_concurrency_enabled,
+                incoming_rate,
+                incoming_burst,
+                incoming_request_rate,
+                incoming_request_burst,
+                incoming_concurrency,
+            );
+            let limiter = AccountLimiter::new(
+                Generation(first_generation),
+                &first,
+                None,
+                LocalSharding::SINGLE,
+            );
+            let before = limiter.current();
+
+            let resolved = limiter.update(
+                Generation(incoming_generation),
+                &incoming,
+                None,
+                LocalSharding::SINGLE,
+            );
+            let expected = if incoming_generation > first_generation {
+                incoming.account_rate_policy()
+            } else {
+                first.account_rate_policy()
+            };
+            prop_assert_eq!(resolved.rate().policy(), expected);
+            let expected_concurrency = if incoming_generation > first_generation {
+                incoming.max_concurrent_requests()
+            } else {
+                first.max_concurrent_requests()
+            };
+            prop_assert_eq!(resolved.max_concurrent_requests(), expected_concurrency);
+
+            let expected_limits = if incoming_generation > first_generation {
+                &incoming
+            } else {
+                &first
+            };
+            let before_params = rate_params(&first, LocalSharding::SINGLE, 1);
+            let expected_params = rate_params(expected_limits, LocalSharding::SINGLE, 1);
+            if before_params.weighted == expected_params.weighted {
+                match (&before.rate.weighted, &resolved.rate.weighted) {
+                    (Some(before), Some(resolved)) => {
+                        prop_assert!(Arc::ptr_eq(before, resolved));
+                    }
+                    (None, None) => {}
+                    _ => prop_assert!(false, "equal weighted configuration changed presence"),
+                }
+            }
+            if before_params.requests == expected_params.requests {
+                match (&before.rate.requests, &resolved.rate.requests) {
+                    (Some(before), Some(resolved)) => {
+                        prop_assert!(Arc::ptr_eq(before, resolved));
+                    }
+                    (None, None) => {}
+                    _ => prop_assert!(false, "equal request configuration changed presence"),
+                }
+            }
+        }
+
+        /// Occupancy is tracked even without a configured ceiling. Publishing
+        /// a ceiling later therefore applies to the exact work already in
+        /// flight instead of starting from a fresh zero — and the handoff
+        /// admits against that ceiling rather than suspending admission until
+        /// the pre-existing work drains.
+        #[test]
+        fn enabling_a_concurrency_ceiling_observes_unbounded_occupancy(
+            existing in 0u32..100,
+            limit in any::<NonZeroU32>(),
+        ) {
+            let gauge = ConcurrencyGauge::new(LocalSharding::SINGLE, false);
+            let mut permits = Vec::new();
+            for _ in 0..existing {
+                permits.push(
+                    gauge
+                        .try_acquire(None, Locality::current())
+                        .expect("the unbounded representation has room"),
+                );
+            }
+
+            let during_handoff = gauge.try_acquire(Some(limit), Locality::current());
+            prop_assert_eq!(during_handoff.is_some(), limit.get() > existing);
+            if let Some(permit) = during_handoff {
+                prop_assert!(permit.shard_index().is_none());
+                prop_assert!(gauge.in_flight() <= limit.get().max(existing));
+                gauge.release(permit);
+            }
+            // A caller that carries no ceiling of its own is never denied by
+            // another policy's activation.
+            let unbounded = gauge
+                .try_acquire(None, Locality::current())
+                .expect("the handoff does not close unlimited admission");
+            gauge.release(unbounded);
+            for permit in permits {
+                gauge.release(permit);
+            }
+            let after_drain = gauge
+                .try_acquire(Some(limit), Locality::current())
+                .expect("a nonzero ceiling admits after old occupancy drains");
+            gauge.release(after_drain);
+            prop_assert_eq!(gauge.in_flight(), 0);
+        }
     }
 
     /// `state.rs` carried no tests at all, and the slot's whole job is to say
@@ -1094,13 +1852,21 @@ mod tests {
             Some(CostUnits(100)),
             LocalSharding::new(NonZeroUsize::new(8).unwrap()),
         );
-        assert_eq!(limiter.current.load().shard_count(), 8);
+        let current = limiter.current();
+        let weighted = current.rate().weighted().expect("weighted rate configured");
+        assert_eq!(weighted.shard_count(), 8);
 
         let request = NonZeroU32::new(100).unwrap();
         for _ in 0..8 {
-            assert_eq!(limiter.check_n(request), Ok(Ok(())));
+            assert_eq!(
+                weighted.check_n_at(request, Locality::current()),
+                Ok(Ok(()))
+            );
         }
-        assert!(matches!(limiter.check_n(request), Ok(Err(_))));
+        assert!(matches!(
+            weighted.check_n_at(request, Locality::current()),
+            Ok(Err(_))
+        ));
     }
 
     #[test]
@@ -1122,13 +1888,25 @@ mod tests {
 
         let ceiling = shard_ceiling(&limits, Some(CostUnits(300)));
         assert_eq!(ceiling, 1);
-        assert_eq!(rate_params(&limits, eight, ceiling).shards, 1);
+        assert_eq!(
+            rate_params(&limits, eight, ceiling)
+                .weighted
+                .expect("weighted rate configured")
+                .shards,
+            1
+        );
 
         // The bound is exact, not conservative: five shards of a 500-unit
         // burst are each 100 units, which is precisely one maximum quote.
         let ceiling = shard_ceiling(&limits, Some(CostUnits(100)));
         assert_eq!(ceiling, 5);
-        assert_eq!(rate_params(&limits, eight, ceiling).shards, 5);
+        assert_eq!(
+            rate_params(&limits, eight, ceiling)
+                .weighted
+                .expect("weighted rate configured")
+                .shards,
+            5
+        );
     }
 
     /// The limiter is shared by every principal of the account, but the
@@ -1144,15 +1922,19 @@ mod tests {
 
         // A light principal installs first: eight buckets of 100 units.
         let limiter = AccountLimiter::new(Generation(7), &limits, Some(CostUnits(10)), eight);
-        assert_eq!(limiter.current().shard_count(), 8);
+        assert_eq!(
+            limiter.current().rate().weighted().unwrap().shard_count(),
+            8
+        );
 
         // A second principal of the same account, at the same generation,
         // prices a 500-unit request. Its quote fits the account's burst, so
         // publication accepted it and admission must too.
-        limiter.update(Generation(7), &limits, Some(CostUnits(500)), eight);
-        assert_eq!(limiter.current().shard_count(), 1);
+        let narrowed = limiter.update(Generation(7), &limits, Some(CostUnits(500)), eight);
+        let weighted = narrowed.rate().weighted().unwrap();
+        assert_eq!(weighted.shard_count(), 1);
         assert_eq!(
-            limiter.check_n(NonZeroU32::new(500).unwrap()),
+            weighted.check_n_at(NonZeroU32::new(500).unwrap(), Locality::current()),
             Ok(Ok(())),
             "a quote within the account's burst must be admissible"
         );
@@ -1166,10 +1948,13 @@ mod tests {
         let limits = ResolvedLimits::new(1).with_weighted_rate(800, 800);
         let eight = LocalSharding::new(NonZeroUsize::new(8).unwrap());
         let limiter = AccountLimiter::new(Generation(1), &limits, Some(CostUnits(10)), eight);
-        assert_eq!(limiter.current().shard_count(), 8);
+        assert_eq!(
+            limiter.current().rate().weighted().unwrap().shard_count(),
+            8
+        );
 
-        limiter.update(Generation(2), &limits, None, eight);
-        assert_eq!(limiter.current().shard_count(), 1);
+        let collapsed = limiter.update(Generation(2), &limits, None, eight);
+        assert_eq!(collapsed.rate().weighted().unwrap().shard_count(), 1);
     }
 
     /// Only a *strictly* newer generation installs its limits, so the first
@@ -1195,9 +1980,150 @@ mod tests {
         );
 
         assert_eq!(
-            limiter.config.lock().unwrap().installed.burst,
+            limiter
+                .config
+                .lock()
+                .unwrap()
+                .installed
+                .weighted
+                .unwrap()
+                .burst,
             800,
             "a same-generation snapshot cannot rewrite the installed limits"
+        );
+    }
+
+    /// `update` arms the gauge *before* it stores the policy, so no request
+    /// can load a ceiling the occupancy state is not yet tracking. Ordering
+    /// is the whole contract here: enforcement that arrives after publication
+    /// leaves a window in which the published ceiling is unenforceable, which
+    /// is INVARIANTS.md #25's failure mode rather than a slow start.
+    #[test]
+    fn publishing_a_ceiling_arms_the_gauge_before_the_policy_is_readable() {
+        let unlimited = ResolvedLimits::new(1);
+        let limiter = AccountLimiter::new(
+            Generation(1),
+            &unlimited,
+            Some(CostUnits(10)),
+            LocalSharding::SINGLE,
+        );
+        assert_eq!(
+            limiter.concurrency.phase.load(Ordering::SeqCst),
+            CONCURRENCY_SHARDED,
+            "an account with no ceiling tracks occupancy on the locality shards"
+        );
+
+        let limited = ResolvedLimits::new(1)
+            .with_concurrency(NonZeroU32::new(4).unwrap(), None)
+            .expect("an account ceiling with no principal ceiling is valid");
+        limiter.update(
+            Generation(2),
+            &limited,
+            Some(CostUnits(10)),
+            LocalSharding::SINGLE,
+        );
+
+        assert_eq!(
+            limiter.concurrency.phase.load(Ordering::SeqCst),
+            CONCURRENCY_CENTRAL,
+            "an idle gauge reaches the central ceiling within the publishing call"
+        );
+        assert_eq!(
+            limiter
+                .current
+                .load_full()
+                .max_concurrent_requests()
+                .map(NonZeroU32::get),
+            Some(4),
+            "and the policy readers load names that same ceiling"
+        );
+    }
+
+    /// The relax half of the same publication point. An operator who
+    /// withdraws a ceiling while its activation handoff is still draining
+    /// must get the gauge back to sharded tracking; a gauge left draining
+    /// keeps routing unlimited callers through the central counter, which is
+    /// the contended path the shards exist to avoid.
+    ///
+    /// A gauge that already reached *central* deliberately stays there — its
+    /// count is the evidence a later re-enable retains — so this covers only
+    /// the transition `configure_limit` is allowed to undo.
+    #[test]
+    fn withdrawing_a_ceiling_mid_handoff_returns_the_gauge_to_sharded_tracking() {
+        let eight = LocalSharding::new(NonZeroUsize::new(8).unwrap());
+        let unlimited = ResolvedLimits::new(1);
+        let limiter = AccountLimiter::new(Generation(1), &unlimited, Some(CostUnits(10)), eight);
+
+        // Old work holds a shard, so the activation below cannot complete its
+        // handoff and the gauge stays draining.
+        let draining = limiter
+            .concurrency
+            .try_acquire(None, Locality::current())
+            .expect("unbounded tracking admits");
+        assert!(draining.shard_index().is_some());
+
+        let limited = ResolvedLimits::new(1)
+            .with_concurrency(NonZeroU32::new(4).unwrap(), None)
+            .expect("an account ceiling with no principal ceiling is valid");
+        limiter.update(Generation(2), &limited, Some(CostUnits(10)), eight);
+        assert_eq!(
+            limiter.concurrency.phase.load(Ordering::SeqCst),
+            CONCURRENCY_DRAINING,
+            "the outstanding shard permit holds the handoff open"
+        );
+
+        limiter.update(Generation(3), &unlimited, Some(CostUnits(10)), eight);
+        assert_eq!(
+            limiter.concurrency.phase.load(Ordering::SeqCst),
+            CONCURRENCY_SHARDED,
+            "withdrawing the ceiling before central work exists undoes the arming"
+        );
+        assert!(
+            limiter
+                .current
+                .load_full()
+                .max_concurrent_requests()
+                .is_none(),
+            "and the published policy no longer carries a ceiling"
+        );
+
+        limiter.concurrency.release(draining);
+        assert_eq!(limiter.concurrency.in_flight(), 0);
+    }
+
+    /// Reinstalling the same limits at a newer generation is a no-op, and the
+    /// published `AccountPolicyState` must be the *same* `Arc` afterwards.
+    ///
+    /// Every request loads this pointer, so republishing on an idempotent
+    /// re-install would churn the arc-swap readers see for no behavioral
+    /// reason. The three-way inequality above is what decides that, and until
+    /// now its only witness was the randomized proptest below: it kills a
+    /// mutation of the first comparison about eleven runs in twelve, which
+    /// made the mutation gate report a survivor or not depending on the seed.
+    /// A generated witness proves the property over a range; it cannot be the
+    /// gate for one branch.
+    #[test]
+    fn reinstalling_identical_limits_does_not_republish_the_policy() {
+        let limits = ResolvedLimits::new(1).with_weighted_rate(800, 800);
+        let limiter = AccountLimiter::new(
+            Generation(1),
+            &limits,
+            Some(CostUnits(10)),
+            LocalSharding::SINGLE,
+        );
+        let before = limiter.current.load_full();
+
+        limiter.update(
+            Generation(2),
+            &limits,
+            Some(CostUnits(10)),
+            LocalSharding::SINGLE,
+        );
+
+        let after = limiter.current.load_full();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "an update that changes no limit must not republish the policy readers load"
         );
     }
 
@@ -1217,7 +2143,172 @@ mod tests {
 
         let config = limiter.config.lock().unwrap();
         assert_eq!(config.generation, Generation(9), "older limits stay out");
-        assert_eq!(config.installed.burst, 800, "and so does the older burst");
-        assert_eq!(config.installed.shards, 2, "but its ceiling still binds");
+        let weighted = config.installed.weighted.unwrap();
+        assert_eq!(weighted.burst, 800, "and so does the older burst");
+        assert_eq!(weighted.shards, 2, "but its ceiling still binds");
+    }
+
+    #[test]
+    fn concurrent_gauge_never_exceeds_its_ceiling_and_releases_exactly_once() {
+        let gauge = Arc::new(ConcurrencyGauge::new(LocalSharding::SINGLE, true));
+        let maximum_seen = Arc::new(AtomicU32::new(0));
+        let limit = NonZeroU32::new(3).unwrap();
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let gauge = Arc::clone(&gauge);
+                let maximum_seen = Arc::clone(&maximum_seen);
+                scope.spawn(move || {
+                    for _ in 0..2_000 {
+                        if let Some(permit) = gauge.try_acquire(Some(limit), Locality::current()) {
+                            maximum_seen.fetch_max(gauge.in_flight(), Ordering::Relaxed);
+                            std::thread::yield_now();
+                            gauge.release(permit);
+                        }
+                    }
+                });
+            }
+        });
+
+        assert!(maximum_seen.load(Ordering::Relaxed) <= limit.get());
+        assert_eq!(gauge.in_flight(), 0);
+    }
+
+    #[test]
+    fn unbounded_gauge_fails_closed_at_its_representation_limit() {
+        let gauge = ConcurrencyGauge::new(LocalSharding::SINGLE, true);
+        gauge.central.0.store(u32::MAX, Ordering::Relaxed);
+
+        assert!(gauge.try_acquire(None, Locality::current()).is_none());
+        assert_eq!(gauge.in_flight(), u32::MAX);
+    }
+
+    #[test]
+    fn activation_drains_shard_permits_before_using_the_central_counter() {
+        let sharding = LocalSharding::new(std::num::NonZeroUsize::new(8).unwrap());
+        let gauge = ConcurrencyGauge::new(sharding, false);
+        let old = gauge
+            .try_acquire(None, Locality::current())
+            .expect("unbounded tracking admits");
+        assert!(old.shard_index().is_some());
+
+        gauge.configure_limit(true);
+        assert_eq!(gauge.phase.load(Ordering::SeqCst), CONCURRENCY_DRAINING);
+        assert!(
+            gauge
+                .try_acquire(Some(NonZeroU32::MIN), Locality::current())
+                .is_none(),
+            "the shard permit already occupies a ceiling of one"
+        );
+
+        gauge.release(old);
+        assert_eq!(gauge.phase.load(Ordering::SeqCst), CONCURRENCY_CENTRAL);
+        let central = gauge
+            .try_acquire(Some(NonZeroU32::MIN), Locality::current())
+            .expect("the drained handoff activates the central ceiling");
+        assert!(central.shard_index().is_none());
+        gauge.release(central);
+        assert_eq!(gauge.in_flight(), 0);
+    }
+
+    /// The regression the draining phase used to carry: enabling a ceiling
+    /// denied *every* caller, whatever its own policy said, until the longest
+    /// request already running finished. A slow handler therefore turned an
+    /// operator publishing a limit into an account-wide outage of unbounded
+    /// length, reported as ordinary saturation.
+    #[test]
+    fn activation_admits_within_the_new_ceiling_while_old_work_drains() {
+        let sharding = LocalSharding::new(std::num::NonZeroUsize::new(8).unwrap());
+        let gauge = ConcurrencyGauge::new(sharding, false);
+        let slow = gauge
+            .try_acquire(None, Locality::current())
+            .expect("unbounded tracking admits");
+
+        gauge.configure_limit(true);
+        assert_eq!(gauge.phase.load(Ordering::SeqCst), CONCURRENCY_DRAINING);
+
+        let limit = NonZeroU32::new(3).unwrap();
+        let mut admitted = Vec::new();
+        while let Some(permit) = gauge.try_acquire(Some(limit), Locality::current()) {
+            assert!(permit.shard_index().is_none());
+            admitted.push(permit);
+            assert!(admitted.len() < 8, "the handoff must still bound admission");
+        }
+        assert_eq!(
+            admitted.len(),
+            2,
+            "the draining shard permit occupies one of the three slots"
+        );
+        assert_eq!(gauge.in_flight(), limit.get());
+
+        // A principal still on the older, unlimited policy is not denied by
+        // the account's activation either.
+        let unlimited = gauge
+            .try_acquire(None, Locality::current())
+            .expect("no ceiling, no denial");
+        gauge.release(unlimited);
+
+        gauge.release(slow);
+        assert_eq!(
+            gauge.phase.load(Ordering::SeqCst),
+            CONCURRENCY_CENTRAL,
+            "the last old shard permit still promotes"
+        );
+        assert!(
+            gauge
+                .try_acquire(Some(limit), Locality::current())
+                .is_some_and(|permit| {
+                    gauge.release(permit);
+                    true
+                }),
+            "the drained slot is reusable under the central ceiling"
+        );
+        for permit in admitted {
+            gauge.release(permit);
+        }
+        assert_eq!(gauge.in_flight(), 0);
+    }
+
+    /// Activation racing acquisition must not manufacture a denial for a
+    /// caller whose own policy carries no ceiling.
+    #[test]
+    fn a_concurrent_activation_never_denies_an_unlimited_caller() {
+        let gauge = Arc::new(ConcurrencyGauge::new(LocalSharding::SINGLE, false));
+        let denials = Arc::new(AtomicU32::new(0));
+
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let gauge = Arc::clone(&gauge);
+                let denials = Arc::clone(&denials);
+                scope.spawn(move || {
+                    for _ in 0..5_000 {
+                        match gauge.try_acquire(None, Locality::current()) {
+                            Some(permit) => gauge.release(permit),
+                            None => {
+                                denials.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+            let gauge = Arc::clone(&gauge);
+            scope.spawn(move || {
+                for _ in 0..5_000 {
+                    gauge.configure_limit(true);
+                    gauge.configure_limit(false);
+                }
+            });
+        });
+
+        assert_eq!(denials.load(Ordering::Relaxed), 0);
+        assert_eq!(gauge.in_flight(), 0);
+    }
+
+    #[test]
+    fn concurrency_guard_carries_the_exact_occupied_state() {
+        assert_eq!(
+            std::mem::size_of::<ConcurrencyGuard>(),
+            3 * std::mem::size_of::<Arc<AccountAdmissionState>>()
+        );
     }
 }

@@ -1000,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_baseline_is_a_valid_pre_change_subset_of_the_manifest() {
+    fn checked_in_baseline_is_a_valid_subset_with_owned_rows_recorded() {
         let manifest: Manifest =
             serde_json::from_str(include_str!("../../../testing/perf_thresholds.json")).unwrap();
         let baseline: Baseline =
@@ -1010,14 +1010,22 @@ mod tests {
             manifest.benchmarks.iter().map(|entry| &entry.id).collect();
 
         assert_eq!(baseline.host.id, "mistral-apple-m1-pro");
-        assert_eq!(entries.len(), 14);
         assert!(
             entries.keys().all(|id| manifest_ids.contains(id)),
             "a baseline row must name a benchmark the gate still runs"
         );
+        for owned in [
+            "admission/request_rate_token",
+            "admission/concurrency_acquire",
+        ] {
+            assert!(
+                entries.contains_key(owned),
+                "the owner that activates {owned} must record its controlled-host baseline"
+            );
+        }
         assert!(
             entries.len() < manifest.benchmarks.len(),
-            "#90's new rows deliberately have no pre-change measurement"
+            "not every historical benchmark has a controlled-host recording yet"
         );
     }
 

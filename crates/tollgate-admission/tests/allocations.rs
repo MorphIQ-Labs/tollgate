@@ -1,5 +1,5 @@
 use std::hint::black_box;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -35,6 +35,18 @@ fn far_future() -> Timestamp {
 }
 
 fn snapshot(account: AccountId, mode: EnforcementMode) -> Arc<AccountSnapshot> {
+    snapshot_with_limits(
+        account,
+        mode,
+        ResolvedLimits::new(4_096).with_weighted_rate(u64::from(u32::MAX), u64::from(u32::MAX)),
+    )
+}
+
+fn snapshot_with_limits(
+    account: AccountId,
+    mode: EnforcementMode,
+    limits: ResolvedLimits,
+) -> Arc<AccountSnapshot> {
     Arc::new(
         AccountSnapshot::builder(
             account,
@@ -42,7 +54,7 @@ fn snapshot(account: AccountId, mode: EnforcementMode) -> Arc<AccountSnapshot> {
             AccountStatus::Active,
             far_future(),
             PermissionBits::bit(0),
-            ResolvedLimits::new(4_096).with_weighted_rate(u64::from(u32::MAX), u64::from(u32::MAX)),
+            limits,
             Arc::new(
                 CostTable::builder(CostUnits(50), CostUnits(50))
                     .weight(&PriceOp, CostUnits(1))
@@ -52,6 +64,22 @@ fn snapshot(account: AccountId, mode: EnforcementMode) -> Arc<AccountSnapshot> {
         .enforcement_mode(mode)
         .build(),
     )
+}
+
+fn engine_with_limits(limits: ResolvedLimits) -> AdmissionEngine<ArcSwapSnapshotMap> {
+    let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+    let slot = LeaseSlot::for_account(AccountId(1));
+    slot.install(lease(
+        AccountId(1),
+        CostUnits(u64::MAX / 2),
+        LocalSharding::SINGLE,
+    ));
+    engine.map().install(
+        Principal(1),
+        snapshot_with_limits(AccountId(1), EnforcementMode::Strict, limits),
+        slot,
+    );
+    engine
 }
 
 fn lease(account: AccountId, units: CostUnits, sharding: LocalSharding) -> Arc<LocalLease> {
@@ -106,7 +134,7 @@ fn admit_and_cancel(engine: &AdmissionEngine<ArcSwapSnapshotMap>, principal: Pri
     let admitted = engine
         .admit(request(principal, PermissionBits::bit(0)), now())
         .unwrap();
-    black_box(admitted.reservation.cancel());
+    black_box(admitted.cancel());
 }
 
 fn assert_zero(scope: &str, operation: impl FnOnce()) {
@@ -186,6 +214,43 @@ fn admission_allocates_nothing_on_the_arc_swap_default() {
     });
     assert_zero("admission/arc_swap_lease_exhausted_elastic", || {
         admit_and_cancel(&elastic_exhausted, Principal(1));
+    });
+}
+
+#[test]
+fn configured_and_disabled_guards_allocate_nothing_after_warmup() {
+    black_box(Locality::current());
+    let request_rate = engine_with_limits(
+        ResolvedLimits::new(4_096)
+            .with_weighted_rate(u64::from(u32::MAX), u64::from(u32::MAX))
+            .with_request_rate(
+                NonZeroU32::new(u32::MAX).unwrap(),
+                NonZeroU32::new(u32::MAX).unwrap(),
+            ),
+    );
+    let concurrency = engine_with_limits(
+        ResolvedLimits::new(4_096)
+            .with_weighted_rate(u64::from(u32::MAX), u64::from(u32::MAX))
+            .with_concurrency(
+                NonZeroU32::new(u32::MAX).unwrap(),
+                Some(NonZeroU32::new(u32::MAX).unwrap()),
+            )
+            .unwrap(),
+    );
+    let disabled = engine_with_limits(ResolvedLimits::new(4_096));
+
+    for engine in [&request_rate, &concurrency, &disabled] {
+        admit_and_cancel(engine, Principal(1));
+    }
+
+    assert_zero("admission/request_rate_token", || {
+        admit_and_cancel(&request_rate, Principal(1));
+    });
+    assert_zero("admission/concurrency_acquire", || {
+        admit_and_cancel(&concurrency, Principal(1));
+    });
+    assert_zero("admission/guards_disabled", || {
+        admit_and_cancel(&disabled, Principal(1));
     });
 }
 
@@ -345,7 +410,7 @@ fn admit_consults_the_map_exactly_once() {
         let admitted = engine
             .admit(request(Principal(1), PermissionBits::bit(0)), now())
             .unwrap();
-        black_box(admitted.reservation.cancel());
+        black_box(admitted.cancel());
     });
     assert_lookup(&engine, || {
         black_box(
@@ -372,6 +437,6 @@ fn admit_consults_the_map_exactly_once() {
         let admitted = engine
             .admit(request(Principal(3), PermissionBits::bit(0)), now())
             .unwrap();
-        black_box(admitted.reservation.cancel());
+        black_box(admitted.cancel());
     });
 }

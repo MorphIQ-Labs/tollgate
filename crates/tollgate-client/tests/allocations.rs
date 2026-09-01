@@ -162,7 +162,7 @@ async fn embedding_path_allocates_nothing_after_warmup() {
 
     let engine = install_admission(principal);
     let warm = engine.admit(request(principal), now()).unwrap();
-    black_box(warm.reservation.cancel());
+    black_box(warm.cancel());
 
     let (_, caller_buffer) = AllocScope::measure(|| {
         let mut body = Vec::with_capacity(128);
@@ -187,9 +187,8 @@ async fn embedding_path_allocates_nothing_after_warmup() {
             .expect("cached credential");
         let permit = recorder.try_reserve().expect("warmed queue has capacity");
         let admitted = engine.admit(request(authenticated), now()).unwrap();
-        let (charge, units) =
-            ChargeGuard::commit(&admitted.reservation, permit, request_id, now()).unwrap();
-        black_box(units);
+        let charge = ChargeGuard::commit(admitted, permit, request_id, now()).unwrap();
+        black_box(charge.units());
         drop(charge);
     });
     record("embedding/cached_auth_through_record", "tollgate", tollgate);

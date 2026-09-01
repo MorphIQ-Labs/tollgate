@@ -11,9 +11,10 @@
 //! shutdown misbehaves.
 #![allow(clippy::let_underscore_must_use)]
 
+use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 
 use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
@@ -182,14 +183,73 @@ impl Visit for FieldCollector {
     }
 }
 
-impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Captor {
+thread_local! {
+    /// The capturing test's buffer, if this thread is inside `capture()`.
+    static SINK: RefCell<Option<Captor>> = const { RefCell::new(None) };
+}
+
+/// The one subscriber this binary ever installs, and it is installed
+/// *globally* rather than per test with `tracing::subscriber::set_default`.
+///
+/// That is not a style choice. `tracing` caches each callsite's `Interest`
+/// in a process-global slot, and computes it the first time any thread hits
+/// that callsite — against *that* thread's current dispatcher
+/// (`tracing_core::callsite::Rebuilder::JustOne` calls `get_default`). A
+/// thread-local subscriber therefore does not make the decision thread-local:
+/// one test reaching `reclaim_sweep`'s `info!` with no dispatcher installed
+/// caches `Interest::never()` for the whole process, and every *other* test's
+/// capture of that event silently returns nothing. That is invisible on a
+/// developer box, where libtest runs one test per core, and reproducible on a
+/// two-vCPU runner, where exactly two tests interleave.
+///
+/// A global dispatcher is what makes the failure unrepresentable: every
+/// thread always has a real subscriber, so interest is never `never`, whether
+/// or not the test that first reaches a callsite is capturing. Per-test
+/// isolation moves to `SINK`, which is genuinely thread-local.
+struct Router;
+
+impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Router {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        let mut collector = FieldCollector(Vec::new());
-        event.record(&mut collector);
-        self.0.lock().unwrap().push(Captured {
-            level: *event.metadata().level(),
-            fields: collector.0,
+        SINK.with(|sink| {
+            let Some(captor) = sink.borrow().clone() else {
+                return;
+            };
+            let mut collector = FieldCollector(Vec::new());
+            event.record(&mut collector);
+            captor.0.lock().unwrap().push(Captured {
+                level: *event.metadata().level(),
+                fields: collector.0,
+            });
         });
+    }
+}
+
+/// Install `Router` as the process-wide dispatcher. Idempotent, and called
+/// from every path that can reach a callsite — see `Router` for why the
+/// install must happen before the first emission rather than lazily.
+fn install_subscriber() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Router))
+            .expect("this binary installs the global subscriber exactly once");
+    });
+}
+
+/// Capture this thread's events until the guard drops.
+fn capture() -> (Captor, CaptureGuard) {
+    install_subscriber();
+    let captor = Captor::default();
+    SINK.with(|sink| *sink.borrow_mut() = Some(captor.clone()));
+    (captor, CaptureGuard)
+}
+
+/// Detaches this thread's sink, so a later test on the same libtest thread
+/// starts from an empty buffer.
+struct CaptureGuard;
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        SINK.with(|sink| *sink.borrow_mut() = None);
     }
 }
 
@@ -209,18 +269,36 @@ fn store_with_expired_lease() -> Arc<MemoryStore> {
     store
 }
 
-/// Run `serve` against the given store for long enough to sweep, then stop.
-async fn serve_briefly(store: Arc<FlakyReclaimStore>, clock: Arc<dyn tollgate_store::Clock>) {
+/// The only way this binary starts a server, and therefore the only way it
+/// can reach `reclaim_sweep`'s callsites. Installing the global subscriber
+/// here is what makes the hazard described on `Router` unreachable: a test
+/// that captures nothing still cannot be the first to register a callsite
+/// against an absent dispatcher, because there is never an absent dispatcher.
+async fn spawn_server(
+    store: Arc<FlakyReclaimStore>,
+    clock: Arc<dyn tollgate_store::Clock>,
+    reclaim_interval: std::time::Duration,
+) -> (
+    tokio::task::JoinHandle<std::io::Result<()>>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    install_subscriber();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(serve(
         listener,
         ServerState { store, clock },
-        std::time::Duration::from_millis(10),
+        reclaim_interval,
         async move {
             let _ = stop_rx.await;
         },
     ));
+    (server, stop_tx)
+}
+
+/// Run `serve` against the given store for long enough to sweep, then stop.
+async fn serve_briefly(store: Arc<FlakyReclaimStore>, clock: Arc<dyn tollgate_store::Clock>) {
+    let (server, stop_tx) = spawn_server(store, clock, std::time::Duration::from_millis(10)).await;
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     let _ = stop_tx.send(());
     let _ = server.await;
@@ -243,9 +321,7 @@ async fn the_server_reclaims_expired_leases_on_its_interval() {
         fail_on_call: None,
         calls: AtomicU32::new(0),
     });
-    let captor = Captor::default();
-    let guard =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(captor.clone()));
+    let (captor, guard) = capture();
     // A clock past the lease's expiry, so the sweep has something to reclaim.
     serve_briefly(
         Arc::clone(&store),
@@ -321,19 +397,12 @@ async fn one_scheduled_sweep_drains_every_saturated_batch() {
         fail_on_call: None,
         calls: AtomicU32::new(0),
     });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(serve(
-        listener,
-        ServerState {
-            store: Arc::clone(&store),
-            clock: Arc::new(tollgate_store::ManualClock::new(t(120))),
-        },
+    let (server, stop_tx) = spawn_server(
+        Arc::clone(&store),
+        Arc::new(tollgate_store::ManualClock::new(t(120))),
         std::time::Duration::from_secs(3_600),
-        async move {
-            let _ = stop_rx.await;
-        },
-    ));
+    )
+    .await;
 
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         while store.calls.load(Ordering::Acquire) < 2 {
@@ -368,22 +437,13 @@ async fn a_failed_later_batch_reports_already_committed_progress() {
         fail_on_call: Some(2),
         calls: AtomicU32::new(0),
     });
-    let captor = Captor::default();
-    let guard =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(captor.clone()));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(serve(
-        listener,
-        ServerState {
-            store: Arc::clone(&store),
-            clock: Arc::new(tollgate_store::ManualClock::new(t(120))),
-        },
+    let (captor, guard) = capture();
+    let (server, stop_tx) = spawn_server(
+        Arc::clone(&store),
+        Arc::new(tollgate_store::ManualClock::new(t(120))),
         std::time::Duration::from_secs(3_600),
-        async move {
-            let _ = stop_rx.await;
-        },
-    ));
+    )
+    .await;
 
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
@@ -444,9 +504,7 @@ async fn a_recovering_sweep_reports_how_many_failures_it_took() {
         fail_on_call: None,
         calls: AtomicU32::new(0),
     });
-    let captor = Captor::default();
-    let guard =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(captor.clone()));
+    let (captor, guard) = capture();
     serve_briefly(Arc::clone(&store), Arc::new(SystemClock)).await;
     drop(guard);
 
@@ -474,9 +532,7 @@ async fn a_recovering_sweep_reports_how_many_failures_it_took() {
 /// the only signal there is, since `/readyz` still answers OK.
 #[tokio::test]
 async fn a_failing_sweep_reports_consecutive_failures() {
-    let captor = Captor::default();
-    let guard =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(captor.clone()));
+    let (captor, guard) = capture();
 
     let store = Arc::new(FlakyReclaimStore {
         inner: store_with_expired_lease(),
