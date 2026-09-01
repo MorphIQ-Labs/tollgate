@@ -240,7 +240,7 @@ async fn http_negative_ttl_refetches_without_push() {
                 Timestamp::now(),
             ) {
                 Ok(admitted) => {
-                    admitted.reservation.cancel();
+                    admitted.cancel();
                     break;
                 }
                 Err(DenyReason::UnknownPrincipal) => {
@@ -364,17 +364,12 @@ async fn full_stack_over_loopback_http() {
                 Timestamp::now(),
             ) {
                 Ok(admitted) => {
-                    admitted
-                        .reservation
-                        .commit_at_execution_start(Timestamp::now())
-                        .unwrap();
                     request_seq += 1;
-                    let event = admitted
-                        .reservation
-                        .usage_event(RequestId(request_seq), Timestamp::now())
+                    let committed = admitted
+                        .commit(RequestId(request_seq), Timestamp::now())
                         .unwrap();
-                    permit.record(event);
-                    committed_units += admitted.quote.total.get();
+                    permit.record(committed.usage_event());
+                    committed_units += committed.units().get();
                     round_commits += 1;
                 }
                 Err(

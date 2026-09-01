@@ -1,17 +1,18 @@
 //! The admission pipeline itself.
 
 use std::num::NonZeroU32;
+#[cfg(test)]
 use std::sync::Arc;
 
 use jiff::Timestamp;
 
 use tollgate_core::{
-    AccountSnapshot, CostQuote, CostUnits, DenyReason, Locality, OpIndex, PermissionBits,
-    QuoteError, Reservation,
+    AccountSnapshot, CancelOutcome, CommitError, CostQuote, CostUnits, DenyReason, Locality,
+    OpIndex, PermissionBits, QuoteError, RequestId, Reservation, UsageEvent,
 };
 
 use crate::counters::AdmissionCounters;
-use crate::state::{AccountAdmissionState, MapEntry, Principal, SnapshotMap};
+use crate::state::{AccountAdmissionState, ConcurrencyGuard, MapEntry, Principal, SnapshotMap};
 
 /// One request's admission inputs. `items` is the batch size (1 for a single
 /// request); the quote is `fixed + weight(op) * items`, floored at the
@@ -24,15 +25,112 @@ pub struct AdmissionRequest<'a, O: OpIndex> {
     pub items: u64,
 }
 
-/// A fully admitted request: the caller executes the work, calls
-/// [`Reservation::commit_at_execution_start`] when execution begins, and
-/// emits the usage event from the committed reservation. Dropping this
-/// without committing charges zero.
+/// A fully admitted request. Call [`Self::commit`] when execution begins;
+/// dropping or explicitly cancelling this value before then charges zero.
+///
+/// The funding reservation and concurrency permits have no separate public
+/// accessors. Committing consumes this proof into [`CommittedAdmission`], so
+/// safe code cannot release occupancy while retaining committed funding.
+///
+/// The reservation is unreachable because the field is private, and the error
+/// code is pinned so this witness cannot pass for an unrelated reason: making
+/// the field public compiles (E0616 disappears), and renaming it reports E0609
+/// instead. Either way the doctest fails and the invariant is re-examined.
+///
+/// ```compile_fail,E0616
+/// fn detach(admitted: tollgate_admission::Admitted) {
+///     let _raw = admitted.reservation;
+/// }
+/// ```
+///
+/// Its companion: the supported path compiles, so the refusal above can never
+/// be a refusal of an API that stopped existing.
+///
+/// ```
+/// # fn execute(
+/// #     admitted: tollgate_admission::Admitted,
+/// #     request_id: tollgate_core::RequestId,
+/// #     now: jiff::Timestamp,
+/// # ) -> Result<tollgate_admission::CommittedAdmission, tollgate_core::CommitError> {
+/// admitted.commit(request_id, now)
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct Admitted {
-    pub snapshot: Arc<AccountSnapshot>,
-    pub quote: CostQuote,
-    pub reservation: Reservation,
+    quote: CostQuote,
+    reservation: Reservation,
+    // Last by construction: pending funding resolves before the in-flight
+    // gauges release when an admitted value is dropped without committing.
+    _concurrency: ConcurrencyGuard,
+}
+
+impl Admitted {
+    /// The principal snapshot that supplied status, permissions, request
+    /// shape, pricing, funding mode, and generation for this admission.
+    /// Account-wide rate and concurrency policy is loaded independently from
+    /// the account's canonical authority.
+    #[must_use]
+    pub fn snapshot(&self) -> &AccountSnapshot {
+        &self._concurrency.state().snapshot
+    }
+
+    /// The charge reserved for this request.
+    #[must_use]
+    pub const fn quote(&self) -> CostQuote {
+        self.quote
+    }
+
+    /// Cancel before execution and release both funding and concurrency.
+    pub fn cancel(self) -> CancelOutcome {
+        self.reservation.cancel()
+    }
+
+    /// Commit at execution start and transfer this entire admission proof
+    /// into the returned execution guard.
+    ///
+    /// A failed commit consumes and drops the proof, releasing concurrency;
+    /// the caller must not execute. A successful commit returns the only
+    /// public source of its billing event while retaining the exact permits.
+    pub fn commit(
+        self,
+        request_id: RequestId,
+        now: Timestamp,
+    ) -> Result<CommittedAdmission, CommitError> {
+        let units = self.reservation.commit_at_execution_start(now)?;
+        let event = self
+            .reservation
+            .usage_event(request_id, now)
+            .expect("a successful commit always yields its usage event");
+        Ok(CommittedAdmission {
+            event,
+            units,
+            _admitted: self,
+        })
+    }
+}
+
+/// A committed request whose concurrency occupancy remains held for the
+/// execution lifetime. Dropping this guard ends that lifetime.
+#[derive(Debug)]
+#[must_use = "dropping the guard releases this request's concurrency occupancy"]
+pub struct CommittedAdmission {
+    event: UsageEvent,
+    units: CostUnits,
+    _admitted: Admitted,
+}
+
+impl CommittedAdmission {
+    /// The full charge committed at execution start.
+    #[must_use]
+    pub const fn units(&self) -> CostUnits {
+        self.units
+    }
+
+    /// The billing event proven by this committed admission.
+    #[must_use]
+    pub const fn usage_event(&self) -> UsageEvent {
+        self.event
+    }
 }
 
 /// The engine: a snapshot map plus the pipeline. Generic over the map so the
@@ -130,8 +228,24 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
                 QuoteError::Overflow => DenyReason::CostOverflow,
             })?;
 
-        // 4. Weighted rate token. Cost-weighted: heavy requests draw down the
-        //    bucket proportionally.
+        // Account-wide policy has one mutable authority shared by every
+        // principal. Load it once so rate and concurrency decisions are from
+        // one generation even if the control plane publishes concurrently.
+        let account = state.limiter.load();
+        let rate = account.rate();
+
+        // 4. Request-count token. Every priced request costs exactly one,
+        //    independently of its cost-weighted charge.
+        if let Some(requests) = rate.requests() {
+            match requests.check_n_at(NonZeroU32::MIN, locality) {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => return Err(DenyReason::RequestRateLimited),
+            }
+        }
+
+        // 5. Weighted rate token. Cost-weighted: heavy requests draw down the
+        //    bucket proportionally. A disabled bucket performs no governor
+        //    check and the carried legacy pair remains rollout data only.
         //
         //    A weight beyond the bucket's whole burst can never pass, however
         //    long the caller waits — that is a schedule whose batch cap admits
@@ -141,38 +255,48 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
         //    honest: the weight is known to fit the bucket before it is
         //    narrowed, so narrowing can no longer disguise an unadmittable
         //    request as an ordinary empty bucket.
-        let legacy_rate = limits.legacy_weighted_rate();
-        if quote.total.get() > legacy_rate.burst_units() {
-            return Err(DenyReason::UnpriceableUnderLimits {
-                weight: quote.total,
-                burst_units: CostUnits(legacy_rate.burst_units()),
-            });
-        }
-        let weight = u32::try_from(quote.total.get()).unwrap_or(u32::MAX);
-        match NonZeroU32::new(weight) {
-            // Zero-cost requests draw no token; the minimum-charge floor
-            // makes this unreachable for any real table.
-            None => {}
-            Some(n) => match state.limiter.check_n_at(n, locality) {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => return Err(DenyReason::RateLimited),
-                // Unreachable: the check above clears the quote against the
-                // account's whole burst, and a split bucket's shards are
-                // sized to admit the largest quote any principal sharing the
-                // account can present (`shard_ceiling`), so clearing the
-                // whole burst clears every shard. Kept because "the bucket
-                // cannot ever hold this" must never be reported as "the
-                // bucket is momentarily empty".
-                Err(_) => {
-                    return Err(DenyReason::UnpriceableUnderLimits {
-                        weight: quote.total,
-                        burst_units: CostUnits(legacy_rate.burst_units()),
-                    });
-                }
-            },
+        if let Some(weighted_rate) = rate.policy().weighted_rate() {
+            if quote.total.get() > weighted_rate.burst_units() {
+                return Err(DenyReason::UnpriceableUnderLimits {
+                    weight: quote.total,
+                    burst_units: CostUnits(weighted_rate.burst_units()),
+                });
+            }
+            let weight = u32::try_from(quote.total.get()).unwrap_or(u32::MAX);
+            match NonZeroU32::new(weight) {
+                // Zero-cost requests draw no token; the minimum-charge floor
+                // makes this unreachable for any real table.
+                None => {}
+                Some(n) => match rate
+                    .weighted()
+                    .expect("configured weighted rate has an installed bucket")
+                    .check_n_at(n, locality)
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => return Err(DenyReason::RateLimited),
+                    // Unreachable: the check above clears the quote against
+                    // the whole burst, and split buckets are sized so every
+                    // legitimate maximum quote fits at least one shard.
+                    Err(_) => {
+                        return Err(DenyReason::UnpriceableUnderLimits {
+                            weight: quote.total,
+                            burst_units: CostUnits(weighted_rate.burst_units()),
+                        });
+                    }
+                },
+            }
         }
 
-        // 5. Quota: debit the lease and open the state machine. Note the
+        // 6. Concurrency: principal first, then account. The RAII guard undoes
+        //    either acquisition on every later refusal and remains held by
+        //    `Admitted` for the caller's full in-flight interval.
+        let concurrency = AccountAdmissionState::acquire_concurrency(
+            state,
+            account.max_concurrent_requests(),
+            locality,
+        )?;
+
+        // 7. Quota: debit the lease and open the state machine. Note the
         //    deliberate ordering — a lease-denied request has still consumed
         //    its rate token, because it did arrive and was priced.
         //
@@ -194,15 +318,18 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
         //    bucket — every one of those still denies with zero charge under
         //    either mode, because none of them is a statement about funding
         //    (INVARIANTS.md #1, #5).
-        let reservation = match Self::reserve_from_lease(&state, quote.total, now, locality) {
-            Ok(reservation) => reservation,
-            Err(denied) => Self::reserve_from_overage(&state, quote.total, denied)?,
-        };
+        let reservation =
+            match Self::reserve_from_lease(concurrency.state(), quote.total, now, locality) {
+                Ok(reservation) => reservation,
+                Err(denied) => {
+                    Self::reserve_from_overage(concurrency.state(), quote.total, denied)?
+                }
+            };
 
         Ok(Admitted {
-            snapshot: Arc::clone(&state.snapshot),
             quote,
             reservation,
+            _concurrency: concurrency,
         })
     }
 
@@ -868,8 +995,12 @@ mod tests {
     }
 
     fn request(items: u64) -> AdmissionRequest<'static, Op> {
+        request_for(Principal(1), items)
+    }
+
+    fn request_for(principal: Principal, items: u64) -> AdmissionRequest<'static, Op> {
         AdmissionRequest {
-            principal: Principal(1),
+            principal,
             required: PermissionBits::bit(0),
             op: &Op::Price,
             items,
@@ -990,6 +1121,535 @@ mod tests {
         );
     }
 
+    #[test]
+    fn request_rate_limiter_counts_requests_not_cost() {
+        let limits = ResolvedLimits::new(64)
+            .with_weighted_rate(1_000_000, 1_000_000)
+            .with_request_rate(NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap());
+        let engine = engine_with_limits(limits);
+
+        // Different quotes each consume one request token.
+        drop(engine.admit(request(1), t(0)).unwrap());
+        drop(engine.admit(request(64), t(0)).unwrap());
+        assert_eq!(
+            engine.admit(request(1), t(0)).unwrap_err(),
+            DenyReason::RequestRateLimited
+        );
+    }
+
+    #[test]
+    fn disabled_weighted_rate_performs_no_weighted_check() {
+        let engine = engine_with_limits(
+            ResolvedLimits::new(64).with_weighted_rate_compatibility_fallback(1, 1),
+        );
+
+        // Every request quotes far beyond the fallback burst. A new reader
+        // treats that pair as rollout data when the explicit flag disables
+        // the bucket, while an old reader conservatively keeps enforcing it.
+        for _ in 0..3 {
+            drop(engine.admit(request(64), t(0)).unwrap());
+        }
+    }
+
+    #[test]
+    fn changing_disabled_weighted_fallback_does_not_refill_request_rate() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease(1_000_000));
+
+        let mut original = (*snapshot(AccountStatus::Active)).clone();
+        original.limits = ResolvedLimits::new(64)
+            .with_weighted_rate_compatibility_fallback(1, 1)
+            .with_request_rate(NonZeroU32::MIN, NonZeroU32::MIN);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(original), Arc::clone(&slot));
+
+        drop(engine.admit(request(1), t(0)).unwrap());
+        assert_eq!(
+            engine.admit(request(1), t(0)).unwrap_err(),
+            DenyReason::RequestRateLimited
+        );
+
+        let mut compatibility_only = (*snapshot(AccountStatus::Active)).clone();
+        compatibility_only.generation = Generation(2);
+        compatibility_only.limits = ResolvedLimits::new(64)
+            .with_weighted_rate_compatibility_fallback(2, 2)
+            .with_request_rate(NonZeroU32::MIN, NonZeroU32::MIN);
+        engine.map().install(
+            Principal(1),
+            Arc::new(compatibility_only),
+            Arc::clone(&slot),
+        );
+
+        assert_eq!(
+            engine.admit(request(1), t(0)).unwrap_err(),
+            DenyReason::RequestRateLimited,
+            "inactive compatibility metadata cannot refill an unchanged request bucket"
+        );
+    }
+
+    #[test]
+    fn enabling_request_rate_does_not_refill_weighted_rate() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease(1_000_000));
+
+        let mut weighted_only = (*snapshot(AccountStatus::Active)).clone();
+        weighted_only.limits = ResolvedLimits::new(64).with_weighted_rate(1, 51);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(weighted_only), Arc::clone(&slot));
+
+        drop(engine.admit(request(1), t(0)).unwrap());
+        assert_eq!(
+            engine.admit(request(1), t(0)).unwrap_err(),
+            DenyReason::RateLimited
+        );
+
+        let mut request_rate_added = (*snapshot(AccountStatus::Active)).clone();
+        request_rate_added.generation = Generation(2);
+        request_rate_added.limits = ResolvedLimits::new(64)
+            .with_weighted_rate(1, 51)
+            .with_request_rate(
+                NonZeroU32::new(1_000_000).unwrap(),
+                NonZeroU32::new(1_000_000).unwrap(),
+            );
+        engine.map().install(
+            Principal(1),
+            Arc::new(request_rate_added),
+            Arc::clone(&slot),
+        );
+
+        assert_eq!(
+            engine.admit(request(1), t(0)).unwrap_err(),
+            DenyReason::RateLimited,
+            "changing request-rate policy cannot refill an unchanged weighted bucket"
+        );
+    }
+
+    /// Two valid principal snapshots can share an account and generation but
+    /// disagree about whether weighted rate is enabled. The account bucket
+    /// selected by the first publication must be the policy advertised by the
+    /// second installed state too; otherwise admission dereferences a bucket
+    /// the state does not contain and aborts in production.
+    #[test]
+    fn divergent_enabled_snapshot_cannot_outlive_a_disabled_account_bucket() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease(1_000_000));
+
+        let mut disabled = (*snapshot(AccountStatus::Active)).clone();
+        disabled.limits = ResolvedLimits::new(64)
+            .with_weighted_rate_compatibility_fallback(1_000_000, 1_000_000)
+            .with_request_rate(NonZeroU32::MIN, NonZeroU32::MIN);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(disabled), Arc::clone(&slot));
+
+        let mut enabled = (*snapshot(AccountStatus::Active)).clone();
+        enabled.limits = ResolvedLimits::new(64)
+            .with_weighted_rate(1_000_000, 1_000_000)
+            .with_request_rate(NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
+        engine
+            .map()
+            .install(Principal(2), Arc::new(enabled), Arc::clone(&slot));
+
+        let admitted = engine
+            .admit(request_for(Principal(2), 1), t(0))
+            .expect("the canonical disabled account bucket performs no check");
+        let MapEntry::Present(state) = engine.map().get(&Principal(2)).unwrap() else {
+            panic!("principal present");
+        };
+        let account = state.limiter.current();
+        assert_eq!(account.rate().policy().weighted_rate(), None);
+        assert_eq!(
+            account
+                .rate()
+                .policy()
+                .request_rate()
+                .expect("the canonical request bucket is enabled")
+                .burst_requests(),
+            NonZeroU32::MIN,
+        );
+        drop(admitted);
+    }
+
+    /// The inverse mismatch must not let a principal whose submitted snapshot
+    /// disables weighted rate bypass the enabled account bucket it joined.
+    #[test]
+    fn divergent_disabled_snapshot_cannot_bypass_an_enabled_account_bucket() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease(1_000_000));
+
+        let mut enabled = (*snapshot(AccountStatus::Active)).clone();
+        enabled.limits = ResolvedLimits::new(64).with_weighted_rate(1, 51);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(enabled), Arc::clone(&slot));
+
+        let mut disabled = (*snapshot(AccountStatus::Active)).clone();
+        disabled.limits =
+            ResolvedLimits::new(64).with_weighted_rate_compatibility_fallback(1_000_000, 1_000_000);
+        engine
+            .map()
+            .install(Principal(2), Arc::new(disabled), Arc::clone(&slot));
+
+        drop(
+            engine
+                .admit(request_for(Principal(2), 1), t(0))
+                .expect("the first request consumes the whole account burst"),
+        );
+        assert_eq!(
+            engine
+                .admit(request_for(Principal(2), 1), t(0))
+                .unwrap_err(),
+            DenyReason::RateLimited
+        );
+    }
+
+    /// Tightening a shared bucket's safe shard count publishes one new
+    /// account authority. An already-installed principal must load that same
+    /// authority on its next request instead of continuing to refill and
+    /// spend an old partition in parallel.
+    #[test]
+    fn shard_tightening_cannot_leave_two_spendable_account_buckets() {
+        let sharding = LocalSharding::new(std::num::NonZeroUsize::new(8).unwrap());
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::with_sharding(sharding));
+        let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
+        slot.install(lease(1_000_000));
+
+        let priced = |quote: u64| {
+            let snapshot = Arc::new(
+                AccountSnapshot::builder(
+                    AccountId(1),
+                    Generation(1),
+                    AccountStatus::Active,
+                    t(10_000),
+                    PermissionBits::bit(0),
+                    ResolvedLimits::new(1).with_weighted_rate(1, 800),
+                    Arc::new(
+                        CostTable::builder(CostUnits(quote), CostUnits(quote))
+                            .weight(&Op::Price, CostUnits::ZERO)
+                            .build(),
+                    ),
+                )
+                .build(),
+            );
+            PublishableSnapshot::try_new(snapshot).unwrap()
+        };
+        engine
+            .map()
+            .install_publishable(Principal(1), priced(100), Arc::clone(&slot));
+        engine
+            .map()
+            .install_publishable(Principal(2), priced(500), Arc::clone(&slot));
+
+        for _ in 0..8 {
+            drop(
+                engine
+                    .admit(request_for(Principal(1), 1), t(0))
+                    .expect("the shared 800-unit burst admits eight 100-unit requests"),
+            );
+        }
+        assert_eq!(
+            engine
+                .admit(request_for(Principal(2), 1), t(0))
+                .unwrap_err(),
+            DenyReason::RateLimited,
+            "the heavier principal cannot retain a second account bucket"
+        );
+    }
+
+    #[test]
+    fn account_concurrency_is_held_for_the_admitted_lifetime() {
+        let limits = ResolvedLimits::new(64)
+            .with_weighted_rate(1_000_000, 1_000_000)
+            .with_concurrency(NonZeroU32::new(1).unwrap(), None)
+            .unwrap();
+        let engine = engine_with_limits(limits);
+
+        let first = engine.admit(request(1), t(0)).unwrap();
+        assert_eq!(
+            engine.admit(request(1), t(0)).unwrap_err(),
+            DenyReason::ConcurrencyLimited
+        );
+        drop(first);
+        drop(engine.admit(request(1), t(0)).unwrap());
+    }
+
+    #[test]
+    fn every_principal_observes_the_canonical_account_concurrency_ceiling() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease(1_000_000));
+
+        let mut bounded = (*snapshot(AccountStatus::Active)).clone();
+        bounded.limits = ResolvedLimits::new(64)
+            .with_weighted_rate(1_000_000, 1_000_000)
+            .with_concurrency(NonZeroU32::MIN, None)
+            .unwrap();
+        engine
+            .map()
+            .install(Principal(1), Arc::new(bounded), Arc::clone(&slot));
+
+        let mut unbounded = (*snapshot(AccountStatus::Active)).clone();
+        unbounded.limits = ResolvedLimits::new(64).with_weighted_rate(1_000_000, 1_000_000);
+        engine
+            .map()
+            .install(Principal(2), Arc::new(unbounded), Arc::clone(&slot));
+
+        let mut wider = (*snapshot(AccountStatus::Active)).clone();
+        wider.limits = ResolvedLimits::new(64)
+            .with_weighted_rate(1_000_000, 1_000_000)
+            .with_concurrency(NonZeroU32::new(8).unwrap(), None)
+            .unwrap();
+        engine
+            .map()
+            .install(Principal(3), Arc::new(wider), Arc::clone(&slot));
+
+        let held = engine
+            .admit(request_for(Principal(2), 1), t(0))
+            .expect("the canonical account slot is initially free");
+        assert_eq!(
+            engine
+                .admit(request_for(Principal(1), 1), t(0))
+                .unwrap_err(),
+            DenyReason::ConcurrencyLimited,
+            "an unbounded sibling must not bypass the account's selected ceiling"
+        );
+        assert_eq!(
+            engine
+                .admit(request_for(Principal(3), 1), t(0))
+                .unwrap_err(),
+            DenyReason::ConcurrencyLimited,
+            "a larger sibling value cannot widen the selected account ceiling"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn newer_account_concurrency_policy_reaches_existing_principals() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease(1_000_000));
+
+        let mut original = (*snapshot(AccountStatus::Active)).clone();
+        original.limits = ResolvedLimits::new(64)
+            .with_weighted_rate(1_000_000, 1_000_000)
+            .with_concurrency(NonZeroU32::new(2).unwrap(), None)
+            .unwrap();
+        engine
+            .map()
+            .install(Principal(1), Arc::new(original), Arc::clone(&slot));
+
+        let mut narrower = (*snapshot(AccountStatus::Active)).clone();
+        narrower.generation = Generation(2);
+        narrower.limits = ResolvedLimits::new(64)
+            .with_weighted_rate(1_000_000, 1_000_000)
+            .with_concurrency(NonZeroU32::MIN, None)
+            .unwrap();
+        engine
+            .map()
+            .install(Principal(2), Arc::new(narrower), Arc::clone(&slot));
+
+        let held = engine.admit(request_for(Principal(1), 1), t(0)).unwrap();
+        assert_eq!(
+            engine
+                .admit(request_for(Principal(1), 1), t(0))
+                .unwrap_err(),
+            DenyReason::ConcurrencyLimited,
+            "an existing principal must load the newer account ceiling"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn enabling_account_concurrency_counts_already_in_flight_work() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease(1_000_000));
+
+        let held = {
+            let mut unlimited = (*snapshot(AccountStatus::Active)).clone();
+            unlimited.limits = ResolvedLimits::new(64).with_weighted_rate(1_000_000, 1_000_000);
+            engine
+                .map()
+                .install(Principal(1), Arc::new(unlimited), Arc::clone(&slot));
+            engine.admit(request(1), t(0)).unwrap()
+        };
+
+        let mut limited = (*snapshot(AccountStatus::Active)).clone();
+        limited.generation = Generation(2);
+        limited.limits = ResolvedLimits::new(64)
+            .with_weighted_rate(1_000_000, 1_000_000)
+            .with_concurrency(NonZeroU32::MIN, None)
+            .unwrap();
+        engine
+            .map()
+            .install(Principal(1), Arc::new(limited), Arc::clone(&slot));
+
+        assert_eq!(
+            engine.admit(request(1), t(0)).unwrap_err(),
+            DenyReason::ConcurrencyLimited,
+            "enabling a ceiling must include work admitted while enforcement was disabled"
+        );
+        drop(held);
+        drop(engine.admit(request(1), t(0)).unwrap());
+    }
+
+    #[test]
+    fn enabling_principal_concurrency_counts_already_in_flight_work() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease(1_000_000));
+
+        let mut account_only = (*snapshot(AccountStatus::Active)).clone();
+        account_only.limits = ResolvedLimits::new(64)
+            .with_weighted_rate(1_000_000, 1_000_000)
+            .with_concurrency(NonZeroU32::new(2).unwrap(), None)
+            .unwrap();
+        engine
+            .map()
+            .install(Principal(1), Arc::new(account_only), Arc::clone(&slot));
+        let held = engine.admit(request(1), t(0)).unwrap();
+
+        let mut principal_limited = (*snapshot(AccountStatus::Active)).clone();
+        principal_limited.generation = Generation(2);
+        principal_limited.limits = ResolvedLimits::new(64)
+            .with_weighted_rate(1_000_000, 1_000_000)
+            .with_concurrency(NonZeroU32::new(2).unwrap(), Some(NonZeroU32::MIN))
+            .unwrap();
+        engine
+            .map()
+            .install(Principal(1), Arc::new(principal_limited), Arc::clone(&slot));
+
+        assert_eq!(
+            engine.admit(request(1), t(0)).unwrap_err(),
+            DenyReason::ConcurrencyLimited,
+            "a newly enabled principal ceiling must include existing work for that principal"
+        );
+        drop(held);
+        drop(engine.admit(request(1), t(0)).unwrap());
+    }
+
+    #[test]
+    fn reenabled_account_concurrency_counts_work_admitted_while_disabled() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease(1_000_000));
+
+        let mut initially_limited = (*snapshot(AccountStatus::Active)).clone();
+        initially_limited.limits = ResolvedLimits::new(64)
+            .with_weighted_rate(1_000_000, 1_000_000)
+            .with_concurrency(NonZeroU32::new(2).unwrap(), None)
+            .unwrap();
+        engine
+            .map()
+            .install(Principal(1), Arc::new(initially_limited), Arc::clone(&slot));
+        let before_disable = engine.admit(request(1), t(0)).unwrap();
+
+        let mut disabled = (*snapshot(AccountStatus::Active)).clone();
+        disabled.generation = Generation(2);
+        disabled.limits = ResolvedLimits::new(64).with_weighted_rate(1_000_000, 1_000_000);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(disabled), Arc::clone(&slot));
+        let while_disabled = engine.admit(request(1), t(0)).unwrap();
+
+        let mut reenabled = (*snapshot(AccountStatus::Active)).clone();
+        reenabled.generation = Generation(3);
+        reenabled.limits = ResolvedLimits::new(64)
+            .with_weighted_rate(1_000_000, 1_000_000)
+            .with_concurrency(NonZeroU32::new(2).unwrap(), None)
+            .unwrap();
+        engine
+            .map()
+            .install(Principal(1), Arc::new(reenabled), Arc::clone(&slot));
+
+        assert_eq!(
+            engine.admit(request(1), t(0)).unwrap_err(),
+            DenyReason::ConcurrencyLimited,
+            "disabling enforcement must not erase occupancy seen after re-enable"
+        );
+        drop(before_disable);
+        drop(while_disabled);
+        drop(engine.admit(request(1), t(0)).unwrap());
+    }
+
+    #[test]
+    fn a_principal_ceiling_narrows_without_bypassing_the_account_ceiling() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease(1_000_000));
+        let limits = ResolvedLimits::new(64)
+            .with_weighted_rate(1_000_000, 1_000_000)
+            .with_concurrency(
+                NonZeroU32::new(2).unwrap(),
+                Some(NonZeroU32::new(1).unwrap()),
+            )
+            .unwrap();
+        for principal in [Principal(1), Principal(2)] {
+            let mut account = (*snapshot(AccountStatus::Active)).clone();
+            account.limits = limits;
+            engine
+                .map()
+                .install(principal, Arc::new(account), Arc::clone(&slot));
+        }
+
+        let first = engine.admit(request_for(Principal(1), 1), t(0)).unwrap();
+        assert_eq!(
+            engine
+                .admit(request_for(Principal(1), 1), t(0))
+                .unwrap_err(),
+            DenyReason::ConcurrencyLimited,
+            "the principal-local ceiling binds first"
+        );
+        let second = engine.admit(request_for(Principal(2), 1), t(0)).unwrap();
+        assert_eq!(
+            engine
+                .admit(request_for(Principal(2), 1), t(0))
+                .unwrap_err(),
+            DenyReason::ConcurrencyLimited,
+            "the shared account ceiling still binds"
+        );
+        drop(first);
+        drop(second);
+    }
+
+    #[test]
+    fn a_later_funding_refusal_releases_concurrency_but_keeps_rate_tokens() {
+        let limits = ResolvedLimits::new(64)
+            .with_weighted_rate(1_000_000, 1_000_000)
+            .with_request_rate(NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap())
+            .with_concurrency(NonZeroU32::new(1).unwrap(), None)
+            .unwrap();
+        let mut account = (*snapshot(AccountStatus::Active)).clone();
+        account.limits = limits;
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        engine.map().install(
+            Principal(1),
+            Arc::new(account),
+            LeaseSlot::for_account(AccountId(1)),
+        );
+
+        assert_eq!(
+            engine.admit(request(1), t(0)).unwrap_err(),
+            DenyReason::LeaseUnavailable
+        );
+        assert_eq!(
+            engine.admit(request(1), t(0)).unwrap_err(),
+            DenyReason::RequestRateLimited,
+            "the request token is not refunded after a funding refusal"
+        );
+        let state = match engine.map().get(&Principal(1)).unwrap() {
+            MapEntry::Present(state) => state,
+            MapEntry::NegativeUntil { .. } => unreachable!(),
+        };
+        assert_eq!(state.account_concurrency_in_flight(), 0);
+    }
+
     /// Builds an engine whose account carries the given limits.
     fn engine_with_limits(limits: ResolvedLimits) -> AdmissionEngine<ArcSwapSnapshotMap> {
         let mut snapshot = (*snapshot(AccountStatus::Active)).clone();
@@ -1057,6 +1717,13 @@ mod tests {
 
     /// A zero burst is not silently repaired into a burst of one: every
     /// priced request is refused, and says why.
+    ///
+    /// Publication rejects this schedule outright
+    /// (`WeightedRateOutsideGovernorDomain`), so the configuration under test
+    /// is reachable only through the unvalidated `SnapshotMap::install` seam.
+    /// That seam is exactly what the runtime `UnpriceableUnderLimits` check
+    /// exists to backstop: the governor quota is clamped to a nonzero burst
+    /// for construction, and the full-width comparison must still refuse.
     #[test]
     fn zero_burst_denies_every_priced_request() {
         let engine = engine_with_limits(ResolvedLimits::new(64).with_weighted_rate(1_000, 0));

@@ -7,8 +7,9 @@
 //! assert on *structured fields*, never on rendered message text, which would
 //! be the source-text assertion AGENTS.md forbids.
 
+use std::cell::RefCell;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 
 use jiff::{SignedDuration, Timestamp};
 
@@ -17,7 +18,6 @@ use tollgate_store::{
     AccountConfig, GrantPolicy, LeaseAllocator, MemoryStore, StoredRecords, UsageSink,
 };
 use tracing::field::{Field, Visit};
-use tracing::subscriber::DefaultGuard;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
@@ -73,25 +73,75 @@ impl Visit for FieldCollector {
     }
 }
 
-impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Captor {
+thread_local! {
+    /// The capturing test's buffer, if this thread is inside `capture()`.
+    static SINK: RefCell<Option<Captor>> = const { RefCell::new(None) };
+}
+
+/// The one subscriber this binary installs, and it is installed *globally*
+/// rather than per test with `tracing::subscriber::set_default`.
+///
+/// `tracing` caches each callsite's `Interest` in a process-global slot and
+/// computes it the first time any thread hits that callsite, against *that*
+/// thread's dispatcher (`tracing_core::callsite::Rebuilder::JustOne` calls
+/// `get_default`). A thread-local subscriber therefore does not make the
+/// decision thread-local: one test reaching a logged path with no dispatcher
+/// installed caches `Interest::never()` for the whole process, and every
+/// other test's capture of that event silently returns nothing. Assertions
+/// that an event is *absent* then pass for the wrong reason.
+///
+/// A global dispatcher makes that unrepresentable: every thread always has a
+/// real subscriber, so interest is never `never`. Per-test isolation moves to
+/// `SINK`, which is genuinely thread-local. See `tollgate-server`'s
+/// `tests/sweep.rs`, where this cost a CI-only failure on a two-vCPU runner.
+struct Router;
+
+impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Router {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        let mut collector = FieldCollector(Vec::new());
-        event.record(&mut collector);
-        self.0.lock().unwrap().push(Captured {
-            fields: collector.0,
+        SINK.with(|sink| {
+            let Some(captor) = sink.borrow().clone() else {
+                return;
+            };
+            let mut collector = FieldCollector(Vec::new());
+            event.record(&mut collector);
+            captor.0.lock().unwrap().push(Captured {
+                fields: collector.0,
+            });
         });
     }
 }
 
-/// Thread-local, so tests stay independent under a parallel runner.
-fn capture() -> (Captor, DefaultGuard) {
+/// Install `Router` as the process-wide dispatcher. Idempotent, and called
+/// from `capture()` and from the store fixture every test builds, so no test
+/// can reach a logged path before a dispatcher exists.
+fn install_subscriber() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Router))
+            .expect("this binary installs the global subscriber exactly once");
+    });
+}
+
+/// Capture this thread's events until the guard drops.
+fn capture() -> (Captor, CaptureGuard) {
+    install_subscriber();
     let captor = Captor::default();
-    let subscriber = tracing_subscriber::registry().with(captor.clone());
-    let guard = tracing::subscriber::set_default(subscriber);
-    (captor, guard)
+    SINK.with(|sink| *sink.borrow_mut() = Some(captor.clone()));
+    (captor, CaptureGuard)
+}
+
+/// Detaches this thread's sink, so a later test on the same libtest thread
+/// starts from an empty buffer.
+struct CaptureGuard;
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        SINK.with(|sink| *sink.borrow_mut() = None);
+    }
 }
 
 fn store() -> Arc<MemoryStore> {
+    install_subscriber();
     let store = MemoryStore::new(GrantPolicy {
         shrink_divisor: 1,
         min_grant: CostUnits(1),

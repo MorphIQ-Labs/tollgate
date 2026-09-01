@@ -182,6 +182,36 @@ impl RequestRateLimit {
     }
 }
 
+/// The account-wide rate dimensions carried inside a principal snapshot.
+///
+/// Admission compiles these values into shared mutable governor buckets. A
+/// separate value type lets that compiler bind the exact policy represented
+/// by a bucket back into every principal state that pins it, while leaving
+/// principal-local shaping and concurrency dimensions untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountRatePolicy {
+    weighted_rate: Option<WeightedRateLimit>,
+    legacy_weighted_rate: WeightedRateLimit,
+    request_rate: Option<RequestRateLimit>,
+}
+
+impl AccountRatePolicy {
+    #[must_use]
+    pub const fn weighted_rate(self) -> Option<WeightedRateLimit> {
+        self.weighted_rate
+    }
+
+    #[must_use]
+    pub const fn legacy_weighted_rate(self) -> WeightedRateLimit {
+        self.legacy_weighted_rate
+    }
+
+    #[must_use]
+    pub const fn request_rate(self) -> Option<RequestRateLimit> {
+        self.request_rate
+    }
+}
+
 /// Why resolved limits could not be constructed from a wire representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedLimitsError {
@@ -336,6 +366,17 @@ impl ResolvedLimits {
     #[must_use]
     pub const fn request_rate(self) -> Option<RequestRateLimit> {
         self.request_rate
+    }
+
+    /// Extract the account-wide rate policy independently of request shaping
+    /// and concurrency limits.
+    #[must_use]
+    pub const fn account_rate_policy(self) -> AccountRatePolicy {
+        AccountRatePolicy {
+            weighted_rate: self.weighted_rate,
+            legacy_weighted_rate: self.legacy_weighted_rate,
+            request_rate: self.request_rate,
+        }
     }
 
     #[must_use]
@@ -878,6 +919,39 @@ mod tests {
         assert_eq!(request_rate.burst_requests(), burst_requests);
         assert_eq!(limits.max_concurrent_requests(), Some(account));
         assert_eq!(limits.principal_max_concurrent_requests(), Some(principal));
+    }
+
+    #[test]
+    fn account_rate_policy_extracts_exactly_the_rate_dimensions() {
+        let account = ResolvedLimits::new(999)
+            .with_weighted_rate(700, 800)
+            .with_request_rate(NonZeroU32::new(9).unwrap(), NonZeroU32::new(10).unwrap());
+        let principal = ResolvedLimits::new(64)
+            .with_weighted_rate_compatibility_fallback(11, 12)
+            .with_concurrency(
+                NonZeroU32::new(4).unwrap(),
+                Some(NonZeroU32::new(2).unwrap()),
+            )
+            .unwrap();
+
+        let policy = account.account_rate_policy();
+        assert_eq!(policy.weighted_rate(), account.weighted_rate());
+        assert_eq!(
+            policy.legacy_weighted_rate(),
+            account.legacy_weighted_rate()
+        );
+        assert_eq!(policy.request_rate(), account.request_rate());
+
+        assert_eq!(principal.max_items_per_request(), 64);
+        assert_eq!(principal.weighted_rate(), None);
+        assert_eq!(principal.legacy_weighted_rate().units_per_second(), 11);
+        assert_eq!(principal.legacy_weighted_rate().burst_units(), 12);
+        assert_eq!(principal.request_rate(), None);
+        assert_eq!(principal.max_concurrent_requests(), NonZeroU32::new(4));
+        assert_eq!(
+            principal.principal_max_concurrent_requests(),
+            NonZeroU32::new(2)
+        );
     }
 
     #[test]

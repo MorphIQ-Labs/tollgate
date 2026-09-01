@@ -226,7 +226,10 @@ allocation-assertions:
   interruptible: true
   cache: *cargo-build-cache
   before_script:
-    - apt-get update && apt-get install -y --no-install-recommends jq ripgrep
+    # `jq` evaluates the allocation report. The gate's text assertions use
+    # `grep` so they cannot be skipped on a host that lacks a tool, and
+    # `check_allocations.sh` refuses to run rather than pass without them.
+    - apt-get update && apt-get install -y --no-install-recommends jq
   script:
     - ./scripts/check_allocations.sh
   artifacts:
@@ -327,9 +330,19 @@ perf-thresholds:
   dependencies: []
   extends: .main-merge-request-manual
   stage: assurance
+  # The controlled-host runner (`run_untagged: false`) is the controlled host, so only a
+  # tagged job reaches it. Without this the job ran wherever a runner was
+  # free — shared SaaS or the general `local` box — which is exactly the
+  # hardware absolute nanoseconds cannot be read on.
+  tags:
+    - perf-i9-10920x
   allow_failure: true
   timeout: 45 minutes
   cache: *cargo-build-cache
+  variables:
+    # The recorded-baseline half of the gate compares against this; it is
+    # skipped as `host-unset` when unset, which is what it had always been.
+    TOLLGATE_PERF_HOST: perf-i9-10920x
   script:
     - ./scripts/check_perf_thresholds.sh
   artifacts:
@@ -341,6 +354,11 @@ perf-thresholds:
 # CPU-heavy assurance jobs so this pipeline does not contaminate its own
 # denominator; absolute thresholds and the recorded host baseline are
 # explicitly skipped by the mode rather than weakened for shared hardware.
+#
+# Deliberately left untagged. Portability is the point of this gate, so it
+# does not need the controlled host — and it is the only *blocking* one of the
+# three, so pinning it to a single machine would make every merge request wait
+# on that box being online.
 perf-ratios:
   dependencies: []
   extends: .main-merge-request
@@ -364,12 +382,20 @@ load-thresholds:
   dependencies: []
   extends: .main-merge-request
   stage: assurance
+  # Absolute latency ceilings and throughput floors, so the controlled host
+  # for the same reason as `perf-thresholds`.
+  tags:
+    - perf-i9-10920x
   interruptible: true
   timeout: 45 minutes
   cache: *cargo-build-cache
-  # Mutation and formal assurance are CPU- and memory-intensive. This job
-  # measures paired latencies on the same group-runner host, so wait for both
-  # instead of letting our own pipeline contaminate its denominator/numerator.
+  variables:
+    TOLLGATE_PERF_HOST: perf-i9-10920x
+  # Ordering, now that this job has the controlled host to itself: nothing
+  # else in the pipeline lands on `perf-i9-10920x`, so the wait is no longer
+  # about our own CPU contention. It stays because the two gates read as one
+  # story — a ratio regression should be reported before the absolute
+  # ceilings that depend on the same measurements.
   needs:
     - job: perf-ratios
       artifacts: false

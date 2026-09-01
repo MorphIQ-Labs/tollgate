@@ -9,9 +9,9 @@
 //!   → connection-cache hit or HMAC-SHA256 verify, derive Principal
 //!   → reserve usage-writer permit          (shed on backpressure, #8)
 //!   → AdmissionEngine::admit               (snapshot/permissions/rate/lease)
-//!   → commit_at_execution_start
-//!   → price (toy Black-Scholes kernel)
-//!   → permit.record(usage event)
+//!   → ChargeGuard::commit                   (owns admission + usage permit)
+//!   → price while holding charge guard      (toy Black-Scholes kernel)
+//!   → drop guard                            (record usage + release concurrency)
 //!   → respond { prices, metadata: { request_id, units_charged } }
 //! ```
 //!
@@ -829,13 +829,6 @@ fn deny_response(reason: DenyReason) -> Response {
             "overage-commit-in-progress",
         ),
         DenyReason::AccountingBackpressure => (StatusCode::SERVICE_UNAVAILABLE, "accounting-busy"),
-        DenyReason::EmptyWorkload => (StatusCode::UNPROCESSABLE_ENTITY, "empty-workload"),
-        DenyReason::FundingExpiredAtStart => {
-            (StatusCode::SERVICE_UNAVAILABLE, "funding-expired-at-start")
-        }
-        DenyReason::CapacityUnavailable => {
-            (StatusCode::SERVICE_UNAVAILABLE, "capacity-unavailable")
-        }
     };
     problem(status, code, reason.to_string())
 }
@@ -921,13 +914,14 @@ async fn price(
     // would make a second instance's legitimate usage read as duplicates
     // (review finding #6).
     let request_id = RequestId(uuid::Uuid::new_v4().as_u128());
-    let (_charge, units) =
-        match ChargeGuard::commit(&admitted.reservation, permit, request_id, Timestamp::now()) {
-            Ok(committed) => committed,
-            Err(_) => return deny_response(DenyReason::LeaseExpired),
-        };
+    let charge = match ChargeGuard::commit(admitted, permit, request_id, Timestamp::now()) {
+        Ok(committed) => committed,
+        Err(_) => return deny_response(DenyReason::LeaseExpired),
+    };
+    let units = charge.units();
 
     let prices: Vec<f64> = request.contracts.iter().map(black_scholes_call).collect();
+    drop(charge);
 
     Json(PriceResponse {
         prices,

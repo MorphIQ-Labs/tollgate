@@ -5,8 +5,9 @@
 //! 1. snapshot lookup by [`Principal`] (in-memory map, negative-cached),
 //! 2. account status / staleness / permission checks,
 //! 3. batch-cap check and cost quote (direct-indexed table),
-//! 4. weighted local rate-token consumption (`governor`),
-//! 5. lease debit, opening the reservation state machine.
+//! 4. request-count and weighted local rate-token consumption (`governor`),
+//! 5. principal and account concurrency acquisition,
+//! 6. lease debit, opening the reservation state machine.
 //!
 //! Nothing in this crate performs I/O, takes a lock on the request path, or
 //! reads a clock (`now` is an argument; `governor` uses its own monotonic
@@ -30,7 +31,7 @@ pub mod maps;
 pub mod state;
 
 pub use counters::{AdmissionCounters, CountersSnapshot};
-pub use engine::{AdmissionEngine, AdmissionRequest, Admitted};
+pub use engine::{AdmissionEngine, AdmissionRequest, Admitted, CommittedAdmission};
 pub use generation_model::{Watermark, accept_positive, accept_revoked, accept_unknown};
 pub use maps::{ArcSwapSnapshotMap, MokaSnapshotMap};
 pub use state::{

@@ -13,7 +13,7 @@
 //! measures the refusal path, which none of the others take.
 
 use std::hint::black_box;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -150,6 +150,18 @@ fn populate_contention(map: &impl SnapshotMap) {
     }
 }
 
+fn populate_with_limits(map: &impl SnapshotMap, limits: ResolvedLimits) {
+    let sharding = map.local_sharding();
+    let mut configured = (*contention_snapshot()).clone();
+    configured.limits = limits;
+    let configured = PublishableSnapshot::try_new(Arc::new(configured)).unwrap();
+    for i in 0..512u128 {
+        let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
+        slot.install(big_lease(sharding));
+        map.install_publishable(Principal(i), configured.clone(), slot);
+    }
+}
+
 fn populate_distinct(map: &impl SnapshotMap) {
     let sharding = map.local_sharding();
     for i in 0..512u128 {
@@ -201,6 +213,12 @@ fn contention_engine(sharding: LocalSharding) -> AdmissionEngine<ArcSwapSnapshot
     engine
 }
 
+fn engine_with_limits(limits: ResolvedLimits) -> AdmissionEngine<ArcSwapSnapshotMap> {
+    let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+    populate_with_limits(engine.map(), limits);
+    engine
+}
+
 fn admit_once(engine: &AdmissionEngine<ArcSwapSnapshotMap>, principal: Principal, now: Timestamp) {
     let admitted = engine
         .admit(
@@ -214,7 +232,7 @@ fn admit_once(engine: &AdmissionEngine<ArcSwapSnapshotMap>, principal: Principal
         )
         .unwrap();
     // Cancel instead of commit so the giant lease never drains during a run.
-    black_box(admitted.reservation.cancel());
+    black_box(admitted.cancel());
 }
 
 /// Seven background admitters on the account under measurement, stopped and
@@ -400,9 +418,34 @@ fn bench_full_check(c: &mut Criterion) {
                 .unwrap();
             // Cancel, as `admit_once` does, so the cap never drains: this
             // measures the debit-and-refund pair, not a one-shot admission.
-            black_box(admitted.reservation.cancel());
+            black_box(admitted.cancel());
         })
     });
+
+    // The two #91 mechanism witnesses keep the rest of the pipeline
+    // identical and disable the weighted bucket, isolating the added mutable
+    // state. The request bucket is uncontended; the concurrency gauge uses the
+    // same sustained eight-thread harness as the existing contention gates.
+    let request_rate = engine_with_limits(ResolvedLimits::new(4_096).with_request_rate(
+        NonZeroU32::new(u32::MAX).unwrap(),
+        NonZeroU32::new(u32::MAX).unwrap(),
+    ));
+    group.bench_function("request_rate_token", |b| {
+        b.iter(|| admit_once(&request_rate, black_box(Principal(97)), now))
+    });
+
+    {
+        let limits = ResolvedLimits::new(4_096)
+            .with_concurrency(NonZeroU32::new(u32::MAX).unwrap(), None)
+            .unwrap();
+        let contended = spawn_contenders(
+            engine_with_limits(limits),
+            std::iter::repeat_n(Principal(97), 7),
+        );
+        group.bench_function("concurrency_acquire", |b| {
+            b.iter(|| admit_once(contended.engine(), black_box(Principal(97)), now))
+        });
+    }
 
     group.finish();
 }

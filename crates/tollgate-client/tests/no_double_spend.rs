@@ -132,16 +132,11 @@ fn hammer(instance: &mut Instance, burst: usize) -> usize {
         );
         match admitted {
             Ok(admitted) => {
-                admitted
-                    .reservation
-                    .commit_at_execution_start(t(0))
+                let execution = admitted
+                    .commit(RequestId(uuid::Uuid::new_v4().as_u128()), t(0))
                     .unwrap();
-                let event = admitted
-                    .reservation
-                    .usage_event(RequestId(uuid::Uuid::new_v4().as_u128()), t(0))
-                    .expect("committed reservation yields an event");
-                permit.record(event);
-                instance.committed += admitted.quote.total.get();
+                permit.record(execution.usage_event());
+                instance.committed += execution.units().get();
                 committed += 1;
             }
             Err(
