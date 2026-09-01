@@ -14,8 +14,8 @@ use tollgate_client::{
     LeaseManager, LeaseManagerConfig, ManualClock, UsageRecorder, UsageWriter, UsageWriterConfig,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, EnforcementMode,
-    Generation, OpIndex, PermissionBits, Principal, RequestId, ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, Generation,
+    OpIndex, PermissionBits, Principal, RequestId, ResolvedLimits,
 };
 use tollgate_store::{AccountConfig, GrantPolicy, MemoryStore};
 
@@ -38,25 +38,22 @@ fn t(secs: i64) -> Timestamp {
 }
 
 fn snapshot() -> Arc<AccountSnapshot> {
-    Arc::new(AccountSnapshot {
-        account_id: ACCOUNT,
-        key_id: None,
-        generation: Generation(1),
-        status: AccountStatus::Active,
-        enforcement_mode: EnforcementMode::Strict,
-        valid_until: t(1_000_000),
-        permissions: PermissionBits::bit(0),
-        limits: ResolvedLimits {
-            max_items_per_request: 64,
-            rate_units_per_second: u64::from(u32::MAX),
-            rate_burst_units: u64::from(u32::MAX),
-        },
-        cost_table: Arc::new(
-            CostTable::builder(CostUnits(50), CostUnits(50))
-                .weight(&PriceOp, CostUnits(1))
-                .build(),
-        ),
-    })
+    Arc::new(
+        AccountSnapshot::builder(
+            ACCOUNT,
+            Generation(1),
+            AccountStatus::Active,
+            t(1_000_000),
+            PermissionBits::bit(0),
+            ResolvedLimits::new(64).with_weighted_rate(u64::from(u32::MAX), u64::from(u32::MAX)),
+            Arc::new(
+                CostTable::builder(CostUnits(50), CostUnits(50))
+                    .weight(&PriceOp, CostUnits(1))
+                    .build(),
+            ),
+        )
+        .build(),
+    )
 }
 
 struct Instance {

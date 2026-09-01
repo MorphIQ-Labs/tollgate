@@ -193,16 +193,19 @@ impl StoredSnapshot {
     /// row's column, and a conversion that could be written without it would
     /// be a conversion someone writes without it.
     fn into_snapshot(self, generation: Generation) -> AccountSnapshot {
-        AccountSnapshot {
-            account_id: AccountId(self.account_id.0),
-            key_id: self.key_id.map(|id| tollgate_core::KeyId(id.0)),
+        let builder = AccountSnapshot::builder(
+            AccountId(self.account_id.0),
             generation,
-            status: self.status,
-            enforcement_mode: self.enforcement_mode,
-            valid_until: self.valid_until,
-            permissions: self.permissions,
-            limits: self.limits,
-            cost_table: self.cost_table,
+            self.status,
+            self.valid_until,
+            self.permissions,
+            self.limits,
+            self.cost_table,
+        )
+        .enforcement_mode(self.enforcement_mode);
+        match self.key_id {
+            Some(key_id) => builder.key_id(tollgate_core::KeyId(key_id.0)).build(),
+            None => builder.build(),
         }
     }
 }

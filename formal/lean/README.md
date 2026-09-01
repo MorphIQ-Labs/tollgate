@@ -1,6 +1,6 @@
 # Tollgate Formal Models
 
-This Lean package contains exact models for four critical contracts:
+This Lean package contains exact models for five critical contracts:
 
 - `LeaseShards` models the aggregate of cache-isolated lease counters and
   exact-total debit/refund receipts. It proves conservation through reserve, cancel,
@@ -25,6 +25,13 @@ This Lean package contains exact models for four critical contracts:
   proves the negative that earns the funding column — billing overage without
   funding it *always* breaks the equation, by exactly the overage — and that an
   accepted debit never carries the counter past its cap.
+- `OveragePublication` models the observer-visible split between pending and
+  committed overage and the publication marker around the reservation phase
+  CAS. It proves an in-flight commit is never reported as refundable, stable
+  refundable/committed-saturation answers agree with committed occupancy, and
+  commit, cancellation, and a lost commit claim preserve occupancy bounds. It
+  intentionally does not infer central account exhaustion from local cap
+  saturation.
 - `SnapshotLimits` proves that checking the largest registered operation
   weight at the configured batch cap bounds every registered operation at
   every permitted item count. Consequently, a worst-case quote at or below

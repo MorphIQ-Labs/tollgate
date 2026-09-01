@@ -10,16 +10,16 @@
 //! Tests share one database, so they serialize on a global lock and truncate
 //! before running.
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use jiff::{SignedDuration, Timestamp};
 use tokio::sync::Mutex;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, FencingToken,
-    Generation, KeyId, LeaseId, PermissionBits, Principal, PublishableSnapshot, RequestId,
-    ResolvedLimits, UsageEvent, UsageSource,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
+    KeyId, LeaseId, PermissionBits, Principal, PublishableSnapshot, RequestId, ResolvedLimits,
+    UsageEvent, UsageSource,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, Conservation, CreateAccountError, GrantPolicy,
@@ -809,21 +809,18 @@ async fn publish_pushes_to_subscribers_only_when_the_row_changes() {
     let mut updates = SnapshotSource::subscribe(&*store);
 
     let snapshot = |generation: u64| {
-        publishable(Arc::new(AccountSnapshot {
-            account_id: ACCOUNT,
-            key_id: None,
-            generation: Generation(generation),
-            status: AccountStatus::Active,
-            enforcement_mode: EnforcementMode::Strict,
-            valid_until: t(10_000),
-            permissions: PermissionBits::ALL,
-            limits: ResolvedLimits {
-                max_items_per_request: 64,
-                rate_units_per_second: 1_000,
-                rate_burst_units: 1_000,
-            },
-            cost_table: Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
-        }))
+        publishable(Arc::new(
+            AccountSnapshot::builder(
+                ACCOUNT,
+                Generation(generation),
+                AccountStatus::Active,
+                t(10_000),
+                PermissionBits::ALL,
+                ResolvedLimits::new(64).with_weighted_rate(1_000, 1_000),
+                Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+            )
+            .build(),
+        ))
     };
 
     store
@@ -975,21 +972,18 @@ async fn enumerating_principals_includes_revoked_ones() {
     );
 
     let snapshot = || {
-        publishable(Arc::new(AccountSnapshot {
-            account_id: ACCOUNT,
-            key_id: None,
-            generation: Generation(1),
-            status: AccountStatus::Active,
-            enforcement_mode: EnforcementMode::Strict,
-            valid_until: t(10_000),
-            permissions: PermissionBits::ALL,
-            limits: ResolvedLimits {
-                max_items_per_request: 64,
-                rate_units_per_second: 1_000,
-                rate_burst_units: 1_000,
-            },
-            cost_table: Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
-        }))
+        publishable(Arc::new(
+            AccountSnapshot::builder(
+                ACCOUNT,
+                Generation(1),
+                AccountStatus::Active,
+                t(10_000),
+                PermissionBits::ALL,
+                ResolvedLimits::new(64).with_weighted_rate(1_000, 1_000),
+                Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+            )
+            .build(),
+        ))
     };
     let live = Principal(1);
     let revoked = Principal(2);
@@ -1090,21 +1084,18 @@ async fn snapshot_publish_fetch_and_generation_monotonicity() {
     };
     let principal = Principal(42);
     let snapshot = |generation: u64| {
-        publishable(Arc::new(AccountSnapshot {
-            account_id: ACCOUNT,
-            key_id: None,
-            generation: Generation(generation),
-            status: AccountStatus::Active,
-            enforcement_mode: EnforcementMode::Strict,
-            valid_until: t(10_000),
-            permissions: PermissionBits::ALL,
-            limits: ResolvedLimits {
-                max_items_per_request: 64,
-                rate_units_per_second: 1_000,
-                rate_burst_units: 1_000,
-            },
-            cost_table: Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
-        }))
+        publishable(Arc::new(
+            AccountSnapshot::builder(
+                ACCOUNT,
+                Generation(generation),
+                AccountStatus::Active,
+                t(10_000),
+                PermissionBits::ALL,
+                ResolvedLimits::new(64).with_weighted_rate(1_000, 1_000),
+                Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+            )
+            .build(),
+        ))
     };
 
     assert!(matches!(
@@ -1168,6 +1159,56 @@ async fn snapshot_publish_fetch_and_generation_monotonicity() {
 }
 
 #[tokio::test]
+async fn staged_limits_round_trip_through_postgres() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    let principal = Principal(43);
+    let limits = ResolvedLimits::new(64)
+        .with_weighted_rate_compatibility_fallback(1_000, 2_000)
+        .with_request_rate(NonZeroU32::new(10).unwrap(), NonZeroU32::new(20).unwrap())
+        .with_concurrency(
+            NonZeroU32::new(4).unwrap(),
+            Some(NonZeroU32::new(2).unwrap()),
+        )
+        .unwrap();
+    let snapshot = AccountSnapshot::builder(
+        ACCOUNT,
+        Generation(1),
+        AccountStatus::Active,
+        t(10_000),
+        PermissionBits::ALL,
+        limits,
+        Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+    )
+    .build();
+    store
+        .publish_snapshot(principal, publishable(Arc::new(snapshot)))
+        .await
+        .unwrap();
+
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("published snapshot must be present");
+    };
+    assert_eq!(fetched.limits, limits);
+}
+
+#[test]
+fn legacy_limit_wire_defaults_new_dimensions_without_changing_weighted_rate() {
+    let limits: ResolvedLimits = serde_json::from_value(serde_json::json!({
+        "max_items_per_request": 64,
+        "rate_units_per_second": 1_000,
+        "rate_burst_units": 2_000
+    }))
+    .unwrap();
+    assert!(limits.weighted_rate().is_some());
+    assert_eq!(limits.request_rate(), None);
+    assert_eq!(limits.max_concurrent_requests(), None);
+    assert_eq!(limits.principal_max_concurrent_requests(), None);
+}
+
+#[tokio::test]
 async fn snapshot_json_preserves_legacy_numbers_and_encodes_high_ids_exactly() {
     let _guard = DB_LOCK.lock().await;
     let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
@@ -1175,21 +1216,19 @@ async fn snapshot_json_preserves_legacy_numbers_and_encodes_high_ids_exactly() {
     };
     let key = KeyId((1u128 << 127) | 2);
     let principal = Principal((1u128 << 127) | 3);
-    let snapshot = publishable(Arc::new(AccountSnapshot {
-        account_id: ACCOUNT,
-        key_id: Some(key),
-        generation: Generation(1),
-        status: AccountStatus::Active,
-        enforcement_mode: EnforcementMode::Strict,
-        valid_until: t(10_000),
-        permissions: PermissionBits::ALL,
-        limits: ResolvedLimits {
-            max_items_per_request: 64,
-            rate_units_per_second: 1_000,
-            rate_burst_units: 1_000,
-        },
-        cost_table: Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
-    }));
+    let snapshot = publishable(Arc::new(
+        AccountSnapshot::builder(
+            ACCOUNT,
+            Generation(1),
+            AccountStatus::Active,
+            t(10_000),
+            PermissionBits::ALL,
+            ResolvedLimits::new(64).with_weighted_rate(1_000, 1_000),
+            Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+        )
+        .key_id(key)
+        .build(),
+    ));
     store.publish_snapshot(principal, snapshot).await.unwrap();
 
     let pool = corruption_pool().await;
@@ -1672,21 +1711,16 @@ async fn checked_ledger_columns_reject_negative_writes() {
 
 /// Mirrors `store_suite::account_snapshot`.
 fn account_snapshot(account: AccountId, generation: u64, status: AccountStatus) -> AccountSnapshot {
-    AccountSnapshot {
-        account_id: account,
-        key_id: None,
-        generation: Generation(generation),
+    AccountSnapshot::builder(
+        account,
+        Generation(generation),
         status,
-        enforcement_mode: EnforcementMode::Strict,
-        valid_until: t(10_000),
-        permissions: PermissionBits::ALL,
-        limits: ResolvedLimits {
-            max_items_per_request: 64,
-            rate_units_per_second: 1_000,
-            rate_burst_units: 1_000,
-        },
-        cost_table: Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
-    }
+        t(10_000),
+        PermissionBits::ALL,
+        ResolvedLimits::new(64).with_weighted_rate(1_000, 1_000),
+        Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+    )
+    .build()
 }
 
 async fn status_of(store: &PostgresStore, principal: Principal) -> (AccountStatus, Generation) {

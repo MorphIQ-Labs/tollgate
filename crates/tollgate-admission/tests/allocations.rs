@@ -35,25 +35,23 @@ fn far_future() -> Timestamp {
 }
 
 fn snapshot(account: AccountId, mode: EnforcementMode) -> Arc<AccountSnapshot> {
-    Arc::new(AccountSnapshot {
-        account_id: account,
-        key_id: None,
-        generation: Generation(1),
-        status: AccountStatus::Active,
-        enforcement_mode: mode,
-        valid_until: far_future(),
-        permissions: PermissionBits::bit(0),
-        limits: ResolvedLimits {
-            max_items_per_request: 4_096,
-            rate_units_per_second: u64::from(u32::MAX),
-            rate_burst_units: u64::from(u32::MAX),
-        },
-        cost_table: Arc::new(
-            CostTable::builder(CostUnits(50), CostUnits(50))
-                .weight(&PriceOp, CostUnits(1))
-                .build(),
-        ),
-    })
+    Arc::new(
+        AccountSnapshot::builder(
+            account,
+            Generation(1),
+            AccountStatus::Active,
+            far_future(),
+            PermissionBits::bit(0),
+            ResolvedLimits::new(4_096).with_weighted_rate(u64::from(u32::MAX), u64::from(u32::MAX)),
+            Arc::new(
+                CostTable::builder(CostUnits(50), CostUnits(50))
+                    .weight(&PriceOp, CostUnits(1))
+                    .build(),
+            ),
+        )
+        .enforcement_mode(mode)
+        .build(),
+    )
 }
 
 fn lease(account: AccountId, units: CostUnits, sharding: LocalSharding) -> Arc<LocalLease> {

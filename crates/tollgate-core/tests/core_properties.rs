@@ -7,9 +7,9 @@ use jiff::Timestamp;
 use proptest::prelude::*;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CancelOutcome, CostTable, CostUnits,
-    EnforcementMode, FencingToken, Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding,
-    OpIndex, PermissionBits, PublishableSnapshot, QuoteError, Reservation, ResolvedLimits,
+    AccountId, AccountOverage, AccountSnapshot, AccountStatus, CancelOutcome, CostTable, CostUnits,
+    DenyReason, FencingToken, Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex,
+    PermissionBits, PublishableSnapshot, QuoteError, Reservation, ResolvedLimits, Retry,
     SnapshotValidationError,
 };
 
@@ -95,7 +95,7 @@ proptest! {
         minimum in any::<u64>(),
         weights in proptest::collection::vec(proptest::option::of(any::<u64>()), 0..16),
         max_items in any::<u64>(),
-        burst in any::<u64>(),
+        burst in 1u64..=u64::from(u32::MAX),
     ) {
         let mut builder = CostTable::builder(CostUnits(fixed), CostUnits(minimum));
         for (index, weight) in weights.iter().enumerate() {
@@ -103,21 +103,15 @@ proptest! {
                 builder = builder.weight(&Op(index), CostUnits(*weight));
             }
         }
-        let snapshot = Arc::new(AccountSnapshot {
-            account_id: AccountId(1),
-            key_id: None,
-            generation: Generation(1),
-            status: AccountStatus::Active,
-            enforcement_mode: EnforcementMode::Strict,
-            valid_until: t(10_000),
-            permissions: PermissionBits::ALL,
-            limits: ResolvedLimits {
-                max_items_per_request: max_items,
-                rate_units_per_second: 1,
-                rate_burst_units: burst,
-            },
-            cost_table: Arc::new(builder.build()),
-        });
+        let snapshot = Arc::new(AccountSnapshot::builder(
+            AccountId(1),
+            Generation(1),
+            AccountStatus::Active,
+            t(10_000),
+            PermissionBits::ALL,
+            ResolvedLimits::new(max_items).with_weighted_rate(1, burst),
+            Arc::new(builder.build()),
+        ).build());
 
         let Some(max_weight) = weights.iter().flatten().max().copied() else {
             prop_assert!(PublishableSnapshot::try_new(snapshot).is_ok());
@@ -194,6 +188,52 @@ proptest! {
         }
         prop_assert!(committed_total <= capacity);
         prop_assert_eq!(l.remaining(), CostUnits(capacity - committed_total));
+    }
+
+    /// In every stable overage state, occupancy determines whether the local
+    /// reason is refundable or committed saturation. Both remain transient at
+    /// the admission boundary because an ordinary lease refill can fund the
+    /// unchanged request.
+    #[test]
+    fn overage_retry_class_matches_stable_occupancy(
+        cap in 0u64..10_000,
+        occupied in 0u64..10_000,
+        want in 0u64..10_000,
+        commit in any::<bool>(),
+    ) {
+        prop_assume!(occupied <= cap);
+        let overage = Arc::new(AccountOverage::new(AccountId(1)));
+        let held = Reservation::reserve_overage(
+            &overage,
+            CostUnits(occupied),
+            CostUnits(cap),
+        )
+        .unwrap();
+        if commit {
+            held.commit_at_execution_start(t(0)).unwrap();
+        }
+
+        match Reservation::reserve_overage(&overage, CostUnits(want), CostUnits(cap)) {
+            Ok(reservation) => {
+                prop_assert!(occupied.checked_add(want).is_some_and(|total| total <= cap));
+                drop(reservation);
+            }
+            Err(reason) if !commit && want <= cap => {
+                prop_assert!(matches!(
+                    reason,
+                    DenyReason::OverageCapTemporarilyExhausted { .. }
+                ), "unexpected pending refusal: {:?}", reason);
+                prop_assert_eq!(reason.retry(), Retry::Transient);
+            }
+            Err(reason) => {
+                prop_assert!(
+                    matches!(reason, DenyReason::OverageCapExhausted { .. }),
+                    "unexpected committed refusal: {:?}",
+                    reason
+                );
+                prop_assert_eq!(reason.retry(), Retry::Transient);
+            }
+        }
     }
 }
 

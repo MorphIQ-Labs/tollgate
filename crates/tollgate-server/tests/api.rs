@@ -319,6 +319,63 @@ async fn admin_snapshot_roundtrip_and_probes() {
 }
 
 #[tokio::test]
+async fn admin_preserves_new_limit_fields_over_http() {
+    let (store, router) = state();
+    store.create_account(AccountConfig {
+        account_id: AccountId(1),
+        initial_balance: CostUnits(1_000),
+        status: AccountStatus::Active,
+    });
+    let snapshot = json!({
+        "account_id": id(1),
+        "key_id": null,
+        "generation": 1,
+        "status": "Active",
+        "valid_until": "2100-01-01T00:00:00Z",
+        "permissions": 1,
+        "limits": {
+            "max_items_per_request": 64,
+            "rate_units_per_second": 1_000,
+            "rate_burst_units": 2_000,
+            "weighted_rate_enabled": false,
+            "request_rate_per_second": 10,
+            "request_burst": 20,
+            "max_concurrent_requests": 4,
+            "principal_max_concurrent_requests": 2
+        },
+        "cost_table": {
+            "fixed_request": 1,
+            "minimum_charge": 1,
+            "weights": [1]
+        }
+    });
+    let (status, _) = call(
+        &router,
+        "PUT",
+        &api(&format!("/admin/snapshots/{}", Principal(8))),
+        Some(json!({"snapshot": snapshot})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, fetched) = call(
+        &router,
+        "GET",
+        &api(&format!("/snapshots/{}", Principal(8))),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fetched["limits"]["rate_units_per_second"], 1_000);
+    assert_eq!(fetched["limits"]["rate_burst_units"], 2_000);
+    assert_eq!(fetched["limits"]["weighted_rate_enabled"], false);
+    assert_eq!(fetched["limits"]["request_rate_per_second"], 10);
+    assert_eq!(fetched["limits"]["request_burst"], 20);
+    assert_eq!(fetched["limits"]["max_concurrent_requests"], 4);
+    assert_eq!(fetched["limits"]["principal_max_concurrent_requests"], 2);
+}
+
+#[tokio::test]
 async fn admin_refuses_snapshot_whose_batch_quote_exceeds_burst() {
     let (_store, router) = state();
     let snapshot = json!({
@@ -362,6 +419,39 @@ async fn admin_refuses_snapshot_whose_batch_quote_exceeds_burst() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(problem["code"], "unknown-principal");
+}
+
+#[tokio::test]
+async fn admin_refuses_weighted_rate_outside_governors_u32_domain() {
+    let (_store, router) = state();
+    let snapshot = json!({
+        "account_id": id(1),
+        "key_id": null,
+        "generation": 1,
+        "status": "Active",
+        "valid_until": "2100-01-01T00:00:00Z",
+        "permissions": 1,
+        "limits": {
+            "max_items_per_request": 64,
+            "rate_units_per_second": u64::from(u32::MAX) + 1,
+            "rate_burst_units": 1_000
+        },
+        "cost_table": {
+            "fixed_request": 1,
+            "minimum_charge": 1,
+            "weights": [1]
+        }
+    });
+
+    let (status, problem) = call(
+        &router,
+        "PUT",
+        &api(&format!("/admin/snapshots/{}", Principal(7))),
+        Some(json!({"snapshot": snapshot})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(problem["code"], "invalid-snapshot-limits");
 }
 
 /// The admin status endpoint speaks the `AccountStatus` vocabulary, and the

@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, Generation,
-    PermissionBits, Principal, PublishableSnapshot, ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, Generation, PermissionBits,
+    Principal, PublishableSnapshot, ResolvedLimits,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, GrantPolicy, MemoryStore, SetStatusError, SnapshotResolution,
@@ -21,21 +21,18 @@ use tollgate_store::{
 };
 
 fn snapshot(account: AccountId, status: AccountStatus) -> PublishableSnapshot {
-    PublishableSnapshot::try_new(Arc::new(AccountSnapshot {
-        account_id: account,
-        key_id: None,
-        generation: Generation(1),
-        status,
-        enforcement_mode: EnforcementMode::Strict,
-        valid_until: jiff::Timestamp::from_second(10_000).unwrap(),
-        permissions: PermissionBits::ALL,
-        limits: ResolvedLimits {
-            max_items_per_request: 64,
-            rate_units_per_second: 1_000,
-            rate_burst_units: 1_000,
-        },
-        cost_table: Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
-    }))
+    PublishableSnapshot::try_new(Arc::new(
+        AccountSnapshot::builder(
+            account,
+            Generation(1),
+            status,
+            jiff::Timestamp::from_second(10_000).unwrap(),
+            PermissionBits::ALL,
+            ResolvedLimits::new(64).with_weighted_rate(1_000, 1_000),
+            Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+        )
+        .build(),
+    ))
     .expect("fixture limits are valid")
 }
 

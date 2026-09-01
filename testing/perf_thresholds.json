@@ -35,6 +35,18 @@
       "threshold_ns": 80.0
     },
     {
+      "_comment": "Overage debit plus commit publication: the marker is visible before the phase claim and remains visible through committed-occupancy publication. Measured at 41.8ns locally; the same-run lease ratio below is the portable cost contract.",
+      "id": "lease/overage_reserve_commit",
+      "target_ns": 50.0,
+      "threshold_ns": 160.0
+    },
+    {
+      "_comment": "Stable committed-cap refusal, including the zero-delta publication RMW that prevents a stale marker observation. Measured at 7.7ns locally; this keeps the denial-path synchronization cost measured rather than inferred from successful reservation.",
+      "id": "lease/overage_refusal_committed",
+      "target_ns": 10.0,
+      "threshold_ns": 50.0
+    },
+    {
       "_comment": "#90 eight threads sharing one lease, with an alternating commit/cancel mix. Measured 4.64us against 38.8ns uncontended; the wide absolute backstop acknowledges scheduler variance while the same-run ratio carries the portable contract.",
       "id": "lease/reserve_commit_contended_8",
       "target_ns": 5500.0,
@@ -171,6 +183,18 @@
       "numerator": "lease/reserve_commit_contended_8",
       "denominator": "lease/reserve_commit",
       "max_ratio": 180.0
+    },
+    {
+      "_comment": "The observer-safe overage transition adds bounded atomic publication to the same reservation CAS. A same-run ratio constrains that cost independently of host speed.",
+      "numerator": "lease/overage_reserve_commit",
+      "denominator": "lease/reserve_commit",
+      "max_ratio": 3.0
+    },
+    {
+      "_comment": "A stable overage refusal measured x0.20 against ordinary reserve-and-commit; even with its publication-ordering RMW it must remain cheaper than that successful transition.",
+      "numerator": "lease/overage_refusal_committed",
+      "denominator": "lease/reserve_commit",
+      "max_ratio": 1.0
     },
     {
       "numerator": "reservation/cancel_after_commit",

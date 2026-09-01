@@ -70,8 +70,8 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
     /// Admit or deny. No I/O, no locks, no clock reads; every deny charges
     /// zero because the reservation is the last step.
     ///
-    /// The outcome is tallied here rather than at each exit: five of the
-    /// fourteen reasons never appear literally in [`Self::admit_inner`], since
+    /// The outcome is tallied here rather than at each exit: several reasons
+    /// never appear literally in [`Self::admit_inner`], since
     /// `AccountSnapshot::admit` and `Reservation::reserve` produce them and
     /// `?` propagates them. Counting at the sites would therefore have been
     /// both noisier and — where it mattered — incomplete.
@@ -116,9 +116,9 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
 
         // 3. Shape and price the work.
         let limits = &state.snapshot.limits;
-        if request.items > limits.max_items_per_request {
+        if request.items > limits.max_items_per_request() {
             return Err(DenyReason::RequestTooLarge {
-                max_items: limits.max_items_per_request,
+                max_items: limits.max_items_per_request(),
             });
         }
         let quote = state
@@ -141,10 +141,11 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
         //    honest: the weight is known to fit the bucket before it is
         //    narrowed, so narrowing can no longer disguise an unadmittable
         //    request as an ordinary empty bucket.
-        if quote.total.get() > limits.rate_burst_units {
+        let legacy_rate = limits.legacy_weighted_rate();
+        if quote.total.get() > legacy_rate.burst_units() {
             return Err(DenyReason::UnpriceableUnderLimits {
                 weight: quote.total,
-                burst_units: CostUnits(limits.rate_burst_units),
+                burst_units: CostUnits(legacy_rate.burst_units()),
             });
         }
         let weight = u32::try_from(quote.total.get()).unwrap_or(u32::MAX);
@@ -165,7 +166,7 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
                 Err(_) => {
                     return Err(DenyReason::UnpriceableUnderLimits {
                         weight: quote.total,
-                        burst_units: CostUnits(limits.rate_burst_units),
+                        burst_units: CostUnits(legacy_rate.burst_units()),
                     });
                 }
             },
@@ -264,7 +265,7 @@ mod tests {
     use tollgate_core::EnforcementMode;
     use tollgate_core::{
         AccountId, AccountStatus, CancelOutcome, CostTable, CostUnits, FencingToken, Generation,
-        LeaseGrant, LeaseId, LocalLease, LocalSharding, PublishableSnapshot, ResolvedLimits,
+        LeaseGrant, LeaseId, LocalLease, LocalSharding, PublishableSnapshot, ResolvedLimits, Retry,
     };
 
     #[derive(Clone, Copy)]
@@ -283,25 +284,22 @@ mod tests {
     }
 
     fn snapshot(status: AccountStatus) -> Arc<AccountSnapshot> {
-        Arc::new(AccountSnapshot {
-            account_id: AccountId(1),
-            key_id: None,
-            generation: Generation(1),
-            status,
-            enforcement_mode: EnforcementMode::Strict,
-            valid_until: t(10_000),
-            permissions: PermissionBits::bit(0),
-            limits: ResolvedLimits {
-                max_items_per_request: 64,
-                rate_units_per_second: 1_000_000,
-                rate_burst_units: 1_000_000,
-            },
-            cost_table: Arc::new(
-                CostTable::builder(CostUnits(50), CostUnits(50))
-                    .weight(&Op::Price, CostUnits(1))
-                    .build(),
-            ),
-        })
+        Arc::new(
+            AccountSnapshot::builder(
+                AccountId(1),
+                Generation(1),
+                status,
+                t(10_000),
+                PermissionBits::bit(0),
+                ResolvedLimits::new(64).with_weighted_rate(1_000_000, 1_000_000),
+                Arc::new(
+                    CostTable::builder(CostUnits(50), CostUnits(50))
+                        .weight(&Op::Price, CostUnits(1))
+                        .build(),
+                ),
+            )
+            .build(),
+        )
     }
 
     fn lease(units: u64) -> Arc<LocalLease> {
@@ -471,10 +469,10 @@ mod tests {
     }
 
     /// The cap bounds the account, not the request: repeated admissions
-    /// accumulate against it and the refusal when it runs out is terminal,
-    /// never `LeaseExhausted` (which would invite a retry that cannot help).
+    /// accumulate against it and the refusal reports the exhausted local
+    /// overage source without claiming that central funding is exhausted.
     #[test]
-    fn elastic_refuses_terminally_once_the_cap_is_spent() {
+    fn elastic_refuses_once_the_local_overage_cap_is_spent() {
         // Two quotes of 51 fit in 102; the third does not.
         let engine = elastic_engine(102, Some(0));
         for _ in 0..2 {
@@ -484,13 +482,60 @@ mod tests {
                 .commit_at_execution_start(t(0))
                 .expect("commit");
         }
+        let denied = engine.admit(request(1), t(0)).unwrap_err();
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            denied,
             DenyReason::OverageCapExhausted {
                 spent: CostUnits(102),
                 overage_cap: CostUnits(102),
             }
         );
+        assert_eq!(denied.retry(), Retry::Transient);
+    }
+
+    /// Exhausting the local overage allowance does not establish that the
+    /// account itself needs funding: an ordinary background grant can make
+    /// the unchanged request admissible without changing the deposit or cap.
+    #[test]
+    fn committed_overage_exhaustion_remains_retryable_after_lease_refill() {
+        for (name, initial_lease, now) in [
+            ("unavailable", None, t(0)),
+            ("exhausted", Some(lease(0)), t(0)),
+            ("expired", Some(lease_until(1_000, t(5))), t(10)),
+        ] {
+            let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+            let slot = LeaseSlot::for_account(AccountId(1));
+            if let Some(initial_lease) = initial_lease {
+                slot.install(initial_lease);
+            }
+            let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
+            snapshot.enforcement_mode = EnforcementMode::Elastic {
+                overage_cap: CostUnits(51),
+            };
+            engine
+                .map()
+                .install(Principal(1), Arc::new(snapshot), Arc::clone(&slot));
+
+            engine
+                .admit(request(1), now)
+                .unwrap_or_else(|denied| panic!("the cap must cover {name}: {denied}"))
+                .reservation
+                .commit_at_execution_start(now)
+                .expect("commit the local overage");
+
+            let denied = engine.admit(request(1), now).unwrap_err();
+            assert!(
+                matches!(denied, DenyReason::OverageCapExhausted { .. }),
+                "the stable local cap reason must survive {name}"
+            );
+            assert_eq!(denied.retry(), Retry::Transient, "lease was {name}");
+
+            slot.install(lease(51));
+            let admitted = engine
+                .admit(request(1), now)
+                .unwrap_or_else(|denied| panic!("a refill must recover {name}: {denied}"));
+            assert!(!admitted.reservation.is_overage());
+        }
     }
 
     /// The two mechanisms this merge put in the same slot had never met: an
@@ -538,13 +583,18 @@ mod tests {
                             1
                         }
                         Err(denied) => {
-                            assert_eq!(
-                                denied,
-                                DenyReason::OverageCapExhausted {
-                                    spent: CostUnits(102),
-                                    overage_cap: CostUnits(102),
+                            match denied {
+                                DenyReason::OverageCapExhausted { spent, overage_cap }
+                                | DenyReason::OverageCapTemporarilyExhausted {
+                                    spent,
+                                    overage_cap,
                                 }
-                            );
+                                | DenyReason::OverageCommitInProgress { spent, overage_cap } => {
+                                    assert_eq!(spent, CostUnits(102));
+                                    assert_eq!(overage_cap, CostUnits(102));
+                                }
+                                other => panic!("unexpected cap refusal: {other}"),
+                            }
                             0
                         }
                     })
@@ -564,6 +614,10 @@ mod tests {
             panic!("principal present");
         };
         assert_eq!(state.lease.overage().spent(), CostUnits(102));
+        assert!(matches!(
+            engine.admit(request(1), t(0)).unwrap_err(),
+            DenyReason::OverageCapExhausted { .. }
+        ));
     }
 
     /// The other half of the same interaction: a sharded slot whose lease can
@@ -590,12 +644,22 @@ mod tests {
         assert_eq!(state.lease.overage().spent(), CostUnits::ZERO);
     }
 
-    /// A cancelled overage charges zero and returns the credit, so the cap is
-    /// a bound on *committed* exposure rather than on arrivals.
+    /// A pending overage can temporarily fill the cap, but its denial must say
+    /// that cancellation can recover: no funding or allowance change is
+    /// required. Cancelling charges zero and returns the credit.
     #[test]
-    fn a_cancelled_overage_returns_its_credit_to_the_cap() {
+    fn pending_overage_saturation_is_transient_until_cancel() {
         let engine = elastic_engine(51, Some(0));
         let admitted = engine.admit(request(1), t(0)).expect("within the cap");
+        let denied = engine.admit(request(1), t(0)).unwrap_err();
+        assert_eq!(
+            denied,
+            DenyReason::OverageCapTemporarilyExhausted {
+                spent: CostUnits(51),
+                overage_cap: CostUnits(51),
+            }
+        );
+        assert_eq!(denied.retry(), Retry::Transient);
         assert_eq!(admitted.reservation.cancel(), CancelOutcome::ZeroCharged);
         engine
             .admit(request(1), t(0))
@@ -635,7 +699,7 @@ mod tests {
         assert_eq!(counters.units_admitted_overage, 51);
         assert_eq!(counters.denied(), 1);
         assert_eq!(
-            counters.denials[DenyReason::OverageCapExhausted {
+            counters.denials[DenyReason::OverageCapTemporarilyExhausted {
                 spent: CostUnits::ZERO,
                 overage_cap: CostUnits::ZERO,
             }
@@ -684,7 +748,7 @@ mod tests {
                     t(0)
                 )
                 .unwrap_err(),
-            DenyReason::OverageCapExhausted {
+            DenyReason::OverageCapTemporarilyExhausted {
                 spent: CostUnits(51),
                 overage_cap: CostUnits(51),
             },
@@ -771,7 +835,7 @@ mod tests {
 
         assert_eq!(
             engine.admit(request(1), t(0)).unwrap_err(),
-            DenyReason::OverageCapExhausted {
+            DenyReason::OverageCapTemporarilyExhausted {
                 spent: CostUnits(51),
                 overage_cap: CostUnits(51),
             }
@@ -906,14 +970,9 @@ mod tests {
         // Burst of 1000 units, negligible refill within the test: exactly ten
         // 100-unit requests fit the burst (GCRA's boundary is inclusive), and
         // the eleventh is rate limited even though the lease has plenty left.
-        let snapshot = Arc::new(AccountSnapshot {
-            limits: ResolvedLimits {
-                max_items_per_request: 64,
-                rate_units_per_second: 1,
-                rate_burst_units: 1_000,
-            },
-            ..(*snapshot(AccountStatus::Active)).clone()
-        });
+        let mut snapshot = (*snapshot(AccountStatus::Active)).clone();
+        snapshot.limits = ResolvedLimits::new(64).with_weighted_rate(1, 1_000);
+        let snapshot = Arc::new(snapshot);
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
         slot.install(lease(1_000_000));
@@ -933,10 +992,9 @@ mod tests {
 
     /// Builds an engine whose account carries the given limits.
     fn engine_with_limits(limits: ResolvedLimits) -> AdmissionEngine<ArcSwapSnapshotMap> {
-        let snapshot = Arc::new(AccountSnapshot {
-            limits,
-            ..(*snapshot(AccountStatus::Active)).clone()
-        });
+        let mut snapshot = (*snapshot(AccountStatus::Active)).clone();
+        snapshot.limits = limits;
+        let snapshot = Arc::new(snapshot);
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
         slot.install(lease(1_000_000));
@@ -949,13 +1007,12 @@ mod tests {
     /// that can never succeed.
     #[test]
     fn batch_cap_above_burst_is_unpriceable_not_throttled() {
-        let engine = engine_with_limits(ResolvedLimits {
-            max_items_per_request: 64,
-            rate_units_per_second: 1_000,
+        let engine = engine_with_limits(ResolvedLimits::new(64).with_weighted_rate(
+            1_000,
             // 64 items quote 50 + 64 = 114 units: inside the batch cap, past
             // the burst, and unadmittable however long the caller waits.
-            rate_burst_units: 64,
-        });
+            64,
+        ));
 
         assert_eq!(
             engine.admit(request(64), t(0)).unwrap_err(),
@@ -983,12 +1040,10 @@ mod tests {
     /// here would deny requests governor would have accepted.
     #[test]
     fn weight_equal_to_burst_admits() {
-        let engine = engine_with_limits(ResolvedLimits {
-            max_items_per_request: 64,
-            rate_units_per_second: 1,
-            // 64 items quote exactly 50 + 64 = 114 units.
-            rate_burst_units: 114,
-        });
+        let engine = engine_with_limits(ResolvedLimits::new(64).with_weighted_rate(
+            1, // 64 items quote exactly 50 + 64 = 114 units.
+            114,
+        ));
 
         let admitted = engine.admit(request(64), t(0)).unwrap();
         assert_eq!(admitted.quote.total, CostUnits(114));
@@ -1004,11 +1059,7 @@ mod tests {
     /// priced request is refused, and says why.
     #[test]
     fn zero_burst_denies_every_priced_request() {
-        let engine = engine_with_limits(ResolvedLimits {
-            max_items_per_request: 64,
-            rate_units_per_second: 1_000,
-            rate_burst_units: 0,
-        });
+        let engine = engine_with_limits(ResolvedLimits::new(64).with_weighted_rate(1_000, 0));
 
         assert_eq!(
             engine.admit(request(1), t(0)).unwrap_err(),
@@ -1023,11 +1074,9 @@ mod tests {
     /// construction; narrowing must not disguise it as an empty bucket.
     #[test]
     fn quote_beyond_the_bucket_domain_is_unpriceable() {
-        let engine = engine_with_limits(ResolvedLimits {
-            max_items_per_request: u64::MAX,
-            rate_units_per_second: 1_000,
-            rate_burst_units: u64::from(u32::MAX),
-        });
+        let engine = engine_with_limits(
+            ResolvedLimits::new(u64::MAX).with_weighted_rate(1_000, u64::from(u32::MAX)),
+        );
 
         // 50 fixed + items: the first quote to exceed the burst.
         let items = u64::from(u32::MAX);
@@ -1050,38 +1099,30 @@ mod tests {
     fn a_shared_split_bucket_never_wedges_a_principal_the_burst_can_hold() {
         let sharding = LocalSharding::new(std::num::NonZeroUsize::new(8).unwrap());
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::with_sharding(sharding));
-        let limits = ResolvedLimits {
-            max_items_per_request: 64,
-            rate_units_per_second: 800,
-            rate_burst_units: 800,
-        };
+        let limits = ResolvedLimits::new(64).with_weighted_rate(800, 800);
 
         // A light key: 64 items quote 2 + 64 = 66 units, so eight buckets of
         // a hundred each can hold one.
-        let light = PublishableSnapshot::try_new(Arc::new(AccountSnapshot {
-            limits,
-            cost_table: Arc::new(
-                CostTable::builder(CostUnits(2), CostUnits(1))
-                    .weight(&Op::Price, CostUnits(1))
-                    .build(),
-            ),
-            ..(*snapshot(AccountStatus::Active)).clone()
-        }))
-        .unwrap();
+        let mut light = (*snapshot(AccountStatus::Active)).clone();
+        light.limits = limits;
+        light.cost_table = Arc::new(
+            CostTable::builder(CostUnits(2), CostUnits(1))
+                .weight(&Op::Price, CostUnits(1))
+                .build(),
+        );
+        let light = PublishableSnapshot::try_new(Arc::new(light)).unwrap();
 
         // A heavy key of the same account at the same generation: 64 items
         // quote 2 + 640 = 642 units. Publication accepts it — it fits the
         // account's 800-unit burst — so admission must too.
-        let heavy = PublishableSnapshot::try_new(Arc::new(AccountSnapshot {
-            limits,
-            cost_table: Arc::new(
-                CostTable::builder(CostUnits(2), CostUnits(1))
-                    .weight(&Op::Price, CostUnits(10))
-                    .build(),
-            ),
-            ..(*snapshot(AccountStatus::Active)).clone()
-        }))
-        .unwrap();
+        let mut heavy = (*snapshot(AccountStatus::Active)).clone();
+        heavy.limits = limits;
+        heavy.cost_table = Arc::new(
+            CostTable::builder(CostUnits(2), CostUnits(1))
+                .weight(&Op::Price, CostUnits(10))
+                .build(),
+        );
+        let heavy = PublishableSnapshot::try_new(Arc::new(heavy)).unwrap();
 
         let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
         slot.install(lease(1_000_000));
@@ -1198,19 +1239,14 @@ mod tests {
         );
 
         // Cost overflow: a table whose weight cannot be multiplied out.
-        let overflowing = Arc::new(AccountSnapshot {
-            limits: ResolvedLimits {
-                max_items_per_request: u64::MAX,
-                rate_units_per_second: u64::MAX,
-                rate_burst_units: u64::MAX,
-            },
-            cost_table: Arc::new(
-                CostTable::builder(CostUnits(50), CostUnits(50))
-                    .weight(&Op::Price, CostUnits(u64::MAX / 2))
-                    .build(),
-            ),
-            ..(*snapshot(AccountStatus::Active)).clone()
-        });
+        let mut overflowing = (*snapshot(AccountStatus::Active)).clone();
+        overflowing.limits = ResolvedLimits::new(u64::MAX).with_weighted_rate(u64::MAX, u64::MAX);
+        overflowing.cost_table = Arc::new(
+            CostTable::builder(CostUnits(50), CostUnits(50))
+                .weight(&Op::Price, CostUnits(u64::MAX / 2))
+                .build(),
+        );
+        let overflowing = Arc::new(overflowing);
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
         slot.install(lease(u64::MAX));

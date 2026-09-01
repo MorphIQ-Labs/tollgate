@@ -219,10 +219,17 @@ impl Reservation {
                 Err(_) => Err(CommitError::AlreadyCommitted),
             };
         }
-        match self
-            .phase
-            .compare_exchange(PENDING, COMMITTED, Ordering::AcqRel, Ordering::Acquire)
-        {
+        let transition = match &self.source {
+            ChargeSource::Overage(overage) => overage.publish_commit(self.units, || {
+                self.phase
+                    .compare_exchange(PENDING, COMMITTED, Ordering::AcqRel, Ordering::Acquire)
+            }),
+            ChargeSource::Lease { .. } => {
+                self.phase
+                    .compare_exchange(PENDING, COMMITTED, Ordering::AcqRel, Ordering::Acquire)
+            }
+        };
+        match transition {
             Ok(_) => Ok(self.units),
             Err(RELEASED) => Err(CommitError::AlreadyReleased),
             Err(_) => Err(CommitError::AlreadyCommitted),
@@ -564,5 +571,87 @@ mod tests {
                 other => panic!("impossible race outcome: {other:?}"),
             }
         }
+    }
+
+    /// The overage counter has a second transition to publish after the
+    /// reservation CAS: committed occupancy. Once both racers return, the
+    /// winning phase and the local occupancy reason must agree exactly —
+    /// cancellation restores headroom, while commit leaves stable saturation.
+    #[test]
+    fn overage_commit_cancel_race_preserves_retry_classification() {
+        for _ in 0..500 {
+            let o = overage();
+            let r =
+                Arc::new(Reservation::reserve_overage(&o, CostUnits(10), CostUnits(10)).unwrap());
+            let committer = std::thread::spawn({
+                let r = Arc::clone(&r);
+                move || r.commit_at_execution_start(t(0))
+            });
+            let canceller = std::thread::spawn({
+                let r = Arc::clone(&r);
+                move || r.cancel()
+            });
+
+            match (committer.join().unwrap(), canceller.join().unwrap()) {
+                (Ok(units), CancelOutcome::AlreadyCommitted { units: seen }) => {
+                    assert_eq!(units, seen);
+                    assert_eq!(o.spent(), CostUnits(10));
+                    let denied =
+                        Reservation::reserve_overage(&o, CostUnits(1), CostUnits(10)).unwrap_err();
+                    assert!(matches!(denied, DenyReason::OverageCapExhausted { .. }));
+                    assert_eq!(denied.retry(), crate::deny::Retry::Transient);
+                }
+                (Err(CommitError::AlreadyReleased), CancelOutcome::ZeroCharged) => {
+                    assert_eq!(o.spent(), CostUnits::ZERO);
+                    drop(
+                        Reservation::reserve_overage(&o, CostUnits(10), CostUnits(10))
+                            .expect("cancelled credit is immediately reusable"),
+                    );
+                }
+                other => panic!("impossible overage race outcome: {other:?}"),
+            }
+        }
+    }
+
+    /// A commit has become irrevocable once it wins the phase transition. A
+    /// cap observer must never describe those units as refundable while the
+    /// committed-occupancy publication is still catching up.
+    #[test]
+    fn overage_commit_publication_never_looks_refundable() {
+        let overage = overage();
+        let reservation =
+            Reservation::reserve_overage(&overage, CostUnits(100), CostUnits(100)).unwrap();
+
+        overage
+            .publish_commit(reservation.units, || {
+                let claimed = reservation.phase.compare_exchange(
+                    PENDING,
+                    COMMITTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                assert!(claimed.is_ok(), "this commit wins the phase claim");
+                assert_eq!(
+                    {
+                        let denied =
+                            Reservation::reserve_overage(&overage, CostUnits(1), CostUnits(100))
+                                .unwrap_err();
+                        assert_eq!(denied.retry(), crate::deny::Retry::AfterInFlight);
+                        denied
+                    },
+                    DenyReason::OverageCommitInProgress {
+                        spent: CostUnits(100),
+                        overage_cap: CostUnits(100),
+                    },
+                    "an irrevocable commit is identified as an in-flight publication"
+                );
+                claimed
+            })
+            .unwrap();
+
+        assert!(matches!(
+            Reservation::reserve_overage(&overage, CostUnits(1), CostUnits(100)).unwrap_err(),
+            DenyReason::OverageCapExhausted { .. }
+        ));
     }
 }

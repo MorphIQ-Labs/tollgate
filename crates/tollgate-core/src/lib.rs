@@ -33,7 +33,7 @@ pub mod units;
 pub mod usage;
 
 pub use cost_table::{CostQuote, CostTable, CostTableBuilder, OpIndex, QuoteError};
-pub use deny::DenyReason;
+pub use deny::{DenyReason, Retry};
 pub use ids::{
     AccountId, FencingToken, Generation, KeyId, LeaseId, ParseIdError, Principal, RequestId,
 };
@@ -41,8 +41,9 @@ pub use lease::{AccountOverage, LeaseGrant, LocalLease, RefillSignal};
 pub use reservation::{CancelOutcome, CommitError, Reservation};
 pub use sharding::{LocalSharding, Locality};
 pub use snapshot::{
-    AccountSnapshot, AccountStatus, EnforcementMode, PermissionBits, PublishableSnapshot,
-    ResolvedLimits, SnapshotValidationError,
+    AccountSnapshot, AccountSnapshotBuilder, AccountStatus, EnforcementMode, PermissionBits,
+    PublishableSnapshot, RequestRateLimit, ResolvedLimits, ResolvedLimitsError,
+    SnapshotValidationError, WeightedRateLimit,
 };
 pub use units::CostUnits;
 pub use usage::{UsageEvent, UsageSource};

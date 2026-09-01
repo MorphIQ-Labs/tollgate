@@ -348,28 +348,26 @@ fn build_app_with(
     let compile_snapshot = {
         let clock = Arc::clone(&clock);
         move |generation: u64| {
-            let snapshot = Arc::new(AccountSnapshot {
-                account_id: DEMO_ACCOUNT,
-                key_id: None,
-                generation: Generation(generation),
-                status: AccountStatus::Active,
-                enforcement_mode,
-                valid_until: clock
-                    .now()
-                    .checked_add(SignedDuration::from_secs(3_600))
-                    .expect("valid_until in range"),
-                permissions: PERMISSION_PRICE,
-                limits: ResolvedLimits {
-                    max_items_per_request: 1_024,
-                    rate_units_per_second: 5_000_000,
-                    rate_burst_units: 10_000_000,
-                },
-                cost_table: Arc::new(
-                    CostTable::builder(CostUnits(50), CostUnits(50))
-                        .weight(&Op::Price, CostUnits(1))
-                        .build(),
-                ),
-            });
+            let snapshot = Arc::new(
+                AccountSnapshot::builder(
+                    DEMO_ACCOUNT,
+                    Generation(generation),
+                    AccountStatus::Active,
+                    clock
+                        .now()
+                        .checked_add(SignedDuration::from_secs(3_600))
+                        .expect("valid_until in range"),
+                    PERMISSION_PRICE,
+                    ResolvedLimits::new(1_024).with_weighted_rate(5_000_000, 10_000_000),
+                    Arc::new(
+                        CostTable::builder(CostUnits(50), CostUnits(50))
+                            .weight(&Op::Price, CostUnits(1))
+                            .build(),
+                    ),
+                )
+                .enforcement_mode(enforcement_mode)
+                .build(),
+            );
             PublishableSnapshot::try_new(snapshot)
                 .expect("example pricing schedule must fit inside its burst")
         }
@@ -795,12 +793,14 @@ fn deny_response(reason: DenyReason) -> Response {
         DenyReason::AccountSuspended
         | DenyReason::AccountClosed
         | DenyReason::MissingPermission => (StatusCode::FORBIDDEN, "forbidden"),
-        DenyReason::SnapshotExpired => (StatusCode::FORBIDDEN, "policy-stale"),
+        DenyReason::SnapshotExpired => (StatusCode::SERVICE_UNAVAILABLE, "policy-stale"),
         DenyReason::RequestTooLarge { .. } => (StatusCode::PAYLOAD_TOO_LARGE, "batch-too-large"),
         DenyReason::UnpricedOperation | DenyReason::CostOverflow => {
             (StatusCode::UNPROCESSABLE_ENTITY, "unpriceable")
         }
         DenyReason::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate-limited"),
+        DenyReason::RequestRateLimited => (StatusCode::TOO_MANY_REQUESTS, "request-rate-limited"),
+        DenyReason::ConcurrencyLimited => (StatusCode::TOO_MANY_REQUESTS, "concurrency-limited"),
         // Deliberately not 429 and deliberately its own code: this request
         // can never be admitted under the current plan, so inviting a retry
         // would be a lie, and folding it into "unpriceable" would hide which
@@ -812,15 +812,30 @@ fn deny_response(reason: DenyReason) -> Response {
             (StatusCode::SERVICE_UNAVAILABLE, "quota-unavailable")
         }
         DenyReason::LeaseExhausted { .. } => (StatusCode::TOO_MANY_REQUESTS, "quota-exhausted"),
-        // 402, not 429, and for the same reason `unpriceable-under-limits` is
-        // not 429: an exhausted overage cap does not refill on its own. The
-        // lease behind `quota-exhausted` does, so telling this caller to retry
-        // would point it at a wall. Payment is the remedy, and the status code
-        // says so.
+        // The local overage cap does not refill, but this reason is observed
+        // only after a lease failed to fund the request. The background lease
+        // manager may install a new grant from existing central balance, so a
+        // payment-required response would claim knowledge this process does
+        // not have.
         DenyReason::OverageCapExhausted { .. } => {
-            (StatusCode::PAYMENT_REQUIRED, "overage-cap-exhausted")
+            (StatusCode::SERVICE_UNAVAILABLE, "overage-cap-exhausted")
         }
+        DenyReason::OverageCapTemporarilyExhausted { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overage-cap-temporarily-exhausted",
+        ),
+        DenyReason::OverageCommitInProgress { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overage-commit-in-progress",
+        ),
         DenyReason::AccountingBackpressure => (StatusCode::SERVICE_UNAVAILABLE, "accounting-busy"),
+        DenyReason::EmptyWorkload => (StatusCode::UNPROCESSABLE_ENTITY, "empty-workload"),
+        DenyReason::FundingExpiredAtStart => {
+            (StatusCode::SERVICE_UNAVAILABLE, "funding-expired-at-start")
+        }
+        DenyReason::CapacityUnavailable => {
+            (StatusCode::SERVICE_UNAVAILABLE, "capacity-unavailable")
+        }
     };
     problem(status, code, reason.to_string())
 }
@@ -955,7 +970,7 @@ fn erf(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tollgate_core::{FencingToken, LeaseGrant, LeaseId, LocalLease};
+    use tollgate_core::{FencingToken, LeaseGrant, LeaseId, LocalLease, Reservation};
     use tollgate_store::{SnapshotResolution, SnapshotSource};
 
     // The cache's own behaviour — verify-once, per-session isolation,
@@ -971,6 +986,65 @@ mod tests {
             refill_healthy: true,
             writer_healthy: true,
         }
+    }
+
+    /// The canonical embedder must preserve the core retry contract. Both
+    /// refundable and committed local saturation are operational because a
+    /// lease refill can recover either; publication has its own stable code.
+    #[tokio::test]
+    async fn overage_retry_classes_map_to_distinct_http_contracts() {
+        for (reason, expected_status, expected_code) in [
+            (
+                DenyReason::OverageCapTemporarilyExhausted {
+                    spent: CostUnits(100),
+                    overage_cap: CostUnits(100),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overage-cap-temporarily-exhausted",
+            ),
+            (
+                DenyReason::OverageCapExhausted {
+                    spent: CostUnits(100),
+                    overage_cap: CostUnits(100),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overage-cap-exhausted",
+            ),
+            (
+                DenyReason::OverageCommitInProgress {
+                    spent: CostUnits(100),
+                    overage_cap: CostUnits(100),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overage-commit-in-progress",
+            ),
+        ] {
+            let response = deny_response(reason);
+            assert_eq!(response.status(), expected_status);
+            let body = axum::body::to_bytes(response.into_body(), 4_096)
+                .await
+                .unwrap();
+            let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(problem["code"], expected_code);
+        }
+    }
+
+    /// Snapshot expiry is repaired by background publication, so the
+    /// canonical adapter must expose an operational outage rather than a
+    /// permanent authorization failure.
+    #[tokio::test]
+    async fn snapshot_expiry_maps_to_a_transient_service_outage() {
+        let reason = DenyReason::SnapshotExpired;
+        assert_eq!(reason.retry(), tollgate_core::Retry::Transient);
+
+        let response = deny_response(reason);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4_096)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["code"], "policy-stale");
+        assert_eq!(problem["units_charged"], 0);
     }
 
     /// INVARIANTS.md #10: fail-closed correctness must not masquerade as
@@ -1099,9 +1173,9 @@ mod tests {
 
         // Spending the cap withdraws the instance, because at that point it
         // really cannot admit anything.
-        slot.overage()
-            .try_debit(CostUnits(100), CostUnits(100))
-            .unwrap();
+        let overage =
+            Reservation::reserve_overage(slot.overage(), CostUnits(100), CostUnits(100)).unwrap();
+        overage.commit_at_execution_start(now).unwrap();
         assert!(
             !quota_usable(&slot, elastic, now),
             "a spent cap is not admissible, and readiness must say so"
@@ -1147,27 +1221,24 @@ mod tests {
         let store = MemoryStore::new(GrantPolicy::default()).expect("valid policy");
         let principal = Principal(7);
         let compile = |generation: u64| {
-            PublishableSnapshot::try_new(Arc::new(AccountSnapshot {
-                account_id: DEMO_ACCOUNT,
-                key_id: None,
-                generation: Generation(generation),
-                status: AccountStatus::Active,
-                enforcement_mode: EnforcementMode::Strict,
-                valid_until: Timestamp::now()
-                    .checked_add(SignedDuration::from_secs(3_600))
-                    .unwrap(),
-                permissions: PERMISSION_PRICE,
-                limits: ResolvedLimits {
-                    max_items_per_request: 1_024,
-                    rate_units_per_second: 5_000_000,
-                    rate_burst_units: 10_000_000,
-                },
-                cost_table: Arc::new(
-                    CostTable::builder(CostUnits(50), CostUnits(50))
-                        .weight(&Op::Price, CostUnits(1))
-                        .build(),
-                ),
-            }))
+            PublishableSnapshot::try_new(Arc::new(
+                AccountSnapshot::builder(
+                    DEMO_ACCOUNT,
+                    Generation(generation),
+                    AccountStatus::Active,
+                    Timestamp::now()
+                        .checked_add(SignedDuration::from_secs(3_600))
+                        .unwrap(),
+                    PERMISSION_PRICE,
+                    ResolvedLimits::new(1_024).with_weighted_rate(5_000_000, 10_000_000),
+                    Arc::new(
+                        CostTable::builder(CostUnits(50), CostUnits(50))
+                            .weight(&Op::Price, CostUnits(1))
+                            .build(),
+                    ),
+                )
+                .build(),
+            ))
             .expect("schedule fits inside its burst")
         };
         store.publish_snapshot(principal, compile(1));

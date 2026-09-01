@@ -44,7 +44,7 @@ until it has one.
    `a_torn_aggregate_above_the_grant_reads_as_the_grant`,
    `a_fragmenting_rollback_never_panics_a_concurrent_aggregate_read`, and the
    exact aggregate model in `formal/lean/Tollgate/LeaseShards.lean`;
-   `elastic_refuses_terminally_once_the_cap_is_spent`,
+   `elastic_refuses_once_the_local_overage_cap_is_spent`,
    `every_principal_of_an_account_shares_one_cap`,
    `republishing_a_snapshot_does_not_reset_the_cap`,
    `concurrent_debits_never_exceed_the_cap`,
@@ -52,6 +52,27 @@ until it has one.
    `a_sharded_slot_still_prefers_the_lease_that_can_fund_the_quote` (the cap
    and the sharded lease views sharing one slot), and
    `Tollgate.Conservation.an_accepted_debit_stays_within_the_cap`.
+
+   Pending and committed occupancy are distinct retry states. Reservation
+   phase and account occupancy publish through a guard-owned transition. A
+   zero-delta observer RMW participates in the marker's modification order,
+   so an observer overlapping it receives
+   `OverageCommitInProgress`/`AfterInFlight`, never a claim that irrevocable
+   units remain refundable or a promise that funding is already required. In
+   a stable state, a refusal is
+   `OverageCapTemporarilyExhausted`/`Transient` only when refunding all pending
+   reservations would make that request fit; otherwise it is stable local
+   `OverageCapExhausted`. Both states are `Transient` at the admission
+   boundary: neither proves central account exhaustion, and an ordinary lease
+   refill can fund the unchanged request. *Tests:*
+   `pending_overage_is_transient_only_when_its_refund_would_make_room`,
+   `overage_retry_class_matches_stable_occupancy`,
+   `pending_overage_saturation_is_transient_until_cancel`, and
+   `elastic_refuses_once_the_local_overage_cap_is_spent`,
+   `committed_overage_exhaustion_remains_retryable_after_lease_refill`, plus
+   `overage_commit_publication_never_looks_refundable` and
+   `overage_retry_classes_map_to_distinct_http_contracts` for the canonical
+   embedder. *Proof:* `formal/lean/Tollgate/OveragePublication.lean`.
 
 2. **Zero charge before execution.** A reservation that never reaches
    `commit_at_execution_start` charges zero units, and its units return to the
@@ -65,7 +86,14 @@ until it has one.
 3. **Atomic commit-vs-cancel.** Commit and cancel race on a single atomic
    transition; exactly one wins. A cancelled reservation can never later
    commit; a committed reservation reports its full charge to a late
-   canceller. *Tests:* `reservation::tests::commit_cancel_race_one_winner`.
+   canceller. Overage wraps that phase transition and committed occupancy in a
+   visible publication guard, so observers never treat the interval between
+   the two atomic words as stable. Once both racers return its retry
+   classification agrees with the winner. *Tests:*
+   `reservation::tests::commit_cancel_race_one_winner`,
+   `reservation::tests::overage_commit_publication_never_looks_refundable`, and
+   `reservation::tests::overage_commit_cancel_race_preserves_retry_classification`.
+   *Proof:* `formal/lean/Tollgate/OveragePublication.lean`.
 
 4. **Lease capabilities are exact and lease-scoped.** Every acquired lease is
    stamped with the next fencing token in its account's strictly increasing
@@ -112,7 +140,9 @@ until it has one.
    `RateLimited`); and
    `elastic_does_not_relax_any_refusal_that_is_not_about_funding`, which pins
    that an elastic account still denies every non-funding refusal *and* claims
-   no credit while doing so.
+   no credit while doing so. `AccountSnapshot::builder` requires the
+   administrative status, and `builder_requires_account_status_at_construction`
+   pins that incomplete construction cannot silently become `Active`.
    An opt-in sharded limiter partitions (never copies) the instance-local
    account rate and burst; publication's already-validated maximum quote
    limits the shard count so every shard can admit the largest legitimate
@@ -351,6 +381,9 @@ until it has one.
     TTLs, polling/refresh/reclaim intervals, negative safety margins or
     reclaim grace, and internally inconsistent lease thresholds are rejected
     before allocation or task startup. A snapshot is publishable only when
+    both carried weighted-rate scalars fit governor's non-zero `u32` domain
+    in full width — including the rollback pair carried while weighted rate
+    is disabled — and when
     checked arithmetic proves that its worst registered operation at
     `max_items_per_request` — including fixed and minimum charges — does not
     exceed `rate_burst_units`; overflow and above-burst results are refused at
@@ -363,13 +396,14 @@ until it has one.
     `invalid_lease_manager_timeouts_are_rejected`, and
     `invalid_pool_config_is_rejected_before_connecting`, plus
     `publication_uses_the_largest_registered_weight`,
+    `publication_rejects_weighted_values_outside_governors_domain`,
     `snapshot_publication_matches_u128_worst_case_oracle`,
     `admin_refuses_snapshot_whose_batch_quote_exceeds_burst`,
-    `http_store_rejects_invalid_snapshot_from_legacy_server`, and
-    `legacy_invalid_snapshot_is_rejected_on_read`. *Proof:*
-    `formal/lean/Tollgate/SnapshotLimits.lean`. No such value is silently
-    repaired: coercing a capacity or overriding a declared limit would change
-    the runtime meaning of a configured contract.
+    `admin_refuses_weighted_rate_outside_governors_u32_domain`,
+    `http_store_rejects_invalid_snapshot_from_legacy_server`,
+    and `legacy_invalid_snapshot_is_rejected_on_read`. *Proof:*
+    `formal/lean/Tollgate/SnapshotLimits.lean`. Values are never silently
+    repaired: coercing a declared capacity would change its contract.
 
 17. **Negative caching is bounded and self-healing.** The ArcSwap map retains
     at most its configured count of request-visible negatives, removes
