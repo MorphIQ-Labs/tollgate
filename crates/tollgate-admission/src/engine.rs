@@ -382,7 +382,7 @@ fn compile_workload<O: OpIndex>(
     if now >= snapshot.valid_until {
         return Err(DenyReason::SnapshotExpired);
     }
-    let (quote, items) =
+    let (quote, items, required) =
         snapshot
             .cost_table
             .quote_workload(workload)
@@ -391,6 +391,14 @@ fn compile_workload<O: OpIndex>(
                 QuoteError::UnknownOperation { .. } => DenyReason::UnpricedOperation,
                 QuoteError::Overflow => DenyReason::CostOverflow,
             })?;
+    // Work permission, as distinct from the route permission `begin` already
+    // checked. It is only knowable here: which classes a request touches is a
+    // property of its decoded workload, not of the route it arrived on. The
+    // bits were folded by the quote's own pass, so this consults neither the
+    // workload nor the map a second time.
+    if !snapshot.permissions.contains_all(required) {
+        return Err(DenyReason::MissingPermission);
+    }
     if items > snapshot.limits.max_items_per_request() {
         return Err(DenyReason::RequestTooLarge {
             max_items: snapshot.limits.max_items_per_request(),
@@ -637,6 +645,27 @@ mod tests {
                 Arc::new(
                     CostTable::builder(CostUnits(50), CostUnits(50))
                         .weight(&Op::Price, CostUnits(1))
+                        .build(),
+                ),
+            )
+            .build(),
+        )
+    }
+
+    /// A snapshot granting the route bit but not the work bit a class needs.
+    fn snapshot_without_work_permission() -> Arc<AccountSnapshot> {
+        Arc::new(
+            AccountSnapshot::builder(
+                AccountId(1),
+                Generation(1),
+                AccountStatus::Active,
+                t(10_000),
+                // Route permission only. The class below wants bit 5.
+                PermissionBits::bit(0),
+                ResolvedLimits::new(64).with_weighted_rate(1_000_000, 1_000_000),
+                Arc::new(
+                    CostTable::builder(CostUnits(50), CostUnits(50))
+                        .class(&Op::Price, CostUnits(1), PermissionBits::bit(5))
                         .build(),
                 ),
             )
@@ -2241,5 +2270,63 @@ mod tests {
         );
         slot.install(lease(10_000));
         engine.admit_one(request(1), t(0)).unwrap();
+    }
+
+    /// Work permission is checked at stage two, and refusing costs nothing.
+    ///
+    /// `begin` cannot make this decision: which classes a request touches is a
+    /// property of its decoded workload. The account here passes the route
+    /// check and still may not run the class it asked for.
+    #[test]
+    fn a_workload_requiring_ungranted_bits_is_denied_at_stage_two() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease(1_000));
+        engine
+            .map()
+            .install(Principal(1), snapshot_without_work_permission(), slot);
+
+        // Stage one succeeds: the route permission is granted.
+        let context = engine
+            .begin(Principal(1), PermissionBits::bit(0), t(0))
+            .expect("route permission is granted");
+
+        let denied = context
+            .admit(&[(Op::Price, 1)], DiscardedUsage::new().slot(), t(0))
+            .expect_err("the class requires a bit the account lacks");
+        assert_eq!(denied, DenyReason::MissingPermission);
+    }
+
+    /// A class the account *is* entitled to still admits.
+    #[test]
+    fn a_workload_within_granted_bits_admits() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease(1_000));
+        let snapshot = Arc::new(
+            AccountSnapshot::builder(
+                AccountId(1),
+                Generation(1),
+                AccountStatus::Active,
+                t(10_000),
+                PermissionBits::bit(0).union(PermissionBits::bit(5)),
+                ResolvedLimits::new(64).with_weighted_rate(1_000_000, 1_000_000),
+                Arc::new(
+                    CostTable::builder(CostUnits(50), CostUnits(50))
+                        .class(&Op::Price, CostUnits(1), PermissionBits::bit(5))
+                        .build(),
+                ),
+            )
+            .build(),
+        );
+        engine.map().install(Principal(1), snapshot, slot);
+
+        let context = engine
+            .begin(Principal(1), PermissionBits::bit(0), t(0))
+            .expect("route permission is granted");
+        let pending = context
+            .admit(&[(Op::Price, 1)], DiscardedUsage::new().slot(), t(0))
+            .expect("the account holds the class bit");
+        assert_eq!(pending.quote().total, CostUnits(51));
     }
 }

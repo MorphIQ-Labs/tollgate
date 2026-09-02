@@ -7,7 +7,7 @@
 
 use core::fmt;
 
-use crate::units::CostUnits;
+use crate::{snapshot::PermissionBits, units::CostUnits};
 
 /// Maps a consumer operation onto a dense table index.
 ///
@@ -73,6 +73,19 @@ pub struct CostTable {
     fixed_request: CostUnits,
     minimum_charge: CostUnits,
     weights: Box<[Option<CostUnits>]>,
+    /// Work permissions, parallel to `weights` and index-addressed the same way.
+    ///
+    /// Held in canonical form: trailing `NONE` entries are trimmed at build
+    /// time and an entirely-`NONE` array is empty. A missing index therefore
+    /// means `PermissionBits::NONE`, which is what makes a table decoded from
+    /// JSON written before this field existed compare equal to the same table
+    /// built today — a stored snapshot must not start denying work because the
+    /// binary that reads it learned a new field.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "<[PermissionBits]>::is_empty")
+    )]
+    permissions: Box<[PermissionBits]>,
 }
 
 impl CostTable {
@@ -82,13 +95,15 @@ impl CostTable {
             fixed_request,
             minimum_charge,
             weights: Vec::new(),
+            permissions: Vec::new(),
         }
     }
 
     /// Quote `items` items of `op` as the homogeneous one-entry workload.
     #[inline]
     pub fn quote(&self, op: &impl OpIndex, items: u64) -> Result<CostQuote, QuoteError> {
-        self.quote_workload(&[(op, items)]).map(|(quote, _)| quote)
+        self.quote_workload(&[(op, items)])
+            .map(|(quote, _, _)| quote)
     }
 
     /// Quote caller-owned class aggregates, applying the fixed and minimum
@@ -97,9 +112,10 @@ impl CostTable {
     pub fn quote_workload<O: OpIndex>(
         &self,
         workload: &[(O, u64)],
-    ) -> Result<(CostQuote, u64), QuoteError> {
+    ) -> Result<(CostQuote, u64, PermissionBits), QuoteError> {
         let mut items = 0_u64;
         let mut variable = CostUnits::ZERO;
+        let mut required = PermissionBits::NONE;
         for (op, count) in workload {
             if *count == 0 {
                 continue;
@@ -112,6 +128,7 @@ impl CostTable {
             };
             let entry = per_item.checked_mul(*count).ok_or(QuoteError::Overflow)?;
             variable = variable.checked_add(entry).ok_or(QuoteError::Overflow)?;
+            required = required.union(self.required_at(index));
         }
         if items == 0 {
             return Err(QuoteError::EmptyWorkload);
@@ -127,7 +144,17 @@ impl CostTable {
                 variable,
             },
             items,
+            required,
         ))
+    }
+
+    /// Work permissions for a class, or `NONE` past the canonical array's end.
+    #[inline]
+    fn required_at(&self, index: usize) -> PermissionBits {
+        self.permissions
+            .get(index)
+            .copied()
+            .unwrap_or(PermissionBits::NONE)
     }
 
     /// Quote one already-resolved weight. Keeping the arithmetic here makes
@@ -185,6 +212,7 @@ pub struct CostTableBuilder {
     fixed_request: CostUnits,
     minimum_charge: CostUnits,
     weights: Vec<Option<CostUnits>>,
+    permissions: Vec<PermissionBits>,
 }
 
 impl CostTableBuilder {
@@ -192,21 +220,47 @@ impl CostTableBuilder {
     /// index twice keeps the last value; that is a configuration authoring
     /// concern, not a runtime one.
     #[must_use]
-    pub fn weight(mut self, op: &impl OpIndex, per_item: CostUnits) -> Self {
+    pub fn weight(self, op: &impl OpIndex, per_item: CostUnits) -> Self {
+        self.class(op, per_item, PermissionBits::NONE)
+    }
+
+    /// Register a class: what it costs per item and what it requires.
+    ///
+    /// One growth path with [`Self::weight`], which is this call with no
+    /// requirement. Registering the same index twice keeps the last pair; that
+    /// is a configuration authoring concern, not a runtime one.
+    #[must_use]
+    pub fn class(
+        mut self,
+        op: &impl OpIndex,
+        per_item: CostUnits,
+        required: PermissionBits,
+    ) -> Self {
         let index = op.index();
         if index >= self.weights.len() {
             self.weights.resize(index + 1, None);
         }
+        if index >= self.permissions.len() {
+            self.permissions.resize(index + 1, PermissionBits::NONE);
+        }
         self.weights[index] = Some(per_item);
+        self.permissions[index] = required;
         self
     }
 
     #[must_use]
-    pub fn build(self) -> CostTable {
+    pub fn build(mut self) -> CostTable {
+        // Canonical form: trailing `NONE` carries no information, and leaving
+        // it in would make a table built with `.weight` unequal to the same
+        // table decoded from JSON that predates the field.
+        while self.permissions.last() == Some(&PermissionBits::NONE) {
+            self.permissions.pop();
+        }
         CostTable {
             fixed_request: self.fixed_request,
             minimum_charge: self.minimum_charge,
             weights: self.weights.into_boxed_slice(),
+            permissions: self.permissions.into_boxed_slice(),
         }
     }
 }
@@ -335,5 +389,104 @@ mod tests {
         // charging from the table cannot disagree.
         let floored = table.quote(&Op::Price, 1).unwrap();
         assert_eq!(floored.total, table.minimum_charge());
+    }
+
+    /// A repeated class is summed, and the fixed term still applies once.
+    ///
+    /// The alternative — rejecting a duplicate — was available and not taken.
+    /// Summing means a caller that groups its own workload and a caller that
+    /// does not are charged identically, so grouping stays an optimisation
+    /// rather than a correctness obligation the caller can get wrong.
+    #[test]
+    fn a_repeated_class_is_summed_not_quoted_twice() {
+        let table = table();
+
+        let (split, split_items, _) = table
+            .quote_workload(&[(Op::Price, 2), (Op::Price, 3)])
+            .unwrap();
+        let (grouped, grouped_items, _) = table.quote_workload(&[(Op::Price, 5)]).unwrap();
+
+        assert_eq!(split, grouped, "a repeated class changed the quote");
+        assert_eq!(split_items, grouped_items);
+        // The load-bearing half: the fixed term is a property of the request,
+        // so it cannot arrive once per entry.
+        assert_eq!(split.fixed, table.fixed_request());
+    }
+
+    /// The fold reports the union of what its classes require.
+    #[test]
+    fn work_permissions_are_the_union_of_the_classes_quoted() {
+        let price = PermissionBits::bit(1);
+        let greeks = PermissionBits::bit(2);
+        let table = CostTable::builder(CostUnits(50), CostUnits(50))
+            .class(&Op::Price, CostUnits(1), price)
+            .class(&Op::Greeks, CostUnits(5), greeks)
+            .build();
+
+        let (_, _, one) = table.quote_workload(&[(Op::Price, 1)]).unwrap();
+        assert_eq!(one, price);
+
+        let (_, _, both) = table
+            .quote_workload(&[(Op::Price, 1), (Op::Greeks, 1)])
+            .unwrap();
+        assert_eq!(both, price.union(greeks));
+
+        // A zero count is not work, so it cannot contribute a requirement —
+        // otherwise a caller could be denied for a class it did not ask for.
+        let (_, _, skipped) = table
+            .quote_workload(&[(Op::Price, 1), (Op::Greeks, 0)])
+            .unwrap();
+        assert_eq!(skipped, price);
+    }
+
+    /// A class registered without a requirement requires nothing.
+    #[test]
+    fn weight_registers_a_class_that_requires_nothing() {
+        let table = table();
+        let (_, _, required) = table.quote_workload(&[(Op::Price, 1)]).unwrap();
+        assert_eq!(required, PermissionBits::NONE);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn legacy_cost_table_round_trips_canonically() {
+        // A table stored before work permissions existed has no such field.
+        let legacy = r#"{"fixed_request":50,"minimum_charge":50,"weights":[1,5]}"#;
+        let decoded: CostTable = serde_json::from_str(legacy).expect("legacy table decodes");
+
+        // It must equal the same table built today, or a control plane that has
+        // not been redeployed would start publishing tables that compare
+        // unequal to what instances already hold.
+        assert_eq!(decoded, table());
+
+        // And it must serialize back without inventing the field, so a
+        // round trip through a newer binary does not rewrite stored bytes.
+        let reserialized = serde_json::to_string(&decoded).expect("table serializes");
+        assert_eq!(reserialized, legacy);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn an_all_none_permission_array_is_not_serialized() {
+        // `.weight` sets NONE, so a table built entirely from it must be
+        // byte-identical to the legacy form; trailing NONE is trimmed at build.
+        let built = table();
+        let rendered = serde_json::to_string(&built).expect("table serializes");
+        assert!(
+            !rendered.contains("permissions"),
+            "an all-NONE array was serialized: {rendered}"
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_table_with_permissions_round_trips() {
+        let table = CostTable::builder(CostUnits(50), CostUnits(50))
+            .class(&Op::Price, CostUnits(1), PermissionBits::bit(1))
+            .class(&Op::Greeks, CostUnits(5), PermissionBits::bit(2))
+            .build();
+        let rendered = serde_json::to_string(&table).expect("table serializes");
+        let decoded: CostTable = serde_json::from_str(&rendered).expect("table decodes");
+        assert_eq!(decoded, table);
     }
 }
