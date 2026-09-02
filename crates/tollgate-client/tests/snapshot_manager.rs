@@ -15,9 +15,9 @@ use tollgate_client::{
     TrackedPrincipals,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, FencingToken,
-    Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex, PermissionBits, Principal,
-    PublishableSnapshot, ResolvedLimits, UsageEvent, UsageSlot,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, DiscardedUsage,
+    FencingToken, Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex,
+    PermissionBits, Principal, PublishableSnapshot, ResolvedLimits,
 };
 use tollgate_store::{
     AccountConfig, GrantPolicy, MemoryStore, SnapshotPush, SnapshotResolution, SnapshotSource,
@@ -33,12 +33,6 @@ impl OpIndex for PriceOp {
     fn index(&self) -> usize {
         0
     }
-}
-
-struct DropSlot;
-
-impl UsageSlot for DropSlot {
-    fn record(self, _event: UsageEvent) {}
 }
 
 fn t(secs: i64) -> Timestamp {
@@ -132,7 +126,7 @@ fn admit(fixture: &Fixture) -> Result<(), DenyReason> {
     fixture
         .engine
         .begin(PRINCIPAL, PermissionBits::bit(0), t(1))
-        .and_then(|context| context.admit(&[(PriceOp, 1)], DropSlot, t(1)))
+        .and_then(|context| context.admit(&[(PriceOp, 1)], DiscardedUsage::new().slot(), t(1)))
         .map(|pending| {
             pending.cancel();
         })
@@ -686,7 +680,7 @@ fn admit_as(fixture: &Fixture, principal: Principal) -> Result<(), DenyReason> {
     fixture
         .engine
         .begin(principal, PermissionBits::bit(0), t(1))
-        .and_then(|context| context.admit(&[(PriceOp, 1)], DropSlot, t(1)))
+        .and_then(|context| context.admit(&[(PriceOp, 1)], DiscardedUsage::new().slot(), t(1)))
         .map(|pending| {
             pending.cancel();
         })

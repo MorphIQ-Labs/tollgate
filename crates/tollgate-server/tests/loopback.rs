@@ -21,9 +21,9 @@ use tollgate_client::{
     SnapshotManagerConfig, SystemClock, TrackedPrincipals, UsageWriter, UsageWriterConfig,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, FencingToken,
-    Generation, KeyId, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, Principal,
-    PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent, UsageSlot,
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, DiscardedUsage,
+    FencingToken, Generation, KeyId, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits,
+    Principal, PublishableSnapshot, RequestId, ResolvedLimits,
 };
 use tollgate_store::wire::API_PREFIX;
 use tollgate_store::{
@@ -61,12 +61,6 @@ impl OpIndex for PriceOp {
     fn index(&self) -> usize {
         0
     }
-}
-
-struct DropSlot;
-
-impl UsageSlot for DropSlot {
-    fn record(self, _event: UsageEvent) {}
 }
 
 fn snapshot() -> Arc<AccountSnapshot> {
@@ -228,8 +222,13 @@ async fn http_negative_ttl_refetches_without_push() {
         loop {
             match engine
                 .begin(PRINCIPAL, PermissionBits::bit(0), Timestamp::now())
-                .and_then(|context| context.admit(&[(PriceOp, 1)], DropSlot, Timestamp::now()))
-            {
+                .and_then(|context| {
+                    context.admit(
+                        &[(PriceOp, 1)],
+                        DiscardedUsage::new().slot(),
+                        Timestamp::now(),
+                    )
+                }) {
                 Ok(pending) => {
                     pending.cancel();
                     break;
