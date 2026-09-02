@@ -7,6 +7,13 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.8.6](https://github.com/MorphIQ-Labs/tollgate/compare/v0.8.5...v0.8.6) - 2026-09-02
+
+### Added
+
+- *(admission)* #91 add staged admission contexts
+- *(admission)* #91 enforce request-rate and concurrency guards
+
 ## [0.8.5](https://github.com/MorphIQ-Labs/tollgate/compare/v0.8.4...v0.8.5) - 2026-09-01
 
 ### Added

@@ -9,11 +9,11 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-tollgate-core = { path = "../../crates/tollgate-core", version = "=0.8.5" }
-tollgate-admission = { path = "../../crates/tollgate-admission", version = "=0.8.5" }
-tollgate-client = { path = "../../crates/tollgate-client", version = "=0.8.5" }
-tollgate-store = { path = "../../crates/tollgate-store", version = "=0.8.5" }
-tollgate-auth = { path = "../../crates/tollgate-auth", version = "=0.8.5" }
+tollgate-core = { path = "../../crates/tollgate-core", version = "=0.8.6" }
+tollgate-admission = { path = "../../crates/tollgate-admission", version = "=0.8.6" }
+tollgate-client = { path = "../../crates/tollgate-client", version = "=0.8.6" }
+tollgate-store = { path = "../../crates/tollgate-store", version = "=0.8.6" }
+tollgate-auth = { path = "../../crates/tollgate-auth", version = "=0.8.6" }
 axum = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true }
