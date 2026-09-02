@@ -816,14 +816,21 @@ until it has one.
     cannot change its permissions, limits, cost table, or limiter
     configuration. Stable concurrency gauges remain shared across generations
     because resetting live occupancy would violate their ceiling. Stage two
-    rechecks only the pinned snapshot's expiry boundary before consuming the
-    context; status or permission changes published after `begin` govern the
-    next request, never splice two generations into one.
+    consults only the pinned snapshot: it rechecks that snapshot's expiry
+    boundary and tests the workload's per-class work permissions against the
+    permissions that snapshot pinned. Both read the context it is consuming,
+    never the map, so neither can observe a generation the request did not
+    begin with. Route permission is checked once, in `begin`; work permission
+    cannot be, because which classes a request touches is a property of its
+    decoded body. Status or permission changes published after `begin` govern
+    the next request, never splice two generations into one.
 
     This is enforcement-ladder rung 1 for ownership and single use: the
     context owns the state, has no engine borrow, is not cloneable, and
     `admit(self, ...)` consumes it. Map-call cardinality remains the rung 3
     witness in (24). *Tests:*
+    `a_workload_requiring_ungranted_bits_is_denied_at_stage_two`,
+    `a_workload_within_granted_bits_admits`,
     `staged_context_is_owned_send_sync_and_generation_pinned`,
     `stage_two_rechecks_expiry_without_rechecking_status`,
     `limit_change_pins_each_principal_until_its_own_reinstall`, and

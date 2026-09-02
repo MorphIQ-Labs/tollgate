@@ -97,6 +97,40 @@ fn bench_cost_table(c: &mut Criterion) {
                 .unwrap()
         })
     });
+    // Heterogeneous quoting is the shape a mixed-model batch produces. The
+    // three sizes exist so the per-class cost is a measured ratio rather than
+    // a claim: the fold is O(distinct classes), so 8 classes must cost roughly
+    // eight times one class and nothing like a scan of the table.
+    group.bench_function("quote_workload_1", |b| {
+        b.iter(|| {
+            dense_table
+                .quote_workload(black_box(&[(DenseOp(0), 64)]))
+                .unwrap()
+        })
+    });
+    group.bench_function("quote_workload_2", |b| {
+        b.iter(|| {
+            dense_table
+                .quote_workload(black_box(&[(DenseOp(0), 32), (DenseOp(1), 32)]))
+                .unwrap()
+        })
+    });
+    group.bench_function("quote_workload_8", |b| {
+        b.iter(|| {
+            dense_table
+                .quote_workload(black_box(&[
+                    (DenseOp(0), 8),
+                    (DenseOp(1), 8),
+                    (DenseOp(2), 8),
+                    (DenseOp(3), 8),
+                    (DenseOp(4), 8),
+                    (DenseOp(5), 8),
+                    (DenseOp(6), 8),
+                    (DenseOp(7), 8),
+                ]))
+                .unwrap()
+        })
+    });
     group.finish();
 }
 

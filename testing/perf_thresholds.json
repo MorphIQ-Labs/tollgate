@@ -3,9 +3,20 @@
   "_reserved_ids": {
     "_comment": "Owners add the benchmark, manifest row, portable ratio where applicable, script production, and controlled-host baseline in one change. Reserved names are stable review contracts, not measurements of APIs that do not exist yet.",
     "#91": [],
-    "#92": ["cost_table/quote_workload_1", "cost_table/quote_workload_2", "cost_table/quote_workload_8"],
-    "#93": ["reservation/commit_split"],
-    "#99": ["capacity/disabled", "capacity/uniform", "capacity/reserved_shared", "capacity/reserved_fallback", "capacity/full_check_contended_8_distinct_accounts_uniform", "capacity/full_check_contended_8_distinct_accounts_reserved", "load/concurrent_distinct_accounts", "load/mixed_saturation"]
+    "#92": [],
+    "#93": [
+      "reservation/commit_split"
+    ],
+    "#99": [
+      "capacity/disabled",
+      "capacity/uniform",
+      "capacity/reserved_shared",
+      "capacity/reserved_fallback",
+      "capacity/full_check_contended_8_distinct_accounts_uniform",
+      "capacity/full_check_contended_8_distinct_accounts_reserved",
+      "load/concurrent_distinct_accounts",
+      "load/mixed_saturation"
+    ]
   },
   "benchmarks": [
     {
@@ -18,6 +29,22 @@
       "id": "cost_table/quote_4096_classes",
       "target_ns": 3.0,
       "threshold_ns": 20.0
+    },
+    {
+      "_comment": "#92 heterogeneous quoting. Measured on a development laptop at 5.86ns (1 class), 6.89ns (2), 20.84ns (8) against this file's 4.36ns cost_table/quote. The absolutes are provisional like every row here; the ratio below is the portable claim.",
+      "id": "cost_table/quote_workload_1",
+      "target_ns": 6.0,
+      "threshold_ns": 20.0
+    },
+    {
+      "id": "cost_table/quote_workload_2",
+      "target_ns": 7.0,
+      "threshold_ns": 22.0
+    },
+    {
+      "id": "cost_table/quote_workload_8",
+      "target_ns": 21.0,
+      "threshold_ns": 45.0
     },
     {
       "id": "snapshot/admit",
@@ -111,7 +138,7 @@
       "threshold_ns": 280.0
     },
     {
-      "_comment": "#3, opt-in eight-shard topology under the same eight-thread load as admission/full_check_contended_8. Measured 446.4/618.0ns against that benchmark's 2.74/2.80us in the same runs — the contention the layout exists to remove. The portable acceptance bounds are the same-run ratios below; this absolute ceiling is a configuration/execution backstop.",
+      "_comment": "#3, opt-in eight-shard topology under the same eight-thread load as admission/full_check_contended_8. Measured 446.4/618.0ns against that benchmark's 2.74/2.80us in the same runs \u2014 the contention the layout exists to remove. The portable acceptance bounds are the same-run ratios below; this absolute ceiling is a configuration/execution backstop.",
       "id": "admission/full_check_contended_8_sharded",
       "target_ns": 700.0,
       "threshold_ns": 2500.0
@@ -129,7 +156,7 @@
       "threshold_ns": 1000.0
     },
     {
-      "_comment": "Added with the request-path counters (#37) as the cheapest refusal there is: one map lookup and a return, so hashing was the largest share of it. Retightened by #9 — SipHash 20.0/19.8/19.9ns, foldhash 14.7/14.7ns.",
+      "_comment": "Added with the request-path counters (#37) as the cheapest refusal there is: one map lookup and a return, so hashing was the largest share of it. Retightened by #9 \u2014 SipHash 20.0/19.8/19.9ns, foldhash 14.7/14.7ns.",
       "id": "admission/full_check_denied",
       "target_ns": 18.0,
       "threshold_ns": 40.0
@@ -229,6 +256,12 @@
       "numerator": "reservation/commit_cancel_race_contended_2",
       "denominator": "reservation/commit_cancel_race_control_2",
       "max_ratio": 5.0
+    },
+    {
+      "_comment": "#92 the fold is O(distinct classes), not O(table). Eight classes measured 3.56x one class, sub-linear because the fixed term and the call dominate. Six permits host variance and a future per-class check; a scan of the compiled table would miss this by orders of magnitude, which is the failure this ratio exists to catch.",
+      "numerator": "cost_table/quote_workload_8",
+      "denominator": "cost_table/quote_workload_1",
+      "max_ratio": 6.0
     }
   ]
 }
