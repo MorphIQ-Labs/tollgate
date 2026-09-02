@@ -20,9 +20,9 @@ This Lean package contains exact models for seven critical contracts:
   already had, while a duplicate publish of a visible snapshot stays a no-op.
 - `ConcurrencyGauge` models principal-then-account acquisition, rollback when
   the account is full, exact ceiling preservation, and single release. Rust's
-  ownership transition from `Admitted` to `CommittedAdmission`, and from there
-  into `ChargeGuard`, separately enforces that execution start transfers the
-  funding reservation without releasing its concurrency permit. The model
+  ownership transition from `Pending` through `ReadyToStart` into `Committed`
+  separately enforces that execution start transfers the funding reservation
+  without releasing its concurrency permit. The model
   proves that transfer retains occupancy and that only finishing either the
   pending or execution owner releases it; Rust's private fields, behavior
   witness, and compile-fail witness connect that model to the API.

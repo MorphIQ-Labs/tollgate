@@ -1,6 +1,6 @@
-// Exercises the deprecated one-shot surface on purpose: it is supported
-// for a minor and must keep working.
-#![allow(deprecated)]
+//! The committed execution guard's two accounting guarantees: occupancy is
+//! held for the guard's whole lifetime, and a failed commit gives back both
+//! the concurrency permits and the unused queue slot.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -9,13 +9,14 @@ use std::time::Duration;
 use async_trait::async_trait;
 use jiff::Timestamp;
 use tollgate_admission::{
-    AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot, Principal, SnapshotMap,
+    AdmissionEngine, ArcSwapSnapshotMap, Committed, LeaseSlot, NoCapacityPermit, NoGate, Principal,
+    ReadyToStart, SnapshotMap,
 };
-use tollgate_client::{ChargeGuard, ManualClock, UsageWriter, UsageWriterConfig};
+use tollgate_client::{ManualClock, UsagePermit, UsageWriter, UsageWriterConfig};
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CommitError, CostTable, CostUnits, DenyReason,
-    FencingToken, Generation, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, RequestId,
-    ResolvedLimits, UsageEvent,
+    DiscardedUsage, FencingToken, Generation, LeaseGrant, LeaseId, LocalLease, OpIndex,
+    PermissionBits, RequestId, ResolvedLimits, UsageEvent,
 };
 use tollgate_store::{IngestReport, StoreError, UsageSink};
 
@@ -90,13 +91,43 @@ fn engine() -> AdmissionEngine<ArcSwapSnapshotMap> {
     engine
 }
 
-fn request() -> AdmissionRequest<'static, Operation> {
-    AdmissionRequest {
-        principal: PRINCIPAL,
-        required: PermissionBits::bit(0),
-        op: &Operation,
-        items: 1,
-    }
+/// Drive the staged path up to the point of commit, binding `permit` as the
+/// usage slot. The slot is chosen at admission now, so a committed charge
+/// cannot reach execution without the queue capacity to bill it.
+fn ready(
+    engine: &AdmissionEngine<ArcSwapSnapshotMap>,
+    permit: UsagePermit,
+    now: Timestamp,
+) -> Result<ReadyToStart<UsagePermit, NoCapacityPermit>, DenyReason> {
+    engine
+        .begin(PRINCIPAL, PermissionBits::bit(0), now)
+        .and_then(|context| context.admit(&[(&Operation, 1)], permit, now))
+        .and_then(|pending| {
+            pending
+                .acquire_capacity(&NoGate)
+                .map_err(|(denied, _)| denied)
+        })
+}
+
+/// An admission whose billing event is discarded: for the probes that are
+/// about occupancy rather than usage.
+fn probe(
+    engine: &AdmissionEngine<ArcSwapSnapshotMap>,
+    now: Timestamp,
+) -> Result<Committed<tollgate_core::DiscardedUsageSlot, NoCapacityPermit>, DenyReason> {
+    engine
+        .begin(PRINCIPAL, PermissionBits::bit(0), now)
+        .and_then(|context| context.admit(&[(&Operation, 1)], DiscardedUsage::new().slot(), now))
+        .and_then(|pending| {
+            pending
+                .acquire_capacity(&NoGate)
+                .map_err(|(denied, _)| denied)
+        })
+        .map(|ready| {
+            ready
+                .commit(RequestId(9_999), now)
+                .expect("the probe commits against a live lease")
+        })
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -116,18 +147,20 @@ async fn committed_charge_holds_concurrency_until_execution_guard_drops() {
     )
     .unwrap();
 
-    let admitted = engine.admit(request(), t(0)).unwrap();
     let permit = recorder.try_reserve().unwrap();
-    let charge = ChargeGuard::commit(admitted, permit, RequestId(1), t(0)).unwrap();
+    let charge = ready(&engine, permit, t(0))
+        .expect("the first request admits")
+        .commit(RequestId(1), t(0))
+        .expect("a live lease commits");
 
     assert_eq!(
-        engine.admit(request(), t(0)).unwrap_err(),
+        probe(&engine, t(0)).unwrap_err(),
         DenyReason::ConcurrencyLimited,
         "committed work must remain in flight for the execution guard's lifetime"
     );
 
     drop(charge);
-    drop(engine.admit(request(), t(0)).unwrap());
+    drop(probe(&engine, t(0)).unwrap());
     drop(recorder);
     writer.shutdown().await.unwrap();
 }
@@ -149,19 +182,20 @@ async fn failed_commit_releases_concurrency_and_accounting_capacity() {
     )
     .unwrap();
 
-    let admitted = engine.admit(request(), t(0)).unwrap();
     let permit = recorder.try_reserve().unwrap();
-    let error = match ChargeGuard::commit(admitted, permit, RequestId(1), t(1_000)) {
+    let error = match ready(&engine, permit, t(0))
+        .expect("the request admits")
+        .commit(RequestId(1), t(1_000))
+    {
         Ok(_) => panic!("an expired lease cannot commit"),
-        Err(error) => error,
+        Err((error, _released)) => error,
     };
-    assert_eq!(error, CommitError::LeaseExpired);
-
-    drop(
-        engine
-            .admit(request(), t(0))
-            .expect("a failed commit releases both concurrency permits"),
+    assert_eq!(
+        error,
+        CommitError::Denied(DenyReason::FundingExpiredAtStart)
     );
+
+    drop(probe(&engine, t(0)).expect("a failed commit releases both concurrency permits"));
     assert!(
         recorder.try_reserve().is_ok(),
         "a failed commit releases its unused queue permit"

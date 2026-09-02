@@ -12,10 +12,6 @@
 //! engine-global counter line that #99 will remove. `full_check_denied`
 //! measures the refusal path, which none of the others take.
 
-// Exercises the deprecated one-shot surface on purpose: it is supported
-// for a minor and must keep working.
-#![allow(deprecated)]
-
 use std::hint::black_box;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
@@ -247,15 +243,6 @@ fn staged_admission(
         .and_then(|context| context.admit(&[(PriceOp, items)], BenchUsageSlot, now))
 }
 
-fn admit_staged_once(
-    engine: &AdmissionEngine<ArcSwapSnapshotMap>,
-    principal: Principal,
-    now: Timestamp,
-) {
-    let pending = staged_admission(engine, principal, 64, now).unwrap();
-    black_box(pending.cancel());
-}
-
 /// Seven background admitters on the account under measurement, stopped and
 /// joined when the guard drops so one benchmark's load never leaks into the
 /// next one's numbers.
@@ -339,9 +326,6 @@ fn bench_full_check(c: &mut Criterion) {
                     .unwrap(),
             )
         })
-    });
-    group.bench_function("admit_staged_1", |b| {
-        b.iter(|| admit_staged_once(&uncontended, black_box(Principal(97)), now))
     });
     group.bench_function("full_check", |b| {
         b.iter(|| admit_once(&uncontended, black_box(Principal(97)), now))
