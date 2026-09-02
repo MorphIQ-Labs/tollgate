@@ -7,6 +7,16 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.8.6...v0.9.0) - 2026-09-02
+
+### Added
+
+- *(core)* export DiscardedUsage, the reference UsageSlot
+
+### Other
+
+- *(admission)* [**breaking**] #102 drop the deprecated one-shot and ChargeGuard surfaces
+
 ## [0.8.6](https://github.com/MorphIQ-Labs/tollgate/compare/v0.8.5...v0.8.6) - 2026-09-02
 
 ### Added
