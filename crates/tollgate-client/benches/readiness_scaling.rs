@@ -11,10 +11,6 @@
 //! the index directly, so it measures the thing the issue complains about: a
 //! real initial load over N principals against an in-memory source.
 
-// Exercises the deprecated one-shot surface on purpose: it is supported
-// for a minor and must keep working.
-#![allow(deprecated)]
-
 use std::hint::black_box;
 use std::sync::Arc;
 
