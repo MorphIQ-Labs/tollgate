@@ -521,13 +521,21 @@ until it has one.
 20. **Every admission outcome is counted, exactly once, under its own reason.**
     The request path may not log (5), so its tallies are the only account it
     can give of itself; an instance refusing every request must be
-    distinguishable from one serving none. `AdmissionEngine::admit` records the
-    single outcome of each call — never the individual exits, five of which
-    only ever arrive by `?` from `AccountSnapshot::admit` and
-    `Reservation::reserve` — so a reason cannot be produced without being
-    tallied. `DenyReason::index` is an exhaustive match, making a slot
+    distinguishable from one serving none. The snapshot map owns one shared
+    counter identity and installs its `Arc` into every request state. `begin`
+    records a stage-one refusal; a successful context records exactly one
+    stage-two outcome when `admit` consumes it. The deprecated one-call wrapper
+    records the same combined outcome once. A context dropped before stage two
+    has created neither pending funding nor an admission outcome.
+    `DenyReason::index` is an exhaustive match, making a slot
     per reason total by construction and a shared slot unrepresentable; a new
-    variant fails to compile until it has one. Denials add no units, because a
+    variant fails to compile until it has one. Those slots are also *stable*:
+    `AdmissionCounters::denials` is exported through the public
+    `CountersSnapshot` as dense positions, so a reason's number is a contract
+    with whatever reads them. Reasons append at the next free slot and `COUNT`
+    only grows; renumbering an existing one silently re-attributes a counter a
+    consumer already reads, and stays internally consistent while doing it, so
+    it is pinned by literal rather than left to the permutation check. Denials add no units, because a
     refusal charges zero (2). `units_admitted` counts what was *quoted*, not
     what was billed — usage events remain the billing record. Refusals decided
     before the engine is reached (accounting backpressure, 8) are recorded by
@@ -537,9 +545,13 @@ until it has one.
     sibling, so a reader of `admitted` never has to add two numbers to get the
     total. *Tests:*
     `indices_cover_every_slot_exactly_once`,
+    `shipped_slots_and_labels_never_move`,
     `labels_are_distinct_and_payload_free`, `payload_does_not_affect_the_slot`,
     `counters_attribute_every_outcome`, `each_reason_reaches_its_own_slot`,
     `denied_requests_add_no_units`, `concurrent_increments_are_not_lost`,
+    `staged_outcomes_are_counted_once_at_their_deciding_stage`,
+    `engines_sharing_a_map_export_one_counter_identity`,
+    `moka_engine_and_installed_context_share_one_counter_identity`,
     `metrics_separate_admissions_from_each_kind_of_refusal`, and
     `an_overage_admission_is_counted_twice_over_and_a_refusal_once`.
 
@@ -657,13 +669,14 @@ until it has one.
     exactly one snapshot lookup.** After the measuring thread has initialised
     dependency-owned thread-local state and the bounded usage queue has a
     reusable block, cached authentication through usage-slot reservation,
-    admission, commit or cancellation, and usage recording performs no heap
+    `begin`, body-independent usage-slot reservation, stage-two admission,
+    commit or cancellation, and usage recording performs no heap
     allocation or reallocation attributable to Tollgate. Every admission
-    invokes `SnapshotMap::get_at` exactly once and never calls `get`
-    separately; an implementation may still satisfy `get_at` through the
-    trait's compatibility default. Body decoding or later execution must
-    consume the evidence that lookup produced rather than retrieve policy
-    again.
+    invokes `SnapshotMap::get_at` exactly once in `begin`; `RequestContext::admit`
+    never re-enters the map or calls `get`. An implementation may still satisfy
+    `get_at` through the trait's compatibility default. Body decoding and later
+    execution consume the owned context and typed pending/committed evidence
+    rather than retrieve policy again.
 
     This is an enforcement-ladder rung 3 convention because it spans four
     crates and neither Rust's type system nor any one owning component can
@@ -725,13 +738,16 @@ until it has one.
     in-flight RAII guard keep the exact gauges strongly reachable. The guard
     is constructed only after both occupancy increments and owns the exact
     state containing both gauges; it has no callable release operation. Every
-    field of `Admitted`, `CommittedAdmission`, and `ChargeGuard` is private.
-    `Admitted` exposes no raw `Reservation`: cancellation consumes it, while
-    commit consumes it into `CommittedAdmission`, and `ChargeGuard` owns that
-    committed proof throughout execution. The public commit result is the
-    must-use guard itself, not a tuple that suppresses its diagnostic. Safe
-    code therefore cannot retain committed funding while accidentally dropping
-    the concurrency authority.
+    field of `RequestContext`, `Pending`, `ReadyToStart`, `Committed`,
+    `Admitted`, `CommittedAdmission`, and `ChargeGuard` is private. The guard
+    moves from `Pending` through `ReadyToStart` into `Committed`, and the
+    deprecated `Admitted` wrapper retains the same guard: `Admitted` exposes no
+    raw `Reservation`, cancellation consumes it, commit consumes it into
+    `CommittedAdmission`, and `ChargeGuard` owns that committed proof
+    throughout execution. The public commit result is the must-use guard
+    itself, not a tuple that suppresses its diagnostic. Safe code therefore
+    cannot retain committed funding while accidentally dropping the
+    concurrency authority.
     The concurrency guard is the last admission field dropped and releases
     account then principal exactly once on cancellation, refusal, panic
     unwinding, or ordinary drop. The
@@ -789,6 +805,27 @@ until it has one.
     its callers — so `release_shard`'s guard is a cost short-circuit, and the
     mutation excluded in `.cargo/mutants.toml` is equivalent rather than
     untested.
+
+26. **A staged request is governed by exactly the generation with which it
+    began.** `AdmissionEngine::begin` performs the one principal lookup and
+    returns an owned `RequestContext` containing the exact
+    `Arc<AccountAdmissionState>` and its selected locality. The installed state
+    pins its immutable snapshot and both rate buckets; a later publication
+    cannot change its permissions, limits, cost table, or limiter
+    configuration. Stable concurrency gauges remain shared across generations
+    because resetting live occupancy would violate their ceiling. Stage two
+    rechecks only the pinned snapshot's expiry boundary before consuming the
+    context; status or permission changes published after `begin` govern the
+    next request, never splice two generations into one.
+
+    This is enforcement-ladder rung 1 for ownership and single use: the
+    context owns the state, has no engine borrow, is not cloneable, and
+    `admit(self, ...)` consumes it. Map-call cardinality remains the rung 3
+    witness in (24). *Tests:*
+    `staged_context_is_owned_send_sync_and_generation_pinned`,
+    `stage_two_rechecks_expiry_without_rechecking_status`,
+    `limit_change_pins_each_principal_until_its_own_reinstall`, and
+    `admit_consults_the_map_exactly_once`.
 
 Ledger roles (context for 1 and 7): leases **bound** spend; usage events **are**
 the billing record; reconciliation compares the two and steady-state drift is

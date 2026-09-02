@@ -48,7 +48,7 @@
 //! exactly like a clean run (INVARIANTS.md #8).
 //!
 //! Lifecycle order the embedder must follow: stop admitting, quiesce the
-//! request tasks holding permits or committed `ChargeGuard`s, `shutdown()`
+//! request tasks holding permits or committed `Committed` guards, `shutdown()`
 //! this writer, and only then shut the lease manager down — events must land
 //! while their lease is live (INVARIANTS.md #12). Size the drain deadline
 //! within `expiry_safety_margin + reclaim_grace`, so a slow drain surfaces
@@ -78,7 +78,7 @@ pub struct UsageWriterConfig {
     pub retry_backoff: std::time::Duration,
     /// Wall-clock bound on the shutdown drain: how long `shutdown` waits for
     /// outstanding permits (slots reserved by in-flight requests or committed
-    /// `ChargeGuard`s) to resolve, *including* the ingest calls it makes along
+    /// committed guards) to resolve, *including* the ingest calls it makes along
     /// the way. Must be positive. Size it within
     /// `expiry_safety_margin + reclaim_grace` so an event landing at the end
     /// of the drain is still billable against its lease.
@@ -376,6 +376,12 @@ impl UsagePermit {
         // able to say how many charges it was carrying.
         self.counters.enqueued();
         self.permit.send(event);
+    }
+}
+
+impl tollgate_core::UsageSlot for UsagePermit {
+    fn record(self, event: UsageEvent) {
+        UsagePermit::record(self, event);
     }
 }
 

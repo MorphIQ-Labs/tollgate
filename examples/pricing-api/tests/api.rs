@@ -63,6 +63,24 @@ async fn call(router: &axum::Router, auth: Option<&str>, body: Value) -> (Status
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
+async fn call_raw(router: &axum::Router, auth: Option<&str>, body: &str) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/v1/price")
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(key) = auth {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {key}"));
+    }
+    let response = router
+        .clone()
+        .oneshot(builder.body(Body::from(body.to_owned())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
 async fn metrics(router: &axum::Router) -> Value {
     let response = router
         .clone()
@@ -159,6 +177,19 @@ async fn missing_or_bad_credentials_deny() {
     let store = runtime.store.clone();
     runtime.shutdown().await;
     assert_eq!(store.usage_recorded(DEMO_ACCOUNT), CostUnits::ZERO);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authentication_and_begin_precede_body_decoding() {
+    let (router, runtime) = build_test_app(100_000, true);
+    wait_ready(&router).await;
+
+    let (status, body) = call_raw(&router, None, "{ definitely not json").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], "unknown-principal");
+    assert_eq!(body["units_charged"], 0);
+
+    runtime.shutdown().await;
 }
 
 /// The optimization is part of server construction, not an optional handler

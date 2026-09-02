@@ -12,6 +12,10 @@
 //! engine-global counter line that #99 will remove. `full_check_denied`
 //! measures the refusal path, which none of the others take.
 
+// Exercises the deprecated one-shot surface on purpose: it is supported
+// for a minor and must keep working.
+#![allow(deprecated)]
+
 use std::hint::black_box;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
@@ -21,14 +25,21 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use jiff::Timestamp;
 
 use tollgate_admission::{
-    AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot, MokaSnapshotMap, Principal,
+    AdmissionEngine, ArcSwapSnapshotMap, LeaseSlot, MokaSnapshotMap, Pending, Principal,
     SnapshotMap,
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, FencingToken,
     Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex, PermissionBits,
-    PublishableSnapshot, ResolvedLimits,
+    PublishableSnapshot, ResolvedLimits, UsageEvent, UsageSlot,
 };
+
+#[derive(Debug)]
+struct BenchUsageSlot;
+
+impl UsageSlot for BenchUsageSlot {
+    fn record(self, _event: UsageEvent) {}
+}
 
 #[derive(Clone, Copy)]
 struct PriceOp;
@@ -220,19 +231,29 @@ fn engine_with_limits(limits: ResolvedLimits) -> AdmissionEngine<ArcSwapSnapshot
 }
 
 fn admit_once(engine: &AdmissionEngine<ArcSwapSnapshotMap>, principal: Principal, now: Timestamp) {
-    let admitted = engine
-        .admit(
-            AdmissionRequest {
-                principal,
-                required: PermissionBits::bit(0),
-                op: &PriceOp,
-                items: 64,
-            },
-            now,
-        )
-        .unwrap();
+    let admitted = staged_admission(engine, principal, 64, now).unwrap();
     // Cancel instead of commit so the giant lease never drains during a run.
     black_box(admitted.cancel());
+}
+
+fn staged_admission(
+    engine: &AdmissionEngine<ArcSwapSnapshotMap>,
+    principal: Principal,
+    items: u64,
+    now: Timestamp,
+) -> Result<Pending<BenchUsageSlot>, tollgate_core::DenyReason> {
+    engine
+        .begin(principal, PermissionBits::bit(0), now)
+        .and_then(|context| context.admit(&[(PriceOp, items)], BenchUsageSlot, now))
+}
+
+fn admit_staged_once(
+    engine: &AdmissionEngine<ArcSwapSnapshotMap>,
+    principal: Principal,
+    now: Timestamp,
+) {
+    let pending = staged_admission(engine, principal, 64, now).unwrap();
+    black_box(pending.cancel());
 }
 
 /// Seven background admitters on the account under measurement, stopped and
@@ -310,6 +331,18 @@ fn bench_full_check(c: &mut Criterion) {
     // threshold at all — and would silently redefine two manifest entries
     // whose calibration was taken against the single-counter path.
     let uncontended = engine(LocalSharding::SINGLE);
+    group.bench_function("begin", |b| {
+        b.iter(|| {
+            black_box(
+                uncontended
+                    .begin(black_box(Principal(97)), PermissionBits::bit(0), now)
+                    .unwrap(),
+            )
+        })
+    });
+    group.bench_function("admit_staged_1", |b| {
+        b.iter(|| admit_staged_once(&uncontended, black_box(Principal(97)), now))
+    });
     group.bench_function("full_check", |b| {
         b.iter(|| admit_once(&uncontended, black_box(Principal(97)), now))
     });
@@ -362,15 +395,7 @@ fn bench_full_check(c: &mut Criterion) {
     // counter, since it is the largest fraction of the smallest path.
     group.bench_function("full_check_denied", |b| {
         b.iter(|| {
-            let denied = uncontended.admit(
-                AdmissionRequest {
-                    principal: black_box(Principal(9_999)),
-                    required: PermissionBits::bit(0),
-                    op: &PriceOp,
-                    items: 64,
-                },
-                now,
-            );
+            let denied = staged_admission(&uncontended, black_box(Principal(9_999)), 64, now);
             black_box(denied.unwrap_err())
         })
     });
@@ -387,15 +412,7 @@ fn bench_full_check(c: &mut Criterion) {
     let strict = exhausted_engine(EnforcementMode::Strict);
     group.bench_function("full_check_lease_exhausted_strict", |b| {
         b.iter(|| {
-            let denied = strict.admit(
-                AdmissionRequest {
-                    principal: black_box(Principal(97)),
-                    required: PermissionBits::bit(0),
-                    op: &PriceOp,
-                    items: 64,
-                },
-                now,
-            );
+            let denied = staged_admission(&strict, black_box(Principal(97)), 64, now);
             black_box(denied.unwrap_err())
         })
     });
@@ -405,17 +422,7 @@ fn bench_full_check(c: &mut Criterion) {
     });
     group.bench_function("full_check_lease_exhausted_elastic", |b| {
         b.iter(|| {
-            let admitted = elastic
-                .admit(
-                    AdmissionRequest {
-                        principal: black_box(Principal(97)),
-                        required: PermissionBits::bit(0),
-                        op: &PriceOp,
-                        items: 64,
-                    },
-                    now,
-                )
-                .unwrap();
+            let admitted = staged_admission(&elastic, black_box(Principal(97)), 64, now).unwrap();
             // Cancel, as `admit_once` does, so the cap never drains: this
             // measures the debit-and-refund pair, not a one-shot admission.
             black_box(admitted.cancel());

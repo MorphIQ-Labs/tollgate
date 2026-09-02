@@ -11,6 +11,10 @@
 //! the index directly, so it measures the thing the issue complains about: a
 //! real initial load over N principals against an in-memory source.
 
+// Exercises the deprecated one-shot surface on purpose: it is supported
+// for a minor and must keep working.
+#![allow(deprecated)]
+
 use std::hint::black_box;
 use std::sync::Arc;
 
@@ -35,11 +39,17 @@ use tollgate_store::{GrantPolicy, MemoryStore};
 /// question is how the *manager's sweep* scales, the map is stubbed out; #8
 /// is measured by its own issue, not conflated with this one.
 #[derive(Debug, Default)]
-struct NullMap;
+struct NullMap {
+    counters: Arc<tollgate_admission::AdmissionCounters>,
+}
 
 impl SnapshotMap for NullMap {
     fn get(&self, _principal: &Principal) -> Option<MapEntry> {
         None
+    }
+
+    fn counters(&self) -> &Arc<tollgate_admission::AdmissionCounters> {
+        &self.counters
     }
 
     fn install(
@@ -193,7 +203,7 @@ fn bench_refresh(c: &mut Criterion) {
                         runtime.block_on(async {
                             let manager = SnapshotManager::spawn(
                                 Arc::clone(&source),
-                                Arc::new(NullMap),
+                                Arc::new(NullMap::default()),
                                 SlotRegistry::new(),
                                 Arc::new(SystemClock),
                                 config.clone(),

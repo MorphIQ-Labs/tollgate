@@ -5,14 +5,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use jiff::Timestamp;
 use tollgate_admission::{
-    AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot, MapEntry, MokaSnapshotMap,
-    Principal, PublishableSnapshotUpdate, SnapshotMap, SnapshotUpdate,
+    AdmissionEngine, ArcSwapSnapshotMap, LeaseSlot, MapEntry, MokaSnapshotMap, NoGate, Principal,
+    PublishableSnapshotUpdate, SnapshotMap, SnapshotUpdate,
 };
 use tollgate_alloc_count::AllocScope;
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, FencingToken,
     Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, Locality, OpIndex, PermissionBits,
-    ResolvedLimits,
+    ResolvedLimits, UsageEvent, UsageSlot,
 };
 
 tollgate_alloc_count::install!();
@@ -24,6 +24,13 @@ impl OpIndex for PriceOp {
     fn index(&self) -> usize {
         0
     }
+}
+
+#[derive(Debug)]
+struct AllocationSlot;
+
+impl UsageSlot for AllocationSlot {
+    fn record(self, _event: UsageEvent) {}
 }
 
 fn now() -> Timestamp {
@@ -121,20 +128,13 @@ fn engine(
     engine
 }
 
-fn request(principal: Principal, required: PermissionBits) -> AdmissionRequest<'static, PriceOp> {
-    AdmissionRequest {
-        principal,
-        required,
-        op: &PriceOp,
-        items: 64,
-    }
-}
-
 fn admit_and_cancel(engine: &AdmissionEngine<ArcSwapSnapshotMap>, principal: Principal) {
-    let admitted = engine
-        .admit(request(principal, PermissionBits::bit(0)), now())
+    let pending = engine
+        .begin(principal, PermissionBits::bit(0), now())
+        .unwrap()
+        .admit(&[(PriceOp, 64)], AllocationSlot, now())
         .unwrap();
-    black_box(admitted.cancel());
+    black_box(pending.acquire_capacity(&NoGate).unwrap().cancel());
 }
 
 fn assert_zero(scope: &str, operation: impl FnOnce()) {
@@ -182,12 +182,14 @@ fn admission_allocates_nothing_on_the_arc_swap_default() {
     admit_and_cancel(&admitted_sharded, Principal(1));
     black_box(
         admitted
-            .admit(request(Principal(999), PermissionBits::bit(0)), now())
+            .begin(Principal(999), PermissionBits::bit(0), now())
             .unwrap_err(),
     );
     black_box(
         strict_exhausted
-            .admit(request(Principal(1), PermissionBits::bit(0)), now())
+            .begin(Principal(1), PermissionBits::bit(0), now())
+            .unwrap()
+            .admit(&[(PriceOp, 64)], AllocationSlot, now())
             .unwrap_err(),
     );
     admit_and_cancel(&elastic_exhausted, Principal(1));
@@ -201,14 +203,16 @@ fn admission_allocates_nothing_on_the_arc_swap_default() {
     assert_zero("admission/arc_swap_unknown", || {
         black_box(
             admitted
-                .admit(request(Principal(999), PermissionBits::bit(0)), now())
+                .begin(Principal(999), PermissionBits::bit(0), now())
                 .unwrap_err(),
         );
     });
     assert_zero("admission/arc_swap_lease_exhausted_strict", || {
         black_box(
             strict_exhausted
-                .admit(request(Principal(1), PermissionBits::bit(0)), now())
+                .begin(Principal(1), PermissionBits::bit(0), now())
+                .unwrap()
+                .admit(&[(PriceOp, 64)], AllocationSlot, now())
                 .unwrap_err(),
         );
     });
@@ -251,6 +255,13 @@ fn configured_and_disabled_guards_allocate_nothing_after_warmup() {
     });
     assert_zero("admission/guards_disabled", || {
         admit_and_cancel(&disabled, Principal(1));
+    });
+    assert_zero("admission/begin", || {
+        black_box(
+            disabled
+                .begin(Principal(1), PermissionBits::bit(0), now())
+                .unwrap(),
+        );
     });
 }
 
@@ -321,6 +332,10 @@ impl<M: SnapshotMap> SnapshotMap for CountingMap<M> {
 
     fn local_sharding(&self) -> LocalSharding {
         self.inner.local_sharding()
+    }
+
+    fn counters(&self) -> &Arc<tollgate_admission::AdmissionCounters> {
+        self.inner.counters()
     }
 
     fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>) {
@@ -407,36 +422,58 @@ fn admit_consults_the_map_exactly_once() {
     let engine = AdmissionEngine::new(map);
 
     assert_lookup(&engine, || {
-        let admitted = engine
-            .admit(request(Principal(1), PermissionBits::bit(0)), now())
+        let pending = engine
+            .begin(Principal(1), PermissionBits::bit(0), now())
+            .unwrap()
+            .admit(&[(PriceOp, 64)], AllocationSlot, now())
             .unwrap();
-        black_box(admitted.cancel());
+        black_box(pending.cancel());
     });
     assert_lookup(&engine, || {
         black_box(
             engine
-                .admit(request(Principal(999), PermissionBits::bit(0)), now())
+                .begin(Principal(999), PermissionBits::bit(0), now())
                 .unwrap_err(),
         );
     });
     assert_lookup(&engine, || {
         black_box(
             engine
-                .admit(request(Principal(1), PermissionBits::bit(1)), now())
+                .begin(Principal(1), PermissionBits::bit(1), now())
                 .unwrap_err(),
         );
     });
     assert_lookup(&engine, || {
         black_box(
             engine
-                .admit(request(Principal(2), PermissionBits::bit(0)), now())
+                .begin(Principal(2), PermissionBits::bit(0), now())
+                .unwrap()
+                .admit(&[(PriceOp, 64)], AllocationSlot, now())
                 .unwrap_err(),
         );
     });
     assert_lookup(&engine, || {
-        let admitted = engine
-            .admit(request(Principal(3), PermissionBits::bit(0)), now())
+        let pending = engine
+            .begin(Principal(3), PermissionBits::bit(0), now())
+            .unwrap()
+            .admit(&[(PriceOp, 64)], AllocationSlot, now())
             .unwrap();
-        black_box(admitted.cancel());
+        black_box(pending.cancel());
+    });
+    assert_lookup(&engine, || {
+        black_box(
+            engine
+                .begin(Principal(1), PermissionBits::bit(0), now())
+                .unwrap(),
+        );
+    });
+    assert_lookup(&engine, || {
+        black_box(
+            engine
+                .begin(Principal(1), PermissionBits::bit(0), now())
+                .unwrap()
+                .admit(&[] as &[(PriceOp, u64)], AllocationSlot, now())
+                .unwrap_err(),
+        );
     });
 }

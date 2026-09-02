@@ -26,6 +26,7 @@ use crate::usage_writer::UsagePermit;
 ///
 /// ```compile_fail
 /// # #![deny(unused_must_use)]
+/// # #![allow(deprecated)]
 /// # fn discard(
 /// #     admitted: tollgate_admission::Admitted,
 /// #     permit: tollgate_client::UsagePermit,
@@ -42,6 +43,7 @@ use crate::usage_writer::UsagePermit;
 /// stopped type-checking.
 ///
 /// ```
+/// # #![allow(deprecated)]
 /// # fn hold(
 /// #     admitted: tollgate_admission::Admitted,
 /// #     permit: tollgate_client::UsagePermit,
@@ -52,6 +54,7 @@ use crate::usage_writer::UsagePermit;
 /// # }
 /// ```
 #[must_use = "hold this guard for the full execution lifetime"]
+#[deprecated(since = "0.9.0", note = "use tollgate_admission::ReadyToStart::commit")]
 pub struct ChargeGuard {
     event: Option<UsageEvent>,
     permit: Option<UsagePermit>,
@@ -61,6 +64,7 @@ pub struct ChargeGuard {
     _admission: CommittedAdmission,
 }
 
+#[allow(deprecated)]
 impl ChargeGuard {
     /// Consume `admitted` at execution start and bind its billing event to
     /// `permit`. The returned guard owns the complete committed admission,
@@ -94,6 +98,7 @@ impl ChargeGuard {
     }
 }
 
+#[allow(deprecated)]
 impl Drop for ChargeGuard {
     fn drop(&mut self) {
         if let (Some(event), Some(permit)) = (self.event.take(), self.permit.take()) {

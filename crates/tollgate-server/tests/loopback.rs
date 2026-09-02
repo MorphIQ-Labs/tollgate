@@ -15,9 +15,7 @@ use std::sync::Arc;
 
 use jiff::{SignedDuration, Timestamp};
 
-use tollgate_admission::{
-    AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot, SnapshotMap,
-};
+use tollgate_admission::{AdmissionEngine, ArcSwapSnapshotMap, LeaseSlot, NoGate, SnapshotMap};
 use tollgate_client::{
     HttpStore, LeaseManager, LeaseManagerConfig, SlotRegistry, SnapshotManager,
     SnapshotManagerConfig, SystemClock, TrackedPrincipals, UsageWriter, UsageWriterConfig,
@@ -25,7 +23,7 @@ use tollgate_client::{
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, FencingToken,
     Generation, KeyId, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, Principal,
-    PublishableSnapshot, RequestId, ResolvedLimits,
+    PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent, UsageSlot,
 };
 use tollgate_store::wire::API_PREFIX;
 use tollgate_store::{
@@ -63,6 +61,12 @@ impl OpIndex for PriceOp {
     fn index(&self) -> usize {
         0
     }
+}
+
+struct DropSlot;
+
+impl UsageSlot for DropSlot {
+    fn record(self, _event: UsageEvent) {}
 }
 
 fn snapshot() -> Arc<AccountSnapshot> {
@@ -200,15 +204,7 @@ async fn http_negative_ttl_refetches_without_push() {
     .await
     .expect("initial unknown resolution must make the manager ready");
     assert!(matches!(
-        engine.admit(
-            AdmissionRequest {
-                principal: PRINCIPAL,
-                required: PermissionBits::bit(0),
-                op: &PriceOp,
-                items: 1,
-            },
-            Timestamp::now(),
-        ),
+        engine.begin(PRINCIPAL, PermissionBits::bit(0), Timestamp::now()),
         Err(DenyReason::UnknownPrincipal)
     ));
 
@@ -230,17 +226,12 @@ async fn http_negative_ttl_refetches_without_push() {
     )));
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            match engine.admit(
-                AdmissionRequest {
-                    principal: PRINCIPAL,
-                    required: PermissionBits::bit(0),
-                    op: &PriceOp,
-                    items: 1,
-                },
-                Timestamp::now(),
-            ) {
-                Ok(admitted) => {
-                    admitted.cancel();
+            match engine
+                .begin(PRINCIPAL, PermissionBits::bit(0), Timestamp::now())
+                .and_then(|context| context.admit(&[(PriceOp, 1)], DropSlot, Timestamp::now()))
+            {
+                Ok(pending) => {
+                    pending.cancel();
                     break;
                 }
                 Err(DenyReason::UnknownPrincipal) => {
@@ -354,23 +345,19 @@ async fn full_stack_over_loopback_http() {
             let Ok(permit) = recorder.try_reserve() else {
                 continue;
             };
-            match engine.admit(
-                AdmissionRequest {
-                    principal: PRINCIPAL,
-                    required: PermissionBits::bit(0),
-                    op: &PriceOp,
-                    items: 1,
-                },
-                Timestamp::now(),
-            ) {
-                Ok(admitted) => {
+            match engine
+                .begin(PRINCIPAL, PermissionBits::bit(0), Timestamp::now())
+                .and_then(|context| context.admit(&[(PriceOp, 1)], permit, Timestamp::now()))
+            {
+                Ok(pending) => {
                     request_seq += 1;
-                    let committed = admitted
+                    let committed = pending.acquire_capacity(&NoGate).unwrap();
+                    let committed = committed
                         .commit(RequestId(request_seq), Timestamp::now())
                         .unwrap();
-                    permit.record(committed.usage_event());
                     committed_units += committed.units().get();
                     round_commits += 1;
+                    drop(committed);
                 }
                 Err(
                     DenyReason::LeaseUnavailable

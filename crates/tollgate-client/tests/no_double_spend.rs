@@ -7,9 +7,7 @@ use std::sync::Arc;
 
 use jiff::{SignedDuration, Timestamp};
 
-use tollgate_admission::{
-    AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot, SnapshotMap,
-};
+use tollgate_admission::{AdmissionEngine, ArcSwapSnapshotMap, LeaseSlot, NoGate, SnapshotMap};
 use tollgate_client::{
     LeaseManager, LeaseManagerConfig, ManualClock, UsageRecorder, UsageWriter, UsageWriterConfig,
 };
@@ -121,23 +119,20 @@ fn hammer(instance: &mut Instance, burst: usize) -> usize {
         let Ok(permit) = instance.recorder.try_reserve() else {
             continue;
         };
-        let admitted = instance.engine.admit(
-            AdmissionRequest {
-                principal: PRINCIPAL,
-                required: PermissionBits::bit(0),
-                op: &PriceOp,
-                items: 1,
-            },
-            t(0),
-        );
+        let admitted = instance
+            .engine
+            .begin(PRINCIPAL, PermissionBits::bit(0), t(0))
+            .and_then(|context| context.admit(&[(PriceOp, 1)], permit, t(0)));
         match admitted {
-            Ok(admitted) => {
-                let execution = admitted
+            Ok(pending) => {
+                let committed_guard = pending
+                    .acquire_capacity(&NoGate)
+                    .unwrap()
                     .commit(RequestId(uuid::Uuid::new_v4().as_u128()), t(0))
                     .unwrap();
-                permit.record(execution.usage_event());
-                instance.committed += execution.units().get();
+                instance.committed += committed_guard.units().get();
                 committed += 1;
+                drop(committed_guard);
             }
             Err(
                 DenyReason::LeaseUnavailable

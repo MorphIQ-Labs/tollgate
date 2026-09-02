@@ -18,6 +18,13 @@ pub trait OpIndex {
     fn index(&self) -> usize;
 }
 
+impl<O: OpIndex + ?Sized> OpIndex for &O {
+    #[inline]
+    fn index(&self) -> usize {
+        (**self).index()
+    }
+}
+
 /// One quoted request: the committed price if execution starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -35,6 +42,8 @@ pub struct CostQuote {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum QuoteError {
+    /// The caller supplied no nonzero work.
+    EmptyWorkload,
     /// The operation's index was never registered in this table.
     UnknownOperation { index: usize },
     /// `fixed + per_item * items` exceeded `u64` (INVARIANTS.md #11).
@@ -44,6 +53,7 @@ pub enum QuoteError {
 impl fmt::Display for QuoteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            QuoteError::EmptyWorkload => f.write_str("workload is empty"),
             QuoteError::UnknownOperation { index } => {
                 write!(f, "operation index {index} is not in the cost table")
             }
@@ -75,15 +85,49 @@ impl CostTable {
         }
     }
 
-    /// Quote `items` items of `op`. Pure, allocation-free, and O(1).
+    /// Quote `items` items of `op` as the homogeneous one-entry workload.
     #[inline]
     pub fn quote(&self, op: &impl OpIndex, items: u64) -> Result<CostQuote, QuoteError> {
-        let index = op.index();
-        let per_item = match self.weights.get(index) {
-            Some(Some(w)) => *w,
-            _ => return Err(QuoteError::UnknownOperation { index }),
-        };
-        self.quote_weight(per_item, items)
+        self.quote_workload(&[(op, items)]).map(|(quote, _)| quote)
+    }
+
+    /// Quote caller-owned class aggregates, applying the fixed and minimum
+    /// terms exactly once. Pure, allocation-free, and O(entries).
+    #[inline]
+    pub fn quote_workload<O: OpIndex>(
+        &self,
+        workload: &[(O, u64)],
+    ) -> Result<(CostQuote, u64), QuoteError> {
+        let mut items = 0_u64;
+        let mut variable = CostUnits::ZERO;
+        for (op, count) in workload {
+            if *count == 0 {
+                continue;
+            }
+            items = items.checked_add(*count).ok_or(QuoteError::Overflow)?;
+            let index = op.index();
+            let per_item = match self.weights.get(index) {
+                Some(Some(weight)) => *weight,
+                _ => return Err(QuoteError::UnknownOperation { index }),
+            };
+            let entry = per_item.checked_mul(*count).ok_or(QuoteError::Overflow)?;
+            variable = variable.checked_add(entry).ok_or(QuoteError::Overflow)?;
+        }
+        if items == 0 {
+            return Err(QuoteError::EmptyWorkload);
+        }
+        let subtotal = self
+            .fixed_request
+            .checked_add(variable)
+            .ok_or(QuoteError::Overflow)?;
+        Ok((
+            CostQuote {
+                total: subtotal.max(self.minimum_charge),
+                fixed: self.fixed_request,
+                variable,
+            },
+            items,
+        ))
     }
 
     /// Quote one already-resolved weight. Keeping the arithmetic here makes
@@ -205,6 +249,46 @@ mod tests {
             .weight(&Op::Price, CostUnits(1))
             .build();
         assert_eq!(t.quote(&Op::Price, 3).unwrap().total, CostUnits(25));
+    }
+
+    #[test]
+    fn workload_applies_fixed_once_and_sums_repeated_classes() {
+        let quote = table()
+            .quote_workload(&[(Op::Price, 2), (Op::Greeks, 3), (Op::Price, 4)])
+            .unwrap();
+        assert_eq!(quote.1, 9);
+        assert_eq!(quote.0.fixed, CostUnits(50));
+        assert_eq!(quote.0.variable, CostUnits(21));
+        assert_eq!(quote.0.total, CostUnits(71));
+    }
+
+    #[test]
+    fn empty_or_all_zero_workload_is_refused() {
+        assert_eq!(
+            table().quote_workload::<Op>(&[]),
+            Err(QuoteError::EmptyWorkload)
+        );
+        assert_eq!(
+            table().quote_workload(&[(Op::Price, 0), (Op::Greeks, 0)]),
+            Err(QuoteError::EmptyWorkload)
+        );
+        assert_eq!(table().quote(&Op::Price, 0), Err(QuoteError::EmptyWorkload));
+    }
+
+    #[test]
+    fn workload_checks_the_item_sum_and_variable_sum() {
+        assert_eq!(
+            table().quote_workload(&[(Op::Price, u64::MAX), (Op::Price, 1)]),
+            Err(QuoteError::Overflow)
+        );
+        let overflowing = CostTable::builder(CostUnits::ZERO, CostUnits::ZERO)
+            .weight(&Op::Price, CostUnits(u64::MAX))
+            .weight(&Op::Greeks, CostUnits(1))
+            .build();
+        assert_eq!(
+            overflowing.quote_workload(&[(Op::Price, 1), (Op::Greeks, 1)]),
+            Err(QuoteError::Overflow)
+        );
     }
 
     #[test]

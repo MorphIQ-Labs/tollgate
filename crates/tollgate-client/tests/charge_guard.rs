@@ -1,3 +1,7 @@
+// Exercises the deprecated one-shot surface on purpose: it is supported
+// for a minor and must keep working.
+#![allow(deprecated)]
+
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;

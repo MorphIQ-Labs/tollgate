@@ -46,4 +46,4 @@ pub use snapshot::{
     SnapshotValidationError, WeightedRateLimit,
 };
 pub use units::CostUnits;
-pub use usage::{UsageEvent, UsageSource};
+pub use usage::{UsageEvent, UsageSlot, UsageSource};

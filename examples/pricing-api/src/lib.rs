@@ -7,11 +7,13 @@
 //! ```text
 //! Authorization: Bearer <key>
 //!   → connection-cache hit or HMAC-SHA256 verify, derive Principal
+//!   → AdmissionEngine::begin               (one lookup + route permission)
 //!   → reserve usage-writer permit          (shed on backpressure, #8)
-//!   → AdmissionEngine::admit               (snapshot/permissions/rate/lease)
-//!   → ChargeGuard::commit                   (owns admission + usage permit)
-//!   → price while holding charge guard      (toy Black-Scholes kernel)
-//!   → drop guard                            (record usage + release concurrency)
+//!   → read/decode under the pinned context
+//!   → RequestContext::admit                (shape/rate/concurrency/funding)
+//!   → acquire NoGate + commit
+//!   → price (toy Black-Scholes kernel)
+//!   → permit.record(usage event)
 //!   → respond { prices, metadata: { request_id, units_charged } }
 //! ```
 //!
@@ -24,26 +26,26 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{ConnectInfo, State, connect_info::Connected};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::{ConnectInfo, FromRequest, FromRequestParts, State, connect_info::Connected};
+use axum::http::{Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use tollgate_admission::{
-    AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot, MapEntry, SnapshotMap,
+    AdmissionEngine, ArcSwapSnapshotMap, LeaseSlot, MapEntry, NoGate, RequestContext, SnapshotMap,
 };
 use tollgate_auth::{CredentialVerifier, HmacRegistry, SessionCredential};
 use tollgate_client::{
-    ChargeGuard, Clock, LeaseCounters, LeaseManager, LeaseManagerConfig, SlotRegistry,
-    SnapshotCounters, SnapshotManager, SnapshotManagerConfig, SystemClock, TrackedPrincipals,
+    Clock, LeaseCounters, LeaseManager, LeaseManagerConfig, SlotRegistry, SnapshotCounters,
+    SnapshotManager, SnapshotManagerConfig, SystemClock, TrackedPrincipals, UsagePermit,
     UsageRecorder, UsageWriter, UsageWriterConfig,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, EnforcementMode,
-    Generation, LocalSharding, OpIndex, PermissionBits, Principal, PublishableSnapshot, RequestId,
-    ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, CommitError, CostTable, CostUnits, DenyReason,
+    EnforcementMode, Generation, LocalSharding, OpIndex, PermissionBits, Principal,
+    PublishableSnapshot, RequestId, ResolvedLimits,
 };
 use tollgate_store::{AccountConfig, GrantPolicy, MemoryStore};
 
@@ -138,6 +140,71 @@ struct Problem {
     code: &'static str,
     title: String,
     units_charged: u64,
+}
+
+/// The request body plus the evidence obtained before Axum consumes it.
+struct PriceInput {
+    request: PriceRequest,
+    staged: Option<(RequestContext, UsagePermit)>,
+}
+
+impl FromRequest<Arc<AppState>> for PriceInput {
+    type Rejection = Response;
+
+    async fn from_request(
+        request: Request<axum::body::Body>,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        if state.admission.is_none() {
+            let Json(request) = Json::<PriceRequest>::from_request(request, state)
+                .await
+                .map_err(IntoResponse::into_response)?;
+            return Ok(Self {
+                request,
+                staged: None,
+            });
+        }
+
+        let (mut parts, body) = request.into_parts();
+        let ConnectInfo(connection) =
+            ConnectInfo::<PricingConnection>::from_request_parts(&mut parts, state)
+                .await
+                .map_err(IntoResponse::into_response)?;
+        let now = Timestamp::now();
+        let Some(principal) =
+            connection.authenticate(parts.headers.get(header::AUTHORIZATION), &state.auth, now)
+        else {
+            state
+                .engine
+                .counters()
+                .record_deny(&DenyReason::UnknownPrincipal);
+            return Err(deny_response(DenyReason::UnknownPrincipal));
+        };
+        let context = state
+            .engine
+            .begin(principal, PERMISSION_PRICE, now)
+            .map_err(deny_response)?;
+        let admission = state
+            .admission
+            .as_ref()
+            .expect("the branch above proved admission is enabled");
+        let permit = admission.recorder.try_reserve().map_err(|_| {
+            state
+                .engine
+                .counters()
+                .record_deny(&DenyReason::AccountingBackpressure);
+            deny_response(DenyReason::AccountingBackpressure)
+        })?;
+
+        let request = Request::from_parts(parts, body);
+        let Json(request) = Json::<PriceRequest>::from_request(request, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        Ok(Self {
+            request,
+            staged: Some((context, permit)),
+        })
+    }
 }
 
 // ---- app ---------------------------------------------------------------
@@ -829,20 +896,20 @@ fn deny_response(reason: DenyReason) -> Response {
             "overage-commit-in-progress",
         ),
         DenyReason::AccountingBackpressure => (StatusCode::SERVICE_UNAVAILABLE, "accounting-busy"),
+        DenyReason::EmptyWorkload => (StatusCode::UNPROCESSABLE_ENTITY, "empty-workload"),
+        DenyReason::FundingExpiredAtStart => {
+            (StatusCode::SERVICE_UNAVAILABLE, "funding-expired-at-start")
+        }
     };
     problem(status, code, reason.to_string())
 }
 
-async fn price(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(connection): ConnectInfo<PricingConnection>,
-    headers: HeaderMap,
-    Json(request): Json<PriceRequest>,
-) -> Response {
+async fn price(input: PriceInput) -> Response {
     // One destructuring, not a flag check followed by an unwrap that has to
     // agree with it: the same `let` that rules out the baseline is what hands
     // this handler the recorder (#16).
-    let Some(admission) = state.admission.as_ref() else {
+    let PriceInput { request, staged } = input;
+    let Some((context, permit)) = staged else {
         // Load-gate baseline: transport + kernel only.
         let prices: Vec<f64> = request.contracts.iter().map(black_scholes_call).collect();
         return Json(PriceResponse {
@@ -855,73 +922,37 @@ async fn price(
         .into_response();
     };
 
-    // 1. Credential → principal. Exact bytes verified earlier on this
-    //    connection reuse their principal; any change clears the slot and
-    //    verifies again. Admission still consults the loaded snapshot below on
-    //    every request, so caching cannot extend authorization.
-    //
-    //    One clock read serves both this and admission, so the credential's
-    //    validity and the snapshot's staleness are judged at the same instant
-    //    rather than at two that could straddle an expiry.
-    let now = Timestamp::now();
-    let Some(principal) =
-        connection.authenticate(headers.get(header::AUTHORIZATION), &state.auth, now)
-    else {
-        // Also recorded here: a credential that fails verification is refused
-        // before the engine is reached, and an operator watching
-        // `unknown_principal` wants both halves — a bad key and a key with no
-        // snapshot are the same refusal from the caller's side.
-        state
-            .engine
-            .counters()
-            .record_deny(&DenyReason::UnknownPrincipal);
-        return deny_response(DenyReason::UnknownPrincipal);
-    };
-
-    // 2. Accounting capacity before admission (INVARIANTS.md #8).
-    let Ok(permit) = admission.recorder.try_reserve() else {
-        // Shed before admission, so the engine never sees this one: the
-        // service records it against the same tally, or the reason would
-        // export a permanent zero and read as "never happens" (#37).
-        state
-            .engine
-            .counters()
-            .record_deny(&DenyReason::AccountingBackpressure);
-        return deny_response(DenyReason::AccountingBackpressure);
-    };
-
-    // 3. One-call admission.
+    // Authentication, begin, accounting backpressure, and body decoding have
+    // already occurred in `PriceInput`, in that order. The owned context is
+    // the proof that this body is still governed by the same generation.
     let items = request.contracts.len() as u64;
-    let admitted = match state.engine.admit(
-        AdmissionRequest {
-            principal,
-            required: PERMISSION_PRICE,
-            op: &Op::Price,
-            items,
-        },
-        now,
-    ) {
-        Ok(admitted) => admitted,
+    let pending = match context.admit(&[(Op::Price, items)], permit, Timestamp::now()) {
+        Ok(pending) => pending,
         Err(reason) => return deny_response(reason),
     };
+    let ready = match pending.acquire_capacity(&NoGate) {
+        Ok(ready) => ready,
+        Err((reason, _released)) => return deny_response(reason),
+    };
 
-    // 4. Execution starts: the charge commits, and ChargeGuard binds the
-    //    billing event to the reserved permit *now* — a panic or task abort
-    //    during the kernel still emits the event on drop, so a spent lease
-    //    is never unbilled (review finding #3).
+    // Execution starts only after the type-state owns funding, accounting,
+    // account concurrency, and the selected execution-capacity permit.
     // Random 128-bit ids: idempotency keys are global, so ids must be
     // collision-free across instances and restarts — a process-local counter
     // would make a second instance's legitimate usage read as duplicates
     // (review finding #6).
     let request_id = RequestId(uuid::Uuid::new_v4().as_u128());
-    let charge = match ChargeGuard::commit(admitted, permit, request_id, Timestamp::now()) {
+    let committed = match ready.commit(request_id, Timestamp::now()) {
         Ok(committed) => committed,
-        Err(_) => return deny_response(DenyReason::LeaseExpired),
+        Err((CommitError::Denied(reason), _released)) => return deny_response(reason),
+        Err((_cancelled, _released)) => {
+            return deny_response(DenyReason::FundingExpiredAtStart);
+        }
     };
-    let units = charge.units();
+    let units = committed.units();
 
     let prices: Vec<f64> = request.contracts.iter().map(black_scholes_call).collect();
-    drop(charge);
+    drop(committed);
 
     Json(PriceResponse {
         prices,
@@ -966,6 +997,18 @@ mod tests {
     use super::*;
     use tollgate_core::{FencingToken, LeaseGrant, LeaseId, LocalLease, Reservation};
     use tollgate_store::{SnapshotResolution, SnapshotSource};
+
+    #[test]
+    fn stale_policy_is_a_transient_service_failure() {
+        assert_eq!(
+            deny_response(DenyReason::SnapshotExpired).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            DenyReason::SnapshotExpired.retry(),
+            tollgate_core::Retry::Transient
+        );
+    }
 
     // The cache's own behaviour — verify-once, per-session isolation,
     // invalidation ordering — is tested in `tollgate-auth`, where it now

@@ -2,7 +2,7 @@
   "_comment": "target_ns is aspirational; threshold_ns fails the gate. Values are provisional laptop bounds \u2014 recalibrate on the controlled host before treating them as the contract.",
   "_reserved_ids": {
     "_comment": "Owners add the benchmark, manifest row, portable ratio where applicable, script production, and controlled-host baseline in one change. Reserved names are stable review contracts, not measurements of APIs that do not exist yet.",
-    "#91": ["admission/begin", "admission/admit_staged_1"],
+    "#91": [],
     "#92": ["cost_table/quote_workload_1", "cost_table/quote_workload_2", "cost_table/quote_workload_8"],
     "#93": ["reservation/commit_split"],
     "#99": ["capacity/disabled", "capacity/uniform", "capacity/reserved_shared", "capacity/reserved_fallback", "capacity/full_check_contended_8_distinct_accounts_uniform", "capacity/full_check_contended_8_distinct_accounts_reserved", "load/concurrent_distinct_accounts", "load/mixed_saturation"]
@@ -87,6 +87,18 @@
       "threshold_ns": 220.0
     },
     {
+      "_comment": "#91 stage one: one map lookup plus status, freshness, and route permission, returning the owned generation pin. Provisional bound; the controlled-host baseline is recorded with the staged rollout.",
+      "id": "admission/begin",
+      "target_ns": 30.0,
+      "threshold_ns": 70.0
+    },
+    {
+      "_comment": "#91 complete staged homogeneous path: begin plus a one-entry borrowed workload through pending funding and cancellation. The same-run ratio against admission/full_check is the compatibility contract. Provisional bound pending a controlled-host recording.",
+      "id": "admission/admit_staged_1",
+      "target_ns": 115.0,
+      "threshold_ns": 240.0
+    },
+    {
       "_comment": "#9: SipHash 115.1/115.7ns, foldhash 99.6/99.5ns. The 15.9ns saving exceeds the 9.8ns measured on the isolated lookup; the remainder is not accounted for by the hash alone. After #91's final always-tracked concurrency state machine, five controlled-host means were 108.91, 111.11, 107.86, 106.83, and 106.03ns (median 107.86ns).",
       "id": "admission/full_check",
       "target_ns": 105.0,
@@ -111,7 +123,7 @@
       "threshold_ns": 2500.0
     },
     {
-      "_comment": "#90 pre-#99 different-account baseline. Seven background requests and the foreground request use eight accounts, but today's engine-global counters still share a line. The sustained fixture uses the same one-unit weighted quote as the existing contention pair so it cannot self-throttle. Measured 583ns; reported honestly so #99 can prove the residual moved.",
+      "_comment": "#90 different-account baseline. Seven background requests and the foreground request use eight accounts, but the map-owned counter set still shares a line across them. The sustained fixture uses the same one-unit weighted quote as the existing contention pair so it cannot self-throttle. Measured 583ns; reported honestly so #99 can measure enabled capacity independently of this residual.",
       "id": "admission/full_check_contended_8_distinct_accounts",
       "target_ns": 700.0,
       "threshold_ns": 3000.0
@@ -160,6 +172,12 @@
     }
   ],
   "ratios": [
+    {
+      "_comment": "#91 homogeneous compatibility: the staged path is the same lookup and checks split across two owned states. Ten percent permits the type-state handoff but no second lookup or allocation.",
+      "numerator": "admission/admit_staged_1",
+      "denominator": "admission/full_check",
+      "max_ratio": 1.1
+    },
     {
       "_comment": "Direct indexing is independent of table size. Measured x0.88 for 4,096 classes versus two; x1.5 leaves compiler noise but no room for a linear scan.",
       "numerator": "cost_table/quote_4096_classes",

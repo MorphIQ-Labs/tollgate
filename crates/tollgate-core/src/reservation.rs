@@ -42,6 +42,10 @@ pub enum CancelOutcome {
 /// Error from [`Reservation::commit_at_execution_start`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitError {
+    /// Cancellation won before execution started.
+    Cancelled,
+    /// Funding could not remain valid through execution start.
+    Denied(DenyReason),
     /// Cancellation won the race. The caller must not execute the work; the
     /// request reports zero units.
     AlreadyReleased,
