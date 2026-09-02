@@ -1,14 +1,13 @@
 //! The admission pipeline itself.
 
 use std::num::NonZeroU32;
-#[cfg(test)]
 use std::sync::Arc;
 
 use jiff::Timestamp;
 
 use tollgate_core::{
-    AccountSnapshot, CancelOutcome, CommitError, CostQuote, CostUnits, DenyReason, Locality,
-    OpIndex, PermissionBits, QuoteError, RequestId, Reservation, UsageEvent,
+    AccountSnapshot, CancelOutcome, CommitError, CostQuote, CostUnits, DenyReason, Generation,
+    Locality, OpIndex, PermissionBits, QuoteError, RequestId, Reservation, UsageEvent, UsageSlot,
 };
 
 use crate::counters::AdmissionCounters;
@@ -133,24 +132,239 @@ impl CommittedAdmission {
     }
 }
 
+/// Generation-pinned stage-one evidence, owned across body decoding.
+#[derive(Debug)]
+pub struct RequestContext {
+    state: Arc<AccountAdmissionState>,
+    locality: Locality,
+}
+
+impl RequestContext {
+    #[must_use]
+    pub fn snapshot(&self) -> &AccountSnapshot {
+        &self.state.snapshot
+    }
+
+    #[must_use]
+    pub fn limits(&self) -> &tollgate_core::ResolvedLimits {
+        &self.state.snapshot.limits
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> Generation {
+        self.state.snapshot.generation
+    }
+
+    pub fn admit<O: OpIndex, S: UsageSlot>(
+        self,
+        workload: &[(O, u64)],
+        slot: S,
+        now: Timestamp,
+    ) -> Result<Pending<S>, DenyReason> {
+        let locality = self.locality;
+        let quote = match compile_workload(&self.state.snapshot, workload, now) {
+            Ok(quote) => quote,
+            Err(reason) => {
+                self.state.counters.record_deny_at(&reason, locality);
+                return Err(reason);
+            }
+        };
+        admit_priced(self.state, locality, quote, now).map(|priced| Pending {
+            concurrency: priced.concurrency,
+            reservation: priced.reservation,
+            slot,
+            quote: priced.quote,
+        })
+    }
+}
+
+/// Funding is reserved, but execution capacity has not yet been acquired.
+#[derive(Debug)]
+pub struct Pending<S: UsageSlot> {
+    concurrency: ConcurrencyGuard,
+    reservation: Reservation,
+    slot: S,
+    quote: CostQuote,
+}
+
+impl<S: UsageSlot> Pending<S> {
+    #[must_use]
+    pub fn quote(&self) -> CostQuote {
+        self.quote
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> &AccountSnapshot {
+        &self.concurrency.state().snapshot
+    }
+
+    #[must_use]
+    pub fn limits(&self) -> &tollgate_core::ResolvedLimits {
+        &self.snapshot().limits
+    }
+
+    pub fn acquire_capacity<G: CapacityGate>(
+        self,
+        gate: &G,
+    ) -> Result<ReadyToStart<S, G::Permit>, (DenyReason, Released)> {
+        let evidence = CapacityEvidence { _private: () };
+        match gate.acquire(evidence) {
+            Ok(permit) => Ok(ReadyToStart {
+                pending: self,
+                permit,
+            }),
+            Err(denied) => Err((denied, Released)),
+        }
+    }
+
+    pub fn cancel(self) -> Released {
+        self.reservation.cancel();
+        Released
+    }
+}
+
+mod private {
+    pub trait Sealed {}
+}
+
+/// Tollgate-owned execution-capacity evidence.
+pub trait CapacityPermit: private::Sealed + Send + 'static {}
+
+/// A startup-selected execution-capacity policy.
+pub trait CapacityGate: private::Sealed + Send + Sync + 'static {
+    type Permit: CapacityPermit;
+
+    fn acquire(&self, evidence: CapacityEvidence) -> Result<Self::Permit, DenyReason>;
+}
+
+/// Opaque evidence retained from the pinned request context.
+#[derive(Debug, Clone, Copy)]
+pub struct CapacityEvidence {
+    _private: (),
+}
+
+/// Disabled execution-capacity policy. This is a zero-sized startup choice.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoGate;
+
+/// Permit produced by [`NoGate`]; callers cannot construct one directly.
+#[derive(Debug)]
+pub struct NoCapacityPermit(());
+
+impl private::Sealed for NoGate {}
+impl private::Sealed for NoCapacityPermit {}
+impl CapacityPermit for NoCapacityPermit {}
+
+impl CapacityGate for NoGate {
+    type Permit = NoCapacityPermit;
+
+    #[inline]
+    fn acquire(&self, _evidence: CapacityEvidence) -> Result<Self::Permit, DenyReason> {
+        Ok(NoCapacityPermit(()))
+    }
+}
+
+/// Funding and execution capacity are both held; committing consumes this
+/// proof immediately before the computational kernel starts.
+#[derive(Debug)]
+pub struct ReadyToStart<S: UsageSlot, P: CapacityPermit> {
+    pending: Pending<S>,
+    permit: P,
+}
+
+impl<S: UsageSlot, P: CapacityPermit> ReadyToStart<S, P> {
+    #[must_use = "the kernel may run only while holding the returned Committed guard"]
+    pub fn commit(
+        self,
+        request_id: RequestId,
+        now: Timestamp,
+    ) -> Result<Committed<S, P>, (CommitError, Released)> {
+        let Pending {
+            concurrency,
+            reservation,
+            slot,
+            quote: _,
+        } = self.pending;
+        let units = match reservation.commit_at_execution_start(now) {
+            Ok(units) => units,
+            Err(CommitError::LeaseExpired) => {
+                return Err((
+                    CommitError::Denied(DenyReason::FundingExpiredAtStart),
+                    Released,
+                ));
+            }
+            Err(CommitError::AlreadyReleased | CommitError::Cancelled) => {
+                return Err((CommitError::Cancelled, Released));
+            }
+            Err(CommitError::AlreadyCommitted | CommitError::Denied(_)) => {
+                debug_assert!(false, "an owned ready state can commit only once");
+                return Err((CommitError::Cancelled, Released));
+            }
+        };
+        let event = reservation
+            .usage_event(request_id, now)
+            .expect("a committed reservation produces usage evidence");
+        Ok(Committed {
+            event: Some(event),
+            slot: Some(slot),
+            units,
+            request_id,
+            _concurrency: concurrency,
+            _capacity: self.permit,
+        })
+    }
+
+    pub fn cancel(self) -> Released {
+        self.pending.cancel()
+    }
+}
+
+/// Typed evidence that a request resolved before execution with zero charge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Released;
+
+/// The only proof that the computational kernel may run.
+#[derive(Debug)]
+pub struct Committed<S: UsageSlot, P: CapacityPermit> {
+    event: Option<UsageEvent>,
+    slot: Option<S>,
+    units: CostUnits,
+    request_id: RequestId,
+    _concurrency: ConcurrencyGuard,
+    _capacity: P,
+}
+
+impl<S: UsageSlot, P: CapacityPermit> Committed<S, P> {
+    #[must_use]
+    pub fn units(&self) -> CostUnits {
+        self.units
+    }
+
+    #[must_use]
+    pub fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+}
+
+impl<S: UsageSlot, P: CapacityPermit> Drop for Committed<S, P> {
+    fn drop(&mut self) {
+        if let (Some(event), Some(slot)) = (self.event.take(), self.slot.take()) {
+            slot.record(event);
+        }
+    }
+}
+
 /// The engine: a snapshot map plus the pipeline. Generic over the map so the
 /// moka and arc-swap candidates compete under identical logic.
 pub struct AdmissionEngine<M: SnapshotMap> {
     map: M,
-    // By value, not behind an `Arc`: the counters sit at a known offset from
-    // an engine the embedder already holds, so recording an outcome is a
-    // direct index off `self` rather than a pointer chase (#37).
-    counters: AdmissionCounters,
 }
 
+#[allow(deprecated)]
 impl<M: SnapshotMap> AdmissionEngine<M> {
     #[must_use]
     pub fn new(map: M) -> Self {
-        let sharding = map.local_sharding();
-        AdmissionEngine {
-            map,
-            counters: AdmissionCounters::with_sharding(sharding),
-        }
+        AdmissionEngine { map }
     }
 
     /// Control-plane surface: the underlying map, for installs/invalidation.
@@ -162,230 +376,314 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
     /// Observability surface: what this instance has admitted and refused.
     #[must_use]
     pub fn counters(&self) -> &AdmissionCounters {
-        &self.counters
+        self.map.counters()
+    }
+
+    /// Resolve and authorize one immutable generation before body decoding.
+    pub fn begin(
+        &self,
+        principal: Principal,
+        required: PermissionBits,
+        now: Timestamp,
+    ) -> Result<RequestContext, DenyReason> {
+        let locality = Locality::current();
+        let outcome = self.begin_inner(principal, required, now, locality);
+        if let Err(reason) = &outcome {
+            self.map.counters().record_deny_at(reason, locality);
+        }
+        outcome
     }
 
     /// Admit or deny. No I/O, no locks, no clock reads; every deny charges
     /// zero because the reservation is the last step.
     ///
-    /// The outcome is tallied here rather than at each exit: several reasons
-    /// never appear literally in [`Self::admit_inner`], since
-    /// `AccountSnapshot::admit` and `Reservation::reserve` produce them and
-    /// `?` propagates them. Counting at the sites would therefore have been
-    /// both noisier and — where it mattered — incomplete.
+    /// Compatibility wrapper over the same private stage-one, workload, and
+    /// priced-admission functions used by the staged API.
+    #[deprecated(since = "0.9.0", note = "use begin followed by RequestContext::admit")]
     pub fn admit<O: OpIndex>(
         &self,
         request: AdmissionRequest<'_, O>,
         now: Timestamp,
     ) -> Result<Admitted, DenyReason> {
         let locality = Locality::current();
-        let outcome = self.admit_inner(request, now, locality);
-        match &outcome {
-            Ok(admitted) if admitted.reservation.is_overage() => {
-                self.counters
-                    .record_admit_overage_at(admitted.quote.total, locality);
+        let context = match self.begin_inner(request.principal, request.required, now, locality) {
+            Ok(context) => context,
+            Err(reason) => {
+                self.map.counters().record_deny_at(&reason, locality);
+                return Err(reason);
             }
-            Ok(admitted) => self
-                .counters
-                .record_admit_at(admitted.quote.total, locality),
-            Err(reason) => self.counters.record_deny_at(reason, locality),
-        }
-        outcome
+        };
+        let quote =
+            match compile_workload(&context.state.snapshot, &[(request.op, request.items)], now) {
+                Ok(quote) => quote,
+                Err(reason) => {
+                    self.map.counters().record_deny_at(&reason, locality);
+                    return Err(reason);
+                }
+            };
+        let priced = admit_priced(context.state, locality, quote, now)?;
+        Ok(Admitted {
+            quote: priced.quote,
+            reservation: priced.reservation,
+            _concurrency: priced.concurrency,
+        })
     }
 
-    fn admit_inner<O: OpIndex>(
+    fn begin_inner(
         &self,
-        request: AdmissionRequest<'_, O>,
+        principal: Principal,
+        required: PermissionBits,
         now: Timestamp,
         locality: Locality,
-    ) -> Result<Admitted, DenyReason> {
-        // 1. Lookup. A miss or live negative entry denies; an expired
-        //    negative entry also denies but signals the background plane may
-        //    retry resolution (it observes the map, not this return value).
-        let state = match self.map.get_at(&request.principal, locality) {
+    ) -> Result<RequestContext, DenyReason> {
+        let state = match self.map.get_at(&principal, locality) {
             Some(MapEntry::Present(state)) => state,
             Some(MapEntry::NegativeUntil { .. }) | None => {
                 return Err(DenyReason::UnknownPrincipal);
             }
         };
+        state.snapshot.admit(now, required)?;
+        Ok(RequestContext { state, locality })
+    }
+}
 
-        // 2. Status, staleness, permissions.
-        state.snapshot.admit(now, request.required)?;
+#[derive(Debug)]
+struct Priced {
+    concurrency: ConcurrencyGuard,
+    reservation: Reservation,
+    quote: CostQuote,
+}
 
-        // 3. Shape and price the work.
-        let limits = &state.snapshot.limits;
-        if request.items > limits.max_items_per_request() {
-            return Err(DenyReason::RequestTooLarge {
-                max_items: limits.max_items_per_request(),
-            });
-        }
-        let quote = state
-            .snapshot
+fn compile_workload<O: OpIndex>(
+    snapshot: &AccountSnapshot,
+    workload: &[(O, u64)],
+    now: Timestamp,
+) -> Result<CostQuote, DenyReason> {
+    if now >= snapshot.valid_until {
+        return Err(DenyReason::SnapshotExpired);
+    }
+    let (quote, items) =
+        snapshot
             .cost_table
-            .quote(request.op, request.items)
-            .map_err(|e| match e {
+            .quote_workload(workload)
+            .map_err(|error| match error {
+                QuoteError::EmptyWorkload => DenyReason::EmptyWorkload,
                 QuoteError::UnknownOperation { .. } => DenyReason::UnpricedOperation,
                 QuoteError::Overflow => DenyReason::CostOverflow,
             })?;
+    if items > snapshot.limits.max_items_per_request() {
+        return Err(DenyReason::RequestTooLarge {
+            max_items: snapshot.limits.max_items_per_request(),
+        });
+    }
+    Ok(quote)
+}
 
-        // Account-wide policy has one mutable authority shared by every
-        // principal. Load it once so rate and concurrency decisions are from
-        // one generation even if the control plane publishes concurrently.
-        let account = state.limiter.load();
-        let rate = account.rate();
+fn admit_priced(
+    state: Arc<AccountAdmissionState>,
+    locality: Locality,
+    quote: CostQuote,
+    now: Timestamp,
+) -> Result<Priced, DenyReason> {
+    // Account-wide policy has one mutable authority shared by every principal.
+    // Load it once so rate and concurrency decisions are from one generation
+    // even if the control plane publishes concurrently.
+    let account = state.limiter.load();
+    let rate = account.rate();
 
-        // 4. Request-count token. Every priced request costs exactly one,
-        //    independently of its cost-weighted charge.
-        if let Some(requests) = rate.requests() {
-            match requests.check_n_at(NonZeroU32::MIN, locality) {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) | Err(_) => return Err(DenyReason::RequestRateLimited),
+    // 4. Request-count token. Every priced request costs exactly one,
+    //    independently of its cost-weighted charge.
+    if let Some(requests) = rate.requests() {
+        match requests.check_n_at(NonZeroU32::MIN, locality) {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => {
+                return deny_priced(&state, DenyReason::RequestRateLimited, locality);
             }
         }
+    }
 
-        // 5. Weighted rate token. Cost-weighted: heavy requests draw down the
-        //    bucket proportionally. A disabled bucket performs no governor
-        //    check and the carried legacy pair remains rollout data only.
-        //
-        //    A weight beyond the bucket's whole burst can never pass, however
-        //    long the caller waits — that is a schedule whose batch cap admits
-        //    a quote its burst cannot hold, and it is reported as such rather
-        //    than as throttling (#40). Deciding it here, in full width against
-        //    the configured burst, is what keeps the u32 conversion below
-        //    honest: the weight is known to fit the bucket before it is
-        //    narrowed, so narrowing can no longer disguise an unadmittable
-        //    request as an ordinary empty bucket.
-        if let Some(weighted_rate) = rate.policy().weighted_rate() {
-            if quote.total.get() > weighted_rate.burst_units() {
-                return Err(DenyReason::UnpriceableUnderLimits {
+    // 5. Weighted rate token. Cost-weighted: heavy requests draw down the
+    //    bucket proportionally. A disabled bucket performs no governor
+    //    check and the carried legacy pair remains rollout data only.
+    //
+    //    A weight beyond the bucket's whole burst can never pass, however
+    //    long the caller waits — that is a schedule whose batch cap admits
+    //    a quote its burst cannot hold, and it is reported as such rather
+    //    than as throttling (#40). Deciding it here, in full width against
+    //    the configured burst, is what keeps the u32 conversion below
+    //    honest: the weight is known to fit the bucket before it is
+    //    narrowed, so narrowing can no longer disguise an unadmittable
+    //    request as an ordinary empty bucket.
+    if let Some(weighted_rate) = rate.policy().weighted_rate() {
+        if quote.total.get() > weighted_rate.burst_units() {
+            return deny_priced(
+                &state,
+                DenyReason::UnpriceableUnderLimits {
                     weight: quote.total,
                     burst_units: CostUnits(weighted_rate.burst_units()),
-                });
-            }
-            let weight = u32::try_from(quote.total.get()).unwrap_or(u32::MAX);
-            match NonZeroU32::new(weight) {
-                // Zero-cost requests draw no token; the minimum-charge floor
-                // makes this unreachable for any real table.
-                None => {}
-                Some(n) => match rate
-                    .weighted()
-                    .expect("configured weighted rate has an installed bucket")
-                    .check_n_at(n, locality)
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) => return Err(DenyReason::RateLimited),
-                    // Unreachable: the check above clears the quote against
-                    // the whole burst, and split buckets are sized so every
-                    // legitimate maximum quote fits at least one shard.
-                    Err(_) => {
-                        return Err(DenyReason::UnpriceableUnderLimits {
+                },
+                locality,
+            );
+        }
+        let weight = u32::try_from(quote.total.get()).unwrap_or(u32::MAX);
+        match NonZeroU32::new(weight) {
+            // Zero-cost requests draw no token; the minimum-charge floor
+            // makes this unreachable for any real table.
+            None => {}
+            Some(n) => match rate
+                .weighted()
+                .expect("configured weighted rate has an installed bucket")
+                .check_n_at(n, locality)
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return deny_priced(&state, DenyReason::RateLimited, locality),
+                // Unreachable: the check above clears the quote against
+                // the whole burst, and split buckets are sized so every
+                // legitimate maximum quote fits at least one shard.
+                Err(_) => {
+                    return deny_priced(
+                        &state,
+                        DenyReason::UnpriceableUnderLimits {
                             weight: quote.total,
                             burst_units: CostUnits(weighted_rate.burst_units()),
-                        });
-                    }
-                },
-            }
-        }
-
-        // 6. Concurrency: principal first, then account. The RAII guard undoes
-        //    either acquisition on every later refusal and remains held by
-        //    `Admitted` for the caller's full in-flight interval.
-        let concurrency = AccountAdmissionState::acquire_concurrency(
-            state,
-            account.max_concurrent_requests(),
-            locality,
-        )?;
-
-        // 7. Quota: debit the lease and open the state machine. Note the
-        //    deliberate ordering — a lease-denied request has still consumed
-        //    its rate token, because it did arrive and was priced.
-        //
-        //    Under `EnforcementMode::Elastic` a lease that cannot fund the
-        //    quote is not the end of the request. Three conditions say the
-        //    same thing — this instance holds no capacity for these units —
-        //    and they are the only three the mode intercepts:
-        //
-        //    - `LeaseUnavailable`: no lease at all, the cold-start and
-        //      control-plane-outage case;
-        //    - `LeaseExpired`: the lease's local window lapsed before refill
-        //      replaced it;
-        //    - `LeaseExhausted`: the lease is live and empty.
-        //
-        //    Nothing above this point is intercepted, and that is the whole
-        //    safety argument. An unknown principal, a suspended or closed
-        //    account, a stale snapshot, a missing permission, an oversized
-        //    batch, an unpriced operation, a cost overflow, an empty rate
-        //    bucket — every one of those still denies with zero charge under
-        //    either mode, because none of them is a statement about funding
-        //    (INVARIANTS.md #1, #5).
-        let reservation =
-            match Self::reserve_from_lease(concurrency.state(), quote.total, now, locality) {
-                Ok(reservation) => reservation,
-                Err(denied) => {
-                    Self::reserve_from_overage(concurrency.state(), quote.total, denied)?
+                        },
+                        locality,
+                    );
                 }
-            };
-
-        Ok(Admitted {
-            quote,
-            reservation,
-            _concurrency: concurrency,
-        })
-    }
-
-    /// The lease half of step 5, unchanged from the strict-only pipeline.
-    #[inline]
-    fn reserve_from_lease(
-        state: &AccountAdmissionState,
-        units: CostUnits,
-        now: Timestamp,
-        locality: Locality,
-    ) -> Result<Reservation, DenyReason> {
-        let lease = state
-            .lease
-            .load_at(locality)
-            .ok_or(DenyReason::LeaseUnavailable)?;
-        Reservation::reserve_at_locality(&lease, units, now, locality)
-    }
-
-    /// The elastic half: extend unfunded credit, or return the lease's own
-    /// refusal untouched.
-    ///
-    /// `denied` is carried through rather than re-derived, so a `Strict`
-    /// account reports exactly the reason it reported before this branch
-    /// existed — including `LeaseExhausted`'s `remaining`, which a second
-    /// lookup could not reproduce.
-    #[inline]
-    fn reserve_from_overage(
-        state: &AccountAdmissionState,
-        units: CostUnits,
-        denied: DenyReason,
-    ) -> Result<Reservation, DenyReason> {
-        let Some(overage_cap) = state.snapshot.enforcement_mode.overage_cap() else {
-            return Err(denied);
-        };
-        if !matches!(
-            denied,
-            DenyReason::LeaseUnavailable
-                | DenyReason::LeaseExpired
-                | DenyReason::LeaseExhausted { .. }
-        ) {
-            return Err(denied);
+            },
         }
-        // No refill signal is raised here, and the reason is worth recording
-        // because the opposite looks necessary. `LocalLease::try_debit`
-        // announces the low-water *crossing*, which for an exhausted lease
-        // already happened on the debit that drained it — before any request
-        // reached this branch. For an absent or expired lease there is no
-        // `RefillSignal` to raise at all, and recovery is the lease manager's
-        // poll, exactly as it is under `Strict`. Elastic mode therefore does
-        // not suppress refill; it runs alongside a refill already in flight.
-        Reservation::reserve_overage(state.lease.overage(), units, overage_cap)
     }
+
+    // 6. Concurrency: principal first, then account. The RAII guard undoes
+    //    either acquisition on every later refusal and remains held by
+    //    `Admitted` for the caller's full in-flight interval.
+    let concurrency = match AccountAdmissionState::acquire_concurrency(
+        state,
+        account.max_concurrent_requests(),
+        locality,
+    ) {
+        Ok(concurrency) => concurrency,
+        Err((reason, state)) => return deny_priced(&state, reason, locality),
+    };
+
+    // 7. Quota: debit the lease and open the state machine. Note the
+    //    deliberate ordering — a lease-denied request has still consumed
+    //    its rate token, because it did arrive and was priced.
+    //
+    //    Under `EnforcementMode::Elastic` a lease that cannot fund the
+    //    quote is not the end of the request. Three conditions say the
+    //    same thing — this instance holds no capacity for these units —
+    //    and they are the only three the mode intercepts:
+    //
+    //    - `LeaseUnavailable`: no lease at all, the cold-start and
+    //      control-plane-outage case;
+    //    - `LeaseExpired`: the lease's local window lapsed before refill
+    //      replaced it;
+    //    - `LeaseExhausted`: the lease is live and empty.
+    //
+    //    Nothing above this point is intercepted, and that is the whole
+    //    safety argument. An unknown principal, a suspended or closed
+    //    account, a stale snapshot, a missing permission, an oversized
+    //    batch, an unpriced operation, a cost overflow, an empty rate
+    //    bucket — every one of those still denies with zero charge under
+    //    either mode, because none of them is a statement about funding
+    //    (INVARIANTS.md #1, #5).
+    let reservation = match reserve_from_lease(concurrency.state(), quote.total, now, locality) {
+        Ok(reservation) => reservation,
+        Err(denied) => match reserve_from_overage(concurrency.state(), quote.total, denied) {
+            Ok(reservation) => reservation,
+            Err(reason) => {
+                concurrency
+                    .state()
+                    .counters
+                    .record_deny_at(&reason, locality);
+                return Err(reason);
+            }
+        },
+    };
+
+    if reservation.is_overage() {
+        concurrency
+            .state()
+            .counters
+            .record_admit_overage_at(quote.total, locality);
+    } else {
+        concurrency
+            .state()
+            .counters
+            .record_admit_at(quote.total, locality);
+    }
+
+    Ok(Priced {
+        concurrency,
+        reservation,
+        quote,
+    })
+}
+
+#[inline]
+fn deny_priced(
+    state: &AccountAdmissionState,
+    reason: DenyReason,
+    locality: Locality,
+) -> Result<Priced, DenyReason> {
+    state.counters.record_deny_at(&reason, locality);
+    Err(reason)
+}
+
+#[inline]
+fn reserve_from_lease(
+    state: &AccountAdmissionState,
+    units: CostUnits,
+    now: Timestamp,
+    locality: Locality,
+) -> Result<Reservation, DenyReason> {
+    let lease = state
+        .lease
+        .load_at(locality)
+        .ok_or(DenyReason::LeaseUnavailable)?;
+    Reservation::reserve_at_locality(&lease, units, now, locality)
+}
+
+/// The elastic half: extend unfunded credit, or return the lease's own
+/// refusal untouched.
+///
+/// `denied` is carried through rather than re-derived, so a `Strict`
+/// account reports exactly the reason it reported before this branch
+/// existed — including `LeaseExhausted`'s `remaining`, which a second
+/// lookup could not reproduce.
+#[inline]
+fn reserve_from_overage(
+    state: &AccountAdmissionState,
+    units: CostUnits,
+    denied: DenyReason,
+) -> Result<Reservation, DenyReason> {
+    let Some(overage_cap) = state.snapshot.enforcement_mode.overage_cap() else {
+        return Err(denied);
+    };
+    if !matches!(
+        denied,
+        DenyReason::LeaseUnavailable | DenyReason::LeaseExpired | DenyReason::LeaseExhausted { .. }
+    ) {
+        return Err(denied);
+    }
+    // No refill signal is raised here, and the reason is worth recording
+    // because the opposite looks necessary. `LocalLease::try_debit`
+    // announces the low-water *crossing*, which for an exhausted lease
+    // already happened on the debit that drained it — before any request
+    // reached this branch. For an absent or expired lease there is no
+    // `RefillSignal` to raise at all, and recovery is the lease manager's
+    // poll, exactly as it is under `Strict`. Elastic mode therefore does
+    // not suppress refill; it runs alongside a refill already in flight.
+    Reservation::reserve_overage(state.lease.overage(), units, overage_cap)
 }
 
 #[cfg(test)]
 mod tests {
+    // The one-shot surface is deprecated but supported for a minor, so its
+    // witnesses keep exercising it; that is the point of keeping it.
+    #![allow(deprecated)]
+
     use super::*;
     use crate::maps::{ArcSwapSnapshotMap, MokaSnapshotMap};
     use crate::state::LeaseSlot;

@@ -125,6 +125,14 @@ pub enum DenyReason {
         /// The account's whole per-instance allowance at the time of refusal.
         overage_cap: CostUnits,
     },
+    /// The staged request carried no priceable work. Produced by
+    /// `compile_workload`, which is the first point that sees the workload:
+    /// stage one runs before the body is decoded.
+    EmptyWorkload,
+    /// The funding reserved at admission had expired by the time execution
+    /// started. Only the staged lifecycle can produce this — the one-shot API
+    /// leaves no interval between admission and start for it to happen in.
+    FundingExpiredAtStart,
 }
 
 impl DenyReason {
@@ -156,10 +164,12 @@ impl DenyReason {
         "accounting_backpressure",
         "overage_cap_temporarily_exhausted",
         "overage_commit_in_progress",
+        "empty_workload",
+        "funding_expired_at_start",
     ];
 
     /// How many distinct reasons exist — the width of any per-reason array.
-    pub const COUNT: usize = 19;
+    pub const COUNT: usize = 21;
 
     /// This reason's dense slot, for direct-indexed per-reason tallies.
     ///
@@ -190,6 +200,8 @@ impl DenyReason {
             DenyReason::AccountingBackpressure => 16,
             DenyReason::OverageCapTemporarilyExhausted { .. } => 17,
             DenyReason::OverageCommitInProgress { .. } => 18,
+            DenyReason::EmptyWorkload => 19,
+            DenyReason::FundingExpiredAtStart => 20,
         }
     }
 
@@ -214,6 +226,7 @@ impl DenyReason {
             | DenyReason::OverageCapExhausted { .. }
             | DenyReason::OverageCapTemporarilyExhausted { .. } => Retry::Transient,
             DenyReason::OverageCommitInProgress { .. } => Retry::AfterInFlight,
+            DenyReason::FundingExpiredAtStart => Retry::Transient,
             DenyReason::UnknownPrincipal
             | DenyReason::AccountSuspended
             | DenyReason::AccountClosed
@@ -221,7 +234,8 @@ impl DenyReason {
             | DenyReason::RequestTooLarge { .. }
             | DenyReason::UnpricedOperation
             | DenyReason::UnpriceableUnderLimits { .. }
-            | DenyReason::CostOverflow => Retry::Never,
+            | DenyReason::CostOverflow
+            | DenyReason::EmptyWorkload => Retry::Never,
         }
     }
 }
@@ -271,6 +285,10 @@ impl fmt::Display for DenyReason {
                 "overage commit publication in progress ({spent} of {overage_cap} unfunded \
                  units extended on this instance)"
             ),
+            DenyReason::EmptyWorkload => f.write_str("request carried no priceable work"),
+            DenyReason::FundingExpiredAtStart => {
+                f.write_str("reserved funding expired before execution started")
+            }
         }
     }
 }
@@ -316,6 +334,8 @@ mod tests {
             spent: CostUnits(20),
             overage_cap: CostUnits(20),
         },
+        DenyReason::EmptyWorkload,
+        DenyReason::FundingExpiredAtStart,
     ];
 
     /// The indices must be a permutation of `0..COUNT`. Two reasons sharing a
@@ -333,6 +353,123 @@ mod tests {
         assert!(
             seen.iter().all(|hit| *hit),
             "every slot must belong to some reason: {seen:?}"
+        );
+    }
+
+    /// Every slot and label that has shipped, written out as literals.
+    ///
+    /// The permutation test above proves the mapping is *internally*
+    /// consistent, and `labels_are_distinct_and_payload_free` proves `ALL` is
+    /// in index order. Neither pins a reason to a particular slot: renumbering
+    /// `index()`, `NAMES`, and `ALL` together satisfies both while moving
+    /// every counter a consumer already reads. `AdmissionCounters::denials` is
+    /// exported through the public `CountersSnapshot` as dense positions, so
+    /// the number is the contract, not an implementation detail.
+    ///
+    /// That is not hypothetical. Declaring three reasons before their
+    /// producers existed shifted `LeaseExhausted` from 11 to 13 and
+    /// `AccountingBackpressure` from 14 to 16; a consumer holding exported
+    /// indices would have mis-attributed both across the upgrade, for refusals
+    /// that could not occur. Removing them shifted everything back. Both moves
+    /// passed every other test in this module.
+    ///
+    /// This change is the case that argument was written for. `EmptyWorkload`
+    /// and `FundingExpiredAtStart` return with the staged lifecycle that
+    /// produces them, and they take slots 19 and 20 — not the 17 and 18 they
+    /// carried before the removal, which now belong to
+    /// `OverageCapTemporarilyExhausted` and `OverageCommitInProgress`. A new
+    /// reason appends and extends this table; editing a number already in it
+    /// is a breaking change for every consumer holding exported indices.
+    #[test]
+    fn shipped_slots_and_labels_never_move() {
+        // (reason, slot, label) — append only.
+        let shipped: [(DenyReason, usize, &str); DenyReason::COUNT] = [
+            (DenyReason::UnknownPrincipal, 0, "unknown_principal"),
+            (DenyReason::AccountSuspended, 1, "account_suspended"),
+            (DenyReason::AccountClosed, 2, "account_closed"),
+            (DenyReason::SnapshotExpired, 3, "snapshot_expired"),
+            (DenyReason::MissingPermission, 4, "missing_permission"),
+            (
+                DenyReason::RequestTooLarge { max_items: 64 },
+                5,
+                "request_too_large",
+            ),
+            (DenyReason::UnpricedOperation, 6, "unpriced_operation"),
+            (DenyReason::RateLimited, 7, "rate_limited"),
+            (DenyReason::RequestRateLimited, 8, "request_rate_limited"),
+            (DenyReason::ConcurrencyLimited, 9, "concurrency_limited"),
+            (
+                DenyReason::UnpriceableUnderLimits {
+                    weight: CostUnits(9),
+                    burst_units: CostUnits(4),
+                },
+                10,
+                "unpriceable_under_limits",
+            ),
+            (DenyReason::LeaseUnavailable, 11, "lease_unavailable"),
+            (DenyReason::LeaseExpired, 12, "lease_expired"),
+            (
+                DenyReason::LeaseExhausted {
+                    remaining: CostUnits(3),
+                },
+                13,
+                "lease_exhausted",
+            ),
+            (
+                DenyReason::OverageCapExhausted {
+                    spent: CostUnits(20),
+                    overage_cap: CostUnits(20),
+                },
+                14,
+                "overage_cap_exhausted",
+            ),
+            (DenyReason::CostOverflow, 15, "cost_overflow"),
+            (
+                DenyReason::AccountingBackpressure,
+                16,
+                "accounting_backpressure",
+            ),
+            (
+                DenyReason::OverageCapTemporarilyExhausted {
+                    spent: CostUnits(20),
+                    overage_cap: CostUnits(20),
+                },
+                17,
+                "overage_cap_temporarily_exhausted",
+            ),
+            (
+                DenyReason::OverageCommitInProgress {
+                    spent: CostUnits(20),
+                    overage_cap: CostUnits(20),
+                },
+                18,
+                "overage_commit_in_progress",
+            ),
+            (DenyReason::EmptyWorkload, 19, "empty_workload"),
+            (
+                DenyReason::FundingExpiredAtStart,
+                20,
+                "funding_expired_at_start",
+            ),
+        ];
+
+        for (reason, slot, label) in shipped {
+            assert_eq!(
+                reason.index(),
+                slot,
+                "{reason} moved off its exported slot {slot}"
+            );
+            assert_eq!(
+                reason.name(),
+                label,
+                "{reason} changed the label scrapers key on"
+            );
+        }
+
+        assert_eq!(
+            DenyReason::COUNT,
+            21,
+            "COUNT may only grow, and only by appending"
         );
     }
 
@@ -416,6 +553,8 @@ mod tests {
         for reason in ALL {
             let expected = match reason {
                 DenyReason::OverageCommitInProgress { .. } => Retry::AfterInFlight,
+                DenyReason::FundingExpiredAtStart => Retry::Transient,
+                DenyReason::EmptyWorkload => Retry::Never,
                 DenyReason::RateLimited
                 | DenyReason::RequestRateLimited
                 | DenyReason::ConcurrencyLimited

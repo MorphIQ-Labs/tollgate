@@ -15,6 +15,8 @@ use tollgate_core::{
     Generation, LocalLease, LocalSharding, Locality, PublishableSnapshot, ResolvedLimits,
 };
 
+use crate::counters::AdmissionCounters;
+
 pub use tollgate_core::Principal;
 
 /// The slot a background refill task installs leases into, and the account's
@@ -786,6 +788,7 @@ impl AccountLimiter {
 #[repr(align(128))]
 pub struct AccountAdmissionState {
     pub snapshot: Arc<AccountSnapshot>,
+    pub(crate) counters: Arc<AdmissionCounters>,
     pub(crate) limiter: Arc<AccountLimiter>,
     pub(crate) principal_gauge: Arc<PrincipalGauge>,
     pub lease: Arc<LeaseSlot>,
@@ -800,12 +803,14 @@ impl AccountAdmissionState {
     #[must_use]
     pub(crate) fn new(
         snapshot: Arc<AccountSnapshot>,
+        counters: Arc<AdmissionCounters>,
         lease: Arc<LeaseSlot>,
         limiter: Arc<AccountLimiter>,
         principal_gauge: Arc<PrincipalGauge>,
     ) -> Arc<Self> {
         Arc::new(AccountAdmissionState {
             snapshot,
+            counters,
             limiter,
             principal_gauge,
             lease,
@@ -817,11 +822,14 @@ impl AccountAdmissionState {
     /// state, keeping both gauges strongly reachable until its one `Drop`
     /// releases them. Occupancy is also recorded while a ceiling is absent so
     /// a later publication can enable it without overlooking existing work.
+    ///
+    /// A refusal hands the state back, because the staged caller still needs
+    /// it to tally the denial against the map-owned counters.
     pub(crate) fn acquire_concurrency(
         state: Arc<Self>,
         account_limit: Option<std::num::NonZeroU32>,
         locality: Locality,
-    ) -> Result<ConcurrencyGuard, DenyReason> {
+    ) -> Result<ConcurrencyGuard, (DenyReason, Arc<Self>)> {
         let principal_limit = state.snapshot.limits.principal_max_concurrent_requests();
 
         let Some(principal_permit) = state
@@ -829,7 +837,7 @@ impl AccountAdmissionState {
             .0
             .try_acquire(principal_limit, locality)
         else {
-            return Err(DenyReason::ConcurrencyLimited);
+            return Err((DenyReason::ConcurrencyLimited, state));
         };
         let Some(account_permit) = state
             .limiter
@@ -837,7 +845,7 @@ impl AccountAdmissionState {
             .try_acquire(account_limit, locality)
         else {
             state.principal_gauge.0.release(principal_permit);
-            return Err(DenyReason::ConcurrencyLimited);
+            return Err((DenyReason::ConcurrencyLimited, state));
         };
 
         Ok(ConcurrencyGuard {
@@ -1379,6 +1387,9 @@ pub trait SnapshotMap: Send + Sync {
         LocalSharding::SINGLE
     }
 
+    /// The one per-map counter set shared by every installed request state.
+    fn counters(&self) -> &Arc<AdmissionCounters>;
+
     /// Install (or refresh) the state for a principal, respecting generation
     /// monotonicity. `lease` is the account's slot, shared across the
     /// account's principals by the caller.
@@ -1508,6 +1519,10 @@ impl<T: SnapshotMap + ?Sized> SnapshotMap for Arc<T> {
 
     fn local_sharding(&self) -> LocalSharding {
         (**self).local_sharding()
+    }
+
+    fn counters(&self) -> &Arc<AdmissionCounters> {
+        (**self).counters()
     }
 
     fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>) {

@@ -1,5 +1,8 @@
 //! Behavior tests for the lease manager and usage writer (INVARIANTS.md #5,
 //! #6, #8, #9's client half).
+// Exercises the deprecated one-shot surface on purpose: it is supported for a
+// minor and must keep working.
+#![allow(deprecated)]
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -902,6 +905,7 @@ async fn writer_retries_through_outage_without_losing_events() {
 /// still bill — ChargeGuard binds the event to the permit at commit time and
 /// emits it during unwind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(deprecated)]
 async fn panic_after_commit_still_bills() {
     use tollgate_client::ChargeGuard;
 
@@ -1106,6 +1110,7 @@ async fn shutdown_waits_for_outstanding_permit() {
 /// INVARIANTS.md #13 across shutdown: a committed guard dropped after
 /// shutdown begins still bills.
 #[tokio::test(start_paused = true)]
+#[allow(deprecated)]
 async fn shutdown_waits_for_committed_guard() {
     use tollgate_client::ChargeGuard;
 

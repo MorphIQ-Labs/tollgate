@@ -9,9 +9,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
 
-use tollgate_admission::{
-    AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, MapEntry, SnapshotMap,
-};
+use tollgate_admission::{AdmissionEngine, ArcSwapSnapshotMap, MapEntry, SnapshotMap};
 use tollgate_client::{
     ManualClock, SlotRegistry, SnapshotManager, SnapshotManagerConfig, SystemClock,
     TrackedPrincipals,
@@ -19,7 +17,7 @@ use tollgate_client::{
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, FencingToken,
     Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex, PermissionBits, Principal,
-    PublishableSnapshot, ResolvedLimits,
+    PublishableSnapshot, ResolvedLimits, UsageEvent, UsageSlot,
 };
 use tollgate_store::{
     AccountConfig, GrantPolicy, MemoryStore, SnapshotPush, SnapshotResolution, SnapshotSource,
@@ -35,6 +33,12 @@ impl OpIndex for PriceOp {
     fn index(&self) -> usize {
         0
     }
+}
+
+struct DropSlot;
+
+impl UsageSlot for DropSlot {
+    fn record(self, _event: UsageEvent) {}
 }
 
 fn t(secs: i64) -> Timestamp {
@@ -127,17 +131,10 @@ fn stock_slot(fixture: &Fixture) {
 fn admit(fixture: &Fixture) -> Result<(), DenyReason> {
     fixture
         .engine
-        .admit(
-            AdmissionRequest {
-                principal: PRINCIPAL,
-                required: PermissionBits::bit(0),
-                op: &PriceOp,
-                items: 1,
-            },
-            t(1),
-        )
-        .map(|admitted| {
-            admitted.cancel();
+        .begin(PRINCIPAL, PermissionBits::bit(0), t(1))
+        .and_then(|context| context.admit(&[(PriceOp, 1)], DropSlot, t(1)))
+        .map(|pending| {
+            pending.cancel();
         })
 }
 
@@ -688,17 +685,10 @@ fn discovering_fixture(store: Arc<MemoryStore>) -> Fixture {
 fn admit_as(fixture: &Fixture, principal: Principal) -> Result<(), DenyReason> {
     fixture
         .engine
-        .admit(
-            AdmissionRequest {
-                principal,
-                required: PermissionBits::bit(0),
-                op: &PriceOp,
-                items: 1,
-            },
-            t(1),
-        )
-        .map(|admitted| {
-            admitted.cancel();
+        .begin(principal, PermissionBits::bit(0), t(1))
+        .and_then(|context| context.admit(&[(PriceOp, 1)], DropSlot, t(1)))
+        .map(|pending| {
+            pending.cancel();
         })
 }
 

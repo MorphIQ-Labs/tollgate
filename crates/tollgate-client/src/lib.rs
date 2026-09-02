@@ -12,7 +12,8 @@
 //! manual clock; production uses [`SystemClock`].
 //!
 //! Graceful shutdown has one safe order: stop admitting, quiesce the request
-//! tasks still holding permits or committed [`ChargeGuard`]s, await
+//! tasks still holding permits or committed
+//! [`tollgate_admission::Committed`] guards, await
 //! [`UsageWriter::shutdown`] (which refuses new reservations, then drains
 //! outstanding permits under its configured deadline and reports anything
 //! unresolved), and only then shut the [`LeaseManager`] down — usage events
@@ -30,6 +31,7 @@ pub mod usage_writer;
 #[cfg(feature = "http")]
 pub mod http;
 
+#[allow(deprecated)]
 pub use charge_guard::ChargeGuard;
 pub use tollgate_store::{Clock, ManualClock, SystemClock};
 

@@ -15,6 +15,7 @@ use tollgate_core::{
     AccountSnapshot, CostUnits, Generation, LocalSharding, Locality, PublishableSnapshot,
 };
 
+use crate::counters::AdmissionCounters;
 use crate::generation_model::{Watermark, accept_positive, accept_revoked};
 use crate::state::{
     AccountAdmissionState, AdmissionStateRegistry, LeaseSlot, MapEntry, Principal,
@@ -49,6 +50,7 @@ enum StoredEntry {
 
 fn present_state(
     snapshot: Arc<AccountSnapshot>,
+    counters: &Arc<AdmissionCounters>,
     lease: Arc<LeaseSlot>,
     runtime: ResolvedAdmissionState,
     sharding: LocalSharding,
@@ -56,6 +58,7 @@ fn present_state(
     if sharding == LocalSharding::SINGLE {
         return StoredEntry::Present(AccountAdmissionState::new(
             snapshot,
+            Arc::clone(counters),
             lease,
             runtime.limiter,
             runtime.principal_gauge,
@@ -65,6 +68,7 @@ fn present_state(
         .map(|_| {
             AccountAdmissionState::new(
                 Arc::new((*snapshot).clone()),
+                Arc::clone(counters),
                 Arc::clone(&lease),
                 Arc::clone(&runtime.limiter),
                 Arc::clone(&runtime.principal_gauge),
@@ -174,7 +178,12 @@ enum InstallUpdate {
     },
 }
 
-fn apply_prepared(map: &mut PrincipalMap, updates: &[PreparedUpdate], sharding: LocalSharding) {
+fn apply_prepared(
+    map: &mut PrincipalMap,
+    updates: &[PreparedUpdate],
+    sharding: LocalSharding,
+    counters: &Arc<AdmissionCounters>,
+) {
     for update in updates {
         match update {
             PreparedUpdate::Present {
@@ -187,6 +196,7 @@ fn apply_prepared(map: &mut PrincipalMap, updates: &[PreparedUpdate], sharding: 
                     *principal,
                     present_state(
                         Arc::clone(snapshot),
+                        counters,
                         Arc::clone(lease),
                         runtime.clone(),
                         sharding,
@@ -269,6 +279,7 @@ pub struct MokaSnapshotMap {
     watermarks: Mutex<GenerationWatermarks>,
     states: AdmissionStateRegistry,
     sharding: LocalSharding,
+    counters: Arc<AdmissionCounters>,
 }
 
 impl MokaSnapshotMap {
@@ -291,6 +302,7 @@ impl MokaSnapshotMap {
             watermarks: Mutex::new(GenerationWatermarks::default()),
             states: AdmissionStateRegistry::new(sharding),
             sharding,
+            counters: Arc::new(AdmissionCounters::with_sharding(sharding)),
         }
     }
 }
@@ -310,6 +322,10 @@ impl SnapshotMap for MokaSnapshotMap {
         self.sharding
     }
 
+    fn counters(&self) -> &Arc<AdmissionCounters> {
+        &self.counters
+    }
+
     fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>) {
         let mut watermarks = self.watermarks.lock().expect("watermarks poisoned");
         let visible = matches!(
@@ -326,7 +342,7 @@ impl SnapshotMap for MokaSnapshotMap {
             );
             self.cache.insert(
                 principal,
-                present_state(snapshot, lease, runtime, self.sharding),
+                present_state(snapshot, &self.counters, lease, runtime, self.sharding),
             );
         }
     }
@@ -354,7 +370,7 @@ impl SnapshotMap for MokaSnapshotMap {
             );
             self.cache.insert(
                 principal,
-                present_state(snapshot, lease, runtime, self.sharding),
+                present_state(snapshot, &self.counters, lease, runtime, self.sharding),
             );
         }
     }
@@ -392,6 +408,7 @@ pub struct ArcSwapSnapshotMap {
     states: AdmissionStateRegistry,
     max_negative_entries: usize,
     sharding: LocalSharding,
+    counters: Arc<AdmissionCounters>,
 }
 
 impl ArcSwapSnapshotMap {
@@ -423,6 +440,7 @@ impl ArcSwapSnapshotMap {
             states: AdmissionStateRegistry::new(sharding),
             max_negative_entries,
             sharding,
+            counters: Arc::new(AdmissionCounters::with_sharding(sharding)),
         }
     }
 
@@ -560,7 +578,7 @@ impl ArcSwapSnapshotMap {
         }
         let accepted = accept_updates(&next, &mut watermarks, updates);
         let prepared = self.prepare_accepted(accepted);
-        apply_prepared(&mut next, &prepared, self.sharding);
+        apply_prepared(&mut next, &prepared, self.sharding, &self.counters);
         trim_negatives(&mut next, self.max_negative_entries);
         self.map.store(Arc::new(next));
     }
@@ -604,6 +622,10 @@ impl SnapshotMap for ArcSwapSnapshotMap {
 
     fn local_sharding(&self) -> LocalSharding {
         self.sharding
+    }
+
+    fn counters(&self) -> &Arc<AdmissionCounters> {
+        &self.counters
     }
 
     fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>) {
@@ -832,11 +854,16 @@ mod tests {
     struct DefaultMethodsMap {
         installs: std::sync::atomic::AtomicUsize,
         negatives: std::sync::atomic::AtomicUsize,
+        counters: Arc<AdmissionCounters>,
     }
 
     impl SnapshotMap for DefaultMethodsMap {
         fn get(&self, _principal: &Principal) -> Option<MapEntry> {
             Some(MapEntry::NegativeUntil { until: t(1) })
+        }
+
+        fn counters(&self) -> &Arc<AdmissionCounters> {
+            &self.counters
         }
 
         fn install(
@@ -941,6 +968,24 @@ mod tests {
             Arc::ptr_eq(&before, &after),
             "a duplicate publish of a visible snapshot must not reinstall it"
         );
+        // The accessor must hand back the *same* counters the states it
+        // installs record through. Stage two tallies against `state.counters`
+        // while the observability surface reads `map.counters()`; two
+        // instances would leave an engine reporting zeros while work flowed
+        // (INVARIANTS.md #20). Asserted behaviourally, so a fresh default
+        // standing in for the accessor cannot satisfy it.
+        let slot = DenyReason::UnknownPrincipal.index();
+        let before = map.counters().snapshot().denials[slot];
+        after.counters.record_deny_at(
+            &DenyReason::UnknownPrincipal,
+            tollgate_core::Locality::current(),
+        );
+        assert_eq!(
+            map.counters().snapshot().denials[slot],
+            before + 1,
+            "the map's counters must be the instance its installed states record through"
+        );
+
         // Newer generation replaces.
         map.install(p, snapshot(6), LeaseSlot::for_account(AccountId(1)));
         assert_eq!(generation_of(&map, &p), Some(6));
@@ -1689,7 +1734,8 @@ mod tests {
                 replacement.limiter.current().max_concurrent_requests(),
                 Locality::current(),
             )
-            .unwrap_err(),
+            .unwrap_err()
+            .0,
             DenyReason::ConcurrencyLimited
         );
 

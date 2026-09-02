@@ -10,6 +10,14 @@ use jiff::Timestamp;
 use crate::ids::{AccountId, FencingToken, LeaseId, RequestId};
 use crate::units::CostUnits;
 
+/// Pre-reserved capacity for exactly one usage event.
+///
+/// Implementations must record without fallible I/O: obtaining a slot is the
+/// backpressure decision, while consuming it is the committed-charge path.
+pub trait UsageSlot: Send + 'static {
+    fn record(self, event: UsageEvent);
+}
+
 /// What funded the units in a [`UsageEvent`].
 ///
 /// Two variants, because two things fund spend and they are validated by

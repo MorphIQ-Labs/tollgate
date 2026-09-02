@@ -5,11 +5,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use jiff::Timestamp;
 use tollgate_admission::{
-    AdmissionEngine, AdmissionRequest, ArcSwapSnapshotMap, LeaseSlot, Principal, SnapshotMap,
+    AdmissionEngine, ArcSwapSnapshotMap, LeaseSlot, NoGate, Principal, SnapshotMap,
 };
 use tollgate_alloc_count::{AllocScope, Allocations};
 use tollgate_auth::{HmacRegistry, SessionCredential};
-use tollgate_client::{ChargeGuard, ManualClock, UsageRecorder, UsageWriter, UsageWriterConfig};
+use tollgate_client::{ManualClock, UsageRecorder, UsageWriter, UsageWriterConfig};
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
     LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, RequestId, ResolvedLimits,
@@ -119,15 +119,6 @@ fn install_admission(principal: Principal) -> AdmissionEngine<ArcSwapSnapshotMap
     engine
 }
 
-fn request(principal: Principal) -> AdmissionRequest<'static, PriceOp> {
-    AdmissionRequest {
-        principal,
-        required: PermissionBits::bit(0),
-        op: &PriceOp,
-        items: 64,
-    }
-}
-
 fn record(scope: &str, attribution: &str, allocations: Allocations) {
     tollgate_alloc_count::record_if_requested!(scope, attribution, allocations).unwrap();
 }
@@ -161,8 +152,12 @@ async fn embedding_path_allocates_nothing_after_warmup() {
     );
 
     let engine = install_admission(principal);
-    let warm = engine.admit(request(principal), now()).unwrap();
-    black_box(warm.cancel());
+    let warm = engine
+        .begin(principal, PermissionBits::bit(0), now())
+        .unwrap()
+        .admit(&[(PriceOp, 64)], recorder.try_reserve().unwrap(), now())
+        .unwrap();
+    black_box(warm.acquire_capacity(&NoGate).unwrap().cancel());
 
     let (_, caller_buffer) = AllocScope::measure(|| {
         let mut body = Vec::with_capacity(128);
@@ -185,11 +180,18 @@ async fn embedding_path_allocates_nothing_after_warmup() {
         let authenticated = session
             .authenticate(Some(b"credential-one"), &registry, now())
             .expect("cached credential");
+        let context = engine
+            .begin(authenticated, PermissionBits::bit(0), now())
+            .unwrap();
         let permit = recorder.try_reserve().expect("warmed queue has capacity");
-        let admitted = engine.admit(request(authenticated), now()).unwrap();
-        let charge = ChargeGuard::commit(admitted, permit, request_id, now()).unwrap();
-        black_box(charge.units());
-        drop(charge);
+        let pending = context.admit(&[(PriceOp, 64)], permit, now()).unwrap();
+        let committed = pending
+            .acquire_capacity(&NoGate)
+            .unwrap()
+            .commit(request_id, now())
+            .unwrap();
+        black_box(committed.units());
+        drop(committed);
     });
     record("embedding/cached_auth_through_record", "tollgate", tollgate);
     assert!(
