@@ -370,14 +370,16 @@ until it has one.
     safety_margin_closes_window_before_expiry}`,
     `reclaim_waits_for_grace_and_release_works_within_it` (both store suites).
 
-13. **A committed charge is always emitted.** Committing through
-    `ChargeGuard` consumes the complete `Admitted` proof, binds the billing
-    event to the pre-reserved queue permit, and retains the resulting
-    `CommittedAdmission`; normal completion, early return, panic unwind, and
-    task abort all enqueue the event and release concurrency only when the
-    execution guard drops. `ChargeGuard::commit` returns that guard directly,
-    rather than hiding it in a tuple, and the guard type is `#[must_use]`, so
-    discarding execution-start evidence is rejected under
+13. **A committed charge is always emitted.** The usage slot is bound at
+    admission, not at commit: `RequestContext::admit` takes the pre-reserved
+    queue permit and carries it through `Pending` and `ReadyToStart` into
+    `Committed`, whose `Drop` records the billing event and only then releases
+    concurrency and execution capacity. Normal completion, early return, panic
+    unwind, and task abort therefore all enqueue the event. Binding the slot
+    one stage earlier than the charge removes the window in which a committed
+    request had no place to be billed. `ReadyToStart::commit` returns the
+    guard directly, rather than hiding it in a tuple, and `Committed` is
+    `#[must_use]`, so discarding execution-start evidence is rejected under
     `unused_must_use`. The guarantee extends through shutdown: the
     writer's drain waits for the permit, so the event is ingested or explicitly
     counted in `WriterStats::unresolved` — never silently dropped. The safe lifecycle
@@ -387,7 +389,7 @@ until it has one.
     `panic_after_commit_still_bills`, `shutdown_waits_for_committed_guard`,
     `committed_charge_holds_concurrency_until_execution_guard_drops`, and
     `failed_commit_releases_concurrency_and_accounting_capacity`, plus the
-    `ChargeGuard` discarded-result compile-fail doctest.
+    `Committed` discarded-result compile-fail doctest.
 
 14. **Account creation is never destructive.** Recreating an existing
     account is a surfaced `AlreadyExists` in every backend — never an
@@ -524,9 +526,8 @@ until it has one.
     distinguishable from one serving none. The snapshot map owns one shared
     counter identity and installs its `Arc` into every request state. `begin`
     records a stage-one refusal; a successful context records exactly one
-    stage-two outcome when `admit` consumes it. The deprecated one-call wrapper
-    records the same combined outcome once. A context dropped before stage two
-    has created neither pending funding nor an admission outcome.
+    stage-two outcome when `admit` consumes it. A context dropped before stage
+    two has created neither pending funding nor an admission outcome.
     `DenyReason::index` is an exhaustive match, making a slot
     per reason total by construction and a shared slot unrepresentable; a new
     variant fails to compile until it has one. Those slots are also *stable*:
@@ -738,16 +739,17 @@ until it has one.
     in-flight RAII guard keep the exact gauges strongly reachable. The guard
     is constructed only after both occupancy increments and owns the exact
     state containing both gauges; it has no callable release operation. Every
-    field of `RequestContext`, `Pending`, `ReadyToStart`, `Committed`,
-    `Admitted`, `CommittedAdmission`, and `ChargeGuard` is private. The guard
-    moves from `Pending` through `ReadyToStart` into `Committed`, and the
-    deprecated `Admitted` wrapper retains the same guard: `Admitted` exposes no
-    raw `Reservation`, cancellation consumes it, commit consumes it into
-    `CommittedAdmission`, and `ChargeGuard` owns that committed proof
-    throughout execution. The public commit result is the must-use guard
-    itself, not a tuple that suppresses its diagnostic. Safe code therefore
-    cannot retain committed funding while accidentally dropping the
-    concurrency authority.
+    field of `RequestContext`, `Pending`, `ReadyToStart`, and `Committed` is
+    private, and the guard moves from `Pending` through `ReadyToStart` into
+    `Committed` without ever exposing a raw `Reservation`: cancellation
+    consumes the state that holds it, and commit consumes it into the
+    execution guard. The public commit result is the must-use guard itself,
+    not a tuple that suppresses its diagnostic. Safe code therefore cannot
+    retain committed funding while accidentally dropping the concurrency
+    authority. *Witnesses:* the `Pending` private-reservation compile-fail
+    doctest (`E0616`, with its companion that pins the refusal to the field
+    rather than to a vanished API), and the `Committed` discarded-result
+    doctest under `unused_must_use`.
     The concurrency guard is the last admission field dropped and releases
     account then principal exactly once on cancellation, refusal, panic
     unwinding, or ordinary drop. The
@@ -777,7 +779,7 @@ until it has one.
     `concurrency_guard_carries_the_exact_occupied_state`,
     `committed_charge_holds_concurrency_until_execution_guard_drops`,
     `failed_commit_releases_concurrency_and_accounting_capacity`, and the
-    `Admitted` raw-reservation compile-fail doctest — pinned to E0616 and
+    `Pending` raw-reservation compile-fail doctest — pinned to E0616 and
     paired with a compiling companion, so it cannot pass for an unresolved
     name or a vanished API;
     formal witnesses

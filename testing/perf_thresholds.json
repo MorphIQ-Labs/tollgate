@@ -93,12 +93,6 @@
       "threshold_ns": 70.0
     },
     {
-      "_comment": "#91 complete staged homogeneous path: begin plus a one-entry borrowed workload through pending funding and cancellation. The same-run ratio against admission/full_check is the compatibility contract. Provisional bound pending a controlled-host recording.",
-      "id": "admission/admit_staged_1",
-      "target_ns": 115.0,
-      "threshold_ns": 240.0
-    },
-    {
       "_comment": "#9: SipHash 115.1/115.7ns, foldhash 99.6/99.5ns. The 15.9ns saving exceeds the 9.8ns measured on the isolated lookup; the remainder is not accounted for by the hash alone. After #91's final always-tracked concurrency state machine, five controlled-host means were 108.91, 111.11, 107.86, 106.83, and 106.03ns (median 107.86ns).",
       "id": "admission/full_check",
       "target_ns": 105.0,
@@ -172,12 +166,6 @@
     }
   ],
   "ratios": [
-    {
-      "_comment": "#91 homogeneous compatibility: the staged path is the same lookup and checks split across two owned states. Ten percent permits the type-state handoff but no second lookup or allocation.",
-      "numerator": "admission/admit_staged_1",
-      "denominator": "admission/full_check",
-      "max_ratio": 1.1
-    },
     {
       "_comment": "Direct indexing is independent of table size. Measured x0.88 for 4,096 classes versus two; x1.5 leaves compiler noise but no room for a linear scan.",
       "numerator": "cost_table/quote_4096_classes",

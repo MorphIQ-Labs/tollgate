@@ -6,131 +6,12 @@ use std::sync::Arc;
 use jiff::Timestamp;
 
 use tollgate_core::{
-    AccountSnapshot, CancelOutcome, CommitError, CostQuote, CostUnits, DenyReason, Generation,
-    Locality, OpIndex, PermissionBits, QuoteError, RequestId, Reservation, UsageEvent, UsageSlot,
+    AccountSnapshot, CommitError, CostQuote, CostUnits, DenyReason, Generation, Locality, OpIndex,
+    PermissionBits, QuoteError, RequestId, Reservation, UsageEvent, UsageSlot,
 };
 
 use crate::counters::AdmissionCounters;
 use crate::state::{AccountAdmissionState, ConcurrencyGuard, MapEntry, Principal, SnapshotMap};
-
-/// One request's admission inputs. `items` is the batch size (1 for a single
-/// request); the quote is `fixed + weight(op) * items`, floored at the
-/// table's minimum charge.
-#[derive(Debug, Clone, Copy)]
-pub struct AdmissionRequest<'a, O: OpIndex> {
-    pub principal: Principal,
-    pub required: PermissionBits,
-    pub op: &'a O,
-    pub items: u64,
-}
-
-/// A fully admitted request. Call [`Self::commit`] when execution begins;
-/// dropping or explicitly cancelling this value before then charges zero.
-///
-/// The funding reservation and concurrency permits have no separate public
-/// accessors. Committing consumes this proof into [`CommittedAdmission`], so
-/// safe code cannot release occupancy while retaining committed funding.
-///
-/// The reservation is unreachable because the field is private, and the error
-/// code is pinned so this witness cannot pass for an unrelated reason: making
-/// the field public compiles (E0616 disappears), and renaming it reports E0609
-/// instead. Either way the doctest fails and the invariant is re-examined.
-///
-/// ```compile_fail,E0616
-/// fn detach(admitted: tollgate_admission::Admitted) {
-///     let _raw = admitted.reservation;
-/// }
-/// ```
-///
-/// Its companion: the supported path compiles, so the refusal above can never
-/// be a refusal of an API that stopped existing.
-///
-/// ```
-/// # fn execute(
-/// #     admitted: tollgate_admission::Admitted,
-/// #     request_id: tollgate_core::RequestId,
-/// #     now: jiff::Timestamp,
-/// # ) -> Result<tollgate_admission::CommittedAdmission, tollgate_core::CommitError> {
-/// admitted.commit(request_id, now)
-/// # }
-/// ```
-#[derive(Debug)]
-pub struct Admitted {
-    quote: CostQuote,
-    reservation: Reservation,
-    // Last by construction: pending funding resolves before the in-flight
-    // gauges release when an admitted value is dropped without committing.
-    _concurrency: ConcurrencyGuard,
-}
-
-impl Admitted {
-    /// The principal snapshot that supplied status, permissions, request
-    /// shape, pricing, funding mode, and generation for this admission.
-    /// Account-wide rate and concurrency policy is loaded independently from
-    /// the account's canonical authority.
-    #[must_use]
-    pub fn snapshot(&self) -> &AccountSnapshot {
-        &self._concurrency.state().snapshot
-    }
-
-    /// The charge reserved for this request.
-    #[must_use]
-    pub const fn quote(&self) -> CostQuote {
-        self.quote
-    }
-
-    /// Cancel before execution and release both funding and concurrency.
-    pub fn cancel(self) -> CancelOutcome {
-        self.reservation.cancel()
-    }
-
-    /// Commit at execution start and transfer this entire admission proof
-    /// into the returned execution guard.
-    ///
-    /// A failed commit consumes and drops the proof, releasing concurrency;
-    /// the caller must not execute. A successful commit returns the only
-    /// public source of its billing event while retaining the exact permits.
-    pub fn commit(
-        self,
-        request_id: RequestId,
-        now: Timestamp,
-    ) -> Result<CommittedAdmission, CommitError> {
-        let units = self.reservation.commit_at_execution_start(now)?;
-        let event = self
-            .reservation
-            .usage_event(request_id, now)
-            .expect("a successful commit always yields its usage event");
-        Ok(CommittedAdmission {
-            event,
-            units,
-            _admitted: self,
-        })
-    }
-}
-
-/// A committed request whose concurrency occupancy remains held for the
-/// execution lifetime. Dropping this guard ends that lifetime.
-#[derive(Debug)]
-#[must_use = "dropping the guard releases this request's concurrency occupancy"]
-pub struct CommittedAdmission {
-    event: UsageEvent,
-    units: CostUnits,
-    _admitted: Admitted,
-}
-
-impl CommittedAdmission {
-    /// The full charge committed at execution start.
-    #[must_use]
-    pub const fn units(&self) -> CostUnits {
-        self.units
-    }
-
-    /// The billing event proven by this committed admission.
-    #[must_use]
-    pub const fn usage_event(&self) -> UsageEvent {
-        self.event
-    }
-}
 
 /// Generation-pinned stage-one evidence, owned across body decoding.
 #[derive(Debug)]
@@ -179,6 +60,37 @@ impl RequestContext {
 }
 
 /// Funding is reserved, but execution capacity has not yet been acquired.
+///
+/// The reservation, the concurrency guard, and the usage slot have no public
+/// accessors. Every transition out of this state consumes it, so safe code
+/// cannot retain funding while releasing occupancy, and cannot reach the
+/// reservation to resolve it out of band.
+///
+/// The reservation is unreachable because the field is private, and the error
+/// code is pinned so this witness cannot pass for an unrelated reason: making
+/// the field public compiles (E0616 disappears), and renaming it reports E0609
+/// instead. Either way the doctest fails and the invariant is re-examined.
+///
+/// ```compile_fail,E0616
+/// use tollgate_core::DiscardedUsageSlot;
+///
+/// fn detach(pending: tollgate_admission::Pending<DiscardedUsageSlot>) {
+///     let _raw = pending.reservation;
+/// }
+/// ```
+///
+/// Its companion: the supported path compiles, so the refusal above can never
+/// be a refusal of an API that stopped existing.
+///
+/// ```
+/// use tollgate_core::DiscardedUsageSlot;
+///
+/// # fn release(
+/// #     pending: tollgate_admission::Pending<DiscardedUsageSlot>,
+/// # ) -> tollgate_admission::Released {
+/// pending.cancel()
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct Pending<S: UsageSlot> {
     concurrency: ConcurrencyGuard,
@@ -324,7 +236,51 @@ impl<S: UsageSlot, P: CapacityPermit> ReadyToStart<S, P> {
 pub struct Released;
 
 /// The only proof that the computational kernel may run.
+///
+/// The guard owns the committed charge for the whole execution: its `Drop`
+/// records the billing event into the usage slot bound at admission and only
+/// then releases concurrency and execution capacity. Normal completion, early
+/// return, panic unwind, and task abort at an await point all run `Drop`, so a
+/// committed charge cannot be spent-but-unbilled.
+///
+/// That guarantee is worth nothing if the guard can be dropped at the point it
+/// is produced, so discarding execution-start evidence is a compile-time error
+/// under the standard `unused_must_use` lint:
+///
+/// ```compile_fail
+/// # #![deny(unused_must_use)]
+/// use tollgate_core::DiscardedUsageSlot;
+/// use tollgate_admission::{NoCapacityPermit, ReadyToStart, Released};
+///
+/// # fn discard(
+/// #     ready: ReadyToStart<DiscardedUsageSlot, NoCapacityPermit>,
+/// #     request_id: tollgate_core::RequestId,
+/// #     now: jiff::Timestamp,
+/// # ) -> Result<(), (tollgate_core::CommitError, Released)> {
+/// ready.commit(request_id, now)?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Its companion: binding the guard compiles, so the refusal above is a
+/// refusal to *discard* the guard rather than a refusal of a call that stopped
+/// type-checking.
+///
+/// ```
+/// # #![deny(unused_must_use)]
+/// use tollgate_core::DiscardedUsageSlot;
+/// use tollgate_admission::{Committed, NoCapacityPermit, ReadyToStart, Released};
+///
+/// # fn hold(
+/// #     ready: ReadyToStart<DiscardedUsageSlot, NoCapacityPermit>,
+/// #     request_id: tollgate_core::RequestId,
+/// #     now: jiff::Timestamp,
+/// # ) -> Result<Committed<DiscardedUsageSlot, NoCapacityPermit>, (tollgate_core::CommitError, Released)> {
+/// ready.commit(request_id, now)
+/// # }
+/// ```
 #[derive(Debug)]
+#[must_use = "hold this guard for the full execution lifetime: dropping it emits the billing event and releases occupancy"]
 pub struct Committed<S: UsageSlot, P: CapacityPermit> {
     event: Option<UsageEvent>,
     slot: Option<S>,
@@ -360,7 +316,6 @@ pub struct AdmissionEngine<M: SnapshotMap> {
     map: M,
 }
 
-#[allow(deprecated)]
 impl<M: SnapshotMap> AdmissionEngine<M> {
     #[must_use]
     pub fn new(map: M) -> Self {
@@ -392,41 +347,6 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
             self.map.counters().record_deny_at(reason, locality);
         }
         outcome
-    }
-
-    /// Admit or deny. No I/O, no locks, no clock reads; every deny charges
-    /// zero because the reservation is the last step.
-    ///
-    /// Compatibility wrapper over the same private stage-one, workload, and
-    /// priced-admission functions used by the staged API.
-    #[deprecated(since = "0.9.0", note = "use begin followed by RequestContext::admit")]
-    pub fn admit<O: OpIndex>(
-        &self,
-        request: AdmissionRequest<'_, O>,
-        now: Timestamp,
-    ) -> Result<Admitted, DenyReason> {
-        let locality = Locality::current();
-        let context = match self.begin_inner(request.principal, request.required, now, locality) {
-            Ok(context) => context,
-            Err(reason) => {
-                self.map.counters().record_deny_at(&reason, locality);
-                return Err(reason);
-            }
-        };
-        let quote =
-            match compile_workload(&context.state.snapshot, &[(request.op, request.items)], now) {
-                Ok(quote) => quote,
-                Err(reason) => {
-                    self.map.counters().record_deny_at(&reason, locality);
-                    return Err(reason);
-                }
-            };
-        let priced = admit_priced(context.state, locality, quote, now)?;
-        Ok(Admitted {
-            quote: priced.quote,
-            reservation: priced.reservation,
-            _concurrency: priced.concurrency,
-        })
     }
 
     fn begin_inner(
@@ -680,17 +600,14 @@ fn reserve_from_overage(
 
 #[cfg(test)]
 mod tests {
-    // The one-shot surface is deprecated but supported for a minor, so its
-    // witnesses keep exercising it; that is the point of keeping it.
-    #![allow(deprecated)]
-
     use super::*;
     use crate::maps::{ArcSwapSnapshotMap, MokaSnapshotMap};
     use crate::state::LeaseSlot;
     use tollgate_core::EnforcementMode;
     use tollgate_core::{
-        AccountId, AccountStatus, CancelOutcome, CostTable, CostUnits, FencingToken, Generation,
-        LeaseGrant, LeaseId, LocalLease, LocalSharding, PublishableSnapshot, ResolvedLimits, Retry,
+        AccountId, AccountStatus, CancelOutcome, CostTable, CostUnits, DiscardedUsage,
+        DiscardedUsageSlot, FencingToken, Generation, LeaseGrant, LeaseId, LocalLease,
+        LocalSharding, PublishableSnapshot, ResolvedLimits, Retry,
     };
 
     #[derive(Clone, Copy)]
@@ -794,14 +711,14 @@ mod tests {
         ] {
             let strict = engine_with(AccountStatus::Active, lease_units);
             assert_eq!(
-                strict.admit(request(1), t(0)).unwrap_err(),
+                strict.admit_one(request(1), t(0)).unwrap_err(),
                 expected_strict,
                 "strict must still deny with {name}"
             );
 
             let elastic = elastic_engine(1_000, lease_units);
             let admitted = elastic
-                .admit(request(1), t(0))
+                .admit_one(request(1), t(0))
                 .unwrap_or_else(|denied| panic!("elastic denied {name}: {denied}"));
             assert!(admitted.reservation.is_overage());
             assert_eq!(admitted.quote.total, CostUnits(51));
@@ -821,7 +738,7 @@ mod tests {
         };
         engine.map().install(Principal(1), Arc::new(snapshot), slot);
 
-        let admitted = engine.admit(request(1), t(10)).expect("elastic admits");
+        let admitted = engine.admit_one(request(1), t(10)).expect("elastic admits");
         assert!(admitted.reservation.is_overage());
     }
 
@@ -846,24 +763,24 @@ mod tests {
                 overage_cap: CostUnits(1_000),
             };
             engine.map().install(Principal(1), Arc::new(snapshot), slot);
-            assert!(engine.admit(request(1), t(0)).is_err(), "{status:?}");
+            assert!(engine.admit_one(request(1), t(0)).is_err(), "{status:?}");
             assert_eq!(overage_spent(&engine), CostUnits::ZERO);
         }
 
         // A stale snapshot, an oversized batch, and an unpriced operation.
         let engine = elastic_engine(1_000, None);
         assert_eq!(
-            engine.admit(request(1), t(20_000)).unwrap_err(),
+            engine.admit_one(request(1), t(20_000)).unwrap_err(),
             DenyReason::SnapshotExpired
         );
         assert_eq!(
-            engine.admit(request(65), t(0)).unwrap_err(),
+            engine.admit_one(request(65), t(0)).unwrap_err(),
             DenyReason::RequestTooLarge { max_items: 64 }
         );
         assert_eq!(
             engine
-                .admit(
-                    AdmissionRequest {
+                .admit_one(
+                    TestRequest {
                         op: &Op::Unpriced,
                         ..request(1)
                     },
@@ -881,8 +798,8 @@ mod tests {
         // An unknown principal never reaches an account at all.
         assert_eq!(
             engine
-                .admit(
-                    AdmissionRequest {
+                .admit_one(
+                    TestRequest {
                         principal: Principal(99),
                         ..request(1)
                     },
@@ -901,13 +818,13 @@ mod tests {
         // Two quotes of 51 fit in 102; the third does not.
         let engine = elastic_engine(102, Some(0));
         for _ in 0..2 {
-            let admitted = engine.admit(request(1), t(0)).expect("within the cap");
+            let admitted = engine.admit_one(request(1), t(0)).expect("within the cap");
             admitted
                 .reservation
                 .commit_at_execution_start(t(0))
                 .expect("commit");
         }
-        let denied = engine.admit(request(1), t(0)).unwrap_err();
+        let denied = engine.admit_one(request(1), t(0)).unwrap_err();
         assert_eq!(
             denied,
             DenyReason::OverageCapExhausted {
@@ -942,13 +859,13 @@ mod tests {
                 .install(Principal(1), Arc::new(snapshot), Arc::clone(&slot));
 
             engine
-                .admit(request(1), now)
+                .admit_one(request(1), now)
                 .unwrap_or_else(|denied| panic!("the cap must cover {name}: {denied}"))
                 .reservation
                 .commit_at_execution_start(now)
                 .expect("commit the local overage");
 
-            let denied = engine.admit(request(1), now).unwrap_err();
+            let denied = engine.admit_one(request(1), now).unwrap_err();
             assert!(
                 matches!(denied, DenyReason::OverageCapExhausted { .. }),
                 "the stable local cap reason must survive {name}"
@@ -957,7 +874,7 @@ mod tests {
 
             slot.install(lease(51));
             let admitted = engine
-                .admit(request(1), now)
+                .admit_one(request(1), now)
                 .unwrap_or_else(|denied| panic!("a refill must recover {name}: {denied}"));
             assert!(!admitted.reservation.is_overage());
         }
@@ -998,7 +915,7 @@ mod tests {
             let handles: Vec<_> = (0..THREADS)
                 .map(|_| {
                     let engine = Arc::clone(&engine);
-                    scope.spawn(move || match engine.admit(request(1), t(0)) {
+                    scope.spawn(move || match engine.admit_one(request(1), t(0)) {
                         Ok(admitted) => {
                             assert!(admitted.reservation.is_overage());
                             admitted
@@ -1040,7 +957,7 @@ mod tests {
         };
         assert_eq!(state.lease.overage().spent(), CostUnits(102));
         assert!(matches!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::OverageCapExhausted { .. }
         ));
     }
@@ -1061,7 +978,9 @@ mod tests {
         };
         engine.map().install(Principal(1), Arc::new(snapshot), slot);
 
-        let admitted = engine.admit(request(1), t(0)).expect("the lease funds it");
+        let admitted = engine
+            .admit_one(request(1), t(0))
+            .expect("the lease funds it");
         assert!(!admitted.reservation.is_overage());
         let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
             panic!("principal present");
@@ -1075,8 +994,8 @@ mod tests {
     #[test]
     fn pending_overage_saturation_is_transient_until_cancel() {
         let engine = elastic_engine(51, Some(0));
-        let admitted = engine.admit(request(1), t(0)).expect("within the cap");
-        let denied = engine.admit(request(1), t(0)).unwrap_err();
+        let admitted = engine.admit_one(request(1), t(0)).expect("within the cap");
+        let denied = engine.admit_one(request(1), t(0)).unwrap_err();
         assert_eq!(
             denied,
             DenyReason::OverageCapTemporarilyExhausted {
@@ -1087,7 +1006,7 @@ mod tests {
         assert_eq!(denied.retry(), Retry::Transient);
         assert_eq!(admitted.reservation.cancel(), CancelOutcome::ZeroCharged);
         engine
-            .admit(request(1), t(0))
+            .admit_one(request(1), t(0))
             .expect("the cancelled credit is available again");
     }
 
@@ -1096,7 +1015,9 @@ mod tests {
     #[test]
     fn elastic_prefers_the_lease_while_it_can_fund_the_quote() {
         let engine = elastic_engine(1_000, Some(1_000));
-        let admitted = engine.admit(request(1), t(0)).expect("the lease funds it");
+        let admitted = engine
+            .admit_one(request(1), t(0))
+            .expect("the lease funds it");
         assert!(!admitted.reservation.is_overage());
         let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
             panic!("principal present");
@@ -1114,8 +1035,10 @@ mod tests {
         // Held, not dropped: an unresolved reservation releases its credit on
         // drop, so a test that lets one fall out of scope would be measuring
         // the refund rather than the cap.
-        let _held = engine.admit(request(1), t(0)).expect("within the cap");
-        engine.admit(request(1), t(0)).expect_err("beyond the cap");
+        let _held = engine.admit_one(request(1), t(0)).expect("within the cap");
+        engine
+            .admit_one(request(1), t(0))
+            .expect_err("beyond the cap");
 
         let counters = engine.counters().snapshot();
         assert_eq!(counters.admitted, 1);
@@ -1134,7 +1057,9 @@ mod tests {
 
         // A lease-funded admission moves only the unqualified counters.
         let strict = engine_with(AccountStatus::Active, Some(1_000));
-        strict.admit(request(1), t(0)).expect("the lease funds it");
+        strict
+            .admit_one(request(1), t(0))
+            .expect("the lease funds it");
         let counters = strict.counters().snapshot();
         assert_eq!(counters.admitted, 1);
         assert_eq!(counters.admitted_overage, 0);
@@ -1161,12 +1086,12 @@ mod tests {
         }
 
         let _held = engine
-            .admit(request(1), t(0))
+            .admit_one(request(1), t(0))
             .expect("the first key spends");
         assert_eq!(
             engine
-                .admit(
-                    AdmissionRequest {
+                .admit_one(
+                    TestRequest {
                         principal: Principal(2),
                         ..request(1)
                     },
@@ -1207,8 +1132,8 @@ mod tests {
         let held: Vec<_> = (0..2)
             .map(|_| {
                 engine
-                    .admit(
-                        AdmissionRequest {
+                    .admit_one(
+                        TestRequest {
                             principal: Principal(2),
                             ..request(1)
                         },
@@ -1223,8 +1148,8 @@ mod tests {
         // maximised, a third request would fit; it must not.
         assert!(
             engine
-                .admit(
-                    AdmissionRequest {
+                .admit_one(
+                    TestRequest {
                         principal: Principal(2),
                         ..request(1)
                     },
@@ -1234,7 +1159,7 @@ mod tests {
             "caps must not add up across an account's principals"
         );
         // And the smaller cap is already over its own limit, so it refuses too.
-        assert!(engine.admit(request(1), t(0)).is_err());
+        assert!(engine.admit_one(request(1), t(0)).is_err());
         drop(held);
     }
 
@@ -1245,7 +1170,7 @@ mod tests {
     #[test]
     fn republishing_a_snapshot_does_not_reset_the_cap() {
         let engine = elastic_engine(51, Some(0));
-        let _held = engine.admit(request(1), t(0)).expect("within the cap");
+        let _held = engine.admit_one(request(1), t(0)).expect("within the cap");
 
         let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
             panic!("principal present");
@@ -1259,7 +1184,7 @@ mod tests {
         engine.map().install(Principal(1), Arc::new(next), slot);
 
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::OverageCapTemporarilyExhausted {
                 spent: CostUnits(51),
                 overage_cap: CostUnits(51),
@@ -1273,8 +1198,8 @@ mod tests {
     #[test]
     fn a_republished_cap_takes_effect_immediately() {
         let engine = elastic_engine(51, Some(0));
-        let _held = engine.admit(request(1), t(0)).expect("within the cap");
-        assert!(engine.admit(request(1), t(0)).is_err());
+        let _held = engine.admit_one(request(1), t(0)).expect("within the cap");
+        assert!(engine.admit_one(request(1), t(0)).is_err());
 
         let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
             panic!("principal present");
@@ -1288,16 +1213,46 @@ mod tests {
         engine.map().install(Principal(1), Arc::new(next), slot);
 
         engine
-            .admit(request(1), t(0))
+            .admit_one(request(1), t(0))
             .expect("the raised cap admits the next request");
     }
 
-    fn request(items: u64) -> AdmissionRequest<'static, Op> {
+    /// One request's inputs, for the tests whose subject is a single
+    /// admission outcome rather than the staging itself. The staged tests
+    /// above drive `begin` and `RequestContext::admit` directly.
+    #[derive(Debug, Clone, Copy)]
+    struct TestRequest<'a, O: OpIndex> {
+        principal: Principal,
+        required: PermissionBits,
+        op: &'a O,
+        items: u64,
+    }
+
+    impl<M: SnapshotMap> AdmissionEngine<M> {
+        /// Stage one and stage two in one call, so a test that is about
+        /// pricing, funding, or a deny reason does not restate the handoff.
+        fn admit_one<O: OpIndex>(
+            &self,
+            request: TestRequest<'_, O>,
+            now: Timestamp,
+        ) -> Result<Pending<DiscardedUsageSlot>, DenyReason> {
+            self.begin(request.principal, request.required, now)
+                .and_then(|context| {
+                    context.admit(
+                        &[(request.op, request.items)],
+                        DiscardedUsage::new().slot(),
+                        now,
+                    )
+                })
+        }
+    }
+
+    fn request(items: u64) -> TestRequest<'static, Op> {
         request_for(Principal(1), items)
     }
 
-    fn request_for(principal: Principal, items: u64) -> AdmissionRequest<'static, Op> {
-        AdmissionRequest {
+    fn request_for(principal: Principal, items: u64) -> TestRequest<'static, Op> {
+        TestRequest {
             principal,
             required: PermissionBits::bit(0),
             op: &Op::Price,
@@ -1308,7 +1263,7 @@ mod tests {
     #[test]
     fn full_pipeline_admits_and_commits() {
         let engine = engine_with(AccountStatus::Active, Some(10_000));
-        let admitted = engine.admit(request(14), t(0)).unwrap();
+        let admitted = engine.admit_one(request(14), t(0)).unwrap();
         assert_eq!(admitted.quote.total, CostUnits(64));
         admitted
             .reservation
@@ -1320,7 +1275,7 @@ mod tests {
     fn unknown_principal_denies() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::UnknownPrincipal
         );
     }
@@ -1330,7 +1285,7 @@ mod tests {
         let engine = AdmissionEngine::new(MokaSnapshotMap::new(10));
         engine.map().install_unknown(Principal(1), t(100));
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::UnknownPrincipal
         );
     }
@@ -1339,7 +1294,7 @@ mod tests {
     fn suspended_account_denies() {
         let engine = engine_with(AccountStatus::Suspended, Some(10_000));
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::AccountSuspended
         );
     }
@@ -1348,7 +1303,7 @@ mod tests {
     fn batch_cap_denies() {
         let engine = engine_with(AccountStatus::Active, Some(10_000));
         assert_eq!(
-            engine.admit(request(65), t(0)).unwrap_err(),
+            engine.admit_one(request(65), t(0)).unwrap_err(),
             DenyReason::RequestTooLarge { max_items: 64 }
         );
     }
@@ -1356,14 +1311,14 @@ mod tests {
     #[test]
     fn unpriced_operation_denies() {
         let engine = engine_with(AccountStatus::Active, Some(10_000));
-        let req = AdmissionRequest {
+        let req = TestRequest {
             principal: Principal(1),
             required: PermissionBits::bit(0),
             op: &Op::Unpriced,
             items: 1,
         };
         assert_eq!(
-            engine.admit(req, t(0)).unwrap_err(),
+            engine.admit_one(req, t(0)).unwrap_err(),
             DenyReason::UnpricedOperation
         );
     }
@@ -1372,7 +1327,7 @@ mod tests {
     fn missing_lease_denies_cold_start() {
         let engine = engine_with(AccountStatus::Active, None);
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::LeaseUnavailable
         );
     }
@@ -1381,17 +1336,17 @@ mod tests {
     fn exhausted_lease_denies_and_charges_zero() {
         let engine = engine_with(AccountStatus::Active, Some(60));
         // First request (51 units) fits; second is denied by remaining=9.
-        let admitted = engine.admit(request(1), t(0)).unwrap();
+        let admitted = engine.admit_one(request(1), t(0)).unwrap();
         assert_eq!(admitted.quote.total, CostUnits(51));
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::LeaseExhausted {
                 remaining: CostUnits(9)
             }
         );
         // Cancelling the first returns its units; admission works again.
         assert_eq!(admitted.reservation.cancel(), CancelOutcome::ZeroCharged);
-        engine.admit(request(1), t(0)).unwrap();
+        engine.admit_one(request(1), t(0)).unwrap();
     }
 
     #[test]
@@ -1409,11 +1364,11 @@ mod tests {
 
         let req = request(50); // 50 + 50 fixed = 100 units
         for _ in 0..10 {
-            let admitted = engine.admit(req, t(0)).unwrap();
+            let admitted = engine.admit_one(req, t(0)).unwrap();
             assert_eq!(admitted.quote.total, CostUnits(100));
         }
         assert_eq!(
-            engine.admit(req, t(0)).unwrap_err(),
+            engine.admit_one(req, t(0)).unwrap_err(),
             DenyReason::RateLimited,
             "an empty-but-refilling bucket is throttling, not misconfiguration"
         );
@@ -1427,10 +1382,10 @@ mod tests {
         let engine = engine_with_limits(limits);
 
         // Different quotes each consume one request token.
-        drop(engine.admit(request(1), t(0)).unwrap());
-        drop(engine.admit(request(64), t(0)).unwrap());
+        drop(engine.admit_one(request(1), t(0)).unwrap());
+        drop(engine.admit_one(request(64), t(0)).unwrap());
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::RequestRateLimited
         );
     }
@@ -1445,7 +1400,7 @@ mod tests {
         // treats that pair as rollout data when the explicit flag disables
         // the bucket, while an old reader conservatively keeps enforcing it.
         for _ in 0..3 {
-            drop(engine.admit(request(64), t(0)).unwrap());
+            drop(engine.admit_one(request(64), t(0)).unwrap());
         }
     }
 
@@ -1463,9 +1418,9 @@ mod tests {
             .map()
             .install(Principal(1), Arc::new(original), Arc::clone(&slot));
 
-        drop(engine.admit(request(1), t(0)).unwrap());
+        drop(engine.admit_one(request(1), t(0)).unwrap());
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::RequestRateLimited
         );
 
@@ -1481,7 +1436,7 @@ mod tests {
         );
 
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::RequestRateLimited,
             "inactive compatibility metadata cannot refill an unchanged request bucket"
         );
@@ -1499,9 +1454,9 @@ mod tests {
             .map()
             .install(Principal(1), Arc::new(weighted_only), Arc::clone(&slot));
 
-        drop(engine.admit(request(1), t(0)).unwrap());
+        drop(engine.admit_one(request(1), t(0)).unwrap());
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::RateLimited
         );
 
@@ -1520,7 +1475,7 @@ mod tests {
         );
 
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::RateLimited,
             "changing request-rate policy cannot refill an unchanged weighted bucket"
         );
@@ -1554,7 +1509,7 @@ mod tests {
             .install(Principal(2), Arc::new(enabled), Arc::clone(&slot));
 
         let admitted = engine
-            .admit(request_for(Principal(2), 1), t(0))
+            .admit_one(request_for(Principal(2), 1), t(0))
             .expect("the canonical disabled account bucket performs no check");
         let MapEntry::Present(state) = engine.map().get(&Principal(2)).unwrap() else {
             panic!("principal present");
@@ -1596,12 +1551,12 @@ mod tests {
 
         drop(
             engine
-                .admit(request_for(Principal(2), 1), t(0))
+                .admit_one(request_for(Principal(2), 1), t(0))
                 .expect("the first request consumes the whole account burst"),
         );
         assert_eq!(
             engine
-                .admit(request_for(Principal(2), 1), t(0))
+                .admit_one(request_for(Principal(2), 1), t(0))
                 .unwrap_err(),
             DenyReason::RateLimited
         );
@@ -1647,13 +1602,13 @@ mod tests {
         for _ in 0..8 {
             drop(
                 engine
-                    .admit(request_for(Principal(1), 1), t(0))
+                    .admit_one(request_for(Principal(1), 1), t(0))
                     .expect("the shared 800-unit burst admits eight 100-unit requests"),
             );
         }
         assert_eq!(
             engine
-                .admit(request_for(Principal(2), 1), t(0))
+                .admit_one(request_for(Principal(2), 1), t(0))
                 .unwrap_err(),
             DenyReason::RateLimited,
             "the heavier principal cannot retain a second account bucket"
@@ -1668,13 +1623,13 @@ mod tests {
             .unwrap();
         let engine = engine_with_limits(limits);
 
-        let first = engine.admit(request(1), t(0)).unwrap();
+        let first = engine.admit_one(request(1), t(0)).unwrap();
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::ConcurrencyLimited
         );
         drop(first);
-        drop(engine.admit(request(1), t(0)).unwrap());
+        drop(engine.admit_one(request(1), t(0)).unwrap());
     }
 
     #[test]
@@ -1708,18 +1663,18 @@ mod tests {
             .install(Principal(3), Arc::new(wider), Arc::clone(&slot));
 
         let held = engine
-            .admit(request_for(Principal(2), 1), t(0))
+            .admit_one(request_for(Principal(2), 1), t(0))
             .expect("the canonical account slot is initially free");
         assert_eq!(
             engine
-                .admit(request_for(Principal(1), 1), t(0))
+                .admit_one(request_for(Principal(1), 1), t(0))
                 .unwrap_err(),
             DenyReason::ConcurrencyLimited,
             "an unbounded sibling must not bypass the account's selected ceiling"
         );
         assert_eq!(
             engine
-                .admit(request_for(Principal(3), 1), t(0))
+                .admit_one(request_for(Principal(3), 1), t(0))
                 .unwrap_err(),
             DenyReason::ConcurrencyLimited,
             "a larger sibling value cannot widen the selected account ceiling"
@@ -1752,10 +1707,12 @@ mod tests {
             .map()
             .install(Principal(2), Arc::new(narrower), Arc::clone(&slot));
 
-        let held = engine.admit(request_for(Principal(1), 1), t(0)).unwrap();
+        let held = engine
+            .admit_one(request_for(Principal(1), 1), t(0))
+            .unwrap();
         assert_eq!(
             engine
-                .admit(request_for(Principal(1), 1), t(0))
+                .admit_one(request_for(Principal(1), 1), t(0))
                 .unwrap_err(),
             DenyReason::ConcurrencyLimited,
             "an existing principal must load the newer account ceiling"
@@ -1775,7 +1732,7 @@ mod tests {
             engine
                 .map()
                 .install(Principal(1), Arc::new(unlimited), Arc::clone(&slot));
-            engine.admit(request(1), t(0)).unwrap()
+            engine.admit_one(request(1), t(0)).unwrap()
         };
 
         let mut limited = (*snapshot(AccountStatus::Active)).clone();
@@ -1789,12 +1746,12 @@ mod tests {
             .install(Principal(1), Arc::new(limited), Arc::clone(&slot));
 
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::ConcurrencyLimited,
             "enabling a ceiling must include work admitted while enforcement was disabled"
         );
         drop(held);
-        drop(engine.admit(request(1), t(0)).unwrap());
+        drop(engine.admit_one(request(1), t(0)).unwrap());
     }
 
     #[test]
@@ -1811,7 +1768,7 @@ mod tests {
         engine
             .map()
             .install(Principal(1), Arc::new(account_only), Arc::clone(&slot));
-        let held = engine.admit(request(1), t(0)).unwrap();
+        let held = engine.admit_one(request(1), t(0)).unwrap();
 
         let mut principal_limited = (*snapshot(AccountStatus::Active)).clone();
         principal_limited.generation = Generation(2);
@@ -1824,12 +1781,12 @@ mod tests {
             .install(Principal(1), Arc::new(principal_limited), Arc::clone(&slot));
 
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::ConcurrencyLimited,
             "a newly enabled principal ceiling must include existing work for that principal"
         );
         drop(held);
-        drop(engine.admit(request(1), t(0)).unwrap());
+        drop(engine.admit_one(request(1), t(0)).unwrap());
     }
 
     #[test]
@@ -1846,7 +1803,7 @@ mod tests {
         engine
             .map()
             .install(Principal(1), Arc::new(initially_limited), Arc::clone(&slot));
-        let before_disable = engine.admit(request(1), t(0)).unwrap();
+        let before_disable = engine.admit_one(request(1), t(0)).unwrap();
 
         let mut disabled = (*snapshot(AccountStatus::Active)).clone();
         disabled.generation = Generation(2);
@@ -1854,7 +1811,7 @@ mod tests {
         engine
             .map()
             .install(Principal(1), Arc::new(disabled), Arc::clone(&slot));
-        let while_disabled = engine.admit(request(1), t(0)).unwrap();
+        let while_disabled = engine.admit_one(request(1), t(0)).unwrap();
 
         let mut reenabled = (*snapshot(AccountStatus::Active)).clone();
         reenabled.generation = Generation(3);
@@ -1867,13 +1824,13 @@ mod tests {
             .install(Principal(1), Arc::new(reenabled), Arc::clone(&slot));
 
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::ConcurrencyLimited,
             "disabling enforcement must not erase occupancy seen after re-enable"
         );
         drop(before_disable);
         drop(while_disabled);
-        drop(engine.admit(request(1), t(0)).unwrap());
+        drop(engine.admit_one(request(1), t(0)).unwrap());
     }
 
     #[test]
@@ -1896,18 +1853,22 @@ mod tests {
                 .install(principal, Arc::new(account), Arc::clone(&slot));
         }
 
-        let first = engine.admit(request_for(Principal(1), 1), t(0)).unwrap();
+        let first = engine
+            .admit_one(request_for(Principal(1), 1), t(0))
+            .unwrap();
         assert_eq!(
             engine
-                .admit(request_for(Principal(1), 1), t(0))
+                .admit_one(request_for(Principal(1), 1), t(0))
                 .unwrap_err(),
             DenyReason::ConcurrencyLimited,
             "the principal-local ceiling binds first"
         );
-        let second = engine.admit(request_for(Principal(2), 1), t(0)).unwrap();
+        let second = engine
+            .admit_one(request_for(Principal(2), 1), t(0))
+            .unwrap();
         assert_eq!(
             engine
-                .admit(request_for(Principal(2), 1), t(0))
+                .admit_one(request_for(Principal(2), 1), t(0))
                 .unwrap_err(),
             DenyReason::ConcurrencyLimited,
             "the shared account ceiling still binds"
@@ -1933,11 +1894,11 @@ mod tests {
         );
 
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::LeaseUnavailable
         );
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::RequestRateLimited,
             "the request token is not refunded after a funding refusal"
         );
@@ -1973,7 +1934,7 @@ mod tests {
         ));
 
         assert_eq!(
-            engine.admit(request(64), t(0)).unwrap_err(),
+            engine.admit_one(request(64), t(0)).unwrap_err(),
             DenyReason::UnpriceableUnderLimits {
                 weight: CostUnits(114),
                 burst_units: CostUnits(64),
@@ -1981,7 +1942,7 @@ mod tests {
         );
         // Repeating never converts it into ordinary throttling.
         assert_eq!(
-            engine.admit(request(64), t(0)).unwrap_err(),
+            engine.admit_one(request(64), t(0)).unwrap_err(),
             DenyReason::UnpriceableUnderLimits {
                 weight: CostUnits(114),
                 burst_units: CostUnits(64),
@@ -1989,7 +1950,7 @@ mod tests {
         );
         // A request the burst *can* hold still admits: the deny is about this
         // request's weight, not a wedged account.
-        engine.admit(request(1), t(0)).unwrap();
+        engine.admit_one(request(1), t(0)).unwrap();
     }
 
     /// The burst bound is inclusive, matching GCRA's own inclusive boundary
@@ -2003,12 +1964,12 @@ mod tests {
             114,
         ));
 
-        let admitted = engine.admit(request(64), t(0)).unwrap();
+        let admitted = engine.admit_one(request(64), t(0)).unwrap();
         assert_eq!(admitted.quote.total, CostUnits(114));
         // The bucket is now empty, so the next one is ordinary throttling —
         // never the terminal reason.
         assert_eq!(
-            engine.admit(request(64), t(0)).unwrap_err(),
+            engine.admit_one(request(64), t(0)).unwrap_err(),
             DenyReason::RateLimited
         );
     }
@@ -2027,7 +1988,7 @@ mod tests {
         let engine = engine_with_limits(ResolvedLimits::new(64).with_weighted_rate(1_000, 0));
 
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::UnpriceableUnderLimits {
                 weight: CostUnits(51),
                 burst_units: CostUnits::ZERO,
@@ -2046,7 +2007,7 @@ mod tests {
         // 50 fixed + items: the first quote to exceed the burst.
         let items = u64::from(u32::MAX);
         assert_eq!(
-            engine.admit(request(items), t(0)).unwrap_err(),
+            engine.admit_one(request(items), t(0)).unwrap_err(),
             DenyReason::UnpriceableUnderLimits {
                 weight: CostUnits(items + 50),
                 burst_units: CostUnits(u64::from(u32::MAX)),
@@ -2097,8 +2058,8 @@ mod tests {
         engine.map().install_publishable(Principal(2), heavy, slot);
 
         let admitted = engine
-            .admit(
-                AdmissionRequest {
+            .admit_one(
+                TestRequest {
                     principal: Principal(2),
                     required: PermissionBits::bit(0),
                     op: &Op::Price,
@@ -2121,22 +2082,22 @@ mod tests {
         let engine = engine_with(AccountStatus::Active, Some(10_000));
 
         // Two admissions: 1 item quotes 51 units, 14 items quote 64.
-        engine.admit(request(1), t(0)).unwrap();
-        engine.admit(request(14), t(0)).unwrap();
+        engine.admit_one(request(1), t(0)).unwrap();
+        engine.admit_one(request(14), t(0)).unwrap();
         // Raised in the pipeline itself.
-        engine.admit(request(65), t(0)).unwrap_err();
-        engine.admit(request(65), t(0)).unwrap_err();
+        engine.admit_one(request(65), t(0)).unwrap_err();
+        engine.admit_one(request(65), t(0)).unwrap_err();
         // Propagated out of `AccountSnapshot::admit`: staleness is decided
         // against `valid_until`, never by an inline refresh.
         assert_eq!(
-            engine.admit(request(1), t(20_000)).unwrap_err(),
+            engine.admit_one(request(1), t(20_000)).unwrap_err(),
             DenyReason::SnapshotExpired
         );
         // Propagated out of `AccountSnapshot::admit`: permissions.
         assert_eq!(
             engine
-                .admit(
-                    AdmissionRequest {
+                .admit_one(
+                    TestRequest {
                         principal: Principal(1),
                         required: PermissionBits::bit(3),
                         op: &Op::Price,
@@ -2178,7 +2139,7 @@ mod tests {
             (AccountStatus::Closed, DenyReason::AccountClosed),
         ] {
             let engine = engine_with(status, Some(10_000));
-            assert_eq!(engine.admit(request(1), t(0)).unwrap_err(), expected);
+            assert_eq!(engine.admit_one(request(1), t(0)).unwrap_err(), expected);
             let snapshot = engine.counters().snapshot();
             assert_eq!(snapshot.denials[expected.index()], 1);
             assert_eq!(snapshot.denied(), 1, "exactly one slot moved");
@@ -2195,7 +2156,7 @@ mod tests {
             .map()
             .install(Principal(1), snapshot(AccountStatus::Active), slot);
         assert_eq!(
-            engine.admit(request(1), t(200)).unwrap_err(),
+            engine.admit_one(request(1), t(200)).unwrap_err(),
             DenyReason::LeaseExpired
         );
         assert_eq!(
@@ -2217,7 +2178,7 @@ mod tests {
         slot.install(lease(u64::MAX));
         engine.map().install(Principal(1), overflowing, slot);
         assert_eq!(
-            engine.admit(request(4), t(0)).unwrap_err(),
+            engine.admit_one(request(4), t(0)).unwrap_err(),
             DenyReason::CostOverflow
         );
         assert_eq!(
@@ -2246,9 +2207,9 @@ mod tests {
         // Held, not dropped: an uncommitted reservation returns its units on
         // drop, so releasing it here would refill the lease and the next
         // request would be admitted instead of refused.
-        let held = engine.admit(request(1), t(0)).unwrap();
+        let held = engine.admit_one(request(1), t(0)).unwrap();
         // The lease now has 9 units left: the next request is refused.
-        engine.admit(request(1), t(0)).unwrap_err();
+        engine.admit_one(request(1), t(0)).unwrap_err();
 
         let snapshot = engine.counters().snapshot();
         assert_eq!(snapshot.admitted, 1);
@@ -2275,10 +2236,10 @@ mod tests {
             Arc::clone(&slot),
         );
         assert_eq!(
-            engine.admit(request(1), t(0)).unwrap_err(),
+            engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::LeaseUnavailable
         );
         slot.install(lease(10_000));
-        engine.admit(request(1), t(0)).unwrap();
+        engine.admit_one(request(1), t(0)).unwrap();
     }
 }

@@ -1,9 +1,5 @@
 //! Behavior tests for the lease manager and usage writer (INVARIANTS.md #5,
 //! #6, #8, #9's client half).
-// Exercises the deprecated one-shot surface on purpose: it is supported for a
-// minor and must keep working.
-#![allow(deprecated)]
-
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -12,10 +8,12 @@ use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
 
 use tollgate_admission::{
-    AdmissionEngine, AdmissionRequest, Admitted, ArcSwapSnapshotMap, LeaseSlot, SnapshotMap,
+    AdmissionEngine, ArcSwapSnapshotMap, LeaseSlot, NoCapacityPermit, NoGate, ReadyToStart,
+    SnapshotMap,
 };
 use tollgate_client::{
-    Clock, LeaseManager, LeaseManagerConfig, ManualClock, UsageWriter, UsageWriterConfig,
+    Clock, LeaseManager, LeaseManagerConfig, ManualClock, UsagePermit, UsageWriter,
+    UsageWriterConfig,
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, Generation,
@@ -43,7 +41,10 @@ fn t(secs: i64) -> Timestamp {
     Timestamp::from_second(secs).unwrap()
 }
 
-fn admitted_from_grant(grant: LeaseGrant) -> Admitted {
+fn ready_from_grant(
+    grant: LeaseGrant,
+    permit: UsagePermit,
+) -> ReadyToStart<UsagePermit, NoCapacityPermit> {
     let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
     let snapshot = Arc::new(
         AccountSnapshot::builder(
@@ -65,16 +66,11 @@ fn admitted_from_grant(grant: LeaseGrant) -> Admitted {
     slot.install(Arc::new(LocalLease::new(grant, CostUnits::ZERO)));
     engine.map().install(PRINCIPAL, snapshot, slot);
     engine
-        .admit(
-            AdmissionRequest {
-                principal: PRINCIPAL,
-                required: PermissionBits::bit(0),
-                op: &Operation,
-                items: 1,
-            },
-            t(0),
-        )
-        .unwrap()
+        .begin(PRINCIPAL, PermissionBits::bit(0), t(0))
+        .and_then(|context| context.admit(&[(&Operation, 1)], permit, t(0)))
+        .expect("the fixture lease funds one request")
+        .acquire_capacity(&NoGate)
+        .expect("capacity is disabled in this fixture")
 }
 
 fn store(balance: u64) -> Arc<MemoryStore> {
@@ -902,13 +898,10 @@ async fn writer_retries_through_outage_without_losing_events() {
 }
 
 /// Review finding #3 regression: a panic between commit and response must
-/// still bill — ChargeGuard binds the event to the permit at commit time and
-/// emits it during unwind.
+/// still bill — the queue permit is the usage slot bound at admission, and
+/// `Committed`'s drop emits into it during unwind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(deprecated)]
 async fn panic_after_commit_still_bills() {
-    use tollgate_client::ChargeGuard;
-
     let store = store(10_000);
     let grant = store
         .acquire(
@@ -924,8 +917,9 @@ async fn panic_after_commit_still_bills() {
 
     let permit = recorder.try_reserve().unwrap();
     let worker = tokio::spawn(async move {
-        let admitted = admitted_from_grant(grant);
-        let charge = ChargeGuard::commit(admitted, permit, RequestId(9), t(0)).unwrap();
+        let charge = ready_from_grant(grant, permit)
+            .commit(RequestId(9), t(0))
+            .expect("a live lease commits");
         assert_eq!(charge.units(), CostUnits(51));
         panic!("kernel exploded mid-execution");
     });
@@ -1110,10 +1104,7 @@ async fn shutdown_waits_for_outstanding_permit() {
 /// INVARIANTS.md #13 across shutdown: a committed guard dropped after
 /// shutdown begins still bills.
 #[tokio::test(start_paused = true)]
-#[allow(deprecated)]
 async fn shutdown_waits_for_committed_guard() {
-    use tollgate_client::ChargeGuard;
-
     let store = store(10_000);
     let grant = store
         .acquire(
@@ -1129,8 +1120,9 @@ async fn shutdown_waits_for_committed_guard() {
 
     let permit = recorder.try_reserve().unwrap();
     let holder = tokio::spawn(async move {
-        let admitted = admitted_from_grant(grant);
-        let charge = ChargeGuard::commit(admitted, permit, RequestId(9), t(0)).unwrap();
+        let charge = ready_from_grant(grant, permit)
+            .commit(RequestId(9), t(0))
+            .expect("a live lease commits");
         assert_eq!(charge.units(), CostUnits(51));
         // The guard outlives the start of shutdown; its drop must still bill.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;

@@ -35,11 +35,9 @@ pub mod maps;
 pub mod state;
 
 pub use counters::{AdmissionCounters, CountersSnapshot};
-#[allow(deprecated)]
 pub use engine::{
-    AdmissionEngine, AdmissionRequest, Admitted, CapacityEvidence, CapacityGate, CapacityPermit,
-    Committed, CommittedAdmission, NoCapacityPermit, NoGate, Pending, ReadyToStart, Released,
-    RequestContext,
+    AdmissionEngine, CapacityEvidence, CapacityGate, CapacityPermit, Committed, NoCapacityPermit,
+    NoGate, Pending, ReadyToStart, Released, RequestContext,
 };
 pub use generation_model::{Watermark, accept_positive, accept_revoked, accept_unknown};
 pub use maps::{ArcSwapSnapshotMap, MokaSnapshotMap};
