@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.9.0...v0.10.0) - 2026-09-02
+
+### Added
+
+- *(core)* [**breaking**] check per-class work permissions over a heterogeneous workload
+
 ## [0.9.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.8.6...v0.9.0) - 2026-09-02
 
 ### Added
