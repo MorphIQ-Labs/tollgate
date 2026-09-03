@@ -472,6 +472,15 @@ fn build_app_with(
                 revoked_ttl: SignedDuration::from_secs(3_600),
                 retry_backoff: std::time::Duration::from_millis(200),
                 max_concurrent_fetches: 16,
+                // Above the slowest fetch this deployment's source
+                // legitimately makes, not against its fast path: an
+                // abandoned fetch keeps the principal's previous resolution
+                // and retries with backoff, so a value under real source
+                // latency would refresh nothing while looking healthy. Five
+                // seconds against an in-process store that answers in
+                // microseconds is deliberate headroom — the bound exists to
+                // keep the sweep returning (#103), not to police latency.
+                fetch_timeout: std::time::Duration::from_secs(5),
             },
         )
         .expect("snapshot-manager configuration is valid");

@@ -140,6 +140,7 @@ fn config_for(principals: TrackedPrincipals) -> SnapshotManagerConfig {
         revoked_ttl: SignedDuration::from_secs(3_600),
         retry_backoff: std::time::Duration::from_millis(5),
         max_concurrent_fetches: 64,
+        fetch_timeout: std::time::Duration::from_secs(5),
     }
 }
 

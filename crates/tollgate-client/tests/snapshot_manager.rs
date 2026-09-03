@@ -84,6 +84,7 @@ fn fixture(store: Arc<MemoryStore>) -> Fixture {
             revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 4,
+            fetch_timeout: std::time::Duration::from_secs(5),
         },
     )
     .unwrap();
@@ -279,6 +280,7 @@ async fn negative_ttl_retry_is_backed_off_and_recovers_without_push() {
             revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(80),
             max_concurrent_fetches: 1,
+            fetch_timeout: std::time::Duration::from_secs(5),
         },
     )
     .unwrap();
@@ -375,6 +377,7 @@ async fn readiness_falls_when_snapshot_expires_during_outage() {
             revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 2,
+            fetch_timeout: std::time::Duration::from_secs(5),
         },
     )
     .unwrap();
@@ -413,6 +416,7 @@ async fn snapshot_counters_track_failures_and_the_unresolved_gauge() {
             revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 2,
+            fetch_timeout: std::time::Duration::from_secs(5),
         },
     )
     .unwrap();
@@ -497,6 +501,7 @@ async fn readiness_falls_if_refresh_hangs_across_snapshot_expiry() {
             revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 1,
+            fetch_timeout: std::time::Duration::from_secs(5),
         },
     )
     .unwrap();
@@ -546,6 +551,7 @@ async fn shutdown_cancels_in_flight_snapshot_fetches() {
             revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 4,
+            fetch_timeout: std::time::Duration::from_secs(5),
         },
     )
     .unwrap();
@@ -593,6 +599,7 @@ async fn a_panicking_fetch_does_not_kill_the_manager() {
             revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 1,
+            fetch_timeout: std::time::Duration::from_secs(5),
         },
     )
     .unwrap();
@@ -605,6 +612,24 @@ async fn a_panicking_fetch_does_not_kill_the_manager() {
     );
 }
 
+/// INVARIANTS.md #16: no config field is silently repaired.
+#[test]
+fn a_zero_fetch_timeout_is_rejected() {
+    let config = SnapshotManagerConfig {
+        principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
+        refresh_interval: std::time::Duration::from_millis(20),
+        unknown_ttl: SignedDuration::from_secs(30),
+        revoked_ttl: SignedDuration::from_secs(3_600),
+        retry_backoff: std::time::Duration::from_millis(5),
+        max_concurrent_fetches: 4,
+        fetch_timeout: std::time::Duration::ZERO,
+    };
+    assert_eq!(
+        config.validate().unwrap_err().to_string(),
+        "fetch_timeout must be positive"
+    );
+}
+
 #[test]
 fn invalid_snapshot_manager_intervals_are_rejected() {
     let config = SnapshotManagerConfig {
@@ -614,6 +639,7 @@ fn invalid_snapshot_manager_intervals_are_rejected() {
         revoked_ttl: SignedDuration::from_secs(3_600),
         retry_backoff: std::time::Duration::from_millis(5),
         max_concurrent_fetches: 4,
+        fetch_timeout: std::time::Duration::from_secs(5),
     };
     assert!(config.validate().is_err());
 }
@@ -633,6 +659,7 @@ async fn mismatched_local_sharding_is_rejected_before_tasks_start() {
             revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 4,
+            fetch_timeout: std::time::Duration::from_secs(5),
         },
     );
     let error = match result {
@@ -666,6 +693,7 @@ fn discovering_fixture(store: Arc<MemoryStore>) -> Fixture {
             revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 4,
+            fetch_timeout: std::time::Duration::from_secs(5),
         },
     )
     .unwrap();
@@ -858,6 +886,7 @@ async fn one_unanswerable_principal_unreadies_only_a_fixed_instance() {
                 revoked_ttl: SignedDuration::from_secs(3_600),
                 retry_backoff: std::time::Duration::from_millis(5),
                 max_concurrent_fetches: 4,
+                fetch_timeout: std::time::Duration::from_secs(5),
             },
         )
         .unwrap();
@@ -982,6 +1011,7 @@ async fn a_hung_enumeration_does_not_hold_shutdown_open() {
             revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 4,
+            fetch_timeout: std::time::Duration::from_secs(5),
         },
     );
     settle().await;
@@ -993,6 +1023,189 @@ async fn a_hung_enumeration_does_not_hold_shutdown_open() {
     .await
     .expect("a hung enumeration must not hold shutdown open");
     assert!(!report.task_died, "the task returned rather than hanging");
+}
+
+/// A source that hangs on one principal until released, and answers every
+/// other principal normally.
+struct HangsOnOneSource {
+    snapshot: Arc<AccountSnapshot>,
+    hung: Principal,
+    release: Arc<tokio::sync::Notify>,
+    answered: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl SnapshotSource for HangsOnOneSource {
+    async fn snapshot(&self, principal: Principal) -> Result<SnapshotResolution, StoreError> {
+        if principal == self.hung {
+            self.release.notified().await;
+        }
+        self.answered.fetch_add(1, Ordering::AcqRel);
+        Ok(SnapshotResolution::Present(publishable(Arc::clone(
+            &self.snapshot,
+        ))))
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
+        let (sender, receiver) = tokio::sync::broadcast::channel(1);
+        drop(sender);
+        receiver
+    }
+}
+
+/// Issue #103: a fetch that never resolves is abandoned at `fetch_timeout`,
+/// so the sweep returns and the loop keeps running. Before this, one hung
+/// fetch left `refresh_all_cancellable` waiting on a `JoinSet` that could
+/// never empty: no tick, push, or control wakeup was processed again for the
+/// life of the process, and readiness fell without ever recovering.
+///
+/// The recovery half is the point. `readiness_falls_if_refresh_hangs_across_snapshot_expiry`
+/// already pins that readiness *falls*; both existing hung-source tests then
+/// shut down, so nothing asserted the instance could come back.
+#[tokio::test(start_paused = true)]
+async fn a_hung_fetch_is_abandoned_so_the_sweep_keeps_running() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let answered = Arc::new(AtomicUsize::new(0));
+    let hung = Principal(99);
+    let fixture = spawn_with(
+        Arc::new(HangsOnOneSource {
+            snapshot: snapshot(1, PermissionBits::bit(0)),
+            hung,
+            release: Arc::clone(&release),
+            answered: Arc::clone(&answered),
+        }),
+        SnapshotManagerConfig {
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL, hung]),
+            refresh_interval: std::time::Duration::from_millis(50),
+            unknown_ttl: SignedDuration::from_secs(30),
+            revoked_ttl: SignedDuration::from_secs(3_600),
+            retry_backoff: std::time::Duration::from_millis(5),
+            max_concurrent_fetches: 1,
+            fetch_timeout: std::time::Duration::from_millis(100),
+        },
+    );
+    let counters = fixture.manager.counters();
+
+    // The loop must keep sweeping while one principal never answers: the
+    // attempt counter is the code's own stated signal that it has not stopped.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let during = counters.snapshot();
+    assert!(
+        during.refresh_timeouts >= 2,
+        "the hung principal must be abandoned repeatedly, got {}",
+        during.refresh_timeouts
+    );
+    assert!(
+        during.refresh_attempts > during.refresh_timeouts,
+        "the answering principal must keep being refreshed alongside it"
+    );
+    assert_eq!(
+        during.refresh_failures, 0,
+        "a timeout is not a refusal and must not be counted as one"
+    );
+
+    // Recovery: once the source answers, the instance comes back without a
+    // restart — the half neither existing hung-source test covers.
+    release.notify_waiters();
+    let recovered = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut ready = fixture.manager.ready();
+        while !*ready.borrow() {
+            ready.changed().await.unwrap();
+        }
+    })
+    .await;
+    recovered.expect("readiness must recover once the source answers");
+    assert!(
+        answered.load(Ordering::Acquire) > 0,
+        "the recovered fetch must have been re-attempted"
+    );
+
+    fixture.manager.shutdown().await;
+}
+
+/// Answers `Unknown` once — putting the principal into a negative resolution
+/// with a live refetch deadline — and hangs on every fetch after that.
+struct UnknownThenHangsSource {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl SnapshotSource for UnknownThenHangsSource {
+    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
+        if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+            return Ok(SnapshotResolution::Unknown);
+        }
+        std::future::pending().await
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
+        let (sender, receiver) = tokio::sync::broadcast::channel(1);
+        drop(sender);
+        receiver
+    }
+}
+
+/// Issue #103 meets issue #53: an abandoned fetch must land in the failed set
+/// that re-arms `next_refetch`, exactly as a refusal does.
+///
+/// `back_off` only moves a principal already holding a negative resolution,
+/// so a hung fetch on a *never-resolved* principal cannot reach it — which is
+/// why this needs its own fixture rather than an extra assertion on the
+/// abandonment test. Marking the abandoned principal completed instead leaves
+/// its deadline in the past, the control wakeup re-fires at zero delay, and
+/// the manager refetches at source latency: the shape #53 measured at 410
+/// fetches in 600 ms.
+///
+/// Real time and a real clock, like `readiness_falls_if_refresh_hangs_across_snapshot_expiry`:
+/// the retry deadline is a business-clock timestamp, so a manual clock that
+/// never advances would never make one due and the test would pass while
+/// measuring nothing.
+#[tokio::test]
+async fn an_abandoned_fetch_is_throttled_like_a_refusal() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let manager = SnapshotManager::spawn(
+        Arc::new(UnknownThenHangsSource {
+            calls: Arc::clone(&calls),
+        }),
+        Arc::new(ArcSwapSnapshotMap::new()),
+        SlotRegistry::new(),
+        Arc::new(SystemClock),
+        SnapshotManagerConfig {
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
+            // Long, so the periodic sweep is not what drives the retries:
+            // a negative principal is skipped by `due_for_sweep`, and the
+            // control wakeup is the path #53 was measured on.
+            refresh_interval: std::time::Duration::from_secs(10),
+            unknown_ttl: SignedDuration::from_millis(50),
+            revoked_ttl: SignedDuration::from_secs(3_600),
+            // Well above `fetch_timeout`, so a throttled retry and an
+            // unthrottled one are an order of magnitude apart rather than
+            // both being paced by the abandonment itself.
+            retry_backoff: std::time::Duration::from_millis(300),
+            max_concurrent_fetches: 1,
+            fetch_timeout: std::time::Duration::from_millis(20),
+        },
+    )
+    .unwrap();
+    let counters = manager.counters();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+
+    let stats = counters.snapshot();
+    assert!(
+        stats.refresh_timeouts >= 2,
+        "the hung principal must keep being retried, got {}",
+        stats.refresh_timeouts
+    );
+    // Paced by `retry_backoff` (300ms), not by `fetch_timeout` (20ms):
+    // roughly four attempts across this window rather than roughly sixty.
+    assert!(
+        stats.refresh_timeouts <= 12,
+        "abandoned fetches are spinning rather than backing off: {} in 1.2s",
+        stats.refresh_timeouts
+    );
+
+    manager.shutdown().await;
 }
 
 fn spawn_with(source: Arc<dyn SnapshotSource>, config: SnapshotManagerConfig) -> Fixture {
@@ -1024,6 +1237,7 @@ fn discovering_config(refresh_ms: u64) -> SnapshotManagerConfig {
         revoked_ttl: SignedDuration::from_secs(3_600),
         retry_backoff: std::time::Duration::from_millis(5),
         max_concurrent_fetches: 4,
+        fetch_timeout: std::time::Duration::from_secs(5),
     }
 }
 
@@ -1210,6 +1424,7 @@ fn churn_config(revoked_ttl: SignedDuration) -> SnapshotManagerConfig {
         revoked_ttl,
         retry_backoff: std::time::Duration::from_millis(5),
         max_concurrent_fetches: 4,
+        fetch_timeout: std::time::Duration::from_secs(5),
     }
 }
 
@@ -1299,6 +1514,7 @@ async fn a_live_principal_that_goes_absent_recovers_on_the_unknown_ttl() {
             revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 1,
+            fetch_timeout: std::time::Duration::from_secs(5),
         },
     )
     .unwrap();
@@ -1366,6 +1582,7 @@ async fn a_reinstated_principal_comes_back_on_the_revoked_ttl() {
             revoked_ttl: SignedDuration::from_millis(40),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 1,
+            fetch_timeout: std::time::Duration::from_secs(5),
         },
     )
     .unwrap();
@@ -1436,6 +1653,7 @@ async fn a_stale_positive_cannot_drop_readiness() {
             revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 1,
+            fetch_timeout: std::time::Duration::from_secs(5),
         },
     )
     .unwrap();
@@ -1541,6 +1759,7 @@ async fn a_push_reinstates_an_absent_principal_at_its_own_generation() {
             revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_secs(3_600),
             max_concurrent_fetches: 1,
+            fetch_timeout: std::time::Duration::from_secs(5),
         },
     )
     .unwrap();
@@ -1607,6 +1826,7 @@ async fn a_refused_answer_is_retried_with_backoff_not_at_source_latency() {
             revoked_ttl: SignedDuration::from_millis(40),
             retry_backoff: std::time::Duration::from_millis(200),
             max_concurrent_fetches: 1,
+            fetch_timeout: std::time::Duration::from_secs(5),
         },
     )
     .unwrap();

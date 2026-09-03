@@ -158,6 +158,25 @@ pub struct SnapshotManagerConfig {
     pub retry_backoff: std::time::Duration,
     /// Maximum snapshot fetches in flight during a full refresh.
     pub max_concurrent_fetches: usize,
+    /// How long one source fetch may run before it is abandoned.
+    ///
+    /// The snapshot plane bounds its source calls by cancellation rather than
+    /// by a wall clock everywhere else — a slow source is answered by
+    /// readiness falling as resolutions expire, not by cutting the call off.
+    /// That is deliberate, and it is why this bound sits at the *fetch*: what
+    /// it protects is the loop's ability to come back, not the freshness of
+    /// any one principal (#103). A future that never resolves is never
+    /// joined, so without it one hung fetch stops the sweep from returning
+    /// and no tick, push, or control wakeup is processed again for the life
+    /// of the process.
+    ///
+    /// Set it above the slowest fetch the source legitimately makes, not
+    /// against the fast path: an abandoned fetch keeps the principal's
+    /// previous resolution and retries with backoff, so a value below real
+    /// source latency turns a slow catalogue into one that never refreshes.
+    /// It is independent of `refresh_interval`, which is a freshness cadence
+    /// rather than a statement about call latency.
+    pub fetch_timeout: std::time::Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +205,9 @@ impl SnapshotManagerConfig {
         }
         if self.retry_backoff.is_zero() {
             return Err(SnapshotManagerConfigError("retry_backoff must be positive"));
+        }
+        if self.fetch_timeout.is_zero() {
+            return Err(SnapshotManagerConfigError("fetch_timeout must be positive"));
         }
         if self.max_concurrent_fetches == 0 {
             return Err(SnapshotManagerConfigError(
@@ -227,6 +249,7 @@ pub struct SnapshotManagerReport {
 pub struct SnapshotCounters {
     refresh_attempts: AtomicU64,
     refresh_failures: AtomicU64,
+    refresh_timeouts: AtomicU64,
     discovery_failures: AtomicU64,
     unresolved: AtomicU64,
 }
@@ -237,6 +260,7 @@ impl SnapshotCounters {
         SnapshotCounters {
             refresh_attempts: AtomicU64::new(0),
             refresh_failures: AtomicU64::new(0),
+            refresh_timeouts: AtomicU64::new(0),
             discovery_failures: AtomicU64::new(0),
             unresolved: AtomicU64::new(0),
         }
@@ -253,6 +277,18 @@ impl SnapshotCounters {
     /// resolution lapses.
     fn record_failure(&self) {
         self.refresh_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A fetch abandoned at `fetch_timeout` rather than answered (#103).
+    ///
+    /// Counted apart from `refresh_failures` for the reason the lease
+    /// manager keeps `acquire_timeouts` apart from refusals: a timeout is not
+    /// a domain answer. The source may well have resolved the principal and
+    /// simply not said so in time, so this cannot be read as "the source
+    /// could not answer" — and a rate that climbs here rather than there
+    /// points at latency, not at the catalogue.
+    fn record_timeout(&self) {
+        self.refresh_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Enumeration failed, so the tracked set is whatever it already was.
@@ -275,6 +311,7 @@ impl SnapshotCounters {
         SnapshotStats {
             refresh_attempts: self.refresh_attempts.load(Ordering::Relaxed),
             refresh_failures: self.refresh_failures.load(Ordering::Relaxed),
+            refresh_timeouts: self.refresh_timeouts.load(Ordering::Relaxed),
             discovery_failures: self.discovery_failures.load(Ordering::Relaxed),
             unresolved: self.unresolved.load(Ordering::Relaxed),
         }
@@ -294,6 +331,10 @@ pub struct SnapshotStats {
     pub refresh_attempts: u64,
     /// Fetches the source could not answer.
     pub refresh_failures: u64,
+    /// Fetches abandoned at `fetch_timeout` rather than answered. Apart from
+    /// `refresh_failures` because a timeout is not a domain answer: the
+    /// source may have resolved the principal and not said so in time.
+    pub refresh_timeouts: u64,
     /// Principal enumerations the source could not answer. Nonzero means the
     /// tracked set is frozen: everything already known keeps being refreshed,
     /// and nothing new is ever discovered.
@@ -887,13 +928,24 @@ async fn refresh_all_cancellable(
     counters: &SnapshotCounters,
 ) -> Option<Vec<Principal>> {
     let mut pending = principals.iter().copied();
-    let mut tasks = JoinSet::<(Principal, Result<SnapshotResolution, StoreError>)>::new();
+    // The inner result is the source's answer; the outer one says whether it
+    // arrived at all. Abandoning the fetch — rather than the task holding a
+    // future that never resolves — is what lets `tasks` empty and the sweep
+    // return (#103).
+    type Fetched = Result<Result<SnapshotResolution, StoreError>, tokio::time::error::Elapsed>;
+    let mut tasks = JoinSet::<(Principal, Fetched)>::new();
     for _ in 0..config.max_concurrent_fetches {
         let Some(principal) = pending.next() else {
             break;
         };
         let source = Arc::clone(source);
-        tasks.spawn(async move { (principal, source.snapshot(principal).await) });
+        let bound = config.fetch_timeout;
+        tasks.spawn(async move {
+            (
+                principal,
+                tokio::time::timeout(bound, source.snapshot(principal)).await,
+            )
+        });
     }
 
     let mut results = Vec::with_capacity(principals.len());
@@ -917,7 +969,13 @@ async fn refresh_all_cancellable(
                 }
                 if let Some(principal) = pending.next() {
                     let source = Arc::clone(source);
-                    tasks.spawn(async move { (principal, source.snapshot(principal).await) });
+                    let bound = config.fetch_timeout;
+                    tasks.spawn(async move {
+                        (
+                            principal,
+                            tokio::time::timeout(bound, source.snapshot(principal)).await,
+                        )
+                    });
                 }
             }
             changed = shutdown.changed() => {
@@ -939,6 +997,21 @@ async fn refresh_all_cancellable(
         // an attempt rate that has gone to zero is itself the signal that the
         // refresh loop has stopped.
         counters.record_attempt();
+        // Unwrap the bound before the source's own answer, so every arm below
+        // reads exactly as it did when a fetch could only succeed or fail.
+        // Left out of `completed` like a refusal, which is what re-arms
+        // `next_refetch` and puts this principal behind the backoff rather
+        // than into a zero-delay refetch loop against a slow source.
+        let Ok(result) = result else {
+            counters.record_timeout();
+            tracing::warn!(
+                %principal,
+                timeout_ms = config.fetch_timeout.as_millis(),
+                "snapshot fetch abandoned at its bound; principal keeps its \
+                 previous resolution and retries with backoff"
+            );
+            continue;
+        };
         match result {
             Ok(SnapshotResolution::Present(snapshot)) => {
                 if !resolutions.accepts_positive(principal, snapshot.generation) {
@@ -1781,6 +1854,7 @@ mod tests {
             revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_secs(2),
             max_concurrent_fetches: 1,
+            fetch_timeout: std::time::Duration::from_secs(5),
         };
         // An absent row: the short TTL, so a signup in flight — or a source
         // still coming up — is picked up soon. A published tombstone: the long
