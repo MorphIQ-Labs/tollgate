@@ -888,6 +888,19 @@ impl KeyDirectory for MemoryStore {
         if inner.keys.contains_key(&record.key_id) {
             return Err(KeyError::AlreadyExists);
         }
+        // Two credentials cannot share a principal. That value is the identity
+        // admission decides with, so a collision would make one account's
+        // revocation withdraw another's credential. At 128 bits of HMAC output
+        // it means secret reuse or corruption rather than chance, and the
+        // stored backend enforces it with a UNIQUE index — this is the
+        // reference implementation of the same rule.
+        if inner
+            .keys
+            .values()
+            .any(|stored| stored.record.principal == record.principal)
+        {
+            return Err(KeyError::AlreadyExists);
+        }
         inner.keys.insert(
             record.key_id,
             StoredKey {

@@ -37,14 +37,15 @@ use tokio::sync::broadcast;
 
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, FencingToken,
-    Generation, LeaseGrant, LeaseId, PermissionBits, Principal, PublishableSnapshot,
+    Generation, KeyId, LeaseGrant, LeaseId, PermissionBits, Principal, PublishableSnapshot,
     ResolvedLimits, UsageEvent,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, Conservation, CreateAccountError, GrantPolicy,
-    IngestReport, LeaseAllocator, PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch,
-    ReclaimedLease, SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource, StatusChange,
-    StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
+    IngestReport, KeyDirectory, KeyError, KeyRecord, LeaseAllocator, PUSH_CHANNEL_CAPACITY,
+    PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation, SetStatusError, SnapshotPush,
+    SnapshotResolution, SnapshotSource, StatusChange, StoreError, StoreHealth, UsageSink,
+    pushes_exceed_capacity,
 };
 
 const STATE_ACTIVE: i16 = 0;
@@ -99,6 +100,129 @@ impl<'de> Deserialize<'de> for StoredId {
         }
 
         deserializer.deserialize_any(StoredIdVisitor)
+    }
+}
+
+/// A digest column that is not exactly 32 bytes is corruption, never
+/// something to pad or truncate into shape: the comparison it feeds decides
+/// authentication, and a silently reshaped digest would either refuse a
+/// legitimate credential forever or, worse, shorten what is compared.
+fn digest_from(bytes: &[u8], key_id: KeyId) -> Result<[u8; 32], StoreError> {
+    <[u8; 32]>::try_from(bytes).map_err(|_| {
+        StoreError(format!(
+            "credential {key_id} has a {}-byte digest in storage, expected 32",
+            bytes.len()
+        ))
+    })
+}
+
+#[async_trait]
+impl KeyDirectory for PostgresStore {
+    async fn insert_key(&self, record: KeyRecord) -> Result<(), KeyError> {
+        // The account reference is checked by the foreign key rather than by a
+        // prior SELECT: a check-then-insert would admit a credential against
+        // an account deleted between the two, and this backend refuses to
+        // hold a credential no account owns.
+        let result = sqlx::query(
+            "INSERT INTO tollgate_credential_keys
+             (key_id, account_id, principal, digest, not_after_us, revoked_at_us)
+             VALUES ($1, $2, $3, $4, $5, NULL)
+             ON CONFLICT (key_id) DO NOTHING",
+        )
+        .bind(id_bytes(record.key_id.0))
+        .bind(id_bytes(record.account_id.0))
+        .bind(id_bytes(record.principal.0))
+        .bind(record.digest.to_vec())
+        .bind(record.not_after.map(ts_micros))
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(done) if done.rows_affected() == 0 => Err(KeyError::AlreadyExists),
+            Ok(_) => Ok(()),
+            // A violated foreign key is the account not existing; a violated
+            // unique index on `principal` is two credentials colliding on the
+            // identity admission decides with, which at 128 bits of HMAC
+            // output means secret reuse or corruption rather than chance.
+            Err(sqlx::Error::Database(e)) if e.is_foreign_key_violation() => {
+                Err(KeyError::UnknownAccount)
+            }
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                Err(KeyError::AlreadyExists)
+            }
+            Err(e) => Err(KeyError::Storage(storage(e))),
+        }
+    }
+
+    async fn revoke_key(&self, key_id: KeyId, now: Timestamp) -> Result<Revocation, KeyError> {
+        // One statement decides all three answers, so "did this retire
+        // anything" cannot race a concurrent revocation between a read and a
+        // write: the UPDATE matches only live rows, and the RETURNING tells us
+        // whether it matched. A follow-up existence check separates "no such
+        // key" from "already retired".
+        let retired = sqlx::query(
+            "UPDATE tollgate_credential_keys SET revoked_at_us = $2
+             WHERE key_id = $1 AND revoked_at_us IS NULL
+             RETURNING key_id",
+        )
+        .bind(id_bytes(key_id.0))
+        .bind(ts_micros(now))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| KeyError::Storage(storage(e)))?;
+        if retired.is_some() {
+            return Ok(Revocation::Retired);
+        }
+        let exists = sqlx::query("SELECT 1 FROM tollgate_credential_keys WHERE key_id = $1")
+            .bind(id_bytes(key_id.0))
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| KeyError::Storage(storage(e)))?;
+        if exists.is_some() {
+            Ok(Revocation::AlreadyRetired)
+        } else {
+            Err(KeyError::UnknownKey)
+        }
+    }
+
+    async fn active_keys(&self, now: Timestamp) -> Result<Vec<KeyRecord>, StoreError> {
+        // Expiry is applied here, beside revocation, so this backend answers
+        // "active" exactly as `MemoryStore` does and a projection built from
+        // either sees the same live set. Ordering is explicit for the same
+        // reason: two instances must not build tables that differ by row
+        // order alone.
+        let rows = sqlx::query(
+            "SELECT key_id, account_id, principal, digest, not_after_us
+             FROM tollgate_credential_keys
+             WHERE revoked_at_us IS NULL
+               AND (not_after_us IS NULL OR not_after_us > $1)
+             ORDER BY key_id",
+        )
+        .bind(ts_micros(now))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
+
+        rows.into_iter()
+            .map(|row| {
+                let key_id = KeyId(id_from(row.get::<Vec<u8>, _>(0).as_slice()));
+                Ok(KeyRecord {
+                    key_id,
+                    account_id: AccountId(id_from(row.get::<Vec<u8>, _>(1).as_slice())),
+                    principal: Principal(id_from(row.get::<Vec<u8>, _>(2).as_slice())),
+                    digest: digest_from(row.get::<Vec<u8>, _>(3).as_slice(), key_id)?,
+                    not_after: row
+                        .get::<Option<i64>, _>(4)
+                        .map(|us| {
+                            Timestamp::from_microsecond(us).map_err(|_| {
+                                StoreError(format!(
+                                    "credential {key_id} has an undecodable not_after: {us}"
+                                ))
+                            })
+                        })
+                        .transpose()?,
+                })
+            })
+            .collect()
     }
 }
 
@@ -424,7 +548,8 @@ impl PostgresStore {
 
     pub async fn truncate_all(&self) -> Result<(), StoreError> {
         sqlx::raw_sql(
-            "TRUNCATE tollgate_usage_events, tollgate_leases, tollgate_snapshots, tollgate_accounts CASCADE",
+            "TRUNCATE tollgate_credential_keys, tollgate_usage_events, tollgate_leases, \
+             tollgate_snapshots, tollgate_accounts CASCADE",
         )
         .execute(&self.pool)
         .await
