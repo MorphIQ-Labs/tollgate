@@ -7,6 +7,13 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.12.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.12.0...v0.12.1) - 2026-09-03
+
+### Fixed
+
+- *(store)* #57 make MemoryStore's failing operations move nothing
+- *(store)* #56 read the conservation equation at one instant
+
 ## [0.12.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.11.0...v0.12.0) - 2026-09-03
 
 ### Added
