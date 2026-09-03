@@ -7,6 +7,13 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.11.0...v0.12.0) - 2026-09-03
+
+### Added
+
+- *(store)* #104 durable credential directory with a PostgreSQL backend
+- *(auth)* [**breaking**] #104 make the credential digest table a durable-backed projection
+
 ## [0.11.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.10.2...v0.11.0) - 2026-09-03
 
 ### Fixed
