@@ -55,10 +55,10 @@ use tollgate_core::{
 use crate::leases::{LeaseRecord, Leases, Settled};
 pub use crate::traits::{AccountConfig, Conservation, StatusChange};
 use crate::traits::{
-    AdminStore, AllocateError, CreateAccountError, GrantPolicy, GrantPolicyError, IngestReport,
-    KeyDirectory, KeyError, KeyRecord, LeaseAllocator, PUSH_CHANNEL_CAPACITY, PublishSnapshotError,
-    ReclaimBatch, ReclaimedLease, Revocation, SetStatusError, SnapshotPush, SnapshotResolution,
-    SnapshotSource, StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
+    AdminStore, AllocateError, CreateAccountError, GrantPolicy, GrantPolicyError, IngestError,
+    IngestReport, KeyDirectory, KeyError, KeyRecord, LeaseAllocator, PUSH_CHANNEL_CAPACITY,
+    PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation, SetStatusError, SnapshotPush,
+    SnapshotResolution, SnapshotSource, StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
 };
 
 #[derive(Debug)]
@@ -843,7 +843,7 @@ impl UsageSink for MemoryStore {
         &self,
         events: &[UsageEvent],
         _now: Timestamp,
-    ) -> Result<IngestReport, StoreError> {
+    ) -> Result<IngestReport, IngestError> {
         let mut inner = self.lock();
 
         // Planned first, applied second. The overage branch can fail the whole
@@ -911,11 +911,15 @@ impl UsageSink for MemoryStore {
                     recorded.checked_add(event.units),
                     overage.checked_add(event.units),
                 ) else {
-                    return Err(StoreError(format!(
+                    // Refused, not unavailable: a monotonic column that cannot
+                    // absorb these units will not absorb them on the next
+                    // attempt either, so retrying this batch forever would
+                    // wedge the writer behind an arithmetic fact (#61).
+                    return Err(IngestError::Refused(StoreError(format!(
                         "overage accounting overflow for account {:#034x}: recorded usage {} \
                          and overage {} cannot absorb {}",
                         event.account_id.0, recorded, overage, event.units
-                    )));
+                    ))));
                 };
                 usage_recorded.insert(event.account_id, next_recorded);
                 overage_recorded.insert(event.account_id, next_overage);

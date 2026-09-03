@@ -21,8 +21,8 @@ use tollgate_core::{
     ResolvedLimits, UsageEvent, UsageSource,
 };
 use tollgate_store::{
-    AccountConfig, GrantPolicy, IngestReport, LeaseAllocator, MemoryStore, ReclaimBatch,
-    StoreError, UsageSink,
+    AccountConfig, GrantPolicy, IngestError, IngestReport, LeaseAllocator, MemoryStore,
+    ReclaimBatch, StoreError, UsageSink,
 };
 
 const ACCOUNT: AccountId = AccountId(1);
@@ -750,10 +750,10 @@ impl UsageSink for BatchCappedSink {
         &self,
         events: &[UsageEvent],
         _now: Timestamp,
-    ) -> Result<IngestReport, StoreError> {
+    ) -> Result<IngestReport, IngestError> {
         self.largest.fetch_max(events.len(), Ordering::AcqRel);
         if events.len() > self.cap {
-            return Err(StoreError("batch exceeds sink limit".into()));
+            return Err(StoreError("batch exceeds sink limit".into()).into());
         }
         self.ingested.fetch_add(events.len(), Ordering::AcqRel);
         Ok(IngestReport {
@@ -857,13 +857,13 @@ impl UsageSink for FlakySink {
         &self,
         events: &[UsageEvent],
         now: Timestamp,
-    ) -> Result<IngestReport, StoreError> {
+    ) -> Result<IngestReport, IngestError> {
         if self
             .failures_left
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
             .is_ok()
         {
-            return Err(StoreError("injected outage".into()));
+            return Err(StoreError("injected outage".into()).into());
         }
         self.inner.ingest(events, now).await
     }
@@ -1277,7 +1277,7 @@ impl UsageSink for PanickingSink {
         &self,
         events: &[UsageEvent],
         now: Timestamp,
-    ) -> Result<IngestReport, StoreError> {
+    ) -> Result<IngestReport, IngestError> {
         if self
             .calls_before_panic
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
@@ -1392,7 +1392,7 @@ impl UsageSink for HangingSink {
         &self,
         _events: &[UsageEvent],
         _now: Timestamp,
-    ) -> Result<IngestReport, StoreError> {
+    ) -> Result<IngestReport, IngestError> {
         std::future::pending().await
     }
 }
@@ -1473,7 +1473,7 @@ impl UsageSink for SlowSink {
         &self,
         events: &[UsageEvent],
         now: Timestamp,
-    ) -> Result<IngestReport, StoreError> {
+    ) -> Result<IngestReport, IngestError> {
         tokio::time::sleep(self.delay).await;
         self.inner.ingest(events, now).await
     }
@@ -1985,5 +1985,104 @@ async fn the_final_flush_backoff_cannot_overrun_the_drain_deadline() {
         "the drain took {took:?} against a {:?} budget; a backoff that sleeps \
          past the deadline spends the margin that keeps a straggler billable",
         config.shutdown_drain_deadline
+    );
+}
+
+/// The sink refuses whatever it is handed, so the event's shape is irrelevant
+/// — only that it is a real event the writer will try to deliver.
+fn refused_event(request: u128) -> UsageEvent {
+    UsageEvent {
+        request_id: RequestId(request),
+        account_id: ACCOUNT,
+        source: UsageSource::Overage,
+        units: CostUnits(50),
+        occurred_at: t(0),
+    }
+}
+
+/// A sink that refuses every batch and will keep refusing it, as an
+/// over-limit body or an undecodable event does.
+struct AlwaysRefusesSink {
+    attempts: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl UsageSink for AlwaysRefusesSink {
+    async fn ingest(
+        &self,
+        _events: &[UsageEvent],
+        _now: Timestamp,
+    ) -> Result<IngestReport, IngestError> {
+        self.attempts.fetch_add(1, Ordering::AcqRel);
+        Err(IngestError::Refused(StoreError(
+            "413 batch-too-large: request body exceeds this endpoint's limit".into(),
+        )))
+    }
+}
+
+/// Issue #61: a batch the sink will never accept must not block every later
+/// event behind it.
+///
+/// The writer retried any failed batch forever, which is right for an outage
+/// and wrong for a refusal: the queue fills, later requests shed as
+/// `AccountingBackpressure`, `/readyz` stays 200 because the task is alive and
+/// spinning, and `lost` stays zero because loss is declared only at the final
+/// flush. A permanent, deterministic error became an unbounded billing and
+/// availability outage.
+///
+/// Two assertions, and the second is the one that matters: the batch is
+/// attempted *once*, and a later event still bills.
+/// Issue #61, INVARIANTS #16: a `max_batch` the ingest endpoint would refuse
+/// is a startup error, not a discovery made in production.
+///
+/// `validate` previously checked only that it was non-zero, so an embedder
+/// raising it to cut round-trips was accepted and then had every batch
+/// refused forever.
+#[test]
+fn a_max_batch_beyond_the_ingest_limit_is_rejected() {
+    let mut oversized = writer_config(8);
+    oversized.max_batch = tollgate_store::MAX_INGEST_BATCH + 1;
+    assert_eq!(
+        oversized.validate().unwrap_err().to_string(),
+        "max_batch exceeds the ingest endpoint's documented limit"
+    );
+
+    let mut at_limit = writer_config(8);
+    at_limit.max_batch = tollgate_store::MAX_INGEST_BATCH;
+    assert!(
+        at_limit.validate().is_ok(),
+        "the documented limit itself must be usable, or it is not the limit"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_batch_is_counted_lost_rather_than_retried_forever() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let sink = Arc::new(AlwaysRefusesSink {
+        attempts: Arc::clone(&attempts),
+    });
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let (recorder, writer) = UsageWriter::spawn(sink, clock, writer_config(8)).unwrap();
+
+    recorder.try_reserve().unwrap().record(refused_event(1));
+    settle().await;
+
+    assert_eq!(
+        attempts.load(Ordering::Acquire),
+        1,
+        "a refused batch must be attempted once, not retried"
+    );
+
+    // The queue keeps working: a later event is not stuck behind the refusal.
+    recorder
+        .try_reserve()
+        .expect("the queue drained rather than filling with a wedged batch")
+        .record(refused_event(2));
+    settle().await;
+
+    let stats = writer.shutdown().await.unwrap();
+    assert!(
+        stats.lost >= 2,
+        "refused events are counted lost, never silently dropped; got {stats:?}"
     );
 }

@@ -23,6 +23,51 @@ use tollgate_core::{
 /// duplicating a magic string.
 pub const API_PREFIX: &str = "/v1";
 
+/// The widest a single [`UsageEvent`] serialises to, in bytes.
+///
+/// Measured, not estimated: every identifier at its full 32-hex width, both
+/// 64-bit fields at `u64::MAX`, and the timestamp at the far end of the
+/// representable range — the leased form, which carries a lease id and
+/// fencing token the overage form does not.
+///
+/// ```text
+/// {"request_id":"ff…ff","account_id":"ff…ff","source":{"Leased":
+///  {"lease_id":"ff…ff","fencing_token":18446744073709551615}},
+///  "units":18446744073709551615,"occurred_at":"9999-12-30T22:00:00Z"}
+/// ```
+///
+/// Pinned by `the_widest_usage_event_still_fits_its_declared_size`, so a field
+/// added to `UsageEvent` cannot silently push a legitimate batch past the body
+/// limit derived from this number.
+pub const MAX_USAGE_EVENT_BYTES: usize = 268;
+
+/// The body limit `/v1/usage/ingest` is served with, in bytes.
+///
+/// Derived from the two constants above rather than chosen: a full batch of
+/// the widest events is `MAX_INGEST_BATCH * (MAX_USAGE_EVENT_BYTES + 1)` — the
+/// `+ 1` being each event's separating comma — plus `{"events":[]}`. That is
+/// about 1.05 MiB, and 2 MiB leaves a little under twice the room, so a
+/// legitimate maximal batch is never refused for want of a byte.
+///
+/// Declared rather than inherited. Without it the endpoint ran on axum's
+/// implicit 2 MiB default, which no document stated and which the server
+/// reported as malformed JSON when it bit (#61).
+pub const MAX_INGEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// The body limit `PUT /v1/admin/snapshots/{principal}` is served with, in
+/// bytes.
+///
+/// A published snapshot carries its whole cost table, so its worst case grows
+/// with the number of priced classes rather than with any batch size. Measured
+/// against that: the table serialises as parallel arrays rather than named
+/// objects, about eleven bytes a class, so a hundred-thousand-class catalogue
+/// is a little over a megabyte and this admits it with room to spare. Pinned
+/// by `the_snapshot_limit_admits_a_hundred_thousand_class_catalogue`. It is stated for the same
+/// reason the ingest limit is — an operator publishing a large catalogue
+/// should be refused by a documented number or not at all, never by an
+/// undocumented default reported as bad JSON.
+pub const MAX_SNAPSHOT_BODY_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AcquireRequest {
     pub account_id: AccountId,

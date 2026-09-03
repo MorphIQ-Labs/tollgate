@@ -42,10 +42,10 @@ use tollgate_core::{
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, Conservation, CreateAccountError, GrantPolicy,
-    IngestReport, KeyDirectory, KeyError, KeyRecord, LeaseAllocator, PUSH_CHANNEL_CAPACITY,
-    PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation, SetStatusError, SnapshotPush,
-    SnapshotResolution, SnapshotSource, StatusChange, StoreError, StoreHealth, UsageSink,
-    pushes_exceed_capacity,
+    IngestError, IngestReport, KeyDirectory, KeyError, KeyRecord, LeaseAllocator,
+    PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation,
+    SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource, StatusChange, StoreError,
+    StoreHealth, UsageSink, pushes_exceed_capacity,
 };
 
 const STATE_ACTIVE: i16 = 0;
@@ -1003,7 +1003,7 @@ impl UsageSink for PostgresStore {
         &self,
         events: &[UsageEvent],
         _now: Timestamp,
-    ) -> Result<IngestReport, StoreError> {
+    ) -> Result<IngestReport, IngestError> {
         // One transaction per *batch* (review finding #8): leases are locked
         // in a single sorted ANY() query (sorted to keep concurrent batches
         // deadlock-free), duplicates are detected with one lookup, events are
@@ -1493,7 +1493,12 @@ impl UsageSink for PostgresStore {
             Ok(report)
         }
         .await;
-        finish_transaction(tx, result).await
+        // Every failure here is a database one — a lost connection, a
+        // serialization failure, a constraint that rolled the transaction
+        // back. None is a judgement about the batch, so all of them retry.
+        finish_transaction(tx, result)
+            .await
+            .map_err(IngestError::from)
     }
 }
 

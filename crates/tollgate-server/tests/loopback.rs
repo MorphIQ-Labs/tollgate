@@ -23,14 +23,14 @@ use tollgate_client::{
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, DiscardedUsage,
     FencingToken, Generation, KeyId, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits,
-    Principal, PublishableSnapshot, RequestId, ResolvedLimits,
+    Principal, PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent, UsageSource,
 };
-use tollgate_store::wire::API_PREFIX;
+use tollgate_store::wire::{API_PREFIX, MAX_INGEST_BODY_BYTES};
 use tollgate_store::{
-    AccountConfig, GrantPolicy, MemoryStore, SnapshotResolution, SnapshotSource as _,
+    AccountConfig, GrantPolicy, MemoryStore, SnapshotResolution, SnapshotSource as _, UsageSink,
 };
 
-use tollgate_server::{ServerState, serve};
+use tollgate_server::{ServerState, router, serve};
 
 const ACCOUNT: AccountId = AccountId((1u128 << 127) | 1);
 const PRINCIPAL: Principal = Principal((1u128 << 127) | 7);
@@ -484,4 +484,132 @@ async fn http_instance_discovers_a_principal_published_after_it_started() {
     manager.shutdown().await;
     let _ = stop_tx.send(());
     server.await.unwrap().unwrap();
+}
+
+fn at(seconds: i64) -> Timestamp {
+    Timestamp::from_second(seconds).unwrap()
+}
+
+/// Issue #61, end to end: a batch the server refuses for size comes back
+/// classified terminal, so the writer will drop it rather than retry forever.
+///
+/// This is the round trip the wedge actually lived on. The unit tests either
+/// side of it prove the server labels the refusal and the writer honours a
+/// refusal; only this one proves the label survives the wire — that a real 413
+/// from a real `DefaultBodyLimit` becomes `IngestError::Refused` rather than
+/// the opaque "server returned 413" that every retry loop treated as an
+/// outage.
+#[tokio::test]
+async fn an_oversized_batch_comes_back_refused_not_retryable() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    store.create_account(AccountConfig {
+        account_id: ACCOUNT,
+        initial_balance: CostUnits(1_000_000),
+        status: AccountStatus::Active,
+    });
+    let app = router(ServerState {
+        store: Arc::clone(&store),
+        clock: Arc::new(tollgate_client::ManualClock::new(at(0))),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = stop_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    // Past the declared body limit, with the count derived from it rather
+    // than guessed: an overage event of this shape serialises to 163 bytes
+    // plus a separating comma, so this is comfortably over with no reliance
+    // on a number that would rot if a field were added. Built directly rather
+    // than through `UsageWriter`, whose `max_batch` validation now makes an
+    // oversized batch unreachable — which is the point: the transport must
+    // still classify correctly for the sinks and versions validation cannot
+    // reach.
+    let events_needed = MAX_INGEST_BODY_BYTES / 164 + 1_000;
+    let events: Vec<UsageEvent> = (0..events_needed as u128)
+        .map(|i| UsageEvent {
+            request_id: RequestId(i),
+            account_id: ACCOUNT,
+            source: UsageSource::Overage,
+            units: CostUnits(1),
+            occurred_at: at(0),
+        })
+        .collect();
+
+    let http = HttpStore::new(format!("http://{address}"));
+    let error = UsageSink::ingest(&*http, &events, at(0))
+        .await
+        .expect_err("a body past the limit must be refused");
+    assert!(
+        !error.is_retryable(),
+        "an oversized batch retried forever is the outage this fix exists to \
+         prevent; got {error}"
+    );
+    assert!(
+        error.to_string().contains("batch-too-large"),
+        "the refusal must carry the server's own code; got {error}"
+    );
+
+    let _ = stop_tx.send(());
+    server.await.unwrap();
+}
+
+/// Issue #61: 408 and 429 are the 4xx statuses that describe the moment, not
+/// the payload, so they stay retryable.
+///
+/// They are the entire reason the classification is not simply
+/// `is_client_error()`, and nothing exercised them: the mutation gate found
+/// both `&&` operators in that condition unconstrained, meaning a build that
+/// treated a rate-limit response as permanent would have shipped. A 429
+/// classified terminal drops a batch the server was only asking us to slow
+/// down about — a silent, permanent loss of billable events under load, which
+/// is when a 429 is most likely.
+#[tokio::test]
+async fn a_rate_limited_or_timed_out_ingest_stays_retryable() {
+    use axum::http::StatusCode;
+    use axum::routing::post;
+
+    for status in [StatusCode::TOO_MANY_REQUESTS, StatusCode::REQUEST_TIMEOUT] {
+        let app = axum::Router::new().route(
+            &format!("{API_PREFIX}/usage/ingest"),
+            post(move || async move { status }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = stop_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let http = HttpStore::new(format!("http://{address}"));
+        let event = UsageEvent {
+            request_id: RequestId(1),
+            account_id: ACCOUNT,
+            source: UsageSource::Overage,
+            units: CostUnits(1),
+            occurred_at: at(0),
+        };
+        let error = UsageSink::ingest(&*http, &[event], at(0))
+            .await
+            .expect_err("the server refused");
+        assert!(
+            error.is_retryable(),
+            "{status} says try again later; classifying it terminal drops \
+             billable events under exactly the load that produces it"
+        );
+
+        let _ = stop_tx.send(());
+        server.await.unwrap();
+    }
 }

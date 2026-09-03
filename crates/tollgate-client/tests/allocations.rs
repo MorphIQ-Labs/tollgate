@@ -15,7 +15,7 @@ use tollgate_core::{
     LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, RequestId, ResolvedLimits,
     UsageEvent, UsageSource,
 };
-use tollgate_store::{IngestReport, StoreError, UsageSink};
+use tollgate_store::{IngestError, IngestReport, UsageSink};
 
 tollgate_alloc_count::install!();
 
@@ -36,7 +36,7 @@ impl UsageSink for AcceptAll {
         &self,
         events: &[UsageEvent],
         _now: Timestamp,
-    ) -> Result<IngestReport, StoreError> {
+    ) -> Result<IngestReport, IngestError> {
         Ok(IngestReport {
             accepted: u64::try_from(events.len()).unwrap(),
             duplicate: 0,

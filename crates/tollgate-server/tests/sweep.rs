@@ -118,7 +118,7 @@ impl tollgate_store::UsageSink for FlakyReclaimStore {
         &self,
         events: &[tollgate_core::UsageEvent],
         now: Timestamp,
-    ) -> Result<tollgate_store::IngestReport, StoreError> {
+    ) -> Result<tollgate_store::IngestReport, tollgate_store::IngestError> {
         self.inner.ingest(events, now).await
     }
 }

@@ -11,9 +11,10 @@ use jiff::{SignedDuration, Timestamp};
 
 use tollgate_core::{AccountId, AccountStatus, CostUnits, Principal, PublishableSnapshot};
 use tollgate_store::{
-    AccountConfig, AdminStore, AllocateError, CreateAccountError, IngestReport, LeaseAllocator,
-    PublishSnapshotError, ReclaimBatch, SetStatusError, SnapshotPush, SnapshotResolution,
-    SnapshotSource, StatusChange, StoreError, StoreHealth, SystemClock, UsageSink,
+    AccountConfig, AdminStore, AllocateError, CreateAccountError, IngestError, IngestReport,
+    LeaseAllocator, PublishSnapshotError, ReclaimBatch, SetStatusError, SnapshotPush,
+    SnapshotResolution, SnapshotSource, StatusChange, StoreError, StoreHealth, SystemClock,
+    UsageSink,
 };
 
 use tollgate_server::{ServerState, router};
@@ -83,7 +84,7 @@ impl UsageSink for PingOnlyStore {
         &self,
         _events: &[tollgate_core::UsageEvent],
         _now: Timestamp,
-    ) -> Result<IngestReport, StoreError> {
+    ) -> Result<IngestReport, IngestError> {
         unreachable!("readiness never ingests")
     }
 }

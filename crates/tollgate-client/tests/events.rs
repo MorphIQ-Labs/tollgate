@@ -17,8 +17,8 @@ use tollgate_admission::LeaseSlot;
 use tollgate_client::{LeaseManager, LeaseManagerConfig, ManualClock, UsageWriter};
 use tollgate_core::{AccountId, AccountStatus, CostUnits, UsageEvent, UsageSource};
 use tollgate_store::{
-    AccountConfig, AllocateError, GrantPolicy, IngestReport, LeaseAllocator, MemoryStore,
-    ReclaimBatch, StoreError, UsageSink,
+    AccountConfig, AllocateError, GrantPolicy, IngestError, IngestReport, LeaseAllocator,
+    MemoryStore, ReclaimBatch, StoreError, UsageSink,
 };
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
@@ -284,7 +284,7 @@ impl UsageSink for FlakySink {
         &self,
         events: &[UsageEvent],
         now: Timestamp,
-    ) -> Result<IngestReport, StoreError> {
+    ) -> Result<IngestReport, IngestError> {
         if self
             .failures_left
             .fetch_update(
@@ -294,7 +294,7 @@ impl UsageSink for FlakySink {
             )
             .is_ok()
         {
-            return Err(StoreError("sink unavailable".into()));
+            return Err(StoreError("sink unavailable".into()).into());
         }
         self.inner.ingest(events, now).await
     }

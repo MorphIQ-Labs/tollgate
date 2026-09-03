@@ -25,7 +25,7 @@ pub mod error;
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -35,8 +35,8 @@ use tracing::Instrument as _;
 use tollgate_core::{AccountId, CostUnits, Principal, PublishableSnapshot};
 use tollgate_store::wire::{
     API_PREFIX, AcquireRequest, AcquireResponse, CreateAccountRequest, DepositRequest,
-    IngestRequest, PrincipalsResponse, PublishSnapshotRequest, ReleaseRequest, SetStatusRequest,
-    SetStatusResponse,
+    IngestRequest, MAX_INGEST_BODY_BYTES, MAX_SNAPSHOT_BODY_BYTES, PrincipalsResponse,
+    PublishSnapshotRequest, ReleaseRequest, SetStatusRequest, SetStatusResponse,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, Clock, DEFAULT_RECLAIM_BATCH_LIMIT, IngestReport, LeaseAllocator,
@@ -91,13 +91,30 @@ pub fn router<S: Backend>(state: ServerState<S>) -> Router {
                 .route("/leases/reclaim", post(reclaim::<S>))
                 .route("/snapshots", get(list_principals::<S>))
                 .route("/snapshots/{principal}", get(fetch_snapshot::<S>))
-                .route("/usage/ingest", post(ingest::<S>))
+                // Declared, not inherited. Without this the endpoint ran on
+                // axum's implicit 2 MiB default: a limit no document stated,
+                // that no client could discover, and that the server reported
+                // as malformed JSON when it bit (#61). The value is derived
+                // from the batch cap and the widest event, both in `wire`, so
+                // the number a client validates against and the number the
+                // server enforces cannot drift apart.
+                .route(
+                    "/usage/ingest",
+                    post(ingest::<S>).layer(DefaultBodyLimit::max(MAX_INGEST_BODY_BYTES)),
+                )
                 .route("/admin/accounts", post(create_account::<S>))
                 .route("/admin/accounts/{account}/deposit", post(deposit::<S>))
                 .route("/admin/accounts/{account}/status", post(set_status::<S>))
+                // A snapshot carries its whole cost table, so its worst
+                // case grows with the number of priced classes rather than
+                // with a batch size. Given its own limit for the same reason
+                // as the one above: an operator publishing a large catalogue
+                // should be refused by a stated number or not at all.
                 .route(
                     "/admin/snapshots/{principal}",
-                    put(publish_snapshot::<S>).delete(remove_snapshot::<S>),
+                    put(publish_snapshot::<S>)
+                        .delete(remove_snapshot::<S>)
+                        .layer(DefaultBodyLimit::max(MAX_SNAPSHOT_BODY_BYTES)),
                 ),
         )
         .with_state(state)

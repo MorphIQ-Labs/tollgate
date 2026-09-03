@@ -26,8 +26,8 @@ use tollgate_store::wire::{
     API_PREFIX, AcquireRequest, IngestRequestRef, PrincipalsResponse, Problem, ReleaseRequest,
 };
 use tollgate_store::{
-    AllocateError, IngestReport, LeaseAllocator, ReclaimBatch, SnapshotPush, SnapshotResolution,
-    SnapshotSource, StoreError, UsageSink,
+    AllocateError, IngestError, IngestReport, LeaseAllocator, ReclaimBatch, SnapshotPush,
+    SnapshotResolution, SnapshotSource, StoreError, UsageSink,
 };
 
 pub struct HttpStore {
@@ -90,6 +90,19 @@ fn problem_to_allocate(problem: Problem) -> AllocateError {
             "server {}: {}",
             problem.status, problem.title
         ))),
+    }
+}
+
+/// The server's own words for a refusal, for an error a human will read.
+///
+/// Falls back to the status when the body is not a `Problem`: a proxy or a
+/// load balancer can refuse before the handler is reached, and "server
+/// returned 502" is still more use than an empty string.
+async fn problem_detail(response: reqwest::Response) -> String {
+    let status = response.status().as_u16();
+    match response.json::<Problem>().await {
+        Ok(problem) => format!("{status} {}: {}", problem.code, problem.title),
+        Err(_) => format!("server returned {status}"),
     }
 }
 
@@ -257,7 +270,7 @@ impl UsageSink for HttpStore {
         &self,
         events: &[UsageEvent],
         _now: Timestamp,
-    ) -> Result<IngestReport, StoreError> {
+    ) -> Result<IngestReport, IngestError> {
         let response = self
             .client
             .post(self.api_url("/usage/ingest"))
@@ -265,12 +278,29 @@ impl UsageSink for HttpStore {
             .send()
             .await
             .map_err(|e| StoreError(format!("http: {e}")))?;
-        if !response.status().is_success() {
-            return Err(StoreError(format!("server returned {}", response.status())));
+        let status = response.status();
+        if !status.is_success() {
+            let detail = problem_detail(response).await;
+            // A 4xx is the server's judgement about *this batch*: too large,
+            // undecodable, a contract it does not implement. Replaying it
+            // unchanged earns the same answer forever, so it is refused rather
+            // than retried — the wedge #61 describes is a writer looping on
+            // exactly this. The two exceptions are the 4xx statuses that
+            // describe the moment rather than the payload: 408 and 429 are
+            // invitations to try again.
+            let terminal = status.is_client_error()
+                && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                && status != reqwest::StatusCode::TOO_MANY_REQUESTS;
+            let error = StoreError(detail);
+            return Err(if terminal {
+                IngestError::Refused(error)
+            } else {
+                IngestError::Unavailable(error)
+            });
         }
         response
             .json()
             .await
-            .map_err(|e| StoreError(format!("http: {e}")))
+            .map_err(|e| StoreError(format!("http: {e}")).into())
     }
 }
