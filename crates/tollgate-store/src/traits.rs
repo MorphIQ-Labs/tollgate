@@ -733,7 +733,7 @@ pub trait UsageSink: Send + Sync {
         &self,
         events: &[UsageEvent],
         now: Timestamp,
-    ) -> Result<IngestReport, StoreError>;
+    ) -> Result<IngestReport, IngestError>;
 }
 
 /// One credential's durable record.
@@ -776,6 +776,69 @@ pub enum Revocation {
     /// The credential was already retired; nothing changed.
     AlreadyRetired,
 }
+
+/// The largest usage batch any sink accepts in one call, in events.
+///
+/// A batch cap has to admit the largest batch the system can legitimately
+/// produce, not a comfortable one: the shipped example writes 256 per flush,
+/// and this leaves a factor of sixteen for an embedder that batches harder to
+/// cut round-trips. Beyond it the answer is more flushes, not a bigger body —
+/// an ingest is idempotent, so splitting costs a round trip and risks nothing.
+///
+/// `UsageWriterConfig::validate` refuses a `max_batch` above this, so the
+/// misconfiguration is a startup error rather than a permanently-rejected
+/// batch discovered in production (#61).
+pub const MAX_INGEST_BATCH: usize = 4_096;
+
+/// Why an ingest attempt failed, and whether replaying it unchanged could
+/// ever succeed.
+///
+/// The distinction exists because the writer's correct response to the two is
+/// opposite. An unreachable sink is a *duration*: retrying the same batch is
+/// the designed behaviour, and giving up would lose billable events over a
+/// blip. A refused batch is a *fact about the batch*: retrying it unchanged
+/// gets the same answer forever, and every event queued behind it waits for a
+/// recovery that cannot come — a permanent, deterministic error laundered
+/// into an unbounded billing and availability outage (#61).
+///
+/// [`From<StoreError>`] yields [`Unavailable`](Self::Unavailable), so a
+/// backend that does not classify keeps the retry-forever behaviour it had.
+/// Terminality is asserted, never assumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngestError {
+    /// The sink could not be reached, or could not answer in time. The batch
+    /// is unchanged and will be retried.
+    Unavailable(StoreError),
+    /// The sink refused this batch and will refuse it again unchanged: a body
+    /// over the endpoint's limit, an event it cannot decode, a contract it
+    /// does not implement. Retrying cannot help.
+    Refused(StoreError),
+}
+
+impl IngestError {
+    /// Whether replaying this batch unchanged could ever succeed.
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        matches!(self, IngestError::Unavailable(_))
+    }
+}
+
+impl From<StoreError> for IngestError {
+    fn from(error: StoreError) -> Self {
+        IngestError::Unavailable(error)
+    }
+}
+
+impl std::fmt::Display for IngestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IngestError::Unavailable(e) => write!(f, "{e}"),
+            IngestError::Refused(e) => write!(f, "refused: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for IngestError {}
 
 /// Refusals from credential lifecycle operations.
 #[derive(Debug, Clone, PartialEq, Eq)]

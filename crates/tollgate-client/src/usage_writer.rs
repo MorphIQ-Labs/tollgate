@@ -63,7 +63,7 @@ use tracing::Instrument as _;
 
 use tollgate_core::{DenyReason, UsageEvent};
 use tollgate_store::Clock;
-use tollgate_store::UsageSink;
+use tollgate_store::{MAX_INGEST_BATCH, UsageSink};
 
 #[derive(Debug, Clone, Copy)]
 pub struct UsageWriterConfig {
@@ -108,6 +108,11 @@ impl UsageWriterConfig {
     pub fn validate(&self) -> Result<(), UsageWriterConfigError> {
         if self.queue_capacity == 0 {
             return Err(UsageWriterConfigError("queue_capacity must be positive"));
+        }
+        if self.max_batch > MAX_INGEST_BATCH {
+            return Err(UsageWriterConfigError(
+                "max_batch exceeds the ingest endpoint's documented limit",
+            ));
         }
         if self.max_batch == 0 {
             return Err(UsageWriterConfigError("max_batch must be positive"));
@@ -673,6 +678,28 @@ async fn flush_retrying(
                 }
                 counters.record_ingest(&report, now);
                 writer.account_for(batch);
+                batch.clear();
+                return;
+            }
+            // A refusal is a fact about this batch, not about the sink's
+            // availability: replaying it unchanged earns the same answer
+            // forever, and every event queued behind it waits for a recovery
+            // that cannot come. Counted lost and dropped, so the queue drains
+            // and later events bill — a permanent configuration or contract
+            // error must not become an unbounded billing outage (#61).
+            //
+            // `lost` is the honest word for it: these events entered the queue
+            // and will never reach the ledger. INVARIANTS #8 asks that they be
+            // counted rather than silently dropped, not that they be delivered
+            // by a sink that refuses them.
+            Ok(Err(refused)) if !refused.is_retryable() => {
+                counters.record_lost(batch.len() as u64);
+                tracing::error!(
+                    events = batch.len(),
+                    %refused,
+                    "usage sink refused this batch and will refuse it again; \
+                     counted lost so later events are not blocked behind it"
+                );
                 batch.clear();
                 return;
             }

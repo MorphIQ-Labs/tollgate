@@ -646,7 +646,7 @@ async fn concurrent_multi_account_batches_use_stable_lock_order() {
                     )
                     .await?;
             }
-            Ok::<(), tollgate_store::StoreError>(())
+            Ok::<(), tollgate_store::IngestError>(())
         }
     });
     let right = tokio::spawn({
@@ -661,7 +661,7 @@ async fn concurrent_multi_account_batches_use_stable_lock_order() {
                     )
                     .await?;
             }
-            Ok::<(), tollgate_store::StoreError>(())
+            Ok::<(), tollgate_store::IngestError>(())
         }
     });
 
@@ -1735,7 +1735,10 @@ async fn straggler_exceeding_recorded_loss_fails_ingest() {
         .ingest(&[usage(&lease, 1, 30, 5)], t(11))
         .await
         .unwrap_err();
-    assert!(err.0.contains("settlement_loss underflow"), "got: {err}");
+    assert!(
+        err.to_string().contains("settlement_loss underflow"),
+        "got: {err}"
+    );
     // The whole batch rolled back: nothing was billed.
     assert_eq!(
         store.usage_recorded(ACCOUNT).await.unwrap(),
@@ -1790,7 +1793,7 @@ async fn release_and_ingest_surface_negative_stored_fence() {
         .ingest(&[usage(&lease, 1, 10, 2)], t(2))
         .await
         .unwrap_err();
-    assert!(err.0.contains("fencing token"), "got: {err}");
+    assert!(err.to_string().contains("fencing token"), "got: {err}");
 }
 
 #[tokio::test]

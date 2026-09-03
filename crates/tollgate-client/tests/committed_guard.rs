@@ -18,7 +18,7 @@ use tollgate_core::{
     DiscardedUsage, FencingToken, Generation, LeaseGrant, LeaseId, LocalLease, OpIndex,
     PermissionBits, RequestId, ResolvedLimits, UsageEvent,
 };
-use tollgate_store::{IngestReport, StoreError, UsageSink};
+use tollgate_store::{IngestError, IngestReport, UsageSink};
 
 const ACCOUNT: AccountId = AccountId(1);
 const PRINCIPAL: Principal = Principal(1);
@@ -40,7 +40,7 @@ impl UsageSink for AcceptAll {
         &self,
         events: &[UsageEvent],
         _now: Timestamp,
-    ) -> Result<IngestReport, StoreError> {
+    ) -> Result<IngestReport, IngestError> {
         Ok(IngestReport {
             accepted: u64::try_from(events.len()).unwrap(),
             duplicate: 0,

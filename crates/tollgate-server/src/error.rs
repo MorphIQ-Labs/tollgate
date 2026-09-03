@@ -16,6 +16,7 @@ use tollgate_store::wire::Problem;
 use tollgate_store::{
     AllocateError, CreateAccountError, PublishSnapshotError, SetStatusError, StoreError,
 };
+use tollgate_store::{IngestError, MAX_INGEST_BATCH};
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -109,6 +110,27 @@ impl ApiError {
 impl From<JsonRejection> for ApiError {
     fn from(error: JsonRejection) -> Self {
         let status = error.into_response().status();
+        // A body over the endpoint's limit is not malformed JSON, and saying
+        // so sent a client looking for a syntax error in a payload it had
+        // serialised correctly. The two are told apart by status rather than
+        // by matching axum's rejection variants, because the nesting that
+        // produces a 413 is an internal detail of the extractor and the status
+        // is the part of that behaviour axum documents (#61).
+        //
+        // Distinct codes matter beyond the message: a client can retry a
+        // transient failure, and must never retry this one unchanged — an
+        // oversized batch is refused identically forever.
+        if status == StatusCode::PAYLOAD_TOO_LARGE {
+            return ApiError {
+                status,
+                code: "batch-too-large",
+                title: format!(
+                    "request body exceeds this endpoint's limit; \
+                     usage batches are capped at {MAX_INGEST_BATCH} events"
+                ),
+                generation: None,
+            };
+        }
         ApiError {
             status,
             code: "invalid-json",
@@ -210,6 +232,28 @@ impl From<StoreError> for ApiError {
             code: "storage",
             title: e.to_string(),
             generation: None,
+        }
+    }
+}
+
+impl From<IngestError> for ApiError {
+    fn from(error: IngestError) -> Self {
+        match error {
+            // The store could not answer. A client should retry, and 503 is
+            // the status that says so.
+            IngestError::Unavailable(e) => ApiError::from(e),
+            // The store examined this batch and refused it: an accounting
+            // total that cannot absorb these units will not absorb them on a
+            // replay either. 422 rather than 503, so a client can tell a
+            // refusal it must not repeat from an outage it should wait out —
+            // which is the distinction #61 is about, made at both ends of the
+            // wire rather than only at the transport.
+            IngestError::Refused(e) => ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "usage-refused",
+                title: e.to_string(),
+                generation: None,
+            },
         }
     }
 }

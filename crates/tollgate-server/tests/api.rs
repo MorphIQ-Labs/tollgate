@@ -524,3 +524,44 @@ async fn account_status_endpoint_speaks_the_status_vocabulary() {
     );
     assert_eq!(problem["code"], "invalid-json");
 }
+
+/// Issue #61: an over-limit ingest body is refused as `batch-too-large`, not
+/// as malformed JSON, and by a limit this crate declares rather than one axum
+/// supplies.
+///
+/// The old spelling reported a 413 with code `invalid-json` and the title
+/// "request body is not valid JSON for this endpoint", sending a client
+/// looking for a syntax error in a payload it had serialised correctly. The
+/// codes must differ because the client's response to them differs: one is
+/// worth retrying and the other is refused identically forever.
+#[tokio::test]
+async fn an_oversized_ingest_body_is_refused_as_batch_too_large() {
+    let (_store, router) = state();
+    // Comfortably past MAX_INGEST_BODY_BYTES without building a real batch:
+    // the limit is enforced on the body, before any of it is parsed.
+    let filler = "x".repeat(tollgate_store::wire::MAX_INGEST_BODY_BYTES + 1);
+    let request = Request::builder()
+        .method("POST")
+        .uri(api("/usage/ingest"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(format!("{{\"events\":\"{filler}\"}}")))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let problem: Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        problem["code"], "batch-too-large",
+        "a 413 reported as invalid-json sends a client hunting for a syntax \
+         error in a payload it serialised correctly; got {problem}"
+    );
+    assert!(
+        problem["title"]
+            .as_str()
+            .unwrap()
+            .contains(&tollgate_store::MAX_INGEST_BATCH.to_string()),
+        "the refusal must name the limit a client should batch against; got {problem}"
+    );
+}
