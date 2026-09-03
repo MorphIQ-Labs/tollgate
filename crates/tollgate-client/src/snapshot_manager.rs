@@ -1064,12 +1064,32 @@ async fn refresh_all_cancellable(
 /// also leaves it alone, but counts as a refresh failure, because an instance
 /// quietly narrowing to nothing on a transient error would deny every request
 /// while reporting itself perfectly healthy (#48).
+/// Returns `None` when shutdown was observed while the source was
+/// enumerating, which the caller must treat as "stop", exactly as it treats
+/// the same answer from [`refresh_all_cancellable`].
+///
+/// Racing it matters because no snapshot-source call carries a wall-clock
+/// timeout — the manager bounds them by cancellation instead — so this was
+/// the one loop-body await a hung source could park indefinitely. Same defect
+/// as issue #78 in the lease manager, found in this crate's other background
+/// loop while fixing that one.
 async fn discover(
     source: &Arc<dyn SnapshotSource>,
     resolutions: &mut Resolutions,
     counters: &SnapshotCounters,
-) {
-    match source.principals().await {
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<()> {
+    let enumerated = tokio::select! {
+        enumerated = source.principals() => enumerated,
+        changed = shutdown.changed() => {
+            if changed.is_err() || *shutdown.borrow() {
+                tracing::debug!("shutdown observed during principal enumeration");
+                return None;
+            }
+            source.principals().await
+        }
+    };
+    match enumerated {
         Ok(Some(discovered)) => resolutions.retain(discovered.into_iter().collect()),
         // Cannot enumerate: keep the configured set. Deliberately not the same
         // as an empty catalogue, which would mean "forget everyone".
@@ -1079,6 +1099,7 @@ async fn discover(
             tracing::warn!(%error, "principal enumeration failed; keeping the current set");
         }
     }
+    Some(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1099,8 +1120,12 @@ async fn run(
     // the real set rather than its (usually empty) seed. Enumeration failure
     // is not fatal: the retry loop below covers it, and the seed keeps the
     // instance serving whatever it was told about meanwhile.
-    if config.principals.discovers() {
-        discover(&source, &mut resolutions, &counters).await;
+    if config.principals.discovers()
+        && discover(&source, &mut resolutions, &counters, &mut shutdown)
+            .await
+            .is_none()
+    {
+        return;
     }
 
     // Initial load: retry until every tracked principal is resolved, then
@@ -1270,8 +1295,12 @@ async fn run(
                 // since the last one, and stop covering any the source has
                 // dropped. Over HTTP this is the only propagation path there
                 // is, because `subscribe` is a closed channel.
-                if config.principals.discovers() {
-                    discover(&source, &mut resolutions, &counters).await;
+                if config.principals.discovers()
+                    && discover(&source, &mut resolutions, &counters, &mut shutdown)
+                        .await
+                        .is_none()
+                {
+                    return;
                 }
                 if refresh_all_cancellable(
                     &source, &map, &slots, &clock, &config, &resolutions.due_for_sweep(),

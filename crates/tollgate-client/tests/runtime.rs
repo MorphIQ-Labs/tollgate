@@ -1508,7 +1508,6 @@ async fn slow_but_healthy_sink_still_delivers_at_shutdown() {
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(25));
 }
 
-/// An allocator that grants normally but never answers a release.
 /// An allocator that never answers an acquire. Distinct from refusing: the
 /// grant may well have been made, so the client cannot treat this as a
 /// domain answer.
@@ -1543,6 +1542,48 @@ impl LeaseAllocator for HangingAcquireAllocator {
     ) -> Result<ReclaimBatch, StoreError> {
         ReclaimBatch::try_new(Vec::new(), limit)
     }
+}
+
+/// INVARIANTS.md #18, issue #78: the shutdown signal is observed inside a
+/// hung `acquire`, not after it. The release pass is the louder half of that
+/// finding, but `acquire` is the loop's other long await and a signal
+/// arriving inside it was equally invisible until the next loop top.
+#[tokio::test(start_paused = true)]
+async fn shutdown_during_a_hung_acquire_is_not_delayed_by_it() {
+    let slot = LeaseSlot::for_account(ACCOUNT);
+    let clock = Arc::new(ManualClock::new(t(0)));
+    // A long per-call timeout with a short budget: if the signal is only
+    // observed at the loop top, shutdown waits out the acquire and blows the
+    // budget. The production shape has the same relationship, more slowly.
+    let config = LeaseManagerConfig {
+        store_call_timeout: std::time::Duration::from_secs(120),
+        shutdown_release_deadline: std::time::Duration::from_secs(10),
+        ..manager_config()
+    };
+    let manager = LeaseManager::spawn(
+        Arc::new(HangingAcquireAllocator) as Arc<dyn LeaseAllocator>,
+        Arc::clone(&slot),
+        clock,
+        config,
+    )
+    .unwrap();
+    settle().await;
+    assert!(slot.load().is_none(), "the acquire is still unanswered");
+
+    let bound = config.shutdown_release_deadline + std::time::Duration::from_secs(1);
+    let began = tokio::time::Instant::now();
+    let report = tokio::time::timeout(bound, manager.shutdown())
+        .await
+        .expect("a hung acquire must not hold the shutdown signal");
+    let took = began.elapsed();
+
+    assert!(!report.task_died);
+    assert_eq!(report.released, 0, "there was never a lease to return");
+    assert_eq!(report.abandoned, 0);
+    assert!(
+        took < config.store_call_timeout,
+        "shutdown took {took:?}, which is the hung acquire's timeout, not the signal"
+    );
 }
 
 /// INVARIANTS.md #18: an allocator that hangs rather than answering is
@@ -1620,6 +1661,85 @@ impl LeaseAllocator for HangingReleaseAllocator {
     }
 }
 
+/// INVARIANTS.md #6, issue #78: a refill must not queue behind the release
+/// pass. With leases parked against a backend whose `release` hangs, the old
+/// loop paid `parked.len()` sequential timeouts before it issued `acquire`,
+/// which put refill latency back on a floor that grew with the parked count —
+/// the very floor #6 exists to remove.
+#[tokio::test(start_paused = true)]
+async fn a_refill_does_not_wait_behind_the_release_pass() {
+    let store = store(100_000);
+    let slot = LeaseSlot::for_account(ACCOUNT);
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let allocator = Arc::new(HangingReleaseAllocator {
+        inner: store.clone(),
+    });
+    let manager = LeaseManager::spawn(
+        allocator as Arc<dyn LeaseAllocator>,
+        Arc::clone(&slot),
+        Arc::clone(&clock) as Arc<dyn tollgate_client::Clock>,
+        manager_config(),
+    )
+    .unwrap();
+    settle().await;
+
+    // Park a queue by rotating on expiry; a hung release keeps every
+    // superseded lease on the books.
+    //
+    // The fixture waits on the observable state rather than on a fixed sleep,
+    // so that a regression shows up in the measurement below instead of
+    // breaking the setup: a slower loop must still reach a fresh lease here,
+    // and then be caught by the ceiling.
+    for tick in 1..=5 {
+        clock.set(t(tick * 120));
+        let installed = tokio::time::timeout(std::time::Duration::from_secs(600), async {
+            loop {
+                match slot.load() {
+                    Some(lease) if lease.grant().expires_at > clock.now() => break,
+                    _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                }
+            }
+        })
+        .await;
+        installed.expect("the manager must install a lease after each rotation");
+    }
+    let before = slot.load().expect("a lease is installed");
+    assert!(
+        !before.needs_refill(),
+        "the fixture must start from a lease that has not already crossed"
+    );
+
+    // Ring the low-water doorbell and time the refill. Waiting on the fresh
+    // lease rather than on a fixed sleep is what makes the ceiling below the
+    // thing under test: a slow refill is measured, not deadlocked.
+    let began = tokio::time::Instant::now();
+    before.try_debit(CostUnits(800), clock.now()).unwrap();
+    assert!(before.needs_refill());
+    tokio::time::timeout(std::time::Duration::from_secs(600), async {
+        loop {
+            match slot.load() {
+                Some(fresh) if fresh.grant().lease_id != before.grant().lease_id => break,
+                _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("the crossing debit must be followed by a fresh lease");
+    let waited = began.elapsed();
+    // One pass budget, not one per parked lease. `settle()` bounds the wait
+    // from above anyway, so the assertion is about the shape: five parked
+    // leases must not cost five timeouts.
+    // Generous enough to absorb finishing a pass already in flight plus the
+    // next one's head lease; five parked leases at one timeout each — the
+    // pre-#78 cost — is 25s and does not fit.
+    let ceiling = manager_config().store_call_timeout * 3;
+    assert!(
+        waited < ceiling,
+        "refill waited {waited:?} behind the release pass, over the {ceiling:?} ceiling"
+    );
+    manager.shutdown().await;
+}
+
 /// A clean shutdown accounts for the leases it returned.
 #[tokio::test(start_paused = true)]
 async fn shutdown_reports_released_leases() {
@@ -1651,7 +1771,7 @@ async fn hung_release_cannot_stall_shutdown() {
     let manager = LeaseManager::spawn(
         allocator as Arc<dyn LeaseAllocator>,
         Arc::clone(&slot),
-        clock,
+        Arc::clone(&clock) as Arc<dyn tollgate_client::Clock>,
         manager_config(),
     )
     .unwrap();
@@ -1660,16 +1780,48 @@ async fn hung_release_cannot_stall_shutdown() {
     assert!(slot.load().is_some());
     assert_eq!(counters.snapshot().abandoned, 0, "nothing abandoned yet");
 
-    let report = tokio::time::timeout(std::time::Duration::from_secs(300), manager.shutdown())
+    // Park more leases by rotating the slot: each expiry supersedes the
+    // current lease, and a hung release keeps every superseded one on the
+    // books. This is the shape issue #78 is about — the old loop paid
+    // `parked.len()` sequential timeouts before it could even look at the
+    // shutdown signal.
+    for tick in 1..=5 {
+        clock.set(t(tick * 120));
+        settle().await;
+    }
+    let parked = counters.snapshot();
+    assert_eq!(parked.released, 0, "a hung release settles nothing");
+
+    // The stated budget, not an arbitrary ceiling. `shutdown()` documents
+    // itself as bounded by `shutdown_release_deadline`, and that is only true
+    // if the signal ends the release pass where it arrives: a pass that runs
+    // to its own budget first would add `store_call_timeout` on top, which
+    // this bound deliberately does not allow for. The extra second is
+    // scheduling slack, not budget.
+    let config = manager_config();
+    let bound = config.shutdown_release_deadline + std::time::Duration::from_secs(1);
+    let began = tokio::time::Instant::now();
+    let report = tokio::time::timeout(bound, manager.shutdown())
         .await
-        .expect("a hung release must not stall shutdown");
+        .expect("a hung release must not stall shutdown past its stated budget");
+    let took = began.elapsed();
+
+    assert!(
+        report.abandoned >= 2,
+        "the test must exercise a multi-lease parked list, got {}",
+        report.abandoned
+    );
     assert_eq!(report.released, 0);
-    assert_eq!(report.abandoned, 1, "the unreturned lease is reported");
     assert!(!report.task_died);
-    // The same number outside the report: stranded units are visible to a
+    assert!(
+        took <= bound,
+        "shutdown took {took:?} against a stated {:?} budget",
+        config.shutdown_release_deadline
+    );
+    // The same numbers outside the report: stranded units are visible to a
     // scrape, not only to whoever awaited this shutdown.
     let stats = counters.snapshot();
-    assert_eq!(stats.abandoned, 1);
+    assert_eq!(stats.abandoned, report.abandoned);
     assert_eq!(stats.released, 0);
 }
 

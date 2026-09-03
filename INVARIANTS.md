@@ -218,6 +218,10 @@ until it has one.
    lease, an early local low-water crossing wakes at most once per shard; if
    the aggregate is not low yet, the manager clears those doorbells and
    rechecks the aggregate so a concurrent crossing cannot be lost. Publishing
+   The doorbell only removes that floor if nothing in the loop body puts one
+   back: the release pass carries a single `store_call_timeout` across every
+   parked lease, so a wedged backend cannot make refill latency grow with the
+   parked count (#78). Publishing
    a lease to N locality views is N swaps, so mutators are serialized: a
    reader straddles one publication exactly as it straddled the single-view
    slot's one swap, but the slot never *ends* a publication holding two
@@ -225,6 +229,7 @@ until it has one.
    revocation. Rotation and shutdown wait for every locality's independently
    reference-counted lease view before releasing the exact aggregate.
    *Tests:* `refill_begins_on_the_crossing_debit_not_the_next_tick`,
+   `a_refill_does_not_wait_behind_the_release_pass`,
    `a_burst_across_a_rotation_never_denies_a_funded_account`,
    `refill_installs_lease_on_cold_start`,
    `usability_window_rollover_returns_unspent_capacity`,
@@ -490,17 +495,32 @@ until it has one.
     `lag_recovery_covers_the_negatives_a_sweep_skips`, and
     `deadline_helpers_are_exact_in_the_supported_domain`.
 
-18. **Background store calls are wall-clock bounded.** No background task may
-    be parked by a backend that hangs rather than answering: every allocator
-    and sink call a client task makes carries a configured timeout, and each
-    graceful shutdown carries a total budget, so shutdown terminates whatever
-    the backend does. Bounding by retry *count* alone is not a bound. What a
-    bound could not complete is reported — a lease left unreleased is
-    `LeaseManagerReport::abandoned` and settles at TTL reclaim (#9); an
-    undelivered batch is `WriterStats::lost` — never silently assumed done.
+18. **Background store calls are wall-clock bounded, and so is every pass
+    over them.** No background task may be parked by a backend that hangs
+    rather than answering: every allocator and sink call a client task makes
+    carries a configured timeout, and each graceful shutdown carries a total
+    budget, so shutdown terminates whatever the backend does. Bounding by
+    retry *count* alone is not a bound, and neither is a per-call bound on a
+    pass that makes `N` calls: the lease manager's release pass carries one
+    `store_call_timeout` across every parked lease, so no loop-body cost
+    scales with the parked count (#78). Every long await in a background
+    loop's body is raced against that task's shutdown watch, so the signal is
+    acted on where it arrives rather than at the next loop top — this is what
+    makes `LeaseManager::shutdown`'s documented `shutdown_release_deadline`
+    bound true, and it is the only bound the snapshot manager has, its source
+    calls carrying no timeout at all. What a bound could not complete is
+    reported — a lease left unreleased is `LeaseManagerReport::abandoned` and
+    settles at TTL reclaim (#9); an undelivered batch is `WriterStats::lost` —
+    never silently assumed done.
     *Tests:* `hung_ingest_cannot_stall_shutdown`,
     `hung_ingest_times_out_into_the_retry_path`,
-    `hung_release_times_out_and_reparks`, and
+    `hung_release_times_out_and_reparks`,
+    `hung_release_cannot_stall_shutdown`,
+    `shutdown_during_a_hung_acquire_is_not_delayed_by_it`,
+    `a_hung_enumeration_does_not_hold_shutdown_open`,
+    `lease_manager::tests::{a_release_pass_costs_one_budget_whatever_the_parked_count,
+    a_lease_that_eats_the_budget_yields_its_place,
+    shutdown_during_a_release_reparks_every_lease}`, and
     `invalid_pool_config_is_rejected_before_connecting`.
 
 19. **A control-plane failure is never silent.** Every fallible call a
