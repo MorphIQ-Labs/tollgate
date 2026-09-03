@@ -603,9 +603,24 @@ async fn run(
         }
     }
 
-    // Graceful shutdown: return what's left of the current and parked
-    // leases. Callers flushed usage and stopped admitting first, so every
-    // lease has quiesced and `remaining` is exactly granted - used.
+    // Graceful shutdown: return what's left of the current and parked leases.
+    //
+    // The comment that used to stand here said every lease had quiesced,
+    // because callers flush usage and stop admitting first. That is the
+    // documented lifecycle (INVARIANTS.md #13), but `parked` at this moment
+    // holds — by construction — exactly the leases the last pass determined
+    // were *not* quiesced, and reading `remaining()` on one of those reads a
+    // number that is not final. A request task still holding a view can debit
+    // after the release credits the account, and total committed usage then
+    // exceeds the allocation with a usage event to prove it (#1, #62).
+    //
+    // Caller discipline is the enforcement tier the standards call drift-prone,
+    // and the predicate that makes it unnecessary already exists in
+    // `release_quiesced`. So it is applied here too: a lease still holding an
+    // outside view is waited for inside the shutdown budget, and abandoned
+    // rather than released if it never quiesces. Abandoning returns the units
+    // at TTL reclaim (#9); releasing units that may still be spent is the one
+    // outcome that cannot be undone.
     if let Some(lease) = slot.take() {
         parked.push(lease);
     }
@@ -617,6 +632,23 @@ async fn run(
     };
     for lease in parked {
         let grant = lease.grant();
+        // Wait for the view to drop, inside the same budget the releases
+        // share. A quiesced lease passes this immediately; one still held
+        // costs a few polls and then, if the budget runs out first, is
+        // abandoned with its units named — which is what the old path did to
+        // an unfinished *call*, applied to an unfinished *reservation*.
+        if !wait_for_quiescence(&lease, deadline).await {
+            report.abandoned += 1;
+            counters.record_abandoned();
+            tracing::warn!(
+                lease = %grant.lease_id,
+                units = lease.remaining().get(),
+                "lease still held by an in-flight request at the shutdown \
+                 deadline; abandoned rather than released, because releasing \
+                 units that may still be spent cannot be undone"
+            );
+            continue;
+        }
         // One budget across every lease, and no single call may outlast the
         // per-call timeout inside it. Whatever the budget cannot cover is
         // reported abandoned and settles at TTL reclaim (INVARIANTS.md #9).
@@ -662,6 +694,30 @@ async fn run(
         }
     }
     report
+}
+
+/// Whether `lease` has quiesced, waiting until `deadline` for it to.
+///
+/// The same predicate `release_quiesced` uses: the local binding must be the
+/// sole outer handle, and a sharded slot must have no independently
+/// reference-counted locality alias left. Together those mean no request can
+/// still reserve or return units, so `remaining()` is final.
+///
+/// Polled rather than notified because a lease view is dropped by whatever
+/// task holds it, with nothing to signal on; the interval is short against a
+/// shutdown budget measured in seconds, and a quiesced lease returns on the
+/// first check without sleeping at all.
+async fn wait_for_quiescence(lease: &Arc<LocalLease>, deadline: tokio::time::Instant) -> bool {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(5);
+    loop {
+        if Arc::strong_count(lease) == 1 && lease.is_only_local_view() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(POLL.min(deadline - tokio::time::Instant::now())).await;
+    }
 }
 
 /// What ended a release pass. A pass that did not run to completion leaves
@@ -800,7 +856,27 @@ async fn release_quiesced(
                     lease = %lease_id,
                     "store rejected this lease's capability; clearing the slot so this instance stops serving"
                 );
-                slot.take();
+                // The slot holds a *different* lease from the fenced one —
+                // this loop walks `parked`, and the current lease is whatever
+                // the last rotation installed. Discarding what `take` hands
+                // back dropped a live, funded lease on the floor: never
+                // released, never re-parked, never counted abandoned, and
+                // named by no event, so an operator saw `released += 1` and
+                // `abandoned == 0` while its units stranded for a full TTL
+                // (#62).
+                //
+                // Parked rather than released here, so the quiescence guard at
+                // the top of this loop applies to it on the next pass: a
+                // request that loaded it before the slot was cleared still
+                // holds a view.
+                //
+                // `Option` is not `#[must_use]`, so the workspace's
+                // `let_underscore_must_use` deny — invariant 19's mechanical
+                // half — could not see this. Binding it is what makes the
+                // discard impossible to write again by accident.
+                if let Some(current) = slot.take() {
+                    retry.push(current);
+                }
             }
             Ok(Err(AllocateError::InvalidRelease)) => {
                 counters.record_released();
@@ -1151,10 +1227,29 @@ mod tests {
 
         harness.release_quiesced(&allocator, &mut parked).await;
 
-        assert!(parked.is_empty(), "a rejected capability is not retried");
         assert!(
             harness.slot.load().is_none(),
             "an instance with divergent lease identity must stop serving"
+        );
+        // The slot's lease is a different, live, funded one — this loop walks
+        // `parked`, and the slot holds whatever the last rotation installed.
+        // It must stay on the books: clearing the slot is how the instance
+        // stops serving, not how its units stop existing (#62).
+        //
+        // The previous spelling asserted only that `parked` was empty, which
+        // conflated "the fenced lease is not retried" with "nothing else is
+        // parked" — and so never asked where the slot's units went while they
+        // were being dropped on the floor.
+        let ids: Vec<_> = parked.iter().map(|l| l.grant().lease_id).collect();
+        assert_eq!(
+            ids,
+            [LeaseId(99)],
+            "the fenced lease is not retried, and the slot's live lease is not lost"
+        );
+        assert_eq!(
+            parked[0].remaining(),
+            CostUnits(100),
+            "its unspent units are still accounted for"
         );
     }
 

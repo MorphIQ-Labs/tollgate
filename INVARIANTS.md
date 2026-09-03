@@ -227,8 +227,17 @@ until it has one.
    slot's one swap, but the slot never *ends* a publication holding two
    different leases, which is what would let a locality keep spending past a
    revocation. Rotation and shutdown wait for every locality's independently
-   reference-counted lease view before releasing the exact aggregate.
+   reference-counted lease view before releasing the exact aggregate. Shutdown
+   waits inside its own budget and *abandons* what has not quiesced by the
+   deadline: releasing units a request may still spend cannot be undone, while
+   abandoning them only defers their return to TTL reclaim (#9). The lifecycle
+   order in #13 asks an embedder to quiesce before shutting down; this no
+   longer depends on that, the predicate being the one the steady-state pass
+   already applies (#62). A lease leaves this instance's books only by being
+   released or by being reported.
    *Tests:* `refill_begins_on_the_crossing_debit_not_the_next_tick`,
+   `shutdown_abandons_a_lease_an_in_flight_request_still_holds`,
+   `fenced_release_clears_the_slot`,
    `a_refill_does_not_wait_behind_the_release_pass`,
    `a_burst_across_a_rotation_never_denies_a_funded_account`,
    `refill_installs_lease_on_cold_start`,
