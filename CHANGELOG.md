@@ -7,6 +7,16 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.12.1...v0.13.0) - 2026-09-03
+
+### Fixed
+
+- *(client)* #63 bound the final flush's backoff by the drain deadline
+- *(client)* #62 keep every lease on the books until released or reported
+- *(ci)* #60 stop the formal gate passing over a sorry
+- *(client)* [**breaking**] #59 bound principal enumeration on the wall clock
+- *(store)* #58 hold one guard across publish_snapshot's check and write
+
 ## [0.12.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.12.0...v0.12.1) - 2026-09-03
 
 ### Fixed
