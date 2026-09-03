@@ -1893,3 +1893,104 @@ async fn a_failed_ingest_batch_leaves_the_ledger_untouched() {
         "an event from a failed batch was left indexed, so the replay saw a duplicate"
     );
 }
+
+/// Issue #58: a publish and a status transition racing each other must not
+/// leave the two records disagreeing.
+///
+/// The check and the write were two lock acquisitions, so a suspension could
+/// run to completion between them: it restamped every snapshot *then* live,
+/// set the ledger, and reported success — and the publish then inserted a
+/// principal `plan_republish` had never seen, because it did not exist yet.
+/// The ledger said suspended, that principal's snapshot said active, and it
+/// kept being admitted until someone repeated the transition. `PostgresStore`
+/// holds `FOR SHARE` on the account row across the same pair, so it never had
+/// the window.
+///
+/// Both orderings are legitimate outcomes — the publish may land before the
+/// suspension or be refused by it. What is never legitimate is the two records
+/// ending up different, which is what this asserts, whichever won.
+///
+/// **What this does and does not catch.** Measured against the original: two
+/// bare acquisitions with no await between them passes this test, because the
+/// window is a few instructions wide and only OS preemption can land inside
+/// it. What it does catch, at round 0 and reliably, is the same split with any
+/// scheduling point between the halves — a `.await` added later for a metric,
+/// a push, a lookup — which is the realistic way this defect comes back. The
+/// structural guarantee is the fix itself: `publish_locked` takes
+/// `&mut Inner`, so it cannot acquire a lock and must be called by a caller
+/// already holding one.
+///
+/// Rounds are therefore few and fixed: they exercise both orderings, not a
+/// probability. Catching bare preemption would need a hook in production code
+/// to stop between the halves, which costs more than this defect's remaining
+/// risk justifies.
+///
+/// It also closes a coverage gap: memory's `AdminStore::publish_snapshot` had
+/// almost none, because the existing snapshot tests drive the inherent helper
+/// instead of the trait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publish_racing_a_suspension_never_leaves_the_records_disagreeing() {
+    const ROUNDS: u128 = 32;
+    for round in 0..ROUNDS {
+        let store = store_with_balance(GrantPolicy::default(), 1_000);
+        let principal = Principal(round + 100);
+
+        let publisher = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move {
+                // Either outcome is legitimate — the publish may land before
+                // the suspension or be refused by it — but no third one is.
+                match AdminStore::publish_snapshot(
+                    &*store,
+                    principal,
+                    publishable(Arc::new(account_snapshot(
+                        ACCOUNT,
+                        9,
+                        AccountStatus::Active,
+                    ))),
+                )
+                .await
+                {
+                    Ok(()) | Err(PublishSnapshotError::StatusMismatch { .. }) => {}
+                    Err(other) => panic!("unexpected publish failure: {other}"),
+                }
+            }
+        });
+        let suspender = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move {
+                AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
+                    .await
+                    .expect("an active account suspends");
+            }
+        });
+        publisher.await.unwrap();
+        suspender.await.unwrap();
+
+        // Read the ledger through the refusal the trait already reports: a
+        // mismatch names the status the ledger holds.
+        let ledger = match AdminStore::publish_snapshot(
+            &*store,
+            Principal(round + 100_000),
+            publishable(Arc::new(account_snapshot(
+                ACCOUNT,
+                1,
+                AccountStatus::Active,
+            ))),
+        )
+        .await
+        {
+            Ok(()) => AccountStatus::Active,
+            Err(PublishSnapshotError::StatusMismatch { ledger, .. }) => ledger,
+            Err(other) => panic!("the probe publish must not fail for storage: {other}"),
+        };
+
+        if let SnapshotResolution::Present(live) = store.snapshot(principal).await.unwrap() {
+            assert_eq!(
+                live.status, ledger,
+                "round {round}: the ledger and principal {principal}'s live snapshot disagree, \
+                 so that principal keeps being admitted against a suspended account"
+            );
+        }
+    }
+}

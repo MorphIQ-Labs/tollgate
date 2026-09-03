@@ -251,21 +251,16 @@ impl MemoryStore {
     /// Postgres backend, which enforces the same rule in its upsert (review
     /// finding #5's backend-divergence note).
     pub fn publish_snapshot(&self, principal: Principal, snapshot: PublishableSnapshot) {
-        {
+        let published = {
             let mut inner = self.lock();
-            if let Some(existing) = inner.snapshots.get(&principal)
-                && existing.generation() >= snapshot.generation
-            {
-                return;
-            }
-            inner
-                .snapshots
-                .insert(principal, SnapshotRecord::Present(snapshot.clone()));
+            publish_locked(&mut inner, principal, snapshot)
+        };
+        if let Some(snapshot) = published {
+            self.push_to_subscribers(SnapshotPush {
+                principal,
+                resolution: SnapshotResolution::Present(snapshot),
+            });
         }
-        self.push_to_subscribers(SnapshotPush {
-            principal,
-            resolution: SnapshotResolution::Present(snapshot),
-        });
     }
 
     /// Broadcast a control-plane change. No receivers is not a failure — a
@@ -590,6 +585,34 @@ impl LeaseAllocator for MemoryStore {
     }
 }
 
+/// Insert a snapshot under a guard the caller already holds, returning what
+/// to push once the guard is released.
+///
+/// Splitting the locked work from the push is what lets a caller hold one
+/// guard across its own checks and this insert. `push_to_subscribers` must not
+/// run under the lock, and a subscriber must never observe a push for a
+/// publication that is still mid-flight — so the value to push comes back out
+/// instead of being sent from in here.
+///
+/// Generation-monotonic: a replayed or reordered publish carrying an older or
+/// equal generation is a no-op, and returns `None` because there is nothing to
+/// announce.
+fn publish_locked(
+    inner: &mut Inner,
+    principal: Principal,
+    snapshot: PublishableSnapshot,
+) -> Option<PublishableSnapshot> {
+    if let Some(existing) = inner.snapshots.get(&principal)
+        && existing.generation() >= snapshot.generation
+    {
+        return None;
+    }
+    inner
+        .snapshots
+        .insert(principal, SnapshotRecord::Present(snapshot.clone()));
+    Some(snapshot)
+}
+
 /// Plan the re-stamping of every live snapshot of `account` to `status`,
 /// under a lock the caller already holds. Mutates nothing: the caller applies
 /// the plan only once every fallible step has succeeded.
@@ -744,13 +767,24 @@ impl AdminStore for MemoryStore {
         principal: Principal,
         snapshot: PublishableSnapshot,
     ) -> Result<(), PublishSnapshotError> {
-        {
+        // One guard for the check and the write. Releasing it between them
+        // left a window `set_account_status` could run through entirely: a
+        // publish that passed the status check, a suspension that restamped
+        // every snapshot then existing, and finally the insert of a principal
+        // `plan_republish` never saw — because it did not exist yet. The
+        // ledger said suspended, that principal's live snapshot said active,
+        // and it kept being admitted until someone repeated the transition.
+        // That is #51's defect reintroduced in the backend that serves as
+        // INVARIANTS.md #22's reference. `PostgresStore` holds `FOR SHARE` on
+        // the account row across the same pair, which `set_account_status`'s
+        // `FOR UPDATE` serialises against.
+        let published = {
+            let mut inner = self.lock();
             // The ledger decides an account's status; a publish may carry it
             // but not change it, or the two records this trait just unified
             // could be pulled apart again one principal at a time (#51).
             // An account the ledger does not hold publishes unchanged: this
             // adds no account-existence requirement.
-            let inner = self.lock();
             if let Some(record) = inner.accounts.get(&snapshot.account_id)
                 && record.status != snapshot.status
             {
@@ -759,8 +793,14 @@ impl AdminStore for MemoryStore {
                     submitted: snapshot.status,
                 });
             }
+            publish_locked(&mut inner, principal, snapshot)
+        };
+        if let Some(snapshot) = published {
+            self.push_to_subscribers(SnapshotPush {
+                principal,
+                resolution: SnapshotResolution::Present(snapshot),
+            });
         }
-        MemoryStore::publish_snapshot(self, principal, snapshot);
         Ok(())
     }
 
