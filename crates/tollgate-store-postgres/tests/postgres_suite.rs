@@ -23,8 +23,8 @@ use tollgate_core::{
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, Conservation, CreateAccountError, GrantPolicy,
-    LeaseAllocator, PublishSnapshotError, SetStatusError, SnapshotResolution, SnapshotSource,
-    UsageSink,
+    KeyDirectory, KeyError, KeyRecord, LeaseAllocator, PublishSnapshotError, Revocation,
+    SetStatusError, SnapshotResolution, SnapshotSource, UsageSink,
 };
 use tollgate_store_postgres::PostgresStore;
 
@@ -2659,4 +2659,217 @@ async fn a_usage_row_cannot_carry_half_a_capability() {
         );
     }
     assert_conserved(&store).await;
+}
+
+// ---------------------------------------------------------------------------
+// Credential lifecycle (#104). Mirrors `store_suite.rs` scenario for scenario:
+// a projection built from either backend must see the same live credential
+// set, so both must agree on what "active" means.
+// ---------------------------------------------------------------------------
+
+fn key(id: u128, principal: u128, digest_byte: u8, not_after: Option<Timestamp>) -> KeyRecord {
+    KeyRecord {
+        key_id: KeyId(id),
+        account_id: ACCOUNT,
+        principal: Principal(principal),
+        digest: [digest_byte; 32],
+        not_after,
+    }
+}
+
+#[tokio::test]
+async fn a_recorded_credential_is_active_until_it_is_revoked() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    store.insert_key(key(1, 11, 0xa1, None)).await.unwrap();
+
+    let active = store.active_keys(t(0)).await.unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].key_id, KeyId(1));
+    assert_eq!(active[0].principal, Principal(11));
+    assert_eq!(active[0].digest, [0xa1; 32]);
+
+    assert_eq!(
+        store.revoke_key(KeyId(1), t(10)).await,
+        Ok(Revocation::Retired)
+    );
+    assert!(
+        store.active_keys(t(11)).await.unwrap().is_empty(),
+        "a retired credential is never active again"
+    );
+}
+
+#[tokio::test]
+async fn revoking_reports_whether_anything_was_retired() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    store.insert_key(key(1, 11, 0xa1, None)).await.unwrap();
+
+    assert_eq!(
+        store.revoke_key(KeyId(1), t(10)).await,
+        Ok(Revocation::Retired)
+    );
+    assert_eq!(
+        store.revoke_key(KeyId(1), t(20)).await,
+        Ok(Revocation::AlreadyRetired),
+        "the second call changed nothing and says so"
+    );
+    assert_eq!(
+        store.revoke_key(KeyId(404), t(20)).await,
+        Err(KeyError::UnknownKey),
+        "revoking a key that never existed is a mistake, not a no-op"
+    );
+}
+
+#[tokio::test]
+async fn a_credential_expires_out_of_the_active_set_without_being_revoked() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    store
+        .insert_key(key(1, 11, 0xa1, Some(t(100))))
+        .await
+        .unwrap();
+
+    assert_eq!(store.active_keys(t(99)).await.unwrap().len(), 1);
+    assert!(
+        store.active_keys(t(100)).await.unwrap().is_empty(),
+        "expiry is exclusive, and needs no operator action"
+    );
+    assert_eq!(
+        store.revoke_key(KeyId(1), t(200)).await,
+        Ok(Revocation::Retired),
+        "an expired credential is still revocable: expiry and retirement are different facts"
+    );
+}
+
+#[tokio::test]
+async fn issuance_is_never_destructive() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    store.insert_key(key(1, 11, 0xa1, None)).await.unwrap();
+
+    assert_eq!(
+        store.insert_key(key(1, 22, 0xb2, None)).await,
+        Err(KeyError::AlreadyExists),
+        "an overwrite would retire a live credential whose digest cannot be recovered"
+    );
+    let active = store.active_keys(t(0)).await.unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(
+        active[0].digest, [0xa1; 32],
+        "the refused insert changed nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_credential_cannot_belong_to_an_account_that_does_not_exist() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    let orphan = KeyRecord {
+        account_id: AccountId(404),
+        ..key(1, 11, 0xa1, None)
+    };
+    assert_eq!(
+        store.insert_key(orphan).await,
+        Err(KeyError::UnknownAccount),
+        "a credential nothing can authenticate as is refused at issuance, not at every admission"
+    );
+    assert!(store.active_keys(t(0)).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_active_set_is_ordered_so_two_instances_project_alike() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    for id in [3u128, 1, 2] {
+        store
+            .insert_key(key(id, 100 + id, id as u8, None))
+            .await
+            .unwrap();
+    }
+    let ids: Vec<_> = store
+        .active_keys(t(0))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| record.key_id)
+        .collect();
+    assert_eq!(ids, [KeyId(1), KeyId(2), KeyId(3)]);
+}
+
+/// A database refusal this code cannot classify must stay a storage failure,
+/// never a domain answer.
+///
+/// `insert_key` maps two specific constraint violations to `UnknownAccount`
+/// and `AlreadyExists`. Everything else the database can refuse — a statement
+/// timeout, a deadlock, an admin shutdown — is *not* a statement about the
+/// credential, and reporting one as "already exists" would send an operator
+/// looking for a key that was never issued. Same rule the lease manager holds
+/// for a hung allocator: a timeout is not a refusal.
+///
+/// No memory mirror: `MemoryStore` has no storage layer to fail, so the
+/// distinction is unrepresentable there.
+///
+/// The constraint is dropped before any assertion runs, so a failure here
+/// cannot leave it behind for the tests that follow.
+#[tokio::test]
+async fn an_unclassified_database_refusal_is_storage_not_a_domain_answer() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    let pool = corruption_pool().await;
+    sqlx::raw_sql(
+        "ALTER TABLE tollgate_credential_keys
+         ADD CONSTRAINT tollgate_credential_keys_test_refuse CHECK (false) NOT VALID",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let refused = store.insert_key(key(1, 11, 0xa1, None)).await;
+
+    sqlx::raw_sql(
+        "ALTER TABLE tollgate_credential_keys
+         DROP CONSTRAINT tollgate_credential_keys_test_refuse",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    match refused {
+        Err(KeyError::Storage(_)) => {}
+        other => panic!(
+            "an unclassifiable database refusal must be Storage, not a domain answer: {other:?}"
+        ),
+    }
+}
+
+/// Two credentials cannot share a principal: that value is the identity
+/// admission decides with, so a collision would let one account's revocation
+/// withdraw another's credential.
+#[tokio::test]
+async fn two_credentials_cannot_share_a_principal() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    store.insert_key(key(1, 11, 0xa1, None)).await.unwrap();
+    assert_eq!(
+        store.insert_key(key(2, 11, 0xb2, None)).await,
+        Err(KeyError::AlreadyExists)
+    );
+    assert_eq!(store.active_keys(t(0)).await.unwrap().len(), 1);
 }
