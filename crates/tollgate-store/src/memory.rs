@@ -38,7 +38,7 @@
 //! [`MemoryStore::stored_records`] reports the numbers, and the server logs
 //! them once per sweep.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -224,14 +224,24 @@ impl MemoryStore {
             .accounts
             .get_mut(&account)
             .ok_or(AllocateError::UnknownAccount)?;
-        record.balance = record
+        // Both sums are computed before either lands, the rule `acquire`
+        // states and `set_account_status` splits into plan/apply. Assigning
+        // as they were computed left the ledger permanently short when the
+        // second overflowed: conservation keeps `balance <= deposited`, so
+        // `deposited` reaches the ceiling first, and a refused top-up on a
+        // fully-spent account still credited `balance` (#57). `PostgresStore`
+        // moves both columns in one statement, where an overflow aborts it
+        // and nothing moves.
+        let balance = record
             .balance
             .checked_add(units)
             .ok_or_else(|| AllocateError::Storage(StoreError("balance overflow".into())))?;
-        record.deposited = record
+        let deposited = record
             .deposited
             .checked_add(units)
             .ok_or_else(|| AllocateError::Storage(StoreError("deposit overflow".into())))?;
+        record.balance = balance;
+        record.deposited = deposited;
         Ok(())
     }
 
@@ -507,36 +517,63 @@ impl LeaseAllocator for MemoryStore {
         let expired = inner
             .leases
             .reclaimable(now, self.policy.reclaim_grace, limit.get());
+        // Planned, validated, then applied. `ReclaimBatch::try_new` is the
+        // last fallible step, and running it after a loop that had already
+        // settled leases and credited balances would return `Err` over a
+        // ledger that had moved. Unreachable while `reclaimable` respects the
+        // limit, but the structure is the defect, and it is one refactor away
+        // from being reachable (#57).
         let mut reclaimed = Vec::with_capacity(expired.len());
-        for lease_id in expired {
+        let mut balances: HashMap<AccountId, CostUnits> = HashMap::new();
+        for &lease_id in &expired {
             let lease = inner.leases.get(lease_id).expect("just listed");
             let credit = lease
                 .granted
                 .checked_sub(lease.used)
                 .expect("usage never exceeds grant");
             let account_id = lease.account_id;
-            assert!(
-                inner.leases.settle(lease_id, Settled::Expired, credit),
-                "reclaimable only yields active leases"
+            // Overlaid, because a sweep can reclaim several leases of one
+            // account and their credits accumulate.
+            let balance = *balances.get(&account_id).unwrap_or_else(|| {
+                &inner
+                    .accounts
+                    .get(&account_id)
+                    .expect("lease account exists")
+                    .balance
+            });
+            balances.insert(
+                account_id,
+                balance
+                    .checked_add(credit)
+                    .expect("reclaim credit overflow"),
             );
-            let record = inner
-                .accounts
-                .get_mut(&account_id)
-                .expect("lease account exists");
-            record.balance = record
-                .balance
-                .checked_add(credit)
-                .expect("reclaim credit overflow");
             reclaimed.push(ReclaimedLease {
                 lease_id,
                 account_id,
                 reclaimed: credit,
             });
         }
+        let batch = ReclaimBatch::try_new(reclaimed, limit)?;
+
+        for entry in batch.reclaimed() {
+            assert!(
+                inner
+                    .leases
+                    .settle(entry.lease_id, Settled::Expired, entry.reclaimed),
+                "reclaimable only yields active leases"
+            );
+        }
+        for (account_id, balance) in balances {
+            inner
+                .accounts
+                .get_mut(&account_id)
+                .expect("lease account exists")
+                .balance = balance;
+        }
         // One line per sweep rather than one per batch: a drain calls this
         // until a batch comes back unsaturated, and that last call carries the
         // post-sweep numbers.
-        if reclaimed.len() < limit.get() {
+        if batch.reclaimed().len() < limit.get() {
             let held = StoredRecords {
                 usage_events: inner.usage.len(),
                 leases: inner.leases.len(),
@@ -549,7 +586,7 @@ impl LeaseAllocator for MemoryStore {
                 "memory store holdings; usage events and settled leases are never reclaimed"
             );
         }
-        ReclaimBatch::try_new(reclaimed, limit)
+        Ok(batch)
     }
 }
 
@@ -768,9 +805,31 @@ impl UsageSink for MemoryStore {
         _now: Timestamp,
     ) -> Result<IngestReport, StoreError> {
         let mut inner = self.lock();
+
+        // Planned first, applied second. The overage branch can fail the whole
+        // batch on an accounting overflow, and returning from the middle of an
+        // applying loop left every earlier event of the batch committed while
+        // the caller was told the batch failed (#57): `UsageWriter` reads a
+        // `StoreError` as an outage and retries, the replay counts the applied
+        // events as duplicates, and retry accounting then describes a batch
+        // that partially succeeded as a total failure. `PostgresStore` runs
+        // the batch in one transaction and rolls it back, so this is the shape
+        // that makes the two backends agree (INVARIANTS.md #7).
+        //
+        // The plan carries overlays rather than reading `inner` twice, because
+        // events in one batch see each other: two charges against the same
+        // lease consume its capacity in order, and a request id repeated
+        // inside a batch is a duplicate of the earlier one.
         let mut report = IngestReport::default();
+        let mut accepted: Vec<UsageEvent> = Vec::new();
+        let mut lease_used: HashMap<LeaseId, CostUnits> = HashMap::new();
+        let mut usage_recorded: HashMap<AccountId, CostUnits> = HashMap::new();
+        let mut overage_recorded: HashMap<AccountId, CostUnits> = HashMap::new();
+        let mut settlement_loss: HashMap<AccountId, CostUnits> = HashMap::new();
+        let mut planned: HashSet<tollgate_core::RequestId> = HashSet::new();
+
         for event in events {
-            if inner.usage.contains_key(&event.request_id) {
+            if inner.usage.contains_key(&event.request_id) || planned.contains(&event.request_id) {
                 report.duplicate += 1;
                 continue;
             }
@@ -792,33 +851,36 @@ impl UsageSink for MemoryStore {
                 fencing_token,
             } = event.source
             else {
-                let Some(record) = inner.accounts.get_mut(&event.account_id) else {
+                let Some(record) = inner.accounts.get(&event.account_id) else {
                     report.rejected += 1;
                     continue;
                 };
+                let recorded = *usage_recorded
+                    .get(&event.account_id)
+                    .unwrap_or(&record.usage_recorded);
+                let overage = *overage_recorded
+                    .get(&event.account_id)
+                    .unwrap_or(&record.overage_recorded);
                 // Both terms must move or neither does, or the equation is
                 // left open (INVARIANTS.md #11). A total that cannot be
                 // represented is corruption of a monotonic column rather than
                 // a problem with this event, so it is surfaced as a store
-                // error and the whole batch fails — which is what
-                // `PostgresStore` does for the same overflow, and what keeps
-                // the two backends' behaviour mirrored.
-                let (Some(usage_recorded), Some(overage_recorded)) = (
-                    record.usage_recorded.checked_add(event.units),
-                    record.overage_recorded.checked_add(event.units),
+                // error and the whole batch fails — and because nothing has
+                // been applied yet, the batch fails whole.
+                let (Some(next_recorded), Some(next_overage)) = (
+                    recorded.checked_add(event.units),
+                    overage.checked_add(event.units),
                 ) else {
                     return Err(StoreError(format!(
                         "overage accounting overflow for account {:#034x}: recorded usage {} \
                          and overage {} cannot absorb {}",
-                        event.account_id.0,
-                        record.usage_recorded,
-                        record.overage_recorded,
-                        event.units
+                        event.account_id.0, recorded, overage, event.units
                     )));
                 };
-                record.usage_recorded = usage_recorded;
-                record.overage_recorded = overage_recorded;
-                inner.usage.insert(event.request_id, *event);
+                usage_recorded.insert(event.account_id, next_recorded);
+                overage_recorded.insert(event.account_id, next_overage);
+                planned.insert(event.request_id);
+                accepted.push(*event);
                 report.accepted += 1;
                 continue;
             };
@@ -830,7 +892,7 @@ impl UsageSink for MemoryStore {
             // was committed before release converts loss into billed usage.
             // For an expired lease the reclaim credited the full remainder —
             // nothing fits, so stragglers stay rejected (they'd double-count).
-            let Some(lease) = inner.leases.get_mut(lease_id) else {
+            let Some(lease) = inner.leases.get(lease_id) else {
                 report.rejected += 1;
                 continue;
             };
@@ -839,8 +901,8 @@ impl UsageSink for MemoryStore {
                 continue;
             }
             let was_settled = !lease.is_active();
-            let capacity = lease
-                .used
+            let used = *lease_used.get(&lease_id).unwrap_or(&lease.used);
+            let capacity = used
                 .checked_add(lease.credited())
                 .and_then(|committed| lease.granted.checked_sub(committed));
             let fits = matches!(capacity, Some(cap) if event.units <= cap);
@@ -848,28 +910,70 @@ impl UsageSink for MemoryStore {
                 report.rejected += 1;
                 continue;
             }
-            lease.used = lease
-                .used
-                .checked_add(event.units)
-                .expect("fits within grant");
             let account_id = lease.account_id;
             let record = inner
                 .accounts
-                .get_mut(&account_id)
+                .get(&account_id)
                 .expect("lease account exists");
-            record.usage_recorded = record
-                .usage_recorded
-                .checked_add(event.units)
-                .expect("usage overflow");
+            let recorded = *usage_recorded
+                .get(&account_id)
+                .unwrap_or(&record.usage_recorded);
+            lease_used.insert(
+                lease_id,
+                used.checked_add(event.units).expect("fits within grant"),
+            );
+            usage_recorded.insert(
+                account_id,
+                recorded.checked_add(event.units).expect("usage overflow"),
+            );
             if was_settled {
                 // The units move from provisional loss to billed usage.
-                record.settlement_loss = record
-                    .settlement_loss
-                    .checked_sub(event.units)
-                    .expect("straggler fits within recorded loss");
+                let loss = *settlement_loss
+                    .get(&account_id)
+                    .unwrap_or(&record.settlement_loss);
+                settlement_loss.insert(
+                    account_id,
+                    loss.checked_sub(event.units)
+                        .expect("straggler fits within recorded loss"),
+                );
             }
-            inner.usage.insert(event.request_id, *event);
+            planned.insert(event.request_id);
+            accepted.push(*event);
             report.accepted += 1;
+        }
+
+        // Apply. Every value here was computed above, so nothing in this block
+        // can fail and leave the ledger half-moved.
+        for (lease_id, used) in lease_used {
+            inner
+                .leases
+                .get_mut(lease_id)
+                .expect("planned against a lease that exists")
+                .used = used;
+        }
+        for (account_id, value) in usage_recorded {
+            inner
+                .accounts
+                .get_mut(&account_id)
+                .expect("planned against an account that exists")
+                .usage_recorded = value;
+        }
+        for (account_id, value) in overage_recorded {
+            inner
+                .accounts
+                .get_mut(&account_id)
+                .expect("planned against an account that exists")
+                .overage_recorded = value;
+        }
+        for (account_id, value) in settlement_loss {
+            inner
+                .accounts
+                .get_mut(&account_id)
+                .expect("planned against an account that exists")
+                .settlement_loss = value;
+        }
+        for event in accepted {
+            inner.usage.insert(event.request_id, event);
         }
         Ok(report)
     }
