@@ -139,8 +139,8 @@ async fn embedding_path_allocates_nothing_after_warmup() {
         wait_until_drained(&recorder).await;
     }
 
-    let mut registry = HmacRegistry::new(b"allocation-test-secret");
-    let principal = registry.register(b"credential-one");
+    let registry = HmacRegistry::new(b"allocation-test-secret");
+    let principal = registry.install_credentials([b"credential-one".as_slice()])[0];
     let session = SessionCredential::new();
     session
         .authenticate(Some(b"credential-one"), &registry, now())

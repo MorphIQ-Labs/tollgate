@@ -226,9 +226,8 @@ mod tests {
 
     impl Counting {
         fn new() -> Self {
-            let mut inner = HmacRegistry::new(b"server-secret");
-            inner.register(b"key-one");
-            inner.register(b"key-two");
+            let inner = HmacRegistry::new(b"server-secret");
+            inner.install_credentials([b"key-one".as_slice(), b"key-two".as_slice()]);
             Counting {
                 inner,
                 calls: std::sync::atomic::AtomicU64::new(0),

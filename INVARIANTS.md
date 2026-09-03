@@ -660,9 +660,10 @@ until it has one.
     cache that ignored it would honour a dead token for as long as a session
     stayed open, with admission unable to compensate because expiry is a
     property of the credential and not of the account snapshot.
-    `Verified::reusable_until` carries it, `HmacRegistry` returns `None`
-    because a server-issued key expires only by withdrawal, and withdrawal
-    travels by snapshot.
+    `Verified::reusable_until` carries it, and `HmacRegistry` populates it
+    from the credential's own `not_after` when its record carries one (#104).
+    A key without one is indefinite: it expires only by withdrawal, and
+    withdrawal travels by snapshot.
 
     A cache hit skips the credential check and **nothing else**: every request
     still enters `AdmissionEngine::admit` and consults the current snapshot, so
@@ -889,3 +890,40 @@ exists to detect corrupt state and must not be able to launder it.
 `settlement_is_unaffected_by_an_account_carrying_overage` (both store suites);
 `Tollgate.Conservation.overage_preserves_conservation` and
 `unfunded_overage_always_breaks_conservation`.
+
+27. **A credential is durable before it is disclosed, and its digest table is
+    a projection.** Credential lifecycle is control-plane state like every
+    other: the durable record lives behind [`KeyDirectory`] and the verifier
+    holds a read projection of it, installed whole. Two orderings are
+    load-bearing and neither is recoverable if broken. **Durability before
+    disclosure:** the record commits before the secret is returned to anyone,
+    because a crash between the two leaves a credential the server has never
+    heard of, and the digest cannot be recovered from the record — that being
+    the point of storing digests. **Replacement, never merge:** a projection
+    that merged would keep verifying a credential the directory has already
+    retired, so the directory decides which credentials are live and the
+    registry reflects that set exactly.
+
+    The secret never reaches a store and the server secret never leaves the
+    verifier, so neither half alone verifies or mints anything — the property
+    HMAC is paid for, preserved across the persistence boundary rather than
+    only within one process.
+
+    Revocation is durable and terminal, like a snapshot tombstone (#15): a
+    retired credential is never resurrected, and issuance refuses to overwrite
+    an existing `KeyId` rather than silently retiring what it replaces. A
+    credential's own `not_after` is enforced by the directory, so every
+    backend answers "active" the same way and no projection can disagree with
+    the ledger about which credentials are live.
+
+    Per-credential withdrawal reaches the request path by the mechanism that
+    already exists: a `Principal` *is* the credential's digest fingerprint, so
+    revoking one is `install_revoked` for that principal, and admission
+    already denies a tombstoned principal on every request regardless of what
+    any verifier's cache holds.
+
+    *Tests:* `a_minted_credential_verifies_until_it_is_revoked`,
+    `a_credentials_own_expiry_travels_to_the_verifier`,
+    `rotation_keeps_both_credentials_live_until_the_old_one_is_retired`,
+    `issuance_refuses_a_duplicate_key_or_an_unknown_account`, and
+    `minting_never_repeats_a_credential`.
