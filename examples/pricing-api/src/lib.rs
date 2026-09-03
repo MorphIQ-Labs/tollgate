@@ -440,8 +440,8 @@ fn build_app_with(
         }
     };
 
-    let mut auth = HmacRegistry::new(b"demo-server-secret-rotate-me");
-    let principal = auth.register(DEMO_API_KEY.as_bytes());
+    let auth = HmacRegistry::new(b"demo-server-secret-rotate-me");
+    let principal = auth.install_credentials([DEMO_API_KEY.as_bytes()])[0];
     store.publish_snapshot(principal, compile_snapshot(1));
 
     let map = Arc::new(ArcSwapSnapshotMap::with_sharding(sharding));

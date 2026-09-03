@@ -8,6 +8,8 @@
 //!   pushes.
 //! - [`UsageSink`] — idempotent, fencing-checked batch ingest of usage
 //!   events.
+//! - [`KeyDirectory`] — durable credential lifecycle, whose read projection
+//!   is the verifier's digest table.
 //!
 //! Every method takes `now` as an argument: the store, like the core, never
 //! reads a clock. That keeps backends deterministic under test and puts the
@@ -29,8 +31,8 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use memory::{MemoryStore, StoredRecords};
 pub use traits::{
     AccountConfig, AdminStore, AllocateError, Conservation, CreateAccountError,
-    DEFAULT_RECLAIM_BATCH_LIMIT, GrantPolicy, GrantPolicyError, IngestReport, LeaseAllocator,
-    PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease, SetStatusError,
-    SnapshotPush, SnapshotResolution, SnapshotSource, StatusChange, StoreError, StoreHealth,
-    UsageSink, pushes_exceed_capacity,
+    DEFAULT_RECLAIM_BATCH_LIMIT, GrantPolicy, GrantPolicyError, IngestReport, KeyDirectory,
+    KeyError, KeyRecord, LeaseAllocator, PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch,
+    ReclaimedLease, Revocation, SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource,
+    StatusChange, StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
 };

@@ -2404,6 +2404,7 @@ version = "0.10.2"
 dependencies = [
  "arc-swap",
  "criterion",
+ "getrandom 0.3.4",
  "hmac",
  "jiff",
  "sha2",

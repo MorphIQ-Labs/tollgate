@@ -12,8 +12,8 @@ fn timestamp() -> Timestamp {
 
 #[test]
 fn a_cached_credential_allocates_nothing() {
-    let mut registry = HmacRegistry::new(b"allocation-test-secret");
-    registry.register(b"credential-one");
+    let registry = HmacRegistry::new(b"allocation-test-secret");
+    registry.install_credentials([b"credential-one".as_slice()]);
     let session = SessionCredential::new();
     let now = timestamp();
 

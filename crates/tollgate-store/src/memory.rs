@@ -48,17 +48,17 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountStatus, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId, Principal,
-    PublishableSnapshot, UsageEvent, UsageSource,
+    AccountId, AccountStatus, CostUnits, FencingToken, Generation, KeyId, LeaseGrant, LeaseId,
+    Principal, PublishableSnapshot, UsageEvent, UsageSource,
 };
 
 use crate::leases::{LeaseRecord, Leases, Settled};
 pub use crate::traits::{AccountConfig, Conservation, StatusChange};
 use crate::traits::{
     AdminStore, AllocateError, CreateAccountError, GrantPolicy, GrantPolicyError, IngestReport,
-    LeaseAllocator, PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease,
-    SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource, StoreError, StoreHealth,
-    UsageSink, pushes_exceed_capacity,
+    KeyDirectory, KeyError, KeyRecord, LeaseAllocator, PUSH_CHANNEL_CAPACITY, PublishSnapshotError,
+    ReclaimBatch, ReclaimedLease, Revocation, SetStatusError, SnapshotPush, SnapshotResolution,
+    SnapshotSource, StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
 };
 
 #[derive(Debug)]
@@ -127,7 +127,20 @@ struct Inner {
     leases: Leases,
     snapshots: HashMap<Principal, SnapshotRecord>,
     usage: HashMap<tollgate_core::RequestId, UsageEvent>,
+    /// Credential records, live and retired alike. A revocation sets
+    /// `revoked_at` rather than removing the row: the tombstone is what makes
+    /// "already retired" distinguishable from "never existed", and a removed
+    /// row would let a replayed issuance resurrect the credential.
+    keys: HashMap<KeyId, StoredKey>,
     next_lease_id: u128,
+}
+
+/// A credential as this backend holds it: the durable record plus its
+/// retirement, which is the one mutable field.
+#[derive(Debug, Clone)]
+struct StoredKey {
+    record: KeyRecord,
+    revoked_at: Option<Timestamp>,
 }
 
 /// What the in-memory ledger is currently holding.
@@ -859,6 +872,66 @@ impl UsageSink for MemoryStore {
             report.accepted += 1;
         }
         Ok(report)
+    }
+}
+
+#[async_trait]
+impl KeyDirectory for MemoryStore {
+    async fn insert_key(&self, record: KeyRecord) -> Result<(), KeyError> {
+        let mut inner = self.lock();
+        if !inner.accounts.contains_key(&record.account_id) {
+            return Err(KeyError::UnknownAccount);
+        }
+        // Never destructive, for the reason `create_account` is not: an
+        // overwrite would retire a live credential without saying so, and the
+        // digest it replaced is unrecoverable.
+        if inner.keys.contains_key(&record.key_id) {
+            return Err(KeyError::AlreadyExists);
+        }
+        inner.keys.insert(
+            record.key_id,
+            StoredKey {
+                record,
+                revoked_at: None,
+            },
+        );
+        Ok(())
+    }
+
+    async fn revoke_key(&self, key_id: KeyId, now: Timestamp) -> Result<Revocation, KeyError> {
+        let mut inner = self.lock();
+        let Some(stored) = inner.keys.get_mut(&key_id) else {
+            return Err(KeyError::UnknownKey);
+        };
+        if stored.revoked_at.is_some() {
+            return Ok(Revocation::AlreadyRetired);
+        }
+        stored.revoked_at = Some(now);
+        Ok(Revocation::Retired)
+    }
+
+    async fn active_keys(&self, now: Timestamp) -> Result<Vec<KeyRecord>, StoreError> {
+        let inner = self.lock();
+        let mut active: Vec<KeyRecord> = inner
+            .keys
+            .values()
+            .filter(|stored| stored.revoked_at.is_none())
+            // Expiry is decided here rather than by each reader, so every
+            // backend answers "active" the same way and a projection cannot
+            // disagree with the ledger about which credentials are live.
+            .filter(|stored| {
+                stored
+                    .record
+                    .not_after
+                    .is_none_or(|not_after| now < not_after)
+            })
+            .map(|stored| stored.record.clone())
+            .collect();
+        // Deterministic order: the projection is rebuilt from this, and a
+        // backend whose output order wanders makes two instances' tables
+        // differ in a way no test would reproduce.
+        active.sort_unstable_by_key(|record| record.key_id);
+        Ok(active)
     }
 }
 

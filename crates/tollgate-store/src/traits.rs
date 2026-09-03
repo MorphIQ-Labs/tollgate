@@ -7,8 +7,8 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountStatus, CostUnits, FencingToken, Generation, LeaseGrant, LeaseId, Principal,
-    PublishableSnapshot, UsageEvent,
+    AccountId, AccountStatus, CostUnits, FencingToken, Generation, KeyId, LeaseGrant, LeaseId,
+    Principal, PublishableSnapshot, UsageEvent,
 };
 
 /// Backend failure unrelated to domain rules (connection lost, transaction
@@ -734,6 +734,116 @@ pub trait UsageSink: Send + Sync {
         events: &[UsageEvent],
         now: Timestamp,
     ) -> Result<IngestReport, StoreError>;
+}
+
+/// One credential's durable record.
+///
+/// The `digest` is opaque here on purpose. The HMAC secret that produced it
+/// lives with the verifier (`tollgate-auth`) and never reaches a store, so a
+/// backend holds material that verifies nothing on its own — the property
+/// `HmacRegistry` is built around, preserved across the persistence boundary.
+/// A store that could compute a digest would be a store whose compromise is
+/// sufficient to mint credentials.
+///
+/// `principal` is the digest's own truncation, so it is derived rather than
+/// assigned: the request path is keyed by it, and per-credential revocation
+/// is `install_revoked` for exactly this value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRecord {
+    pub key_id: KeyId,
+    pub account_id: AccountId,
+    /// The principal this credential authenticates as: the leading 128 bits
+    /// of `digest`.
+    pub principal: Principal,
+    /// HMAC-SHA256 of the secret under the verifier's server secret.
+    pub digest: [u8; 32],
+    /// When the credential stops being valid of its own accord, independent
+    /// of revocation. Surfaced to the request path through
+    /// `Verified::reusable_until`, so a session cache cannot outlive it.
+    pub not_after: Option<Timestamp>,
+}
+
+/// What a revocation actually did.
+///
+/// Returned rather than inferred, for the reason [`StatusChange`] is: an
+/// operator retiring a suspicious credential needs to know whether they
+/// retired anything. "Already revoked" and "no such key" are different
+/// answers to the same request and only one of them is a mistake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revocation {
+    /// The credential was live and is now retired.
+    Retired,
+    /// The credential was already retired; nothing changed.
+    AlreadyRetired,
+}
+
+/// Refusals from credential lifecycle operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyError {
+    /// No such credential. Never a silent no-op — an operator revoking a key
+    /// that does not exist has either the wrong id or a false belief about
+    /// what is live, and both are worth surfacing.
+    UnknownKey,
+    /// The credential's account does not exist, so nothing could authenticate
+    /// as it. Refused at issuance rather than producing a key that verifies
+    /// and is then denied by every admission.
+    UnknownAccount,
+    /// This `key_id` is already recorded. Issuance is never destructive, for
+    /// the reason account creation is not ([`CreateAccountError`]): an
+    /// overwrite would silently retire a live credential.
+    AlreadyExists,
+    Storage(StoreError),
+}
+
+impl std::fmt::Display for KeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyError::UnknownKey => f.write_str("no such credential"),
+            KeyError::UnknownAccount => f.write_str("no such account"),
+            KeyError::AlreadyExists => f.write_str("credential already exists"),
+            KeyError::Storage(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for KeyError {}
+
+/// Durable credential lifecycle: the half of key management that outlives a
+/// process and is shared by a fleet.
+///
+/// **Why this is a store trait rather than registry state.** Every other
+/// control-plane fact here — accounts, balances, leases, statuses, snapshots —
+/// is transactional in a backend with a local read projection, and credentials
+/// are the same class of fact. An in-memory-only registry would lose issued
+/// keys on restart, keep verifying a credential another instance revoked, and
+/// make a fleet-wide active-key limit unenforceable, because no instance sees
+/// the fleet.
+///
+/// **Durability before disclosure.** [`insert_key`](Self::insert_key) must
+/// commit before its caller returns the secret to anyone. A crash between the
+/// two hands out a credential the server has never heard of, which no later
+/// reconciliation can repair: the digest is unrecoverable from the record,
+/// which is the point of storing digests.
+///
+/// The verifier's projection is rebuilt from [`active_keys`](Self::active_keys),
+/// so a backend decides what "active" means once, here, rather than in each
+/// reader.
+#[async_trait]
+pub trait KeyDirectory: Send + Sync {
+    /// Record a minted credential. The caller has already generated the
+    /// secret and computed its digest; this stores what remains.
+    async fn insert_key(&self, record: KeyRecord) -> Result<(), KeyError>;
+
+    /// Retire one credential, reporting whether it was live.
+    ///
+    /// Revocation is durable and terminal: a retired credential is never
+    /// resurrected, for the same reason a snapshot tombstone is not
+    /// (INVARIANTS.md #15).
+    async fn revoke_key(&self, key_id: KeyId, now: Timestamp) -> Result<Revocation, KeyError>;
+
+    /// Every credential valid at `now`: not revoked, and not past its
+    /// `not_after`. This is the projection's source of truth.
+    async fn active_keys(&self, now: Timestamp) -> Result<Vec<KeyRecord>, StoreError>;
 }
 
 #[cfg(test)]

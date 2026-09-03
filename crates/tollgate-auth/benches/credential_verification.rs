@@ -36,8 +36,8 @@ fn now() -> Timestamp {
 }
 
 fn registry() -> HmacRegistry {
-    let mut registry = HmacRegistry::new(SECRET);
-    registry.register(CREDENTIAL);
+    let registry = HmacRegistry::new(SECRET);
+    registry.install_credentials([CREDENTIAL]);
     registry
 }
 

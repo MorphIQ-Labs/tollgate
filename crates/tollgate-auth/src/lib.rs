@@ -44,8 +44,8 @@
 //! use jiff::Timestamp;
 //! use tollgate_auth::{HmacRegistry, SessionCredential};
 //!
-//! let mut registry = HmacRegistry::new(b"secret-from-the-environment");
-//! let issued = registry.register(b"demo-key-1");
+//! let registry = HmacRegistry::new(b"secret-from-the-environment");
+//! let issued = registry.install_credentials([b"demo-key-1".as_slice()])[0];
 //!
 //! // One session — a connection, a TLS session, whatever the transport calls it.
 //! let session = SessionCredential::new();
