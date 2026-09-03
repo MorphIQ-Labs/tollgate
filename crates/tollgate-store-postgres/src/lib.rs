@@ -342,6 +342,15 @@ impl StoredSnapshot {
 ///
 /// `state = 0` is spelled out rather than bound, so the predicate is a literal
 /// the partial index can match.
+///
+/// Deliberately still its own statement. Folding it into the account read as a
+/// lateral subquery would make the reconciliation read atomic without a
+/// transaction, but it also destabilises the plan: measured over twelve runs
+/// of `the_account_filter_is_answered_by_an_index_not_by_discarding_rows`, the
+/// correlated form kept the index 4 times in 5 and the uncorrelated form 10
+/// times in 12, against 12 in 12 for this shape. Atomicity is bought with a
+/// transaction instead (#56), which leaves this predicate — and the plan #12
+/// pinned — untouched.
 const ACTIVE_LEASE_SUM_SQL: &str =
     "SELECT COALESCE(SUM(granted), 0)::BIGINT, COALESCE(SUM(used), 0)::BIGINT
      FROM tollgate_leases WHERE account_id = $1 AND state = 0";
@@ -585,32 +594,68 @@ impl PostgresStore {
         &self,
         account: AccountId,
     ) -> Result<Option<Conservation>, StoreError> {
-        let Some(row) = sqlx::query(
-            "SELECT deposited, balance, usage_recorded, settlement_loss, overage_recorded
-             FROM tollgate_accounts WHERE account_id = $1",
-        )
-        .bind(id_bytes(account.0))
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(storage)?
-        else {
-            return Ok(None);
-        };
-        let lease_row = sqlx::query(ACTIVE_LEASE_SUM_SQL)
+        // One snapshot for both halves. The account's stored totals and the
+        // sums over its live leases move together — `ingest` raises
+        // `usage_recorded` and the lease's `used` in one transaction — so
+        // reading them on two pooled connections let a commit land between
+        // them: reconciliation then paired a pre-write total with a post-write
+        // sum and reported corruption on a correct ledger, or underflowed the
+        // subtraction outright (#56).
+        //
+        // `READ COMMITTED` is not enough, because it takes a fresh snapshot
+        // per statement; `REPEATABLE READ` takes one at the first read and
+        // holds it for the rest of the transaction. Read-only, so it cannot
+        // hit the serialization failures that make `SERIALIZABLE` a retry
+        // contract rather than a snapshot.
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let result = async {
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?;
+            let account_row = sqlx::query(
+                "SELECT deposited, balance, usage_recorded, settlement_loss, overage_recorded
+                 FROM tollgate_accounts WHERE account_id = $1",
+            )
             .bind(id_bytes(account.0))
-            .fetch_one(&self.pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(storage)?;
+            let lease_row = sqlx::query(ACTIVE_LEASE_SUM_SQL)
+                .bind(id_bytes(account.0))
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(storage)?;
+            Ok::<_, StoreError>((account_row, lease_row))
+        }
+        .await;
+        let (account_row, lease_row) = finish_transaction(tx, result).await?;
+
+        let Some(row) = account_row else {
+            return Ok(None);
+        };
         let active_grants = to_units(lease_row.get::<i64, _>(0), "active lease grants")?;
         let active_used = to_units(lease_row.get::<i64, _>(1), "active lease usage")?;
+        let recorded = to_units(row.get::<i64, _>(2), "usage_recorded")?;
         Ok(Some(Conservation {
             deposited: to_units(row.get::<i64, _>(0), "deposited")?,
             overage_recorded: to_units(row.get::<i64, _>(4), "overage_recorded")?,
             balance: to_units(row.get::<i64, _>(1), "balance")?,
             active_lease_grants: active_grants,
-            settled_usage: to_units(row.get::<i64, _>(2), "usage_recorded")?
-                .checked_sub(active_used)
-                .expect("active usage never exceeds recorded usage"),
+            // Surfaced, never panicked on. These are two stored columns read
+            // from a database this process does not exclusively own, so
+            // `recorded < active_used` is corruption to report — the same
+            // class as a negative unit column (INVARIANTS.md #11) — not an
+            // internal invariant a caller could not violate. `MemoryStore`
+            // keeps its `expect` because there the counters are maintained by
+            // one process under one lock and the state is unrepresentable.
+            settled_usage: recorded.checked_sub(active_used).ok_or_else(|| {
+                StoreError(format!(
+                    "active lease usage {} exceeds recorded usage {} for account {account}",
+                    active_used.get(),
+                    recorded.get()
+                ))
+            })?,
             settlement_loss: to_units(row.get::<i64, _>(3), "settlement_loss")?,
         }))
     }

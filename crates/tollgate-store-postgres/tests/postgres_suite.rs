@@ -1533,6 +1533,141 @@ async fn negative_lease_sum_fails_conservation_read() {
     assert!(err.0.contains("active lease usage"), "got: {err}");
 }
 
+/// Issue #56: a reconciliation read must see one instant, even while the
+/// ledger is moving under it.
+///
+/// The two halves of the equation move together under `ingest`: it raises the
+/// account's `usage_recorded` and the lease's `used` in one transaction. Read
+/// as two statements on two pooled connections, an `ingest` committing between
+/// them paired a pre-write total with a post-write sum — reporting corruption
+/// on a correct ledger, or underflowing the subtraction and panicking inside a
+/// library call on a read-only path.
+///
+/// The existing `no_double_spend_across_instances` cannot catch this: it
+/// reconciles only after every task has joined, at quiescence, where any
+/// interleaving reads the same answer. This one reads *during* the writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconciliation_read_never_observes_a_torn_ledger() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100_000).await else {
+        return;
+    };
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(50_000), TTL, t(0))
+        .await
+        .unwrap();
+
+    const WRITES: u32 = 200;
+    // The writer's progress, so the reader can prove it read *during* the
+    // writes. `conservation`'s own output cannot show that: `ingest` raises
+    // `usage_recorded` and the lease's `used` together, so every field this
+    // read returns is invariant under the writes. Without this counter the
+    // test would pass just as happily against a quiesced ledger, which is the
+    // one thing it must not do.
+    let written = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+    // Writer: each ingest moves `usage_recorded` and the lease's `used`
+    // together in one transaction, so every commit is a window a torn read
+    // could fall into.
+    let writers = tokio::spawn({
+        let store = Arc::clone(&store);
+        let written = Arc::clone(&written);
+        async move {
+            for request in 0..u128::from(WRITES) {
+                UsageSink::ingest(&*store, &[usage(&lease, request, 1, 0)], t(1))
+                    .await
+                    .unwrap();
+                written.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+        }
+    });
+
+    // Reader: reconcile continuously against the moving ledger. Before the
+    // fix this either panicked or returned `holds() == false`.
+    let reader = tokio::spawn({
+        let store = Arc::clone(&store);
+        let written = Arc::clone(&written);
+        async move {
+            let mut overlapping = 0u32;
+            let mut reads = 0u32;
+            loop {
+                let before = written.load(std::sync::atomic::Ordering::Acquire);
+                let observed = store
+                    .conservation(ACCOUNT)
+                    .await
+                    .expect("a reconciliation read must not fail on a healthy ledger")
+                    .expect("the account exists");
+                assert!(
+                    observed.holds(),
+                    "reconciliation reported corruption on a correct ledger: {observed:?}"
+                );
+                reads += 1;
+                // A read that began after the first commit and ended before
+                // the last one straddles at least one commit boundary.
+                let after = written.load(std::sync::atomic::Ordering::Acquire);
+                if before > 0 && after < WRITES {
+                    overlapping += 1;
+                }
+                // Terminates on the writer's own progress rather than on a
+                // completion flag, so at least one read always happens
+                // whatever the scheduler does. A reader that never ran would
+                // otherwise fail this test for timing rather than for the
+                // defect it exists to catch.
+                if after >= WRITES || reads > 10_000 {
+                    break;
+                }
+            }
+            (reads, overlapping)
+        }
+    });
+
+    writers.await.unwrap();
+    let (reads, overlapping) = reader.await.unwrap();
+    assert!(reads > 0, "the reader must have run at all");
+    assert!(
+        overlapping > 0,
+        "every read landed outside the write sequence, so nothing was raced: \
+         {reads} reads, {overlapping} overlapping"
+    );
+    assert_conserved(&store).await;
+}
+
+/// Issue #56: usage recorded below the live leases' own usage is corruption to
+/// report, not to panic on."""
+///
+/// The subtraction runs over two stored columns of a database this process
+/// does not exclusively own, so it is the "surface it" case (INVARIANTS.md
+/// #11), not a documented internal invariant a caller could not violate.
+/// `MemoryStore` keeps its `expect` because there the counters are maintained
+/// by one process under one lock, and the state is unrepresentable.
+#[tokio::test]
+async fn usage_below_the_live_lease_sum_fails_the_conservation_read() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
+        .await
+        .unwrap();
+    let pool = corruption_pool().await;
+
+    // The lease has spent 100 of its grant while the account's total says
+    // nothing was ever spent — the shape a torn two-statement read produced
+    // on a correct ledger, and which a restore or an external write can
+    // produce on a real one.
+    set_lease_column(&pool, lease.lease_id.0, "used", 100).await;
+
+    let err = store
+        .conservation(ACCOUNT)
+        .await
+        .expect_err("a read that cannot subtract must report, not panic");
+    assert!(
+        err.0.contains("exceeds recorded usage"),
+        "the error must name the discrepancy it found; got: {err}"
+    );
+}
+
 #[tokio::test]
 async fn acquire_surfaces_negative_stored_balance() {
     let _guard = DB_LOCK.lock().await;
