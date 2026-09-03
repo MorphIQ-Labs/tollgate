@@ -939,6 +939,62 @@ impl SnapshotSource for FailingCatalogueSource {
     }
 }
 
+/// A source that answers snapshots but never answers enumeration.
+struct HangingCatalogueSource {
+    snapshot: Arc<AccountSnapshot>,
+}
+
+#[async_trait]
+impl SnapshotSource for HangingCatalogueSource {
+    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
+        Ok(SnapshotResolution::Present(publishable(Arc::clone(
+            &self.snapshot,
+        ))))
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
+        let (sender, receiver) = tokio::sync::broadcast::channel(1);
+        drop(sender);
+        receiver
+    }
+
+    async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
+        std::future::pending().await
+    }
+}
+
+/// INVARIANTS.md #18, issue #78's sibling: no snapshot-source call carries a
+/// wall-clock timeout — the manager bounds them by cancellation — so every
+/// loop-body await must be raced against the shutdown watch. Enumeration was
+/// the one that was not, which let a source that hangs on `principals()`
+/// hold shutdown open indefinitely.
+#[tokio::test(start_paused = true)]
+async fn a_hung_enumeration_does_not_hold_shutdown_open() {
+    let fixture = spawn_with(
+        Arc::new(HangingCatalogueSource {
+            snapshot: snapshot(1, PermissionBits::bit(0)),
+        }),
+        SnapshotManagerConfig {
+            // `All` is what makes the manager enumerate at all.
+            principals: TrackedPrincipals::All { seed: Vec::new() },
+            refresh_interval: std::time::Duration::from_millis(20),
+            unknown_ttl: SignedDuration::from_secs(30),
+            revoked_ttl: SignedDuration::from_secs(3_600),
+            retry_backoff: std::time::Duration::from_millis(5),
+            max_concurrent_fetches: 4,
+        },
+    );
+    settle().await;
+
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fixture.manager.shutdown(),
+    )
+    .await
+    .expect("a hung enumeration must not hold shutdown open");
+    assert!(!report.task_died, "the task returned rather than hanging");
+}
+
 fn spawn_with(source: Arc<dyn SnapshotSource>, config: SnapshotManagerConfig) -> Fixture {
     let map = Arc::new(ArcSwapSnapshotMap::new());
     let engine = AdmissionEngine::new(Arc::clone(&map));

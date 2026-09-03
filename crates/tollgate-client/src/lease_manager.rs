@@ -30,6 +30,15 @@
 //! could not return are counted in [`LeaseManagerReport::abandoned`] and
 //! settle at TTL reclaim.
 //!
+//! Those bounds are per *pass*, not per call, because the cost of a pass is
+//! what the loop's two latency promises are made of. A steady-state release
+//! pass carries one `store_call_timeout` across every parked lease and each
+//! call within it is additionally capped by that budget, so neither refill
+//! latency (#6) nor shutdown latency (#18) grows with the number of parked
+//! leases. Both long awaits in the loop body — the release pass and
+//! `acquire` — are raced against the shutdown watch, so the signal is acted
+//! on where it arrives rather than at the next loop top (issue #78).
+//!
 //! What a release refusal *means* differs by variant (issue #42): a storage
 //! error or timeout is retried next tick, a settled lease is dropped, a
 //! fenced release also clears the slot because the store rejected a
@@ -452,7 +461,11 @@ async fn run(
         }
 
         let now = clock.now();
-        release_quiesced(
+        // One budget for the pass, so a wedged backend costs this tick one
+        // store call's worth of wall clock whatever `parked.len()` is, and
+        // the refill below is not queued behind it (#6, #78).
+        let pass_deadline = tokio::time::Instant::now() + config.store_call_timeout;
+        if release_quiesced(
             &allocator,
             &mut parked,
             &clock,
@@ -460,8 +473,14 @@ async fn run(
             &slot,
             health,
             counters,
+            &mut shutdown,
+            pass_deadline,
         )
-        .await;
+        .await
+            == ReleasePass::ShutdownObserved
+        {
+            break;
+        }
         let needs_acquire = match slot.load() {
             None => true,
             Some(lease) if now >= lease.usable_until() => {
@@ -472,7 +491,9 @@ async fn run(
                 if let Some(old) = slot.take() {
                     parked.push(old);
                 }
-                release_quiesced(
+                // The rollover's own pass shares this tick's budget, so
+                // closing the slot cannot buy a second full pass.
+                if release_quiesced(
                     &allocator,
                     &mut parked,
                     &clock,
@@ -480,8 +501,14 @@ async fn run(
                     &slot,
                     health,
                     counters,
+                    &mut shutdown,
+                    pass_deadline,
                 )
-                .await;
+                .await
+                    == ReleasePass::ShutdownObserved
+                {
+                    break;
+                }
                 true
             }
             Some(lease) => lease.refill_due_or_rearm(),
@@ -492,13 +519,22 @@ async fn run(
 
         // A hung allocator must not park the refill loop: a timeout takes the
         // same path as a refusal, so the slot fails closed and the next tick
-        // tries again.
-        match tokio::time::timeout(
+        // tries again. The signal is raced against the call for the same
+        // reason it is raced inside the release pass — an acquire abandoned
+        // here settles nothing, and the slot it would have filled is one the
+        // shutdown phase is about to drain anyway (#78).
+        let acquire = tokio::time::timeout(
             config.store_call_timeout,
             allocator.acquire(config.account, config.target_grant, config.lease_ttl, now),
-        )
-        .await
-        {
+        );
+        let acquired = tokio::select! {
+            outcome = acquire => outcome,
+            _ = shutdown.changed() => {
+                tracing::debug!("shutdown observed during an acquire; abandoning the refill");
+                break;
+            }
+        };
+        match acquired {
             Ok(Ok(grant)) => {
                 counters.record_acquired(grant.units);
                 // Rotation: install the fresh lease and park the superseded
@@ -628,9 +664,36 @@ async fn run(
     report
 }
 
+/// What ended a release pass. A pass that did not run to completion leaves
+/// every lease it did not settle parked for the next one, so no outcome here
+/// can strand units: the caller either loops again or enters the shutdown
+/// release phase, and both see the full parked list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleasePass {
+    /// Every parked lease was examined.
+    Complete,
+    /// The pass budget ran out first. Unexamined leases keep their place at
+    /// the front of the queue, so the next pass starts with them.
+    BudgetExpired,
+    /// The shutdown signal arrived mid-pass. The caller must stop looping and
+    /// enter the shutdown release phase, which has its own budget.
+    ShutdownObserved,
+}
+
 /// Release every parked lease that has quiesced; keep the rest parked. Each
-/// parked lease is examined exactly once per pass, and each release call is
-/// wall-clock bounded.
+/// parked lease is examined at most once per pass, and the pass as a whole is
+/// wall-clock bounded — not merely each call within it.
+///
+/// One budget across the pass is what keeps this off both latency paths. With
+/// a per-call bound only, a pass against a wedged backend cost
+/// `parked.len() * store_call_timeout`, which the refill that rang the
+/// low-water doorbell waited behind (#6) and which a shutdown signal could
+/// not interrupt until the next loop top (#18) — issue #78, where six parked
+/// leases turned a stated 10s shutdown budget into ~75s.
+///
+/// A lease that consumes budget without settling yields its place: it goes
+/// behind the leases this pass never reached, so a single permanently hung
+/// lease cannot starve the rest of the queue pass after pass.
 ///
 /// The allocator's answer decides what the refusal *means* (issue #42):
 /// storage errors and timeouts keep the lease parked for the next tick; a
@@ -639,6 +702,11 @@ async fn run(
 /// has diverged from the store and spending must stop; and an invalid release
 /// means local accounting disagrees with the store's, which is not a state in
 /// which continuing to spend is safe — readiness drops and stays down.
+// The loop's context, passed through rather than captured: same shape and
+// same reason as `snapshot_manager::refresh_all_cancellable`, which carries
+// the same allow. Bundling these into a struct for one of the two and not the
+// other would trade a lint for an asymmetry.
+#[allow(clippy::too_many_arguments)]
 async fn release_quiesced(
     allocator: &Arc<dyn LeaseAllocator>,
     parked: &mut Vec<Arc<LocalLease>>,
@@ -647,9 +715,23 @@ async fn release_quiesced(
     slot: &Arc<LeaseSlot>,
     health: &watch::Sender<bool>,
     counters: &LeaseCounters,
-) {
+    shutdown: &mut watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+) -> ReleasePass {
+    // Ownership discipline for the whole pass: `queue` holds what has not
+    // been examined and `retry` what was examined without settling. Every
+    // early return writes both back, so a pass that stops early — for budget
+    // or for shutdown — cannot drop a lease on the floor. Taking the list and
+    // rebuilding it only at the end would strand every taken lease if this
+    // future were ever cancelled instead.
+    let mut queue = std::mem::take(parked).into_iter();
     let mut retry = Vec::new();
-    for lease in std::mem::take(parked) {
+    while let Some(lease) = queue.next() {
+        if tokio::time::Instant::now() >= deadline {
+            // Unexamined leases first: they have not had a turn this pass.
+            *parked = std::iter::once(lease).chain(queue).chain(retry).collect();
+            return ReleasePass::BudgetExpired;
+        }
         // The local binding must be the sole outer handle, and sharded slots
         // must have no independently reference-counted locality alias left.
         // Together those conditions mean no request can still reserve or
@@ -659,18 +741,38 @@ async fn release_quiesced(
             continue;
         }
         let grant = lease.grant();
-        let outcome = tokio::time::timeout(
-            config.store_call_timeout,
+        // No single call may outlast the per-call timeout, and none may
+        // outlast what is left of the pass budget — the same shape the
+        // shutdown release phase uses, for the same reason.
+        let call_deadline = deadline.min(tokio::time::Instant::now() + config.store_call_timeout);
+        let call = tokio::time::timeout_at(
+            call_deadline,
             allocator.release(
                 grant.lease_id,
                 grant.fencing_token,
                 lease.remaining(),
                 clock.now(),
             ),
-        )
-        .await;
+        );
         let lease_id = grant.lease_id;
-        match outcome {
+        // Racing the signal here is what makes the documented shutdown bound
+        // true: a signal arriving inside a hung release is acted on now, not
+        // after this call's timeout and the rest of the pass. The abandoned
+        // call settles nothing locally, so the lease is re-parked exactly as
+        // a timeout would leave it and the shutdown phase releases it again
+        // under its own budget.
+        let call_outcome = tokio::select! {
+            outcome = call => outcome,
+            _ = shutdown.changed() => {
+                tracing::debug!(
+                    lease = %lease_id,
+                    "shutdown observed during a release; entering the shutdown release phase"
+                );
+                *parked = std::iter::once(lease).chain(queue).chain(retry).collect();
+                return ReleasePass::ShutdownObserved;
+            }
+        };
+        match call_outcome {
             // Unfinished or unreachable: nothing was settled, try next tick.
             Err(_) => {
                 tracing::debug!(lease = %lease_id, "release timed out; retrying next tick");
@@ -722,7 +824,10 @@ async fn release_quiesced(
             }
         }
     }
+    // Reached only by examining every lease; the two early returns above own
+    // the partial cases and their ordering.
     *parked = retry;
+    ReleasePass::Complete
 }
 
 #[cfg(test)]
@@ -911,11 +1016,24 @@ mod tests {
             }
         }
 
+        /// A pass with a budget wide enough not to be the subject: the
+        /// tests that are about the budget set their own.
         async fn release_quiesced(
             &self,
             allocator: &Arc<dyn LeaseAllocator>,
             parked: &mut Vec<Arc<LocalLease>>,
-        ) {
+        ) -> ReleasePass {
+            self.release_pass(allocator, parked, std::time::Duration::from_secs(3_600))
+                .await
+        }
+
+        async fn release_pass(
+            &self,
+            allocator: &Arc<dyn LeaseAllocator>,
+            parked: &mut Vec<Arc<LocalLease>>,
+            budget: std::time::Duration,
+        ) -> ReleasePass {
+            let (_tx, mut shutdown) = watch::channel(false);
             release_quiesced(
                 allocator,
                 parked,
@@ -924,8 +1042,10 @@ mod tests {
                 &self.slot,
                 &self.health,
                 &self.counters,
+                &mut shutdown,
+                tokio::time::Instant::now() + budget,
             )
-            .await;
+            .await
         }
 
         fn stats(&self) -> LeaseStats {
@@ -1079,5 +1199,89 @@ mod tests {
             harness.is_healthy(),
             "a timeout is not accounting divergence"
         );
+    }
+
+    /// Issue #78: the pass carries one budget, so its cost does not scale
+    /// with the parked count. Six hung leases under a one-call budget cost
+    /// one call's wall clock, not six.
+    #[tokio::test(start_paused = true)]
+    async fn a_release_pass_costs_one_budget_whatever_the_parked_count() {
+        let scripted = ScriptedAllocator::new((1..=6).map(|id| (LeaseId(id), Refusal::Hang)));
+        let allocator: Arc<dyn LeaseAllocator> = Arc::clone(&scripted) as _;
+        let harness = Harness::new();
+        let mut parked: Vec<_> = (1..=6).map(parked_lease).collect();
+        let budget = std::time::Duration::from_millis(50);
+
+        let began = tokio::time::Instant::now();
+        let outcome = harness.release_pass(&allocator, &mut parked, budget).await;
+        let elapsed = began.elapsed();
+
+        assert_eq!(outcome, ReleasePass::BudgetExpired);
+        assert!(
+            elapsed < budget * 2,
+            "a pass over six hung leases took {elapsed:?}, which is per-call not per-pass"
+        );
+        assert_eq!(parked.len(), 6, "every lease is still parked, none dropped");
+    }
+
+    /// Issue #78: a lease that consumes the budget without settling goes
+    /// behind the ones the pass never reached, so it cannot starve them.
+    #[tokio::test(start_paused = true)]
+    async fn a_lease_that_eats_the_budget_yields_its_place() {
+        let scripted = ScriptedAllocator::new([(LeaseId(1), Refusal::Hang)]);
+        let allocator: Arc<dyn LeaseAllocator> = Arc::clone(&scripted) as _;
+        let harness = Harness::new();
+        let mut parked = vec![parked_lease(1), parked_lease(2), parked_lease(3)];
+        let budget = std::time::Duration::from_millis(50);
+
+        let outcome = harness.release_pass(&allocator, &mut parked, budget).await;
+
+        assert_eq!(outcome, ReleasePass::BudgetExpired);
+        let order: Vec<_> = parked.iter().map(|l| l.grant().lease_id).collect();
+        assert_eq!(
+            order,
+            [LeaseId(2), LeaseId(3), LeaseId(1)],
+            "the hung lease must not hold the front of the queue every pass"
+        );
+        assert_eq!(scripted.released(), [], "nothing settled under a hung head");
+    }
+
+    /// Issue #78: the signal is observed inside a hung release, and every
+    /// lease — the one in flight included — stays parked for the shutdown
+    /// release phase to attempt under its own budget.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_a_release_reparks_every_lease() {
+        let scripted = ScriptedAllocator::new([(LeaseId(1), Refusal::Hang)]);
+        let allocator: Arc<dyn LeaseAllocator> = Arc::clone(&scripted) as _;
+        let harness = Harness::new();
+        let mut parked = vec![parked_lease(1), parked_lease(2), parked_lease(3)];
+        let (tx, mut shutdown) = watch::channel(false);
+        let clock = clock();
+
+        let pass = release_quiesced(
+            &allocator,
+            &mut parked,
+            &clock,
+            &harness.config,
+            &harness.slot,
+            &harness.health,
+            &harness.counters,
+            &mut shutdown,
+            // A budget far past the signal, so the signal is what ends it.
+            tokio::time::Instant::now() + std::time::Duration::from_secs(3_600),
+        );
+        let signal = async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tx.send(true).unwrap();
+        };
+        let (outcome, ()) = tokio::join!(pass, signal);
+
+        assert_eq!(outcome, ReleasePass::ShutdownObserved);
+        assert_eq!(
+            parked.len(),
+            3,
+            "the in-flight lease and the unexamined ones all survive the pass"
+        );
+        assert_eq!(parked[0].grant().lease_id, LeaseId(1));
     }
 }
