@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.10.0...v0.10.1) - 2026-09-02
+
+### Other
+
+- *(client)* #102 remove the stale deprecation allow in readiness_scaling
+
 ## [0.10.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.9.0...v0.10.0) - 2026-09-02
 
 ### Added
