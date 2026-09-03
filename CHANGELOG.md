@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.10.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.10.1...v0.10.2) - 2026-09-03
+
+### Fixed
+
+- *(client)* #78 bound the release pass, not just its calls
+
 ## [0.10.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.10.0...v0.10.1) - 2026-09-02
 
 ### Other
