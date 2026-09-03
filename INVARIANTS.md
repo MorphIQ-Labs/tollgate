@@ -530,8 +530,11 @@ until it has one.
     (#103). An abandoned call is counted apart from a refusal — `refresh_timeouts`
     beside `refresh_failures`, as `acquire_timeouts` sits beside the lease
     manager's refusals — because a timeout is not a domain answer: the backend
-    may have done the work and simply not said so in time. What a bound could
-    not complete is
+    may have done the work and simply not said so in time. Racing a call
+    against shutdown is not a substitute for bounding it: it frees the
+    shutdown path and leaves every other caller parked, which is how principal
+    enumeration stayed unbounded after its cancellation was fixed (#59). What
+    a bound could not complete is
     reported — a lease left unreleased is `LeaseManagerReport::abandoned` and
     settles at TTL reclaim (#9); an undelivered batch is `WriterStats::lost` —
     never silently assumed done.
@@ -541,6 +544,8 @@ until it has one.
     `hung_release_cannot_stall_shutdown`,
     `shutdown_during_a_hung_acquire_is_not_delayed_by_it`,
     `a_hung_enumeration_does_not_hold_shutdown_open`,
+    `a_hung_enumeration_is_abandoned_so_the_loop_keeps_sweeping`,
+    `a_zero_enumeration_timeout_is_rejected`,
     `a_hung_fetch_is_abandoned_so_the_sweep_keeps_running`,
     `a_zero_fetch_timeout_is_rejected`,
     `lease_manager::tests::{a_release_pass_costs_one_budget_whatever_the_parked_count,

@@ -481,6 +481,7 @@ fn build_app_with(
                 // microseconds is deliberate headroom — the bound exists to
                 // keep the sweep returning (#103), not to police latency.
                 fetch_timeout: std::time::Duration::from_secs(5),
+                enumeration_timeout: std::time::Duration::from_secs(30),
             },
         )
         .expect("snapshot-manager configuration is valid");

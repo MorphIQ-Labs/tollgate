@@ -177,6 +177,22 @@ pub struct SnapshotManagerConfig {
     /// It is independent of `refresh_interval`, which is a freshness cadence
     /// rather than a statement about call latency.
     pub fetch_timeout: std::time::Duration,
+    /// How long one principal enumeration may run before it is abandoned.
+    ///
+    /// Separate from [`fetch_timeout`](Self::fetch_timeout) because the two
+    /// calls have different worst cases, not because the mechanism differs:
+    /// `snapshot` returns one principal's row, `principals` returns the whole
+    /// catalogue. A single bound would have to be sized for the enumeration,
+    /// which would leave the per-fetch bound uselessly loose — and a limit is
+    /// justified against the largest legitimate input, so one value cannot
+    /// serve two inputs that differ by orders of magnitude.
+    ///
+    /// Set it above the slowest enumeration this source legitimately
+    /// performs, counted over the whole tracked set rather than a typical one.
+    /// An abandoned enumeration keeps the set it already had, so a value under
+    /// real catalogue latency freezes discovery while everything already
+    /// tracked keeps working — the failure #48 exists to make visible.
+    pub enumeration_timeout: std::time::Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +224,11 @@ impl SnapshotManagerConfig {
         }
         if self.fetch_timeout.is_zero() {
             return Err(SnapshotManagerConfigError("fetch_timeout must be positive"));
+        }
+        if self.enumeration_timeout.is_zero() {
+            return Err(SnapshotManagerConfigError(
+                "enumeration_timeout must be positive",
+            ));
         }
         if self.max_concurrent_fetches == 0 {
             return Err(SnapshotManagerConfigError(
@@ -1150,17 +1171,41 @@ async fn discover(
     source: &Arc<dyn SnapshotSource>,
     resolutions: &mut Resolutions,
     counters: &SnapshotCounters,
+    config: &SnapshotManagerConfig,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Option<()> {
+    // Bounded as well as raced. The shutdown race means a wedged enumeration
+    // cannot hold shutdown open, but nothing else escaped it: during ordinary
+    // operation the loop stayed parked here, stopped sweeping, and never
+    // recovered — the same shape #103 fixed for fetches, on the one source
+    // call it did not cover (#59).
+    //
+    // Both awaits carry the bound. The second is the spurious-wake path: a
+    // watch change that is not a shutdown falls through to a fresh call, and
+    // leaving that one bare would have kept the trap open for exactly the
+    // wake-up that is not shutting anything down.
+    let enumerate = || tokio::time::timeout(config.enumeration_timeout, source.principals());
     let enumerated = tokio::select! {
-        enumerated = source.principals() => enumerated,
+        enumerated = enumerate() => enumerated,
         changed = shutdown.changed() => {
             if changed.is_err() || *shutdown.borrow() {
                 tracing::debug!("shutdown observed during principal enumeration");
                 return None;
             }
-            source.principals().await
+            enumerate().await
         }
+    };
+    let Ok(enumerated) = enumerated else {
+        // Counted as a discovery failure, because the consequence is the same
+        // one #48 names: the tracked set is frozen, everything already known
+        // keeps being refreshed, and nothing new is ever discovered. The event
+        // says which of the two it was.
+        counters.record_discovery_failure();
+        tracing::warn!(
+            timeout_ms = config.enumeration_timeout.as_millis(),
+            "principal enumeration abandoned at its bound; keeping the current set"
+        );
+        return Some(());
     };
     match enumerated {
         Ok(Some(discovered)) => resolutions.retain(discovered.into_iter().collect()),
@@ -1194,7 +1239,7 @@ async fn run(
     // is not fatal: the retry loop below covers it, and the seed keeps the
     // instance serving whatever it was told about meanwhile.
     if config.principals.discovers()
-        && discover(&source, &mut resolutions, &counters, &mut shutdown)
+        && discover(&source, &mut resolutions, &counters, &config, &mut shutdown)
             .await
             .is_none()
     {
@@ -1369,7 +1414,7 @@ async fn run(
                 // dropped. Over HTTP this is the only propagation path there
                 // is, because `subscribe` is a closed channel.
                 if config.principals.discovers()
-                    && discover(&source, &mut resolutions, &counters, &mut shutdown)
+                    && discover(&source, &mut resolutions, &counters, &config, &mut shutdown)
                         .await
                         .is_none()
                 {
@@ -1855,6 +1900,7 @@ mod tests {
             retry_backoff: std::time::Duration::from_secs(2),
             max_concurrent_fetches: 1,
             fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(30),
         };
         // An absent row: the short TTL, so a signup in flight — or a source
         // still coming up — is picked up soon. A published tombstone: the long
