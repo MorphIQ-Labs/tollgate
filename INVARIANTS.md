@@ -497,9 +497,9 @@ until it has one.
 
 18. **Background store calls are wall-clock bounded, and so is every pass
     over them.** No background task may be parked by a backend that hangs
-    rather than answering: every allocator and sink call a client task makes
-    carries a configured timeout, and each graceful shutdown carries a total
-    budget, so shutdown terminates whatever the backend does. Bounding by
+    rather than answering: every allocator, sink, and snapshot-source call a
+    client task makes carries a configured timeout, and each graceful shutdown
+    carries a total budget, so shutdown terminates whatever the backend does. Bounding by
     retry *count* alone is not a bound, and neither is a per-call bound on a
     pass that makes `N` calls: the lease manager's release pass carries one
     `store_call_timeout` across every parked lease, so no loop-body cost
@@ -507,8 +507,15 @@ until it has one.
     loop's body is raced against that task's shutdown watch, so the signal is
     acted on where it arrives rather than at the next loop top — this is what
     makes `LeaseManager::shutdown`'s documented `shutdown_release_deadline`
-    bound true, and it is the only bound the snapshot manager has, its source
-    calls carrying no timeout at all. What a bound could not complete is
+    bound true. A bound must also let the loop *return*: a fetch future that
+    never resolves is abandoned at `fetch_timeout` rather than awaited
+    forever, because a `JoinSet` that cannot empty stops the snapshot sweep
+    from returning at all, and readiness then falls without ever recovering
+    (#103). An abandoned call is counted apart from a refusal — `refresh_timeouts`
+    beside `refresh_failures`, as `acquire_timeouts` sits beside the lease
+    manager's refusals — because a timeout is not a domain answer: the backend
+    may have done the work and simply not said so in time. What a bound could
+    not complete is
     reported — a lease left unreleased is `LeaseManagerReport::abandoned` and
     settles at TTL reclaim (#9); an undelivered batch is `WriterStats::lost` —
     never silently assumed done.
@@ -518,6 +525,8 @@ until it has one.
     `hung_release_cannot_stall_shutdown`,
     `shutdown_during_a_hung_acquire_is_not_delayed_by_it`,
     `a_hung_enumeration_does_not_hold_shutdown_open`,
+    `a_hung_fetch_is_abandoned_so_the_sweep_keeps_running`,
+    `a_zero_fetch_timeout_is_rejected`,
     `lease_manager::tests::{a_release_pass_costs_one_budget_whatever_the_parked_count,
     a_lease_that_eats_the_budget_yields_its_place,
     shutdown_during_a_release_reparks_every_lease}`, and

@@ -185,6 +185,7 @@ async fn http_negative_ttl_refetches_without_push() {
             revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(20),
             max_concurrent_fetches: 1,
+            fetch_timeout: std::time::Duration::from_secs(5),
         },
     )
     .unwrap();
@@ -448,6 +449,7 @@ async fn http_instance_discovers_a_principal_published_after_it_started() {
             revoked_ttl: SignedDuration::from_secs(3_600),
             retry_backoff: std::time::Duration::from_millis(20),
             max_concurrent_fetches: 4,
+            fetch_timeout: std::time::Duration::from_secs(5),
         },
     )
     .unwrap();
