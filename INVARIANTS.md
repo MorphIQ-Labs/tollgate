@@ -302,8 +302,13 @@ until it has one.
    happen, so no embedder can forget to; and the time the sink last answered
    separates a quiet writer from an unreachable one — a distinction `lost`
    cannot make while the process runs, since the steady-state path retries
-   forever and declares loss only at the final flush. *Tests:* client writer
+   forever and declares loss only at the final flush. The drain's budget is
+   total wall clock, so its retry backoffs sleep into whatever remains and
+   never past it: an overrun spends the margin `expiry_safety_margin +
+   reclaim_grace` reserves (#12), and bounding by attempt count alone is not a
+   bound (#18, #63). *Tests:* client writer
    overflow tests,
+   `the_final_flush_backoff_cannot_overrun_the_drain_deadline`,
    `shutdown_flushes_in_configured_batch_sizes`,
    `shutdown_during_outage_terminates_and_reports_loss`,
    `reserve_fails_once_shutdown_begins`,

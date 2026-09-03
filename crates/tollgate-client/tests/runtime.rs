@@ -1930,3 +1930,60 @@ async fn shutdown_abandons_a_lease_an_in_flight_request_still_holds() {
     // the units were not returned.
     assert!(in_flight.try_debit(CostUnits(50), t(0)).is_ok());
 }
+
+/// Issue #63, INVARIANTS #8: the drain deadline is the drain's total wall
+/// clock, backoffs included.
+///
+/// `final_flush_backs_off_only_between_attempts` pins the backoff *count*, but
+/// runs with a 60s deadline and a 100ms backoff — so it can never observe the
+/// two interacting. The exposing configuration is the opposite one, and it is
+/// not exotic: the module doc tells an operator to size the drain inside
+/// `expiry_safety_margin + reclaim_grace`, which makes a short deadline beside
+/// a longer backoff the ordinary shape.
+///
+/// Overrunning here is not merely a slow shutdown. The lease manager releases
+/// after the writer drains, so the overrun spends the margin that keeps a
+/// straggler billable: events that do land arrive against a lease the
+/// allocator has re-granted and are refused — the outcome #12's budget exists
+/// to prevent.
+#[tokio::test(start_paused = true)]
+async fn the_final_flush_backoff_cannot_overrun_the_drain_deadline() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let sink = Arc::new(FlakySink {
+        inner: store.clone(),
+        failures_left: AtomicU32::new(u32::MAX),
+    });
+    let mut config = writer_config(16);
+    config.flush_interval = std::time::Duration::from_secs(3_600);
+    // The shape that exposes it: a backoff longer than the whole budget.
+    config.shutdown_drain_deadline = std::time::Duration::from_secs(2);
+    config.retry_backoff = std::time::Duration::from_secs(5);
+    config.ingest_timeout = std::time::Duration::from_millis(50);
+    let (recorder, writer) = UsageWriter::spawn(sink, clock, config).unwrap();
+    recorder.try_reserve().unwrap().record(event(1, 10, &lease));
+
+    let start = tokio::time::Instant::now();
+    let stats = writer.shutdown().await.unwrap();
+    let took = start.elapsed();
+
+    assert_eq!(
+        stats.lost, 1,
+        "an undeliverable event is counted, not dropped"
+    );
+    assert!(
+        took <= config.shutdown_drain_deadline + config.ingest_timeout,
+        "the drain took {took:?} against a {:?} budget; a backoff that sleeps \
+         past the deadline spends the margin that keeps a straggler billable",
+        config.shutdown_drain_deadline
+    );
+}

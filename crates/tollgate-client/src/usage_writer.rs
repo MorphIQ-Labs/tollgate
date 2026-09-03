@@ -797,10 +797,30 @@ async fn flush_bounded(
                 break;
             }
             Ok(Err(_)) if attempt < FINAL_FLUSH_ATTEMPTS => {
-                tokio::time::sleep(config.retry_backoff).await;
+                // The backoff sleeps into whatever budget is left, never past
+                // it. Sleeping the full `retry_backoff` here overran the
+                // deadline by up to `2 * retry_backoff`, because the comment
+                // claiming otherwise was attached to the *timeout* arm while
+                // this one — an ordinary store error, and the common case —
+                // slept unconditionally (#63).
+                //
+                // That overrun is not merely a slow shutdown. The drain's
+                // budget is sized inside `expiry_safety_margin + reclaim_grace`
+                // (#12), so overrunning it releases leases past the window
+                // that keeps a straggler billable: events that do land arrive
+                // against a lease the allocator has re-granted, and are
+                // refused. Bounding by attempt *count* alone is not a bound
+                // (#18).
+                tokio::time::sleep_until(
+                    deadline.min(tokio::time::Instant::now() + config.retry_backoff),
+                )
+                .await;
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
             }
-            // The deadline governs the retries too: once it has passed there
-            // is no budget left to back off into.
+            // Once the deadline has passed there is no budget left to back
+            // off into, and none to make another attempt with.
             Err(_) => break,
             Ok(Err(_)) => {}
         }
