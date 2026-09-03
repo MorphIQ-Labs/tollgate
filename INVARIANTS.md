@@ -247,8 +247,24 @@ until it has one.
    IDs) never double-bills. Every successful mixed batch classifies each
    input exactly once as accepted, duplicate, or rejected; only accepted
    events change either ledger, and their grouped lease/account effects stay
-   in the same atomic transaction. *Tests:* `usage_replay_is_idempotent` and
-   `mixed_usage_batch_preserves_partial_acceptance` (store suites).
+   in the same atomic transaction.
+
+   A batch that *fails* changes neither ledger. This is where the reference
+   backend has to work for its living: `PostgresStore` gets it from one
+   transaction and `finish_transaction`, while `MemoryStore` must reach the
+   same outcome by computing every fallible value before it mutates anything
+   — the rule `acquire` states and `set_account_status` splits into
+   plan/apply. Applying as it walked left earlier events of a failed batch
+   committed while the caller was told the batch failed, which inverts
+   "partial data is surfaced, never silently absorbed": the replay counts them
+   as duplicates, so a partial success is reported as a total failure and
+   nothing says otherwise (#57).
+
+   *Tests:* `usage_replay_is_idempotent`,
+   `mixed_usage_batch_preserves_partial_acceptance`,
+   `a_failed_ingest_batch_leaves_the_ledger_untouched`, and
+   `a_refused_deposit_moves_neither_column` (all mirrored across both store
+   suites).
 
 8. **Accounting backpressure sheds.** When the usage queue is full, new work is
    refused with zero units charged. Usage events are never silently dropped

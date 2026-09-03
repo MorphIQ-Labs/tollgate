@@ -2873,3 +2873,90 @@ async fn two_credentials_cannot_share_a_principal() {
     );
     assert_eq!(store.active_keys(t(0)).await.unwrap().len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Failed operations move nothing (#57). Mirrors `store_suite.rs` by name. This
+// backend was already correct — `deposit` moves both columns in one statement
+// and `ingest` runs the batch in one transaction — so these assert the parity
+// the reference implementation had drifted from, at this backend's ceiling:
+// `BIGINT`, where memory's is `u64`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_refused_deposit_moves_neither_column() {
+    let _guard = DB_LOCK.lock().await;
+    let ceiling = u64::try_from(i64::MAX).unwrap();
+    let Some(store) = store_with_balance(full_grant_policy(), ceiling).await else {
+        return;
+    };
+    // Spend some balance so `balance < deposited`, the ordering that makes
+    // `deposited` overflow while `balance` still has room.
+    store
+        .acquire(ACCOUNT, CostUnits(1_000), TTL, t(0))
+        .await
+        .unwrap();
+    let before = store.conservation(ACCOUNT).await.unwrap().unwrap();
+    assert!(before.holds(), "fixture must start conserved: {before:?}");
+
+    let refused = AdminStore::deposit(&*store, ACCOUNT, CostUnits(500)).await;
+    assert!(refused.is_err(), "the deposit cannot be represented");
+
+    let after = store.conservation(ACCOUNT).await.unwrap().unwrap();
+    assert_eq!(
+        after.balance, before.balance,
+        "a refused deposit credited balance anyway"
+    );
+    assert_eq!(after.deposited, before.deposited);
+    assert!(
+        after.holds(),
+        "the ledger no longer conserves after a refused deposit: {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_ingest_batch_leaves_the_ledger_untouched() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 10_000).await else {
+        return;
+    };
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(1_000), TTL, t(0))
+        .await
+        .unwrap();
+    let before = store.conservation(ACCOUNT).await.unwrap().unwrap();
+
+    let ceiling = u64::try_from(i64::MAX).unwrap();
+    let failed = UsageSink::ingest(
+        &*store,
+        &[
+            usage(&lease, 1, 100, 0),
+            overage_usage(ACCOUNT, 2, ceiling, 0),
+        ],
+        t(1),
+    )
+    .await;
+    assert!(failed.is_err(), "the overage cannot be represented");
+
+    assert_eq!(
+        store.usage_recorded(ACCOUNT).await.unwrap(),
+        CostUnits::ZERO,
+        "the first event of a failed batch was applied anyway"
+    );
+    let after = store.conservation(ACCOUNT).await.unwrap().unwrap();
+    assert_eq!(after.settled_usage, before.settled_usage);
+    assert!(
+        after.holds(),
+        "conservation after a failed batch: {after:?}"
+    );
+
+    // The decisive one: the caller was told the batch failed, so a replay must
+    // accept the event rather than report it as already recorded.
+    let replay = UsageSink::ingest(&*store, &[usage(&lease, 1, 100, 0)], t(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        (replay.accepted, replay.duplicate),
+        (1, 0),
+        "an event from a failed batch was left indexed, so the replay saw a duplicate"
+    );
+}
