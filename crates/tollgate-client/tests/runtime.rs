@@ -1874,3 +1874,59 @@ fn invalid_lease_manager_timeouts_are_rejected() {
     config.shutdown_release_deadline = std::time::Duration::ZERO;
     assert!(config.validate().is_err());
 }
+
+/// Issue #62, INVARIANTS #1 and #6: shutdown must not release a lease an
+/// in-flight request can still spend.
+///
+/// `parked` at shutdown holds, by construction, the leases the last pass
+/// determined were *not* quiesced — `release_quiesced` re-parks exactly those.
+/// Releasing them read `remaining()` at an instant that was not final: the
+/// account is credited, the request then debits and commits, and total
+/// committed usage exceeds the allocation with a usage event to prove it.
+///
+/// The documented lifecycle says an embedder quiesces first (#13), but that is
+/// caller discipline — the tier the standards call drift-prone — and the
+/// predicate that makes it unnecessary already existed in the same file.
+///
+/// Held here by keeping an `Arc<LocalLease>` across `shutdown()`, which is
+/// what a request task in flight looks like from the manager's side.
+#[tokio::test(start_paused = true)]
+async fn shutdown_abandons_a_lease_an_in_flight_request_still_holds() {
+    let store = store(10_000);
+    let slot = LeaseSlot::for_account(ACCOUNT);
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let manager = LeaseManager::spawn(
+        store.clone(),
+        Arc::clone(&slot),
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        manager_config(),
+    )
+    .unwrap();
+    settle().await;
+
+    // The in-flight request: a view loaded before shutdown and still held
+    // across it, exactly as a handler holding a reservation would.
+    let in_flight = slot.load().expect("a lease is installed");
+    let balance_before = store.balance(ACCOUNT);
+
+    let report = manager.shutdown().await;
+
+    assert_eq!(
+        report.released, 0,
+        "a lease still reachable by a request must not be released"
+    );
+    assert_eq!(
+        report.abandoned, 1,
+        "it is abandoned instead, and reported — never silently dropped"
+    );
+    assert_eq!(
+        store.balance(ACCOUNT),
+        balance_before,
+        "no units were credited back while a request could still spend them; \
+         crediting early is what lets committed usage exceed the allocation"
+    );
+
+    // The request can still spend what it holds, which is the whole reason
+    // the units were not returned.
+    assert!(in_flight.try_debit(CostUnits(50), t(0)).is_ok());
+}
