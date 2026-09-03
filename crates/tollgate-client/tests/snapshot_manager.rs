@@ -85,6 +85,7 @@ fn fixture(store: Arc<MemoryStore>) -> Fixture {
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 4,
             fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(30),
         },
     )
     .unwrap();
@@ -281,6 +282,7 @@ async fn negative_ttl_retry_is_backed_off_and_recovers_without_push() {
             retry_backoff: std::time::Duration::from_millis(80),
             max_concurrent_fetches: 1,
             fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(30),
         },
     )
     .unwrap();
@@ -378,6 +380,7 @@ async fn readiness_falls_when_snapshot_expires_during_outage() {
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 2,
             fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(30),
         },
     )
     .unwrap();
@@ -417,6 +420,7 @@ async fn snapshot_counters_track_failures_and_the_unresolved_gauge() {
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 2,
             fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(30),
         },
     )
     .unwrap();
@@ -502,6 +506,7 @@ async fn readiness_falls_if_refresh_hangs_across_snapshot_expiry() {
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 1,
             fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(30),
         },
     )
     .unwrap();
@@ -552,6 +557,7 @@ async fn shutdown_cancels_in_flight_snapshot_fetches() {
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 4,
             fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(30),
         },
     )
     .unwrap();
@@ -600,6 +606,7 @@ async fn a_panicking_fetch_does_not_kill_the_manager() {
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 1,
             fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(30),
         },
     )
     .unwrap();
@@ -623,6 +630,7 @@ fn a_zero_fetch_timeout_is_rejected() {
         retry_backoff: std::time::Duration::from_millis(5),
         max_concurrent_fetches: 4,
         fetch_timeout: std::time::Duration::ZERO,
+        enumeration_timeout: std::time::Duration::from_secs(30),
     };
     assert_eq!(
         config.validate().unwrap_err().to_string(),
@@ -640,6 +648,7 @@ fn invalid_snapshot_manager_intervals_are_rejected() {
         retry_backoff: std::time::Duration::from_millis(5),
         max_concurrent_fetches: 4,
         fetch_timeout: std::time::Duration::from_secs(5),
+        enumeration_timeout: std::time::Duration::from_secs(30),
     };
     assert!(config.validate().is_err());
 }
@@ -660,6 +669,7 @@ async fn mismatched_local_sharding_is_rejected_before_tasks_start() {
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 4,
             fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(30),
         },
     );
     let error = match result {
@@ -694,6 +704,7 @@ fn discovering_fixture(store: Arc<MemoryStore>) -> Fixture {
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 4,
             fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(30),
         },
     )
     .unwrap();
@@ -887,6 +898,7 @@ async fn one_unanswerable_principal_unreadies_only_a_fixed_instance() {
                 retry_backoff: std::time::Duration::from_millis(5),
                 max_concurrent_fetches: 4,
                 fetch_timeout: std::time::Duration::from_secs(5),
+                enumeration_timeout: std::time::Duration::from_secs(30),
             },
         )
         .unwrap();
@@ -992,6 +1004,114 @@ impl SnapshotSource for HangingCatalogueSource {
     }
 }
 
+/// A source whose enumeration hangs until released, and which answers
+/// snapshots normally throughout.
+struct HangsOnEnumerationSource {
+    snapshot: Arc<AccountSnapshot>,
+    release: Arc<tokio::sync::Notify>,
+    enumerations: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl SnapshotSource for HangsOnEnumerationSource {
+    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
+        Ok(SnapshotResolution::Present(publishable(Arc::clone(
+            &self.snapshot,
+        ))))
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
+        let (sender, receiver) = tokio::sync::broadcast::channel(1);
+        drop(sender);
+        receiver
+    }
+
+    async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
+        self.enumerations.fetch_add(1, Ordering::AcqRel);
+        self.release.notified().await;
+        Ok(Some(vec![PRINCIPAL]))
+    }
+}
+
+/// Issue #59: an enumeration that never answers is abandoned at
+/// `enumeration_timeout`, so the loop keeps sweeping.
+///
+/// #78 raced this call against the shutdown watch, which stopped a wedged
+/// enumeration holding shutdown open — but nothing else escaped it. During
+/// ordinary operation the loop stayed parked in `discover`, stopped sweeping,
+/// and never recovered. That is the shape #103 fixed for fetches, on the one
+/// source call it did not cover.
+///
+/// The counter is the evidence the loop kept running: a manager parked inside
+/// one enumeration never starts a second.
+#[tokio::test(start_paused = true)]
+async fn a_hung_enumeration_is_abandoned_so_the_loop_keeps_sweeping() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let enumerations = Arc::new(AtomicUsize::new(0));
+    let fixture = spawn_with(
+        Arc::new(HangsOnEnumerationSource {
+            snapshot: snapshot(1, PermissionBits::bit(0)),
+            release: Arc::clone(&release),
+            enumerations: Arc::clone(&enumerations),
+        }),
+        SnapshotManagerConfig {
+            // `All` is what makes the manager enumerate at all.
+            principals: TrackedPrincipals::All {
+                seed: vec![PRINCIPAL],
+            },
+            refresh_interval: std::time::Duration::from_millis(50),
+            unknown_ttl: SignedDuration::from_secs(30),
+            revoked_ttl: SignedDuration::from_secs(3_600),
+            retry_backoff: std::time::Duration::from_millis(5),
+            max_concurrent_fetches: 4,
+            fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_millis(100),
+        },
+    );
+    let counters = fixture.manager.counters();
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let attempted = enumerations.load(Ordering::Acquire);
+    assert!(
+        attempted >= 2,
+        "the loop must keep sweeping and re-enumerating, got {attempted} attempts"
+    );
+    let stats = counters.snapshot();
+    assert!(
+        stats.discovery_failures >= 2,
+        "an abandoned enumeration is a discovery failure, so a frozen tracked \
+         set is visible to a scrape; got {}",
+        stats.discovery_failures
+    );
+    assert!(
+        stats.refresh_attempts > 0,
+        "the seeded principal must still be refreshed while enumeration is wedged"
+    );
+
+    release.notify_waiters();
+    fixture.manager.shutdown().await;
+}
+
+/// INVARIANTS.md #16: no config field is silently repaired.
+#[test]
+fn a_zero_enumeration_timeout_is_rejected() {
+    let config = SnapshotManagerConfig {
+        principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
+        refresh_interval: std::time::Duration::from_millis(20),
+        unknown_ttl: SignedDuration::from_secs(30),
+        revoked_ttl: SignedDuration::from_secs(3_600),
+        retry_backoff: std::time::Duration::from_millis(5),
+        max_concurrent_fetches: 4,
+        fetch_timeout: std::time::Duration::from_secs(5),
+        enumeration_timeout: std::time::Duration::ZERO,
+    };
+    assert_eq!(
+        config.validate().unwrap_err().to_string(),
+        "enumeration_timeout must be positive"
+    );
+}
+
 /// INVARIANTS.md #18, issue #78's sibling: no snapshot-source call carries a
 /// wall-clock timeout — the manager bounds them by cancellation — so every
 /// loop-body await must be raced against the shutdown watch. Enumeration was
@@ -1012,6 +1132,7 @@ async fn a_hung_enumeration_does_not_hold_shutdown_open() {
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 4,
             fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(30),
         },
     );
     settle().await;
@@ -1082,6 +1203,7 @@ async fn a_hung_fetch_is_abandoned_so_the_sweep_keeps_running() {
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 1,
             fetch_timeout: std::time::Duration::from_millis(100),
+            enumeration_timeout: std::time::Duration::from_secs(30),
         },
     );
     let counters = fixture.manager.counters();
@@ -1184,6 +1306,7 @@ async fn an_abandoned_fetch_is_throttled_like_a_refusal() {
             retry_backoff: std::time::Duration::from_millis(300),
             max_concurrent_fetches: 1,
             fetch_timeout: std::time::Duration::from_millis(20),
+            enumeration_timeout: std::time::Duration::from_secs(30),
         },
     )
     .unwrap();
@@ -1238,6 +1361,7 @@ fn discovering_config(refresh_ms: u64) -> SnapshotManagerConfig {
         retry_backoff: std::time::Duration::from_millis(5),
         max_concurrent_fetches: 4,
         fetch_timeout: std::time::Duration::from_secs(5),
+        enumeration_timeout: std::time::Duration::from_secs(30),
     }
 }
 
@@ -1425,6 +1549,7 @@ fn churn_config(revoked_ttl: SignedDuration) -> SnapshotManagerConfig {
         retry_backoff: std::time::Duration::from_millis(5),
         max_concurrent_fetches: 4,
         fetch_timeout: std::time::Duration::from_secs(5),
+        enumeration_timeout: std::time::Duration::from_secs(30),
     }
 }
 
@@ -1515,6 +1640,7 @@ async fn a_live_principal_that_goes_absent_recovers_on_the_unknown_ttl() {
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 1,
             fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(30),
         },
     )
     .unwrap();
@@ -1583,6 +1709,7 @@ async fn a_reinstated_principal_comes_back_on_the_revoked_ttl() {
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 1,
             fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(30),
         },
     )
     .unwrap();
@@ -1654,6 +1781,7 @@ async fn a_stale_positive_cannot_drop_readiness() {
             retry_backoff: std::time::Duration::from_millis(5),
             max_concurrent_fetches: 1,
             fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(30),
         },
     )
     .unwrap();
@@ -1760,6 +1888,7 @@ async fn a_push_reinstates_an_absent_principal_at_its_own_generation() {
             retry_backoff: std::time::Duration::from_secs(3_600),
             max_concurrent_fetches: 1,
             fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(30),
         },
     )
     .unwrap();
@@ -1827,6 +1956,7 @@ async fn a_refused_answer_is_retried_with_backoff_not_at_source_latency() {
             retry_backoff: std::time::Duration::from_millis(200),
             max_concurrent_fetches: 1,
             fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(30),
         },
     )
     .unwrap();
