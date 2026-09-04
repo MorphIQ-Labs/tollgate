@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.14.0"
+version = "0.14.1"
 edition = "2024"
 rust-version = "1.89"
 authors = ["MorphIQ Labs"]
@@ -39,7 +39,7 @@ serde_json = "1.0"
 # Dev/bench
 criterion = "0.5"
 proptest = "1.7"
-tollgate-alloc-count = { path = "crates/tollgate-alloc-count", version = "=0.14.0" }
+tollgate-alloc-count = { path = "crates/tollgate-alloc-count", version = "=0.14.1" }
 
 # Later members (admission/store/server/client) — declared centrally so every
 # crate resolves the same versions.
