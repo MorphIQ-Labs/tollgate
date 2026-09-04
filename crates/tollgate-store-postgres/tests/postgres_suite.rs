@@ -17,9 +17,9 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::Mutex;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, BudgetSchedule, CostTable, CostUnits, FencingToken,
-    Generation, KeyId, LeaseId, PermissionBits, Principal, PublishableSnapshot, RequestId,
-    ResolvedLimits, UsageEvent, UsageSource,
+    AccountId, AccountSnapshot, AccountStatus, BudgetSchedule, BudgetView, CostTable, CostUnits,
+    FencingToken, Generation, KeyId, LeaseId, PermissionBits, Principal, PublishableSnapshot,
+    RequestId, ResolvedLimits, UsageEvent, UsageSource,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, BudgetError, Conservation, CreateAccountError,
@@ -3747,4 +3747,324 @@ async fn a_lease_reclaimed_inside_its_own_period_expires_nothing() {
     );
     assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(500));
     assert_conserved(&store).await;
+}
+
+#[tokio::test]
+async fn a_published_snapshot_carries_the_ledgers_budget() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+        return;
+    };
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+    let principal = Principal(0x51);
+
+    let submitted = account_snapshot(ACCOUNT, 1, AccountStatus::Active);
+    assert_eq!(
+        submitted.budget, None,
+        "a builder cannot describe a balance; only the store can"
+    );
+    AdminStore::publish_snapshot(&*store, principal, publishable(Arc::new(submitted)))
+        .await
+        .unwrap();
+
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("the snapshot must be present");
+    };
+    let budget = fetched.budget.expect("the store stamps a budget view");
+    assert_eq!(budget.balance_at_publish, CostUnits(500));
+    assert_eq!(
+        budget.period_end,
+        Some(t(FEB)),
+        "the current period ends at the next boundary"
+    );
+}
+
+#[tokio::test]
+async fn the_budget_view_counts_units_out_on_lease() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    let principal = Principal(0x52);
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap();
+    store
+        .ingest(&[usage(&lease, 1, 150, 1)], t(1))
+        .await
+        .unwrap();
+
+    AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            1,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("the snapshot must be present");
+    };
+    assert_eq!(
+        fetched.budget.unwrap().balance_at_publish,
+        CostUnits(850),
+        "600 in the balance plus the lease's unspent 250; only the 150 spent is gone"
+    );
+    assert_eq!(
+        fetched.budget.unwrap().period_end,
+        None,
+        "an account with no schedule has no period that ends"
+    );
+}
+
+#[tokio::test]
+async fn a_supplied_budget_never_survives_publication() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 700).await else {
+        return;
+    };
+    let fabricated = BudgetView {
+        balance_at_publish: CostUnits(999_999),
+        period_end: Some(t(MAR)),
+    };
+
+    let known = publishable(Arc::new(account_snapshot(
+        ACCOUNT,
+        1,
+        AccountStatus::Active,
+    )))
+    .with_budget(Some(fabricated));
+    AdminStore::publish_snapshot(&*store, Principal(0x53), known)
+        .await
+        .unwrap();
+    let SnapshotResolution::Present(fetched) = store.snapshot(Principal(0x53)).await.unwrap()
+    else {
+        panic!("the snapshot must be present");
+    };
+    assert_eq!(
+        fetched.budget.unwrap().balance_at_publish,
+        CostUnits(700),
+        "the ledger's number, not the publisher's"
+    );
+
+    let stranger = AccountId(0xdead);
+    let unknown = publishable(Arc::new(account_snapshot(
+        stranger,
+        1,
+        AccountStatus::Active,
+    )))
+    .with_budget(Some(fabricated));
+    AdminStore::publish_snapshot(&*store, Principal(0x54), unknown)
+        .await
+        .unwrap();
+    let SnapshotResolution::Present(fetched) = store.snapshot(Principal(0x54)).await.unwrap()
+    else {
+        panic!("the snapshot must be present");
+    };
+    assert_eq!(
+        fetched.budget, None,
+        "an account the ledger does not hold reports no budget, not a fabricated one"
+    );
+}
+
+#[tokio::test]
+async fn the_budget_view_does_not_report_expired_units_as_spendable() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+    let principal = Principal(0x55);
+
+    // Nothing spent, so the whole 500 expires at the boundary.
+    roll(&store, FEB).await;
+    AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            1,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("the snapshot must be present");
+    };
+    assert_eq!(
+        fetched.budget.unwrap().balance_at_publish,
+        CostUnits(600),
+        "the new allowance plus the surviving top-up, and not a unit of the expired 500"
+    );
+    assert_eq!(fetched.budget.unwrap().period_end, Some(t(MAR)));
+}
+
+#[tokio::test]
+async fn the_budget_view_writes_off_settlement_loss() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    let principal = Principal(0x56);
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap();
+    store
+        .ingest(&[usage(&lease, 1, 150, 1)], t(1))
+        .await
+        .unwrap();
+    // 400 granted, 150 billed, 200 returned: 50 is written off.
+    store
+        .release(lease.lease_id, lease.fencing_token, CostUnits(200), t(2))
+        .await
+        .unwrap();
+
+    AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            1,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("the snapshot must be present");
+    };
+    assert_eq!(
+        fetched.budget.unwrap().balance_at_publish,
+        CostUnits(800),
+        "1000 funded, less the 150 billed and the 50 written off"
+    );
+    assert_conserved(&store).await;
+}
+
+/// Half a schedule is corruption, not a shape to interpret. The row's
+/// all-or-nothing CHECK makes it unstorable, so reaching this state means the
+/// constraint is gone — and a read that guessed at the missing half would
+/// present a period nobody configured as if an operator had asked for it.
+#[tokio::test]
+async fn a_partially_populated_schedule_is_reported_not_interpreted() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    let pool = corruption_pool().await;
+    let dropped = suspend_checks(&pool, "tollgate_accounts", "budget_allowance", None).await;
+    sqlx::query(
+        "UPDATE tollgate_accounts SET budget_period = 'utc_calendar_month' WHERE account_id = $1",
+    )
+    .bind(account_bytes())
+    .execute(&pool)
+    .await
+    .unwrap();
+    restore_checks(&pool, "tollgate_accounts", dropped).await;
+
+    let error = AdminStore::publish_snapshot(
+        &*store,
+        Principal(0x57),
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            1,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("partially populated"),
+        "the publish must say what it found: {error}"
+    );
+}
+
+/// A schedule name this binary cannot evaluate must not be rolled, reported,
+/// or silently treated as the variant it happens to know. Both columns are
+/// TEXT precisely so a variant added ahead of this one survives as a name
+/// rather than being re-labelled by an ordinal — and an older binary meeting
+/// that name has to refuse it.
+///
+/// The rollover column is the sharper of the two: reading an unknown
+/// carry-over rule as `Rollover::None` would expire an allowance the operator
+/// configured to carry, which is a silent deletion of units rather than a
+/// visible failure.
+#[tokio::test]
+async fn an_unrecognized_stored_schedule_name_is_refused() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    let pool = corruption_pool().await;
+
+    for (column, planted, principal) in [
+        ("budget_period", "lunar_month", Principal(0x58)),
+        ("budget_rollover", "carry_over", Principal(0x59)),
+    ] {
+        sqlx::query(
+            "UPDATE tollgate_accounts
+             SET budget_allowance = 500, budget_period = 'utc_calendar_month',
+                 budget_rollover = 'none'
+             WHERE account_id = $1",
+        )
+        .bind(account_bytes())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(&format!(
+            "UPDATE tollgate_accounts SET {column} = $1 WHERE account_id = $2"
+        ))
+        .bind(planted)
+        .bind(account_bytes())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = AdminStore::publish_snapshot(
+            &*store,
+            principal,
+            publishable(Arc::new(account_snapshot(
+                ACCOUNT,
+                1,
+                AccountStatus::Active,
+            ))),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains(planted),
+            "the refusal must name what it could not read in {column}: {error}"
+        );
+    }
+
+    // An unreadable *period* is also never selected by the rollover pass: its
+    // statement matches the period names this binary knows, so the account is
+    // left alone rather than rolled as if it were monthly.
+    sqlx::query("UPDATE tollgate_accounts SET budget_period = 'lunar_month' WHERE account_id = $1")
+        .bind(account_bytes())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let batch = AdminStore::roll_due_periods(&*store, t(FEB), NonZeroUsize::new(8).unwrap())
+        .await
+        .unwrap();
+    assert!(batch.is_empty());
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(100));
 }

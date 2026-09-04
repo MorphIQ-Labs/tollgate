@@ -159,6 +159,36 @@ impl BudgetSchedule {
     }
 }
 
+/// What an instance is told about its account's budget, carried by the
+/// snapshot (#97).
+///
+/// A *projection of the ledger at publication*, not a live balance: the
+/// request path performs no I/O, so this is the last thing the control plane
+/// said, and it ages between refreshes. Readers combine it with what the
+/// instance has spent since — see `estimate_remaining` in
+/// `tollgate-admission` — and the result is an estimate that names itself one.
+///
+/// The store stamps it. A publisher cannot supply it, because a balance is not
+/// a compiled policy decision the way permissions and limits are: it moves
+/// constantly and has exactly one authority. That is why
+/// [`AccountSnapshot`](crate::AccountSnapshot) has no builder setter for it,
+/// and `PublishableSnapshot::with_budget` is the only way to attach one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct BudgetView {
+    /// Everything the account could still spend when this snapshot was
+    /// published — its balance *plus* the unspent remainder of every active
+    /// lease, because units out on lease are still the account's.
+    ///
+    /// Equivalently, and this is how a backend computes it in one row read:
+    /// what the account was funded with, minus what it has consumed or lost.
+    pub balance_at_publish: CostUnits,
+    /// When the current period's allowance stops being spendable, for an
+    /// account that has a [`BudgetSchedule`]. `None` means no schedule — the
+    /// balance does not expire — and is not the same as "unknown".
+    pub period_end: Option<Timestamp>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

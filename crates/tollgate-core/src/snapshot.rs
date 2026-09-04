@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use jiff::Timestamp;
 
+use crate::budget::BudgetView;
 use crate::cost_table::CostTable;
 use crate::deny::DenyReason;
 use crate::ids::{AccountId, Generation, KeyId};
@@ -502,6 +503,28 @@ pub struct AccountSnapshot {
     pub permissions: PermissionBits,
     pub limits: ResolvedLimits,
     pub cost_table: Arc<CostTable>,
+    /// What the control plane last said about the account's budget (#97), or
+    /// `None` when it said nothing — an older control plane, or a publication
+    /// that did not go through a store.
+    ///
+    /// `None` is deliberately not "zero remaining": an instance that reported
+    /// a fabricated zero because its publisher predated the field would deny
+    /// nothing but would tell every caller they were out of quota. Readers
+    /// return `None` rather than a number they cannot stand behind.
+    ///
+    /// Defaults on the wire as well as in storage, the precedent
+    /// `enforcement_mode` set, so a control plane that predates this keeps
+    /// publishing successfully instead of getting a 422 for a field it has
+    /// never heard of.
+    ///
+    /// There is no builder setter: the store stamps this at publication and is
+    /// its only writer. See [`PublishableSnapshot::with_budget`].
+    ///
+    /// Free, spatially: it lands in the tail padding `#[repr(align(128))]`
+    /// already reserved, so `AccountSnapshot` remains 256 bytes and the
+    /// request path touches no line it did not already touch.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub budget: Option<BudgetView>,
 }
 
 /// Builder for the optional parts of an immutable account snapshot.
@@ -543,6 +566,9 @@ impl AccountSnapshotBuilder {
             permissions: self.permissions,
             limits: self.limits,
             cost_table: self.cost_table,
+            // Absent by construction. A publisher describes policy; the
+            // account's balance has one authority and it is the store.
+            budget: None,
         }
     }
 }
@@ -727,6 +753,32 @@ impl PublishableSnapshot {
     /// This is what an account-wide status change needs (#22): the ledger and
     /// every live snapshot move together, and re-deriving a proof that cannot
     /// have changed would only invite an `expect` at each call site.
+    /// Attach the ledger's budget view, carrying the publication proof over.
+    ///
+    /// Sound without revalidating for the reason [`restamped`](Self::restamped)
+    /// gives: [`try_new`](Self::try_new) checks the weighted-rate pair's
+    /// domain and the cost table's worst quote against the burst and any
+    /// overage cap. The budget view participates in none of them, so a
+    /// snapshot that was publishable stays publishable under any value of it.
+    ///
+    /// This exists so that the store, and only the store, can write the field:
+    /// [`AccountSnapshot`]'s builder has no setter for it, so no caller
+    /// outside this crate can put a balance into a snapshot except by
+    /// deserializing one — which is exactly why the argument is an `Option`
+    /// and a publish calls this *unconditionally*. An account the ledger does
+    /// not hold clears the field rather than leaving it, so a submitted value
+    /// can never survive publication. One fact, one writer — the rule #51
+    /// established for status, applied to a number that moves far faster.
+    #[must_use]
+    pub fn with_budget(&self, budget: Option<BudgetView>) -> Self {
+        let mut snapshot = AccountSnapshot::clone(&self.snapshot);
+        snapshot.budget = budget;
+        PublishableSnapshot {
+            snapshot: Arc::new(snapshot),
+            maximum_quote: self.maximum_quote,
+        }
+    }
+
     #[must_use]
     pub fn restamped(&self, status: AccountStatus, generation: Generation) -> Self {
         let mut snapshot = AccountSnapshot::clone(&self.snapshot);
@@ -833,6 +885,70 @@ mod tests {
                 "{status:?} disagrees with its serde spelling"
             );
         }
+    }
+
+    /// A payload from a control plane that predates periodic budgets. It must
+    /// decode, and it must decode to "nothing was said" — a required field
+    /// would deny every principal until the whole catalogue was republished,
+    /// and a defaulted zero would tell every caller they were out of quota.
+    #[test]
+    #[cfg(feature = "serde")]
+    fn a_snapshot_without_a_budget_key_decodes_as_no_budget() {
+        let snapshot = AccountSnapshot::builder(
+            AccountId(1),
+            Generation(1),
+            AccountStatus::Active,
+            Timestamp::from_second(10_000).unwrap(),
+            PermissionBits::ALL,
+            ResolvedLimits::new(64).with_weighted_rate(1_000, 1_000),
+            Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+        )
+        .build();
+
+        let mut value = serde_json::to_value(&snapshot).expect("a snapshot serializes");
+        let removed = value
+            .as_object_mut()
+            .expect("a snapshot is a JSON object")
+            .remove("budget");
+        assert!(removed.is_some(), "the field is on the wire when present");
+
+        let decoded: AccountSnapshot =
+            serde_json::from_value(value).expect("an older payload still decodes");
+        assert_eq!(decoded.budget, None);
+    }
+
+    /// The store overwrites this field on every publish, so the clearing arm
+    /// has to work as well as the setting one — that is what stops a value
+    /// arriving over the wire from surviving publication.
+    #[test]
+    fn with_budget_replaces_and_can_clear() {
+        let publishable = PublishableSnapshot::try_new(Arc::new(
+            AccountSnapshot::builder(
+                AccountId(1),
+                Generation(1),
+                AccountStatus::Active,
+                Timestamp::from_second(10_000).unwrap(),
+                PermissionBits::ALL,
+                ResolvedLimits::new(64).with_weighted_rate(1_000, 1_000),
+                Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+            )
+            .build(),
+        ))
+        .expect("the test snapshot is publishable");
+        assert_eq!(publishable.budget, None, "a builder cannot set one");
+
+        let view = BudgetView {
+            balance_at_publish: CostUnits(500),
+            period_end: None,
+        };
+        let stamped = publishable.with_budget(Some(view));
+        assert_eq!(stamped.budget, Some(view));
+        assert_eq!(
+            stamped.maximum_quote(),
+            publishable.maximum_quote(),
+            "the publication proof carries over: validation does not read the budget"
+        );
+        assert_eq!(stamped.with_budget(None).budget, None);
     }
 
     /// The same rule `AccountStatus` follows, for the same reason: the mode's

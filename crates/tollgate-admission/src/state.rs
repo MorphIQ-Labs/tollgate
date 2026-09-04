@@ -792,6 +792,18 @@ pub struct AccountAdmissionState {
     pub(crate) limiter: Arc<AccountLimiter>,
     pub(crate) principal_gauge: Arc<PrincipalGauge>,
     pub lease: Arc<LeaseSlot>,
+    /// The instance's admitted-unit total at the instant this snapshot was
+    /// installed, so the balance estimate can subtract only what has been
+    /// spent *since* the ledger reported it (#97).
+    ///
+    /// Captured here rather than reset on the counter because the counter is
+    /// account-wide, monotonic, and shared by every principal and every
+    /// generation — an exported tally nothing may rewind. A per-snapshot
+    /// baseline gets the same subtraction without touching it, and the
+    /// baseline and `snapshot.budget` are then true of exactly the same
+    /// instant, which is the only thing that makes their difference mean
+    /// anything.
+    units_admitted_at_publish: u64,
 }
 
 impl AccountAdmissionState {
@@ -809,12 +821,49 @@ impl AccountAdmissionState {
         principal_gauge: Arc<PrincipalGauge>,
     ) -> Arc<Self> {
         Arc::new(AccountAdmissionState {
+            units_admitted_at_publish: counters.units_admitted(),
             snapshot,
             counters,
             limiter,
             principal_gauge,
             lease,
         })
+    }
+
+    /// What the account can still spend this period, as well as this instance
+    /// can know it.
+    ///
+    /// `None` when the control plane published no budget view — an older
+    /// control plane, or a snapshot that did not come from a store. A
+    /// fabricated zero would tell every caller they were out of quota.
+    ///
+    /// **An estimate, and the name is the contract.** It is what the ledger
+    /// last reported minus what this instance has admitted since, so it is
+    /// wrong by two bounded terms: the fleet's spend elsewhere since the
+    /// publication, and this instance's own admissions that were later
+    /// cancelled. The first dominates, and its bound is the snapshot refresh
+    /// interval times the fleet's spend rate — so an operator sizing a
+    /// customer-visible number tightens it by refreshing more often, not by
+    /// asking here for a guarantee this cannot give.
+    ///
+    /// Both errors point the same way: cancellations are counted as spent and
+    /// other instances' spend is missed, so this reads low against the ledger
+    /// far more often than high. Under-reporting remaining quota is the safe
+    /// direction for a number a customer acts on.
+    ///
+    /// It is never an authorization input. Admission denies from the lease and
+    /// the ledger (INVARIANTS.md #1), never from this — a stale estimate that
+    /// could deny would turn a refresh delay into an outage.
+    #[must_use]
+    pub fn estimate_remaining(&self) -> Option<CostUnits> {
+        let budget = self.snapshot.budget?;
+        let spent = self
+            .counters
+            .units_admitted()
+            .wrapping_sub(self.units_admitted_at_publish);
+        Some(CostUnits(
+            budget.balance_at_publish.get().saturating_sub(spent),
+        ))
     }
 
     /// Record principal occupancy followed by account occupancy, enforcing

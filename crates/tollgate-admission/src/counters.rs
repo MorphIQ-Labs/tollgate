@@ -220,6 +220,25 @@ impl AdmissionCounters {
     /// forbids outright — and skew between counters read microseconds apart
     /// does not survive the scrape interval that consumes them.
     #[must_use]
+    /// Units quoted by every admitted request on this instance, including the
+    /// overage ones (`record_admit_overage` counts through `record_admit`).
+    ///
+    /// A focused read, because its one caller wants this number and not the
+    /// twenty-odd in [`snapshot`](Self::snapshot): the balance estimate
+    /// subtracts it from what the ledger last reported, and building a whole
+    /// `CountersSnapshot` to reach one field would walk every denial slot as
+    /// well. Wrapping-summed across shards for the same reason `snapshot` is —
+    /// see the type docs on why a monitoring counter does not use checked
+    /// arithmetic.
+    pub fn units_admitted(&self) -> u64 {
+        match &self.shards {
+            Some(shards) => shards.iter().fold(0u64, |total, shard| {
+                total.wrapping_add(shard.units_admitted.load(Ordering::Relaxed))
+            }),
+            None => self.units_admitted.get(),
+        }
+    }
+
     pub fn snapshot(&self) -> CountersSnapshot {
         if let Some(shards) = &self.shards {
             let mut snapshot = CountersSnapshot {

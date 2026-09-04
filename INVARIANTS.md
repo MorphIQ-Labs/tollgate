@@ -1001,10 +1001,26 @@ exists to detect corrupt state and must not be able to launder it.
     way. Usage is unaffected, so a straggling event bills against the period
     its lease was granted in.
 
-    This is rung 2 of the enforcement ladder: the store owns both the crossing
-    and the settlement decision, and neither is expressible by a caller. The
-    `expired` term makes the outcome auditable rather than merely correct —
-    see *Ledger roles*. *Tests:* `racing_passes_cross_a_boundary_exactly_once`,
+    **What an instance is told is a projection, never an authority.** A
+    published snapshot carries a [`BudgetView`] — what the account could still
+    spend at publication, its balance *plus* every active lease's unspent
+    remainder, and when the period ends. The store stamps it on every publish
+    and is its only writer: `AccountSnapshot`'s builder has no setter, and the
+    overwrite is unconditional, so a value arriving over the wire cannot
+    survive publication. Absent means the control plane said nothing, which a
+    reader reports as nothing rather than as a zero balance.
+
+    `estimate_remaining` subtracts what the instance has admitted since that
+    publication, saturating at zero. It is an *estimate*, wrong by the fleet's
+    spend elsewhere and by this instance's cancelled admissions, both of which
+    make it read low rather than high. It never decides admission: quota comes
+    from the lease and the ledger (1), so a stale figure cannot turn a refresh
+    delay into an outage.
+
+    This is rung 2 of the enforcement ladder: the store owns the crossing, the
+    settlement decision, and the published view, and none is expressible by a
+    caller. The `expired` term makes the outcome auditable rather than merely
+    correct — see *Ledger roles*. *Tests:* `racing_passes_cross_a_boundary_exactly_once`,
     `a_top_up_survives_rollover_but_the_allowance_does_not`,
     `a_missed_period_does_not_accrue_a_backlog`,
     `a_lease_from_the_closed_period_expires_its_unspent_allowance`,
@@ -1014,6 +1030,20 @@ exists to detect corrupt state and must not be able to launder it.
     `the_rollover_pass_is_bounded_and_saturation_says_there_is_more`, and
     `the_allowance_split_cannot_exceed_what_it_is_part_of` (both store suites
     but the last, which is the PostgreSQL schema's half);
+    `a_published_snapshot_carries_the_ledgers_budget`,
+    `the_budget_view_counts_units_out_on_lease`,
+    `the_budget_view_does_not_report_expired_units_as_spendable`,
+    `the_budget_view_writes_off_settlement_loss`,
+    `a_supplied_budget_never_survives_publication`,
+    `an_instance_reports_no_estimate_when_the_control_plane_reported_no_budget`,
+    `an_estimate_subtracts_what_this_instance_admitted_since_publication`,
+    `a_republish_rebases_the_estimate`,
+    `an_estimate_saturates_at_zero_rather_than_wrapping`,
+    `a_committed_request_reports_the_estimate_its_response_carries`,
+    `an_exhausted_estimate_does_not_deny`,
+    `a_snapshot_without_a_budget_key_decodes_as_no_budget`,
+    `a_partially_populated_schedule_is_reported_not_interpreted`, and
+    `an_unrecognized_stored_schedule_name_is_refused`;
     `Tollgate.Conservation.rollover_preserves_conservation`,
     `a_rollover_never_touches_a_top_up`,
     `a_top_up_funded_lease_expires_nothing`, and

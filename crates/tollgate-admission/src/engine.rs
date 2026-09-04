@@ -36,6 +36,19 @@ impl RequestContext {
         self.state.snapshot.generation
     }
 
+    /// What the account can still spend this period, as this instance best
+    /// knows it — see [`AccountAdmissionState::estimate_remaining`] for what
+    /// the estimate is wrong by and why it is never an authorization input.
+    ///
+    /// Reachable from all three response-producing stages, because a caller
+    /// answering "how much is left" has to answer it on a denial as well: this
+    /// stage is the only one a denied request still holds, `Pending` is what a
+    /// cancelled one holds, and [`Committed`] is what a served one holds.
+    #[must_use]
+    pub fn estimate_remaining(&self) -> Option<CostUnits> {
+        self.state.estimate_remaining()
+    }
+
     pub fn admit<O: OpIndex, S: UsageSlot>(
         self,
         workload: &[(O, u64)],
@@ -113,6 +126,13 @@ impl<S: UsageSlot> Pending<S> {
     #[must_use]
     pub fn limits(&self) -> &tollgate_core::ResolvedLimits {
         &self.snapshot().limits
+    }
+
+    /// See [`RequestContext::estimate_remaining`]. This request's own quote is
+    /// already counted: admission tallies the units it reserved.
+    #[must_use]
+    pub fn estimate_remaining(&self) -> Option<CostUnits> {
+        self.concurrency.state().estimate_remaining()
     }
 
     pub fn acquire_capacity<G: CapacityGate>(
@@ -299,6 +319,13 @@ impl<S: UsageSlot, P: CapacityPermit> Committed<S, P> {
     #[must_use]
     pub fn request_id(&self) -> RequestId {
         self.request_id
+    }
+
+    /// See [`RequestContext::estimate_remaining`]. This is the one a response
+    /// carries: the charge for this request is already in it.
+    #[must_use]
+    pub fn estimate_remaining(&self) -> Option<CostUnits> {
+        self._concurrency.state().estimate_remaining()
     }
 }
 
@@ -613,7 +640,7 @@ mod tests {
     use crate::state::LeaseSlot;
     use tollgate_core::EnforcementMode;
     use tollgate_core::{
-        AccountId, AccountStatus, CancelOutcome, CostTable, CostUnits, DiscardedUsage,
+        AccountId, AccountStatus, BudgetView, CancelOutcome, CostTable, CostUnits, DiscardedUsage,
         DiscardedUsageSlot, FencingToken, Generation, LeaseGrant, LeaseId, LocalLease,
         LocalSharding, PublishableSnapshot, ResolvedLimits, Retry,
     };
@@ -1274,6 +1301,147 @@ mod tests {
                     )
                 })
         }
+    }
+
+    // --- Instance-visible balance (#97) -------------------------------------
+    //
+    // A quote here is 50 fixed + 1 per item, so `request(n)` costs `50 + n`.
+
+    /// An engine whose snapshot carries `balance_at_publish`, funded by a
+    /// lease large enough that the estimate is never what refuses a request.
+    fn budgeted_engine(balance: u64, generation: u64) -> AdmissionEngine<ArcSwapSnapshotMap> {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        install_budget(&engine, balance, generation);
+        engine
+    }
+
+    fn install_budget(engine: &AdmissionEngine<ArcSwapSnapshotMap>, balance: u64, generation: u64) {
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease(1_000_000));
+        let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
+        snapshot.generation = Generation(generation);
+        snapshot.budget = Some(BudgetView {
+            balance_at_publish: CostUnits(balance),
+            period_end: None,
+        });
+        engine.map().install(Principal(1), Arc::new(snapshot), slot);
+    }
+
+    fn estimate(engine: &AdmissionEngine<ArcSwapSnapshotMap>) -> Option<CostUnits> {
+        engine
+            .begin(Principal(1), PermissionBits::bit(0), t(0))
+            .expect("an active principal begins")
+            .estimate_remaining()
+    }
+
+    /// `None` is not zero. A snapshot published by a control plane that
+    /// predates this field would otherwise make every instance tell every
+    /// caller they were out of quota — a number nobody could stand behind,
+    /// reported with the same confidence as a real one.
+    #[test]
+    fn an_instance_reports_no_estimate_when_the_control_plane_reported_no_budget() {
+        let engine = engine_with(AccountStatus::Active, Some(1_000));
+        assert_eq!(estimate(&engine), None);
+    }
+
+    /// The subtraction that makes the number worth publishing: the ledger's
+    /// figure ages, and the instance knows exactly how much of that ageing it
+    /// caused itself.
+    #[test]
+    fn an_estimate_subtracts_what_this_instance_admitted_since_publication() {
+        let engine = budgeted_engine(1_000, 1);
+        assert_eq!(estimate(&engine), Some(CostUnits(1_000)));
+
+        let pending = engine.admit_one(request(10), t(0)).expect("admits");
+        assert_eq!(
+            pending.estimate_remaining(),
+            Some(CostUnits(940)),
+            "this request's own 60-unit quote is already counted"
+        );
+        let _released = pending.cancel();
+
+        assert_eq!(
+            estimate(&engine),
+            Some(CostUnits(940)),
+            "a cancelled admission still reads as spent: the estimate errs low, \
+             which is the safe direction for a number a customer acts on"
+        );
+    }
+
+    /// A republish is a fresh statement of the ledger, so the instance's own
+    /// tally has to restart with it. Carrying the old baseline forward would
+    /// double-count every unit spent before the refresh.
+    #[test]
+    fn a_republish_rebases_the_estimate() {
+        let engine = budgeted_engine(1_000, 1);
+        engine.admit_one(request(10), t(0)).expect("admits");
+        assert_eq!(estimate(&engine), Some(CostUnits(940)));
+
+        install_budget(&engine, 800, 2);
+
+        assert_eq!(
+            estimate(&engine),
+            Some(CostUnits(800)),
+            "the new figure already accounts for what was spent before it"
+        );
+        engine.admit_one(request(10), t(0)).expect("admits");
+        assert_eq!(estimate(&engine), Some(CostUnits(740)));
+    }
+
+    /// Spend outruns the published figure whenever the fleet is busy between
+    /// refreshes. Zero is the floor; a wrapped estimate would report a
+    /// customer's exhausted quota as astronomically large.
+    #[test]
+    fn an_estimate_saturates_at_zero_rather_than_wrapping() {
+        let engine = budgeted_engine(100, 1);
+        engine.admit_one(request(10), t(0)).expect("admits");
+        engine.admit_one(request(10), t(0)).expect("admits");
+
+        assert_eq!(estimate(&engine), Some(CostUnits::ZERO));
+    }
+
+    /// The stage a response is actually built from. `Committed` is what a
+    /// served request holds while its kernel runs, so an embedder answering
+    /// "how much is left" on a successful response reads it here — and it must
+    /// give the same answer the earlier stages would, not a fresh `None`
+    /// because the guard forgot to carry the state.
+    #[test]
+    fn a_committed_request_reports_the_estimate_its_response_carries() {
+        let engine = budgeted_engine(1_000, 1);
+
+        let committed = engine
+            .admit_one(request(10), t(0))
+            .expect("admits")
+            .acquire_capacity(&NoGate)
+            .expect("NoGate always permits")
+            .commit(RequestId(1), t(0))
+            .expect("a fresh reservation commits");
+
+        assert_eq!(
+            committed.estimate_remaining(),
+            Some(CostUnits(940)),
+            "the 60 units this request was charged are already subtracted"
+        );
+
+        // And it keeps moving as the instance serves more, rather than being
+        // frozen at whatever the first response happened to see.
+        engine.admit_one(request(10), t(0)).expect("admits");
+        assert_eq!(committed.estimate_remaining(), Some(CostUnits(880)));
+    }
+
+    /// The estimate is a report, never an input. Admission denies from the
+    /// lease and the ledger (INVARIANTS.md #1); if a stale published zero
+    /// could refuse, a refresh delay would become an outage.
+    #[test]
+    fn an_exhausted_estimate_does_not_deny() {
+        let engine = budgeted_engine(0, 1);
+
+        let pending = engine
+            .admit_one(request(10), t(0))
+            .expect("the lease funds this request whatever the published balance says");
+
+        assert_eq!(pending.estimate_remaining(), Some(CostUnits::ZERO));
+        let _released = pending.cancel();
     }
 
     fn request(items: u64) -> TestRequest<'static, Op> {

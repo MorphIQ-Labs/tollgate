@@ -9,9 +9,9 @@ use std::sync::Arc;
 use jiff::{SignedDuration, Timestamp};
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, BudgetSchedule, CostTable, CostUnits, FencingToken,
-    Generation, KeyId, LeaseId, PermissionBits, Principal, PublishableSnapshot, RequestId,
-    ResolvedLimits, UsageEvent, UsageSource,
+    AccountId, AccountSnapshot, AccountStatus, BudgetSchedule, BudgetView, CostTable, CostUnits,
+    FencingToken, Generation, KeyId, LeaseId, PermissionBits, Principal, PublishableSnapshot,
+    RequestId, ResolvedLimits, UsageEvent, UsageSource,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, BudgetError, Conservation, CreateAccountError,
@@ -2558,5 +2558,215 @@ async fn a_lease_reclaimed_inside_its_own_period_expires_nothing() {
         CostUnits::ZERO
     );
     assert_eq!(store.balance(ACCOUNT), CostUnits(500));
+    assert_conserved(&store);
+}
+
+/// The store stamps the budget view, and a publisher cannot: a snapshot is
+/// built without one and comes back carrying the ledger's numbers.
+#[tokio::test]
+async fn a_published_snapshot_carries_the_ledgers_budget() {
+    let store = store_with_balance(full_grant_policy(), 0);
+    store
+        .set_budget_schedule(ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+    let principal = Principal(0x51);
+
+    let submitted = account_snapshot(ACCOUNT, 1, AccountStatus::Active);
+    assert_eq!(
+        submitted.budget, None,
+        "a builder cannot describe a balance; only the store can"
+    );
+    AdminStore::publish_snapshot(&*store, principal, publishable(Arc::new(submitted)))
+        .await
+        .unwrap();
+
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("the snapshot must be present");
+    };
+    let budget = fetched.budget.expect("the store stamps a budget view");
+    assert_eq!(budget.balance_at_publish, CostUnits(500));
+    assert_eq!(
+        budget.period_end,
+        Some(t(FEB)),
+        "the current period ends at the next boundary"
+    );
+}
+
+/// Units out on lease are still the account's. A view that reported only the
+/// balance would tell a customer their quota had halved the moment an instance
+/// took a lease, and would then *rise* again when that lease settled.
+#[tokio::test]
+async fn the_budget_view_counts_units_out_on_lease() {
+    let store = store_with_balance(full_grant_policy(), 1_000);
+    let principal = Principal(0x52);
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap();
+    store
+        .ingest(&[usage(&lease, 1, 150, 1)], t(1))
+        .await
+        .unwrap();
+
+    AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            1,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("the snapshot must be present");
+    };
+    assert_eq!(
+        fetched.budget.unwrap().balance_at_publish,
+        CostUnits(850),
+        "600 in the balance plus the lease's unspent 250; only the 150 spent is gone"
+    );
+    assert_eq!(
+        fetched.budget.unwrap().period_end,
+        None,
+        "an account with no schedule has no period that ends"
+    );
+}
+
+/// A snapshot crosses a wire before it reaches a store, and nothing on that
+/// wire stops a publisher writing a balance into the JSON. The store
+/// overwrites the field on every publish — including to `None` for an account
+/// it does not hold — so a supplied value can never survive.
+#[tokio::test]
+async fn a_supplied_budget_never_survives_publication() {
+    let store = store_with_balance(full_grant_policy(), 700);
+    let fabricated = BudgetView {
+        balance_at_publish: CostUnits(999_999),
+        period_end: Some(t(MAR)),
+    };
+
+    let known = publishable(Arc::new(account_snapshot(
+        ACCOUNT,
+        1,
+        AccountStatus::Active,
+    )))
+    .with_budget(Some(fabricated));
+    AdminStore::publish_snapshot(&*store, Principal(0x53), known)
+        .await
+        .unwrap();
+    let SnapshotResolution::Present(fetched) = store.snapshot(Principal(0x53)).await.unwrap()
+    else {
+        panic!("the snapshot must be present");
+    };
+    assert_eq!(
+        fetched.budget.unwrap().balance_at_publish,
+        CostUnits(700),
+        "the ledger's number, not the publisher's"
+    );
+
+    let stranger = AccountId(0xdead);
+    let unknown = publishable(Arc::new(account_snapshot(
+        stranger,
+        1,
+        AccountStatus::Active,
+    )))
+    .with_budget(Some(fabricated));
+    AdminStore::publish_snapshot(&*store, Principal(0x54), unknown)
+        .await
+        .unwrap();
+    let SnapshotResolution::Present(fetched) = store.snapshot(Principal(0x54)).await.unwrap()
+    else {
+        panic!("the snapshot must be present");
+    };
+    assert_eq!(
+        fetched.budget, None,
+        "an account the ledger does not hold reports no budget, not a fabricated one"
+    );
+}
+
+/// Expired units are gone, and the published view has to say so. Counting
+/// them as still spendable would report last month's unspent allowance as
+/// this month's quota — the one number the whole feature exists to get right.
+#[tokio::test]
+async fn the_budget_view_does_not_report_expired_units_as_spendable() {
+    let store = store_with_balance(full_grant_policy(), 100);
+    store
+        .set_budget_schedule(ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+    let principal = Principal(0x55);
+
+    // Nothing spent, so the whole 500 expires at the boundary.
+    roll(&store, FEB).await;
+    AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            1,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("the snapshot must be present");
+    };
+    assert_eq!(
+        fetched.budget.unwrap().balance_at_publish,
+        CostUnits(600),
+        "the new allowance plus the surviving top-up, and not a unit of the expired 500"
+    );
+    assert_eq!(fetched.budget.unwrap().period_end, Some(t(MAR)));
+}
+
+/// Settlement loss is spend too: units a lease was granted, that no usage
+/// event ever claimed, and that were not credited back. They are gone, and a
+/// view that ignored them would keep reporting quota the account can never
+/// spend again.
+#[tokio::test]
+async fn the_budget_view_writes_off_settlement_loss() {
+    let store = store_with_balance(full_grant_policy(), 1_000);
+    let principal = Principal(0x56);
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap();
+    store
+        .ingest(&[usage(&lease, 1, 150, 1)], t(1))
+        .await
+        .unwrap();
+    // 400 granted, 150 billed, 200 returned: 50 is written off.
+    store
+        .release(lease.lease_id, lease.fencing_token, CostUnits(200), t(2))
+        .await
+        .unwrap();
+
+    AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            1,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("the snapshot must be present");
+    };
+    assert_eq!(
+        fetched.budget.unwrap().balance_at_publish,
+        CostUnits(800),
+        "1000 funded, less the 150 billed and the 50 written off"
+    );
     assert_conserved(&store);
 }
