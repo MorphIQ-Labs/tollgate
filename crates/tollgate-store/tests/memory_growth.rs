@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, Once};
 
 use jiff::{SignedDuration, Timestamp};
 
-use tollgate_core::{AccountId, AccountStatus, CostUnits, UsageSource};
+use tollgate_core::{AccountId, AccountStatus, CostUnits, PolicyRevision, UsageSource};
 use tollgate_store::{
     AccountConfig, GrantPolicy, LeaseAllocator, MemoryStore, StoredRecords, UsageSink,
 };
@@ -238,16 +238,17 @@ async fn holdings_climb_with_traffic_while_the_live_count_returns_to_zero() {
         assert_eq!(store.stored_records().active_leases, 1);
         store
             .ingest(
-                &[tollgate_core::UsageEvent {
-                    request_id: tollgate_core::RequestId(request),
-                    account_id: ACCOUNT,
-                    source: UsageSource::Leased {
+                &[tollgate_core::UsageEvent::new(
+                    tollgate_core::RequestId(request),
+                    ACCOUNT,
+                    UsageSource::Leased {
                         lease_id: lease.lease_id,
                         fencing_token: lease.fencing_token,
                     },
-                    units: CostUnits(3),
-                    occurred_at: t(1),
-                }],
+                    CostUnits(3),
+                    t(1),
+                    PolicyRevision::UNSTATED,
+                )],
                 t(1),
             )
             .await

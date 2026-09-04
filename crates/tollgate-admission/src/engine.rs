@@ -7,8 +7,8 @@ use jiff::Timestamp;
 
 use tollgate_core::{
     AccountSnapshot, CancelHandle, CommitError, CommitFunding, CostQuote, CostUnits, DenyReason,
-    Generation, Locality, OpIndex, PermissionBits, QuoteError, RequestId, Reservation,
-    SharedCharge, UsageEvent, UsageSlot, UsageSource,
+    Generation, Locality, OpIndex, PermissionBits, PolicyRevision, QuoteError, RequestId,
+    Reservation, SharedCharge, UsageEvent, UsageSlot, UsageSource,
 };
 
 use crate::counters::{AdmissionCounters, CommitRefusal};
@@ -44,6 +44,18 @@ impl RequestContext {
     #[must_use]
     pub fn generation(&self) -> Generation {
         self.state().snapshot.generation
+    }
+
+    /// The consuming application's identity for the policy governing this
+    /// request (#94).
+    ///
+    /// Pinned with everything else: a revision republished after this stage
+    /// belongs to the next request, not this one. That is what lets a
+    /// consumer resolve its own customer-visible metadata locally, with no
+    /// I/O, and know it describes the policy that actually priced the work.
+    #[must_use]
+    pub fn policy_revision(&self) -> PolicyRevision {
+        self.state().snapshot.policy_revision
     }
 
     /// The pinned state. Present for the whole of a context's public life:
@@ -236,6 +248,13 @@ impl<S: UsageSlot> Pending<S> {
         &self.snapshot().limits
     }
 
+    /// See [`RequestContext::policy_revision`]. Still the revision this
+    /// request pinned, whatever the control plane has published since.
+    #[must_use]
+    pub fn policy_revision(&self) -> PolicyRevision {
+        self.snapshot().policy_revision
+    }
+
     /// See [`RequestContext::estimate_remaining`]. This request's own quote is
     /// already counted: admission tallies the units it reserved.
     #[must_use]
@@ -386,9 +405,12 @@ impl<S: UsageSlot, P: CapacityPermit> ReadyToStart<S, P> {
                 return Err((CommitError::Cancelled, Released));
             }
         };
+        // The revision comes from the same pinned snapshot that priced the
+        // request, so the billing record names the policy the response will.
+        let policy_revision = concurrency.state().snapshot.policy_revision;
         let event = funding
             .reservation()
-            .usage_event(request_id, now)
+            .usage_event(request_id, now, policy_revision)
             .expect("a committed reservation produces usage evidence");
         concurrency
             .state()
@@ -588,6 +610,19 @@ impl<S: UsageSlot, P: CapacityPermit> Committed<S, P> {
     #[must_use]
     pub fn request_id(&self) -> RequestId {
         self.request_id
+    }
+
+    /// The policy revision this charge is billed under (#94).
+    ///
+    /// Read from the usage event this guard will emit, not from the snapshot
+    /// again. A consumer returns this in its response metadata, so taking it
+    /// from the event makes "what the response says" and "what the bill says"
+    /// the same value by construction rather than by two lookups agreeing.
+    #[must_use]
+    pub fn policy_revision(&self) -> PolicyRevision {
+        self.event
+            .as_ref()
+            .map_or(PolicyRevision::UNSTATED, |event| event.policy_revision)
     }
 
     /// See [`RequestContext::estimate_remaining`]. This is the one a response
@@ -970,6 +1005,13 @@ mod tests {
             )
             .build(),
         )
+    }
+
+    /// The same fixture carrying a stated policy revision (#94).
+    fn snapshot_with_revision(revision: PolicyRevision) -> Arc<AccountSnapshot> {
+        let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
+        snapshot.policy_revision = revision;
+        Arc::new(snapshot)
     }
 
     /// A snapshot granting the route bit but not the work bit a class needs.
@@ -2042,6 +2084,111 @@ mod tests {
             "the commit changed no funding source"
         );
         assert_eq!(counters.execution_started, 1);
+    }
+
+    /// The revision reaches the billing record, and every stage reports the
+    /// same one. A consumer returns it in its response metadata, so "what the
+    /// response says" and "what the bill says" must be one value rather than
+    /// two lookups that happen to agree.
+    #[test]
+    fn a_committed_event_carries_the_pinned_revision() {
+        let revision = PolicyRevision([0x11; 32]);
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease(10_000));
+        engine
+            .map()
+            .install(Principal(1), snapshot_with_revision(revision), slot);
+
+        let context = engine
+            .begin(Principal(1), PermissionBits::bit(0), t(0))
+            .expect("stage one authorizes");
+        assert_eq!(context.policy_revision(), revision);
+
+        let pending = context
+            .admit(&[(&Op::Price, 1)], DiscardedUsage::new().slot(), t(0))
+            .expect("the request admits");
+        assert_eq!(pending.policy_revision(), revision);
+
+        let committed = pending
+            .acquire_capacity(&NoGate)
+            .expect("capacity is disabled")
+            .commit(RequestId(1), t(0))
+            .expect("the request commits");
+        assert_eq!(committed.policy_revision(), revision);
+    }
+
+    /// An unstated revision is carried as such rather than becoming an error
+    /// or a fabricated value — the reader-first half of the rollout, seen from
+    /// the request path.
+    #[test]
+    fn an_unstated_revision_reaches_the_charge_unstated() {
+        let engine = engine_with(AccountStatus::Active, Some(10_000));
+        let committed = engine
+            .admit_one(request(1), t(0))
+            .expect("the request admits")
+            .acquire_capacity(&NoGate)
+            .expect("capacity is disabled")
+            .commit(RequestId(1), t(0))
+            .expect("the request commits");
+        assert_eq!(committed.policy_revision(), PolicyRevision::UNSTATED);
+    }
+
+    /// Revision and generation are different facts and must not be conflated.
+    ///
+    /// A republication that changes only the revision is a *newer generation*
+    /// carrying different application identity; a request already begun keeps
+    /// the one it pinned (INVARIANTS.md #26), and the next request sees the
+    /// new one. This is the test that would fail if either value were ever
+    /// derived from the other.
+    #[test]
+    fn a_republished_revision_does_not_reach_an_already_pinned_request() {
+        let first = PolicyRevision([0x01; 32]);
+        let second = PolicyRevision([0x02; 32]);
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease(10_000));
+        engine.map().install(
+            Principal(1),
+            snapshot_with_revision(first),
+            Arc::clone(&slot),
+        );
+
+        // Pinned before the republication.
+        let context = engine
+            .begin(Principal(1), PermissionBits::bit(0), t(0))
+            .expect("stage one authorizes");
+
+        let mut next = AccountSnapshot::clone(&snapshot_with_revision(second));
+        next.generation = Generation(2);
+        engine.map().install(Principal(1), Arc::new(next), slot);
+
+        assert_eq!(
+            context.policy_revision(),
+            first,
+            "an in-flight request keeps the revision it pinned"
+        );
+        assert_eq!(context.generation(), Generation(1));
+
+        let committed = context
+            .admit(&[(&Op::Price, 1)], DiscardedUsage::new().slot(), t(0))
+            .expect("the request admits")
+            .acquire_capacity(&NoGate)
+            .expect("capacity is disabled")
+            .commit(RequestId(1), t(0))
+            .expect("the request commits");
+        assert_eq!(
+            committed.policy_revision(),
+            first,
+            "and bills under it, not under the republished one"
+        );
+
+        // The next request sees the new revision at the new generation.
+        let later = engine
+            .begin(Principal(1), PermissionBits::bit(0), t(0))
+            .expect("stage one authorizes");
+        assert_eq!(later.policy_revision(), second);
+        assert_eq!(later.generation(), Generation(2));
     }
 
     /// The consumer topology this whole lifecycle exists for: an asynchronous

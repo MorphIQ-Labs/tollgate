@@ -17,8 +17,8 @@ use tollgate_client::{
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, Generation,
-    LeaseGrant, LocalLease, LocalSharding, OpIndex, PermissionBits, Principal, RequestId,
-    ResolvedLimits, UsageEvent, UsageSource,
+    LeaseGrant, LocalLease, LocalSharding, OpIndex, PermissionBits, PolicyRevision, Principal,
+    RequestId, ResolvedLimits, UsageEvent, UsageSource,
 };
 use tollgate_store::{
     AccountConfig, GrantPolicy, IngestError, IngestReport, LeaseAllocator, MemoryStore,
@@ -391,16 +391,17 @@ async fn shutdown_releases_unspent_units() {
 }
 
 fn event(request: u128, units: u64, lease: &tollgate_core::LeaseGrant) -> UsageEvent {
-    UsageEvent {
-        request_id: RequestId(request),
-        account_id: lease.account_id,
-        source: UsageSource::Leased {
+    UsageEvent::new(
+        RequestId(request),
+        lease.account_id,
+        UsageSource::Leased {
             lease_id: lease.lease_id,
             fencing_token: lease.fencing_token,
         },
-        units: CostUnits(units),
-        occurred_at: t(0),
-    }
+        CostUnits(units),
+        t(0),
+        PolicyRevision::UNSTATED,
+    )
 }
 
 fn writer_config(capacity: usize) -> UsageWriterConfig {
@@ -2038,13 +2039,14 @@ async fn the_final_flush_backoff_cannot_overrun_the_drain_deadline() {
 /// The sink refuses whatever it is handed, so the event's shape is irrelevant
 /// — only that it is a real event the writer will try to deliver.
 fn refused_event(request: u128) -> UsageEvent {
-    UsageEvent {
-        request_id: RequestId(request),
-        account_id: ACCOUNT,
-        source: UsageSource::Overage,
-        units: CostUnits(50),
-        occurred_at: t(0),
-    }
+    UsageEvent::new(
+        RequestId(request),
+        ACCOUNT,
+        UsageSource::Overage,
+        CostUnits(50),
+        t(0),
+        PolicyRevision::UNSTATED,
+    )
 }
 
 /// A sink that refuses every batch and will keep refusing it, as an

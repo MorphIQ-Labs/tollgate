@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use jiff::Timestamp;
 
 use crate::deny::DenyReason;
-use crate::ids::{AccountId, RequestId};
+use crate::ids::{AccountId, PolicyRevision, RequestId};
 use crate::lease::{AccountOverage, LeaseDebit, LocalLease};
 use crate::sharding::Locality;
 use crate::snapshot::EnforcementMode;
@@ -467,8 +467,20 @@ impl Reservation {
     /// Billing the fallback against its receipt would therefore silently drop
     /// the charge for work that ran, on the exact path elastic mode exists to
     /// serve. The terminal phase is the funding statement.
+    ///
+    /// `policy_revision` is the consuming application's identity for the
+    /// policy that priced this request (#94), taken from the pinned snapshot.
+    /// It is a parameter rather than reservation state on purpose: the
+    /// reservation is a request-path value and would carry 32 bytes for a
+    /// field only the commit reads, and passing it here keeps the event built
+    /// complete in one place instead of assembled and then patched.
     #[must_use]
-    pub fn usage_event(&self, request_id: RequestId, now: Timestamp) -> Option<UsageEvent> {
+    pub fn usage_event(
+        &self,
+        request_id: RequestId,
+        now: Timestamp,
+        policy_revision: PolicyRevision,
+    ) -> Option<UsageEvent> {
         let source = match self.phase.load(Ordering::Acquire) {
             // Both a natively admitted overage and a commit-time fallback.
             COMMITTED_OVERAGE => UsageSource::Overage,
@@ -491,13 +503,14 @@ impl Reservation {
             },
             _ => return None,
         };
-        Some(UsageEvent {
+        Some(UsageEvent::new(
             request_id,
-            account_id: self.account_id(),
+            self.account_id(),
             source,
-            units: self.units,
-            occurred_at: now,
-        })
+            self.units,
+            now,
+            policy_revision,
+        ))
     }
 }
 
@@ -655,7 +668,9 @@ mod tests {
                 .unwrap(),
             CostUnits(30)
         );
-        let event = r.usage_event(RequestId(7), t(1)).unwrap();
+        let event = r
+            .usage_event(RequestId(7), t(1), PolicyRevision::UNSTATED)
+            .unwrap();
         assert_eq!(event.account_id, AccountId(1));
         assert_eq!(event.units, CostUnits(30));
         assert_eq!(event.source, UsageSource::Overage);
@@ -671,7 +686,10 @@ mod tests {
         let r = Reservation::reserve_overage(&o, CostUnits(30), CostUnits(100)).unwrap();
         assert_eq!(r.cancel(), CancelOutcome::ZeroCharged);
         assert_eq!(o.spent(), CostUnits::ZERO);
-        assert_eq!(r.usage_event(RequestId(7), t(1)), None);
+        assert_eq!(
+            r.usage_event(RequestId(7), t(1), PolicyRevision::UNSTATED),
+            None
+        );
     }
 
     #[test]
@@ -739,7 +757,10 @@ mod tests {
             Ok(CostUnits(30))
         );
         assert_eq!(l.remaining(), CostUnits(70));
-        assert!(r.usage_event(RequestId(9), t(1)).is_some());
+        assert!(
+            r.usage_event(RequestId(9), t(1), PolicyRevision::UNSTATED)
+                .is_some()
+        );
         drop(r);
         // Drop of a committed reservation must not refund.
         assert_eq!(l.remaining(), CostUnits(70));
@@ -770,7 +791,9 @@ mod tests {
             Ok(r.units())
         );
         assert_eq!(
-            r.usage_event(RequestId(1), t(1)).unwrap().units,
+            r.usage_event(RequestId(1), t(1), PolicyRevision::UNSTATED)
+                .unwrap()
+                .units,
             r.units(),
             "and the billing event carries it too"
         );
@@ -782,7 +805,10 @@ mod tests {
         let r = Reservation::reserve(&l, CostUnits(30), t(0)).unwrap();
         assert_eq!(r.cancel(), CancelOutcome::ZeroCharged);
         assert_eq!(l.remaining(), CostUnits(100));
-        assert_eq!(r.usage_event(RequestId(9), t(1)), None);
+        assert_eq!(
+            r.usage_event(RequestId(9), t(1), PolicyRevision::UNSTATED),
+            None
+        );
         // Idempotent, and no double credit.
         assert_eq!(r.cancel(), CancelOutcome::ZeroCharged);
         assert_eq!(l.remaining(), CostUnits(100));
@@ -852,7 +878,10 @@ mod tests {
         );
         // Units returned; no usage event can exist; later commit is refused.
         assert_eq!(l.remaining(), CostUnits(100));
-        assert_eq!(r.usage_event(RequestId(1), t(1_001)), None);
+        assert_eq!(
+            r.usage_event(RequestId(1), t(1_001), PolicyRevision::UNSTATED),
+            None
+        );
         assert_eq!(
             r.commit_at_execution_start(t(999), CommitFunding::LeaseOnly),
             Err(CommitError::AlreadyReleased)
@@ -892,7 +921,9 @@ mod tests {
         assert_eq!(l.remaining(), CostUnits(100));
         assert_eq!(o.spent(), CostUnits(30));
 
-        let event = r.usage_event(RequestId(7), t(1_000)).unwrap();
+        let event = r
+            .usage_event(RequestId(7), t(1_000), PolicyRevision::UNSTATED)
+            .unwrap();
         assert_eq!(event.units, CostUnits(30));
         assert_eq!(event.account_id, AccountId(1));
         assert_eq!(event.source, UsageSource::Overage);
@@ -916,7 +947,10 @@ mod tests {
             Err(CommitError::Denied(DenyReason::FundingExpiredAtStart))
         );
         assert_eq!(l.remaining(), CostUnits(100));
-        assert_eq!(r.usage_event(RequestId(7), t(1_000)), None);
+        assert_eq!(
+            r.usage_event(RequestId(7), t(1_000), PolicyRevision::UNSTATED),
+            None
+        );
         // Strict took no overage: the counter was never touched.
         assert_eq!(o.spent(), CostUnits::ZERO);
     }
@@ -947,7 +981,10 @@ mod tests {
         // Released for zero, and the refused debit claimed nothing.
         assert_eq!(l.remaining(), CostUnits(100));
         assert_eq!(o.spent(), CostUnits(100));
-        assert_eq!(r.usage_event(RequestId(7), t(1_000)), None);
+        assert_eq!(
+            r.usage_event(RequestId(7), t(1_000), PolicyRevision::UNSTATED),
+            None
+        );
     }
 
     /// When the cap is occupied by a *refundable* sibling, the refusal is the
@@ -1100,7 +1137,9 @@ mod tests {
         // One debit, taken at admission — not a second one at commit.
         assert_eq!(o.spent(), CostUnits(30));
         assert_eq!(
-            r.usage_event(RequestId(1), t(9_999)).unwrap().source,
+            r.usage_event(RequestId(1), t(9_999), PolicyRevision::UNSTATED)
+                .unwrap()
+                .source,
             UsageSource::Overage
         );
     }
@@ -1221,7 +1260,9 @@ mod tests {
                     assert_eq!(l.remaining(), CostUnits(100));
                     assert_eq!(o.spent(), CostUnits(10));
                     assert_eq!(
-                        r.usage_event(RequestId(1), t(1_000)).unwrap().source,
+                        r.usage_event(RequestId(1), t(1_000), PolicyRevision::UNSTATED)
+                            .unwrap()
+                            .source,
                         UsageSource::Overage
                     );
                 }
@@ -1230,7 +1271,10 @@ mod tests {
                 (Err(CommitError::AlreadyReleased), CancelOutcome::ZeroCharged) => {
                     assert_eq!(l.remaining(), CostUnits(100));
                     assert_eq!(o.spent(), CostUnits::ZERO);
-                    assert_eq!(r.usage_event(RequestId(1), t(1_000)), None);
+                    assert_eq!(
+                        r.usage_event(RequestId(1), t(1_000), PolicyRevision::UNSTATED),
+                        None
+                    );
                 }
                 other => panic!("impossible race outcome: {other:?}"),
             }
@@ -1341,7 +1385,12 @@ mod tests {
             Err(CommitError::AlreadyReleased),
             "the worker must not execute after a winning cancellation"
         );
-        assert_eq!(shared.reservation().usage_event(RequestId(1), t(0)), None);
+        assert_eq!(
+            shared
+                .reservation()
+                .usage_event(RequestId(1), t(0), PolicyRevision::UNSTATED),
+            None
+        );
     }
 
     /// Once the worker has started, a late cancellation reports the full
@@ -1372,7 +1421,7 @@ mod tests {
         assert!(
             shared
                 .reservation()
-                .usage_event(RequestId(1), t(0))
+                .usage_event(RequestId(1), t(0), PolicyRevision::UNSTATED)
                 .is_some()
         );
     }

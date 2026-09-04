@@ -9,8 +9,8 @@ use proptest::prelude::*;
 use tollgate_core::{
     AccountId, AccountOverage, AccountSnapshot, AccountStatus, CancelOutcome, CommitFunding,
     CostTable, CostUnits, DenyReason, FencingToken, Generation, LeaseGrant, LeaseId, LocalLease,
-    LocalSharding, OpIndex, PermissionBits, PublishableSnapshot, QuoteError, RequestId,
-    Reservation, ResolvedLimits, Retry, SnapshotValidationError, UsageSource,
+    LocalSharding, OpIndex, PermissionBits, PolicyRevision, PublishableSnapshot, QuoteError,
+    RequestId, Reservation, ResolvedLimits, Retry, SnapshotValidationError, UsageSource,
 };
 
 struct Op(usize);
@@ -64,6 +64,22 @@ proptest! {
         prop_assert_eq!(text.len(), 32);
         prop_assert!(text.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
         prop_assert_eq!(text.parse::<AccountId>(), Ok(id));
+    }
+
+    /// The same contract at the other width, over the full 256-bit domain.
+    ///
+    /// A consumer compares these for equality to select its own metadata, so
+    /// a byte that survived as a different byte — or an ordering the text
+    /// transposed — would silently name a different policy while still
+    /// looking like a valid revision (INVARIANTS.md #21).
+    #[test]
+    fn revision_text_round_trips_the_full_256_bit_domain(bytes in any::<[u8; 32]>()) {
+        let revision = PolicyRevision(bytes);
+        let text = revision.to_string();
+        prop_assert_eq!(text.len(), 64);
+        prop_assert!(text.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        prop_assert_eq!(text.parse::<PolicyRevision>(), Ok(revision));
+        prop_assert_eq!(revision.as_bytes(), &bytes);
     }
 
     /// Quotes match exact u128 arithmetic or refuse with Overflow — never a
@@ -246,7 +262,7 @@ proptest! {
                 Action::Commit => {
                     if r.commit_at_execution_start(t(0), CommitFunding::LeaseOnly).is_ok() {
                         lease_committed += units;
-                        let source = r.usage_event(RequestId(1), t(0)).unwrap().source;
+                        let source = r.usage_event(RequestId(1), t(0), PolicyRevision::UNSTATED).unwrap().source;
                         prop_assert!(
                             matches!(source, UsageSource::Leased { .. }),
                             "an unlapsed commit bills against its lease, got {:?}",
@@ -276,7 +292,7 @@ proptest! {
                     prop_assert!(
                         r.commit_at_execution_start(lapsed, CommitFunding::LeaseOnly).is_err()
                     );
-                    prop_assert!(r.usage_event(RequestId(1), lapsed).is_none());
+                    prop_assert!(r.usage_event(RequestId(1), lapsed, PolicyRevision::UNSTATED).is_none());
                 }
                 // Elastic: the charge either moves wholly to overage or is
                 // released wholly; the lease receipt never funds it.
@@ -284,12 +300,12 @@ proptest! {
                     if r.commit_at_execution_start(lapsed, elastic).is_ok() {
                         overage_committed += units;
                         prop_assert_eq!(
-                            r.usage_event(RequestId(1), lapsed).unwrap().source,
+                            r.usage_event(RequestId(1), lapsed, PolicyRevision::UNSTATED).unwrap().source,
                             UsageSource::Overage,
                             "a fallback must never bill against its lapsed lease"
                         );
                     } else {
-                        prop_assert!(r.usage_event(RequestId(1), lapsed).is_none());
+                        prop_assert!(r.usage_event(RequestId(1), lapsed, PolicyRevision::UNSTATED).is_none());
                     }
                 }
             }

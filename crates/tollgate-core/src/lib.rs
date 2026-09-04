@@ -37,7 +37,8 @@ pub use budget::{BudgetSchedule, BudgetView, Period, Rollover};
 pub use cost_table::{CostQuote, CostTable, CostTableBuilder, OpIndex, QuoteError};
 pub use deny::{DenyReason, Retry};
 pub use ids::{
-    AccountId, FencingToken, Generation, KeyId, LeaseId, ParseIdError, Principal, RequestId,
+    AccountId, FencingToken, Generation, KeyId, LeaseId, ParseIdError, PolicyRevision, Principal,
+    RequestId,
 };
 pub use lease::{AccountOverage, LeaseGrant, LocalLease, RefillSignal};
 pub use reservation::{

@@ -15,7 +15,7 @@ use jiff::Timestamp;
 use crate::budget::BudgetView;
 use crate::cost_table::CostTable;
 use crate::deny::DenyReason;
-use crate::ids::{AccountId, Generation, KeyId};
+use crate::ids::{AccountId, Generation, KeyId, PolicyRevision};
 use crate::units::CostUnits;
 
 /// Administrative state of the account at compile time.
@@ -475,20 +475,29 @@ impl From<ResolvedLimits> for WireResolvedLimits {
 ///
 /// Shared as `Arc<AccountSnapshot>`; replaced whole (never mutated) when the
 /// control plane publishes a newer [`Generation`].
+/// # Layout
+///
+/// `#[repr(C, align(128))]`, and both halves are load-bearing. The alignment
+/// keeps one snapshot off its neighbours' cache lines. `repr(C)` is what makes
+/// the declaration order below a *contract* rather than whatever this build
+/// chose: without it the compiler reorders freely, and an offset assertion
+/// would pin an accident. The fields the request path reads to admit — status,
+/// permissions, validity, enforcement mode — are declared first so they share
+/// the first cache line, and the cold ones follow. Pinned by
+/// `stage_one_fields_share_the_first_cache_line`.
 #[derive(Debug, Clone)]
-#[repr(align(128))]
+#[repr(C, align(128))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub struct AccountSnapshot {
-    pub account_id: AccountId,
-    /// The credential this snapshot was compiled for, when key-scoped.
-    pub key_id: Option<KeyId>,
-    /// Monotonic snapshot version; see [`Generation`].
-    pub generation: Generation,
     pub status: AccountStatus,
-    /// What this account does when its lease cannot fund a quote. Lands in
-    /// the struct's existing tail padding beside `status`, and is read on the
-    /// same cache line the request path already touches for it.
+    pub permissions: PermissionBits,
+    /// Hard staleness bound: past this instant the snapshot denies
+    /// (INVARIANTS.md #5) until the control plane delivers a successor.
+    pub valid_until: Timestamp,
+    /// What this account does when its lease cannot fund a quote. Declared
+    /// among the stage-one fields because funding reads it on the same cache
+    /// line the request path already touches for `status`.
     ///
     /// Defaults on the wire as well as in storage, so a control plane that
     /// predates elastic mode keeps publishing successfully instead of getting
@@ -497,12 +506,13 @@ pub struct AccountSnapshot {
     /// extend credit.
     #[cfg_attr(feature = "serde", serde(default))]
     pub enforcement_mode: EnforcementMode,
-    /// Hard staleness bound: past this instant the snapshot denies
-    /// (INVARIANTS.md #5) until the control plane delivers a successor.
-    pub valid_until: Timestamp,
-    pub permissions: PermissionBits,
-    pub limits: ResolvedLimits,
+    /// Monotonic snapshot version; see [`Generation`].
+    pub generation: Generation,
     pub cost_table: Arc<CostTable>,
+    pub account_id: AccountId,
+    /// The credential this snapshot was compiled for, when key-scoped.
+    pub key_id: Option<KeyId>,
+    pub limits: ResolvedLimits,
     /// What the control plane last said about the account's budget (#97), or
     /// `None` when it said nothing — an older control plane, or a publication
     /// that did not go through a store.
@@ -525,6 +535,20 @@ pub struct AccountSnapshot {
     /// request path touches no line it did not already touch.
     #[cfg_attr(feature = "serde", serde(default))]
     pub budget: Option<BudgetView>,
+    /// The consuming application's identity for the product policy compiled
+    /// into this snapshot (#94). See [`PolicyRevision`].
+    ///
+    /// Tollgate carries it and never reads it, so it is declared last, well
+    /// clear of the cache line admission touches. Distinct from `generation`:
+    /// that orders publications, this names the inputs one was compiled from.
+    ///
+    /// Defaults on the wire as well as in storage, the precedent
+    /// `enforcement_mode` and `budget` set. An absent revision decodes to
+    /// [`PolicyRevision::UNSTATED`] rather than failing, which is safe here in
+    /// a way it would not be for an enforcement field: nothing in Tollgate
+    /// reads this, so an unstated revision cannot change an outcome.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub policy_revision: PolicyRevision,
 }
 
 /// Builder for the optional parts of an immutable account snapshot.
@@ -539,6 +563,7 @@ pub struct AccountSnapshotBuilder {
     permissions: PermissionBits,
     limits: ResolvedLimits,
     cost_table: Arc<CostTable>,
+    policy_revision: PolicyRevision,
 }
 
 impl AccountSnapshotBuilder {
@@ -551,6 +576,18 @@ impl AccountSnapshotBuilder {
     #[must_use]
     pub const fn enforcement_mode(mut self, enforcement_mode: EnforcementMode) -> Self {
         self.enforcement_mode = enforcement_mode;
+        self
+    }
+
+    /// Name the product policy this snapshot was compiled from (#94).
+    ///
+    /// Optional, and omitting it leaves [`PolicyRevision::UNSTATED`] — a
+    /// publisher that has no revision to state says nothing rather than
+    /// inventing one. Unlike `budget`, this has a setter: the control plane
+    /// compiling the snapshot is the value's author, not the store.
+    #[must_use]
+    pub const fn policy_revision(mut self, policy_revision: PolicyRevision) -> Self {
+        self.policy_revision = policy_revision;
         self
     }
 
@@ -569,6 +606,7 @@ impl AccountSnapshotBuilder {
             // Absent by construction. A publisher describes policy; the
             // account's balance has one authority and it is the store.
             budget: None,
+            policy_revision: self.policy_revision,
         }
     }
 }
@@ -839,6 +877,7 @@ impl AccountSnapshot {
             permissions,
             limits,
             cost_table,
+            policy_revision: PolicyRevision::UNSTATED,
         }
     }
 
@@ -915,6 +954,58 @@ mod tests {
         let decoded: AccountSnapshot =
             serde_json::from_value(value).expect("an older payload still decodes");
         assert_eq!(decoded.budget, None);
+    }
+
+    /// A control plane that predates #94 publishes no revision, and its
+    /// snapshots must keep working. The absent key decodes to "unstated"
+    /// rather than to a decode error, which is the whole reader-first half of
+    /// the rollout.
+    #[test]
+    fn a_snapshot_without_a_revision_key_decodes_as_unstated() {
+        let snapshot = AccountSnapshot::builder(
+            AccountId(1),
+            Generation(1),
+            AccountStatus::Active,
+            Timestamp::from_second(10_000).unwrap(),
+            PermissionBits::ALL,
+            ResolvedLimits::new(64).with_weighted_rate(1_000, 1_000),
+            Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+        )
+        .policy_revision(PolicyRevision([0x5a; 32]))
+        .build();
+
+        let mut value = serde_json::to_value(&snapshot).expect("a snapshot serializes");
+        assert_eq!(
+            value["policy_revision"],
+            serde_json::Value::String("5a".repeat(32)),
+            "a stated revision is on the wire in canonical form"
+        );
+        let removed = value
+            .as_object_mut()
+            .expect("a snapshot is a JSON object")
+            .remove("policy_revision");
+        assert!(removed.is_some(), "the field is on the wire when present");
+
+        let decoded: AccountSnapshot =
+            serde_json::from_value(value).expect("an older payload still decodes");
+        assert_eq!(decoded.policy_revision, PolicyRevision::UNSTATED);
+        assert!(decoded.policy_revision.is_unstated());
+    }
+
+    /// Omitting the setter states nothing rather than inventing a value.
+    #[test]
+    fn a_builder_without_a_revision_states_none() {
+        let snapshot = AccountSnapshot::builder(
+            AccountId(1),
+            Generation(1),
+            AccountStatus::Active,
+            Timestamp::from_second(10_000).unwrap(),
+            PermissionBits::ALL,
+            ResolvedLimits::new(64),
+            Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+        )
+        .build();
+        assert_eq!(snapshot.policy_revision, PolicyRevision::UNSTATED);
     }
 
     /// The store overwrites this field on every publish, so the clearing arm
@@ -1447,5 +1538,65 @@ mod tests {
     #[test]
     fn publication_allows_a_table_with_no_registered_operations() {
         PublishableSnapshot::try_new(priced_snapshot(100, 100, &[], 64, 1)).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod layout {
+    use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+
+    /// One cache line, and the admission path reads it once.
+    ///
+    /// Before `#[repr(C)]` these four fields were wherever the compiler put
+    /// them — measured at offsets 160, 192, 200 and 32, so admitting a request
+    /// touched two lines to read four values. Declaration order is now a
+    /// contract, and this is what makes it one: a later field inserted among
+    /// them, or a reorder that looks harmless, fails here rather than showing
+    /// up as an unexplained regression in `snapshot/admit`.
+    #[test]
+    fn stage_one_fields_share_the_first_cache_line() {
+        const LINE: usize = 64;
+        for (name, offset) in [
+            ("status", offset_of!(AccountSnapshot, status)),
+            ("permissions", offset_of!(AccountSnapshot, permissions)),
+            ("valid_until", offset_of!(AccountSnapshot, valid_until)),
+            (
+                "enforcement_mode",
+                offset_of!(AccountSnapshot, enforcement_mode),
+            ),
+        ] {
+            assert!(
+                offset < LINE,
+                "{name} sits at offset {offset}, past the first {LINE}-byte line \
+                 the request path reads"
+            );
+        }
+    }
+
+    /// The revision is carried, never read, so it must not displace anything
+    /// admission touches. Asserting it is *past* the first line is the half
+    /// that would catch a well-meaning reorder putting it up front.
+    #[test]
+    fn the_policy_revision_is_cold() {
+        assert!(
+            offset_of!(AccountSnapshot, policy_revision) >= 64,
+            "the policy revision belongs outside the stage-one cache line"
+        );
+    }
+
+    /// The alignment keeps one account's snapshot off another's cache lines,
+    /// and the size claim in `budget`'s documentation is now checked rather
+    /// than asserted in prose: `policy_revision` lands in padding the
+    /// `align(128)` had already reserved, so the type did not grow.
+    #[test]
+    fn the_snapshot_stays_one_two_line_object() {
+        assert_eq!(align_of::<AccountSnapshot>(), 128);
+        assert_eq!(
+            size_of::<AccountSnapshot>(),
+            256,
+            "a snapshot that outgrew its two lines costs every account an \
+             extra line; justify the growth or move the new field"
+        );
     }
 }

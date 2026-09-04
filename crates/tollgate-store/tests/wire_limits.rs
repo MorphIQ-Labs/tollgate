@@ -9,27 +9,30 @@
 use jiff::Timestamp;
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
-    KeyId, LeaseId, PermissionBits, RequestId, ResolvedLimits, UsageEvent, UsageSource,
+    KeyId, LeaseId, PermissionBits, PolicyRevision, RequestId, ResolvedLimits, UsageEvent,
+    UsageSource,
 };
 use tollgate_store::MAX_INGEST_BATCH;
 use tollgate_store::wire::{
     MAX_INGEST_BODY_BYTES, MAX_SNAPSHOT_BODY_BYTES, MAX_USAGE_EVENT_BYTES, PublishSnapshotRequest,
 };
 
-/// Every identifier at full width, both 64-bit fields at their maximum, and
+/// Every identifier at full width, the policy revision at full width, both
+/// 64-bit fields at their maximum, and
 /// the timestamp at the far end of the representable range. The leased form,
 /// which carries a lease id and fencing token the overage form does not.
 fn widest_event() -> UsageEvent {
-    UsageEvent {
-        request_id: RequestId(u128::MAX),
-        account_id: AccountId(u128::MAX),
-        source: UsageSource::Leased {
+    UsageEvent::new(
+        RequestId(u128::MAX),
+        AccountId(u128::MAX),
+        UsageSource::Leased {
             lease_id: LeaseId(u128::MAX),
             fencing_token: FencingToken(u64::MAX),
         },
-        units: CostUnits(u64::MAX),
-        occurred_at: Timestamp::from_second(253_402_207_200).unwrap(),
-    }
+        CostUnits(u64::MAX),
+        Timestamp::from_second(253_402_207_200).unwrap(),
+        PolicyRevision([0xff; 32]),
+    )
 }
 
 #[test]

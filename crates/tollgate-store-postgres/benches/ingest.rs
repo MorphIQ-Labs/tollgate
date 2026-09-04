@@ -17,7 +17,9 @@ use std::time::Duration;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use jiff::{SignedDuration, Timestamp};
 
-use tollgate_core::{AccountId, AccountStatus, CostUnits, RequestId, UsageEvent, UsageSource};
+use tollgate_core::{
+    AccountId, AccountStatus, CostUnits, PolicyRevision, RequestId, UsageEvent, UsageSource,
+};
 use tollgate_store::{AccountConfig, AdminStore, GrantPolicy, LeaseAllocator, UsageSink};
 use tollgate_store_postgres::PostgresStore;
 
@@ -98,15 +100,18 @@ fn bench_ingest(c: &mut Criterion) {
                 leases
                     .iter()
                     .enumerate()
-                    .map(|(index, lease)| UsageEvent {
-                        request_id: RequestId((batch << 64) | u128::try_from(index).unwrap()),
-                        account_id: lease.account_id,
-                        source: UsageSource::Leased {
-                            lease_id: lease.lease_id,
-                            fencing_token: lease.fencing_token,
-                        },
-                        units: CostUnits(1),
-                        occurred_at: timestamp(1),
+                    .map(|(index, lease)| {
+                        UsageEvent::new(
+                            RequestId((batch << 64) | u128::try_from(index).unwrap()),
+                            lease.account_id,
+                            UsageSource::Leased {
+                                lease_id: lease.lease_id,
+                                fencing_token: lease.fencing_token,
+                            },
+                            CostUnits(1),
+                            timestamp(1),
+                            PolicyRevision::UNSTATED,
+                        )
                     })
                     .collect::<Vec<_>>()
             },

@@ -25,29 +25,39 @@ pub const API_PREFIX: &str = "/v1";
 
 /// The widest a single [`UsageEvent`] serialises to, in bytes.
 ///
-/// Measured, not estimated: every identifier at its full 32-hex width, both
-/// 64-bit fields at `u64::MAX`, and the timestamp at the far end of the
-/// representable range — the leased form, which carries a lease id and
-/// fencing token the overage form does not.
+/// Measured, not estimated: every identifier at its full 32-hex width, the
+/// policy revision at its full 64-hex width, both 64-bit fields at `u64::MAX`,
+/// and the timestamp at the far end of the representable range — the leased
+/// form, which carries a lease id and fencing token the overage form does not.
 ///
 /// ```text
 /// {"request_id":"ff…ff","account_id":"ff…ff","source":{"Leased":
 ///  {"lease_id":"ff…ff","fencing_token":18446744073709551615}},
-///  "units":18446744073709551615,"occurred_at":"9999-12-30T22:00:00Z"}
+///  "units":18446744073709551615,"occurred_at":"9999-12-30T22:00:00Z",
+///  "policy_revision":"ff…ff"}
 /// ```
 ///
 /// Pinned by `the_widest_usage_event_still_fits_its_declared_size`, so a field
 /// added to `UsageEvent` cannot silently push a legitimate batch past the body
 /// limit derived from this number.
-pub const MAX_USAGE_EVENT_BYTES: usize = 268;
+///
+/// #94 raised it from 268: the policy revision is fixed-width, so it costs the
+/// same 85 bytes on every event whether stated or unstated. That is the price
+/// of carrying it on the wire in its canonical spelling, and it is recorded
+/// here rather than discovered when a maximal batch starts being refused.
+pub const MAX_USAGE_EVENT_BYTES: usize = 353;
 
 /// The body limit `/v1/usage/ingest` is served with, in bytes.
 ///
 /// Derived from the two constants above rather than chosen: a full batch of
 /// the widest events is `MAX_INGEST_BATCH * (MAX_USAGE_EVENT_BYTES + 1)` — the
 /// `+ 1` being each event's separating comma — plus `{"events":[]}`. That is
-/// about 1.05 MiB, and 2 MiB leaves a little under twice the room, so a
-/// legitimate maximal batch is never refused for want of a byte.
+/// about 1.38 MiB since #94 widened the event, and 2 MiB still leaves room to
+/// spare, so a legitimate maximal batch is never refused for want of a byte.
+/// The headroom is checked by
+/// `a_full_batch_of_the_widest_events_fits_the_declared_body_limit`, not
+/// assumed: the next field to land here may be the one that exhausts it, and
+/// this limit must then rise with it.
 ///
 /// Declared rather than inherited. Without it the endpoint ran on axum's
 /// implicit 2 MiB default, which no document stated and which the server
@@ -173,20 +183,22 @@ pub struct Problem {
 mod tests {
     use super::*;
     use jiff::Timestamp;
+    use tollgate_core::PolicyRevision;
     use tollgate_core::RequestId;
     use tollgate_core::UsageSource;
 
     fn event(seq: u128) -> UsageEvent {
-        UsageEvent {
-            request_id: RequestId(seq),
-            account_id: AccountId(7),
-            source: UsageSource::Leased {
+        UsageEvent::new(
+            RequestId(seq),
+            AccountId(7),
+            UsageSource::Leased {
                 lease_id: LeaseId(11),
                 fencing_token: FencingToken(3),
             },
-            units: CostUnits(64),
-            occurred_at: Timestamp::from_second(1_755_600_000).unwrap(),
-        }
+            CostUnits(64),
+            Timestamp::from_second(1_755_600_000).unwrap(),
+            PolicyRevision::UNSTATED,
+        )
     }
 
     /// #20 added a second ingest type so the transport could stop copying the
