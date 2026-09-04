@@ -7,6 +7,21 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.13.0...v0.14.0) - 2026-09-04
+
+### Added
+
+- *(core)* #97 instance-visible budget and remaining estimate
+- *(store)* #97 periodic budgets with period-end expiry
+
+### Fixed
+
+- *(store)* [**breaking**] #61 bound the usage batch and stop a refusal wedging the writer
+
+### Other
+
+- #106 run the blocking assurance gates on every merge request
+
 ## [0.13.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.12.1...v0.13.0) - 2026-09-03
 
 ### Fixed
