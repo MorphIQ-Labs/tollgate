@@ -34,7 +34,7 @@ pub mod generation_model;
 pub mod maps;
 pub mod state;
 
-pub use counters::{AdmissionCounters, CountersSnapshot};
+pub use counters::{AdmissionCounters, CommitRefusal, CountersSnapshot};
 pub use engine::{
     AdmissionEngine, CapacityEvidence, CapacityGate, CapacityPermit, Committed, NoCapacityPermit,
     NoGate, Pending, ReadyToStart, Released, RequestContext,

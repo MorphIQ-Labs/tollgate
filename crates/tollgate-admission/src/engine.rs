@@ -8,33 +8,51 @@ use jiff::Timestamp;
 use tollgate_core::{
     AccountSnapshot, CancelHandle, CommitError, CommitFunding, CostQuote, CostUnits, DenyReason,
     Generation, Locality, OpIndex, PermissionBits, QuoteError, RequestId, Reservation,
-    SharedCharge, UsageEvent, UsageSlot,
+    SharedCharge, UsageEvent, UsageSlot, UsageSource,
 };
 
-use crate::counters::AdmissionCounters;
+use crate::counters::{AdmissionCounters, CommitRefusal};
 use crate::state::{AccountAdmissionState, ConcurrencyGuard, MapEntry, Principal, SnapshotMap};
 
 /// Generation-pinned stage-one evidence, owned across body decoding.
 #[derive(Debug)]
 pub struct RequestContext {
-    state: Arc<AccountAdmissionState>,
+    /// `Option` so `admit` can *move* the state out rather than clone it.
+    ///
+    /// The counter below needs a `Drop`, and a type with `Drop` cannot be
+    /// destructured — but cloning the `Arc` to work around that would put a
+    /// contended refcount bump on the hottest staged path for the sake of a
+    /// counter that only fires when the request ends early. `Option<Arc<_>>`
+    /// is niche-optimized to the same size as the `Arc`, so taking it costs
+    /// one null write and no atomic, and the `None` it leaves behind is
+    /// exactly the "this context was consumed" signal `Drop` needs.
+    state: Option<Arc<AccountAdmissionState>>,
     locality: Locality,
 }
 
 impl RequestContext {
     #[must_use]
     pub fn snapshot(&self) -> &AccountSnapshot {
-        &self.state.snapshot
+        &self.state().snapshot
     }
 
     #[must_use]
     pub fn limits(&self) -> &tollgate_core::ResolvedLimits {
-        &self.state.snapshot.limits
+        &self.state().snapshot.limits
     }
 
     #[must_use]
     pub fn generation(&self) -> Generation {
-        self.state.snapshot.generation
+        self.state().snapshot.generation
+    }
+
+    /// The pinned state. Present for the whole of a context's public life:
+    /// only `admit` takes it, and `admit` consumes the context.
+    #[inline]
+    fn state(&self) -> &AccountAdmissionState {
+        self.state
+            .as_ref()
+            .expect("a request context holds its pinned state until admit consumes it")
     }
 
     /// What the account can still spend this period, as this instance best
@@ -47,7 +65,7 @@ impl RequestContext {
     /// cancelled one holds, and [`Committed`] is what a served one holds.
     #[must_use]
     pub fn estimate_remaining(&self) -> Option<CostUnits> {
-        self.state.estimate_remaining()
+        self.state().estimate_remaining()
     }
 
     pub fn admit<O: OpIndex, S: UsageSlot>(
@@ -56,19 +74,29 @@ impl RequestContext {
         slot: S,
         now: Timestamp,
     ) -> Result<Pending<S>, DenyReason> {
-        let locality = self.locality;
-        let quote = match compile_workload(&self.state.snapshot, workload, now) {
+        let mut this = self;
+        let locality = this.locality;
+        // Taking the state is both the ownership transfer `admit(self)` always
+        // performed and the signal that this context was not abandoned: `Drop`
+        // sees `None` and counts nothing. No clone, so the hot path pays no
+        // refcount for a counter that fires only when a request ends early.
+        let state = this
+            .state
+            .take()
+            .expect("a request context holds its pinned state until admit consumes it");
+        let quote = match compile_workload(&state.snapshot, workload, now) {
             Ok(quote) => quote,
             Err(reason) => {
-                self.state.counters.record_deny_at(&reason, locality);
+                state.counters.record_deny_at(&reason, locality);
                 return Err(reason);
             }
         };
-        admit_priced(self.state, locality, quote, now).map(|priced| Pending {
+        admit_priced(state, locality, quote, now).map(|priced| Pending {
             concurrency: priced.concurrency,
             funding: Funding::Owned(priced.reservation),
             slot,
             quote: priced.quote,
+            locality,
         })
     }
 }
@@ -105,6 +133,24 @@ impl RequestContext {
 /// pending.cancel()
 /// # }
 /// ```
+impl Drop for RequestContext {
+    fn drop(&mut self) {
+        let Some(state) = &self.state else {
+            // `admit` took the state, so stage two ran and recorded its own
+            // outcome.
+            return;
+        };
+        // Reached only when the context was never consumed by `admit`: the
+        // request authenticated and pinned a generation, then ended before
+        // stage two — a failed body read, a client disconnect, a refused
+        // decode. No pending funding exists and no admission outcome was
+        // decided, so this is neither an admission nor a denial. Counting it
+        // is what keeps an instance that authenticates a flood it never admits
+        // distinguishable from one serving nothing (INVARIANTS.md #20).
+        state.counters.record_context_abandoned();
+    }
+}
+
 /// Where a staged request's funding lives: owned outright, or shared with an
 /// asynchronous canceller.
 ///
@@ -167,6 +213,11 @@ pub struct Pending<S: UsageSlot> {
     funding: Funding,
     slot: S,
     quote: CostQuote,
+    /// The locality `begin` pinned, carried so later phases tally into the
+    /// same counter shard the admission did rather than re-reading the
+    /// thread-local — which, after a Tokio worker hop, would be a different
+    /// shard for the same request.
+    locality: Locality,
 }
 
 impl<S: UsageSlot> Pending<S> {
@@ -202,13 +253,29 @@ impl<S: UsageSlot> Pending<S> {
                 pending: self,
                 permit,
             }),
-            Err(denied) => Err((denied, Released)),
+            Err(denied) => {
+                // The gate decided this, so the gate's own tally records it
+                // rather than requiring every embedder to remember to — and it
+                // claims the terminal slot, so the guard's `Drop` does not
+                // also report a cancellation for the same request.
+                let mut pending = self;
+                pending.counters().record_capacity_shed();
+                pending.concurrency.mark_terminal_recorded();
+                Err((denied, Released))
+            }
         }
     }
 
     pub fn cancel(self) -> Released {
+        // The guard's `Drop` records the terminal outcome; cancelling here
+        // only resolves the funding.
         self.funding.reservation().cancel();
         Released
+    }
+
+    #[inline]
+    fn counters(&self) -> &AdmissionCounters {
+        &self.concurrency.state().counters
     }
 }
 
@@ -273,22 +340,42 @@ impl<S: UsageSlot, P: CapacityPermit> ReadyToStart<S, P> {
             funding,
             slot,
             quote: _,
+            locality,
         } = self.pending;
-        // The pinned snapshot decides what a lapsed lease means, and the
-        // counter comes from the same slot that funded the reservation.
-        let state = concurrency.state();
-        let commit_funding =
-            CommitFunding::from_mode(state.snapshot.enforcement_mode, state.lease.overage());
-        let units = match funding
-            .reservation()
-            .commit_at_execution_start(now, commit_funding)
-        {
+        let mut concurrency = concurrency;
+        // Whether the lease funded this admission, read before the commit can
+        // change it: an admission the lease funded that settles against
+        // overage is the commit-time transition, and it is a different fact
+        // from an admission no lease could fund.
+        let admitted_on_lease = !funding.reservation().admitted_as_overage();
+        // Scoped so the borrow of the pinned state ends before the terminal
+        // tally below needs the guard mutably. The pinned snapshot decides
+        // what a lapsed lease means, and the counter comes from the same slot
+        // that funded the reservation.
+        let committed = {
+            let state = concurrency.state();
+            let commit_funding =
+                CommitFunding::from_mode(state.snapshot.enforcement_mode, state.lease.overage());
+            funding
+                .reservation()
+                .commit_at_execution_start(now, commit_funding)
+        };
+        let units = match committed {
             Ok(units) => units,
             // Core already released for zero and classified the refusal —
             // expired funding, or an overage cap the fallback could not fit
             // inside. Each keeps its own retry class through to the embedder.
-            Err(denied @ CommitError::Denied(_)) => return Err((denied, Released)),
+            Err(denied @ CommitError::Denied(_)) => {
+                if let Some(refusal) = CommitRefusal::from_commit_error(&denied) {
+                    concurrency.state().counters.record_commit_refusal(refusal);
+                }
+                concurrency.mark_terminal_recorded();
+                return Err((denied, Released));
+            }
             Err(CommitError::AlreadyReleased | CommitError::Cancelled) => {
+                // A cancellation won the phase. That is Tollgate's outcome, so
+                // the guard's default cancellation tally is exactly right and
+                // is deliberately left armed here.
                 return Err((CommitError::Cancelled, Released));
             }
             Err(CommitError::AlreadyCommitted) => {
@@ -303,6 +390,17 @@ impl<S: UsageSlot, P: CapacityPermit> ReadyToStart<S, P> {
             .reservation()
             .usage_event(request_id, now)
             .expect("a committed reservation produces usage evidence");
+        concurrency
+            .state()
+            .counters
+            .record_execution_started_at(locality);
+        if admitted_on_lease && event.source == UsageSource::Overage {
+            concurrency
+                .state()
+                .counters
+                .record_committed_at_overage(units);
+        }
+        concurrency.mark_terminal_recorded();
         Ok(Committed {
             event: Some(event),
             slot: Some(slot),
@@ -365,6 +463,7 @@ impl<S: UsageSlot, P: CapacityPermit> ReadyToStart<S, P> {
             funding,
             slot,
             quote,
+            locality,
         } = pending;
         let (shared, handle) = match funding {
             Funding::Owned(reservation) => {
@@ -385,6 +484,7 @@ impl<S: UsageSlot, P: CapacityPermit> ReadyToStart<S, P> {
                     funding: Funding::Shared(shared),
                     slot,
                     quote,
+                    locality,
                 },
                 permit,
             },
@@ -580,7 +680,10 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
             }
         };
         state.snapshot.admit(now, required)?;
-        Ok(RequestContext { state, locality })
+        Ok(RequestContext {
+            state: Some(state),
+            locality,
+        })
     }
 }
 
@@ -1663,6 +1766,282 @@ mod tests {
             .reservation()
             .commit_at_execution_start(t(0), CommitFunding::LeaseOnly)
             .unwrap();
+    }
+
+    /// A capacity gate that always refuses.
+    ///
+    /// `NoGate` is infallible, so without this the shed path is unreachable
+    /// and its counter could only ever export zero — which reads as "this
+    /// never happens" rather than "nothing can produce it". The gate traits
+    /// are sealed against external implementations, so the witness has to live
+    /// beside them. #99 replaces it with real pools and adds
+    /// `CapacityUnavailable`; until then the reason below stands in, because
+    /// what is under test is the tally, not the vocabulary.
+    #[derive(Debug)]
+    struct RefusingGate;
+
+    #[derive(Debug)]
+    struct RefusedPermit;
+
+    impl private::Sealed for RefusingGate {}
+    impl private::Sealed for RefusedPermit {}
+    impl CapacityPermit for RefusedPermit {}
+
+    impl CapacityGate for RefusingGate {
+        type Permit = RefusedPermit;
+
+        fn acquire(&self, _evidence: CapacityEvidence) -> Result<Self::Permit, DenyReason> {
+            Err(DenyReason::ConcurrencyLimited)
+        }
+    }
+
+    /// A shed request is counted at the stage that shed it, released for zero,
+    /// and never added to the pre-admission denial total — it was already
+    /// counted under `admitted`.
+    #[test]
+    fn a_capacity_shed_is_counted_without_a_second_denial() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        let installed = lease(10_000);
+        slot.install(Arc::clone(&installed));
+        engine
+            .map()
+            .install(Principal(1), snapshot(AccountStatus::Active), slot);
+        let before = installed.remaining();
+
+        let (reason, _released) = engine
+            .admit_one(request(1), t(0))
+            .expect("the request admits")
+            .acquire_capacity(&RefusingGate)
+            .expect_err("this gate refuses everything");
+        assert_eq!(reason, DenyReason::ConcurrencyLimited);
+
+        let counters = engine.counters().snapshot();
+        assert_eq!(counters.admitted, 1);
+        assert_eq!(counters.capacity_shed, 1);
+        assert_eq!(
+            counters.canceled_before_start, 0,
+            "a shed is its own outcome, not a cancellation"
+        );
+        assert_eq!(counters.execution_started, 0);
+        assert_eq!(
+            counters.denied(),
+            0,
+            "the request was admitted; the shed belongs to a later stage"
+        );
+        assert_eq!(
+            counters.execution_started
+                + counters.canceled_before_start
+                + counters.capacity_shed
+                + counters.refused_at_start(),
+            counters.admitted,
+            "a shed still partitions `admitted` exactly"
+        );
+        assert_eq!(
+            installed.remaining(),
+            before,
+            "a shed request is released for zero"
+        );
+    }
+
+    /// Every admitted request reaches exactly one terminal counter, and none
+    /// of them touches the pre-admission denial total.
+    ///
+    /// This is the arithmetic INVARIANTS.md #20 asks for: `admitted` is the
+    /// total, and `execution_started + canceled_before_start + capacity_shed +
+    /// refused_at_start` accounts for all of it. A request counted as both an
+    /// admission and a denial is the contradictory identity the invariant
+    /// exists to prevent.
+    #[test]
+    fn every_admitted_request_reaches_exactly_one_terminal_counter() {
+        let engine = engine_with(AccountStatus::Active, Some(10_000));
+
+        // Committed.
+        drop(
+            engine
+                .admit_one(request(1), t(0))
+                .unwrap()
+                .acquire_capacity(&NoGate)
+                .unwrap()
+                .commit(RequestId(1), t(0))
+                .unwrap(),
+        );
+        // Explicitly cancelled while pending.
+        engine.admit_one(request(1), t(0)).unwrap().cancel();
+        // Abandoned while pending, with no explicit call at all.
+        drop(engine.admit_one(request(1), t(0)).unwrap());
+        // Abandoned after acquiring capacity.
+        drop(
+            engine
+                .admit_one(request(1), t(0))
+                .unwrap()
+                .acquire_capacity(&NoGate)
+                .unwrap(),
+        );
+
+        let counters = engine.counters().snapshot();
+        assert_eq!(counters.admitted, 4);
+        assert_eq!(counters.execution_started, 1);
+        assert_eq!(counters.canceled_before_start, 3);
+        assert_eq!(counters.capacity_shed, 0);
+        assert_eq!(counters.refused_at_start(), 0);
+        assert_eq!(
+            counters.execution_started
+                + counters.canceled_before_start
+                + counters.capacity_shed
+                + counters.refused_at_start(),
+            counters.admitted,
+            "every admitted request must reach exactly one terminal counter"
+        );
+        assert_eq!(
+            counters.denied(),
+            0,
+            "a post-admission outcome is never a pre-admission denial"
+        );
+    }
+
+    /// A context that `begin` produced and nothing consumed is counted as its
+    /// own phase outcome — neither an admission nor a denial.
+    ///
+    /// Without this an instance authenticating a flood of requests whose
+    /// bodies never arrive is indistinguishable from one serving nothing.
+    #[test]
+    fn an_abandoned_context_is_counted_and_denies_nothing() {
+        let engine = engine_with(AccountStatus::Active, Some(10_000));
+        drop(
+            engine
+                .begin(Principal(1), PermissionBits::bit(0), t(0))
+                .expect("stage one authorizes"),
+        );
+
+        let counters = engine.counters().snapshot();
+        assert_eq!(counters.contexts_abandoned, 1);
+        assert_eq!(counters.admitted, 0, "no pending funding was created");
+        assert_eq!(counters.denied(), 0, "and nothing was refused");
+    }
+
+    /// Consuming a context through `admit` is not abandoning it, whether the
+    /// admission succeeds or is refused at stage two.
+    #[test]
+    fn a_consumed_context_is_never_counted_as_abandoned() {
+        let engine = engine_with(AccountStatus::Active, Some(10_000));
+        engine.admit_one(request(1), t(0)).unwrap().cancel();
+        assert_eq!(engine.counters().snapshot().contexts_abandoned, 0);
+
+        // A stage-two refusal also consumed its context.
+        let engine = engine_with(AccountStatus::Active, Some(10_000));
+        engine
+            .admit_one(request(u64::MAX), t(0))
+            .expect_err("an oversized workload is refused at stage two");
+        let counters = engine.counters().snapshot();
+        assert_eq!(counters.contexts_abandoned, 0);
+        assert_eq!(counters.denied(), 1, "the refusal is a stage-two denial");
+    }
+
+    /// A commit-time funding refusal is counted under its own reason, at the
+    /// stage that decided it — never added to the pre-admission denial total,
+    /// which would make one request both an admission and a refusal.
+    #[test]
+    fn a_commit_time_funding_refusal_is_counted_under_its_own_reason() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease_until(10_000, t(100)));
+        engine
+            .map()
+            .install(Principal(1), snapshot(AccountStatus::Active), slot);
+
+        engine
+            .admit_one(request(1), t(99))
+            .unwrap()
+            .acquire_capacity(&NoGate)
+            .unwrap()
+            .commit(RequestId(1), t(100))
+            .expect_err("an expired lease cannot commit");
+
+        let counters = engine.counters().snapshot();
+        assert_eq!(counters.admitted, 1);
+        assert_eq!(counters.refused_at_start(), 1);
+        assert_eq!(
+            counters.commit_refusals[CommitRefusal::FundingExpired.index()],
+            1
+        );
+        assert_eq!(counters.execution_started, 0);
+        assert_eq!(
+            counters.canceled_before_start, 0,
+            "a funding refusal is not a cancellation"
+        );
+        assert_eq!(
+            counters.denied(),
+            0,
+            "the request was admitted; its refusal belongs to a later stage"
+        );
+        assert_eq!(
+            counters
+                .commit_refusals_by_name()
+                .find(|(name, _)| *name == "funding_expired")
+                .map(|(_, count)| count),
+            Some(1)
+        );
+    }
+
+    /// A commit-time elastic fallback gets its own qualifier, disjoint from
+    /// the admission-time one: this request *was* funded by a lease, and
+    /// changed funding at execution start.
+    #[test]
+    fn a_commit_time_fallback_is_counted_under_its_own_qualifier() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease_until(10_000, t(100)));
+        let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
+        snapshot.enforcement_mode = EnforcementMode::Elastic {
+            overage_cap: CostUnits(10_000),
+        };
+        engine.map().install(Principal(1), Arc::new(snapshot), slot);
+
+        let committed = engine
+            .admit_one(request(1), t(99))
+            .unwrap()
+            .acquire_capacity(&NoGate)
+            .unwrap()
+            .commit(RequestId(1), t(100))
+            .expect("an elastic lapse settles against overage");
+        let units = committed.units();
+        drop(committed);
+
+        let counters = engine.counters().snapshot();
+        assert_eq!(counters.admitted, 1);
+        assert_eq!(counters.execution_started, 1);
+        assert_eq!(counters.committed_at_overage, 1);
+        assert_eq!(counters.units_committed_at_overage, units.get());
+        assert_eq!(
+            counters.admitted_overage, 0,
+            "a lease funded the admission; only the commit moved to overage"
+        );
+    }
+
+    /// The two elastic qualifiers answer different questions and must not be
+    /// conflated: an admission no lease could fund is not a commit that
+    /// changed funding.
+    #[test]
+    fn an_admission_time_overage_is_not_counted_as_a_commit_time_one() {
+        let engine = elastic_engine(10_000, None);
+        drop(
+            engine
+                .admit_one(request(1), t(0))
+                .unwrap()
+                .acquire_capacity(&NoGate)
+                .unwrap()
+                .commit(RequestId(1), t(0))
+                .expect("overage funds the request"),
+        );
+
+        let counters = engine.counters().snapshot();
+        assert_eq!(counters.admitted_overage, 1);
+        assert_eq!(
+            counters.committed_at_overage, 0,
+            "the commit changed no funding source"
+        );
+        assert_eq!(counters.execution_started, 1);
     }
 
     /// The consumer topology this whole lifecycle exists for: an asynchronous

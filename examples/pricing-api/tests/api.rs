@@ -11,6 +11,7 @@ use tower::ServiceExt;
 use pricing_api::{
     AppRuntime, DEMO_ACCOUNT, DEMO_API_KEY, PricingConnection, build_app, build_app_with_mode,
 };
+use tollgate_admission::CommitRefusal;
 use tollgate_core::{CostUnits, DenyReason, EnforcementMode};
 use tollgate_store::SnapshotSource;
 
@@ -434,6 +435,34 @@ async fn metrics_separate_admissions_from_each_kind_of_refusal() {
     // be refused for either reason, so both are exported.
     assert!(after["lease_remaining"].as_u64().is_some());
     assert!(after["lease_usable_until"].as_str().is_some());
+
+    // The later phases are exported too, and they partition `admitted`
+    // exactly. Both requests ran their kernel to completion, so nothing was
+    // cancelled, shed, or refused at execution start (INVARIANTS.md #20).
+    assert_eq!(after["execution_started"], 2);
+    assert_eq!(after["canceled_before_start"], 0);
+    assert_eq!(after["capacity_shed"], 0);
+    assert_eq!(after["refused_at_start"], 0);
+    assert_eq!(
+        after["execution_started"].as_u64().unwrap()
+            + after["canceled_before_start"].as_u64().unwrap()
+            + after["capacity_shed"].as_u64().unwrap()
+            + after["refused_at_start"].as_u64().unwrap(),
+        after["admitted"].as_u64().unwrap(),
+        "every admitted request must reach exactly one terminal counter"
+    );
+    // The two credentials that could not be resolved were refused before a
+    // context existed, so they abandoned none.
+    assert_eq!(after["contexts_abandoned"], 0);
+    assert_eq!(after["committed_at_overage"], 0, "the lease funded both");
+    // Present-at-zero, exactly as `denials` is: a reader must be able to tell
+    // "has not happened" from "no such counter".
+    assert_eq!(
+        after["commit_refusals"].as_object().unwrap().len(),
+        CommitRefusal::COUNT,
+        "every commit refusal must be exported, including the ones at zero"
+    );
+    assert_eq!(after["commit_refusals"]["funding_expired"], 0);
 
     runtime.shutdown().await;
 }
