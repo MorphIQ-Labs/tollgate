@@ -8,6 +8,7 @@
     { "id": "snapshot/admit", "mean_ns": 1.123 },
     { "id": "lease/reserve_commit", "mean_ns": 40.051 },
     { "id": "lease/reserve_cancel", "mean_ns": 45.86 },
+    { "id": "lease/overage_commit_fallback", "mean_ns": 48.65 },
     { "id": "admission/snapshot_lookup_arc_swap", "mean_ns": 14.248, "max_regression": 0.1 },
     { "id": "admission/snapshot_lookup_moka", "mean_ns": 70.142, "max_regression": 0.1 },
     { "id": "admission/full_check", "mean_ns": 108.659 },

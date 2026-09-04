@@ -1,3 +1,4 @@
+import Tollgate.CommitFallback
 import Tollgate.Conservation
 import Tollgate.ConcurrencyGauge
 import Tollgate.LeaseShards

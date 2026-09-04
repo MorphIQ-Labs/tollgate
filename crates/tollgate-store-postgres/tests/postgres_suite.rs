@@ -2712,6 +2712,54 @@ async fn overage_usage_is_billed_and_funds_itself() {
     assert_eq!(store.usage_recorded(ACCOUNT).await.unwrap(), CostUnits(40));
 }
 
+/// Mirrors `a_commit_time_fallback_is_ingested_as_overage_after_its_lease_is_reclaimed`.
+///
+/// The commit-time elastic fallback bills against the terminal phase, not the
+/// funding receipt. This backend must reach the same verdict: the leased
+/// spelling of the charge is a straggler against a reclaimed lease and is
+/// rejected, while the overage spelling the fallback actually emits is billed
+/// and funds itself.
+#[tokio::test]
+async fn a_commit_time_fallback_is_ingested_as_overage_after_its_lease_is_reclaimed() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
+        .await
+        .unwrap();
+
+    let reclaimed = store.reclaim_expired(t(60)).await.unwrap();
+    assert_eq!(reclaimed[0].reclaimed, CostUnits(500));
+
+    let receipt_sourced = store
+        .ingest(&[usage(&lease, 1, 30, 61)], t(61))
+        .await
+        .unwrap();
+    assert_eq!(
+        (receipt_sourced.accepted, receipt_sourced.rejected),
+        (0, 1),
+        "a leased event naming a reclaimed lease is a straggler"
+    );
+    assert_eq!(
+        store.usage_recorded(ACCOUNT).await.unwrap(),
+        CostUnits::ZERO
+    );
+
+    let phase_sourced = store
+        .ingest(&[overage_usage(ACCOUNT, 2, 30, 61)], t(61))
+        .await
+        .unwrap();
+    assert_eq!((phase_sourced.accepted, phase_sourced.rejected), (1, 0));
+
+    let after = store.conservation(ACCOUNT).await.unwrap().unwrap();
+    assert_eq!(after.settled_usage, CostUnits(30), "the work is billed");
+    assert_eq!(after.overage_recorded, CostUnits(30), "and it is funded");
+    assert!(after.holds(), "conservation violated: {after:?}");
+    assert_conserved(&store).await;
+}
+
 /// Mirrors `overage_usage_for_an_unknown_account_is_rejected`.
 ///
 /// The backends reach the same verdict by different routes: memory looks the

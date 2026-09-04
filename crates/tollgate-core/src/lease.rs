@@ -10,6 +10,7 @@
 //! release or usage from being attributed to a different lease
 //! (INVARIANTS.md #1, #4).
 
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -206,8 +207,21 @@ impl AccountOverage {
     /// claim has advanced `committed`. A cap observer that overlaps either
     /// half therefore sees `OverageCommitInProgress`, never a stable claim
     /// that the already-irrevocable units remain refundable.
+    ///
+    /// **Precondition: the caller already owns `units` in `spent`, and this
+    /// function never credits them back.** Publication is not a debit. There
+    /// are exactly two owners that satisfy that, and both are in this crate: a
+    /// pending overage [`Reservation`], whose cancel/drop refunds, and a
+    /// [`TentativeOverage`] guard, which refunds on drop. A caller that
+    /// publishes without holding one leaves committed occupancy above recorded
+    /// spend, which the `publish` assertion catches in debug and which silently
+    /// reopens the cap in release. Reach it through
+    /// [`TentativeOverage::publish_commit`] unless a pending reservation is
+    /// already the owner.
+    ///
+    /// [`Reservation`]: crate::reservation::Reservation
     #[inline]
-    pub(crate) fn publish_commit<T, E>(
+    pub(crate) fn publish_claim<T, E>(
         &self,
         units: CostUnits,
         claim: impl FnOnce() -> Result<T, E>,
@@ -250,6 +264,80 @@ impl AccountOverage {
             "overage credit of {} exceeds recorded spend {prior}",
             units.get()
         );
+    }
+
+    /// Extend `units` as a *revocable* debit, owned by the returned guard.
+    ///
+    /// This is the commit-time half of elastic funding: a leased reservation
+    /// whose window lapsed needs overage capacity *before* it can claim the
+    /// phase, because a won claim with no funding term breaks the ledger
+    /// equation by exactly these units. But it cannot know yet whether it will
+    /// win — a canceller may already be resolving the same reservation — so
+    /// the debit must be revocable until the claim resolves.
+    ///
+    /// The guard is what makes "debited but never resolved" unrepresentable.
+    /// Without it the units sit in `spent` with no owner between the debit and
+    /// the claim; a panic unwinding through that window (or any early return a
+    /// later edit adds) leaves the reservation's own `Drop` refunding the
+    /// *lease* while these units are stranded for the life of the process,
+    /// silently shrinking the account's cap.
+    #[inline]
+    pub(crate) fn debit_tentatively(
+        &self,
+        units: CostUnits,
+        cap: CostUnits,
+    ) -> Result<TentativeOverage<'_>, DenyReason> {
+        self.try_debit(units, cap)?;
+        Ok(TentativeOverage {
+            overage: self,
+            units,
+        })
+    }
+}
+
+/// A revocable overage debit, held between the claim's funding and its
+/// resolution. Dropping it returns the units; [`publish_commit`] is the only
+/// way to make them irrevocable.
+///
+/// [`publish_commit`]: TentativeOverage::publish_commit
+#[derive(Debug)]
+pub(crate) struct TentativeOverage<'a> {
+    overage: &'a AccountOverage,
+    units: CostUnits,
+}
+
+impl TentativeOverage<'_> {
+    /// Publish `claim` and this debit as one observer-safe transition.
+    ///
+    /// Consuming `self` is the ordering guarantee: the debit is already in
+    /// `spent` before the marker is installed, so the publication's occupancy
+    /// assertion holds exactly as it does for a natively admitted overage, and
+    /// a cap observer that overlaps either half sees `OverageCommitInProgress`
+    /// rather than a stable claim that irrevocable units are refundable. A
+    /// caller cannot claim without first holding a debit, because there is no
+    /// other way to reach this function.
+    ///
+    /// A winning claim retains the units; a losing claim credits them back
+    /// before returning, because the winner was a cancellation that refunded
+    /// its own funding source and owes nothing for these.
+    #[inline]
+    pub(crate) fn publish_commit<T, E>(self, claim: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        // The refund is this function's responsibility from here, so disarm
+        // the guard rather than letting it double-credit a retained debit.
+        let this = ManuallyDrop::new(self);
+        match this.overage.publish_claim(this.units, claim) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                this.overage.credit(this.units);
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for TentativeOverage<'_> {
+    fn drop(&mut self) {
+        self.overage.credit(self.units);
     }
 }
 
@@ -720,13 +808,64 @@ mod tests {
         AccountOverage::new(AccountId(1))
     }
 
+    /// The tentative debit's whole reason for existing: units taken but never
+    /// resolved come back on their own. Without the guard they would sit in
+    /// `spent` with no owner — a panic or an early return between the debit
+    /// and the claim would strand them for the life of the process, silently
+    /// shrinking the account's cap.
+    #[test]
+    fn dropping_an_unresolved_tentative_debit_returns_the_credit() {
+        let o = overage();
+        {
+            let tentative = o.debit_tentatively(CostUnits(40), CostUnits(100)).unwrap();
+            assert_eq!(o.spent(), CostUnits(40));
+            drop(tentative);
+        }
+        assert_eq!(o.spent(), CostUnits::ZERO);
+        assert_eq!(o.headroom(CostUnits(100)), CostUnits(100));
+    }
+
+    /// A losing claim credits the debit back before returning, so the cap is
+    /// immediately reusable and committed occupancy never moved.
+    #[test]
+    fn a_tentative_debit_whose_claim_loses_returns_the_credit() {
+        let o = overage();
+        let tentative = o.debit_tentatively(CostUnits(40), CostUnits(100)).unwrap();
+        assert_eq!(o.spent(), CostUnits(40));
+
+        let lost: Result<(), ()> = tentative.publish_commit(|| Err(()));
+        assert!(lost.is_err());
+        assert_eq!(o.spent(), CostUnits::ZERO);
+        assert_eq!(o.headroom(CostUnits(100)), CostUnits(100));
+    }
+
+    /// A winning claim retains the debit and advances committed occupancy,
+    /// which is what makes those units irrevocable to a cap observer.
+    #[test]
+    fn a_tentative_debit_whose_claim_wins_becomes_irrevocable() {
+        let o = overage();
+        let tentative = o.debit_tentatively(CostUnits(40), CostUnits(100)).unwrap();
+        let won: Result<(), ()> = tentative.publish_commit(|| Ok(()));
+        assert!(won.is_ok());
+        assert_eq!(o.spent(), CostUnits(40));
+        // Committed occupancy moved with it, so the remaining cap is stably
+        // exhausted rather than temporarily so.
+        assert_eq!(
+            o.try_debit(CostUnits(61), CostUnits(100)),
+            Err(DenyReason::OverageCapExhausted {
+                spent: CostUnits(40),
+                overage_cap: CostUnits(100),
+            })
+        );
+    }
+
     #[test]
     fn committed_overage_accumulates_up_to_the_cap_and_then_refuses() {
         let o = overage();
         o.try_debit(CostUnits(40), CostUnits(100)).unwrap();
-        o.publish_commit(CostUnits(40), || Ok::<_, ()>(())).unwrap();
+        o.publish_claim(CostUnits(40), || Ok::<_, ()>(())).unwrap();
         o.try_debit(CostUnits(60), CostUnits(100)).unwrap();
-        o.publish_commit(CostUnits(60), || Ok::<_, ()>(())).unwrap();
+        o.publish_claim(CostUnits(60), || Ok::<_, ()>(())).unwrap();
         assert_eq!(o.spent(), CostUnits(100));
         assert_eq!(o.headroom(CostUnits(100)), CostUnits::ZERO);
         assert_eq!(

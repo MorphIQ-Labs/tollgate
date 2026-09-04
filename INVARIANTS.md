@@ -34,6 +34,23 @@ until it has one.
    conservation stays exact (see *Ledger roles*) and no unit is ever spent without being
    accounted for. Elastic mode changes whether a request is admitted; it
    changes nothing about whether its units are counted.
+
+   Elastic funding is decided twice: at admission, when no lease can fund the
+   quote, and at execution start, when the funding lease's window lapsed in
+   between (3, 12). Both go through the same cap and the same compare-exchange,
+   so both are bounded identically. A commit-time attempt reports the overage
+   counter's own refusal verbatim — `OverageCapExhausted`,
+   `OverageCapTemporarilyExhausted`, or `OverageCommitInProgress` — because each
+   carries a different retry classification — the same three states the
+   retry-state paragraph below defines — and collapsing them would tell a
+   caller to retry immediately against units that are already irrevocable.
+
+   While a commit-time attempt is in flight the account's units are momentarily
+   counted against both its lease and its overage counter. That window cannot
+   be closed — the counters are separate atomics, and returning the lease
+   earlier is the double-refund defect (3) — but it only ever *over*-states
+   local occupancy, so every refusal it can cause is conservative and none of
+   them can admit work the cap should have refused.
    *Tests:* `no_double_spend_across_instances` (memory and Postgres variants),
    `tollgate-core` reservation proptests; `lease_units_are_conserved` and
    `concurrent_commit_conservation` across sharded layouts,
@@ -72,15 +89,24 @@ until it has one.
    `committed_overage_exhaustion_remains_retryable_after_lease_refill`, plus
    `overage_commit_publication_never_looks_refundable` and
    `overage_retry_classes_map_to_distinct_http_contracts` for the canonical
-   embedder. *Proof:* `formal/lean/Tollgate/OveragePublication.lean`.
+   embedder. The commit-time attempt reaches the same three states:
+   `an_elastic_lapse_with_no_committed_headroom_releases_the_lease_for_zero`,
+   `an_elastic_lapse_blocked_by_refundable_occupancy_is_temporarily_exhausted`,
+   and
+   `an_elastic_lapse_overlapping_a_sibling_publication_reports_an_in_flight_commit`.
+   *Proof:* `formal/lean/Tollgate/OveragePublication.lean`.
 
 2. **Zero charge before execution.** A reservation that never reaches
    `commit_at_execution_start` charges zero units, and its units return to the
    local lease. Dropping a pending reservation is a release, not a leak.
    A fragmented sharded reservation refunds its exact aggregate once; shards
-   may rebalance because they are partitions of the same lease bound. *Tests:*
+   may rebalance because they are partitions of the same lease bound. A
+   commit-time elastic fallback is a *commit*, not a release: it returns the
+   lease receipt because overage now funds the same units, and the charge
+   stands in full. *Tests:*
    `reservation::tests::{drop_releases_pending, cancel_charges_zero}`,
-   `fragmented_reservation_refunds_without_stranding_capacity`, and
+   `fragmented_reservation_refunds_without_stranding_capacity`,
+   `a_fallback_commit_refunds_its_lease_exactly_once`, and
    `lease_units_are_conserved`.
 
 3. **Atomic commit-vs-cancel.** Commit and cancel race on a single atomic
@@ -89,11 +115,30 @@ until it has one.
    canceller. Overage wraps that phase transition and committed occupancy in a
    visible publication guard, so observers never treat the interval between
    the two atomic words as stable. Once both racers return its retry
-   classification agrees with the winner. *Tests:*
+   classification agrees with the winner.
+
+   The phase word carries five values, and the terminal one names the funding
+   that settled the charge: `PENDING_LEASE` reaches `COMMITTED_LEASE`,
+   `COMMITTED_OVERAGE`, or `RELEASED`; `PENDING_OVERAGE` reaches
+   `COMMITTED_OVERAGE` or `RELEASED`. The middle edge is the commit-time
+   elastic fallback, and it is **one** transition rather than a release
+   followed by a second reservation — which would give a canceller one phase
+   to win while a worker committed another, and let both report success. It is
+   funded by a revocable overage debit taken strictly *before* the claim, so a
+   winning claim can never name overage the account never recorded, and it
+   returns the lease receipt strictly *after* the claim, so a losing claim
+   cannot double-refund alongside the canceller that already returned it. An
+   unresolved tentative debit is returned by its own guard, making "debited but
+   never resolved" unrepresentable rather than merely tested. *Tests:*
    `reservation::tests::commit_cancel_race_one_winner`,
-   `reservation::tests::overage_commit_publication_never_looks_refundable`, and
-   `reservation::tests::overage_commit_cancel_race_preserves_retry_classification`.
-   *Proof:* `formal/lean/Tollgate/OveragePublication.lean`.
+   `reservation::tests::overage_commit_publication_never_looks_refundable`,
+   `reservation::tests::overage_commit_cancel_race_preserves_retry_classification`,
+   `reservation::tests::fallback_commit_and_cancel_leave_exactly_one_funding_term`,
+   `reservation::tests::a_fallback_that_loses_to_cancel_strands_no_overage_capacity`,
+   `lease::tests::dropping_an_unresolved_tentative_debit_returns_the_credit`, and
+   `funding_terms_are_conserved_across_lapse_and_fallback`.
+   *Proofs:* `formal/lean/Tollgate/OveragePublication.lean` and
+   `formal/lean/Tollgate/CommitFallback.lean`.
 
 4. **Lease capabilities are exact and lease-scoped.** Every acquired lease is
    stamped with the next fencing token in its account's strictly increasing
@@ -401,9 +446,25 @@ until it has one.
     releases and late usage through the window). Work committed inside the
     window therefore always has margin + grace to be flushed and billed;
     work cannot commit against capacity the allocator may have re-granted.
+
+    Under `Elastic` a lapsed window is not a refusal but a change of funding:
+    the charge settles against overage and the lease receipt is returned. The
+    bill it emits therefore names **no lease capability**, and that follows
+    from the terminal phase rather than the funding receipt. This is not a
+    stylistic choice — the sink rejects a leased event whose lease has been
+    reclaimed, and a lapsed lease is precisely one about to be reclaimed, so
+    billing a fallback against its receipt would silently drop the charge for
+    work that ran. Under `Strict` the lapse still releases for zero and the
+    kernel must not run.
     *Tests:* `reservation::tests::{commit_after_window_closes_releases_for_zero,
-    safety_margin_closes_window_before_expiry}`,
-    `reclaim_waits_for_grace_and_release_works_within_it` (both store suites).
+    safety_margin_closes_window_before_expiry,
+    an_elastic_lapse_at_execution_start_bills_as_overage_with_no_lease_capability,
+    a_strict_lapse_at_execution_start_releases_for_zero_and_yields_no_event}`,
+    `engine::tests::a_strict_expiry_at_execution_start_produces_no_committed_guard`,
+    `reclaim_waits_for_grace_and_release_works_within_it` and
+    `a_commit_time_fallback_is_ingested_as_overage_after_its_lease_is_reclaimed`
+    (both store suites).
+    *Proof:* `formal/lean/Tollgate/CommitFallback.lean`.
 
 13. **A committed charge is always emitted.** The usage slot is bound at
     admission, not at commit: `RequestContext::admit` takes the pre-reserved

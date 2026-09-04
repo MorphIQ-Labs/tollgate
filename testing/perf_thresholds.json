@@ -68,6 +68,12 @@
       "threshold_ns": 160.0
     },
     {
+      "_comment": "The commit-time elastic fallback (#93): a lapsed lease settling against overage in one transition. One revocable debit and one lease credit on top of the ordinary claim, on a branch only a lapsed lease reaches. Measured at 48.7ns locally; the same-run ratio below is the portable contract, and lease/reserve_commit holding at 39.7ns against its 40.1ns baseline is the evidence the cold branch costs the ordinary path nothing.",
+      "id": "lease/overage_commit_fallback",
+      "target_ns": 60.0,
+      "threshold_ns": 190.0
+    },
+    {
       "_comment": "Stable committed-cap refusal, including the zero-delta publication RMW that prevents a stale marker observation. Measured at 7.7ns locally; this keeps the denial-path synchronization cost measured rather than inferred from successful reservation.",
       "id": "lease/overage_refusal_committed",
       "target_ns": 10.0,
@@ -234,6 +240,12 @@
       "numerator": "lease/overage_reserve_commit",
       "denominator": "lease/reserve_commit",
       "max_ratio": 3.0
+    },
+    {
+      "_comment": "The commit-time fallback against the ordinary lease commit it replaces. It is strictly more work — a revocable debit, a publication, and a lease credit — so the contract is that it stays a small bounded factor rather than that it is free. Measured x1.22.",
+      "numerator": "lease/overage_commit_fallback",
+      "denominator": "lease/reserve_commit",
+      "max_ratio": 2.0
     },
     {
       "_comment": "A stable overage refusal measured x0.20 against ordinary reserve-and-commit; even with its publication-ordering RMW it must remain cheaper than that successful transition.",

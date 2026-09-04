@@ -6,8 +6,8 @@ use std::sync::Arc;
 use jiff::Timestamp;
 
 use tollgate_core::{
-    AccountSnapshot, CommitError, CostQuote, CostUnits, DenyReason, Generation, Locality, OpIndex,
-    PermissionBits, QuoteError, RequestId, Reservation, UsageEvent, UsageSlot,
+    AccountSnapshot, CommitError, CommitFunding, CostQuote, CostUnits, DenyReason, Generation,
+    Locality, OpIndex, PermissionBits, QuoteError, RequestId, Reservation, UsageEvent, UsageSlot,
 };
 
 use crate::counters::AdmissionCounters;
@@ -217,18 +217,21 @@ impl<S: UsageSlot, P: CapacityPermit> ReadyToStart<S, P> {
             slot,
             quote: _,
         } = self.pending;
-        let units = match reservation.commit_at_execution_start(now) {
+        // The pinned snapshot decides what a lapsed lease means, and the
+        // counter comes from the same slot that funded the reservation.
+        let state = concurrency.state();
+        let funding =
+            CommitFunding::from_mode(state.snapshot.enforcement_mode, state.lease.overage());
+        let units = match reservation.commit_at_execution_start(now, funding) {
             Ok(units) => units,
-            Err(CommitError::LeaseExpired) => {
-                return Err((
-                    CommitError::Denied(DenyReason::FundingExpiredAtStart),
-                    Released,
-                ));
-            }
+            // Core already released for zero and classified the refusal —
+            // expired funding, or an overage cap the fallback could not fit
+            // inside. Each keeps its own retry class through to the embedder.
+            Err(denied @ CommitError::Denied(_)) => return Err((denied, Released)),
             Err(CommitError::AlreadyReleased | CommitError::Cancelled) => {
                 return Err((CommitError::Cancelled, Released));
             }
-            Err(CommitError::AlreadyCommitted | CommitError::Denied(_)) => {
+            Err(CommitError::AlreadyCommitted) => {
                 debug_assert!(false, "an owned ready state can commit only once");
                 return Err((CommitError::Cancelled, Released));
             }
@@ -557,7 +560,7 @@ fn admit_priced(
         },
     };
 
-    if reservation.is_overage() {
+    if reservation.admitted_as_overage() {
         concurrency
             .state()
             .counters
@@ -776,7 +779,7 @@ mod tests {
             let admitted = elastic
                 .admit_one(request(1), t(0))
                 .unwrap_or_else(|denied| panic!("elastic denied {name}: {denied}"));
-            assert!(admitted.reservation.is_overage());
+            assert!(admitted.reservation.admitted_as_overage());
             assert_eq!(admitted.quote.total, CostUnits(51));
         }
     }
@@ -795,7 +798,7 @@ mod tests {
         engine.map().install(Principal(1), Arc::new(snapshot), slot);
 
         let admitted = engine.admit_one(request(1), t(10)).expect("elastic admits");
-        assert!(admitted.reservation.is_overage());
+        assert!(admitted.reservation.admitted_as_overage());
     }
 
     /// The safety argument in one test: elasticity is a statement about
@@ -877,7 +880,7 @@ mod tests {
             let admitted = engine.admit_one(request(1), t(0)).expect("within the cap");
             admitted
                 .reservation
-                .commit_at_execution_start(t(0))
+                .commit_at_execution_start(t(0), CommitFunding::LeaseOnly)
                 .expect("commit");
         }
         let denied = engine.admit_one(request(1), t(0)).unwrap_err();
@@ -918,7 +921,7 @@ mod tests {
                 .admit_one(request(1), now)
                 .unwrap_or_else(|denied| panic!("the cap must cover {name}: {denied}"))
                 .reservation
-                .commit_at_execution_start(now)
+                .commit_at_execution_start(now, CommitFunding::LeaseOnly)
                 .expect("commit the local overage");
 
             let denied = engine.admit_one(request(1), now).unwrap_err();
@@ -932,7 +935,7 @@ mod tests {
             let admitted = engine
                 .admit_one(request(1), now)
                 .unwrap_or_else(|denied| panic!("a refill must recover {name}: {denied}"));
-            assert!(!admitted.reservation.is_overage());
+            assert!(!admitted.reservation.admitted_as_overage());
         }
     }
 
@@ -973,10 +976,10 @@ mod tests {
                     let engine = Arc::clone(&engine);
                     scope.spawn(move || match engine.admit_one(request(1), t(0)) {
                         Ok(admitted) => {
-                            assert!(admitted.reservation.is_overage());
+                            assert!(admitted.reservation.admitted_as_overage());
                             admitted
                                 .reservation
-                                .commit_at_execution_start(t(0))
+                                .commit_at_execution_start(t(0), CommitFunding::LeaseOnly)
                                 .expect("commit");
                             1
                         }
@@ -1037,7 +1040,7 @@ mod tests {
         let admitted = engine
             .admit_one(request(1), t(0))
             .expect("the lease funds it");
-        assert!(!admitted.reservation.is_overage());
+        assert!(!admitted.reservation.admitted_as_overage());
         let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
             panic!("principal present");
         };
@@ -1074,7 +1077,7 @@ mod tests {
         let admitted = engine
             .admit_one(request(1), t(0))
             .expect("the lease funds it");
-        assert!(!admitted.reservation.is_overage());
+        assert!(!admitted.reservation.admitted_as_overage());
         let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
             panic!("principal present");
         };
@@ -1464,8 +1467,103 @@ mod tests {
         assert_eq!(admitted.quote.total, CostUnits(64));
         admitted
             .reservation
-            .commit_at_execution_start(t(0))
+            .commit_at_execution_start(t(0), CommitFunding::LeaseOnly)
             .unwrap();
+    }
+
+    /// The staged path under `Strict`: a lease whose window lapsed between
+    /// admission and execution start produces **no** `Committed` guard, so the
+    /// kernel cannot run. `Committed` is the only proof execution may begin,
+    /// and the type system is what enforces that here.
+    #[test]
+    fn a_strict_expiry_at_execution_start_produces_no_committed_guard() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease_until(10_000, t(100)));
+        engine
+            .map()
+            .install(Principal(1), snapshot(AccountStatus::Active), slot);
+
+        let ready = engine
+            .admit_one(request(1), t(99))
+            .expect("the request admits while the lease is usable")
+            .acquire_capacity(&NoGate)
+            .expect("capacity is disabled");
+
+        // The window lapses before the worker starts.
+        let (error, _released) = ready
+            .commit(RequestId(1), t(100))
+            .expect_err("an expired lease must not produce an execution guard");
+        assert_eq!(
+            error,
+            CommitError::Denied(DenyReason::FundingExpiredAtStart)
+        );
+    }
+
+    /// The same lapse under `Elastic` settles against overage instead of
+    /// refusing: the worker gets its guard, the charge stands in full, and the
+    /// bill names no lease — the lease that funded admission was returned.
+    #[test]
+    fn an_elastic_expiry_at_execution_start_produces_a_guard_billed_as_overage() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease_until(10_000, t(100)));
+        let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
+        snapshot.enforcement_mode = EnforcementMode::Elastic {
+            overage_cap: CostUnits(10_000),
+        };
+        let overage = Arc::clone(slot.overage());
+        engine.map().install(Principal(1), Arc::new(snapshot), slot);
+
+        let pending = engine
+            .admit_one(request(1), t(99))
+            .expect("the request admits while the lease is usable");
+        let quote = pending.quote().total;
+        let committed = pending
+            .acquire_capacity(&NoGate)
+            .expect("capacity is disabled")
+            .commit(RequestId(1), t(100))
+            .expect("an elastic lapse settles against overage");
+
+        assert_eq!(committed.units(), quote, "the full quote still stands");
+        assert_eq!(
+            overage.spent(),
+            quote,
+            "the charge moved to the overage counter"
+        );
+    }
+
+    /// A commit-time fallback that cannot fit inside the cap reports the
+    /// overage counter's own refusal, with its own retry classification —
+    /// never relabelled as expired funding, which would tell the caller the
+    /// lease was the problem.
+    #[test]
+    fn a_commit_time_fallback_beyond_the_cap_reports_the_overage_refusal() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease_until(10_000, t(100)));
+        let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
+        // A cap far below any quote this request can produce.
+        snapshot.enforcement_mode = EnforcementMode::Elastic {
+            overage_cap: CostUnits(1),
+        };
+        engine.map().install(Principal(1), Arc::new(snapshot), slot);
+
+        let (error, _released) = engine
+            .admit_one(request(1), t(99))
+            .expect("the request admits while the lease is usable")
+            .acquire_capacity(&NoGate)
+            .expect("capacity is disabled")
+            .commit(RequestId(1), t(100))
+            .expect_err("a fallback beyond the cap cannot produce a guard");
+        let CommitError::Denied(reason) = error else {
+            panic!("expected a classified funding denial, got {error:?}")
+        };
+        assert!(
+            matches!(reason, DenyReason::OverageCapExhausted { .. }),
+            "expected the overage counter's own refusal, got {reason:?}"
+        );
+        assert_eq!(reason.retry(), Retry::Transient);
     }
 
     #[test]

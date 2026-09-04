@@ -1005,7 +1005,9 @@ fn erf(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tollgate_core::{FencingToken, LeaseGrant, LeaseId, LocalLease, Reservation};
+    use tollgate_core::{
+        CommitFunding, FencingToken, LeaseGrant, LeaseId, LocalLease, Reservation,
+    };
     use tollgate_store::{SnapshotResolution, SnapshotSource};
 
     #[test]
@@ -1222,7 +1224,9 @@ mod tests {
         // really cannot admit anything.
         let overage =
             Reservation::reserve_overage(slot.overage(), CostUnits(100), CostUnits(100)).unwrap();
-        overage.commit_at_execution_start(now).unwrap();
+        overage
+            .commit_at_execution_start(now, CommitFunding::LeaseOnly)
+            .unwrap();
         assert!(
             !quota_usable(&slot, elastic, now),
             "a spent cap is not admissible, and readiness must say so"
