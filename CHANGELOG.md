@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.14.4](https://github.com/MorphIQ-Labs/tollgate/compare/v0.14.3...v0.14.4) - 2026-09-04
+
+### Fixed
+
+- *(ci)* #110 stop a dependency's housekeeping failing the allocation gate
+
 ## [0.14.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.14.2...v0.14.3) - 2026-09-04
 
 ### Added
