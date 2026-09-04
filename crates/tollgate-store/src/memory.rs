@@ -522,6 +522,24 @@ impl MemoryStore {
             .unwrap_or(CostUnits::ZERO)
     }
 
+    /// The event this store settled for `request_id`, if it settled one.
+    ///
+    /// The reference implementation keeps whole events — the idempotency map
+    /// is keyed by request and holds the value — so this reads back what was
+    /// actually billed rather than a projection of it. `PostgresStore` keeps
+    /// only the columns it needs and has no equivalent, which is why a
+    /// backend-parity assertion on a stored field reads that backend's column
+    /// directly instead.
+    ///
+    /// Exists for inspection and tests, beside [`usage_recorded`]. It is not
+    /// part of `UsageSink`: no request-path code reads settled events back.
+    ///
+    /// [`usage_recorded`]: MemoryStore::usage_recorded
+    #[must_use]
+    pub fn settled_event(&self, request_id: tollgate_core::RequestId) -> Option<UsageEvent> {
+        self.lock().usage.get(&request_id).copied()
+    }
+
     #[must_use]
     pub fn balance(&self, account: AccountId) -> CostUnits {
         self.lock()

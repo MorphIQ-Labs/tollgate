@@ -1245,5 +1245,15 @@ exists to detect corrupt state and must not be able to launder it.
     `a_builder_without_a_revision_states_none`,
     `an_event_without_a_revision_key_decodes_as_unstated`,
     `a_revision_survives_the_event_round_trip_exactly`,
-    `the_unstated_revision_is_all_zeroes_and_round_trips`, and
-    `the_policy_revision_is_cold`.
+    `the_unstated_revision_is_all_zeroes_and_round_trips`,
+    `the_policy_revision_is_cold`,
+    `a_snapshot_revision_round_trips_through_the_store` and
+    `..._through_postgres`,
+    `a_usage_event_is_ingested_with_its_revision_and_conserves`,
+    `a_usage_row_carries_its_policy_revision`,
+    `a_usage_row_cannot_carry_a_wrong_width_revision`,
+    `a_legacy_snapshot_document_defaults_the_revision_to_unstated`,
+    `admin_preserves_the_policy_revision_over_http`,
+    `admin_refuses_a_noncanonical_policy_revision`,
+    `full_stack_over_loopback_http`, and
+    `the_response_and_the_bill_name_the_same_policy_revision`.

@@ -44,7 +44,7 @@ use tollgate_client::{
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CommitError, CostTable, CostUnits, DenyReason,
-    EnforcementMode, Generation, LocalSharding, OpIndex, PermissionBits, Principal,
+    EnforcementMode, Generation, LocalSharding, OpIndex, PermissionBits, PolicyRevision, Principal,
     PublishableSnapshot, RequestId, ResolvedLimits,
 };
 use tollgate_store::{AccountConfig, GrantPolicy, MemoryStore};
@@ -132,6 +132,15 @@ pub struct PriceResponse {
 pub struct ResponseMetadata {
     pub request_id: String,
     pub units_charged: u64,
+    /// Which of the publisher's policies priced this request (#94).
+    ///
+    /// Read off the committed guard rather than looked up again, so it is the
+    /// revision the usage event carries by construction. A real consumer
+    /// resolves its customer-visible metadata — plan name, schedule version,
+    /// whatever it publishes — from this value locally, with no I/O, and can
+    /// state that the description matches the charge rather than hoping two
+    /// lookups agreed.
+    pub policy_revision: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -301,6 +310,12 @@ impl AppRuntime {
 pub const DEMO_API_KEY: &str = "demo-key-1";
 pub const DEMO_ACCOUNT: AccountId = AccountId(1);
 
+/// The example's application-policy identity (#94). A real publisher would
+/// hash the resolved product records it compiled into the snapshot; a fixed
+/// value is enough to demonstrate that the response metadata and the usage
+/// event name the same policy.
+pub const DEMO_POLICY_REVISION: PolicyRevision = PolicyRevision([0x5e; 32]);
+
 /// Well inside the one-hour validity each published snapshot carries, so a
 /// republish that is late or skipped still leaves many attempts before
 /// anything can age out.
@@ -433,6 +448,10 @@ fn build_app_with(
                     ),
                 )
                 .enforcement_mode(enforcement_mode)
+                // A real publisher hashes the product records it compiled;
+                // this example states a fixed one, which is enough to show
+                // the value reaching both the response and the bill (#94).
+                .policy_revision(DEMO_POLICY_REVISION)
                 .build(),
             );
             PublishableSnapshot::try_new(snapshot)
@@ -962,6 +981,7 @@ async fn price(input: PriceInput) -> Response {
             metadata: ResponseMetadata {
                 request_id: "baseline".to_string(),
                 units_charged: 0,
+                policy_revision: PolicyRevision::UNSTATED.to_string(),
             },
         })
         .into_response();
@@ -995,6 +1015,9 @@ async fn price(input: PriceInput) -> Response {
         }
     };
     let units = committed.units();
+    // Taken from the guard, which reads it off the event it will emit — so
+    // the response cannot name a policy the bill does not.
+    let policy_revision = committed.policy_revision();
 
     let prices: Vec<f64> = request.contracts.iter().map(black_scholes_call).collect();
     drop(committed);
@@ -1004,6 +1027,7 @@ async fn price(input: PriceInput) -> Response {
         metadata: ResponseMetadata {
             request_id: request_id.to_string(),
             units_charged: units.get(),
+            policy_revision: policy_revision.to_string(),
         },
     })
     .into_response()

@@ -3799,6 +3799,208 @@ async fn a_lease_reclaimed_inside_its_own_period_expires_nothing() {
     assert_conserved(&store).await;
 }
 
+/// Mirrors `a_snapshot_revision_round_trips_through_the_store`.
+///
+/// Free on the memory side; not here. Snapshots go through storage-local
+/// DTOs and are rebuilt via the builder, so a field missing from either would
+/// be silently dropped on every read — which is the failure this pins.
+#[tokio::test]
+async fn a_snapshot_revision_round_trips_through_postgres() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    let principal = Principal(0x94);
+    let revision = PolicyRevision([0x7e; 32]);
+
+    let submitted = AccountSnapshot::builder(
+        ACCOUNT,
+        Generation(1),
+        AccountStatus::Active,
+        t(10_000),
+        PermissionBits::ALL,
+        ResolvedLimits::new(64).with_weighted_rate(1_000, 1_000),
+        Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+    )
+    .policy_revision(revision)
+    .build();
+    AdminStore::publish_snapshot(&*store, principal, publishable(Arc::new(submitted)))
+        .await
+        .unwrap();
+
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("the snapshot must be present");
+    };
+    assert_eq!(fetched.policy_revision, revision);
+
+    // And it is on the wire inside the JSONB, spelled canonically — the
+    // stored document is what a future reader decodes, so its shape is the
+    // contract rather than the Rust value that happened to round-trip.
+    let pool = corruption_pool().await;
+    let stored: serde_json::Value =
+        sqlx::query_scalar("SELECT snapshot FROM tollgate_snapshots WHERE principal = $1")
+            .bind(principal.0.to_be_bytes().to_vec())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored["policy_revision"],
+        serde_json::Value::String("7e".repeat(32))
+    );
+}
+
+/// A snapshot document written before #94 has no revision key, and must decode
+/// rather than deny. A required field here would make every pre-existing row
+/// fail to decode and the request path deny every principal until the whole
+/// catalogue was republished — the silent outage `enforcement_mode` and
+/// `budget` each avoided the same way.
+#[tokio::test]
+async fn a_legacy_snapshot_document_defaults_the_revision_to_unstated() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    let principal = Principal(0x96);
+
+    let submitted = account_snapshot(ACCOUNT, 1, AccountStatus::Active);
+    AdminStore::publish_snapshot(&*store, principal, publishable(Arc::new(submitted)))
+        .await
+        .unwrap();
+
+    // Strip the key from the stored document, exactly as a control plane that
+    // predates the field would have written it.
+    let pool = corruption_pool().await;
+    sqlx::query("UPDATE tollgate_snapshots SET snapshot = snapshot - 'policy_revision' WHERE principal = $1")
+        .bind(principal.0.to_be_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let stored: serde_json::Value =
+        sqlx::query_scalar("SELECT snapshot FROM tollgate_snapshots WHERE principal = $1")
+            .bind(principal.0.to_be_bytes().to_vec())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        stored.get("policy_revision").is_none(),
+        "the fixture must actually be a pre-#94 document"
+    );
+
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("a legacy document must still decode");
+    };
+    assert!(fetched.policy_revision.is_unstated());
+}
+
+/// The charge's revision reaches the column, byte for byte.
+///
+/// Read back with raw SQL rather than through the sink, because no store API
+/// reconstructs a `UsageEvent` — the only SELECT on this table is the
+/// idempotency probe. Asserting the stored bytes is what can honestly be
+/// checked, so that is what is checked.
+#[tokio::test]
+async fn a_usage_row_carries_its_policy_revision() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
+        .await
+        .unwrap();
+    let revision = PolicyRevision([0x31; 32]);
+
+    let event = UsageEvent::new(
+        RequestId(1),
+        lease.account_id,
+        UsageSource::Leased {
+            lease_id: lease.lease_id,
+            fencing_token: lease.fencing_token,
+        },
+        CostUnits(40),
+        t(1),
+        revision,
+    );
+    let report = store.ingest(&[event], t(1)).await.unwrap();
+    assert_eq!((report.accepted, report.rejected), (1, 0));
+
+    let pool = corruption_pool().await;
+    let stored: Vec<u8> = sqlx::query_scalar(
+        "SELECT policy_revision FROM tollgate_usage_events WHERE request_id = $1",
+    )
+    .bind(1u128.to_be_bytes().to_vec())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, revision.as_bytes().to_vec());
+
+    // An unstated revision stores the zero the migration's default already
+    // gives pre-existing rows, so the two are indistinguishable — which is
+    // correct, because they mean the same thing.
+    let plain = UsageEvent::new(
+        RequestId(2),
+        lease.account_id,
+        UsageSource::Leased {
+            lease_id: lease.lease_id,
+            fencing_token: lease.fencing_token,
+        },
+        CostUnits(10),
+        t(2),
+        PolicyRevision::UNSTATED,
+    );
+    store.ingest(&[plain], t(2)).await.unwrap();
+    let unstated: Vec<u8> = sqlx::query_scalar(
+        "SELECT policy_revision FROM tollgate_usage_events WHERE request_id = $1",
+    )
+    .bind(2u128.to_be_bytes().to_vec())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unstated, vec![0u8; 32]);
+
+    // The revision funds nothing, so no conservation term may have moved.
+    assert_conserved(&store).await;
+}
+
+/// The schema refuses a wrong-width revision rather than storing something a
+/// reader would decode as a different policy. Mirrors
+/// `a_usage_row_cannot_carry_half_a_capability`: the constraint is the
+/// backstop for a codec bug the Rust types cannot express.
+#[tokio::test]
+async fn a_usage_row_cannot_carry_a_wrong_width_revision() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
+        .await
+        .unwrap();
+    let pool = corruption_pool().await;
+
+    for wrong in [vec![0u8; 31], vec![0u8; 33], Vec::new()] {
+        let error = sqlx::query(
+            "INSERT INTO tollgate_usage_events
+             (request_id, account_id, lease_id, fencing_token, units, occurred_at_us, policy_revision)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(vec![9u8; 16])
+        .bind(lease.account_id.0.to_be_bytes().to_vec())
+        .bind(lease.lease_id.0.to_be_bytes().to_vec())
+        .bind(i64::try_from(lease.fencing_token.0).unwrap())
+        .bind(1i64)
+        .bind(1i64)
+        .bind(&wrong)
+        .execute(&pool)
+        .await
+        .expect_err("a revision that is not 32 bytes must be refused");
+        assert!(
+            error.to_string().contains("policy_revision_len"),
+            "expected the length constraint, got {error}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_published_snapshot_carries_the_ledgers_budget() {
     let _guard = DB_LOCK.lock().await;

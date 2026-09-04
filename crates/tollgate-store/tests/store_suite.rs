@@ -2615,6 +2615,102 @@ async fn a_lease_reclaimed_inside_its_own_period_expires_nothing() {
     assert_conserved(&store);
 }
 
+/// The policy revision survives publication and refetch unchanged (#94).
+///
+/// The memory backend stores the typed value, so this ought to be free — which
+/// is exactly why it is asserted. "Free" is an assumption about a code path,
+/// and the PostgreSQL mirror of this test covers a path where it is not free
+/// at all.
+#[tokio::test]
+async fn a_snapshot_revision_round_trips_through_the_store() {
+    let store = store_with_balance(full_grant_policy(), 1_000);
+    let principal = Principal(0x94);
+    let revision = PolicyRevision([0x7e; 32]);
+
+    let submitted = AccountSnapshot::builder(
+        ACCOUNT,
+        Generation(1),
+        AccountStatus::Active,
+        t(10_000),
+        PermissionBits::ALL,
+        ResolvedLimits::new(64).with_weighted_rate(1_000, 1_000),
+        Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+    )
+    .policy_revision(revision)
+    .build();
+    AdminStore::publish_snapshot(&*store, principal, publishable(Arc::new(submitted)))
+        .await
+        .unwrap();
+
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("the snapshot must be present");
+    };
+    assert_eq!(fetched.policy_revision, revision);
+}
+
+/// A publisher that states no revision publishes the unstated one, and it
+/// comes back as such — not as an error, and not as a value the store made up.
+#[tokio::test]
+async fn a_snapshot_without_a_revision_publishes_as_unstated() {
+    let store = store_with_balance(full_grant_policy(), 1_000);
+    let principal = Principal(0x95);
+
+    let submitted = account_snapshot(ACCOUNT, 1, AccountStatus::Active);
+    assert_eq!(submitted.policy_revision, PolicyRevision::UNSTATED);
+    AdminStore::publish_snapshot(&*store, principal, publishable(Arc::new(submitted)))
+        .await
+        .unwrap();
+
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("the snapshot must be present");
+    };
+    assert!(fetched.policy_revision.is_unstated());
+}
+
+/// A charge carries its revision into the sink, and ingesting it moves the
+/// ledger exactly as it did before — the revision funds nothing, so no
+/// conservation term may notice it.
+#[tokio::test]
+async fn a_usage_event_is_ingested_with_its_revision_and_conserves() {
+    let store = store_with_balance(full_grant_policy(), 1_000);
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
+        .await
+        .unwrap();
+    let revision = PolicyRevision([0x31; 32]);
+
+    let event = UsageEvent::new(
+        RequestId(1),
+        lease.account_id,
+        UsageSource::Leased {
+            lease_id: lease.lease_id,
+            fencing_token: lease.fencing_token,
+        },
+        CostUnits(40),
+        t(1),
+        revision,
+    );
+    let report = store.ingest(&[event], t(1)).await.unwrap();
+    assert_eq!((report.accepted, report.rejected), (1, 0));
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(40));
+    assert_eq!(
+        store
+            .settled_event(RequestId(1))
+            .expect("the charge settled")
+            .policy_revision,
+        revision,
+        "the settled record names the policy that priced it"
+    );
+    assert_conserved(&store);
+
+    // Replaying the same request is still one charge: the revision rides
+    // along, it does not become a second idempotency axis.
+    let replay = store.ingest(&[event], t(2)).await.unwrap();
+    assert_eq!((replay.accepted, replay.duplicate), (0, 1));
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(40));
+    assert_conserved(&store);
+}
+
 /// The store stamps the budget view, and a publisher cannot: a snapshot is
 /// built without one and comes back carrying the ledger's numbers.
 #[tokio::test]

@@ -64,6 +64,9 @@ impl OpIndex for PriceOp {
     }
 }
 
+/// The consuming application's policy identity for the loopback fixture.
+const REVISION: PolicyRevision = PolicyRevision([0xa7; 32]);
+
 fn snapshot() -> Arc<AccountSnapshot> {
     Arc::new(
         AccountSnapshot::builder(
@@ -80,6 +83,9 @@ fn snapshot() -> Arc<AccountSnapshot> {
             ),
         )
         .key_id(KeyId((1u128 << 127) | 2))
+        // A stated revision, so the end-to-end path carries a real value
+        // rather than the zero an omission would also produce (#94).
+        .policy_revision(REVISION)
         .build(),
     )
 }
@@ -296,6 +302,10 @@ async fn full_stack_over_loopback_http() {
         panic!("published snapshot must be present");
     };
     assert_eq!(fetched.generation, Generation(1));
+    // The revision survived store -> HTTP -> client. The server decodes into
+    // an `AccountSnapshot` and reserializes, so a field it did not carry would
+    // be stripped exactly here (#94).
+    assert_eq!(fetched.policy_revision, REVISION);
     assert!(matches!(
         http.snapshot(Principal(999)).await.unwrap(),
         SnapshotResolution::Unknown
@@ -524,27 +534,39 @@ async fn an_oversized_batch_comes_back_refused_not_retryable() {
             .unwrap();
     });
 
-    // Past the declared body limit, with the count derived from it rather
-    // than guessed: an overage event of this shape serialises to 163 bytes
-    // plus a separating comma, so this is comfortably over with no reliance
-    // on a number that would rot if a field were added. Built directly rather
-    // than through `UsageWriter`, whose `max_batch` validation now makes an
-    // oversized batch unreachable — which is the point: the transport must
-    // still classify correctly for the sinks and versions validation cannot
-    // reach.
-    let events_needed = MAX_INGEST_BODY_BYTES / 164 + 1_000;
-    let events: Vec<UsageEvent> = (0..events_needed as u128)
-        .map(|i| {
-            UsageEvent::new(
-                RequestId(i),
-                ACCOUNT,
-                UsageSource::Overage,
-                CostUnits(1),
-                at(0),
-                PolicyRevision::UNSTATED,
-            )
-        })
-        .collect();
+    // Past the declared body limit, and *measured* past it rather than
+    // estimated. This previously divided the limit by a hardcoded 163-byte
+    // guess, under a comment claiming no reliance on a number that would rot
+    // if a field were added — and then #94 added a field, taking the body from
+    // 8% over the limit to 64% over. Being far over is not harmlessly safer:
+    // the server rejects and closes while the client is still writing, so the
+    // clean 413 this test asserts becomes a connection reset often enough to
+    // fail intermittently.
+    //
+    // Deriving the count from the encoded size keeps the batch just over the
+    // limit, where the server reads the body and answers with its own code,
+    // and keeps it there for whatever the next field costs.
+    //
+    // Built directly rather than through `UsageWriter`, whose `max_batch`
+    // validation now makes an oversized batch unreachable — which is the
+    // point: the transport must still classify correctly for the sinks and
+    // versions validation cannot reach.
+    let event = |i: u128| {
+        UsageEvent::new(
+            RequestId(i),
+            ACCOUNT,
+            UsageSource::Overage,
+            CostUnits(1),
+            at(0),
+            PolicyRevision::UNSTATED,
+        )
+    };
+    let encoded_event = serde_json::to_string(&event(0))
+        .expect("a usage event serialises")
+        .len()
+        + 1; // the separating comma
+    let events_needed = MAX_INGEST_BODY_BYTES / encoded_event + 64;
+    let events: Vec<UsageEvent> = (0..events_needed as u128).map(event).collect();
 
     let http = HttpStore::new(format!("http://{address}"));
     let error = UsageSink::ingest(&*http, &events, at(0))
