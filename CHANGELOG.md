@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.14.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.14.2...v0.14.3) - 2026-09-04
+
+### Added
+
+- *(core)* #94 carry an opaque policy revision through admission
+
 ## [0.14.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.14.1...v0.14.2) - 2026-09-04
 
 ### Added
