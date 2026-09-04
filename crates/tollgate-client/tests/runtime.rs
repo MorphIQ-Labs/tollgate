@@ -932,6 +932,53 @@ async fn panic_after_commit_still_bills() {
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(51));
 }
 
+/// The panic boundary a Rayon-style executor must own, exercised the way that
+/// executor would: the kernel runs under `catch_unwind` on a plain thread, and
+/// the guard is dropped there rather than leaked.
+///
+/// Tollgate never runs the kernel, so it cannot install this boundary itself —
+/// which is exactly why the ownership is documented on `Committed`. What this
+/// asserts is Tollgate's half of the contract: when the guard *is* dropped
+/// during an unwind, emission still happens, because the event was built at
+/// commit and `Drop` takes no lock and allocates nothing.
+#[tokio::test]
+async fn a_panicking_kernel_under_catch_unwind_still_bills() {
+    let store = store(10_000);
+    let grant = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8)).unwrap();
+
+    let permit = recorder.try_reserve().unwrap();
+    let ready = ready_from_grant(grant, permit);
+
+    // A consumer executor's shape: commit at execution start on a worker
+    // thread, run the kernel inside a panic boundary, drop the guard there.
+    let worker = std::thread::spawn(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let charge = ready
+                .commit(RequestId(9), t(0))
+                .expect("a live lease commits");
+            assert_eq!(charge.units(), CostUnits(51));
+            panic!("kernel exploded mid-execution");
+        }))
+    });
+    let outcome = worker.join().expect("the boundary contains the panic");
+    assert!(outcome.is_err(), "the kernel panicked");
+
+    let stats = writer.shutdown().await.unwrap();
+    assert_eq!(stats.accepted, 1, "the committed charge was still emitted");
+    assert_eq!(stats.lost, 0);
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(51));
+}
+
 /// Review finding #2 regression: shutdown during an *ongoing* outage must
 /// still terminate via the bounded final flush, not hang in the retry loop.
 #[tokio::test(start_paused = true)]

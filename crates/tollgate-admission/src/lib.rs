@@ -45,3 +45,5 @@ pub use state::{
     AccountAdmissionState, LeaseSlot, MapEntry, Principal, PublishableSnapshotUpdate, SnapshotMap,
     SnapshotUpdate,
 };
+#[doc(inline)]
+pub use tollgate_core::CancelHandle;

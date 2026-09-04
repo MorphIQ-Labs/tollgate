@@ -96,6 +96,18 @@
       "threshold_ns": 150.0
     },
     {
+      "_comment": "#93's opt-in shared cancel state: split, then commit through the shared reservation as a worker thread would. Measured at 70.8ns against 38.7ns for the unsplit lease/reserve_commit; the gap is the one Arc the split allocates, and it is reported separately precisely so a consumer that needs no timeout/worker race is never charged for one.",
+      "id": "reservation/commit_split",
+      "target_ns": 85.0,
+      "threshold_ns": 220.0
+    },
+    {
+      "_comment": "#93's contended half: a worker committing while a waiter cancels, over the same phase word, through the shared object. Measured 279us against the 56.4us raw-atomic control; the wide absolute backstop acknowledges scheduler variance while the same-run ratio below carries the portable contract.",
+      "id": "reservation/commit_split_race_contended_2",
+      "target_ns": 320000.0,
+      "threshold_ns": 800000.0
+    },
+    {
       "_comment": "#90 batched two-thread harness control: 4,096 bare authoritative CAS races per Criterion iteration, measured at 52.7us total.",
       "id": "reservation/commit_cancel_race_control_2",
       "target_ns": 60000.0,
@@ -262,6 +274,12 @@
       "numerator": "reservation/commit_after_cancel",
       "denominator": "lease/reserve_commit",
       "max_ratio": 2.0
+    },
+    {
+      "_comment": "The shared cancel state against the same raw-atomic control the unsplit race uses. It reaches one identical phase CAS through an Arc, so the contract is a bounded constant factor over the control rather than parity with the unsplit race. Measured x4.95 against the unsplit race's x2.96.",
+      "numerator": "reservation/commit_split_race_contended_2",
+      "denominator": "reservation/commit_cancel_race_control_2",
+      "max_ratio": 8.5
     },
     {
       "_comment": "The Reservation race measured x3.19 over the same batched two-thread bare-CAS control.",

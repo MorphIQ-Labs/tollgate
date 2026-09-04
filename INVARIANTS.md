@@ -117,6 +117,19 @@ until it has one.
    the two atomic words as stable. Once both racers return its retry
    classification agrees with the winner.
 
+   That race is reachable across threads without a lock. `ReadyToStart::split`
+   moves the reservation into one shared object and hands the asynchronous side
+   a `CancelHandle`; both halves resolve the *same* compare-exchange, so
+   splitting changes who may ask for a cancellation and never how the race is
+   decided. Cancellation being *requested* is a separate fact from whether it
+   changed the funding: the request flag is set before the phase is attempted,
+   so a worker that wins still observes it and may stop computing work whose
+   caller has gone, while the charge stands in full. The worker's half releases
+   eagerly on drop rather than waiting for the handle to let go, so abandoning
+   a request refunds at the instant the worker gives up. Splitting is opt-in
+   and costs exactly one allocation; an unsplit request has no handle, so
+   nothing can have asked it to stop.
+
    The phase word carries five values, and the terminal one names the funding
    that settled the charge: `PENDING_LEASE` reaches `COMMITTED_LEASE`,
    `COMMITTED_OVERAGE`, or `RELEASED`; `PENDING_OVERAGE` reaches
@@ -135,8 +148,12 @@ until it has one.
    `reservation::tests::overage_commit_cancel_race_preserves_retry_classification`,
    `reservation::tests::fallback_commit_and_cancel_leave_exactly_one_funding_term`,
    `reservation::tests::a_fallback_that_loses_to_cancel_strands_no_overage_capacity`,
-   `lease::tests::dropping_an_unresolved_tentative_debit_returns_the_credit`, and
-   `funding_terms_are_conserved_across_lapse_and_fallback`.
+   `lease::tests::dropping_an_unresolved_tentative_debit_returns_the_credit`,
+   `funding_terms_are_conserved_across_lapse_and_fallback`,
+   `reservation::tests::split_commit_and_handle_cancel_have_exactly_one_winner`,
+   `reservation::tests::a_shared_fallback_and_a_handle_cancel_leave_one_funding_term`,
+   `reservation::tests::a_late_cancel_reports_the_full_charge_and_still_records_the_request`, and
+   `engine::tests::dropping_the_worker_side_refunds_before_the_cancel_handle_does`.
    *Proofs:* `formal/lean/Tollgate/OveragePublication.lean` and
    `formal/lean/Tollgate/CommitFallback.lean`.
 
@@ -481,11 +498,27 @@ until it has one.
     counted in `WriterStats::unresolved` — never silently dropped. The safe lifecycle
     order is: stop admitting, quiesce request tasks holding permits or
     guards, shut the usage writer down, then release leases. A spent lease
-    with no billing event requires losing the whole process. *Tests:*
-    `panic_after_commit_still_bills`, `shutdown_waits_for_committed_guard`,
+    with no billing event requires losing the whole process.
+
+    Unwinding is safe on Tollgate's side by construction: the event is built at
+    commit rather than at drop, so `Drop` takes no lock that could be poisoned,
+    allocates nothing, and cannot fail — and the shared cancel path is a
+    compare-exchange rather than a mutex precisely so it stays usable from a
+    thread that is already panicking. **The panic boundary around the kernel
+    belongs to the consumer**, because Tollgate does not run the kernel and
+    cannot wrap it. A panic in a Rayon `spawn` closure propagates at the join
+    and can abort a pool thread, so without a consumer-installed `catch_unwind`
+    the guard is leaked rather than dropped on the worker, and a leaked guard
+    emits nothing. Under the `production` profile's `panic=abort` unwinding
+    does not exist and the process-loss boundary above is the whole story.
+    *Tests:*
+    `panic_after_commit_still_bills`,
+    `a_panicking_kernel_under_catch_unwind_still_bills`,
+    `shutdown_waits_for_committed_guard`,
     `committed_charge_holds_concurrency_until_execution_guard_drops`, and
     `failed_commit_releases_concurrency_and_accounting_capacity`, plus the
-    `Committed` discarded-result compile-fail doctest.
+    `Committed` discarded-result and `CancelHandle` cannot-commit compile-fail
+    doctests.
 
 14. **Account creation is never destructive.** Recreating an existing
     account is a surfaced `AlreadyExists` in every backend — never an

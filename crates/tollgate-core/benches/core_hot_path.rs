@@ -13,9 +13,9 @@ use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_mai
 use jiff::Timestamp;
 
 use tollgate_core::{
-    AccountId, AccountOverage, AccountSnapshot, AccountStatus, CancelOutcome, CommitError,
-    CommitFunding, CostTable, CostUnits, FencingToken, Generation, KeyId, LeaseGrant, LeaseId,
-    LocalLease, OpIndex, PermissionBits, Reservation, ResolvedLimits,
+    AccountId, AccountOverage, AccountSnapshot, AccountStatus, CancelHandle, CancelOutcome,
+    CommitError, CommitFunding, CostTable, CostUnits, FencingToken, Generation, KeyId, LeaseGrant,
+    LeaseId, LocalLease, OpIndex, PermissionBits, Reservation, ResolvedLimits, SharedCharge,
 };
 
 #[derive(Clone, Copy)]
@@ -316,6 +316,44 @@ fn pending_batch(lease: &Arc<LocalLease>, now: Timestamp) -> Vec<Reservation> {
         .collect()
 }
 
+/// The shared-charge race as a consumer runs it: a worker thread committing
+/// through the shared reservation while an asynchronous waiter cancels through
+/// its handle. Same single phase word as `run_commit_cancel_race`, reached
+/// through one extra indirection.
+fn run_split_cancel_race(
+    split: &[(Arc<SharedCharge>, CancelHandle)],
+    now: Timestamp,
+) -> (usize, usize) {
+    let start = Barrier::new(3);
+    let (commit_wins, cancel_saw_committed) = std::thread::scope(|scope| {
+        let commit = scope.spawn(|| {
+            start.wait();
+            split
+                .iter()
+                .filter(|(shared, _)| {
+                    shared
+                        .reservation()
+                        .commit_at_execution_start(now, CommitFunding::LeaseOnly)
+                        .is_ok()
+                })
+                .count()
+        });
+        let cancel = scope.spawn(|| {
+            start.wait();
+            split
+                .iter()
+                .filter(|(_, handle)| {
+                    matches!(handle.cancel(), CancelOutcome::AlreadyCommitted { .. })
+                })
+                .count()
+        });
+        start.wait();
+        (commit.join().unwrap(), cancel.join().unwrap())
+    });
+    assert_eq!(commit_wins, cancel_saw_committed);
+    (commit_wins, split.len() - commit_wins)
+}
+
 fn run_commit_cancel_race(reservations: &[Reservation], now: Timestamp) -> (usize, usize) {
     let start = Barrier::new(3);
     let (commit_wins, cancel_saw_committed) = std::thread::scope(|scope| {
@@ -382,6 +420,44 @@ fn bench_reservation(c: &mut Criterion) {
     let now = Timestamp::from_second(1_755_600_000).unwrap();
     let lease = big_lease();
     let mut group = c.benchmark_group("reservation");
+
+    // The opt-in shared cancel state (#93): split, then commit through the
+    // shared reservation as a worker thread would. One `Arc` and one extra
+    // indirection over the unsplit `lease/reserve_commit` path, which stays
+    // the allocation-free comparison a consumer gets when it does not need a
+    // timeout/worker race.
+    group.bench_function("commit_split", |b| {
+        b.iter(|| {
+            let (shared, handle) = Reservation::reserve(black_box(&lease), CostUnits(1), now)
+                .unwrap()
+                .split();
+            shared
+                .reservation()
+                .commit_at_execution_start(now, CommitFunding::LeaseOnly)
+                .unwrap();
+            black_box(handle.is_cancelled());
+            (shared, handle)
+        })
+    });
+    // The contended half of #93's "uncontended and contended" requirement: a
+    // worker committing while a waiter cancels, over the same phase word.
+    // `commit_cancel_race_control_2` is the raw-atomic control it is measured
+    // against.
+    group.bench_function("commit_split_race_contended_2", |b| {
+        b.iter_batched(
+            || {
+                (0..RACE_BATCH)
+                    .map(|_| {
+                        Reservation::reserve(&lease, CostUnits(1), now)
+                            .unwrap()
+                            .split()
+                    })
+                    .collect::<Vec<_>>()
+            },
+            |split| black_box(run_split_cancel_race(&split, now)),
+            BatchSize::SmallInput,
+        )
+    });
 
     group.bench_function("cancel_after_commit", |b| {
         b.iter_batched(
