@@ -18,7 +18,7 @@
 //!   a single phase rather than for two separate reservations.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use jiff::Timestamp;
 
@@ -517,6 +517,112 @@ impl Drop for Reservation {
         {
             self.refund();
         }
+    }
+}
+
+/// A reservation shared between the thread that will execute the work and an
+/// asynchronous waiter that may cancel it first.
+///
+/// This is the one object #93 adds, and it exists because the consumer topology
+/// requires it: an executor races its timeout/disconnect path (on the async
+/// side) against its worker's actual execution start (on a pool thread), and
+/// both need to reach the same charge state. It replaces the
+/// `Cancellation + Arc<Mutex<ChargePhase>>` pairing an embedder would otherwise
+/// build, with no mutex to poison and nothing to lock during a panic.
+///
+/// The reservation's own compare-exchange remains the single authority for
+/// whether the request charged. The extra flag records only that cancellation
+/// was *requested*, which is a different question: once commit wins, the charge
+/// stands in full, and the worker may still want to know that nobody is waiting
+/// for the answer.
+#[derive(Debug)]
+pub struct SharedCharge {
+    reservation: Reservation,
+    cancel_requested: AtomicBool,
+}
+
+impl SharedCharge {
+    /// The reservation itself. Every resolution goes through this, so the
+    /// worker side and the handle side transition the same phase word.
+    #[inline]
+    #[must_use]
+    pub fn reservation(&self) -> &Reservation {
+        &self.reservation
+    }
+
+    /// Whether anyone has asked for this request to stop.
+    ///
+    /// Independent of whether the charge stands: a cancellation that arrives
+    /// after commit reports [`CancelOutcome::AlreadyCommitted`] and changes no
+    /// funding, but still sets this so a running kernel can choose to stop
+    /// computing work nobody is waiting for.
+    #[inline]
+    #[must_use]
+    pub fn cancel_requested(&self) -> bool {
+        self.cancel_requested.load(Ordering::Acquire)
+    }
+
+    /// Another handle to this same charge.
+    ///
+    /// Handles are interchangeable: each can cancel, and the first to win the
+    /// phase decides the outcome for all of them.
+    #[must_use]
+    pub fn cancel_handle(self: &Arc<Self>) -> CancelHandle {
+        CancelHandle(Arc::clone(self))
+    }
+}
+
+/// The asynchronous waiter's half of a [`SharedCharge`].
+///
+/// Holds no ability to commit — only to cancel and to observe. A cancel handle
+/// cannot start execution, and it deliberately cannot move the usage slot,
+/// concurrency guard, or capacity permit out of the worker's value: those are
+/// released exactly once, by the side that owns them, when it observes the
+/// cancellation and drops.
+#[derive(Debug, Clone)]
+pub struct CancelHandle(Arc<SharedCharge>);
+
+impl CancelHandle {
+    /// Ask for the request to stop, and learn whether it had already started.
+    ///
+    /// The request flag is set *before* the phase transition is attempted, so a
+    /// worker that wins the race and reads
+    /// [`cancel_requested`](SharedCharge::cancel_requested) still sees that a
+    /// cancellation happened. Ordering it the other way would let a committed
+    /// worker observe `false` for a cancellation that had already returned
+    /// `AlreadyCommitted` to its caller.
+    #[inline]
+    pub fn cancel(&self) -> CancelOutcome {
+        self.0.cancel_requested.store(true, Ordering::Release);
+        self.0.reservation.cancel()
+    }
+
+    /// Whether cancellation has been requested through this or any other
+    /// handle to the same charge.
+    #[inline]
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.cancel_requested()
+    }
+}
+
+impl Reservation {
+    /// Move this reservation into a shared object and hand back a cancel
+    /// handle for the asynchronous side.
+    ///
+    /// This is the single allocation #93 permits, and it is opt-in: an inline
+    /// executor never calls it and its admission path stays allocation-free. A
+    /// consumer that needs a timeout/worker race pays one `Arc` for it; one
+    /// that moves an unsplit value to its worker has deliberately chosen to
+    /// have no external cancel race.
+    #[must_use]
+    pub fn split(self) -> (Arc<SharedCharge>, CancelHandle) {
+        let shared = Arc::new(SharedCharge {
+            reservation: self,
+            cancel_requested: AtomicBool::new(false),
+        });
+        let handle = CancelHandle(Arc::clone(&shared));
+        (shared, handle)
     }
 }
 
@@ -1174,6 +1280,158 @@ mod tests {
         // Every loser released its lease for zero; every winner returned it.
         for (l, _) in &reservations {
             assert_eq!(l.remaining(), CostUnits(100));
+        }
+    }
+
+    /// The shared-charge race, from the consumer's angle: an asynchronous
+    /// waiter cancels while a worker thread commits. One phase, one winner,
+    /// and the funding follows the winner.
+    #[test]
+    fn split_commit_and_handle_cancel_have_exactly_one_winner() {
+        for _ in 0..500 {
+            let l = lease(100);
+            let (shared, handle) = Reservation::reserve(&l, CostUnits(10), t(0))
+                .unwrap()
+                .split();
+            let worker = std::thread::spawn({
+                let shared = Arc::clone(&shared);
+                move || {
+                    shared
+                        .reservation()
+                        .commit_at_execution_start(t(0), CommitFunding::LeaseOnly)
+                }
+            });
+            let waiter = std::thread::spawn(move || handle.cancel());
+            let commit = worker.join().unwrap();
+            let cancel = waiter.join().unwrap();
+            match (commit, cancel) {
+                (Ok(units), CancelOutcome::AlreadyCommitted { units: seen }) => {
+                    assert_eq!(units, seen);
+                    assert_eq!(l.remaining(), CostUnits(90));
+                }
+                (Err(CommitError::AlreadyReleased), CancelOutcome::ZeroCharged) => {
+                    assert_eq!(l.remaining(), CostUnits(100));
+                }
+                other => panic!("impossible race outcome: {other:?}"),
+            }
+            // Either way the cancellation was *requested*, which is a separate
+            // fact from whether it changed the funding.
+            assert!(shared.cancel_requested());
+        }
+    }
+
+    /// A cancellation that arrives before the worker starts charges zero, and
+    /// the units go back to the lease immediately.
+    #[test]
+    fn a_cancel_handle_before_worker_start_charges_zero() {
+        let l = lease(100);
+        let (shared, handle) = Reservation::reserve(&l, CostUnits(30), t(0))
+            .unwrap()
+            .split();
+        assert!(!handle.is_cancelled());
+        assert_eq!(l.remaining(), CostUnits(70));
+
+        assert_eq!(handle.cancel(), CancelOutcome::ZeroCharged);
+        assert!(handle.is_cancelled());
+        assert_eq!(l.remaining(), CostUnits(100));
+        assert_eq!(
+            shared
+                .reservation()
+                .commit_at_execution_start(t(0), CommitFunding::LeaseOnly),
+            Err(CommitError::AlreadyReleased),
+            "the worker must not execute after a winning cancellation"
+        );
+        assert_eq!(shared.reservation().usage_event(RequestId(1), t(0)), None);
+    }
+
+    /// Once the worker has started, a late cancellation reports the full
+    /// charge and refunds nothing — but the *request* is still recorded, so a
+    /// running kernel can see that nobody is waiting for its answer.
+    #[test]
+    fn a_late_cancel_reports_the_full_charge_and_still_records_the_request() {
+        let l = lease(100);
+        let (shared, handle) = Reservation::reserve(&l, CostUnits(30), t(0))
+            .unwrap()
+            .split();
+        shared
+            .reservation()
+            .commit_at_execution_start(t(0), CommitFunding::LeaseOnly)
+            .unwrap();
+
+        assert_eq!(
+            handle.cancel(),
+            CancelOutcome::AlreadyCommitted {
+                units: CostUnits(30)
+            }
+        );
+        assert_eq!(l.remaining(), CostUnits(70), "the charge stands in full");
+        assert!(
+            shared.cancel_requested(),
+            "a kernel may still learn its caller has gone"
+        );
+        assert!(
+            shared
+                .reservation()
+                .usage_event(RequestId(1), t(0))
+                .is_some()
+        );
+    }
+
+    /// Every handle to one charge resolves the same phase, so a second handle
+    /// cannot produce a second outcome.
+    #[test]
+    fn a_second_cancel_handle_resolves_the_same_charge() {
+        let l = lease(100);
+        let (shared, first) = Reservation::reserve(&l, CostUnits(30), t(0))
+            .unwrap()
+            .split();
+        let second = shared.cancel_handle();
+
+        assert_eq!(first.cancel(), CancelOutcome::ZeroCharged);
+        assert_eq!(second.cancel(), CancelOutcome::ZeroCharged);
+        assert!(second.is_cancelled());
+        // One refund, not two.
+        assert_eq!(l.remaining(), CostUnits(100));
+    }
+
+    /// The commit-time elastic fallback composes with the shared cancel: the
+    /// two race for the same phase, and the guard's revocable debit means a
+    /// losing fallback strands nothing.
+    #[test]
+    fn a_shared_fallback_and_a_handle_cancel_leave_one_funding_term() {
+        for _ in 0..200 {
+            let l = lease(100);
+            let o = overage();
+            let (shared, handle) = Reservation::reserve(&l, CostUnits(10), t(999))
+                .unwrap()
+                .split();
+            let worker = std::thread::spawn({
+                let shared = Arc::clone(&shared);
+                let o = Arc::clone(&o);
+                move || {
+                    shared.reservation().commit_at_execution_start(
+                        t(1_000),
+                        CommitFunding::OverageFallback {
+                            overage: &o,
+                            cap: CostUnits(100),
+                        },
+                    )
+                }
+            });
+            let waiter = std::thread::spawn(move || handle.cancel());
+            let commit = worker.join().unwrap();
+            let cancel = waiter.join().unwrap();
+            match (commit, cancel) {
+                (Ok(_), CancelOutcome::AlreadyCommitted { .. }) => {
+                    assert_eq!(l.remaining(), CostUnits(100));
+                    assert_eq!(o.spent(), CostUnits(10));
+                }
+                (Err(CommitError::AlreadyReleased), CancelOutcome::ZeroCharged) => {
+                    assert_eq!(l.remaining(), CostUnits(100));
+                    assert_eq!(o.spent(), CostUnits::ZERO);
+                }
+                other => panic!("impossible race outcome: {other:?}"),
+            }
         }
     }
 

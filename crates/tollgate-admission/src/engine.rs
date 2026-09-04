@@ -6,8 +6,9 @@ use std::sync::Arc;
 use jiff::Timestamp;
 
 use tollgate_core::{
-    AccountSnapshot, CommitError, CommitFunding, CostQuote, CostUnits, DenyReason, Generation,
-    Locality, OpIndex, PermissionBits, QuoteError, RequestId, Reservation, UsageEvent, UsageSlot,
+    AccountSnapshot, CancelHandle, CommitError, CommitFunding, CostQuote, CostUnits, DenyReason,
+    Generation, Locality, OpIndex, PermissionBits, QuoteError, RequestId, Reservation,
+    SharedCharge, UsageEvent, UsageSlot,
 };
 
 use crate::counters::AdmissionCounters;
@@ -65,7 +66,7 @@ impl RequestContext {
         };
         admit_priced(self.state, locality, quote, now).map(|priced| Pending {
             concurrency: priced.concurrency,
-            reservation: priced.reservation,
+            funding: Funding::Owned(priced.reservation),
             slot,
             quote: priced.quote,
         })
@@ -104,10 +105,66 @@ impl RequestContext {
 /// pending.cancel()
 /// # }
 /// ```
+/// Where a staged request's funding lives: owned outright, or shared with an
+/// asynchronous canceller.
+///
+/// Both arms resolve through the same `&Reservation`, so there is one commit
+/// path and one cancel path regardless of which the consumer chose. Splitting
+/// changes who may *ask* for a cancellation, never how the race is decided.
+#[derive(Debug)]
+enum Funding {
+    /// The default. Allocation-free, and no external cancel race.
+    Owned(Reservation),
+    /// Opted into by [`ReadyToStart::split`]; one `Arc` per request.
+    Shared(WorkerShare),
+}
+
+impl Funding {
+    #[inline]
+    fn reservation(&self) -> &Reservation {
+        match self {
+            Self::Owned(reservation) => reservation,
+            Self::Shared(shared) => shared.0.reservation(),
+        }
+    }
+
+    #[inline]
+    fn cancel_requested(&self) -> bool {
+        match self {
+            // Nobody else holds a handle, so nobody can have asked.
+            Self::Owned(_) => false,
+            Self::Shared(shared) => shared.0.cancel_requested(),
+        }
+    }
+}
+
+/// The worker's half of a shared charge.
+///
+/// Its `Drop` is the reason this is a named type rather than a bare `Arc`. An
+/// `Owned` reservation is released by `Reservation::drop`, but a shared one is
+/// co-owned by the cancel handle — so waiting for the reservation's own drop
+/// would hold funding until the *asynchronous* side also let go, which is an
+/// unbounded interval after the worker abandoned the request. Releasing here
+/// refunds at the instant the worker gives up, and is a no-op on a phase that
+/// already resolved, so a committed guard's eventual drop changes nothing.
+///
+/// The guard sits inside the enum rather than on `Funding` itself so that
+/// `Funding` stays freely movable: `commit` and `split` both destructure the
+/// staged types, and a `Drop` on the enum would make that impossible without
+/// `unsafe`.
+#[derive(Debug)]
+struct WorkerShare(Arc<SharedCharge>);
+
+impl Drop for WorkerShare {
+    fn drop(&mut self) {
+        self.0.reservation().cancel();
+    }
+}
+
 #[derive(Debug)]
 pub struct Pending<S: UsageSlot> {
     concurrency: ConcurrencyGuard,
-    reservation: Reservation,
+    funding: Funding,
     slot: S,
     quote: CostQuote,
 }
@@ -150,7 +207,7 @@ impl<S: UsageSlot> Pending<S> {
     }
 
     pub fn cancel(self) -> Released {
-        self.reservation.cancel();
+        self.funding.reservation().cancel();
         Released
     }
 }
@@ -213,16 +270,19 @@ impl<S: UsageSlot, P: CapacityPermit> ReadyToStart<S, P> {
     ) -> Result<Committed<S, P>, (CommitError, Released)> {
         let Pending {
             concurrency,
-            reservation,
+            funding,
             slot,
             quote: _,
         } = self.pending;
         // The pinned snapshot decides what a lapsed lease means, and the
         // counter comes from the same slot that funded the reservation.
         let state = concurrency.state();
-        let funding =
+        let commit_funding =
             CommitFunding::from_mode(state.snapshot.enforcement_mode, state.lease.overage());
-        let units = match reservation.commit_at_execution_start(now, funding) {
+        let units = match funding
+            .reservation()
+            .commit_at_execution_start(now, commit_funding)
+        {
             Ok(units) => units,
             // Core already released for zero and classified the refusal —
             // expired funding, or an overage cap the fallback could not fit
@@ -232,11 +292,15 @@ impl<S: UsageSlot, P: CapacityPermit> ReadyToStart<S, P> {
                 return Err((CommitError::Cancelled, Released));
             }
             Err(CommitError::AlreadyCommitted) => {
-                debug_assert!(false, "an owned ready state can commit only once");
+                debug_assert!(
+                    matches!(funding, Funding::Shared(_)),
+                    "an owned ready state can commit only once"
+                );
                 return Err((CommitError::Cancelled, Released));
             }
         };
-        let event = reservation
+        let event = funding
+            .reservation()
             .usage_event(request_id, now)
             .expect("a committed reservation produces usage evidence");
         Ok(Committed {
@@ -244,9 +308,88 @@ impl<S: UsageSlot, P: CapacityPermit> ReadyToStart<S, P> {
             slot: Some(slot),
             units,
             request_id,
+            // Retained so a committed kernel can still observe a late
+            // cancellation request, and so a late `CancelHandle::cancel`
+            // finds the committed phase rather than a freed reservation.
+            funding,
             _concurrency: concurrency,
             _capacity: self.permit,
         })
+    }
+
+    /// Share this request's charge state with an asynchronous canceller.
+    ///
+    /// The handle can cancel and observe; it has no method that starts
+    /// execution, so a waiter cannot commit a charge behind the worker's back:
+    ///
+    /// ```compile_fail,E0599
+    /// # use tollgate_core::{CancelHandle, RequestId};
+    /// # fn waiter_cannot_commit(handle: CancelHandle, request_id: RequestId, now: jiff::Timestamp) {
+    /// handle.commit(request_id, now);
+    /// # }
+    /// ```
+    ///
+    /// Its companion, so the refusal above is a refusal to *commit* rather
+    /// than a refusal of a handle that stopped existing:
+    ///
+    /// ```
+    /// # use tollgate_core::{CancelHandle, CancelOutcome};
+    /// # fn waiter_may_cancel(handle: CancelHandle) -> CancelOutcome {
+    /// let _asked = handle.is_cancelled();
+    /// handle.cancel()
+    /// # }
+    /// ```
+    ///
+    /// Returns the same worker-owned value plus a [`CancelHandle`] for the
+    /// side that races it — a timeout, a client disconnect, a shutdown. Both
+    /// halves resolve the *same* compare-exchange, so exactly one of commit
+    /// and cancel wins and Tollgate remains the single authority for whether
+    /// the request charged.
+    ///
+    /// Opt-in, and the one allocation this lifecycle adds: an inline executor
+    /// never calls it and its path stays allocation-free. A consumer that
+    /// moves an unsplit value to its worker has chosen to have no external
+    /// cancel race.
+    ///
+    /// The handle can cancel and observe; it cannot commit, and it cannot take
+    /// the usage slot, concurrency guard, or capacity permit out of the
+    /// worker's value. Those are released exactly once, by the side that owns
+    /// them, when it observes the cancellation and drops — so a consumer whose
+    /// executor queues work must discard cancelled jobs and quiesce them at
+    /// shutdown rather than leaving them parked.
+    #[must_use = "the returned state is the only one that can commit; dropping it releases the request"]
+    pub fn split(self) -> (Self, CancelHandle) {
+        let ReadyToStart { pending, permit } = self;
+        let Pending {
+            concurrency,
+            funding,
+            slot,
+            quote,
+        } = pending;
+        let (shared, handle) = match funding {
+            Funding::Owned(reservation) => {
+                let (shared, handle) = reservation.split();
+                (WorkerShare(shared), handle)
+            }
+            // Splitting twice hands out a second handle to the same charge
+            // rather than building a second one; both cancel the same phase.
+            Funding::Shared(shared) => {
+                let handle = shared.0.cancel_handle();
+                (shared, handle)
+            }
+        };
+        (
+            ReadyToStart {
+                pending: Pending {
+                    concurrency,
+                    funding: Funding::Shared(shared),
+                    slot,
+                    quote,
+                },
+                permit,
+            },
+            handle,
+        )
     }
 
     pub fn cancel(self) -> Released {
@@ -265,6 +408,28 @@ pub struct Released;
 /// then releases concurrency and execution capacity. Normal completion, early
 /// return, panic unwind, and task abort at an await point all run `Drop`, so a
 /// committed charge cannot be spent-but-unbilled.
+///
+/// # Panic boundary: who owns what
+///
+/// `Drop` is safe to run while unwinding, and that is Tollgate's half of the
+/// contract. The event is built at commit rather than at drop, so the drop
+/// path takes no lock that could be poisoned, allocates nothing, and cannot
+/// fail. There is no `Mutex` anywhere in the charge state — the shared cancel
+/// path is a compare-exchange, which is what makes it usable from a thread
+/// that is already panicking.
+///
+/// **The consumer owns the panic boundary itself**, because Tollgate does not
+/// run the kernel and cannot wrap it. This matters concretely for a Rayon-style
+/// executor: a panic in a closure given to `spawn` propagates at the join and
+/// can abort a pool thread, so without a consumer-installed `catch_unwind` (or
+/// equivalent) around the kernel, the guard is *leaked* rather than dropped on
+/// the worker — and a leaked guard emits nothing. Scope the guard to the
+/// computational kernel only, never across response serialization or an
+/// unrelated asynchronous wait, and drop it inside that boundary.
+///
+/// Under the `production` profile (`panic=abort`) unwinding does not exist, so
+/// none of this applies and INVARIANTS.md #13 keeps its stated boundary: a
+/// spent lease with no billing event requires losing the whole process.
 ///
 /// That guarantee is worth nothing if the guard can be dropped at the point it
 /// is produced, so discarding execution-start evidence is a compile-time error
@@ -309,6 +474,7 @@ pub struct Committed<S: UsageSlot, P: CapacityPermit> {
     slot: Option<S>,
     units: CostUnits,
     request_id: RequestId,
+    funding: Funding,
     _concurrency: ConcurrencyGuard,
     _capacity: P,
 }
@@ -330,10 +496,31 @@ impl<S: UsageSlot, P: CapacityPermit> Committed<S, P> {
     pub fn estimate_remaining(&self) -> Option<CostUnits> {
         self._concurrency.state().estimate_remaining()
     }
+
+    /// Whether someone has asked for this request to stop since it started.
+    ///
+    /// The charge is settled and stands in full either way — commit won its
+    /// race, and a later cancellation reports `AlreadyCommitted` without
+    /// moving funding. This answers a different question: whether anybody is
+    /// still waiting for the result. A long kernel may poll it and return
+    /// early rather than finish work whose caller has gone, and it will still
+    /// be billed for what it started.
+    ///
+    /// Always `false` for a request that never split: with no handle
+    /// outstanding, nobody can have asked.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.funding.cancel_requested()
+    }
 }
 
 impl<S: UsageSlot, P: CapacityPermit> Drop for Committed<S, P> {
     fn drop(&mut self) {
+        // Unwind-safe by construction: the event was built at commit, so this
+        // takes no lock that could be poisoned, allocates nothing, and cannot
+        // fail. Tollgate does not run the kernel, so the consumer owns the
+        // panic boundary that guarantees this runs on the worker — see the
+        // type docs.
         if let (Some(event), Some(slot)) = (self.event.take(), self.slot.take()) {
             slot.record(event);
         }
@@ -779,7 +966,7 @@ mod tests {
             let admitted = elastic
                 .admit_one(request(1), t(0))
                 .unwrap_or_else(|denied| panic!("elastic denied {name}: {denied}"));
-            assert!(admitted.reservation.admitted_as_overage());
+            assert!(admitted.funding.reservation().admitted_as_overage());
             assert_eq!(admitted.quote.total, CostUnits(51));
         }
     }
@@ -798,7 +985,7 @@ mod tests {
         engine.map().install(Principal(1), Arc::new(snapshot), slot);
 
         let admitted = engine.admit_one(request(1), t(10)).expect("elastic admits");
-        assert!(admitted.reservation.admitted_as_overage());
+        assert!(admitted.funding.reservation().admitted_as_overage());
     }
 
     /// The safety argument in one test: elasticity is a statement about
@@ -879,7 +1066,8 @@ mod tests {
         for _ in 0..2 {
             let admitted = engine.admit_one(request(1), t(0)).expect("within the cap");
             admitted
-                .reservation
+                .funding
+                .reservation()
                 .commit_at_execution_start(t(0), CommitFunding::LeaseOnly)
                 .expect("commit");
         }
@@ -920,7 +1108,8 @@ mod tests {
             engine
                 .admit_one(request(1), now)
                 .unwrap_or_else(|denied| panic!("the cap must cover {name}: {denied}"))
-                .reservation
+                .funding
+                .reservation()
                 .commit_at_execution_start(now, CommitFunding::LeaseOnly)
                 .expect("commit the local overage");
 
@@ -935,7 +1124,7 @@ mod tests {
             let admitted = engine
                 .admit_one(request(1), now)
                 .unwrap_or_else(|denied| panic!("a refill must recover {name}: {denied}"));
-            assert!(!admitted.reservation.admitted_as_overage());
+            assert!(!admitted.funding.reservation().admitted_as_overage());
         }
     }
 
@@ -976,9 +1165,10 @@ mod tests {
                     let engine = Arc::clone(&engine);
                     scope.spawn(move || match engine.admit_one(request(1), t(0)) {
                         Ok(admitted) => {
-                            assert!(admitted.reservation.admitted_as_overage());
+                            assert!(admitted.funding.reservation().admitted_as_overage());
                             admitted
-                                .reservation
+                                .funding
+                                .reservation()
                                 .commit_at_execution_start(t(0), CommitFunding::LeaseOnly)
                                 .expect("commit");
                             1
@@ -1040,7 +1230,7 @@ mod tests {
         let admitted = engine
             .admit_one(request(1), t(0))
             .expect("the lease funds it");
-        assert!(!admitted.reservation.admitted_as_overage());
+        assert!(!admitted.funding.reservation().admitted_as_overage());
         let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
             panic!("principal present");
         };
@@ -1063,7 +1253,10 @@ mod tests {
             }
         );
         assert_eq!(denied.retry(), Retry::Transient);
-        assert_eq!(admitted.reservation.cancel(), CancelOutcome::ZeroCharged);
+        assert_eq!(
+            admitted.funding.reservation().cancel(),
+            CancelOutcome::ZeroCharged
+        );
         engine
             .admit_one(request(1), t(0))
             .expect("the cancelled credit is available again");
@@ -1077,7 +1270,7 @@ mod tests {
         let admitted = engine
             .admit_one(request(1), t(0))
             .expect("the lease funds it");
-        assert!(!admitted.reservation.admitted_as_overage());
+        assert!(!admitted.funding.reservation().admitted_as_overage());
         let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
             panic!("principal present");
         };
@@ -1466,9 +1659,117 @@ mod tests {
         let admitted = engine.admit_one(request(14), t(0)).unwrap();
         assert_eq!(admitted.quote.total, CostUnits(64));
         admitted
-            .reservation
+            .funding
+            .reservation()
             .commit_at_execution_start(t(0), CommitFunding::LeaseOnly)
             .unwrap();
+    }
+
+    /// The consumer topology this whole lifecycle exists for: an asynchronous
+    /// waiter holds a cancel handle while a worker thread holds the only value
+    /// that can commit. The worker wins, and the charge stands.
+    #[test]
+    fn a_split_worker_that_commits_first_charges_in_full() {
+        let engine = engine_with(AccountStatus::Active, Some(10_000));
+        let (ready, handle) = engine
+            .admit_one(request(1), t(0))
+            .expect("the request admits")
+            .acquire_capacity(&NoGate)
+            .expect("capacity is disabled")
+            .split();
+
+        let committed = ready.commit(RequestId(1), t(0)).expect("the worker wins");
+        assert!(!committed.is_cancelled(), "nobody has asked yet");
+
+        assert_eq!(
+            handle.cancel(),
+            CancelOutcome::AlreadyCommitted {
+                units: committed.units()
+            }
+        );
+        assert!(
+            committed.is_cancelled(),
+            "a running kernel can see its caller has gone"
+        );
+    }
+
+    /// The other side of the race: cancellation lands first, so the worker
+    /// gets no guard and must not execute.
+    #[test]
+    fn a_split_cancel_before_start_leaves_the_worker_without_a_guard() {
+        let engine = engine_with(AccountStatus::Active, Some(10_000));
+        let (ready, handle) = engine
+            .admit_one(request(1), t(0))
+            .expect("the request admits")
+            .acquire_capacity(&NoGate)
+            .expect("capacity is disabled")
+            .split();
+
+        assert_eq!(handle.cancel(), CancelOutcome::ZeroCharged);
+        let (error, _released) = ready
+            .commit(RequestId(1), t(0))
+            .expect_err("a cancelled request must not produce an execution guard");
+        assert_eq!(error, CommitError::Cancelled);
+    }
+
+    /// A worker that abandons a split request must refund *immediately*, not
+    /// when the asynchronous side eventually lets go of its handle.
+    ///
+    /// This is what the worker-side share guard buys. Leaving the release to
+    /// the reservation's own drop would hold funding for as long as any handle
+    /// outlived the worker — an unbounded interval, during which the account's
+    /// own retries see capacity that nothing is using.
+    #[test]
+    fn dropping_the_worker_side_refunds_before_the_cancel_handle_does() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        let installed = lease(10_000);
+        slot.install(Arc::clone(&installed));
+        engine
+            .map()
+            .install(Principal(1), snapshot(AccountStatus::Active), slot);
+        let before = installed.remaining();
+
+        let (ready, handle) = engine
+            .admit_one(request(1), t(0))
+            .expect("the request admits")
+            .acquire_capacity(&NoGate)
+            .expect("capacity is disabled")
+            .split();
+        assert!(
+            installed.remaining() < before,
+            "admission debited the lease"
+        );
+
+        // The worker gives up. The handle is deliberately still alive.
+        drop(ready);
+        assert_eq!(
+            installed.remaining(),
+            before,
+            "the refund must not wait for the cancel handle"
+        );
+        assert!(!handle.is_cancelled(), "nobody asked; the worker just left");
+        assert_eq!(handle.cancel(), CancelOutcome::ZeroCharged);
+        assert_eq!(
+            installed.remaining(),
+            before,
+            "and it is refunded exactly once"
+        );
+    }
+
+    /// An unsplit request has no handle outstanding, so nothing can have asked
+    /// it to stop and it pays nothing for the capability.
+    #[test]
+    fn an_unsplit_committed_guard_is_never_cancelled() {
+        let engine = engine_with(AccountStatus::Active, Some(10_000));
+        let committed = engine
+            .admit_one(request(1), t(0))
+            .expect("the request admits")
+            .acquire_capacity(&NoGate)
+            .expect("capacity is disabled")
+            .commit(RequestId(1), t(0))
+            .expect("the request commits");
+        assert!(!committed.is_cancelled());
     }
 
     /// The staged path under `Strict`: a lease whose window lapsed between
@@ -1640,7 +1941,10 @@ mod tests {
             }
         );
         // Cancelling the first returns its units; admission works again.
-        assert_eq!(admitted.reservation.cancel(), CancelOutcome::ZeroCharged);
+        assert_eq!(
+            admitted.funding.reservation().cancel(),
+            CancelOutcome::ZeroCharged
+        );
         engine.admit_one(request(1), t(0)).unwrap();
     }
 
@@ -2364,7 +2668,10 @@ mod tests {
             )
             .expect("a quote within the account's burst is admissible");
         assert_eq!(admitted.quote.total, CostUnits(642));
-        assert_eq!(admitted.reservation.cancel(), CancelOutcome::ZeroCharged);
+        assert_eq!(
+            admitted.funding.reservation().cancel(),
+            CancelOutcome::ZeroCharged
+        );
     }
 
     /// The counters must attribute each outcome to the right slot and leave

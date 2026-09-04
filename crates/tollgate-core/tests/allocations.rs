@@ -67,6 +67,27 @@ fn lease() -> Arc<LocalLease> {
     ))
 }
 
+/// Record a scope that is *allowed* to allocate, and pin the exact count.
+///
+/// `split` is the one allocation #93 adds, and it is opt-in: the unsplit
+/// scopes above stay at zero and are the comparison. Recording it under its own
+/// attribution keeps it out of the `tollgate` allocation-free rule while the
+/// gate still holds it to exactly one `Arc` — an exemption that could not fail
+/// would witness nothing.
+fn assert_exactly_one_allocation(scope: &str, operation: impl FnOnce()) {
+    let ((), allocations) = AllocScope::measure(operation);
+    tollgate_alloc_count::record_if_requested!(scope, "tollgate_opt_in", allocations).unwrap();
+    assert_eq!(
+        (
+            allocations.alloc_calls,
+            allocations.alloc_zeroed_calls,
+            allocations.realloc_calls
+        ),
+        (1, 0, 0),
+        "{scope} must cost exactly one allocation: {allocations:?}"
+    );
+}
+
 fn assert_zero(scope: &str, operation: impl FnOnce()) {
     let ((), allocations) = AllocScope::measure(operation);
     tollgate_alloc_count::record_if_requested!(scope, "tollgate", allocations).unwrap();
@@ -146,6 +167,26 @@ fn core_hot_path_allocates_nothing() {
                 .usage_event(RequestId(9), lapsed_at)
                 .expect("a committed fallback has usage"),
         );
+    });
+    // The shared cancel state: the single allocation #93 permits, measured
+    // separately from the allocation-free path above so a consumer that does
+    // not need a timeout/worker race is never charged for one.
+    assert_exactly_one_allocation("reservation/commit_split", || {
+        let reservation = Reservation::reserve(&lease, CostUnits(100), now).unwrap();
+        let (shared, handle) = reservation.split();
+        black_box(
+            shared
+                .reservation()
+                .commit_at_execution_start(now, CommitFunding::LeaseOnly)
+                .unwrap(),
+        );
+        black_box(handle.is_cancelled());
+    });
+    // And cancelling through the handle stays on the same one allocation.
+    assert_exactly_one_allocation("reservation/split_cancel", || {
+        let reservation = Reservation::reserve(&lease, CostUnits(100), now).unwrap();
+        let (_shared, handle) = reservation.split();
+        black_box(handle.cancel());
     });
     assert_zero("core/reserve_overage_cancel", || {
         let reservation =

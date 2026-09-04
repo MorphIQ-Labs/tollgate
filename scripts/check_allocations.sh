@@ -46,14 +46,24 @@ if printf '%s\n' "$reverse_deps" | grep -v '^$' | grep -qv '^tollgate-alloc-coun
   exit 1
 fi
 
+# `tollgate` scopes must be allocation-free. `tollgate_opt_in` is the one
+# exception the design permits (#93's shared cancel state), and it is held to an
+# exact count rather than merely exempted: an exemption that cannot fail would
+# witness nothing, and the whole point of reporting the split separately is that
+# its cost stays one deliberate allocation instead of drifting upward.
 jq -s -e '
   length > 0
   and any(.[]; .scope == "caller/request_buffer" and .attribution == "caller")
   and any(.[]; .scope == "consumer/executor_job" and .attribution == "consumer_executor")
+  and any(.[]; .scope == "reservation/commit_split" and .attribution == "tollgate_opt_in")
   and all(.
     [];
     if .attribution == "tollgate"
     then .allocations.alloc_calls == 0
+      and .allocations.alloc_zeroed_calls == 0
+      and .allocations.realloc_calls == 0
+    elif .attribution == "tollgate_opt_in"
+    then .allocations.alloc_calls == 1
       and .allocations.alloc_zeroed_calls == 0
       and .allocations.realloc_calls == 0
     else true
