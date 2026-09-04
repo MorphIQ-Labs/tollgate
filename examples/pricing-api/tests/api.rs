@@ -9,10 +9,11 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use pricing_api::{
-    AppRuntime, DEMO_ACCOUNT, DEMO_API_KEY, PricingConnection, build_app, build_app_with_mode,
+    AppRuntime, DEMO_ACCOUNT, DEMO_API_KEY, DEMO_POLICY_REVISION, PricingConnection, build_app,
+    build_app_with_mode,
 };
 use tollgate_admission::CommitRefusal;
-use tollgate_core::{CostUnits, DenyReason, EnforcementMode};
+use tollgate_core::{CostUnits, DenyReason, EnforcementMode, RequestId};
 use tollgate_store::SnapshotSource;
 
 /// Every test router needs a connection to authenticate against, because the
@@ -141,6 +142,52 @@ async fn authorized_request_prices_and_charges() {
     let store = runtime.store.clone();
     runtime.shutdown().await;
     assert_eq!(store.usage_recorded(DEMO_ACCOUNT), CostUnits(64));
+}
+
+/// #94's acceptance criterion: the response metadata and the usage record
+/// refer to the same policy revision.
+///
+/// This is the whole point of the field and nothing else proves it. A
+/// consumer resolves its customer-visible metadata — plan name, schedule
+/// version — from the value it returns, so if the response could name one
+/// policy while the bill named another, every such description would be
+/// unverifiable. The two are one value by construction here, because the
+/// handler reads it off the committed guard, which reads it off the event it
+/// will emit; this test is what keeps that construction from drifting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_response_and_the_bill_name_the_same_policy_revision() {
+    let (router, runtime) = build_test_app(100_000, true);
+    wait_ready(&router).await;
+
+    let (status, body) = call(&router, Some(DEMO_API_KEY), price_body(14)).await;
+    assert_eq!(status, StatusCode::OK);
+    let reported = body["metadata"]["policy_revision"]
+        .as_str()
+        .expect("the response states a policy revision")
+        .to_string();
+    assert_eq!(
+        reported,
+        DEMO_POLICY_REVISION.to_string(),
+        "the response names the revision the snapshot was published with"
+    );
+    let request_id: RequestId = body["metadata"]["request_id"]
+        .as_str()
+        .expect("the response states a request id")
+        .parse()
+        .expect("the request id is canonical");
+
+    let store = runtime.store.clone();
+    runtime.shutdown().await;
+
+    let settled = store
+        .settled_event(request_id)
+        .expect("the committed charge reached the ledger");
+    assert_eq!(
+        settled.policy_revision.to_string(),
+        reported,
+        "the bill must name exactly the policy the response reported"
+    );
+    assert_eq!(settled.units, CostUnits(64));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

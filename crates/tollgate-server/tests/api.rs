@@ -375,6 +375,125 @@ async fn admin_preserves_new_limit_fields_over_http() {
     assert_eq!(fetched["limits"]["principal_max_concurrent_requests"], 2);
 }
 
+/// A revision published over HTTP comes back over HTTP, in canonical form
+/// (#94) — and a document that omits it is served as unstated rather than
+/// refused.
+///
+/// The server is a *reader* in this rollout: it decodes into an
+/// `AccountSnapshot` and reserializes. A field it did not know about would be
+/// silently stripped in exactly this round trip, which is the failure mode the
+/// deployment order (schema, then readers, then publication) exists to avoid
+/// and the reason this is checked at the HTTP boundary rather than only in the
+/// store.
+#[tokio::test]
+async fn admin_preserves_the_policy_revision_over_http() {
+    let (store, router) = state();
+    store.create_account(AccountConfig {
+        account_id: AccountId(1),
+        initial_balance: CostUnits(1_000),
+        status: AccountStatus::Active,
+    });
+    let revision = "5c".repeat(32);
+    let base = json!({
+        "account_id": id(1),
+        "key_id": null,
+        "generation": 1,
+        "status": "Active",
+        "valid_until": "2100-01-01T00:00:00Z",
+        "permissions": 1,
+        "limits": { "max_items_per_request": 64, "rate_units_per_second": 1_000, "rate_burst_units": 2_000 },
+        "cost_table": { "fixed_request": 1, "minimum_charge": 1, "weights": [1] }
+    });
+
+    let mut stated = base.clone();
+    stated["policy_revision"] = json!(revision);
+    let (status, _) = call(
+        &router,
+        "PUT",
+        &api(&format!("/admin/snapshots/{}", Principal(0x94))),
+        Some(json!({ "snapshot": stated })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, fetched) = call(
+        &router,
+        "GET",
+        &api(&format!("/snapshots/{}", Principal(0x94))),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        fetched["policy_revision"], revision,
+        "the server must not strip a field it merely carries"
+    );
+
+    // A publisher that predates the field: accepted, and served as unstated.
+    let (status, _) = call(
+        &router,
+        "PUT",
+        &api(&format!("/admin/snapshots/{}", Principal(0x95))),
+        Some(json!({ "snapshot": base })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "a snapshot without a revision is not a malformed snapshot"
+    );
+    let (_, fetched) = call(
+        &router,
+        "GET",
+        &api(&format!("/snapshots/{}", Principal(0x95))),
+        None,
+    )
+    .await;
+    assert_eq!(fetched["policy_revision"], "0".repeat(64));
+}
+
+/// A revision that is not canonical is refused at the boundary rather than
+/// stored and later read back as something else. Two spellings of one revision
+/// would silently look like two policies to the consumer comparing them.
+#[tokio::test]
+async fn admin_refuses_a_noncanonical_policy_revision() {
+    let (store, router) = state();
+    store.create_account(AccountConfig {
+        account_id: AccountId(1),
+        initial_balance: CostUnits(1_000),
+        status: AccountStatus::Active,
+    });
+    for bad in [
+        "5C".repeat(32), // uppercase
+        "5c".repeat(16), // identifier width, not revision width
+        format!("0x{}", "5c".repeat(32)),
+    ] {
+        let snapshot = json!({
+            "account_id": id(1),
+            "key_id": null,
+            "generation": 1,
+            "status": "Active",
+            "valid_until": "2100-01-01T00:00:00Z",
+            "permissions": 1,
+            "limits": { "max_items_per_request": 64, "rate_units_per_second": 1_000, "rate_burst_units": 2_000 },
+            "cost_table": { "fixed_request": 1, "minimum_charge": 1, "weights": [1] },
+            "policy_revision": bad,
+        });
+        let (status, _) = call(
+            &router,
+            "PUT",
+            &api(&format!("/admin/snapshots/{}", Principal(0x97))),
+            Some(json!({ "snapshot": snapshot })),
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::NO_CONTENT,
+            "a non-canonical revision must not be accepted: {bad}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn admin_refuses_snapshot_whose_batch_quote_exceeds_burst() {
     let (_store, router) = state();

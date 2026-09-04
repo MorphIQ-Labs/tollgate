@@ -1,0 +1,72 @@
+-- Opaque application-policy revision (#94): which of the consumer's policies
+-- priced each charge.
+--
+-- A service publishes compiled enforcement data derived from its own versioned
+-- product records. The revision is how it says *which* records those were, so
+-- a billing row can be traced back to the policy that produced it without any
+-- product vocabulary -- plan, model, schedule, tier -- entering this schema.
+-- Tollgate stores it and hands it back; it never parses or interprets it.
+--
+-- Column notes:
+--
+-- 1. `policy_revision BYTEA NOT NULL DEFAULT` all-zeroes on
+--    `tollgate_usage_events`. Zero is not a placeholder standing in for a
+--    missing value -- it is the domain's own "no revision stated", the same
+--    value the Rust type's `Default` produces. That is exactly what is true of
+--    a row written before this feature, so the backfill states a fact rather
+--    than inventing one, and a reader cannot tell a defaulted row from one
+--    whose publisher genuinely stated nothing, because there is nothing to
+--    tell apart.
+--
+-- 2. The length CHECK follows `tollgate_credential_keys_digest_len` from
+--    0009: a fixed-width identifier column whose width is asserted by the
+--    schema rather than trusted from the writer. 32 bytes, always. A short or
+--    long value is a corruption or a codec bug, and it fails the insert
+--    instead of being stored and later read back as a different revision --
+--    which is the failure that matters here, since a consumer compares these
+--    for equality to select its own metadata and two spellings of one
+--    revision would silently look like two policies.
+--
+-- 3. No index. The column is carried, never queried: nothing in Tollgate
+--    filters, groups, or joins on it, and the reconciliation query reads
+--    account-level aggregates rather than event rows. An index would cost
+--    every ingest a write for a lookup no code performs. A consumer that
+--    later wants to report by revision adds one then, against a real query.
+--
+-- 4. `tollgate_snapshots` needs no column. Snapshots are stored as one JSONB
+--    document, and the revision rides inside it beside `enforcement_mode` and
+--    `budget`, both of which arrived the same way. The Rust-side storage DTO
+--    defaults the key when absent, so pre-existing documents decode unchanged.
+--
+-- Locks and rewrite: `ADD COLUMN ... DEFAULT` uses PostgreSQL 11+
+-- non-rewriting defaults, so this records the default in the catalogue and
+-- returns it for existing rows without touching heap pages. The ACCESS
+-- EXCLUSIVE lock is held for the catalogue update only. The new CHECK is
+-- validated against those rows, and no legitimate pre-existing row can fail
+-- it: every one of them takes the 32-byte default.
+--
+-- Compatibility: additive and forward-only, and the mixed-version rollout is
+-- safe in both directions. An old writer omits the column and gets the zero
+-- default -- correct, because an old writer has no revision to state. A new
+-- writer against an old schema fails loudly on an unknown column rather than
+-- silently dropping the value, which is the direction the deployment order
+-- exists to avoid: schema first, then readers, then publication of non-default
+-- revisions. Rolling a *writer* back after that last step is what loses data,
+-- and it is the one constraint this rollout carries.
+--
+-- Recovery: this migration is reversible, since nothing reads the column.
+--
+--   ALTER TABLE tollgate_usage_events
+--       DROP CONSTRAINT IF EXISTS tollgate_usage_events_policy_revision_len,
+--       DROP COLUMN IF EXISTS policy_revision;
+--   DELETE FROM _sqlx_migrations WHERE version = 11;
+--
+-- Dropping the column discards every stated revision permanently; the charges
+-- themselves are untouched, because the revision funds nothing and no
+-- conservation term reads it.
+
+ALTER TABLE tollgate_usage_events
+    ADD COLUMN policy_revision BYTEA NOT NULL
+        DEFAULT '\x0000000000000000000000000000000000000000000000000000000000000000'::bytea,
+    ADD CONSTRAINT tollgate_usage_events_policy_revision_len
+        CHECK (octet_length(policy_revision) = 32);

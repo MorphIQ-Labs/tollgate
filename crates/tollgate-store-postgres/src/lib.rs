@@ -38,7 +38,7 @@ use tokio::sync::broadcast;
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, BudgetSchedule, BudgetView, CostTable, CostUnits,
     EnforcementMode, FencingToken, Generation, KeyId, LeaseGrant, LeaseId, Period, PermissionBits,
-    Principal, PublishableSnapshot, ResolvedLimits, Rollover, UsageEvent,
+    PolicyRevision, Principal, PublishableSnapshot, ResolvedLimits, Rollover, UsageEvent,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, BudgetError, Conservation, CreateAccountError,
@@ -271,6 +271,11 @@ struct StoredSnapshotRef<'a> {
     /// it an instance that refreshed instead of receiving a push would report
     /// no budget at all, and the two would disagree about the same account.
     budget: Option<&'a BudgetView>,
+    /// The consuming application's policy identity (#94). Rides the JSONB
+    /// column, so it needs no schema change of its own — but it does need to
+    /// be here: this DTO is the whole of what storage writes, and a field
+    /// omitted from it is dropped on every publish without a word.
+    policy_revision: &'a PolicyRevision,
 }
 
 impl<'a> From<&'a AccountSnapshot> for StoredSnapshotRef<'a> {
@@ -285,6 +290,7 @@ impl<'a> From<&'a AccountSnapshot> for StoredSnapshotRef<'a> {
             limits: &snapshot.limits,
             cost_table: &snapshot.cost_table,
             budget: snapshot.budget.as_ref(),
+            policy_revision: &snapshot.policy_revision,
         }
     }
 }
@@ -320,6 +326,13 @@ struct StoredSnapshot {
     /// nothing", which readers report as such rather than as a zero balance.
     #[serde(default)]
     budget: Option<BudgetView>,
+    /// Absent from every row written before #94, and `default` for the reason
+    /// the two fields above are. The unstated revision is a value rather than
+    /// an absence, so a pre-existing row decodes to "this account's publisher
+    /// stated no policy identity" — which is true, and is what a consumer
+    /// reading it back should be told.
+    #[serde(default)]
+    policy_revision: PolicyRevision,
 }
 
 impl StoredSnapshot {
@@ -338,7 +351,8 @@ impl StoredSnapshot {
             self.limits,
             self.cost_table,
         )
-        .enforcement_mode(self.enforcement_mode);
+        .enforcement_mode(self.enforcement_mode)
+        .policy_revision(self.policy_revision);
         match self.key_id {
             Some(key_id) => builder.key_id(tollgate_core::KeyId(key_id.0)).build(),
             None => builder.build(),
@@ -1478,7 +1492,8 @@ impl UsageSink for PostgresStore {
             }
 
             // Bulk insert the accepted events.
-            let (mut rid, mut acct, mut lease, mut fence, mut units, mut at) = (
+            let (mut rid, mut acct, mut lease, mut fence, mut units, mut at, mut revision) = (
+                Vec::with_capacity(accepted.len()),
                 Vec::with_capacity(accepted.len()),
                 Vec::with_capacity(accepted.len()),
                 Vec::with_capacity(accepted.len()),
@@ -1496,6 +1511,11 @@ impl UsageSink for PostgresStore {
                 fence.push(accepted_event.fence);
                 units.push(accepted_event.units);
                 at.push(event.occurred_at_us);
+                // Carried verbatim: 32 bytes in, 32 bytes out, and the
+                // schema's length CHECK says so. Unlike the identifiers
+                // above this needs no width conversion — the Rust type is
+                // already the stored representation.
+                revision.push(event.event.policy_revision.as_bytes().to_vec());
                 if accepted_event.overage {
                     debug_assert!(
                         event.lease_id.is_none() && accepted_event.fence.is_none(),
@@ -1530,8 +1550,8 @@ impl UsageSink for PostgresStore {
             }
             let inserted = sqlx::query(
                 "INSERT INTO tollgate_usage_events
-                 (request_id, account_id, lease_id, fencing_token, units, occurred_at_us)
-                 SELECT * FROM UNNEST($1::bytea[], $2::bytea[], $3::bytea[], $4::bigint[], $5::bigint[], $6::bigint[])",
+                 (request_id, account_id, lease_id, fencing_token, units, occurred_at_us, policy_revision)
+                 SELECT * FROM UNNEST($1::bytea[], $2::bytea[], $3::bytea[], $4::bigint[], $5::bigint[], $6::bigint[], $7::bytea[])",
             )
             .bind(&rid)
             .bind(&acct)
@@ -1539,6 +1559,7 @@ impl UsageSink for PostgresStore {
             .bind(&fence)
             .bind(&units)
             .bind(&at)
+            .bind(&revision)
             .execute(&mut *tx)
             .await
             .map_err(storage)?;
