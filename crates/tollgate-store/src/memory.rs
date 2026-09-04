@@ -48,8 +48,8 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountStatus, BudgetSchedule, CostUnits, FencingToken, Generation, KeyId,
-    LeaseGrant, LeaseId, Principal, PublishableSnapshot, UsageEvent, UsageSource,
+    AccountId, AccountStatus, BudgetSchedule, BudgetView, CostUnits, FencingToken, Generation,
+    KeyId, LeaseGrant, LeaseId, Principal, PublishableSnapshot, UsageEvent, UsageSource,
 };
 
 use crate::leases::{LeaseRecord, Leases, Settled};
@@ -151,6 +151,53 @@ struct AccountRecord {
     /// was released/reclaimed. Bounded by construction; reconciliation
     /// watches it.
     settlement_loss: CostUnits,
+}
+
+impl AccountRecord {
+    /// What this account could still spend, for a snapshot's budget view
+    /// (#97).
+    ///
+    /// Balance *plus* the unspent remainder of every active lease, because
+    /// units out on lease are still the account's — an instance holding a
+    /// 500-unit lease has not lost those units, and a figure that excluded
+    /// them would tell a customer their quota had halved the moment a lease
+    /// was taken.
+    ///
+    /// Derived from the account row alone, with no walk over the leases. The
+    /// conservation equation is what makes that possible: `balance + active
+    /// grants` is `funded - consumed`, so what an account can still spend is
+    /// everything it was funded with minus everything it has consumed or lost.
+    /// A lease scan would be O(the account's leases) at every publication and
+    /// would answer the same number.
+    ///
+    /// The `expect`s are the split `PostgresStore::conservation` documents:
+    /// here the counters are maintained by one process under one lock, so an
+    /// underflow is unrepresentable rather than corruption a caller could
+    /// have caused. The PostgreSQL backend reads a database it does not
+    /// exclusively own and reports the same condition as an error.
+    fn budget_view(&self) -> BudgetView {
+        let funded = self
+            .deposited
+            .checked_add(self.overage_recorded)
+            .expect("an account cannot be funded past what it was funded with");
+        let consumed = self
+            .usage_recorded
+            .checked_add(self.settlement_loss)
+            .and_then(|spent| spent.checked_add(self.expired))
+            .expect("consumption cannot exceed the funding it came from");
+        BudgetView {
+            balance_at_publish: funded
+                .checked_sub(consumed)
+                .expect("conservation keeps consumption within funding"),
+            // The period the account is *in*, which is what it can spend
+            // against. An account whose schedule was set but whose first
+            // rollover has not run yet is still in its previous period, and
+            // says so, until the next sweep tick moves it.
+            period_end: self
+                .schedule
+                .map(|schedule| schedule.period.end_after(self.period_start)),
+        }
+    }
 }
 
 /// Return a settled lease's unspent units to the account — expiring the
@@ -733,6 +780,21 @@ fn publish_locked(
     {
         return None;
     }
+    // The store stamps the budget view; a publisher cannot supply one (#97).
+    // Done here rather than at each caller so the two publication entry points
+    // cannot drift, and under the same lock as the write so the number
+    // published is the ledger as of that write. An account this store does not
+    // hold publishes unstamped, which is the same "adds no account-existence
+    // requirement" rule the status check follows.
+    // Unconditional, including the `None` arm: a snapshot arrives here having
+    // crossed a wire, where nothing stops a publisher putting a balance in the
+    // JSON. Overwriting always is what makes the store the field's only
+    // writer, rather than only usually.
+    let view = inner
+        .accounts
+        .get(&snapshot.account_id)
+        .map(AccountRecord::budget_view);
+    let snapshot = snapshot.with_budget(view);
     inner
         .snapshots
         .insert(principal, SnapshotRecord::Present(snapshot.clone()));

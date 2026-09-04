@@ -36,9 +36,9 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, BudgetSchedule, CostTable, CostUnits,
+    AccountId, AccountSnapshot, AccountStatus, BudgetSchedule, BudgetView, CostTable, CostUnits,
     EnforcementMode, FencingToken, Generation, KeyId, LeaseGrant, LeaseId, Period, PermissionBits,
-    Principal, PublishableSnapshot, ResolvedLimits, UsageEvent,
+    Principal, PublishableSnapshot, ResolvedLimits, Rollover, UsageEvent,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, BudgetError, Conservation, CreateAccountError,
@@ -267,6 +267,10 @@ struct StoredSnapshotRef<'a> {
     permissions: &'a PermissionBits,
     limits: &'a ResolvedLimits,
     cost_table: &'a Arc<CostTable>,
+    /// Stored so a *pulled* snapshot carries what a pushed one does. Without
+    /// it an instance that refreshed instead of receiving a push would report
+    /// no budget at all, and the two would disagree about the same account.
+    budget: Option<&'a BudgetView>,
 }
 
 impl<'a> From<&'a AccountSnapshot> for StoredSnapshotRef<'a> {
@@ -280,6 +284,7 @@ impl<'a> From<&'a AccountSnapshot> for StoredSnapshotRef<'a> {
             permissions: &snapshot.permissions,
             limits: &snapshot.limits,
             cost_table: &snapshot.cost_table,
+            budget: snapshot.budget.as_ref(),
         }
     }
 }
@@ -308,6 +313,13 @@ struct StoredSnapshot {
     permissions: PermissionBits,
     limits: ResolvedLimits,
     cost_table: Arc<CostTable>,
+    /// Absent from every row written before periodic budgets, and `default`
+    /// for the reason `enforcement_mode` is: a required field would make every
+    /// pre-existing row fail to decode and deny every principal until the
+    /// whole catalogue was republished. `None` is "the control plane said
+    /// nothing", which readers report as such rather than as a zero balance.
+    #[serde(default)]
+    budget: Option<BudgetView>,
 }
 
 impl StoredSnapshot {
@@ -380,6 +392,16 @@ fn to_units(value: i64, what: &str) -> Result<CostUnits, StoreError> {
 
 fn ts_micros(ts: Timestamp) -> i64 {
     ts.as_microsecond()
+}
+
+/// The inverse of [`ts_micros`]. A stored value outside the representable
+/// range is corruption to report, never an instant to clamp to.
+fn micros_ts(value: i64, what: &str) -> Result<Timestamp, StoreError> {
+    Timestamp::from_microsecond(value).map_err(|e| {
+        StoreError(format!(
+            "{what} is not a representable instant: {value} ({e})"
+        ))
+    })
 }
 
 fn storage(e: sqlx::Error) -> StoreError {
@@ -1695,6 +1717,93 @@ fn decode_status(stored: String) -> Result<AccountStatus, StoreError> {
     }
 }
 
+/// Rebuild an account's schedule from its three stored columns.
+///
+/// `None` is "no schedule", and it is only reachable when all three are NULL:
+/// the row's all-or-nothing CHECK makes half a schedule unstorable, so a
+/// half-populated row read here is corruption to report rather than a shape to
+/// interpret. Unknown names are refused for the same reason `decode_status`
+/// refuses them — a period this binary cannot evaluate must not be presented
+/// as if it were monthly.
+fn decode_schedule(
+    allowance: Option<i64>,
+    period: Option<String>,
+    rollover: Option<String>,
+) -> Result<Option<BudgetSchedule>, StoreError> {
+    let populated = [allowance.is_some(), period.is_some(), rollover.is_some()];
+    let (Some(allowance), Some(period), Some(rollover)) = (allowance, period, rollover) else {
+        if populated.iter().any(|present| *present) {
+            return Err(StoreError(
+                "stored budget schedule is partially populated".into(),
+            ));
+        }
+        return Ok(None);
+    };
+    let period = match period.as_str() {
+        s if s == Period::UtcCalendarMonth.as_str() => Period::UtcCalendarMonth,
+        other => return Err(StoreError(format!("unrecognized budget period {other:?}"))),
+    };
+    let rollover = match rollover.as_str() {
+        s if s == Rollover::None.as_str() => Rollover::None,
+        other => {
+            return Err(StoreError(format!(
+                "unrecognized budget rollover {other:?}"
+            )));
+        }
+    };
+    Ok(Some(BudgetSchedule {
+        allowance: to_units(allowance, "budget allowance")?,
+        period,
+        rollover,
+    }))
+}
+
+/// What the account could still spend, for a snapshot's budget view (#97).
+///
+/// Balance *plus* the unspent remainder of every active lease, because units
+/// out on lease are still the account's. Derived from the account row alone:
+/// the conservation equation makes `balance + active grants` equal to what the
+/// account was funded with minus what it consumed, so no join over
+/// `tollgate_leases` is needed at every publication to answer the same
+/// number.
+///
+/// Reads the columns of the `FOR SHARE` row in `publish_snapshot`, positions 1
+/// through 9. Corruption is reported rather than saturated: unlike
+/// `MemoryStore`, this backend does not exclusively own the ledger it reads,
+/// so an underflow here is the same class of event as a negative unit column
+/// (INVARIANTS.md #11) — see the note in `PostgresStore::conservation`.
+fn budget_view(row: &sqlx::postgres::PgRow) -> Result<BudgetView, StoreError> {
+    let deposited = to_units(row.get::<i64, _>(1), "deposited")?;
+    let overage = to_units(row.get::<i64, _>(2), "overage_recorded")?;
+    let usage = to_units(row.get::<i64, _>(3), "usage_recorded")?;
+    let loss = to_units(row.get::<i64, _>(4), "settlement_loss")?;
+    let expired = to_units(row.get::<i64, _>(5), "expired")?;
+    let schedule = decode_schedule(row.get(6), row.get(7), row.get(8))?;
+    let period_start = micros_ts(row.get::<i64, _>(9), "period_start_us")?;
+
+    let funded = deposited
+        .checked_add(overage)
+        .ok_or_else(|| StoreError("account funding total overflows".into()))?;
+    let consumed = usage
+        .checked_add(loss)
+        .and_then(|spent| spent.checked_add(expired))
+        .ok_or_else(|| StoreError("account consumption total overflows".into()))?;
+    Ok(BudgetView {
+        balance_at_publish: funded.checked_sub(consumed).ok_or_else(|| {
+            StoreError(format!(
+                "consumption {} exceeds funding {}",
+                consumed.get(),
+                funded.get()
+            ))
+        })?,
+        // The period the account is *in*, which is what it can spend against.
+        // An account whose schedule was set but whose first rollover has not
+        // run yet is still in its previous period, and says so, until the next
+        // sweep tick moves it.
+        period_end: schedule.map(|schedule| schedule.period.end_after(period_start)),
+    })
+}
+
 /// Decode one stored snapshot row into the publication proof.
 ///
 /// Shared by `SnapshotSource::snapshot` and the status republish so the latter
@@ -1714,11 +1823,21 @@ fn decode_publishable(
     let generation = generation_from(generation)?;
     let snapshot: StoredSnapshot =
         serde_json::from_value(value).map_err(|e| StoreError(format!("snapshot decode: {e}")))?;
-    PublishableSnapshot::try_new(Arc::new(snapshot.into_snapshot(generation))).map_err(|error| {
-        StoreError(format!(
-            "invalid stored snapshot for principal {:#034x}: {error}",
-            principal.0
-        ))
+    // Carried across the rebuild rather than through the builder: the builder
+    // has no setter for a budget on purpose, so that a publisher cannot supply
+    // one. Re-attaching what this store itself wrote is the store writing it
+    // again, which is the same rule and not an exception to it.
+    let budget = snapshot.budget;
+    let publishable = PublishableSnapshot::try_new(Arc::new(snapshot.into_snapshot(generation)))
+        .map_err(|error| {
+            StoreError(format!(
+                "invalid stored snapshot for principal {:#034x}: {error}",
+                principal.0
+            ))
+        })?;
+    Ok(match budget {
+        Some(budget) => publishable.with_budget(Some(budget)),
+        None => publishable,
     })
 }
 
@@ -2087,8 +2206,6 @@ impl AdminStore for PostgresStore {
         let generation = i64::try_from(snapshot.generation.0).map_err(|_| {
             StoreError("snapshot generation exceeds PostgreSQL BIGINT range".into())
         })?;
-        let value = serde_json::to_value(StoredSnapshotRef::from(snapshot.as_snapshot()))
-            .map_err(|e| StoreError(format!("snapshot encode: {e}")))?;
 
         let mut tx = self.pool.begin().await.map_err(storage)?;
         let result = async {
@@ -2098,23 +2215,44 @@ impl AdminStore for PostgresStore {
             // (#51). FOR SHARE, not FOR UPDATE: this only has to hold the
             // status still, and a status change takes FOR UPDATE on the same
             // row, so the two serialize without publishes blocking each other.
-            let ledger =
-                sqlx::query("SELECT status FROM tollgate_accounts WHERE account_id = $1 FOR SHARE")
-                    .bind(id_bytes(snapshot.account_id.0))
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(storage)?;
+            //
+            // The budget columns ride along on the read that was already being
+            // taken, under the same lock, so the view stamped below is the
+            // ledger as of this publication rather than a second read that
+            // could straddle a lease or a rollover (#97).
+            let ledger = sqlx::query(
+                "SELECT status, deposited, overage_recorded, usage_recorded, settlement_loss,
+                        expired, budget_allowance, budget_period, budget_rollover, period_start_us
+                 FROM tollgate_accounts WHERE account_id = $1 FOR SHARE",
+            )
+            .bind(id_bytes(snapshot.account_id.0))
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(storage)?;
+
             // An account the ledger does not hold publishes unchanged: this
-            // adds no account-existence requirement to publication.
-            if let Some(row) = ledger {
-                let ledger = decode_status(row.get::<String, _>(0))?;
-                if ledger != snapshot.status {
-                    return Err(PublishSnapshotError::StatusMismatch {
-                        ledger,
-                        submitted: snapshot.status,
-                    });
+            // adds no account-existence requirement to publication, and an
+            // unstamped snapshot reports no budget rather than a zero.
+            // Unconditional, including the `None` arm: a snapshot arrives here
+            // having crossed a wire, where nothing stops a publisher putting a
+            // balance in the JSON. Overwriting always is what makes the store
+            // the field's only writer, rather than only usually.
+            let view = match &ledger {
+                Some(row) => {
+                    let ledger = decode_status(row.get::<String, _>(0))?;
+                    if ledger != snapshot.status {
+                        return Err(PublishSnapshotError::StatusMismatch {
+                            ledger,
+                            submitted: snapshot.status,
+                        });
+                    }
+                    Some(budget_view(row)?)
                 }
-            }
+                None => None,
+            };
+            let published = snapshot.with_budget(view);
+            let value = serde_json::to_value(StoredSnapshotRef::from(published.as_snapshot()))
+                .map_err(|e| StoreError(format!("snapshot encode: {e}")))?;
 
             let result = sqlx::query(
                 "INSERT INTO tollgate_snapshots (principal, generation, snapshot, deleted)
@@ -2130,14 +2268,18 @@ impl AdminStore for PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(storage)?;
-            Ok(result.rows_affected() > 0)
+            Ok((result.rows_affected() > 0, published))
         }
         .await;
 
-        if finish_transaction(tx, result).await? {
+        let (written, published) = finish_transaction(tx, result).await?;
+        if written {
+            // The stamped snapshot, not the submitted one: a subscriber must
+            // receive exactly what was stored, or a pushed instance and a
+            // pulling one would disagree about the account's balance.
             self.push_to_subscribers(SnapshotPush {
                 principal,
-                resolution: SnapshotResolution::Present(snapshot),
+                resolution: SnapshotResolution::Present(published),
             });
         }
         Ok(())

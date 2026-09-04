@@ -33,7 +33,7 @@ pub mod snapshot;
 pub mod units;
 pub mod usage;
 
-pub use budget::{BudgetSchedule, Period, Rollover};
+pub use budget::{BudgetSchedule, BudgetView, Period, Rollover};
 pub use cost_table::{CostQuote, CostTable, CostTableBuilder, OpIndex, QuoteError};
 pub use deny::{DenyReason, Retry};
 pub use ids::{
