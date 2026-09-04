@@ -674,7 +674,34 @@ pub struct Metrics {
     /// Refusals by reason. Every reason is present, so a zero says "this has
     /// not happened" rather than leaving the reader to guess whether the
     /// counter exists. Ordered, so two scrapes diff cleanly.
+    ///
+    /// Pre-admission only. A request refused at execution start was already
+    /// counted under `admitted`, and is reported by `refused_at_start` below.
     pub denials: BTreeMap<&'static str, u64>,
+    /// Contexts authorized by stage one that never reached stage two: a body
+    /// that failed to read, a client that went away. Neither an admission nor
+    /// a refusal, and visible so a flood of them cannot look like an idle
+    /// instance.
+    pub contexts_abandoned: u64,
+    /// What became of every admitted request. These four partition `admitted`
+    /// exactly, so an operator can see where work is going without inferring
+    /// it from a difference.
+    pub execution_started: u64,
+    pub canceled_before_start: u64,
+    pub capacity_shed: u64,
+    pub refused_at_start: u64,
+    /// Refusals at execution start by reason, in the same always-present,
+    /// ordered form as `denials`.
+    pub commit_refusals: BTreeMap<&'static str, u64>,
+    /// Commits that settled against overage because their funding lease
+    /// lapsed after admission.
+    ///
+    /// Disjoint from `admitted_overage`: that is credit extended because no
+    /// lease could fund the request, this is credit extended because the lease
+    /// that *did* fund it expired before the work began. Both climb toward an
+    /// invoice; they mean different things about why.
+    pub committed_at_overage: u64,
+    pub units_committed_at_overage: u64,
     /// Units left on the installed lease, absent when no lease is installed
     /// (cold start, expiry, or control-plane invalidation). Read off the
     /// shared slot, never from the request path.
@@ -802,6 +829,14 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Json<Metrics> {
         units_admitted: counters.units_admitted,
         denied: counters.denied(),
         denials: counters.denials_by_name().collect(),
+        contexts_abandoned: counters.contexts_abandoned,
+        execution_started: counters.execution_started,
+        canceled_before_start: counters.canceled_before_start,
+        capacity_shed: counters.capacity_shed,
+        refused_at_start: counters.refused_at_start(),
+        commit_refusals: counters.commit_refusals_by_name().collect(),
+        committed_at_overage: counters.committed_at_overage,
+        units_committed_at_overage: counters.units_committed_at_overage,
         lease_remaining: lease.as_ref().map(|lease| lease.remaining().get()),
         admitted_overage: counters.admitted_overage,
         units_admitted_overage: counters.units_admitted_overage,

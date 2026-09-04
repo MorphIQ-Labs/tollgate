@@ -19,7 +19,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tollgate_core::{CostUnits, DenyReason, LocalSharding, Locality};
+use tollgate_core::{CommitError, CostUnits, DenyReason, LocalSharding, Locality};
 
 /// One counter on its own cache line.
 ///
@@ -57,6 +57,79 @@ impl Padded {
     }
 }
 
+/// Why a request that already held pending funding was refused at execution
+/// start.
+///
+/// A small dedicated vocabulary rather than a second [`DenyReason`]-shaped
+/// array. Only four refusals can reach commit, and mirroring the twenty-one
+/// slot table would add roughly 2.7 KB per counter set for seventeen slots
+/// nothing can ever bump. It keeps `DenyReason`'s forcing function, though:
+/// [`index`](CommitRefusal::index) is an exhaustive match, so a new variant
+/// fails to compile until it has a slot, and [`NAMES`](CommitRefusal::NAMES)
+/// gives every slot a stable label.
+///
+/// These are counted separately from `denials` on purpose. A request refused
+/// here was already counted under `admitted`, and bumping the pre-admission
+/// denial total a second time would make one request both an admission and a
+/// member of the same flat refusal sum (INVARIANTS.md #20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitRefusal {
+    /// The funding lease's window lapsed and no overage fallback applied.
+    FundingExpired,
+    /// An elastic fallback could not fit inside the overage cap, and pending
+    /// refunds would not make room.
+    OverageCapExhausted,
+    /// The same, but refundable occupancy is the reason it did not fit.
+    OverageCapTemporarilyExhausted,
+    /// A cancellation won the race for the phase.
+    Cancelled,
+}
+
+impl CommitRefusal {
+    /// Stable label per slot, in [`index`](Self::index) order.
+    pub const NAMES: [&'static str; Self::COUNT] = [
+        "funding_expired",
+        "overage_cap_exhausted",
+        "overage_cap_temporarily_exhausted",
+        "cancelled",
+    ];
+
+    /// How many slots the tally has.
+    pub const COUNT: usize = 4;
+
+    /// This refusal's dense slot. Exhaustive by construction.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::FundingExpired => 0,
+            Self::OverageCapExhausted => 1,
+            Self::OverageCapTemporarilyExhausted => 2,
+            Self::Cancelled => 3,
+        }
+    }
+
+    /// Classify a commit outcome, or `None` if it did not refuse.
+    ///
+    /// `AlreadyCommitted` is a programming error rather than an outcome the
+    /// request path produces, and it is deliberately not given a slot: a
+    /// counter for it would read as an operational condition.
+    #[must_use]
+    pub fn from_commit_error(error: &CommitError) -> Option<Self> {
+        match error {
+            CommitError::Cancelled | CommitError::AlreadyReleased => Some(Self::Cancelled),
+            CommitError::Denied(DenyReason::FundingExpiredAtStart) => Some(Self::FundingExpired),
+            CommitError::Denied(DenyReason::OverageCapExhausted { .. }) => {
+                Some(Self::OverageCapExhausted)
+            }
+            CommitError::Denied(DenyReason::OverageCapTemporarilyExhausted { .. })
+            | CommitError::Denied(DenyReason::OverageCommitInProgress { .. }) => {
+                Some(Self::OverageCapTemporarilyExhausted)
+            }
+            CommitError::Denied(_) | CommitError::AlreadyCommitted => None,
+        }
+    }
+}
+
 /// Per-instance admission tallies, written from the request path and read by
 /// whatever exports them.
 ///
@@ -74,6 +147,26 @@ pub struct AdmissionCounters {
     admitted_overage: Padded,
     units_admitted_overage: Padded,
     denials: [Padded; DenyReason::COUNT],
+    // Post-admission phase outcomes (INVARIANTS.md #20). None of these touch
+    // `denials`: a request counted here was already counted under `admitted`,
+    // and adding it to the pre-admission refusal total a second time would
+    // give one request two contradictory identities.
+    //
+    // `execution_started` and `canceled_before_start` shard with `admitted`,
+    // because every request reaches exactly one of them and they run at the
+    // same rate as admission itself. The rest stay inline: a shed, an
+    // abandoned context, a commit refusal, and a commit-time fallback are
+    // bounded exceptions, and the fallback already serializes on the overage
+    // counter's own compare-exchange one step earlier.
+    // The sharded layout keeps these two in `CounterShard`; these inline
+    // copies serve the single-locality layout, exactly as `admitted` does.
+    execution_started: Padded,
+    canceled_before_start: Padded,
+    contexts_abandoned: Padded,
+    capacity_shed: Padded,
+    committed_at_overage: Padded,
+    units_committed_at_overage: Padded,
+    commit_refusals: [Padded; CommitRefusal::COUNT],
     shards: Option<Box<[CounterShard]>>,
 }
 
@@ -85,6 +178,8 @@ pub struct AdmissionCounters {
 struct CounterShard {
     admitted: AtomicU64,
     units_admitted: AtomicU64,
+    execution_started: AtomicU64,
+    canceled_before_start: AtomicU64,
     denials: [AtomicU64; DenyReason::COUNT],
 }
 
@@ -93,6 +188,8 @@ impl CounterShard {
         Self {
             admitted: AtomicU64::new(0),
             units_admitted: AtomicU64::new(0),
+            execution_started: AtomicU64::new(0),
+            canceled_before_start: AtomicU64::new(0),
             denials: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
@@ -107,6 +204,13 @@ impl AdmissionCounters {
             admitted_overage: Padded::zero(),
             units_admitted_overage: Padded::zero(),
             denials: [const { Padded::zero() }; DenyReason::COUNT],
+            execution_started: Padded::zero(),
+            canceled_before_start: Padded::zero(),
+            contexts_abandoned: Padded::zero(),
+            capacity_shed: Padded::zero(),
+            committed_at_overage: Padded::zero(),
+            units_committed_at_overage: Padded::zero(),
+            commit_refusals: [const { Padded::zero() }; CommitRefusal::COUNT],
             shards: None,
         }
     }
@@ -124,6 +228,13 @@ impl AdmissionCounters {
             admitted_overage: Padded::zero(),
             units_admitted_overage: Padded::zero(),
             denials: [const { Padded::zero() }; DenyReason::COUNT],
+            execution_started: Padded::zero(),
+            canceled_before_start: Padded::zero(),
+            contexts_abandoned: Padded::zero(),
+            capacity_shed: Padded::zero(),
+            committed_at_overage: Padded::zero(),
+            units_committed_at_overage: Padded::zero(),
+            commit_refusals: [const { Padded::zero() }; CommitRefusal::COUNT],
             shards: Some(
                 (0..sharding.get())
                     .map(|_| CounterShard::zero())
@@ -184,6 +295,81 @@ impl AdmissionCounters {
         self.record_admit_at(units, locality);
         self.admitted_overage.bump(1);
         self.units_admitted_overage.bump(units.get());
+    }
+
+    /// Record a context that was resolved before stage two ever ran.
+    ///
+    /// `begin` authorized the principal and pinned its generation, and then
+    /// the request ended — a body read that failed, a client that
+    /// disconnected, a decode that was refused. No pending funding was created
+    /// and no admission outcome was decided, so this is neither an admission
+    /// nor a denial. It is counted anyway because the alternative is silence:
+    /// an instance authenticating a flood of requests that never reach stage
+    /// two would otherwise be indistinguishable from one serving none, which
+    /// is exactly the blindness INVARIANTS.md #20 exists to prevent.
+    #[inline]
+    pub fn record_context_abandoned(&self) {
+        self.contexts_abandoned.bump(1);
+    }
+
+    /// Record a request shed by the execution-capacity gate.
+    ///
+    /// Pending funding existed and was released for zero. Counted here rather
+    /// than in `denials` because the request was already counted under
+    /// `admitted`; #99 adds the per-class breakdown on top of this total.
+    #[inline]
+    pub fn record_capacity_shed(&self) {
+        self.capacity_shed.bump(1);
+    }
+
+    /// Record a request that resolved for zero after admission and before
+    /// execution start — a cancellation, or an abandoned pending state.
+    #[inline]
+    pub(crate) fn record_canceled_before_start_at(&self, locality: Locality) {
+        if let Some(shard) = self.shard_at(locality) {
+            shard.canceled_before_start.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.canceled_before_start.bump(1);
+    }
+
+    /// Record a request whose kernel was cleared to run.
+    #[inline]
+    pub(crate) fn record_execution_started_at(&self, locality: Locality) {
+        if let Some(shard) = self.shard_at(locality) {
+            shard.execution_started.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.execution_started.bump(1);
+    }
+
+    /// Record a commit that settled against overage because its lease lapsed.
+    ///
+    /// Disjoint from `admitted_overage`, which counts admissions no lease
+    /// could fund. This request *was* funded at admission and changed funding
+    /// at execution start, so adding the two would double-count nothing and
+    /// separating them is what lets an operator tell the two elastic paths
+    /// apart.
+    #[inline]
+    pub(crate) fn record_committed_at_overage(&self, units: CostUnits) {
+        self.committed_at_overage.bump(1);
+        self.units_committed_at_overage.bump(units.get());
+    }
+
+    /// Record a refusal at execution start against its own slot.
+    #[inline]
+    pub(crate) fn record_commit_refusal(&self, refusal: CommitRefusal) {
+        self.commit_refusals[refusal.index()].bump(1);
+    }
+
+    #[inline]
+    fn shard_at(&self, locality: Locality) -> Option<&CounterShard> {
+        let shards = self.shards.as_ref()?;
+        Some(
+            &shards[locality.index(LocalSharding::new(
+                std::num::NonZeroUsize::new(shards.len()).expect("sharded counters are non-empty"),
+            ))],
+        )
     }
 
     /// Record a refusal against its reason's slot.
@@ -250,6 +436,13 @@ impl AdmissionCounters {
                 admitted_overage: self.admitted_overage.get(),
                 units_admitted_overage: self.units_admitted_overage.get(),
                 denials: [0; DenyReason::COUNT],
+                execution_started: 0,
+                canceled_before_start: 0,
+                contexts_abandoned: self.contexts_abandoned.get(),
+                capacity_shed: self.capacity_shed.get(),
+                committed_at_overage: self.committed_at_overage.get(),
+                units_committed_at_overage: self.units_committed_at_overage.get(),
+                commit_refusals: std::array::from_fn(|slot| self.commit_refusals[slot].get()),
             };
             for shard in shards {
                 snapshot.admitted = snapshot
@@ -258,6 +451,12 @@ impl AdmissionCounters {
                 snapshot.units_admitted = snapshot
                     .units_admitted
                     .wrapping_add(shard.units_admitted.load(Ordering::Relaxed));
+                snapshot.execution_started = snapshot
+                    .execution_started
+                    .wrapping_add(shard.execution_started.load(Ordering::Relaxed));
+                snapshot.canceled_before_start = snapshot
+                    .canceled_before_start
+                    .wrapping_add(shard.canceled_before_start.load(Ordering::Relaxed));
                 for (total, counter) in snapshot.denials.iter_mut().zip(&shard.denials) {
                     *total = total.wrapping_add(counter.load(Ordering::Relaxed));
                 }
@@ -270,6 +469,13 @@ impl AdmissionCounters {
             admitted_overage: self.admitted_overage.get(),
             units_admitted_overage: self.units_admitted_overage.get(),
             denials: std::array::from_fn(|slot| self.denials[slot].get()),
+            execution_started: self.execution_started.get(),
+            canceled_before_start: self.canceled_before_start.get(),
+            contexts_abandoned: self.contexts_abandoned.get(),
+            capacity_shed: self.capacity_shed.get(),
+            committed_at_overage: self.committed_at_overage.get(),
+            units_committed_at_overage: self.units_committed_at_overage.get(),
+            commit_refusals: std::array::from_fn(|slot| self.commit_refusals[slot].get()),
         }
     }
 }
@@ -304,7 +510,35 @@ pub struct CountersSnapshot {
     /// whatever was cancelled before execution.
     pub units_admitted_overage: u64,
     /// Refusals per [`DenyReason::index`] slot.
+    ///
+    /// Pre-admission only. Every field below describes a *later* phase and
+    /// none of them appear here, so [`denied`](Self::denied) keeps its meaning
+    /// and one request is never counted as both an admission and a denial.
     pub denials: [u64; DenyReason::COUNT],
+    /// Contexts that `begin` produced and that were dropped before `admit`
+    /// consumed them: no pending funding, no admission outcome.
+    pub contexts_abandoned: u64,
+    /// Admitted requests refused by the execution-capacity gate, released for
+    /// zero. #99 adds the per-class breakdown.
+    pub capacity_shed: u64,
+    /// Admitted requests that resolved for zero between admission and
+    /// execution start — cancelled, or abandoned while pending.
+    pub canceled_before_start: u64,
+    /// Requests whose kernel was cleared to run. Together with
+    /// `canceled_before_start`, `capacity_shed`, and `commit_refusals`, this
+    /// accounts for every request that reached `admitted`.
+    pub execution_started: u64,
+    /// Commits that settled against overage because their funding lease
+    /// lapsed after admission.
+    ///
+    /// Disjoint from `admitted_overage`: that counts admissions no lease could
+    /// fund, this counts admissions a lease *did* fund whose window then
+    /// closed. An account can produce either without the other.
+    pub committed_at_overage: u64,
+    /// Units those commits moved to the overage counter.
+    pub units_committed_at_overage: u64,
+    /// Refusals at execution start, per [`CommitRefusal::index`] slot.
+    pub commit_refusals: [u64; CommitRefusal::COUNT],
 }
 
 impl CountersSnapshot {
@@ -317,9 +551,28 @@ impl CountersSnapshot {
     }
 
     /// Every refusal, whatever the reason.
+    ///
+    /// Pre-admission refusals only. A request refused at execution start was
+    /// already counted under `admitted`, so adding it here would give one
+    /// request two contradictory identities; read
+    /// [`refused_at_start`](Self::refused_at_start) for that phase.
     #[must_use]
     pub fn denied(&self) -> u64 {
         self.denials.iter().sum()
+    }
+
+    /// Refusals at execution start paired with their stable labels.
+    pub fn commit_refusals_by_name(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        CommitRefusal::NAMES
+            .iter()
+            .copied()
+            .zip(self.commit_refusals.iter().copied())
+    }
+
+    /// Every refusal at execution start, whatever the reason.
+    #[must_use]
+    pub fn refused_at_start(&self) -> u64 {
+        self.commit_refusals.iter().sum()
     }
 }
 
@@ -339,6 +592,132 @@ mod tests {
         let first = std::ptr::from_ref(&counters.denials[0]).addr();
         let second = std::ptr::from_ref(&counters.denials[1]).addr();
         assert_eq!(second - first, 128, "adjacent slots must not share a line");
+    }
+
+    const ALL_REFUSALS: [CommitRefusal; CommitRefusal::COUNT] = [
+        CommitRefusal::FundingExpired,
+        CommitRefusal::OverageCapExhausted,
+        CommitRefusal::OverageCapTemporarilyExhausted,
+        CommitRefusal::Cancelled,
+    ];
+
+    /// The same forcing function `DenyReason` has, at a size that fits four
+    /// outcomes: the mapping is total and no two refusals share a slot.
+    #[test]
+    fn commit_refusal_indices_cover_every_slot_exactly_once() {
+        let mut seen = [false; CommitRefusal::COUNT];
+        for refusal in ALL_REFUSALS {
+            let index = refusal.index();
+            assert!(
+                index < CommitRefusal::COUNT,
+                "{refusal:?} indexes out of range"
+            );
+            assert!(!seen[index], "{refusal:?} shares slot {index}");
+            seen[index] = true;
+        }
+        assert!(seen.iter().all(|hit| *hit), "every slot must belong to one");
+    }
+
+    /// The slots are a contract with whatever reads the exported counters, so
+    /// they are pinned by literal. Renumbering `index()` and `NAMES` together
+    /// stays internally consistent while silently re-attributing a counter a
+    /// consumer already reads — which is exactly what this catches.
+    #[test]
+    fn shipped_commit_refusal_slots_and_labels_never_move() {
+        assert_eq!(CommitRefusal::FundingExpired.index(), 0);
+        assert_eq!(CommitRefusal::OverageCapExhausted.index(), 1);
+        assert_eq!(CommitRefusal::OverageCapTemporarilyExhausted.index(), 2);
+        assert_eq!(CommitRefusal::Cancelled.index(), 3);
+        assert_eq!(CommitRefusal::NAMES[0], "funding_expired");
+        assert_eq!(CommitRefusal::NAMES[1], "overage_cap_exhausted");
+        assert_eq!(CommitRefusal::NAMES[2], "overage_cap_temporarily_exhausted");
+        assert_eq!(CommitRefusal::NAMES[3], "cancelled");
+    }
+
+    /// Every funding refusal core can produce at execution start reaches a
+    /// slot. A refusal that classified to `None` would be counted nowhere
+    /// while still refusing the request.
+    #[test]
+    fn every_commit_time_funding_refusal_reaches_a_slot() {
+        let cap = CostUnits(10);
+        let spent = CostUnits(10);
+        for error in [
+            CommitError::Denied(DenyReason::FundingExpiredAtStart),
+            CommitError::Denied(DenyReason::OverageCapExhausted {
+                spent,
+                overage_cap: cap,
+            }),
+            CommitError::Denied(DenyReason::OverageCapTemporarilyExhausted {
+                spent,
+                overage_cap: cap,
+            }),
+            CommitError::Denied(DenyReason::OverageCommitInProgress {
+                spent,
+                overage_cap: cap,
+            }),
+            CommitError::Cancelled,
+            CommitError::AlreadyReleased,
+        ] {
+            assert!(
+                CommitRefusal::from_commit_error(&error).is_some(),
+                "{error:?} must reach a counter slot"
+            );
+        }
+        // A programming error is not an operational outcome, so it
+        // deliberately has no slot that could read as one.
+        assert_eq!(
+            CommitRefusal::from_commit_error(&CommitError::AlreadyCommitted),
+            None
+        );
+    }
+
+    /// Post-admission outcomes never move the pre-admission refusal total.
+    #[test]
+    fn transition_counters_never_move_the_denied_total() {
+        let counters = AdmissionCounters::new();
+        counters.record_admit(CostUnits(10));
+        counters.record_context_abandoned();
+        counters.record_capacity_shed();
+        counters.record_execution_started_at(Locality::current());
+        counters.record_canceled_before_start_at(Locality::current());
+        counters.record_committed_at_overage(CostUnits(10));
+        for refusal in ALL_REFUSALS {
+            counters.record_commit_refusal(refusal);
+        }
+
+        let snapshot = counters.snapshot();
+        assert_eq!(
+            snapshot.denied(),
+            0,
+            "no post-admission outcome is a denial"
+        );
+        assert_eq!(snapshot.refused_at_start(), CommitRefusal::COUNT as u64);
+        assert_eq!(snapshot.contexts_abandoned, 1);
+        assert_eq!(snapshot.capacity_shed, 1);
+        assert_eq!(snapshot.execution_started, 1);
+        assert_eq!(snapshot.canceled_before_start, 1);
+        assert_eq!(snapshot.committed_at_overage, 1);
+        assert_eq!(snapshot.units_committed_at_overage, 10);
+    }
+
+    /// The sharded layout must report the same totals as the inline one, for
+    /// the transition counters as much as for `admitted`.
+    #[test]
+    fn a_sharded_layout_reports_the_same_transition_totals() {
+        let sharding = LocalSharding::new(std::num::NonZeroUsize::new(8).unwrap());
+        let counters = AdmissionCounters::with_sharding(sharding);
+        for _ in 0..5 {
+            counters.record_execution_started_at(Locality::current());
+            counters.record_canceled_before_start_at(Locality::current());
+        }
+        counters.record_capacity_shed();
+        counters.record_context_abandoned();
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.execution_started, 5);
+        assert_eq!(snapshot.canceled_before_start, 5);
+        assert_eq!(snapshot.capacity_shed, 1);
+        assert_eq!(snapshot.contexts_abandoned, 1);
     }
 
     #[test]

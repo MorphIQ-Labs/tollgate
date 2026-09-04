@@ -901,6 +901,8 @@ impl AccountAdmissionState {
             state,
             principal_permit,
             account_permit,
+            locality,
+            terminal_recorded: false,
         })
     }
 
@@ -919,16 +921,41 @@ pub(crate) struct ConcurrencyGuard {
     state: Arc<AccountAdmissionState>,
     principal_permit: GaugePermit,
     account_permit: GaugePermit,
+    locality: Locality,
+    terminal_recorded: bool,
 }
 
 impl ConcurrencyGuard {
     pub(crate) fn state(&self) -> &AccountAdmissionState {
         &self.state
     }
+
+    /// A later phase has already tallied this request's terminal outcome, so
+    /// `Drop` must not tally it again.
+    ///
+    /// The guard is the natural home for that decision because it is already
+    /// the one value every admitted request holds exactly once, and it holds
+    /// the state the counters live on — so making the tally exact costs no
+    /// extra allocation, no extra `Arc`, and no second ownership story
+    /// (INVARIANTS.md #20).
+    pub(crate) fn mark_terminal_recorded(&mut self) {
+        self.terminal_recorded = true;
+    }
 }
 
 impl Drop for ConcurrencyGuard {
     fn drop(&mut self) {
+        // Nothing later in the lifecycle claimed this request, so it ended
+        // before execution for zero charge: an explicit cancellation, or a
+        // pending state simply abandoned. Both are the same outcome, and
+        // counting them here is what makes "every admitted request reaches
+        // exactly one terminal counter" true by construction rather than by
+        // every call site remembering.
+        if !self.terminal_recorded {
+            self.state
+                .counters
+                .record_canceled_before_start_at(self.locality);
+        }
         // Construction succeeds only after both occupancy increments. The
         // guard is therefore the complete release proof; no mutable policy
         // lookup or detachable reservation can change what Drop must undo.
@@ -2368,11 +2395,28 @@ mod tests {
         assert_eq!(gauge.in_flight(), 0);
     }
 
+    /// The guard is held for a request's whole lifetime, so what it carries is
+    /// a deliberate choice rather than a convenience. It is the occupied state
+    /// plus its two permits, and — since #93 — the pinned locality and the
+    /// one-bit record of whether a later phase already tallied this request's
+    /// terminal outcome.
+    ///
+    /// Those two were added rather than tallying at each call site because the
+    /// guard is the only value every admitted request holds exactly once: it
+    /// is what makes "exactly one terminal counter per admitted request" true
+    /// by construction, including for a pending state that is simply abandoned
+    /// (INVARIANTS.md #20). Carrying the locality keeps that tally in the same
+    /// counter shard the admission used, which re-reading the thread-local in
+    /// `Drop` would not after a worker hop.
     #[test]
     fn concurrency_guard_carries_the_exact_occupied_state() {
+        let word = std::mem::size_of::<Arc<AccountAdmissionState>>();
         assert_eq!(
             std::mem::size_of::<ConcurrencyGuard>(),
-            3 * std::mem::size_of::<Arc<AccountAdmissionState>>()
+            // state + principal permit + account permit + locality + the
+            // padded terminal-outcome flag.
+            5 * word,
+            "the execution-lifetime guard grew: justify what it now carries"
         );
     }
 }

@@ -682,10 +682,46 @@ until it has one.
     The request path may not log (5), so its tallies are the only account it
     can give of itself; an instance refusing every request must be
     distinguishable from one serving none. The snapshot map owns one shared
-    counter identity and installs its `Arc` into every request state. `begin`
-    records a stage-one refusal; a successful context records exactly one
-    stage-two outcome when `admit` consumes it. A context dropped before stage
-    two has created neither pending funding nor an admission outcome.
+    counter identity and installs its `Arc` into every request state.
+
+    A request has **three** deciding stages, and each records exactly one
+    outcome. `begin` records a stage-one refusal. A successful context records
+    one stage-two outcome when `admit` consumes it. An admitted request then
+    records one *terminal* outcome at execution start: it started executing,
+    it was shed by the capacity gate, it was refused by its own funding, or it
+    resolved for zero before starting. Those four partition `admitted`
+    exactly — `execution_started + capacity_shed + refused_at_start +
+    canceled_before_start == admitted` — and the partition is enforced by
+    construction rather than by call-site discipline: the execution-lifetime
+    concurrency guard is the one value every admitted request holds exactly
+    once, so its `Drop` records the zero-charge outcome for any request no
+    later phase claimed, including a pending state that was simply abandoned.
+
+    A context dropped before stage two creates neither pending funding nor an
+    admission outcome, and is counted as `contexts_abandoned` — its own phase,
+    neither an admission nor a denial. Counting it is the point: an instance
+    authenticating a flood of requests whose bodies never arrive would
+    otherwise be indistinguishable from one serving nothing.
+
+    **No later outcome joins the pre-admission denial total.** A request
+    refused at execution start was already counted under `admitted`, so adding
+    it to `denials` would give one request two contradictory identities;
+    `denied()` therefore stays pre-admission and `refused_at_start()` reads the
+    later phase. A cancellation that wins Tollgate's compare-exchange is a
+    Tollgate outcome and is recorded here, not left for the consumer to infer.
+    Commit-time refusals get their own dense vocabulary rather than a second
+    twenty-one-slot table: only four refusals can reach commit, and
+    `CommitRefusal::index` keeps `DenyReason`'s forcing function — an
+    exhaustive match, stable slots pinned by literal — at the size the outcome
+    space actually has.
+
+    The two elastic qualifiers stay disjoint. `admitted_overage` counts
+    admissions no lease could fund; `committed_at_overage` counts admissions a
+    lease *did* fund whose window lapsed before execution start (3, 12). They
+    answer different operational questions and an account can produce either
+    without the other, so neither is a subset of the other and adding them is
+    never correct.
+
     `DenyReason::index` is an exhaustive match, making a slot
     per reason total by construction and a shared slot unrepresentable; a new
     variant fails to compile until it has one. Those slots are also *stable*:
@@ -711,8 +747,20 @@ until it has one.
     `staged_outcomes_are_counted_once_at_their_deciding_stage`,
     `engines_sharing_a_map_export_one_counter_identity`,
     `moka_engine_and_installed_context_share_one_counter_identity`,
-    `metrics_separate_admissions_from_each_kind_of_refusal`, and
-    `an_overage_admission_is_counted_twice_over_and_a_refusal_once`.
+    `metrics_separate_admissions_from_each_kind_of_refusal`,
+    `an_overage_admission_is_counted_twice_over_and_a_refusal_once`,
+    `every_admitted_request_reaches_exactly_one_terminal_counter`,
+    `an_abandoned_context_is_counted_and_denies_nothing`,
+    `a_consumed_context_is_never_counted_as_abandoned`,
+    `a_commit_time_funding_refusal_is_counted_under_its_own_reason`,
+    `a_commit_time_fallback_is_counted_under_its_own_qualifier`,
+    `an_admission_time_overage_is_not_counted_as_a_commit_time_one`,
+    `commit_refusal_indices_cover_every_slot_exactly_once`,
+    `shipped_commit_refusal_slots_and_labels_never_move`,
+    `every_commit_time_funding_refusal_reaches_a_slot`,
+    `transition_counters_never_move_the_denied_total`,
+    `a_sharded_layout_reports_the_same_transition_totals`, and
+    `concurrency_guard_carries_the_exact_occupied_state`.
 
 21. **Every 128-bit identifier has one portable wire spelling.** `AccountId`,
     `KeyId`, `LeaseId`, `RequestId`, and `Principal` are exactly 32 lowercase
