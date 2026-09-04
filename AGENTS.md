@@ -36,11 +36,12 @@ TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
 ./scripts/check_perf_thresholds.sh
 ./scripts/check_load_thresholds.sh
 ./scripts/check_allocations.sh
+./scripts/check_ci_rules.sh
 cargo run -p pricing-api
 cargo run -p tollgate-server
 ```
 
-CI uses `check`, `test`, `assurance`, and `release`: format, Clippy, title convention, all-feature workspace tests, the PostgreSQL suite, and benchmark compilation run on every merge request; the blocking dependency-advisory scan runs on merge requests and the default branch; mutation and formal gates run only for merge requests targeting the default branch; release-plz runs only after merge. Shared CI blocks on deterministic allocation counts and same-run Criterion ratios. Absolute Criterion latency and the recorded regression baseline remain controlled-host decisions. The automatic loopback load job is non-gating evidence because a shared runner can contaminate its paired denominator and numerator differently; build, configuration, execution, and report failures still fail it. The `production` profile (fat LTO, `panic=abort`) is for deployment and the load gate; Criterion retains the default release profile. Keep `rust-toolchain.toml` and the GitLab CI Rust image in lockstep.
+CI uses `check`, `test`, `assurance`, and `release`: format, Clippy, title convention, repository hygiene, all-feature workspace tests, the PostgreSQL suite, and benchmark compilation run on every merge request; the blocking dependency-advisory scan runs on merge requests and the default branch; the blocking assurance gates — mutation, formal, and Criterion ratios — also run on **every** merge request, whatever it targets, because whether a gate runs is a property of the change and not of where the change is routed (#106); the two jobs pinned to the controlled host stay restricted to merge requests targeting the default branch, since neither blocks a merge and queueing every request on one machine buys no gate; release preparation and tagging run only after merge. `./scripts/check_ci_rules.sh` enforces that split, because a gate that is never scheduled leaves no red job to notice. Shared CI blocks on deterministic allocation counts and same-run Criterion ratios. Absolute Criterion latency and the recorded regression baseline remain controlled-host decisions. The automatic loopback load job is non-gating evidence because a shared runner can contaminate its paired denominator and numerator differently; build, configuration, execution, and report failures still fail it. The `production` profile (fat LTO, `panic=abort`) is for deployment and the load gate; Criterion retains the default release profile. Keep `rust-toolchain.toml` and the GitLab CI Rust image in lockstep.
 
 ## Design Constraints
 
@@ -121,7 +122,7 @@ Trunk-based, one long-lived branch. The workflow above is prose until these sett
 
 | Setting | Value | Why |
 | --- | --- | --- |
-| Default branch | `main` | There is no `develop` and no release train. A second long-lived branch also silently disables the `assurance` stage, which runs only on merge requests targeting the default branch. |
+| Default branch | `main` | There is no `develop` and no release train. A second long-lived branch would divert merge requests away from `main`; since #106 that no longer disables the blocking assurance gates, which run on every merge request, but it still splits release preparation. |
 | `main` protection | push: **No one**; merge: **Maintainers**; force push: **off** | "Accepts no direct pushes" is a setting, not a convention. |
 | Squash commits | **Always** | The MR title becomes the single commit subject on the default branch. |
 | Merge method | Merge commit | Group convention, for one review model everywhere. |

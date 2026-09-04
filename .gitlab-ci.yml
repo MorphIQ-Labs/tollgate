@@ -61,6 +61,14 @@ variables:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - when: never
 
+# Only the two jobs pinned to the controlled host still use this. A *blocking*
+# gate must not, because whether a gate runs would then be a property of where
+# a change is routed rather than of the change itself (#106): a merge request
+# targeting a feature branch got no `assurance` stage at all -- not a skipped
+# job with a visible state, but no jobs created, so the pipeline page showed a
+# complete green pipeline with the column missing. When the parent merged,
+# GitLab retargeted that request to `main` and left the assurance-free pipeline
+# standing as its "pipelines must succeed" evidence.
 .main-merge-request:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
@@ -153,6 +161,10 @@ repository-hygiene:
         printf 'Cargo manifests must not carry a publish registry list (see AGENTS.md, issue #46):\n%s\n' "$publish_lists" >&2
         exit 1
       fi
+    # Runs here, in `check`, and not in `assurance`: it guards the assurance
+    # stage's own rules, so it must run in a pipeline where those rules have
+    # already decided whether that stage exists (#106).
+    - ./scripts/check_ci_rules.sh
 
 fmt:
   dependencies: []
@@ -281,7 +293,7 @@ bench-compile:
 
 formal:
   dependencies: []
-  extends: .main-merge-request
+  extends: .merge-request
   stage: assurance
   interruptible: true
   variables:
@@ -302,7 +314,7 @@ formal:
 
 mutation:
   dependencies: []
-  extends: [.main-merge-request, .postgres-service]
+  extends: [.merge-request, .postgres-service]
   stage: assurance
   timeout: 90 minutes
   interruptible: true
@@ -361,7 +373,7 @@ perf-thresholds:
 # on that box being online.
 perf-ratios:
   dependencies: []
-  extends: .main-merge-request
+  extends: .merge-request
   stage: assurance
   interruptible: true
   timeout: 45 minutes
