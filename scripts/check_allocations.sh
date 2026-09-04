@@ -46,11 +46,21 @@ if printf '%s\n' "$reverse_deps" | grep -v '^$' | grep -qv '^tollgate-alloc-coun
   exit 1
 fi
 
-# `tollgate` scopes must be allocation-free. `tollgate_opt_in` is the one
-# exception the design permits (#93's shared cancel state), and it is held to an
-# exact count rather than merely exempted: an exemption that cannot fail would
-# witness nothing, and the whole point of reporting the split separately is that
-# its cost stays one deliberate allocation instead of drifting upward.
+# `tollgate` scopes must be allocation-free. The other attributions name what
+# an allocation belongs to, and each is bounded by the test that records it
+# rather than merely exempted here — an exemption that cannot fail would
+# witness nothing:
+#
+#   tollgate_opt_in       #93's shared cancel state; exactly one allocation,
+#                         checked below, so its cost cannot drift upward.
+#   dependency_amortized  a dependency's own housekeeping, which Tollgate does
+#                         not own and the dependency does not promise to avoid
+#                         (moka drains its read log on a 300ms timer). Held to
+#                         a per-operation budget by `assert_amortized_bound`.
+#   tollgate_cold_path    off the request path by construction.
+#   caller / consumer_executor
+#                         the embedder's own allocations, reported so the
+#                         boundary between ours and theirs stays visible.
 jq -s -e '
   length > 0
   and any(.[]; .scope == "caller/request_buffer" and .attribution == "caller")

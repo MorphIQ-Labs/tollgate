@@ -146,6 +146,36 @@ fn assert_zero(scope: &str, operation: impl FnOnce()) {
     );
 }
 
+/// Record a scope whose allocations belong to a dependency's amortized
+/// housekeeping, and hold it to a per-operation bound.
+///
+/// Attribution matters here rather than being bookkeeping. INVARIANTS.md #24
+/// says steady-state admission allocates nothing *it owns*; moka's cache
+/// maintenance is not Tollgate's, and moka does not promise a read never
+/// allocates. Recording it under `tollgate` and asserting zero claimed a
+/// guarantee the dependency does not give, and the claim failed on a loaded
+/// runner rather than on a change (see the caller for the mechanism).
+///
+/// The bound is what keeps this from being an exemption that cannot fail: a
+/// regression in which Tollgate itself allocated per lookup would report one
+/// allocation per operation, which is far outside `max_per_operation`.
+fn assert_amortized_bound(
+    scope: &str,
+    operations: usize,
+    max_per_operation: f64,
+    operation: impl FnOnce(),
+) {
+    let ((), allocations) = AllocScope::measure(operation);
+    tollgate_alloc_count::record_if_requested!(scope, "dependency_amortized", allocations).unwrap();
+    let budget = (operations as f64 * max_per_operation) as u64;
+    assert!(
+        allocations.alloc_calls <= budget,
+        "{scope} allocated {} times over {operations} operations, past the amortized \
+         budget of {budget}: {allocations:?}",
+        allocations.alloc_calls
+    );
+}
+
 #[test]
 fn admission_allocates_nothing_on_the_arc_swap_default() {
     black_box(Locality::current());
@@ -266,7 +296,7 @@ fn configured_and_disabled_guards_allocate_nothing_after_warmup() {
 }
 
 #[test]
-fn moka_reads_are_allocation_free_after_current_thread_warmup() {
+fn moka_reads_stay_within_their_amortized_allocation_budget() {
     let map = MokaSnapshotMap::new(4_096);
     for value in 0..512_u128 {
         install(
@@ -281,12 +311,34 @@ fn moka_reads_are_allocation_free_after_current_thread_warmup() {
     let locality = Locality::current();
 
     // Crossbeam epoch and Moka read maintenance initialise on first use. Run
-    // through one maintenance interval before asserting steady-state reads.
+    // through one maintenance interval before measuring steady-state reads.
     for _ in 0..65 {
         black_box(map.get_at(&principal, locality).expect("installed"));
     }
 
-    assert_zero("admission/moka_reads_1024", || {
+    // Amortized, not zero — and the difference is moka's, not Tollgate's.
+    //
+    // `MokaSnapshotMap::get_at` allocates nothing. Moka's own housekeeper
+    // drains its read log when either of two things is true
+    // (`Housekeeper::should_apply`, moka 0.12.16):
+    //
+    //     ch_len >= READ_LOG_FLUSH_POINT || now >= self.run_after
+    //
+    // The first is a read count. **The second is a 300 ms wall clock**
+    // (`LOG_SYNC_INTERVAL_MILLIS`), and that is why this cannot be made
+    // deterministic by choosing a warmup or a read count: a loaded machine
+    // that deschedules this loop crosses the timer, moka drains, and the
+    // drain allocates. This assertion used to demand zero across 1,024 reads
+    // and failed a release merge request whose diff was version numbers and a
+    // changelog — the same shape of defect #102 removed from a Criterion
+    // ratio, where a gate failed for a reason the change could not have
+    // caused.
+    //
+    // A budget of one allocation per 32 reads leaves room for several timer
+    // drains while still failing loudly at the regression that matters: were
+    // Tollgate to allocate per lookup, this scope would report ~1,024 against
+    // a budget of 32.
+    assert_amortized_bound("admission/moka_reads_1024", 1_024, 1.0 / 32.0, || {
         for _ in 0..1_024 {
             black_box(map.get_at(&principal, locality).expect("installed"));
         }
