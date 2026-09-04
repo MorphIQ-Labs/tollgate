@@ -148,6 +148,22 @@ impl AdminStore for FlakyReclaimStore {
         AdminStore::set_account_status(&*self.inner, account, status).await
     }
 
+    async fn set_budget_schedule(
+        &self,
+        account: AccountId,
+        schedule: Option<tollgate_core::BudgetSchedule>,
+    ) -> Result<(), tollgate_store::BudgetError> {
+        AdminStore::set_budget_schedule(&*self.inner, account, schedule).await
+    }
+
+    async fn roll_due_periods(
+        &self,
+        now: Timestamp,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<tollgate_store::RolloverBatch, StoreError> {
+        AdminStore::roll_due_periods(&*self.inner, now, limit).await
+    }
+
     async fn publish_snapshot(
         &self,
         principal: tollgate_core::Principal,
@@ -566,5 +582,103 @@ async fn a_failing_sweep_reports_consecutive_failures() {
     assert_eq!(
         counts[1], 2,
         "the count must rise so a persistent failure is distinguishable from a blip"
+    );
+}
+
+/// The rollover pass shares this tick, and it is the *only* trigger: without
+/// it a budget schedule is a stored intention nothing ever acts on. The
+/// account below has one and has never been rolled, so a served interval must
+/// leave it holding its allowance.
+#[tokio::test]
+async fn the_server_rolls_due_budget_periods_on_its_interval() {
+    let inner = store_with_expired_lease();
+    AdminStore::set_budget_schedule(
+        &*inner,
+        ACCOUNT,
+        Some(tollgate_core::BudgetSchedule::monthly(CostUnits(500))),
+    )
+    .await
+    .unwrap();
+    assert_eq!(inner.balance(ACCOUNT), CostUnits(1_000), "no allowance yet");
+
+    let store = Arc::new(FlakyReclaimStore {
+        inner: Arc::clone(&inner),
+        failures_left: AtomicU32::new(0),
+        fail_on_call: None,
+        calls: AtomicU32::new(0),
+    });
+    let (captor, guard) = capture();
+    // 2026-02-14, past the boundary the epoch-stamped account still sits
+    // behind.
+    serve_briefly(
+        Arc::clone(&store),
+        Arc::new(tollgate_store::ManualClock::new(t(1_771_027_200))),
+    )
+    .await;
+    drop(guard);
+
+    assert_eq!(
+        inner.balance(ACCOUNT),
+        CostUnits(1_500),
+        "the allowance was deposited beside the opening top-up"
+    );
+
+    // Reported once, and only by the tick that rolled something: a pass that
+    // logged every tick would bury the one event an operator needs, and one
+    // that logged none would leave "rolling normally" and "the schedule
+    // stopped firing" indistinguishable.
+    let rolls: Vec<_> = captor
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| {
+            event.level == Level::INFO && event.fields.iter().any(|(key, _)| key == "accounts")
+        })
+        .cloned()
+        .collect();
+    assert_eq!(
+        rolls.len(),
+        1,
+        "exactly the tick that crossed a boundary reports it: {rolls:?}"
+    );
+    assert!(
+        rolls[0]
+            .fields
+            .contains(&("accounts".to_string(), "1".to_string())),
+        "the event must say how many accounts moved: {:?}",
+        rolls[0].fields
+    );
+}
+
+/// An account with no schedule is not "rolled with zero accounts" — the pass
+/// must stay silent, or every quiet tick would emit an event and the signal
+/// above would be worthless.
+#[tokio::test]
+async fn a_tick_that_rolls_nothing_says_nothing() {
+    let inner = store_with_expired_lease();
+    let store = Arc::new(FlakyReclaimStore {
+        inner: Arc::clone(&inner),
+        failures_left: AtomicU32::new(0),
+        fail_on_call: None,
+        calls: AtomicU32::new(0),
+    });
+    let (captor, guard) = capture();
+    serve_briefly(
+        Arc::clone(&store),
+        Arc::new(tollgate_store::ManualClock::new(t(1_771_027_200))),
+    )
+    .await;
+    drop(guard);
+
+    assert_eq!(inner.balance(ACCOUNT), CostUnits(1_000));
+    assert!(
+        !captor
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.fields.iter().any(|(key, _)| key == "accounts")),
+        "an unscheduled account must not produce a rollover event"
     );
 }

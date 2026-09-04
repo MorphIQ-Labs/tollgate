@@ -7,8 +7,8 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountStatus, CostUnits, FencingToken, Generation, KeyId, LeaseGrant, LeaseId,
-    Principal, PublishableSnapshot, UsageEvent,
+    AccountId, AccountStatus, BudgetSchedule, CostUnits, FencingToken, Generation, KeyId,
+    LeaseGrant, LeaseId, Principal, PublishableSnapshot, UsageEvent,
 };
 
 /// Backend failure unrelated to domain rules (connection lost, transaction
@@ -171,11 +171,24 @@ pub struct Conservation {
     /// `active_lease_grants`.
     pub settled_usage: CostUnits,
     pub settlement_loss: CostUnits,
+    /// Units that were funded but will never be spent, because the period
+    /// that funded them ended (#97).
+    ///
+    /// A resting place on the right of the equation, beside `settlement_loss`
+    /// and for the same reason: both are units the account was funded with
+    /// that no longer sit in a balance, on a lease, or in billed usage.
+    /// Without it, an allowance that resets each month would make the equation
+    /// fail by exactly the unspent remainder — the ledger reporting corruption
+    /// every time a budget did the one thing it exists to do.
+    ///
+    /// Monotonic, like `deposited` and `overage_recorded`: expiry is a fact
+    /// about a period that has closed, and closing a period is not reversible.
+    pub expired: CostUnits,
 }
 
 impl Conservation {
-    /// `deposited + overage == balance + active grants + settled usage + loss`,
-    /// exactly.
+    /// `deposited + overage == balance + active grants + settled usage + loss
+    /// + expired`, exactly.
     ///
     /// Both sides accumulate with checked arithmetic and an overflow answers
     /// `false`, never a wrap or a panic: this function exists to *detect*
@@ -192,6 +205,7 @@ impl Conservation {
             self.active_lease_grants,
             self.settled_usage,
             self.settlement_loss,
+            self.expired,
         ] {
             match sum.checked_add(part) {
                 Some(next) => sum = next,
@@ -580,6 +594,103 @@ pub struct StatusChange {
     pub unreadable: usize,
 }
 
+/// One account moved across a period boundary by a rollover pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RolledAccount {
+    pub account_id: AccountId,
+    /// The new period's allowance, deposited by this pass.
+    pub deposited: CostUnits,
+    /// Unspent allowance from the period that just closed. Manual top-ups are
+    /// never included: they persist across a boundary (#97).
+    pub expired: CostUnits,
+}
+
+/// The production-sized upper bound for one rollover transaction.
+///
+/// Every scheduled account comes due at the same instant — that is what a
+/// calendar boundary means — so this is not a cap on a rare backlog but the
+/// normal shape of the first pass after midnight on the 1st. It bounds locks,
+/// row materialization, and transaction size per statement; the sweep drains
+/// saturated batches until it reaches a partial one, exactly as the expiry
+/// reclaim does.
+pub const DEFAULT_ROLLOVER_BATCH_LIMIT: NonZeroUsize =
+    NonZeroUsize::new(256).expect("the rollover batch limit is nonzero");
+
+/// Verified evidence returned by one bounded rollover transaction.
+///
+/// Private fields, so `saturated` cannot disagree with the requested limit —
+/// the same contract [`ReclaimBatch`] carries, and for the same reason: the
+/// caller decides whether to ask for another batch from this, without
+/// re-deriving the backend's result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolloverBatch {
+    rolled: Vec<RolledAccount>,
+    saturated: bool,
+}
+
+impl RolloverBatch {
+    /// Build a batch and derive its saturation evidence from `limit`.
+    pub fn try_new(rolled: Vec<RolledAccount>, limit: NonZeroUsize) -> Result<Self, StoreError> {
+        if rolled.len() > limit.get() {
+            return Err(StoreError(format!(
+                "rollover backend returned {} accounts for a batch limit of {}",
+                rolled.len(),
+                limit
+            )));
+        }
+        Ok(RolloverBatch {
+            saturated: rolled.len() == limit.get(),
+            rolled,
+        })
+    }
+
+    #[must_use]
+    pub fn rolled(&self) -> &[RolledAccount] {
+        &self.rolled
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rolled.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rolled.is_empty()
+    }
+
+    #[must_use]
+    pub fn is_saturated(&self) -> bool {
+        self.saturated
+    }
+}
+
+/// Refusals from setting or rolling a budget schedule (#97).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BudgetError {
+    /// No such account. Never a silent no-op: an operator setting a schedule
+    /// on a mistyped id has to learn it now rather than at the next boundary.
+    UnknownAccount,
+    Storage(StoreError),
+}
+
+impl std::fmt::Display for BudgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BudgetError::UnknownAccount => f.write_str("no such account"),
+            BudgetError::Storage(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for BudgetError {}
+
+impl From<StoreError> for BudgetError {
+    fn from(error: StoreError) -> Self {
+        BudgetError::Storage(error)
+    }
+}
+
 /// Refusals from an account-status transition (#51).
 ///
 /// Deliberately not an [`AllocateError`]: that enum's `NAMES`/`COUNT`/`index`
@@ -692,6 +803,49 @@ pub trait AdminStore: Send + Sync {
         account: AccountId,
         status: AccountStatus,
     ) -> Result<StatusChange, SetStatusError>;
+
+    /// Give an account a periodic allowance, or take it away.
+    ///
+    /// Setting a schedule does not deposit anything: the first allowance
+    /// arrives at the first [`roll_period`](Self::roll_period) after the
+    /// schedule exists. Depositing here would make "set a schedule" and "give
+    /// this account units now" the same operation, and an operator correcting
+    /// a mistyped allowance would fund the account twice.
+    ///
+    /// `None` removes the schedule and leaves the balance alone — including
+    /// any unspent allowance, which simply stops expiring. Removing a schedule
+    /// is not a way to claw units back.
+    async fn set_budget_schedule(
+        &self,
+        account: AccountId,
+        schedule: Option<BudgetSchedule>,
+    ) -> Result<(), BudgetError>;
+
+    /// Cross the period boundary for up to `limit` accounts that are past it:
+    /// expire each closed period's unspent allowance and deposit the next one,
+    /// one transaction per batch.
+    ///
+    /// **Idempotency is this method's job, not its caller's.** The pass runs
+    /// on every control-plane replica, so two of them will race a boundary;
+    /// the backend crosses it under a row lock, and the second caller then
+    /// reads the period the first one wrote and skips the account. A caller
+    /// that read each period first and then rolled would produce two deposits
+    /// under exactly the race this exists to survive.
+    ///
+    /// Safe to call at any cadence: before a boundary it selects nothing, and
+    /// after one the first caller wins. It never rolls an account more than
+    /// one period at a time — an account left unrolled for two months lands in
+    /// the current period with one allowance, because an allowance is what the
+    /// account is entitled to now, not a backlog to be paid out.
+    ///
+    /// Bounded, and saturating means there is more: every scheduled account
+    /// comes due at the same instant, so a caller must drain saturated batches
+    /// until one comes back partial. Unscheduled accounts are never selected.
+    async fn roll_due_periods(
+        &self,
+        now: Timestamp,
+        limit: NonZeroUsize,
+    ) -> Result<RolloverBatch, StoreError>;
     /// Publish a principal's compiled snapshot.
     ///
     /// Refused with [`PublishSnapshotError::StatusMismatch`] when the
@@ -1041,6 +1195,7 @@ mod tests {
             active_lease_grants: CostUnits(2),
             settled_usage: CostUnits(3),
             settlement_loss: CostUnits(4),
+            expired: CostUnits::ZERO,
         };
         assert!(balanced.holds());
 
@@ -1057,6 +1212,7 @@ mod tests {
             active_lease_grants: CostUnits(1),
             settled_usage: CostUnits::ZERO,
             settlement_loss: CostUnits::ZERO,
+            expired: CostUnits::ZERO,
         };
         assert!(!overflowing.holds());
     }
@@ -1073,6 +1229,7 @@ mod tests {
             active_lease_grants: CostUnits(2),
             settled_usage: CostUnits(8),
             settlement_loss: CostUnits(4),
+            expired: CostUnits::ZERO,
         };
         assert!(elastic.holds());
         assert!(
@@ -1097,8 +1254,89 @@ mod tests {
             active_lease_grants: CostUnits::ZERO,
             settled_usage: CostUnits::ZERO,
             settlement_loss: CostUnits::ZERO,
+            expired: CostUnits::ZERO,
         };
         assert!(!overflowing.holds());
+    }
+
+    /// An allowance that expired at a period boundary left the balance without
+    /// being spent, so the equation only closes if `expired` is on the right
+    /// side — and the same ledger without the term must fail by exactly the
+    /// units that expired, or the field would be decorative (#97).
+    #[test]
+    fn expiry_accounts_for_an_allowance_that_was_never_spent() {
+        let rolled = Conservation {
+            deposited: CostUnits(10),
+            overage_recorded: CostUnits::ZERO,
+            balance: CostUnits(1),
+            active_lease_grants: CostUnits(2),
+            settled_usage: CostUnits(3),
+            settlement_loss: CostUnits::ZERO,
+            expired: CostUnits(4),
+        };
+        assert!(rolled.holds());
+        assert!(
+            !Conservation {
+                expired: CostUnits::ZERO,
+                ..rolled
+            }
+            .holds(),
+            "the same ledger without the expiry term must fail by exactly the expired units"
+        );
+    }
+
+    /// A rollover pass reports what it did, and its caller decides whether to
+    /// ask for another batch from `is_saturated` alone. Every accessor is
+    /// asserted directly: a `len` that always answered 1, or an `is_empty`
+    /// stuck either way, would send the server's drain loop into an endless
+    /// round of empty batches or stop it one batch short of the boundary it
+    /// was crossing.
+    #[test]
+    fn rollover_batch_reports_what_it_rolled() {
+        let limit = NonZeroUsize::new(2).unwrap();
+        let rolled = |account| RolledAccount {
+            account_id: AccountId(account),
+            deposited: CostUnits(100),
+            expired: CostUnits::ZERO,
+        };
+
+        let empty = RolloverBatch::try_new(Vec::new(), limit).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+        assert!(!empty.is_saturated());
+        assert!(empty.rolled().is_empty());
+
+        let partial = RolloverBatch::try_new(vec![rolled(1)], limit).unwrap();
+        assert!(!partial.is_empty());
+        assert_eq!(partial.len(), 1);
+        assert!(
+            !partial.is_saturated(),
+            "a partial batch is what ends the drain"
+        );
+        assert_eq!(partial.rolled(), &[rolled(1)]);
+
+        let full = RolloverBatch::try_new(vec![rolled(1), rolled(2)], limit).unwrap();
+        assert_eq!(full.len(), 2);
+        assert!(
+            full.is_saturated(),
+            "a batch at the limit means there may be more"
+        );
+    }
+
+    /// Saturation is derived from the limit the caller asked for, so a backend
+    /// returning more than it was allowed is corruption to refuse rather than
+    /// a batch to trust — the same contract `ReclaimBatch::try_new` carries.
+    #[test]
+    fn a_rollover_batch_beyond_its_limit_is_refused() {
+        let rolled = |account| RolledAccount {
+            account_id: AccountId(account),
+            deposited: CostUnits(100),
+            expired: CostUnits::ZERO,
+        };
+        assert!(
+            RolloverBatch::try_new(vec![rolled(1), rolled(2)], NonZeroUsize::new(1).unwrap())
+                .is_err()
+        );
     }
 
     #[test]

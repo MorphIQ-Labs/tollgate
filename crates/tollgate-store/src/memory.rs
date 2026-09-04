@@ -48,23 +48,93 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountStatus, CostUnits, FencingToken, Generation, KeyId, LeaseGrant, LeaseId,
-    Principal, PublishableSnapshot, UsageEvent, UsageSource,
+    AccountId, AccountStatus, BudgetSchedule, CostUnits, FencingToken, Generation, KeyId,
+    LeaseGrant, LeaseId, Principal, PublishableSnapshot, UsageEvent, UsageSource,
 };
 
 use crate::leases::{LeaseRecord, Leases, Settled};
 pub use crate::traits::{AccountConfig, Conservation, StatusChange};
 use crate::traits::{
-    AdminStore, AllocateError, CreateAccountError, GrantPolicy, GrantPolicyError, IngestError,
-    IngestReport, KeyDirectory, KeyError, KeyRecord, LeaseAllocator, PUSH_CHANNEL_CAPACITY,
-    PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation, SetStatusError, SnapshotPush,
-    SnapshotResolution, SnapshotSource, StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
+    AdminStore, AllocateError, BudgetError, CreateAccountError, GrantPolicy, GrantPolicyError,
+    IngestError, IngestReport, KeyDirectory, KeyError, KeyRecord, LeaseAllocator,
+    PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation,
+    RolledAccount, RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource,
+    StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
 };
+
+/// An account's balance, split by what expires and what does not (#97).
+///
+/// One number could not carry this. At a period boundary the allowance's
+/// remainder is expired and manual credits are kept, and a single balance can
+/// only either expire the credits with it or resurrect allowance units that
+/// were already spent — there is no arithmetic on one counter that separates
+/// "unspent allowance" from "unspent top-up" after the fact.
+///
+/// Spend order is allowance first. A credit bought or granted out of band
+/// should outlive the monthly allowance sitting beside it, so the units with
+/// an expiry date are the ones consumed first.
+#[derive(Debug, Clone, Copy, Default)]
+struct Balance {
+    /// Unspent units from the current period's allowance. Expired whole at
+    /// the next boundary under `Rollover::None`.
+    allowance: CostUnits,
+    /// Unspent units from manual deposits. Never expired by a rollover.
+    topup: CostUnits,
+}
+
+impl Balance {
+    /// What the account can spend, and what every reader outside this module
+    /// means by "balance".
+    fn total(self) -> CostUnits {
+        self.allowance
+            .checked_add(self.topup)
+            .expect("a balance that was funded in halves fits the sum it came from")
+    }
+
+    /// Take `units`, allowance first, reporting the split so the lease can
+    /// give each half back to the bucket it came from.
+    ///
+    /// Returning the split rather than crediting allowance-first on release is
+    /// what stops a top-up being silently expired: a lease funded entirely
+    /// from credits, released after a boundary, would otherwise return its
+    /// units to the allowance bucket and have them expired at the next one.
+    fn take(&mut self, units: CostUnits) -> Option<Drawn> {
+        let from_allowance = self.allowance.min(units);
+        let from_topup = units.checked_sub(from_allowance)?;
+        self.allowance = self.allowance.checked_sub(from_allowance)?;
+        self.topup = self.topup.checked_sub(from_topup)?;
+        Some(Drawn {
+            from_allowance,
+            from_topup,
+        })
+    }
+}
+
+/// Which buckets a grant drew from, carried by the lease so settlement can
+/// return each half to where it came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Drawn {
+    pub(crate) from_allowance: CostUnits,
+    pub(crate) from_topup: CostUnits,
+}
 
 #[derive(Debug)]
 struct AccountRecord {
-    balance: CostUnits,
+    balance: Balance,
     deposited: CostUnits,
+    /// The account's periodic allowance, if it has one. `None` keeps the
+    /// manual-deposit behaviour the ledger has always had, and a rollover pass
+    /// skips the account entirely — which is why this is an `Option` rather
+    /// than a schedule with a zero allowance, a very different thing.
+    schedule: Option<BudgetSchedule>,
+    /// The first instant of the period this account is currently in, and the
+    /// marker rollover is idempotent against: a boundary is crossed exactly
+    /// once because the update that crosses it is conditional on this value
+    /// still being the old one.
+    period_start: Timestamp,
+    /// Units funded but never spendable again, because the period that funded
+    /// them closed. Monotonic.
+    expired: CostUnits,
     /// Mirrors `tollgate_accounts.status`. An [`AccountStatus`] rather than a
     /// bool so `Closed` is representable and terminality can be checked here
     /// instead of inferred from snapshots (#51).
@@ -81,6 +151,51 @@ struct AccountRecord {
     /// was released/reclaimed. Bounded by construction; reconciliation
     /// watches it.
     settlement_loss: CostUnits,
+}
+
+/// Return a settled lease's unspent units to the account — expiring the
+/// allowance half, if the period that funded it has closed (#97).
+///
+/// This is the whole of the "drain then expire" decision. An active lease at a
+/// period boundary keeps serving to its own TTL, so there is no admission gap
+/// and no clock read on the request path; the boundary shows up here instead,
+/// when the lease finally settles. Unspent units funded by an allowance that
+/// no longer exists cannot go back to a balance — that would resurrect an
+/// expired allowance, and the account would carry units its schedule says it
+/// should not have.
+///
+/// The split is charged in the order the account spends, allowance first, so
+/// the top-up half is what survives a partly-spent lease. Only that half is
+/// unconditional: a top-up never expires, boundary or not, which is what makes
+/// "manual credits persist across rollover" true even for a lease that
+/// straddles one.
+///
+/// Usage is untouched either way, which is what makes a straggler across the
+/// boundary bill against the period the lease was granted in.
+fn credit_settlement(
+    record: &mut AccountRecord,
+    funding: Drawn,
+    period_start: Timestamp,
+    unspent: CostUnits,
+) {
+    let to_topup = funding.from_topup.min(unspent);
+    let to_allowance = unspent
+        .checked_sub(to_topup)
+        .expect("the top-up half never exceeds the grant it was drawn from");
+    record.balance.topup = record
+        .balance
+        .topup
+        .checked_add(to_topup)
+        .expect("settlement credit overflow");
+    // The only thing the boundary decides.
+    let bucket = if period_start < record.period_start {
+        &mut record.expired
+    } else {
+        &mut record.balance.allowance
+    };
+    *bucket = bucket
+        .checked_add(to_allowance)
+        .expect("settlement credit overflow");
 }
 
 /// A principal's stored snapshot state.
@@ -205,8 +320,18 @@ impl MemoryStore {
         inner.accounts.insert(
             config.account_id,
             AccountRecord {
-                balance: config.initial_balance,
+                // The opening balance is a top-up, not an allowance: it was
+                // deposited by whoever created the account, and nothing has
+                // scheduled it to expire. A schedule set later starts its
+                // first period at the next rollover.
+                balance: Balance {
+                    allowance: CostUnits::ZERO,
+                    topup: config.initial_balance,
+                },
                 deposited: config.initial_balance,
+                schedule: None,
+                period_start: Timestamp::UNIX_EPOCH,
+                expired: CostUnits::ZERO,
                 status: config.status,
                 next_fence: 1,
                 usage_recorded: CostUnits::ZERO,
@@ -232,15 +357,19 @@ impl MemoryStore {
         // fully-spent account still credited `balance` (#57). `PostgresStore`
         // moves both columns in one statement, where an overflow aborts it
         // and nothing moves.
-        let balance = record
+        // A manual deposit is a top-up: it survives a period boundary, which
+        // is the documented default (#97). An allowance only ever arrives
+        // through `roll_period`.
+        let topup = record
             .balance
+            .topup
             .checked_add(units)
             .ok_or_else(|| AllocateError::Storage(StoreError("balance overflow".into())))?;
         let deposited = record
             .deposited
             .checked_add(units)
             .ok_or_else(|| AllocateError::Storage(StoreError("deposit overflow".into())))?;
-        record.balance = balance;
+        record.balance.topup = topup;
         record.deposited = deposited;
         Ok(())
     }
@@ -326,13 +455,14 @@ impl MemoryStore {
         Some(Conservation {
             deposited: record.deposited,
             overage_recorded: record.overage_recorded,
-            balance: record.balance,
+            balance: record.balance.total(),
             active_lease_grants: active_grants,
             settled_usage: record
                 .usage_recorded
                 .checked_sub(active_used)
                 .expect("active usage never exceeds recorded usage"),
             settlement_loss: record.settlement_loss,
+            expired: record.expired,
         })
     }
 
@@ -350,7 +480,7 @@ impl MemoryStore {
         self.lock()
             .accounts
             .get(&account)
-            .map(|a| a.balance)
+            .map(|a| a.balance.total())
             .unwrap_or(CostUnits::ZERO)
     }
 
@@ -411,16 +541,19 @@ impl LeaseAllocator for MemoryStore {
             return Err(AllocateError::AccountInactive);
         }
         let granted = policy
-            .grant(requested, record.balance)
+            .grant(requested, record.balance.total())
             .ok_or(AllocateError::InsufficientBalance)?;
         let next_fence = record
             .next_fence
             .checked_add(1)
             .ok_or_else(|| AllocateError::Storage(StoreError("fencing token overflow".into())))?;
-        record.balance = record
+        // Allowance first, and the split travels with the lease so settlement
+        // returns each half where it came from (#97).
+        let drawn = record
             .balance
-            .checked_sub(granted)
+            .take(granted)
             .expect("grant never exceeds balance");
+        let period_start = record.period_start;
         let fencing_token = FencingToken(record.next_fence);
         record.next_fence = next_fence;
 
@@ -428,7 +561,8 @@ impl LeaseAllocator for MemoryStore {
         let lease_id = LeaseId(next_lease_id);
         inner.leases.open(
             lease_id,
-            LeaseRecord::opened(account, fencing_token, granted, expires_at),
+            LeaseRecord::opened(account, fencing_token, granted, expires_at)
+                .funded_by(drawn, period_start),
         );
         Ok(LeaseGrant {
             lease_id,
@@ -481,6 +615,8 @@ impl LeaseAllocator for MemoryStore {
             .checked_sub(spent_plus_unspent)
             .ok_or(AllocateError::InvalidRelease)?;
         let account_id = lease.account_id;
+        let funding = lease.funding;
+        let period_start = lease.period_start;
         assert!(
             inner.leases.settle(lease_id, Settled::Released, unspent),
             "the lease was active a line ago, under this same lock"
@@ -489,10 +625,7 @@ impl LeaseAllocator for MemoryStore {
             .accounts
             .get_mut(&account_id)
             .expect("lease account exists");
-        record.balance = record
-            .balance
-            .checked_add(unspent)
-            .expect("release credit overflow");
+        credit_settlement(record, funding, period_start, unspent);
         record.settlement_loss = record
             .settlement_loss
             .checked_add(loss)
@@ -519,32 +652,21 @@ impl LeaseAllocator for MemoryStore {
         // limit, but the structure is the defect, and it is one refactor away
         // from being reachable (#57).
         let mut reclaimed = Vec::with_capacity(expired.len());
-        let mut balances: HashMap<AccountId, CostUnits> = HashMap::new();
+        // Each reclaimed lease is settled by the same rule a release uses, so
+        // a lease whose period has closed expires its remainder here too — a
+        // sweep is just the settlement the instance never got to (#97).
+        let mut settlements: Vec<(AccountId, Drawn, Timestamp, CostUnits)> =
+            Vec::with_capacity(expired.len());
         for &lease_id in &expired {
             let lease = inner.leases.get(lease_id).expect("just listed");
             let credit = lease
                 .granted
                 .checked_sub(lease.used)
                 .expect("usage never exceeds grant");
-            let account_id = lease.account_id;
-            // Overlaid, because a sweep can reclaim several leases of one
-            // account and their credits accumulate.
-            let balance = *balances.get(&account_id).unwrap_or_else(|| {
-                &inner
-                    .accounts
-                    .get(&account_id)
-                    .expect("lease account exists")
-                    .balance
-            });
-            balances.insert(
-                account_id,
-                balance
-                    .checked_add(credit)
-                    .expect("reclaim credit overflow"),
-            );
+            settlements.push((lease.account_id, lease.funding, lease.period_start, credit));
             reclaimed.push(ReclaimedLease {
                 lease_id,
-                account_id,
+                account_id: lease.account_id,
                 reclaimed: credit,
             });
         }
@@ -558,12 +680,16 @@ impl LeaseAllocator for MemoryStore {
                 "reclaimable only yields active leases"
             );
         }
-        for (account_id, balance) in balances {
-            inner
+        for (account_id, funding, period_start, credit) in settlements {
+            // Applied one at a time against the live record rather than
+            // through an overlay: several leases of one account accumulate,
+            // and `credit_settlement` reads the record's current period to
+            // decide where each credit goes.
+            let record = inner
                 .accounts
                 .get_mut(&account_id)
-                .expect("lease account exists")
-                .balance = balance;
+                .expect("lease account exists");
+            credit_settlement(record, funding, period_start, credit);
         }
         // One line per sweep rather than one per batch: a drain calls this
         // until a batch comes back unsaturated, and that last call carries the
@@ -700,6 +826,70 @@ impl AdminStore for MemoryStore {
 
     async fn deposit(&self, account: AccountId, units: CostUnits) -> Result<(), AllocateError> {
         MemoryStore::deposit(self, account, units)
+    }
+
+    async fn set_budget_schedule(
+        &self,
+        account: AccountId,
+        schedule: Option<BudgetSchedule>,
+    ) -> Result<(), BudgetError> {
+        let mut inner = self.lock();
+        let record = inner
+            .accounts
+            .get_mut(&account)
+            .ok_or(BudgetError::UnknownAccount)?;
+        record.schedule = schedule;
+        Ok(())
+    }
+
+    async fn roll_due_periods(
+        &self,
+        now: Timestamp,
+        limit: NonZeroUsize,
+    ) -> Result<RolloverBatch, StoreError> {
+        let mut inner = self.lock();
+        let mut rolled = Vec::new();
+        for (account_id, record) in inner.accounts.iter_mut() {
+            if rolled.len() == limit.get() {
+                break;
+            }
+            let Some(schedule) = record.schedule else {
+                continue;
+            };
+            // The boundary test and the crossing happen under one lock, which
+            // is what makes two passes racing a boundary produce one roll. The
+            // reference backend gets that from the mutex; PostgreSQL gets it
+            // from a row lock over the same comparison.
+            let boundary = schedule.period.start_of(now);
+            if boundary <= record.period_start {
+                continue;
+            }
+            // One allowance, not one per missed boundary: an account left
+            // unrolled for two months is entitled to what it has now, not to a
+            // backlog.
+            let expired = record.balance.allowance;
+            let deposited = record
+                .deposited
+                .checked_add(schedule.allowance)
+                .ok_or_else(|| StoreError(format!("deposit overflow for account {account_id}")))?;
+            let total_expired = record
+                .expired
+                .checked_add(expired)
+                .ok_or_else(|| StoreError(format!("expiry overflow for account {account_id}")))?;
+            // Written only after every fallible step has succeeded: a rollover
+            // that overflowed halfway would leave the account funded but not
+            // credited, or credited twice at the next pass.
+            record.deposited = deposited;
+            record.expired = total_expired;
+            record.balance.allowance = schedule.allowance;
+            record.period_start = boundary;
+            rolled.push(RolledAccount {
+                account_id: *account_id,
+                deposited: schedule.allowance,
+                expired,
+            });
+        }
+        RolloverBatch::try_new(rolled, limit)
     }
 
     async fn set_account_status(

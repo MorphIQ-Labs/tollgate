@@ -17,14 +17,14 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::Mutex;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
-    KeyId, LeaseId, PermissionBits, Principal, PublishableSnapshot, RequestId, ResolvedLimits,
-    UsageEvent, UsageSource,
+    AccountId, AccountSnapshot, AccountStatus, BudgetSchedule, CostTable, CostUnits, FencingToken,
+    Generation, KeyId, LeaseId, PermissionBits, Principal, PublishableSnapshot, RequestId,
+    ResolvedLimits, UsageEvent, UsageSource,
 };
 use tollgate_store::{
-    AccountConfig, AdminStore, AllocateError, Conservation, CreateAccountError, GrantPolicy,
-    KeyDirectory, KeyError, KeyRecord, LeaseAllocator, PublishSnapshotError, Revocation,
-    SetStatusError, SnapshotResolution, SnapshotSource, UsageSink,
+    AccountConfig, AdminStore, AllocateError, BudgetError, Conservation, CreateAccountError,
+    GrantPolicy, KeyDirectory, KeyError, KeyRecord, LeaseAllocator, PublishSnapshotError,
+    Revocation, RolledAccount, SetStatusError, SnapshotResolution, SnapshotSource, UsageSink,
 };
 use tollgate_store_postgres::PostgresStore;
 
@@ -1406,10 +1406,61 @@ fn account_bytes() -> Vec<u8> {
     ACCOUNT.0.to_be_bytes().to_vec()
 }
 
-/// Set one checked column, dropping and re-adding its non-negative CHECK
-/// constraint around the write (re-added NOT VALID so the planted row
-/// survives while future writes stay checked). Constraint names follow the
-/// migrations' `{table}_{column}_nonneg` convention.
+/// Suspend every CHECK constraint on `table` whose definition mentions
+/// `column`, except `keep`, and report what was dropped so it can be restored.
+///
+/// Matched by definition text rather than by a name convention, because a
+/// column is no longer guarded only by its own `{table}_{column}_nonneg`: #97
+/// added cross-column checks (`allowance_balance <= balance`,
+/// `from_allowance <= granted`), and a corruption fixture that dropped one
+/// constraint and tripped another would fail on the schema rather than on the
+/// behaviour it is testing. Matching the text means a check added later is
+/// suspended without anyone remembering to list it here.
+async fn suspend_checks(
+    pool: &sqlx::PgPool,
+    table: &str,
+    column: &str,
+    keep: Option<&str>,
+) -> Vec<(String, String)> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT conname, pg_get_constraintdef(oid)
+         FROM pg_constraint
+         WHERE conrelid = $1::regclass AND contype = 'c'
+           AND pg_get_constraintdef(oid) LIKE '%' || $2 || '%'",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let dropped: Vec<_> = rows
+        .into_iter()
+        .filter(|(name, _)| Some(name.as_str()) != keep)
+        .collect();
+    for (name, _) in &dropped {
+        sqlx::raw_sql(&format!("ALTER TABLE {table} DROP CONSTRAINT {name}"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    dropped
+}
+
+/// Put back what [`suspend_checks`] dropped, `NOT VALID` so a planted row
+/// survives while every future write stays checked.
+async fn restore_checks(pool: &sqlx::PgPool, table: &str, dropped: Vec<(String, String)>) {
+    for (name, definition) in dropped {
+        sqlx::raw_sql(&format!(
+            "ALTER TABLE {table} ADD CONSTRAINT {name} {definition} NOT VALID"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+/// Set one checked column to a value its constraints forbid, so a read path
+/// can be shown to surface the corruption rather than absorb it.
 async fn plant_value(
     pool: &sqlx::PgPool,
     table: &str,
@@ -1418,13 +1469,7 @@ async fn plant_value(
     id: Vec<u8>,
     value: i64,
 ) {
-    let constraint = format!("{table}_{column}_nonneg");
-    sqlx::raw_sql(&format!(
-        "ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {constraint}"
-    ))
-    .execute(pool)
-    .await
-    .unwrap();
+    let dropped = suspend_checks(pool, table, column, None).await;
     sqlx::query(&format!(
         "UPDATE {table} SET {column} = $1 WHERE {id_column} = $2"
     ))
@@ -1433,12 +1478,7 @@ async fn plant_value(
     .execute(pool)
     .await
     .unwrap();
-    sqlx::raw_sql(&format!(
-        "ALTER TABLE {table} ADD CONSTRAINT {constraint} CHECK ({column} >= 0) NOT VALID"
-    ))
-    .execute(pool)
-    .await
-    .unwrap();
+    restore_checks(pool, table, dropped).await;
 }
 
 async fn set_account_column(pool: &sqlx::PgPool, column: &str, value: i64) {
@@ -1826,16 +1866,78 @@ async fn checked_ledger_columns_reject_negative_writes() {
         )
     });
     for (table, column, id_column, id) in account_columns.into_iter().chain(lease_columns) {
-        let err = sqlx::query(&format!(
+        // Only the column's own guard is left standing. A negative balance
+        // also violates `allowance_balance <= balance`, and whichever of the
+        // two PostgreSQL happened to evaluate first would decide the message —
+        // so the cross-column checks step aside and the assertion stays about
+        // the one constraint this test is named for.
+        let nonneg = format!("{table}_{column}_nonneg");
+        let dropped = suspend_checks(&pool, table, column, Some(&nonneg)).await;
+        let result = sqlx::query(&format!(
             "UPDATE {table} SET {column} = -1 WHERE {id_column} = $1"
         ))
+        .bind(id)
+        .execute(&pool)
+        .await;
+        // Restored before the assertion, never after. The suite shares one
+        // database across every test, so a panic between the drop and the
+        // restore would leave the schema missing a constraint for the rest of
+        // the run — and the failures that followed would point at the wrong
+        // code entirely.
+        restore_checks(&pool, table, dropped).await;
+        let err = result.expect_err("a negative write must be refused");
+        assert!(
+            err.to_string().contains(&nonneg),
+            "negative {table}.{column} write must violate its CHECK constraint, got: {err}"
+        );
+    }
+}
+
+/// The cross-column guards #97 added: the allowance portion is part of the
+/// balance, and a lease's allowance funding part of its grant. Neither is
+/// derivable from a per-column check, and a split that drifts is exactly how
+/// an account would come to expire units it never had.
+#[tokio::test]
+async fn the_allowance_split_cannot_exceed_what_it_is_part_of() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(10), TTL, t(0))
+        .await
+        .unwrap();
+    let pool = corruption_pool().await;
+
+    for (table, column, id_column, id, value, constraint) in [
+        (
+            "tollgate_accounts",
+            "allowance_balance",
+            "account_id",
+            account_bytes(),
+            1_000,
+            "tollgate_accounts_allowance_within_balance",
+        ),
+        (
+            "tollgate_leases",
+            "from_allowance",
+            "lease_id",
+            lease.lease_id.0.to_be_bytes().to_vec(),
+            1_000,
+            "tollgate_leases_from_allowance_within_grant",
+        ),
+    ] {
+        let err = sqlx::query(&format!(
+            "UPDATE {table} SET {column} = $1 WHERE {id_column} = $2"
+        ))
+        .bind(value)
         .bind(id)
         .execute(&pool)
         .await
         .unwrap_err();
         assert!(
-            err.to_string().contains(&format!("{column}_nonneg")),
-            "negative {table}.{column} write must violate its CHECK constraint, got: {err}"
+            err.to_string().contains(constraint),
+            "{table}.{column} beyond its whole must violate {constraint}, got: {err}"
         );
     }
 }
@@ -3097,4 +3199,552 @@ async fn a_failed_ingest_batch_leaves_the_ledger_untouched() {
         (1, 0),
         "an event from a failed batch was left indexed, so the replay saw a duplicate"
     );
+}
+
+// --- Periodic budgets (#97) -------------------------------------------------
+//
+// Mirrors `store_suite.rs`'s budget block scenario for scenario. The rules are
+// the same; only the mechanism differs — a row lock and a `CASE` where the
+// reference backend uses a mutex and an `if`.
+
+/// 2026-01-01T00:00:00Z.
+const JAN: i64 = 1_767_225_600;
+/// 2026-02-01T00:00:00Z.
+const FEB: i64 = 1_769_904_000;
+/// 2026-03-01T00:00:00Z.
+const MAR: i64 = 1_772_323_200;
+
+fn monthly(allowance: u64) -> BudgetSchedule {
+    BudgetSchedule::monthly(CostUnits(allowance))
+}
+
+/// Roll every due account, and report what the pass did to `ACCOUNT`.
+async fn roll(store: &PostgresStore, now: i64) -> Option<RolledAccount> {
+    let batch = AdminStore::roll_due_periods(store, t(now), NonZeroUsize::new(64).unwrap())
+        .await
+        .expect("the rollover pass succeeds");
+    batch
+        .rolled()
+        .iter()
+        .find(|rolled| rolled.account_id == ACCOUNT)
+        .copied()
+}
+
+#[tokio::test]
+async fn setting_a_schedule_deposits_nothing() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(100));
+    assert_conserved(&store).await;
+}
+
+#[tokio::test]
+async fn setting_a_schedule_on_an_unknown_account_is_refused() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    assert_eq!(
+        AdminStore::set_budget_schedule(&*store, AccountId(999), Some(monthly(500)))
+            .await
+            .unwrap_err(),
+        BudgetError::UnknownAccount
+    );
+}
+
+#[tokio::test]
+async fn racing_passes_cross_a_boundary_exactly_once() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+        return;
+    };
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+
+    // Genuinely concurrent, on two pooled connections: the row lock is the
+    // whole mechanism, and a sequential pair would not exercise it.
+    let (first, second) = tokio::join!(roll(&store, FEB), roll(&store, FEB));
+
+    let rolled = [first, second];
+    let winners: Vec<_> = rolled.iter().flatten().collect();
+    assert_eq!(winners.len(), 1, "exactly one pass crosses the boundary");
+    assert_eq!(winners[0].deposited, CostUnits(500));
+    assert_eq!(winners[0].expired, CostUnits::ZERO);
+    assert_eq!(
+        store.balance(ACCOUNT).await.unwrap(),
+        CostUnits(500),
+        "the loser must not deposit a second allowance"
+    );
+    assert_conserved(&store).await;
+}
+
+#[tokio::test]
+async fn a_pass_inside_the_current_period_changes_nothing() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+        return;
+    };
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, FEB).await;
+
+    assert_eq!(roll(&store, FEB + 10 * 86_400).await, None);
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(500));
+}
+
+#[tokio::test]
+async fn an_account_without_a_schedule_is_untouched() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    assert_eq!(roll(&store, FEB).await, None);
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(100));
+    assert_conserved(&store).await;
+}
+
+#[tokio::test]
+async fn a_top_up_survives_rollover_but_the_allowance_does_not() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+        return;
+    };
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+    AdminStore::deposit(&*store, ACCOUNT, CostUnits(70))
+        .await
+        .unwrap();
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(570));
+
+    assert_eq!(
+        roll(&store, FEB).await,
+        Some(RolledAccount {
+            account_id: ACCOUNT,
+            deposited: CostUnits(500),
+            expired: CostUnits(500),
+        }),
+        "the whole unspent allowance expires; the top-up is not touched"
+    );
+    assert_eq!(
+        store.balance(ACCOUNT).await.unwrap(),
+        CostUnits(570),
+        "one fresh allowance plus the surviving top-up"
+    );
+    assert_conserved(&store).await;
+}
+
+#[tokio::test]
+async fn a_missed_period_does_not_accrue_a_backlog() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+        return;
+    };
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+
+    // Two boundaries have passed (February and March).
+    assert_eq!(
+        roll(&store, MAR + 86_400).await,
+        Some(RolledAccount {
+            account_id: ACCOUNT,
+            deposited: CostUnits(500),
+            expired: CostUnits(500),
+        })
+    );
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(500));
+    assert_conserved(&store).await;
+}
+
+#[tokio::test]
+async fn a_lease_from_the_closed_period_expires_its_unspent_allowance() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+        return;
+    };
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(200), TTL, t(FEB - 30))
+        .await
+        .unwrap();
+    roll(&store, FEB).await;
+
+    store
+        .ingest(&[usage(&lease, 1, 50, FEB + 5)], t(FEB + 5))
+        .await
+        .unwrap();
+    store
+        .release(
+            lease.lease_id,
+            lease.fencing_token,
+            CostUnits(150),
+            t(FEB + 10),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.balance(ACCOUNT).await.unwrap(),
+        CostUnits(500),
+        "the released units belonged to the closed period; only the new allowance remains"
+    );
+    let conservation = store.conservation(ACCOUNT).await.unwrap().unwrap();
+    assert_eq!(
+        conservation.expired,
+        CostUnits(450),
+        "300 unspent at the boundary plus the lease's 150"
+    );
+    assert_eq!(
+        conservation.settled_usage,
+        CostUnits(50),
+        "the straggler bills against the period the lease was granted in"
+    );
+    assert!(conservation.holds(), "{conservation:?}");
+}
+
+#[tokio::test]
+async fn a_lease_funded_by_a_top_up_is_unaffected_by_a_boundary() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 300).await else {
+        return;
+    };
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(200), TTL, t(FEB - 30))
+        .await
+        .unwrap();
+    roll(&store, FEB).await;
+    store
+        .release(
+            lease.lease_id,
+            lease.fencing_token,
+            CostUnits(200),
+            t(FEB + 10),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.balance(ACCOUNT).await.unwrap(),
+        CostUnits(800),
+        "the 300 top-up is intact and the new allowance sits beside it"
+    );
+    assert_eq!(
+        store.conservation(ACCOUNT).await.unwrap().unwrap().expired,
+        CostUnits::ZERO
+    );
+    assert_conserved(&store).await;
+}
+
+#[tokio::test]
+async fn a_split_funded_lease_charges_the_allowance_half_first() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(60)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+
+    // 160 available: 60 allowance, 100 top-up. The grant takes all of it.
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(160), TTL, t(FEB - 30))
+        .await
+        .unwrap();
+    roll(&store, FEB).await;
+    store
+        .ingest(&[usage(&lease, 1, 10, FEB + 1)], t(FEB + 1))
+        .await
+        .unwrap();
+    store
+        .release(
+            lease.lease_id,
+            lease.fencing_token,
+            CostUnits(150),
+            t(FEB + 2),
+        )
+        .await
+        .unwrap();
+
+    let conservation = store.conservation(ACCOUNT).await.unwrap().unwrap();
+    assert_eq!(
+        conservation.expired,
+        CostUnits(50),
+        "the 10 units spent came out of the 60-unit allowance half, leaving 50 to expire"
+    );
+    assert_eq!(
+        store.balance(ACCOUNT).await.unwrap(),
+        CostUnits(160),
+        "the whole top-up survives, beside the new allowance"
+    );
+    assert!(conservation.holds(), "{conservation:?}");
+}
+
+#[tokio::test]
+async fn reclaim_expires_a_closed_period_lease_it_sweeps() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+        return;
+    };
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(200), TTL, t(FEB - 30))
+        .await
+        .unwrap();
+    roll(&store, FEB).await;
+
+    let batch = store
+        .reclaim_expired_batch(t(FEB + 3_600), NonZeroUsize::new(8).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch.reclaimed()[0].lease_id, lease.lease_id);
+    assert_eq!(
+        store.balance(ACCOUNT).await.unwrap(),
+        CostUnits(500),
+        "the swept units belonged to the closed period"
+    );
+    assert_eq!(
+        store.conservation(ACCOUNT).await.unwrap().unwrap().expired,
+        CostUnits(500)
+    );
+    assert_conserved(&store).await;
+}
+
+#[tokio::test]
+async fn clearing_a_schedule_leaves_the_balance_alone() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+        return;
+    };
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, None)
+        .await
+        .unwrap();
+
+    assert_eq!(roll(&store, FEB).await, None);
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(500));
+    assert_conserved(&store).await;
+}
+
+#[tokio::test]
+async fn the_rollover_pass_is_bounded_and_saturation_says_there_is_more() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+        return;
+    };
+    for id in 2..=5u128 {
+        AdminStore::create_account(
+            &*store,
+            AccountConfig {
+                account_id: AccountId(id),
+                initial_balance: CostUnits::ZERO,
+                status: AccountStatus::Active,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    for id in 1..=5u128 {
+        AdminStore::set_budget_schedule(&*store, AccountId(id), Some(monthly(100)))
+            .await
+            .unwrap();
+    }
+    let limit = NonZeroUsize::new(2).unwrap();
+
+    let mut seen = Vec::new();
+    let mut batches = 0;
+    loop {
+        let batch = AdminStore::roll_due_periods(&*store, t(FEB), limit)
+            .await
+            .unwrap();
+        batches += 1;
+        assert!(batch.len() <= limit.get(), "the backend honoured the limit");
+        seen.extend(batch.rolled().iter().map(|rolled| rolled.account_id));
+        if !batch.is_saturated() {
+            break;
+        }
+        assert!(batches < 10, "the drain must terminate");
+    }
+
+    assert_eq!(seen.len(), 5, "every due account is rolled exactly once");
+    seen.sort_unstable_by_key(|account| account.0);
+    seen.dedup();
+    assert_eq!(seen.len(), 5, "no account is rolled twice across batches");
+    assert_eq!(
+        batches, 3,
+        "two saturated batches of two, then the partial one that ends the drain"
+    );
+}
+
+#[tokio::test]
+async fn an_unscheduled_account_is_never_selected() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 10).await else {
+        return;
+    };
+    for id in 2..=3u128 {
+        AdminStore::create_account(
+            &*store,
+            AccountConfig {
+                account_id: AccountId(id),
+                initial_balance: CostUnits(10),
+                status: AccountStatus::Active,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    AdminStore::set_budget_schedule(&*store, AccountId(2), Some(monthly(100)))
+        .await
+        .unwrap();
+
+    let batch = AdminStore::roll_due_periods(&*store, t(FEB), NonZeroUsize::new(64).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch.rolled()[0].account_id, AccountId(2));
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(10));
+    assert_eq!(store.balance(AccountId(3)).await.unwrap(), CostUnits(10));
+}
+
+#[tokio::test]
+async fn a_grant_spends_the_expiring_allowance_before_a_top_up() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(60)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+
+    // 160 available: 60 allowance, 100 top-up. This takes less than either.
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(40), TTL, t(JAN + 2))
+        .await
+        .unwrap();
+    store
+        .ingest(&[usage(&lease, 1, 40, JAN + 3)], t(JAN + 3))
+        .await
+        .unwrap();
+    store
+        .release(
+            lease.lease_id,
+            lease.fencing_token,
+            CostUnits::ZERO,
+            t(JAN + 4),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.balance(ACCOUNT).await.unwrap(),
+        CostUnits(120),
+        "60 - 40 allowance, plus the untouched top-up"
+    );
+
+    assert_eq!(
+        roll(&store, FEB).await.map(|rolled| rolled.expired),
+        Some(CostUnits(20)),
+        "the 40 spent came out of the allowance, so only 20 of it was left to expire"
+    );
+    assert_eq!(
+        store.balance(ACCOUNT).await.unwrap(),
+        CostUnits(160),
+        "the whole 100 top-up survives beside the new allowance"
+    );
+    assert_conserved(&store).await;
+}
+
+#[tokio::test]
+async fn a_lease_released_inside_its_own_period_expires_nothing() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+        return;
+    };
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(200), TTL, t(JAN + 2))
+        .await
+        .unwrap();
+    store
+        .release(
+            lease.lease_id,
+            lease.fencing_token,
+            CostUnits(200),
+            t(JAN + 3),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.conservation(ACCOUNT).await.unwrap().unwrap().expired,
+        CostUnits::ZERO
+    );
+    assert_eq!(
+        store.balance(ACCOUNT).await.unwrap(),
+        CostUnits(500),
+        "the allowance is whole again"
+    );
+    assert_conserved(&store).await;
+}
+
+#[tokio::test]
+async fn a_lease_reclaimed_inside_its_own_period_expires_nothing() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+        return;
+    };
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+    store
+        .acquire(ACCOUNT, CostUnits(200), TTL, t(JAN + 2))
+        .await
+        .unwrap();
+
+    let batch = store
+        .reclaim_expired_batch(t(JAN + 3_600), NonZeroUsize::new(8).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        store.conservation(ACCOUNT).await.unwrap().unwrap().expired,
+        CostUnits::ZERO
+    );
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(500));
+    assert_conserved(&store).await;
 }

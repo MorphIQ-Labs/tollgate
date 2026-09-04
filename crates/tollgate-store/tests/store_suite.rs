@@ -9,15 +9,15 @@ use std::sync::Arc;
 use jiff::{SignedDuration, Timestamp};
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
-    KeyId, LeaseId, PermissionBits, Principal, PublishableSnapshot, RequestId, ResolvedLimits,
-    UsageEvent, UsageSource,
+    AccountId, AccountSnapshot, AccountStatus, BudgetSchedule, CostTable, CostUnits, FencingToken,
+    Generation, KeyId, LeaseId, PermissionBits, Principal, PublishableSnapshot, RequestId,
+    ResolvedLimits, UsageEvent, UsageSource,
 };
 use tollgate_store::{
-    AccountConfig, AdminStore, AllocateError, Conservation, CreateAccountError, GrantPolicy,
-    KeyDirectory, KeyError, KeyRecord, LeaseAllocator, MemoryStore, PublishSnapshotError,
-    ReclaimBatch, ReclaimedLease, Revocation, SetStatusError, SnapshotResolution, SnapshotSource,
-    UsageSink,
+    AccountConfig, AdminStore, AllocateError, BudgetError, Conservation, CreateAccountError,
+    GrantPolicy, KeyDirectory, KeyError, KeyRecord, LeaseAllocator, MemoryStore,
+    PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation, RolledAccount, SetStatusError,
+    SnapshotResolution, SnapshotSource, UsageSink,
 };
 
 fn t(secs: i64) -> Timestamp {
@@ -1993,4 +1993,570 @@ async fn a_publish_racing_a_suspension_never_leaves_the_records_disagreeing() {
             );
         }
     }
+}
+
+// --- Periodic budgets (#97) -------------------------------------------------
+//
+// Boundaries are named for the months they start, because that is what the
+// scenarios are about. Real dates rather than epoch arithmetic: a fresh
+// account's `period_start` is the epoch, so the first pass after a schedule is
+// set has a boundary to cross — which is exactly the state a real account is
+// in, and would be silently skipped by a suite that rolled between epoch
+// months.
+
+/// 2026-01-01T00:00:00Z.
+const JAN: i64 = 1_767_225_600;
+/// 2026-02-01T00:00:00Z.
+const FEB: i64 = 1_769_904_000;
+/// 2026-03-01T00:00:00Z.
+const MAR: i64 = 1_772_323_200;
+
+fn monthly(allowance: u64) -> BudgetSchedule {
+    BudgetSchedule::monthly(CostUnits(allowance))
+}
+
+/// Roll every due account, and report what the pass did to `ACCOUNT` — `None`
+/// when it was not due, which is what a pass before a boundary, an account
+/// with no schedule, and a boundary someone else already crossed all look
+/// like from the outside.
+async fn roll(store: &MemoryStore, now: i64) -> Option<RolledAccount> {
+    let batch = store
+        .roll_due_periods(t(now), NonZeroUsize::new(64).unwrap())
+        .await
+        .expect("the rollover pass succeeds");
+    batch
+        .rolled()
+        .iter()
+        .find(|rolled| rolled.account_id == ACCOUNT)
+        .copied()
+}
+
+/// Setting a schedule must not fund the account. Were it a deposit, an
+/// operator correcting a mistyped allowance would fund the account twice, and
+/// there would be no way to describe next month's budget without paying it
+/// today.
+#[tokio::test]
+async fn setting_a_schedule_deposits_nothing() {
+    let store = store_with_balance(full_grant_policy(), 100);
+    store
+        .set_budget_schedule(ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+
+    assert_eq!(store.balance(ACCOUNT), CostUnits(100));
+    assert_conserved(&store);
+}
+
+/// A mistyped account id must not be a silent no-op: the operator has to learn
+/// it now rather than at a boundary that never funds anything.
+#[tokio::test]
+async fn setting_a_schedule_on_an_unknown_account_is_refused() {
+    let store = store_with_balance(full_grant_policy(), 100);
+    assert_eq!(
+        store
+            .set_budget_schedule(AccountId(999), Some(monthly(500)))
+            .await,
+        Err(BudgetError::UnknownAccount)
+    );
+}
+
+/// The rollover pass runs on every control-plane replica, so two of them will
+/// race a boundary. Exactly one deposit and one expiry may result, and the
+/// loser must be able to tell that it lost from what it is returned.
+#[tokio::test]
+async fn racing_passes_cross_a_boundary_exactly_once() {
+    let store = store_with_balance(full_grant_policy(), 0);
+    store
+        .set_budget_schedule(ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+
+    let first = roll(&store, FEB).await;
+    let second = roll(&store, FEB).await;
+
+    assert_eq!(
+        first,
+        Some(RolledAccount {
+            account_id: ACCOUNT,
+            deposited: CostUnits(500),
+            expired: CostUnits::ZERO,
+        })
+    );
+    assert_eq!(
+        second, None,
+        "the second pass finds the account already in the current period"
+    );
+    assert_eq!(
+        store.balance(ACCOUNT),
+        CostUnits(500),
+        "the second pass must not deposit a second allowance"
+    );
+    assert_conserved(&store);
+}
+
+/// A pass before the boundary is a no-op, so the caller is free to run it at
+/// any cadence without checking the calendar itself.
+#[tokio::test]
+async fn a_pass_inside_the_current_period_changes_nothing() {
+    let store = store_with_balance(full_grant_policy(), 0);
+    store
+        .set_budget_schedule(ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, FEB).await;
+
+    assert_eq!(roll(&store, FEB + 10 * 86_400).await, None);
+    assert_eq!(store.balance(ACCOUNT), CostUnits(500));
+}
+
+/// An unscheduled account is reported as such rather than counted among the
+/// no-ops: a pass that finds *every* account unscheduled means schedules are
+/// not being set, and `AlreadyCurrent` could not say so.
+#[tokio::test]
+async fn an_account_without_a_schedule_is_untouched() {
+    let store = store_with_balance(full_grant_policy(), 100);
+    assert_eq!(roll(&store, FEB).await, None);
+    assert_eq!(store.balance(ACCOUNT), CostUnits(100));
+    assert_conserved(&store);
+}
+
+/// The product promise, and the reason the balance is split in two: the
+/// allowance resets, manual credits do not.
+#[tokio::test]
+async fn a_top_up_survives_rollover_but_the_allowance_does_not() {
+    let store = store_with_balance(full_grant_policy(), 0);
+    store
+        .set_budget_schedule(ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+    store.deposit(ACCOUNT, CostUnits(70)).unwrap();
+    assert_eq!(store.balance(ACCOUNT), CostUnits(570));
+
+    let rolled = roll(&store, FEB).await;
+
+    assert_eq!(
+        rolled,
+        Some(RolledAccount {
+            account_id: ACCOUNT,
+            deposited: CostUnits(500),
+            expired: CostUnits(500),
+        }),
+        "the whole unspent allowance expires; the top-up is not touched"
+    );
+    assert_eq!(
+        store.balance(ACCOUNT),
+        CostUnits(570),
+        "one fresh allowance plus the surviving top-up"
+    );
+    assert_conserved(&store);
+}
+
+/// An account nobody rolled for two months is entitled to what its schedule
+/// gives it now, not to a backlog. Paying one allowance per missed boundary
+/// would turn an operational outage into a billing event.
+#[tokio::test]
+async fn a_missed_period_does_not_accrue_a_backlog() {
+    let store = store_with_balance(full_grant_policy(), 0);
+    store
+        .set_budget_schedule(ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+
+    // Two boundaries have passed (February and March).
+    let rolled = roll(&store, MAR + 86_400).await;
+
+    assert_eq!(
+        rolled,
+        Some(RolledAccount {
+            account_id: ACCOUNT,
+            deposited: CostUnits(500),
+            expired: CostUnits(500),
+        })
+    );
+    assert_eq!(store.balance(ACCOUNT), CostUnits(500));
+    assert_conserved(&store);
+}
+
+/// Drain then expire: a lease granted before the boundary keeps serving to its
+/// own TTL, and its unspent allowance is expired when it finally settles
+/// rather than returned to a balance the schedule says should be fresh.
+#[tokio::test]
+async fn a_lease_from_the_closed_period_expires_its_unspent_allowance() {
+    let store = store_with_balance(full_grant_policy(), 0);
+    store
+        .set_budget_schedule(ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(200), TTL, t(FEB - 30))
+        .await
+        .unwrap();
+    roll(&store, FEB).await;
+
+    // Still serving: the lease outlives its period by its own TTL, which is
+    // what removes the admission gap a boundary would otherwise open.
+    store
+        .ingest(&[usage(&lease, 1, 50, FEB + 5)], t(FEB + 5))
+        .await
+        .unwrap();
+    store
+        .release(
+            lease.lease_id,
+            lease.fencing_token,
+            CostUnits(150),
+            t(FEB + 10),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.balance(ACCOUNT),
+        CostUnits(500),
+        "the released units belonged to the closed period; only the new allowance remains"
+    );
+    let conservation = store.conservation(ACCOUNT).unwrap();
+    assert_eq!(
+        conservation.expired,
+        CostUnits(450),
+        "300 unspent at the boundary plus the lease's 150"
+    );
+    assert_eq!(
+        conservation.settled_usage,
+        CostUnits(50),
+        "the straggler bills against the period the lease was granted in"
+    );
+    assert!(conservation.holds(), "{conservation:?}");
+}
+
+/// The same lease, funded by a top-up instead. Nothing about the boundary may
+/// touch it: an unrolled account's leases predate every period, so expiring on
+/// the timestamp alone would consume credits that never had an expiry date.
+#[tokio::test]
+async fn a_lease_funded_by_a_top_up_is_unaffected_by_a_boundary() {
+    let store = store_with_balance(full_grant_policy(), 300);
+    store
+        .set_budget_schedule(ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(200), TTL, t(FEB - 30))
+        .await
+        .unwrap();
+    roll(&store, FEB).await;
+    store
+        .release(
+            lease.lease_id,
+            lease.fencing_token,
+            CostUnits(200),
+            t(FEB + 10),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.balance(ACCOUNT),
+        CostUnits(800),
+        "the 300 top-up is intact and the new allowance sits beside it"
+    );
+    assert_eq!(
+        store.conservation(ACCOUNT).unwrap().expired,
+        CostUnits::ZERO
+    );
+    assert_conserved(&store);
+}
+
+/// A lease straddling the boundary that drew from both buckets. The allowance
+/// half is charged first, so the top-up half is what survives — crediting the
+/// allowance half back instead would close the equation just as well while
+/// moving durable credits into the bucket that expires next month.
+#[tokio::test]
+async fn a_split_funded_lease_charges_the_allowance_half_first() {
+    let store = store_with_balance(full_grant_policy(), 100);
+    store
+        .set_budget_schedule(ACCOUNT, Some(monthly(60)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+
+    // 160 available: 60 allowance, 100 top-up. The grant takes all of it.
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(160), TTL, t(FEB - 30))
+        .await
+        .unwrap();
+    roll(&store, FEB).await;
+    store
+        .ingest(&[usage(&lease, 1, 10, FEB + 1)], t(FEB + 1))
+        .await
+        .unwrap();
+    store
+        .release(
+            lease.lease_id,
+            lease.fencing_token,
+            CostUnits(150),
+            t(FEB + 2),
+        )
+        .await
+        .unwrap();
+
+    let conservation = store.conservation(ACCOUNT).unwrap();
+    assert_eq!(
+        conservation.expired,
+        CostUnits(50),
+        "the 10 units spent came out of the 60-unit allowance half, leaving 50 to expire"
+    );
+    assert_eq!(
+        store.balance(ACCOUNT),
+        CostUnits(160),
+        "the whole top-up survives, beside the new allowance"
+    );
+    assert!(conservation.holds(), "{conservation:?}");
+}
+
+/// Reclaim is the other settlement path, and the boundary rule has to live in
+/// both: a lease nobody released must not resurrect its period's allowance
+/// through the sweep.
+#[tokio::test]
+async fn reclaim_expires_a_closed_period_lease_it_sweeps() {
+    let store = store_with_balance(full_grant_policy(), 0);
+    store
+        .set_budget_schedule(ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(200), TTL, t(FEB - 30))
+        .await
+        .unwrap();
+    roll(&store, FEB).await;
+
+    let batch = store
+        .reclaim_expired_batch(t(FEB + 3_600), NonZeroUsize::new(8).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch.reclaimed()[0].lease_id, lease.lease_id);
+    assert_eq!(
+        store.balance(ACCOUNT),
+        CostUnits(500),
+        "the swept units belonged to the closed period"
+    );
+    assert_eq!(store.conservation(ACCOUNT).unwrap().expired, CostUnits(500));
+    assert_conserved(&store);
+}
+
+/// Removing a schedule is not a way to claw units back, and it must stop the
+/// expiry it started: the allowance simply becomes an ordinary balance.
+#[tokio::test]
+async fn clearing_a_schedule_leaves_the_balance_alone() {
+    let store = store_with_balance(full_grant_policy(), 0);
+    store
+        .set_budget_schedule(ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+    store.set_budget_schedule(ACCOUNT, None).await.unwrap();
+
+    assert_eq!(roll(&store, FEB).await, None);
+    assert_eq!(store.balance(ACCOUNT), CostUnits(500));
+    assert_conserved(&store);
+}
+
+/// Every scheduled account comes due at the same instant — that is what a
+/// calendar boundary is — so the pass is bounded and its caller drains it.
+/// A batch that quietly rolled everything would make the first pass after
+/// midnight on the 1st as large as the account table.
+#[tokio::test]
+async fn the_rollover_pass_is_bounded_and_saturation_says_there_is_more() {
+    let store = MemoryStore::new(full_grant_policy()).unwrap();
+    for id in 1..=5u128 {
+        store.create_account(AccountConfig {
+            account_id: AccountId(id),
+            initial_balance: CostUnits::ZERO,
+            status: AccountStatus::Active,
+        });
+        store
+            .set_budget_schedule(AccountId(id), Some(monthly(100)))
+            .await
+            .unwrap();
+    }
+    let limit = NonZeroUsize::new(2).unwrap();
+
+    let mut seen = Vec::new();
+    let mut batches = 0;
+    loop {
+        let batch = store.roll_due_periods(t(FEB), limit).await.unwrap();
+        batches += 1;
+        assert!(batch.len() <= limit.get(), "the backend honoured the limit");
+        seen.extend(batch.rolled().iter().map(|rolled| rolled.account_id));
+        if !batch.is_saturated() {
+            break;
+        }
+        assert!(batches < 10, "the drain must terminate");
+    }
+
+    assert_eq!(seen.len(), 5, "every due account is rolled exactly once");
+    seen.sort_unstable_by_key(|account| account.0);
+    seen.dedup();
+    assert_eq!(seen.len(), 5, "no account is rolled twice across batches");
+    assert_eq!(
+        batches, 3,
+        "two saturated batches of two, then the partial one that ends the drain"
+    );
+}
+
+/// An unscheduled account is never selected, however many scheduled ones sit
+/// around it — the pass must not spend its bounded batch on rows it cannot
+/// roll, or a large unscheduled population would starve the ones that are due.
+#[tokio::test]
+async fn an_unscheduled_account_is_never_selected() {
+    let store = MemoryStore::new(full_grant_policy()).unwrap();
+    for id in 1..=3u128 {
+        store.create_account(AccountConfig {
+            account_id: AccountId(id),
+            initial_balance: CostUnits(10),
+            status: AccountStatus::Active,
+        });
+    }
+    store
+        .set_budget_schedule(AccountId(2), Some(monthly(100)))
+        .await
+        .unwrap();
+
+    let batch = store
+        .roll_due_periods(t(FEB), NonZeroUsize::new(64).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch.rolled()[0].account_id, AccountId(2));
+    assert_eq!(store.balance(AccountId(1)), CostUnits(10));
+    assert_eq!(store.balance(AccountId(3)), CostUnits(10));
+}
+
+/// Spend order, which only a *partial* grant can witness: a lease that takes
+/// the whole balance draws the same split either way. The expiring units are
+/// spent first, so what an account holds after a boundary is the credits it
+/// bought — reversing the order would silently expire those and keep the
+/// allowance that was about to reset.
+#[tokio::test]
+async fn a_grant_spends_the_expiring_allowance_before_a_top_up() {
+    let store = store_with_balance(full_grant_policy(), 100);
+    store
+        .set_budget_schedule(ACCOUNT, Some(monthly(60)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+
+    // 160 available: 60 allowance, 100 top-up. This takes less than either.
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(40), TTL, t(JAN + 2))
+        .await
+        .unwrap();
+    store
+        .ingest(&[usage(&lease, 1, 40, JAN + 3)], t(JAN + 3))
+        .await
+        .unwrap();
+    store
+        .release(
+            lease.lease_id,
+            lease.fencing_token,
+            CostUnits::ZERO,
+            t(JAN + 4),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.balance(ACCOUNT),
+        CostUnits(120),
+        "60 - 40 allowance, plus the untouched top-up"
+    );
+
+    let rolled = roll(&store, FEB).await;
+
+    assert_eq!(
+        rolled.map(|rolled| rolled.expired),
+        Some(CostUnits(20)),
+        "the 40 spent came out of the allowance, so only 20 of it was left to expire"
+    );
+    assert_eq!(
+        store.balance(ACCOUNT),
+        CostUnits(160),
+        "the whole 100 top-up survives beside the new allowance"
+    );
+    assert_conserved(&store);
+}
+
+/// The boundary comparison is strict, and this is the case that says so: a
+/// lease granted *inside* the account's current period returns its units to
+/// the balance. A rule that expired same-period leases would consume an
+/// account's fresh allowance every time a request cancelled.
+#[tokio::test]
+async fn a_lease_released_inside_its_own_period_expires_nothing() {
+    let store = store_with_balance(full_grant_policy(), 0);
+    store
+        .set_budget_schedule(ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(200), TTL, t(JAN + 2))
+        .await
+        .unwrap();
+    store
+        .release(
+            lease.lease_id,
+            lease.fencing_token,
+            CostUnits(200),
+            t(JAN + 3),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.conservation(ACCOUNT).unwrap().expired,
+        CostUnits::ZERO
+    );
+    assert_eq!(
+        store.balance(ACCOUNT),
+        CostUnits(500),
+        "the allowance is whole again"
+    );
+    assert_conserved(&store);
+}
+
+/// The same strictness on the sweep's side of the settlement path: a lease
+/// that expired by its own TTL, inside the account's current period, is
+/// reclaimed to the balance rather than written off.
+#[tokio::test]
+async fn a_lease_reclaimed_inside_its_own_period_expires_nothing() {
+    let store = store_with_balance(full_grant_policy(), 0);
+    store
+        .set_budget_schedule(ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+    store
+        .acquire(ACCOUNT, CostUnits(200), TTL, t(JAN + 2))
+        .await
+        .unwrap();
+
+    let batch = store
+        .reclaim_expired_batch(t(JAN + 3_600), NonZeroUsize::new(8).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        store.conservation(ACCOUNT).unwrap().expired,
+        CostUnits::ZERO
+    );
+    assert_eq!(store.balance(ACCOUNT), CostUnits(500));
+    assert_conserved(&store);
 }

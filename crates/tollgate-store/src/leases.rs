@@ -51,6 +51,14 @@ pub(crate) struct LeaseRecord {
     /// only through [`Leases::settle`], so it cannot drift from the state it
     /// describes.
     credited: CostUnits,
+    /// Which balance buckets this grant drew from, so settlement returns each
+    /// half where it came from rather than guessing (#97).
+    pub(crate) funding: crate::memory::Drawn,
+    /// The account's period at the moment of the grant. A lease whose period
+    /// has since closed credits its unspent units to `expired` rather than to
+    /// a balance: those units were funded by an allowance that no longer
+    /// exists, and returning them would resurrect it.
+    pub(crate) period_start: Timestamp,
     state: LeaseState,
 }
 
@@ -70,8 +78,23 @@ impl LeaseRecord {
             used: CostUnits::ZERO,
             expires_at,
             credited: CostUnits::ZERO,
+            funding: crate::memory::Drawn::default(),
+            period_start: Timestamp::UNIX_EPOCH,
             state: LeaseState::Active,
         }
+    }
+
+    /// Record which buckets funded this grant, and the period it was granted
+    /// in. Separate from `opened` so the constructor keeps one job and the
+    /// funding detail stays beside the settlement rule that reads it.
+    pub(crate) fn funded_by(
+        mut self,
+        funding: crate::memory::Drawn,
+        period_start: Timestamp,
+    ) -> Self {
+        self.funding = funding;
+        self.period_start = period_start;
+        self
     }
 
     pub(crate) fn is_active(&self) -> bool {

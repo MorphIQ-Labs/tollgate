@@ -107,6 +107,22 @@ impl AdminStore for PingOnlyStore {
         unreachable!("readiness never administers")
     }
 
+    async fn set_budget_schedule(
+        &self,
+        _account: AccountId,
+        _schedule: Option<tollgate_core::BudgetSchedule>,
+    ) -> Result<(), tollgate_store::BudgetError> {
+        unreachable!("readiness never administers")
+    }
+
+    async fn roll_due_periods(
+        &self,
+        _now: Timestamp,
+        _limit: std::num::NonZeroUsize,
+    ) -> Result<tollgate_store::RolloverBatch, StoreError> {
+        unreachable!("readiness never administers")
+    }
+
     async fn publish_snapshot(
         &self,
         _principal: Principal,

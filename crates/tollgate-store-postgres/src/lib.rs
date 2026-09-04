@@ -36,16 +36,16 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, FencingToken,
-    Generation, KeyId, LeaseGrant, LeaseId, PermissionBits, Principal, PublishableSnapshot,
-    ResolvedLimits, UsageEvent,
+    AccountId, AccountSnapshot, AccountStatus, BudgetSchedule, CostTable, CostUnits,
+    EnforcementMode, FencingToken, Generation, KeyId, LeaseGrant, LeaseId, Period, PermissionBits,
+    Principal, PublishableSnapshot, ResolvedLimits, UsageEvent,
 };
 use tollgate_store::{
-    AccountConfig, AdminStore, AllocateError, Conservation, CreateAccountError, GrantPolicy,
-    IngestError, IngestReport, KeyDirectory, KeyError, KeyRecord, LeaseAllocator,
+    AccountConfig, AdminStore, AllocateError, BudgetError, Conservation, CreateAccountError,
+    GrantPolicy, IngestError, IngestReport, KeyDirectory, KeyError, KeyRecord, LeaseAllocator,
     PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation,
-    SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource, StatusChange, StoreError,
-    StoreHealth, UsageSink, pushes_exceed_capacity,
+    RolledAccount, RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource,
+    StatusChange, StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
 };
 
 const STATE_ACTIVE: i16 = 0;
@@ -614,7 +614,8 @@ impl PostgresStore {
                 .await
                 .map_err(storage)?;
             let account_row = sqlx::query(
-                "SELECT deposited, balance, usage_recorded, settlement_loss, overage_recorded
+                "SELECT deposited, balance, usage_recorded, settlement_loss, overage_recorded,
+                        expired
                  FROM tollgate_accounts WHERE account_id = $1",
             )
             .bind(id_bytes(account.0))
@@ -657,6 +658,7 @@ impl PostgresStore {
                 ))
             })?,
             settlement_loss: to_units(row.get::<i64, _>(3), "settlement_loss")?,
+            expired: to_units(row.get::<i64, _>(5), "expired")?,
         }))
     }
 }
@@ -672,6 +674,82 @@ struct LockedLeaseRow {
     credited: i64,
     expires_at_us: i64,
     state: i16,
+    /// The half of `granted` drawn from the account's periodic allowance, and
+    /// the period that funded it. Settlement needs both: the split says which
+    /// bucket each unspent unit belongs to, the period says whether the
+    /// allowance half still exists (#97).
+    from_allowance: i64,
+    period_start_us: i64,
+}
+
+/// One expired lease's settlement, before the account's current period is
+/// known.
+///
+/// Named rather than a tuple for the reason [`LockedLeaseRow`] is: the sweep
+/// carries four same-typed numbers per lease, and a positional tuple would let
+/// any two of them swap without a compiler error.
+struct LeaseSettlement {
+    account: Vec<u8>,
+    /// Unspent units returning to the top-up bucket, which no boundary
+    /// touches.
+    to_topup: i64,
+    /// The whole unspent credit. What is not `to_topup` is the allowance half,
+    /// and the account's period decides where that lands.
+    credit: i64,
+    period_start_us: i64,
+}
+
+/// One account's share of a sweep, split the way the ledger columns are.
+#[derive(Default)]
+struct AccountCredit {
+    /// Added to `balance`: the top-up half always, plus the allowance half of
+    /// any lease still inside the account's current period.
+    spendable: i64,
+    /// The part of `spendable` that is allowance, so `allowance_balance`
+    /// tracks the same units `balance` just gained.
+    to_allowance: i64,
+    /// The allowance half of leases funded by a period that has since closed.
+    expiring: i64,
+}
+
+impl AccountCredit {
+    /// Fold one lease's settlement in, deciding the allowance half against the
+    /// account's current period.
+    ///
+    /// Checked, and refused rather than wrapped: these sums are paid into a
+    /// ledger, so an overflow is corruption to report, not a number to
+    /// truncate (INVARIANTS.md #11).
+    fn add(
+        &mut self,
+        settlement: &LeaseSettlement,
+        account_period_us: i64,
+    ) -> Result<(), StoreError> {
+        let overflow = || StoreError("reclaim credit sum overflow".into());
+        let to_allowance = settlement
+            .credit
+            .checked_sub(settlement.to_topup)
+            .ok_or_else(overflow)?;
+        self.spendable = self
+            .spendable
+            .checked_add(settlement.to_topup)
+            .ok_or_else(overflow)?;
+        if settlement.period_start_us < account_period_us {
+            self.expiring = self
+                .expiring
+                .checked_add(to_allowance)
+                .ok_or_else(overflow)?;
+        } else {
+            self.spendable = self
+                .spendable
+                .checked_add(to_allowance)
+                .ok_or_else(overflow)?;
+            self.to_allowance = self
+                .to_allowance
+                .checked_add(to_allowance)
+                .ok_or_else(overflow)?;
+        }
+        Ok(())
+    }
 }
 
 /// Lock one lease row for a settlement transition.
@@ -680,7 +758,8 @@ async fn lock_lease(
     lease_id: LeaseId,
 ) -> Result<Option<LockedLeaseRow>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT account_id, fencing_token, granted, used, credited, expires_at_us, state
+        "SELECT account_id, fencing_token, granted, used, credited, expires_at_us, state,
+                from_allowance, period_start_us
          FROM tollgate_leases WHERE lease_id = $1 FOR UPDATE",
     )
     .bind(id_bytes(lease_id.0))
@@ -694,6 +773,8 @@ async fn lock_lease(
         credited: row.get(4),
         expires_at_us: row.get(5),
         state: row.get(6),
+        from_allowance: row.get(7),
+        period_start_us: row.get(8),
     }))
 }
 
@@ -712,8 +793,8 @@ impl LeaseAllocator for PostgresStore {
         let mut tx = self.pool.begin().await.map_err(alloc_storage)?;
         let result = async {
             let row = sqlx::query(
-                "SELECT balance, status, next_fence FROM tollgate_accounts
-                 WHERE account_id = $1 FOR UPDATE",
+                "SELECT balance, status, next_fence, allowance_balance, period_start_us
+                 FROM tollgate_accounts WHERE account_id = $1 FOR UPDATE",
             )
             .bind(id_bytes(account.0))
             .fetch_optional(&mut *tx)
@@ -735,6 +816,14 @@ impl LeaseAllocator for PostgresStore {
                 .policy
                 .grant(requested, balance)
                 .ok_or(AllocateError::InsufficientBalance)?;
+            // Allowance first: the units with an expiry date are spent
+            // before the manual credits sitting beside them, and the lease
+            // remembers the split so settlement can return each half to where
+            // it came from (#97).
+            let granted_i = to_i64(granted, "grant").map_err(AllocateError::Storage)?;
+            let allowance_balance = row.get::<i64, _>(3);
+            let from_allowance = granted_i.min(allowance_balance);
+            let period_start_us = row.get::<i64, _>(4);
             let fence = row.get::<i64, _>(2);
             // Fence counters are seeded at 1 and only incremented; a negative
             // stored value is corruption, never a token to alias to 0.
@@ -749,30 +838,37 @@ impl LeaseAllocator for PostgresStore {
             } else {
                 ttl
             };
-            let expires_at = now.checked_add(ttl).map_err(|e| {
-                AllocateError::Storage(StoreError(format!("ttl overflow: {e}")))
-            })?;
+            let expires_at = now
+                .checked_add(ttl)
+                .map_err(|e| AllocateError::Storage(StoreError(format!("ttl overflow: {e}"))))?;
             let lease_id = LeaseId(uuid::Uuid::new_v4().as_u128());
 
             sqlx::query(
-                "UPDATE tollgate_accounts SET balance = balance - $2, next_fence = next_fence + 1
+                "UPDATE tollgate_accounts
+                 SET balance = balance - $2,
+                     allowance_balance = allowance_balance - $3,
+                     next_fence = next_fence + 1
                  WHERE account_id = $1",
             )
             .bind(id_bytes(account.0))
-            .bind(to_i64(granted, "grant").map_err(AllocateError::Storage)?)
+            .bind(granted_i)
+            .bind(from_allowance)
             .execute(&mut *tx)
             .await
             .map_err(alloc_storage)?;
             sqlx::query(
                 "INSERT INTO tollgate_leases
-                 (lease_id, account_id, fencing_token, granted, used, credited, expires_at_us, state)
-                 VALUES ($1, $2, $3, $4, 0, 0, $5, 0)",
+                 (lease_id, account_id, fencing_token, granted, used, credited, expires_at_us,
+                  state, from_allowance, period_start_us)
+                 VALUES ($1, $2, $3, $4, 0, 0, $5, 0, $6, $7)",
             )
             .bind(id_bytes(lease_id.0))
             .bind(id_bytes(account.0))
             .bind(fence)
-            .bind(to_i64(granted, "grant").map_err(AllocateError::Storage)?)
+            .bind(granted_i)
             .bind(ts_micros(expires_at))
+            .bind(from_allowance)
+            .bind(period_start_us)
             .execute(&mut *tx)
             .await
             .map_err(alloc_storage)?;
@@ -806,6 +902,8 @@ impl LeaseAllocator for PostgresStore {
                 credited: _credited,
                 expires_at_us,
                 state,
+                from_allowance,
+                period_start_us,
             } = lock_lease(&mut tx, lease_id)
                 .await
                 .map_err(alloc_storage)?
@@ -841,14 +939,43 @@ impl LeaseAllocator for PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(alloc_storage)?;
+            // The lease's usage is charged in the order the account spends,
+            // allowance first, so the top-up half is what survives a partly
+            // spent lease. Crediting the allowance half back first would close
+            // the equation just as well while moving durable credits into the
+            // bucket that expires at the next boundary (#97).
+            let from_topup = granted
+                .checked_sub(from_allowance)
+                .filter(|t| *t >= 0)
+                .ok_or_else(|| {
+                    AllocateError::Storage(StoreError(format!(
+                        "lease allowance funding {from_allowance} exceeds its grant {granted}"
+                    )))
+                })?;
+            let to_topup = from_topup.min(unspent_i);
+            let to_allowance = unspent_i - to_topup;
+
+            // One statement, and the `CASE` is the whole boundary rule: if the
+            // account has moved on to a later period, the allowance half is
+            // expired instead of returned. Deciding it in SQL against the
+            // row's own `period_start_us` keeps the read and the write in one
+            // atomic step, so a rollover committing between them cannot make
+            // this credit an allowance the account no longer has.
             sqlx::query(
-                "UPDATE tollgate_accounts
-                 SET balance = balance + $2, settlement_loss = settlement_loss + $3
+                "UPDATE tollgate_accounts SET
+                     balance = balance + $2
+                         + CASE WHEN period_start_us > $5 THEN 0 ELSE $3 END,
+                     allowance_balance = allowance_balance
+                         + CASE WHEN period_start_us > $5 THEN 0 ELSE $3 END,
+                     expired = expired + CASE WHEN period_start_us > $5 THEN $3 ELSE 0 END,
+                     settlement_loss = settlement_loss + $4
                  WHERE account_id = $1",
             )
             .bind(account_id)
-            .bind(unspent_i)
+            .bind(to_topup)
+            .bind(to_allowance)
             .bind(loss)
+            .bind(period_start_us)
             .execute(&mut *tx)
             .await
             .map_err(alloc_storage)?;
@@ -873,7 +1000,8 @@ impl LeaseAllocator for PostgresStore {
             // SKIP LOCKED lets concurrent sweepers cooperate; the limit keeps
             // both the lease locks and the transaction's row work bounded.
             let rows = sqlx::query(
-                "SELECT lease_id, account_id, granted, used FROM tollgate_leases
+                "SELECT lease_id, account_id, granted, used, from_allowance, period_start_us
+                 FROM tollgate_leases
                  WHERE state = 0 AND expires_at_us <= $1
                  ORDER BY account_id, lease_id LIMIT $2 FOR UPDATE SKIP LOCKED",
             )
@@ -886,13 +1014,13 @@ impl LeaseAllocator for PostgresStore {
             let mut reclaimed = Vec::with_capacity(rows.len());
             let mut lease_ids = Vec::with_capacity(rows.len());
             let mut lease_credits = Vec::with_capacity(rows.len());
-            let mut account_credits: std::collections::BTreeMap<Vec<u8>, i64> =
-                std::collections::BTreeMap::new();
+            let mut settlements = Vec::with_capacity(rows.len());
             for row in rows {
                 let lease_bytes: Vec<u8> = row.get(0);
                 let account_bytes: Vec<u8> = row.get(1);
                 let granted = row.get::<i64, _>(2);
                 let used = row.get::<i64, _>(3);
+                let from_allowance = row.get::<i64, _>(4);
                 let credit = granted.checked_sub(used).ok_or_else(|| {
                     StoreError(format!(
                         "reclaim credit overflow: granted {granted}, used {used}"
@@ -902,13 +1030,21 @@ impl LeaseAllocator for PostgresStore {
                 // negative credit is corruption, and paying it would debit the
                 // account rather than returning quota.
                 let credit_units = to_units(credit, "reclaim credit")?;
-                let account_credit = account_credits.entry(account_bytes.clone()).or_default();
-                *account_credit = account_credit.checked_add(credit).ok_or_else(|| {
-                    StoreError(format!(
-                        "reclaim credit sum overflow for account {:#034x}",
-                        id_from(&account_bytes)
-                    ))
-                })?;
+                let from_topup = granted
+                    .checked_sub(from_allowance)
+                    .filter(|t| *t >= 0)
+                    .ok_or_else(|| {
+                        StoreError(format!(
+                            "lease allowance funding {from_allowance} exceeds its grant {granted}"
+                        ))
+                    })?;
+                settlements.push(LeaseSettlement {
+                    account: account_bytes.clone(),
+                    // Allowance first, exactly as `release` charges it.
+                    to_topup: from_topup.min(credit),
+                    credit,
+                    period_start_us: row.get::<i64, _>(5),
+                });
                 lease_ids.push(lease_bytes.clone());
                 lease_credits.push(credit);
                 reclaimed.push(ReclaimedLease {
@@ -923,8 +1059,12 @@ impl LeaseAllocator for PostgresStore {
                 return Ok(batch);
             }
 
-            let (account_ids, account_credit_deltas): (Vec<_>, Vec<_>) =
-                account_credits.into_iter().unzip();
+            let mut account_ids: Vec<Vec<u8>> = settlements
+                .iter()
+                .map(|settlement| settlement.account.clone())
+                .collect();
+            account_ids.sort_unstable();
+            account_ids.dedup();
             let expected_lease_rows = u64::try_from(lease_ids.len())
                 .map_err(|_| StoreError("reclaim lease row count exceeds u64 range".into()))?;
             let expected_account_rows = u64::try_from(account_ids.len())
@@ -934,8 +1074,13 @@ impl LeaseAllocator for PostgresStore {
             // affected account explicitly in byte-sorted order first, matching
             // release and ingest's lease-then-account order and preventing
             // concurrent multi-account sweeps from forming a deadlock cycle.
+            //
+            // The lock is also what makes `period_start_us` safe to read here
+            // and aggregate against: a rollover cannot commit between this
+            // read and the credit below, so a lease is expired or returned
+            // against the period the account is actually in (#97).
             let locked_accounts = sqlx::query(
-                "SELECT account_id FROM tollgate_accounts
+                "SELECT account_id, period_start_us FROM tollgate_accounts
                  WHERE account_id = ANY($1) ORDER BY account_id FOR UPDATE",
             )
             .bind(&account_ids)
@@ -949,6 +1094,33 @@ impl LeaseAllocator for PostgresStore {
                     account_ids.len()
                 )));
             }
+            let periods: std::collections::BTreeMap<Vec<u8>, i64> = locked_accounts
+                .iter()
+                .map(|row| (row.get::<Vec<u8>, _>(0), row.get::<i64, _>(1)))
+                .collect();
+
+            let mut credits: std::collections::BTreeMap<Vec<u8>, AccountCredit> =
+                std::collections::BTreeMap::new();
+            for settlement in settlements {
+                let account_period = *periods.get(&settlement.account).ok_or_else(|| {
+                    StoreError(format!(
+                        "reclaim locked no account row for {:#034x}",
+                        id_from(&settlement.account)
+                    ))
+                })?;
+                let credit = credits.entry(settlement.account.clone()).or_default();
+                credit.add(&settlement, account_period)?;
+            }
+
+            let (account_ids, account_credits): (Vec<_>, Vec<_>) = credits.into_iter().unzip();
+            let (spendable, expiring): (Vec<_>, Vec<_>) = account_credits
+                .iter()
+                .map(|credit| (credit.spendable, credit.expiring))
+                .unzip();
+            let to_allowance: Vec<_> = account_credits
+                .iter()
+                .map(|credit| credit.to_allowance)
+                .collect();
 
             let updated_leases = sqlx::query(
                 "UPDATE tollgate_leases AS lease
@@ -973,12 +1145,17 @@ impl LeaseAllocator for PostgresStore {
 
             let updated_accounts = sqlx::query(
                 "UPDATE tollgate_accounts AS account
-                 SET balance = account.balance + delta.credit
-                 FROM UNNEST($1::bytea[], $2::bigint[]) AS delta(account_id, credit)
+                 SET balance = account.balance + delta.spendable,
+                     allowance_balance = account.allowance_balance + delta.to_allowance,
+                     expired = account.expired + delta.expiring
+                 FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[], $4::bigint[])
+                     AS delta(account_id, spendable, to_allowance, expiring)
                  WHERE account.account_id = delta.account_id",
             )
             .bind(&account_ids)
-            .bind(&account_credit_deltas)
+            .bind(&spendable)
+            .bind(&to_allowance)
+            .bind(&expiring)
             .execute(&mut *tx)
             .await
             .map_err(storage)?;
@@ -1662,6 +1839,109 @@ impl AdminStore for PostgresStore {
             return Err(AllocateError::UnknownAccount);
         }
         Ok(())
+    }
+
+    async fn set_budget_schedule(
+        &self,
+        account: AccountId,
+        schedule: Option<BudgetSchedule>,
+    ) -> Result<(), BudgetError> {
+        // No deposit here. Were setting a schedule also a funding operation,
+        // an operator correcting a mistyped allowance would fund the account
+        // twice, and there would be no way to describe next month's budget
+        // without paying it today. The first allowance arrives at the first
+        // `roll_period` after this lands.
+        //
+        // All three columns are written together, NULL together, which is what
+        // the row's all-or-nothing CHECK enforces: half a schedule satisfies
+        // neither branch of the rollover.
+        let allowance = schedule
+            .map(|s| to_i64(s.allowance, "budget allowance"))
+            .transpose()
+            .map_err(BudgetError::Storage)?;
+        let result = sqlx::query(
+            "UPDATE tollgate_accounts
+             SET budget_allowance = $2, budget_period = $3, budget_rollover = $4
+             WHERE account_id = $1",
+        )
+        .bind(id_bytes(account.0))
+        .bind(allowance)
+        .bind(schedule.map(|s| s.period.as_str()))
+        .bind(schedule.map(|s| s.rollover.as_str()))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| BudgetError::Storage(storage(e)))?;
+        if result.rows_affected() == 0 {
+            return Err(BudgetError::UnknownAccount);
+        }
+        Ok(())
+    }
+
+    async fn roll_due_periods(
+        &self,
+        now: Timestamp,
+        limit: NonZeroUsize,
+    ) -> Result<RolloverBatch, StoreError> {
+        let limit_i = i64::try_from(limit.get())
+            .map_err(|_| StoreError(format!("rollover batch limit exceeds i64 range: {limit}")))?;
+        let mut rolled = Vec::new();
+        // One statement per period kind, because the boundary is a property of
+        // the period: a weekly schedule and a monthly one are due at different
+        // instants, and a single comparison could only be right for one of
+        // them. The exhaustive match in `every_period_is_swept` is what makes
+        // a new variant a compile error here rather than a silently unswept
+        // schedule.
+        for period in Period::ALL {
+            let boundary_us = ts_micros(period.start_of(now));
+            let remaining = limit_i
+                - i64::try_from(rolled.len())
+                    .map_err(|_| StoreError("rollover batch row count exceeds i64 range".into()))?;
+            if remaining <= 0 {
+                break;
+            }
+            // One statement, so the selection and the crossing cannot be
+            // separated. `FOR UPDATE SKIP LOCKED` is what lets replicas
+            // cooperate: a concurrent pass skips the rows this one holds, and
+            // once this commits their `period_start_us < boundary` test is
+            // false — so a boundary is crossed exactly once however many
+            // passes race it.
+            //
+            // The prior `allowance_balance` is read in the CTE because the
+            // UPDATE cannot return it: PostgreSQL's RETURNING sees the new row
+            // only, and `expired` has to be reported as the delta it is.
+            let rows = sqlx::query(
+                "WITH due AS (
+                     SELECT account_id, allowance_balance AS prior, budget_allowance AS allowance
+                     FROM tollgate_accounts
+                     WHERE budget_period = $1 AND period_start_us < $2
+                     ORDER BY account_id LIMIT $3 FOR UPDATE SKIP LOCKED
+                 )
+                 UPDATE tollgate_accounts AS account SET
+                     deposited = account.deposited + due.allowance,
+                     expired = account.expired + due.prior,
+                     balance = account.balance - due.prior + due.allowance,
+                     allowance_balance = due.allowance,
+                     period_start_us = $2
+                 FROM due
+                 WHERE account.account_id = due.account_id
+                 RETURNING due.account_id, due.allowance, due.prior",
+            )
+            .bind(period.as_str())
+            .bind(boundary_us)
+            .bind(remaining)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)?;
+
+            for row in rows {
+                rolled.push(RolledAccount {
+                    account_id: AccountId(id_from(&row.get::<Vec<u8>, _>(0))),
+                    deposited: to_units(row.get::<i64, _>(1), "budget allowance")?,
+                    expired: to_units(row.get::<i64, _>(2), "expiring allowance")?,
+                });
+            }
+        }
+        RolloverBatch::try_new(rolled, limit)
     }
 
     async fn set_account_status(

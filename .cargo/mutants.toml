@@ -52,4 +52,20 @@ exclude_re = [
   # worth pinning is therefore extracted out of it and tested directly
   # (`is_loopback`, `redact_dsn`, `init_tracing` in tollgate-server).
   "replace main -> ",
+  # `PostgresStore::roll_due_periods` runs one statement per `Period` variant
+  # and keeps the batch within `limit` across them:
+  #     let remaining = limit_i - i64::try_from(rolled.len())?;
+  # `Period::ALL` holds exactly one variant today, so the loop body runs once
+  # with `rolled.len() == 0`, and `limit - 0` and `limit + 0` are the same
+  # number. No input separates them: reaching the second iteration requires a
+  # second period kind, which does not exist. The loop is written this way
+  # regardless, because a second variant is due at a different instant and
+  # needs its own statement.
+  #
+  # This exclusion retires itself. `every_period_is_swept` matches
+  # exhaustively over `Period`, so adding a variant stops the workspace
+  # compiling until someone visits `Period::ALL` — and the mutant becomes
+  # killable at exactly that moment, by any test that fills a batch from the
+  # first period and expects the second to respect what is left.
+  "replace - with \\+ in <impl AdminStore for PostgresStore>::roll_due_periods",
 ]
