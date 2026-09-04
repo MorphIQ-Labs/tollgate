@@ -907,7 +907,7 @@ zero. Per account, exactly:
 
 ```
 deposited + overage_recorded
-    == balance + active lease grants + settled usage + settlement loss
+    == balance + active lease grants + settled usage + settlement loss + expired
 ```
 
 Read it as a funding statement: the left side is everything the account was
@@ -915,16 +915,22 @@ ever funded with — money in, and credit extended under `Elastic` (1) — and t
 right side is where those units now sit. `overage_recorded` is a *funding*
 term, not a bucket: overage usage also lands in settled usage, so without it
 the equation would fail by exactly the overage and reconciliation would report
-corruption on a correctly working ledger. Both sides use checked arithmetic and
-an overflow answers "violated" rather than wrapping (11), because this equation
+corruption on a correctly working ledger. `expired` is the mirror of that on
+the sink side: units a closed budget period took away (28) are neither
+spendable nor billable, and without a resting place the equation would fail by
+exactly the units that expired. Both sides use checked arithmetic and an
+overflow answers "violated" rather than wrapping (11), because this equation
 exists to detect corrupt state and must not be able to launder it.
 *Tests:* `conservation_requires_an_exact_equation_without_overflow`,
 `overage_funds_the_usage_it_bills`,
+`expiry_accounts_for_an_allowance_that_was_never_spent`,
 `overflowing_the_funding_sum_is_a_violation_not_a_wrap`,
 `overage_usage_is_billed_and_funds_itself` and
 `settlement_is_unaffected_by_an_account_carrying_overage` (both store suites);
-`Tollgate.Conservation.overage_preserves_conservation` and
-`unfunded_overage_always_breaks_conservation`.
+`Tollgate.Conservation.overage_preserves_conservation`,
+`unfunded_overage_always_breaks_conservation`,
+`rollover_preserves_conservation` and
+`unrecorded_expiry_always_breaks_conservation`.
 
 27. **A credential is durable before it is disclosed, and its digest table is
     a projection.** Credential lifecycle is control-plane state like every
@@ -962,3 +968,53 @@ exists to detect corrupt state and must not be able to launder it.
     `rotation_keeps_both_credentials_live_until_the_old_one_is_retired`,
     `issuance_refuses_a_duplicate_key_or_an_unknown_account`, and
     `minting_never_repeats_a_credential`.
+
+28. **A budget period is crossed exactly once, and only its allowance
+    expires.** An account may carry a [`BudgetSchedule`]: an allowance
+    replenished each period, with unspent units that do not carry over. The
+    balance is therefore two buckets — the current period's allowance and
+    manual top-ups — spent allowance-first, so the units with an expiry date
+    go first. A rollover deposits one allowance, expires what is left of the
+    old one, and moves the account's period marker, all in one transaction.
+    Manual top-ups are never touched by a boundary; that is what the split
+    exists to guarantee, and a single balance could only expire both or
+    neither.
+
+    **Crossing is the store's job, not the caller's.** The scheduled pass runs
+    on every control-plane replica, so two of them will race a boundary: the
+    backend crosses it under a row lock (a mutex in `MemoryStore`,
+    `FOR UPDATE SKIP LOCKED` in `PostgresStore`) guarded on the stored period,
+    and the loser finds the account already current. A caller that read the
+    period and then rolled would produce two deposits under exactly that race.
+    One allowance is deposited however many boundaries have passed — an
+    account left unrolled for two months is entitled to what its schedule
+    gives it now, not to a backlog. The pass is bounded per transaction and
+    its caller drains saturated batches, because every scheduled account comes
+    due at the same instant.
+
+    **Leases drain, then expire.** An active lease at a boundary keeps serving
+    to its own TTL: there is no admission gap, and the request path still
+    reads no clock for policy. The boundary is applied at settlement instead —
+    release and the reclaim sweep both — where a lease funded by a period
+    older than the account's credits its unspent *allowance* half to `expired`
+    rather than to the balance. The top-up half returns to its bucket either
+    way. Usage is unaffected, so a straggling event bills against the period
+    its lease was granted in.
+
+    This is rung 2 of the enforcement ladder: the store owns both the crossing
+    and the settlement decision, and neither is expressible by a caller. The
+    `expired` term makes the outcome auditable rather than merely correct —
+    see *Ledger roles*. *Tests:* `racing_passes_cross_a_boundary_exactly_once`,
+    `a_top_up_survives_rollover_but_the_allowance_does_not`,
+    `a_missed_period_does_not_accrue_a_backlog`,
+    `a_lease_from_the_closed_period_expires_its_unspent_allowance`,
+    `a_lease_funded_by_a_top_up_is_unaffected_by_a_boundary`,
+    `a_split_funded_lease_charges_the_allowance_half_first`,
+    `reclaim_expires_a_closed_period_lease_it_sweeps`,
+    `the_rollover_pass_is_bounded_and_saturation_says_there_is_more`, and
+    `the_allowance_split_cannot_exceed_what_it_is_part_of` (both store suites
+    but the last, which is the PostgreSQL schema's half);
+    `Tollgate.Conservation.rollover_preserves_conservation`,
+    `a_rollover_never_touches_a_top_up`,
+    `a_top_up_funded_lease_expires_nothing`, and
+    `unrecorded_expiry_always_breaks_conservation`.

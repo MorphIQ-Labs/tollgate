@@ -39,9 +39,9 @@ use tollgate_store::wire::{
     PublishSnapshotRequest, ReleaseRequest, SetStatusRequest, SetStatusResponse,
 };
 use tollgate_store::{
-    AccountConfig, AdminStore, Clock, DEFAULT_RECLAIM_BATCH_LIMIT, IngestReport, LeaseAllocator,
-    ReclaimBatch, ReclaimedLease, SnapshotResolution, SnapshotSource, StoreError, StoreHealth,
-    UsageSink,
+    AccountConfig, AdminStore, Clock, DEFAULT_RECLAIM_BATCH_LIMIT, DEFAULT_ROLLOVER_BATCH_LIMIT,
+    IngestReport, LeaseAllocator, ReclaimBatch, ReclaimedLease, SnapshotResolution, SnapshotSource,
+    StoreError, StoreHealth, UsageSink,
 };
 
 use crate::error::{ApiError, ApiJson, ApiPath};
@@ -120,7 +120,7 @@ pub fn router<S: Backend>(state: ServerState<S>) -> Router {
         .with_state(state)
 }
 
-/// Serve until `shutdown` resolves, running the expiry-reclaim sweep every
+/// Serve until `shutdown` resolves, running the maintenance sweep every
 /// `reclaim_interval` in the background (INVARIANTS.md #9's server half).
 pub async fn serve<S: Backend>(
     listener: tokio::net::TcpListener,
@@ -137,10 +137,12 @@ pub async fn serve<S: Backend>(
     let sweep_store = Arc::clone(&state.store);
     let sweep_clock = Arc::clone(&state.clock);
     let sweeper = tokio::spawn(
-        reclaim_sweep(sweep_store, sweep_clock, reclaim_interval).instrument(tracing::info_span!(
-            "reclaim_sweep",
-            interval_ms = reclaim_interval.as_millis()
-        )),
+        maintenance_sweep(sweep_store, sweep_clock, reclaim_interval).instrument(
+            tracing::info_span!(
+                "maintenance_sweep",
+                interval_ms = reclaim_interval.as_millis()
+            ),
+        ),
     );
     let result = axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown)
@@ -149,7 +151,8 @@ pub async fn serve<S: Backend>(
     result
 }
 
-/// Reclaim expired leases forever, on the configured interval.
+/// Reclaim expired leases and roll due budget periods forever, on the
+/// configured interval.
 ///
 /// This is INVARIANTS.md #9's server half, and it is the only thing that
 /// returns units stranded by a crashed holder. A sweep that fails every tick
@@ -158,7 +161,17 @@ pub async fn serve<S: Backend>(
 /// be said out loud. Both outcomes are reported: silence about success would
 /// leave "the sweep is running but finding nothing" and "the sweep stopped"
 /// indistinguishable.
-async fn reclaim_sweep<S: Backend>(
+///
+/// The rollover pass (#97) shares this tick rather than owning a timer,
+/// because it needs the same three things and gets them here already: a frozen
+/// cutoff, a bounded drain, and a failure that is reported rather than
+/// swallowed. It is also the only trigger — without it a schedule is a stored
+/// intention nothing ever acts on — and a boundary the pass misses is not lost
+/// but late, since the store crosses it on the next tick that sees it. The two
+/// passes are independent: one failing must not stop the other, because a
+/// stuck rollover stranding quota would be a strictly worse outcome than a
+/// late allowance.
+async fn maintenance_sweep<S: Backend>(
     store: Arc<S>,
     clock: Arc<dyn Clock>,
     interval: std::time::Duration,
@@ -233,6 +246,8 @@ async fn reclaim_sweep<S: Backend>(
             }
         };
 
+        roll_due_periods(store.as_ref(), now).await;
+
         match outcome {
             Ok(()) => {
                 if consecutive_failures > 0 {
@@ -263,6 +278,67 @@ async fn reclaim_sweep<S: Backend>(
                 );
             }
         }
+    }
+}
+
+/// Drain the rollover pass for one tick.
+///
+/// Bounded per transaction and drained to a partial batch, exactly as the
+/// reclaim loop above is, and for a sharper reason: every scheduled account is
+/// due at the same instant, so the first tick after midnight on the 1st has
+/// the whole scheduled population to cross. A single unbounded statement there
+/// would hold locks across the entire account table.
+///
+/// Failures are reported and the tick ends. Retrying inside the tick would
+/// spin against a store that is down; the next tick is the retry, and until it
+/// succeeds the affected accounts keep spending last period's allowance, which
+/// is late rather than wrong.
+async fn roll_due_periods<S: Backend>(store: &S, now: jiff::Timestamp) {
+    let mut accounts: u64 = 0;
+    let mut batches: u64 = 0;
+    loop {
+        match store
+            .roll_due_periods(now, DEFAULT_ROLLOVER_BATCH_LIMIT)
+            .await
+        {
+            Ok(batch) => {
+                let Some(total) = u64::try_from(batch.len())
+                    .ok()
+                    .and_then(|rolled| accounts.checked_add(rolled))
+                    .zip(batches.checked_add(1))
+                else {
+                    // Unreachable short of a backend ignoring the batch limit
+                    // forever, and still not a place to wrap: a counter that
+                    // silently restarts would under-report a boundary that
+                    // rolled more accounts than it claimed.
+                    tracing::warn!(
+                        accounts,
+                        batches,
+                        "budget rollover progress counter overflowed; stopping this tick"
+                    );
+                    return;
+                };
+                (accounts, batches) = (total.0, total.1);
+                if !batch.is_saturated() {
+                    break;
+                }
+                // MemoryStore can finish a batch without an .await that
+                // yields; let request handlers run between chunks.
+                tokio::task::yield_now().await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    rolled_accounts = accounts,
+                    completed_batches = batches,
+                    "budget rollover failed; accounts past their boundary keep last period's allowance until it recovers"
+                );
+                return;
+            }
+        }
+    }
+    if accounts > 0 {
+        tracing::info!(accounts, batches, "rolled budget periods");
     }
 }
 
