@@ -40,7 +40,7 @@ pub use ids::{
     AccountId, FencingToken, Generation, KeyId, LeaseId, ParseIdError, Principal, RequestId,
 };
 pub use lease::{AccountOverage, LeaseGrant, LocalLease, RefillSignal};
-pub use reservation::{CancelOutcome, CommitError, Reservation};
+pub use reservation::{CancelOutcome, CommitError, CommitFunding, Reservation};
 pub use sharding::{LocalSharding, Locality};
 pub use snapshot::{
     AccountRatePolicy, AccountSnapshot, AccountSnapshotBuilder, AccountStatus, EnforcementMode,

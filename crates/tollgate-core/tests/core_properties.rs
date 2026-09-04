@@ -7,10 +7,10 @@ use jiff::Timestamp;
 use proptest::prelude::*;
 
 use tollgate_core::{
-    AccountId, AccountOverage, AccountSnapshot, AccountStatus, CancelOutcome, CostTable, CostUnits,
-    DenyReason, FencingToken, Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex,
-    PermissionBits, PublishableSnapshot, QuoteError, Reservation, ResolvedLimits, Retry,
-    SnapshotValidationError,
+    AccountId, AccountOverage, AccountSnapshot, AccountStatus, CancelOutcome, CommitFunding,
+    CostTable, CostUnits, DenyReason, FencingToken, Generation, LeaseGrant, LeaseId, LocalLease,
+    LocalSharding, OpIndex, PermissionBits, PublishableSnapshot, QuoteError, RequestId,
+    Reservation, ResolvedLimits, Retry, SnapshotValidationError, UsageSource,
 };
 
 struct Op(usize);
@@ -47,6 +47,10 @@ enum Action {
     Drop,
     CommitThenCancel,
     CancelThenCommit,
+    /// The lease's window lapses before execution start, under `Strict`.
+    LapseStrict,
+    /// The same lapse under `Elastic`, which may settle against overage.
+    LapseElastic,
 }
 
 proptest! {
@@ -162,14 +166,14 @@ proptest! {
                 continue; // exhausted: denied, nothing debited
             };
             let committed = match action {
-                Action::Commit => r.commit_at_execution_start(t(0)).is_ok(),
+                Action::Commit => r.commit_at_execution_start(t(0), CommitFunding::LeaseOnly).is_ok(),
                 Action::Cancel => {
                     prop_assert_eq!(r.cancel(), CancelOutcome::ZeroCharged);
                     false
                 }
                 Action::Drop => { drop(r); false }
                 Action::CommitThenCancel => {
-                    r.commit_at_execution_start(t(0)).unwrap();
+                    r.commit_at_execution_start(t(0), CommitFunding::LeaseOnly).unwrap();
                     prop_assert_eq!(
                         r.cancel(),
                         CancelOutcome::AlreadyCommitted { units: CostUnits(units) }
@@ -178,9 +182,15 @@ proptest! {
                 }
                 Action::CancelThenCommit => {
                     prop_assert_eq!(r.cancel(), CancelOutcome::ZeroCharged);
-                    prop_assert!(r.commit_at_execution_start(t(0)).is_err());
+                    prop_assert!(r.commit_at_execution_start(t(0), CommitFunding::LeaseOnly).is_err());
                     false
                 }
+                // Lapse belongs to `funding_terms_are_conserved_across_lapse_and_fallback`,
+                // which owns the commit-time funding transition; this property
+                // does not generate them.
+                Action::LapseStrict | Action::LapseElastic => unreachable!(
+                    "this property generates no lapse actions"
+                ),
             };
             if committed {
                 committed_total += units;
@@ -188,6 +198,111 @@ proptest! {
         }
         prop_assert!(committed_total <= capacity);
         prop_assert_eq!(l.remaining(), CostUnits(capacity - committed_total));
+    }
+
+    /// Every resolved reservation reports **exactly one** funding term, across
+    /// any mix of ordinary commits, cancels, drops, and commit-time elastic
+    /// fallbacks. A committed request moves its units into the lease's spend
+    /// or into overage — never both, never neither — and a released one moves
+    /// nothing (INVARIANTS.md #1, #2, #3).
+    ///
+    /// This is the double-charge exclusion as a property. The lapse actions
+    /// exercise the one transition that changes a reservation's funding source
+    /// after admission, which is exactly where a second funding term could
+    /// appear.
+    #[test]
+    fn funding_terms_are_conserved_across_lapse_and_fallback(
+        capacity in 0u64..10_000,
+        shards in 1usize..16,
+        cap in 0u64..10_000,
+        requests in proptest::collection::vec(
+            (1u64..200, prop_oneof![
+                Just(Action::Commit),
+                Just(Action::Cancel),
+                Just(Action::Drop),
+                Just(Action::CommitThenCancel),
+                Just(Action::CancelThenCommit),
+                Just(Action::LapseElastic),
+                Just(Action::LapseStrict),
+            ]),
+            0..64,
+        ),
+    ) {
+        let l = sharded_lease(capacity, shards);
+        let overage = Arc::new(AccountOverage::new(AccountId(1)));
+        let cap = CostUnits(cap);
+        // Past the lease's `expires_at`, so every lapse action really lapses.
+        let lapsed = t(i64::from(u16::MAX) + 1);
+        let mut lease_committed: u64 = 0;
+        let mut overage_committed: u64 = 0;
+
+        for (units, action) in requests {
+            let Ok(r) = Reservation::reserve(&l, CostUnits(units), t(0)) else {
+                continue; // exhausted: denied, nothing debited
+            };
+            let elastic = CommitFunding::OverageFallback { overage: &overage, cap };
+
+            match action {
+                Action::Commit => {
+                    if r.commit_at_execution_start(t(0), CommitFunding::LeaseOnly).is_ok() {
+                        lease_committed += units;
+                        let source = r.usage_event(RequestId(1), t(0)).unwrap().source;
+                        prop_assert!(
+                            matches!(source, UsageSource::Leased { .. }),
+                            "an unlapsed commit bills against its lease, got {:?}",
+                            source
+                        );
+                    }
+                }
+                Action::Cancel => {
+                    prop_assert_eq!(r.cancel(), CancelOutcome::ZeroCharged);
+                }
+                Action::Drop => drop(r),
+                Action::CommitThenCancel => {
+                    r.commit_at_execution_start(t(0), CommitFunding::LeaseOnly).unwrap();
+                    prop_assert_eq!(
+                        r.cancel(),
+                        CancelOutcome::AlreadyCommitted { units: CostUnits(units) }
+                    );
+                    lease_committed += units;
+                }
+                Action::CancelThenCommit => {
+                    prop_assert_eq!(r.cancel(), CancelOutcome::ZeroCharged);
+                    prop_assert!(r.commit_at_execution_start(lapsed, elastic).is_err());
+                }
+                // Strict: a lapse is always a release for zero, whatever the
+                // overage counter looks like.
+                Action::LapseStrict => {
+                    prop_assert!(
+                        r.commit_at_execution_start(lapsed, CommitFunding::LeaseOnly).is_err()
+                    );
+                    prop_assert!(r.usage_event(RequestId(1), lapsed).is_none());
+                }
+                // Elastic: the charge either moves wholly to overage or is
+                // released wholly; the lease receipt never funds it.
+                Action::LapseElastic => {
+                    if r.commit_at_execution_start(lapsed, elastic).is_ok() {
+                        overage_committed += units;
+                        prop_assert_eq!(
+                            r.usage_event(RequestId(1), lapsed).unwrap().source,
+                            UsageSource::Overage,
+                            "a fallback must never bill against its lapsed lease"
+                        );
+                    } else {
+                        prop_assert!(r.usage_event(RequestId(1), lapsed).is_none());
+                    }
+                }
+            }
+        }
+
+        // The lease funded exactly its own commits: every lapse, refusal, and
+        // cancellation returned its units.
+        prop_assert!(lease_committed <= capacity);
+        prop_assert_eq!(l.remaining(), CostUnits(capacity - lease_committed));
+        // Overage funded exactly the fallbacks that won, and stayed inside
+        // its cap.
+        prop_assert_eq!(overage.spent(), CostUnits(overage_committed));
+        prop_assert!(overage.spent() <= cap);
     }
 
     /// In every stable overage state, occupancy determines whether the local
@@ -210,7 +325,7 @@ proptest! {
         )
         .unwrap();
         if commit {
-            held.commit_at_execution_start(t(0)).unwrap();
+            held.commit_at_execution_start(t(0), CommitFunding::LeaseOnly).unwrap();
         }
 
         match Reservation::reserve_overage(&overage, CostUnits(want), CostUnits(cap)) {
@@ -256,7 +371,8 @@ fn concurrent_commit_conservation() {
                 };
                 // Odd iterations cancel (zero charge), even ones commit.
                 if i % 2 == 0 {
-                    r.commit_at_execution_start(t(0)).unwrap();
+                    r.commit_at_execution_start(t(0), CommitFunding::LeaseOnly)
+                        .unwrap();
                     committed += units;
                 } else {
                     assert_eq!(r.cancel(), CancelOutcome::ZeroCharged);

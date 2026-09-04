@@ -1589,6 +1589,58 @@ async fn overage_accounting_overflow_is_surfaced() {
     );
 }
 
+/// The commit-time elastic fallback's billing, seen from the sink — and the
+/// reason [`Reservation::usage_event`] reads the terminal phase rather than
+/// the funding receipt.
+///
+/// A fallback happens *because* the lease's usability window lapsed, so the
+/// allocator reclaims that lease shortly afterwards. The two events below are
+/// the same charge for the same work, differing only in what they name as
+/// their source. The overage-sourced one — what the fallback actually emits —
+/// is billed and funds itself. The leased-sourced one — what attributing the
+/// charge to the receipt would have emitted — is rejected as a straggler
+/// against a settled lease, silently losing the charge for work that ran.
+#[tokio::test]
+async fn a_commit_time_fallback_is_ingested_as_overage_after_its_lease_is_reclaimed() {
+    let store = store_with_balance(full_grant_policy(), 1_000);
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
+        .await
+        .unwrap();
+
+    // The window lapses and the allocator credits the whole remainder back.
+    let reclaimed = store.reclaim_expired(t(60)).await.unwrap();
+    assert_eq!(reclaimed[0].reclaimed, CostUnits(500));
+
+    // The counterfactual first, so the accepted case below is a *reason*
+    // rather than a coincidence: billing this charge against its receipt
+    // loses it outright.
+    let receipt_sourced = store
+        .ingest(&[usage(&lease, 1, 30, 61)], t(61))
+        .await
+        .unwrap();
+    assert_eq!(
+        (receipt_sourced.accepted, receipt_sourced.rejected),
+        (0, 1),
+        "a leased event naming a reclaimed lease is a straggler"
+    );
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits::ZERO);
+
+    // What the fallback actually emits: no lease capability, so nothing to
+    // straggle against, and the two ledger columns move together.
+    let phase_sourced = store
+        .ingest(&[overage_usage(ACCOUNT, 2, 30, 61)], t(61))
+        .await
+        .unwrap();
+    assert_eq!((phase_sourced.accepted, phase_sourced.rejected), (1, 0));
+
+    let after = store.conservation(ACCOUNT).unwrap();
+    assert_eq!(after.settled_usage, CostUnits(30), "the work is billed");
+    assert_eq!(after.overage_recorded, CostUnits(30), "and it is funded");
+    assert!(after.holds(), "conservation violated: {after:?}");
+    assert_conserved(&store);
+}
+
 /// The regression this whole leaseless design exists to prevent. Attributing
 /// overage to a real lease would drive `used` past `granted`, and settlement
 /// would then compute a negative credit — a panic here and a permanently

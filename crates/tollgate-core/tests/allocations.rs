@@ -4,9 +4,9 @@ use std::sync::Arc;
 use jiff::Timestamp;
 use tollgate_alloc_count::AllocScope;
 use tollgate_core::{
-    AccountId, AccountOverage, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken,
-    Generation, KeyId, LeaseGrant, LeaseId, LocalLease, Locality, OpIndex, PermissionBits,
-    RequestId, Reservation, ResolvedLimits,
+    AccountId, AccountOverage, AccountSnapshot, AccountStatus, CommitFunding, CostTable, CostUnits,
+    FencingToken, Generation, KeyId, LeaseGrant, LeaseId, LocalLease, Locality, OpIndex,
+    PermissionBits, RequestId, Reservation, ResolvedLimits,
 };
 
 tollgate_alloc_count::install!();
@@ -81,6 +81,19 @@ fn core_hot_path_allocates_nothing() {
     let table = cost_table();
     let snapshot = snapshot(Arc::clone(&table));
     let lease = lease();
+    // A lease usable at `timestamp()` but not one second later, so the
+    // reservation opens normally and the commit takes the fallback branch.
+    let lapsed_at = Timestamp::from_second(timestamp().as_second() + 1).unwrap();
+    let lapsed_lease = Arc::new(LocalLease::new(
+        LeaseGrant {
+            lease_id: LeaseId(8),
+            account_id: AccountId(1),
+            fencing_token: FencingToken(4),
+            units: CostUnits(u64::MAX / 2),
+            expires_at: lapsed_at,
+        },
+        CostUnits::ZERO,
+    ));
     let overage = Arc::new(AccountOverage::new(AccountId(1)));
     let now = timestamp();
 
@@ -97,7 +110,11 @@ fn core_hot_path_allocates_nothing() {
     });
     assert_zero("core/reserve_commit_usage", || {
         let reservation = Reservation::reserve(&lease, CostUnits(100), now).unwrap();
-        black_box(reservation.commit_at_execution_start(now).unwrap());
+        black_box(
+            reservation
+                .commit_at_execution_start(now, CommitFunding::LeaseOnly)
+                .unwrap(),
+        );
         black_box(
             reservation
                 .usage_event(RequestId(9), now)
@@ -107,6 +124,28 @@ fn core_hot_path_allocates_nothing() {
     assert_zero("core/reserve_cancel", || {
         let reservation = Reservation::reserve(&lease, CostUnits(100), now).unwrap();
         black_box(reservation.cancel());
+    });
+    // The commit-time elastic fallback changes a reservation's funding source
+    // on the request path, so it must stay allocation-free like every other
+    // resolution (INVARIANTS.md #24). A lease that lapsed at execution start.
+    assert_zero("core/reserve_commit_overage_fallback", || {
+        let reservation = Reservation::reserve(&lapsed_lease, CostUnits(100), now).unwrap();
+        black_box(
+            reservation
+                .commit_at_execution_start(
+                    lapsed_at,
+                    CommitFunding::OverageFallback {
+                        overage: &overage,
+                        cap: CostUnits(u64::MAX / 2),
+                    },
+                )
+                .unwrap(),
+        );
+        black_box(
+            reservation
+                .usage_event(RequestId(9), lapsed_at)
+                .expect("a committed fallback has usage"),
+        );
     });
     assert_zero("core/reserve_overage_cancel", || {
         let reservation =

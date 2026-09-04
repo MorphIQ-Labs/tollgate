@@ -14,8 +14,8 @@ use jiff::Timestamp;
 
 use tollgate_core::{
     AccountId, AccountOverage, AccountSnapshot, AccountStatus, CancelOutcome, CommitError,
-    CostTable, CostUnits, FencingToken, Generation, KeyId, LeaseGrant, LeaseId, LocalLease,
-    OpIndex, PermissionBits, Reservation, ResolvedLimits,
+    CommitFunding, CostTable, CostUnits, FencingToken, Generation, KeyId, LeaseGrant, LeaseId,
+    LocalLease, OpIndex, PermissionBits, Reservation, ResolvedLimits,
 };
 
 #[derive(Clone, Copy)]
@@ -74,6 +74,25 @@ fn big_lease() -> Arc<LocalLease> {
         },
         CostUnits::ZERO,
     ))
+}
+
+/// A lease usable at `now` but not one second later, so a reservation opens
+/// normally and its commit takes the elastic fallback branch.
+fn lapsed_lease(now: Timestamp) -> Arc<LocalLease> {
+    Arc::new(LocalLease::new(
+        LeaseGrant {
+            lease_id: LeaseId(8),
+            account_id: AccountId(3),
+            fencing_token: FencingToken(4),
+            units: CostUnits(u64::MAX / 2),
+            expires_at: lapsed_at(now),
+        },
+        CostUnits::ZERO,
+    ))
+}
+
+fn lapsed_at(now: Timestamp) -> Timestamp {
+    Timestamp::from_second(now.as_second() + 1).unwrap()
 }
 
 fn bench_cost_table(c: &mut Criterion) {
@@ -155,7 +174,8 @@ fn bench_lease(c: &mut Criterion) {
     group.bench_function("reserve_commit", |b| {
         b.iter(|| {
             let r = Reservation::reserve(black_box(&lease), CostUnits(100), now).unwrap();
-            r.commit_at_execution_start(now).unwrap();
+            r.commit_at_execution_start(now, CommitFunding::LeaseOnly)
+                .unwrap();
             r
         })
     });
@@ -181,7 +201,30 @@ fn bench_lease(c: &mut Criterion) {
                 CostUnits(u64::MAX),
             )
             .unwrap();
-            r.commit_at_execution_start(now).unwrap();
+            r.commit_at_execution_start(now, CommitFunding::LeaseOnly)
+                .unwrap();
+            r
+        })
+    });
+
+    // The commit-time elastic fallback: the cold branch a lapsed lease takes
+    // under `Elastic`. It costs one extra tentative debit and one lease credit
+    // on top of the ordinary claim, and it is measured separately precisely so
+    // that cost stays visible rather than being averaged into the path every
+    // request takes. `lease/reserve_commit` above is the unlapsed comparison.
+    let fallback_overage = Arc::new(AccountOverage::new(AccountId(3)));
+    let lapsed = lapsed_lease(now);
+    group.bench_function("overage_commit_fallback", |b| {
+        b.iter(|| {
+            let r = Reservation::reserve(black_box(&lapsed), CostUnits(100), now).unwrap();
+            r.commit_at_execution_start(
+                lapsed_at(now),
+                CommitFunding::OverageFallback {
+                    overage: black_box(&fallback_overage),
+                    cap: CostUnits(u64::MAX),
+                },
+            )
+            .unwrap();
             r
         })
     });
@@ -192,7 +235,7 @@ fn bench_lease(c: &mut Criterion) {
     let full_overage = Arc::new(AccountOverage::new(AccountId(2)));
     Reservation::reserve_overage(&full_overage, CostUnits(100), CostUnits(100))
         .unwrap()
-        .commit_at_execution_start(now)
+        .commit_at_execution_start(now, CommitFunding::LeaseOnly)
         .unwrap();
     group.bench_function("overage_refusal_committed", |b| {
         b.iter(|| {
@@ -215,7 +258,11 @@ fn bench_lease(c: &mut Criterion) {
 fn reserve_and_resolve(lease: &Arc<LocalLease>, now: Timestamp, commit: bool) {
     let reservation = Reservation::reserve(lease, CostUnits(100), now).unwrap();
     if commit {
-        black_box(reservation.commit_at_execution_start(now).unwrap());
+        black_box(
+            reservation
+                .commit_at_execution_start(now, CommitFunding::LeaseOnly)
+                .unwrap(),
+        );
     } else {
         black_box(reservation.cancel());
     }
@@ -276,7 +323,11 @@ fn run_commit_cancel_race(reservations: &[Reservation], now: Timestamp) -> (usiz
             start.wait();
             reservations
                 .iter()
-                .filter(|reservation| reservation.commit_at_execution_start(now).is_ok())
+                .filter(|reservation| {
+                    reservation
+                        .commit_at_execution_start(now, CommitFunding::LeaseOnly)
+                        .is_ok()
+                })
                 .count()
         });
         let cancel = scope.spawn(|| {
@@ -336,7 +387,9 @@ fn bench_reservation(c: &mut Criterion) {
         b.iter_batched(
             || Reservation::reserve(&lease, CostUnits(1), now).unwrap(),
             |reservation| {
-                reservation.commit_at_execution_start(now).unwrap();
+                reservation
+                    .commit_at_execution_start(now, CommitFunding::LeaseOnly)
+                    .unwrap();
                 black_box(reservation.cancel())
             },
             BatchSize::SmallInput,
@@ -348,7 +401,7 @@ fn bench_reservation(c: &mut Criterion) {
             |reservation| {
                 assert_eq!(reservation.cancel(), CancelOutcome::ZeroCharged);
                 assert_eq!(
-                    black_box(reservation.commit_at_execution_start(now)),
+                    black_box(reservation.commit_at_execution_start(now, CommitFunding::LeaseOnly)),
                     Err(CommitError::AlreadyReleased)
                 );
             },
