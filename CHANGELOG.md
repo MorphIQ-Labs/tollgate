@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.14.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.14.1...v0.14.2) - 2026-09-04
+
+### Added
+
+- *(admission)* #93 count every post-admission transition
+
 ## [0.14.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.14.0...v0.14.1) - 2026-09-04
 
 ### Added
