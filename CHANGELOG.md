@@ -7,6 +7,13 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.14.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.14.0...v0.14.1) - 2026-09-04
+
+### Added
+
+- *(admission)* #93 share the charge state with a cancel handle
+- *(core)* #93 commit a lapsed lease as overage in one transition
+
 ## [0.14.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.13.0...v0.14.0) - 2026-09-04
 
 ### Added
