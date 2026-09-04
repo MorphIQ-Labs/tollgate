@@ -12,7 +12,7 @@ use std::sync::{
 
 use jiff::Timestamp;
 
-use crate::ids::{AccountId, FencingToken, LeaseId, RequestId};
+use crate::ids::{AccountId, FencingToken, LeaseId, PolicyRevision, RequestId};
 use crate::units::CostUnits;
 
 /// Pre-reserved capacity for exactly one usage event.
@@ -152,8 +152,18 @@ impl UsageSource {
 /// One committed charge. Produced only from a committed
 /// [`crate::reservation::Reservation`]; there is deliberately no public
 /// constructor path for uncommitted work.
+///
+/// `#[non_exhaustive]` is what makes that sentence true outside this crate
+/// rather than merely stated. The type had said "produced only from a
+/// committed reservation" while remaining a plain struct literal any crate
+/// could fill in, which is a convention rather than a boundary; a caller could
+/// assemble an event for work that never committed and hand it to a sink.
+/// Construction now goes through [`UsageEvent::new`], and the sealing has a
+/// second benefit the workspace pays for once: a field added here no longer
+/// breaks every literal in every downstream test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct UsageEvent {
     /// Idempotency key: a sink must treat a replayed `request_id` as the same
     /// charge, not a new one.
@@ -167,6 +177,109 @@ pub struct UsageEvent {
     pub source: UsageSource,
     pub units: CostUnits,
     pub occurred_at: Timestamp,
+    /// The consuming application's policy identity, copied from the pinned
+    /// snapshot that priced this request (#94).
+    ///
+    /// Carried so a billing record can be traced to the exact product policy
+    /// that produced it. Tollgate never reads it, and an event from a
+    /// publisher that stated no revision carries
+    /// [`PolicyRevision::UNSTATED`].
+    ///
+    /// Defaults on the wire, so an ingest from a peer that predates the field
+    /// decodes rather than failing — the same rule the snapshot's optional
+    /// fields follow.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub policy_revision: PolicyRevision,
+}
+
+impl UsageEvent {
+    /// Build a committed charge.
+    ///
+    /// Called by [`Reservation::usage_event`], which is the only place that
+    /// can prove the charge committed. It is public because tests, benchmarks,
+    /// and store backends across the workspace need to construct events
+    /// without a live reservation; what `#[non_exhaustive]` buys is that every
+    /// such construction goes through one signature, so a new field reaches
+    /// them as a compile error at one call each rather than as a silent
+    /// default.
+    ///
+    /// [`Reservation::usage_event`]: crate::reservation::Reservation::usage_event
+    #[must_use]
+    pub const fn new(
+        request_id: RequestId,
+        account_id: AccountId,
+        source: UsageSource,
+        units: CostUnits,
+        occurred_at: Timestamp,
+        policy_revision: PolicyRevision,
+    ) -> Self {
+        Self {
+            request_id,
+            account_id,
+            source,
+            units,
+            occurred_at,
+            policy_revision,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod revision_wire_tests {
+    use super::*;
+
+    fn event(revision: PolicyRevision) -> UsageEvent {
+        UsageEvent::new(
+            RequestId(9),
+            AccountId(1),
+            UsageSource::Overage,
+            CostUnits(70),
+            Timestamp::UNIX_EPOCH,
+            revision,
+        )
+    }
+
+    /// A peer that predates #94 sends no revision, and its events must ingest
+    /// rather than fail. The absent key decodes to "unstated" — a value, not
+    /// an error — which is what makes the additive rollout safe in both
+    /// directions.
+    #[test]
+    fn an_event_without_a_revision_key_decodes_as_unstated() {
+        let mut value =
+            serde_json::to_value(event(PolicyRevision([0xc3; 32]))).expect("an event serializes");
+        assert_eq!(
+            value["policy_revision"],
+            serde_json::Value::String("c3".repeat(32)),
+            "a stated revision is on the wire in canonical form"
+        );
+        assert!(
+            value
+                .as_object_mut()
+                .expect("an event is a JSON object")
+                .remove("policy_revision")
+                .is_some()
+        );
+
+        let decoded: UsageEvent =
+            serde_json::from_value(value).expect("an older payload still decodes");
+        assert_eq!(decoded.policy_revision, PolicyRevision::UNSTATED);
+    }
+
+    /// The revision survives the wire byte for byte. It is compared for
+    /// equality by the consumer to select its own metadata, so a value that
+    /// round-tripped to something else would silently name a different policy.
+    #[test]
+    fn a_revision_survives_the_event_round_trip_exactly() {
+        let mut bytes = [0u8; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(7).wrapping_add(1);
+        }
+        let original = event(PolicyRevision(bytes));
+        let encoded = serde_json::to_string(&original).expect("an event serializes");
+        let decoded: UsageEvent = serde_json::from_str(&encoded).expect("it decodes");
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.policy_revision.as_bytes(), &bytes);
+    }
 }
 
 #[cfg(test)]
@@ -174,13 +287,14 @@ mod discarded_usage_tests {
     use super::*;
 
     fn event(request: u128) -> UsageEvent {
-        UsageEvent {
-            request_id: RequestId(request),
-            account_id: AccountId(1),
-            source: UsageSource::Overage,
-            units: CostUnits(70),
-            occurred_at: Timestamp::UNIX_EPOCH,
-        }
+        UsageEvent::new(
+            RequestId(request),
+            AccountId(1),
+            UsageSource::Overage,
+            CostUnits(70),
+            Timestamp::UNIX_EPOCH,
+            PolicyRevision::UNSTATED,
+        )
     }
 
     #[test]

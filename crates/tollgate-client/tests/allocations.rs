@@ -12,8 +12,8 @@ use tollgate_auth::{HmacRegistry, SessionCredential};
 use tollgate_client::{ManualClock, UsageRecorder, UsageWriter, UsageWriterConfig};
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
-    LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, RequestId, ResolvedLimits,
-    UsageEvent, UsageSource,
+    LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, PolicyRevision, RequestId,
+    ResolvedLimits, UsageEvent, UsageSource,
 };
 use tollgate_store::{IngestError, IngestReport, UsageSink};
 
@@ -65,13 +65,14 @@ fn writer_config() -> UsageWriterConfig {
 }
 
 fn warm_event(request_id: u128) -> UsageEvent {
-    UsageEvent {
-        request_id: RequestId(request_id),
-        account_id: AccountId(1),
-        source: UsageSource::Overage,
-        units: CostUnits(1),
-        occurred_at: now(),
-    }
+    UsageEvent::new(
+        RequestId(request_id),
+        AccountId(1),
+        UsageSource::Overage,
+        CostUnits(1),
+        now(),
+        PolicyRevision::UNSTATED,
+    )
 }
 
 async fn wait_until_drained(recorder: &UsageRecorder) {

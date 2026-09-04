@@ -15,7 +15,7 @@ use jiff::{SignedDuration, Timestamp};
 
 use tollgate_admission::LeaseSlot;
 use tollgate_client::{LeaseManager, LeaseManagerConfig, ManualClock, UsageWriter};
-use tollgate_core::{AccountId, AccountStatus, CostUnits, UsageEvent, UsageSource};
+use tollgate_core::{AccountId, AccountStatus, CostUnits, PolicyRevision, UsageEvent, UsageSource};
 use tollgate_store::{
     AccountConfig, AllocateError, GrantPolicy, IngestError, IngestReport, LeaseAllocator,
     MemoryStore, ReclaimBatch, StoreError, UsageSink,
@@ -334,16 +334,17 @@ async fn usage_sink_outage_and_recovery_are_reported() {
     )
     .unwrap();
 
-    recorder.try_reserve().unwrap().record(UsageEvent {
-        request_id: tollgate_core::RequestId(1),
-        account_id: lease.account_id,
-        source: UsageSource::Leased {
+    recorder.try_reserve().unwrap().record(UsageEvent::new(
+        tollgate_core::RequestId(1),
+        lease.account_id,
+        UsageSource::Leased {
             lease_id: lease.lease_id,
             fencing_token: lease.fencing_token,
         },
-        units: CostUnits(25),
-        occurred_at: t(0),
-    });
+        CostUnits(25),
+        t(0),
+        PolicyRevision::UNSTATED,
+    ));
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let stats = writer.shutdown().await.unwrap();
 

@@ -23,7 +23,8 @@ use tollgate_client::{
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, DiscardedUsage,
     FencingToken, Generation, KeyId, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits,
-    Principal, PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent, UsageSource,
+    PolicyRevision, Principal, PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent,
+    UsageSource,
 };
 use tollgate_store::wire::{API_PREFIX, MAX_INGEST_BODY_BYTES};
 use tollgate_store::{
@@ -533,12 +534,15 @@ async fn an_oversized_batch_comes_back_refused_not_retryable() {
     // reach.
     let events_needed = MAX_INGEST_BODY_BYTES / 164 + 1_000;
     let events: Vec<UsageEvent> = (0..events_needed as u128)
-        .map(|i| UsageEvent {
-            request_id: RequestId(i),
-            account_id: ACCOUNT,
-            source: UsageSource::Overage,
-            units: CostUnits(1),
-            occurred_at: at(0),
+        .map(|i| {
+            UsageEvent::new(
+                RequestId(i),
+                ACCOUNT,
+                UsageSource::Overage,
+                CostUnits(1),
+                at(0),
+                PolicyRevision::UNSTATED,
+            )
         })
         .collect();
 
@@ -593,13 +597,14 @@ async fn a_rate_limited_or_timed_out_ingest_stays_retryable() {
         });
 
         let http = HttpStore::new(format!("http://{address}"));
-        let event = UsageEvent {
-            request_id: RequestId(1),
-            account_id: ACCOUNT,
-            source: UsageSource::Overage,
-            units: CostUnits(1),
-            occurred_at: at(0),
-        };
+        let event = UsageEvent::new(
+            RequestId(1),
+            ACCOUNT,
+            UsageSource::Overage,
+            CostUnits(1),
+            at(0),
+            PolicyRevision::UNSTATED,
+        );
         let error = UsageSink::ingest(&*http, &[event], at(0))
             .await
             .expect_err("the server refused");

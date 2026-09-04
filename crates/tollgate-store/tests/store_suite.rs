@@ -10,8 +10,8 @@ use jiff::{SignedDuration, Timestamp};
 
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, BudgetSchedule, BudgetView, CostTable, CostUnits,
-    FencingToken, Generation, KeyId, LeaseId, PermissionBits, Principal, PublishableSnapshot,
-    RequestId, ResolvedLimits, UsageEvent, UsageSource,
+    FencingToken, Generation, KeyId, LeaseId, PermissionBits, PolicyRevision, Principal,
+    PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent, UsageSource,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, BudgetError, Conservation, CreateAccountError,
@@ -99,27 +99,29 @@ async fn nonpositive_lease_ttl_is_rejected_without_debiting() {
 }
 
 fn usage(lease: &tollgate_core::LeaseGrant, request: u128, units: u64, at: i64) -> UsageEvent {
-    UsageEvent {
-        request_id: RequestId(request),
-        account_id: lease.account_id,
-        source: UsageSource::Leased {
+    UsageEvent::new(
+        RequestId(request),
+        lease.account_id,
+        UsageSource::Leased {
             lease_id: lease.lease_id,
             fencing_token: lease.fencing_token,
         },
-        units: CostUnits(units),
-        occurred_at: t(at),
-    }
+        CostUnits(units),
+        t(at),
+        PolicyRevision::UNSTATED,
+    )
 }
 
 /// A charge with no lease behind it, as elastic admission produces.
 fn overage_usage(account: AccountId, request: u128, units: u64, at: i64) -> UsageEvent {
-    UsageEvent {
-        request_id: RequestId(request),
-        account_id: account,
-        source: UsageSource::Overage,
-        units: CostUnits(units),
-        occurred_at: t(at),
-    }
+    UsageEvent::new(
+        RequestId(request),
+        account,
+        UsageSource::Overage,
+        CostUnits(units),
+        t(at),
+        PolicyRevision::UNSTATED,
+    )
 }
 
 fn assert_conserved(store: &MemoryStore) {

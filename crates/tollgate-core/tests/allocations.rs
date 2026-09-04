@@ -6,7 +6,7 @@ use tollgate_alloc_count::AllocScope;
 use tollgate_core::{
     AccountId, AccountOverage, AccountSnapshot, AccountStatus, CommitFunding, CostTable, CostUnits,
     FencingToken, Generation, KeyId, LeaseGrant, LeaseId, LocalLease, Locality, OpIndex,
-    PermissionBits, RequestId, Reservation, ResolvedLimits,
+    PermissionBits, PolicyRevision, RequestId, Reservation, ResolvedLimits,
 };
 
 tollgate_alloc_count::install!();
@@ -138,7 +138,7 @@ fn core_hot_path_allocates_nothing() {
         );
         black_box(
             reservation
-                .usage_event(RequestId(9), now)
+                .usage_event(RequestId(9), now, PolicyRevision::UNSTATED)
                 .expect("committed reservation has usage"),
         );
     });
@@ -164,7 +164,7 @@ fn core_hot_path_allocates_nothing() {
         );
         black_box(
             reservation
-                .usage_event(RequestId(9), lapsed_at)
+                .usage_event(RequestId(9), lapsed_at, PolicyRevision::UNSTATED)
                 .expect("a committed fallback has usage"),
         );
     });

@@ -762,10 +762,21 @@ until it has one.
     `a_sharded_layout_reports_the_same_transition_totals`, and
     `concurrency_guard_carries_the_exact_occupied_state`.
 
-21. **Every 128-bit identifier has one portable wire spelling.** `AccountId`,
+21. **Every opaque identifier has one portable wire spelling.** `AccountId`,
     `KeyId`, `LeaseId`, `RequestId`, and `Principal` are exactly 32 lowercase
     hexadecimal characters without a prefix in human-readable serialization
-    and URL paths. A malformed path is a structured `invalid-id`, never an
+    and URL paths. `PolicyRevision` is the same rule at 64 characters, being
+    256 bits rather than 128.
+
+    One rule, at two widths — `validate_hex_digits` is the single function
+    both go through, and `ParseIdError` carries the width it was applying so a
+    caller is never told a 64-digit value should have been 32. Two parsers
+    that had to agree would be the defect; the widths are nevertheless
+    enforced separately, and each rejects the other's canonical form.
+    Strictness earns its keep differently for the revision: nothing in
+    Tollgate reads it, but a consumer compares it for equality to select its
+    own metadata, so two spellings of one revision would silently look like
+    two policies. A malformed path is a structured `invalid-id`, never an
     unknown principal; only a structured `404 unknown-principal` is negative
     evidence that may enter the authorization cache. The pre-public v1
     contract is updated in place; numeric identifiers are rejected rather than
@@ -776,6 +787,11 @@ until it has one.
     extending storage to the full u128 domain. *Tests:*
     `every_id_uses_the_same_fixed_width_lowercase_hexadecimal_text`,
     `identifier_text_round_trips_the_full_u128_domain`,
+    `revision_text_round_trips_the_full_256_bit_domain`,
+    `noncanonical_revision_spellings_are_rejected`,
+    `the_two_identifier_widths_reject_each_others_canonical_form`,
+    `the_parse_error_names_the_width_it_expected`,
+    `revision_serde_is_textual_and_strict`,
     `high_bit_ids_are_portable_text_in_an_untyped_json_consumer`,
     `identifier_failures_are_structured_and_never_unknown`,
     `an_unstructured_route_404_is_not_a_confirmed_unknown_principal`,
@@ -1190,3 +1206,44 @@ exists to detect corrupt state and must not be able to launder it.
     `a_rollover_never_touches_a_top_up`,
     `a_top_up_funded_lease_expires_nothing`, and
     `unrecorded_expiry_always_breaks_conservation`.
+
+29. **The application's policy identity is carried, never interpreted.** A
+    snapshot may name the product policy it was compiled from — a
+    [`PolicyRevision`], 256 opaque bits — and every charge admitted under that
+    snapshot is billed carrying the same value. Tollgate stores it, transports
+    it, and hands it back; it never parses, hashes, orders, or branches on it.
+    That is what keeps product vocabulary out of an enforcement substrate
+    while still letting a consumer say which of *its* policies priced a
+    request.
+
+    **It is pinned with everything else.** The revision a request reports is
+    the one its snapshot carried when `begin` resolved it, so a republication
+    mid-request reaches the next request and not this one (26). A consumer can
+    therefore resolve its own customer-visible metadata locally from the same
+    value, with no I/O, and know it describes the policy that actually priced
+    the work. `Committed::policy_revision` reads it from the usage event it
+    will emit rather than from the snapshot a second time, which is what makes
+    "what the response says" and "what the bill says" one value rather than
+    two reads that agree.
+
+    **Distinct from generation, in both directions.** [`Generation`] orders
+    publications and decides staleness (15, 26); this identifies the inputs one
+    publication was compiled from and carries no order at all — which is why it
+    is deliberately not comparable. Two generations may share a revision (the
+    same policy republished after a status change) and each generation carries
+    exactly one. Neither may be derived from the other.
+
+    **Unstated is a value.** All zeroes means "no revision stated", and an
+    absent field on the wire or in storage decodes to it rather than failing.
+    That is safe precisely because nothing in Tollgate reads the value: an
+    unstated revision cannot change an enforcement outcome, only the identity
+    reported alongside one. *Tests:*
+    `a_committed_event_carries_the_pinned_revision`,
+    `an_unstated_revision_reaches_the_charge_unstated`,
+    `a_republished_revision_does_not_reach_an_already_pinned_request`,
+    `a_snapshot_without_a_revision_key_decodes_as_unstated`,
+    `a_builder_without_a_revision_states_none`,
+    `an_event_without_a_revision_key_decodes_as_unstated`,
+    `a_revision_survives_the_event_round_trip_exactly`,
+    `the_unstated_revision_is_all_zeroes_and_round_trips`, and
+    `the_policy_revision_is_cold`.
