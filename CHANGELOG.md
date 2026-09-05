@@ -7,6 +7,16 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.14.6](https://github.com/MorphIQ-Labs/tollgate/compare/v0.14.5...v0.14.6) - 2026-09-05
+
+### Added
+
+- *(admission)* #99 reserve execution capacity for assured work
+
+### Fixed
+
+- *(ci)* #112 stop the perf gate ruling on measurements it called unreadable
+
 ## [0.14.5](https://github.com/MorphIQ-Labs/tollgate/compare/v0.14.4...v0.14.5) - 2026-09-05
 
 ### Added
