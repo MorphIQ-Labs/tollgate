@@ -7,10 +7,7 @@
     "#93": [
       "reservation/commit_split"
     ],
-    "#99": [
-      "load/concurrent_distinct_accounts",
-      "load/mixed_saturation"
-    ]
+    "#99": []
   },
   "benchmarks": [
     {

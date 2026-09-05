@@ -34,7 +34,8 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use tollgate_admission::{
-    AdmissionEngine, ArcSwapSnapshotMap, LeaseSlot, MapEntry, NoGate, RequestContext, SnapshotMap,
+    AdmissionEngine, ArcSwapSnapshotMap, CapacityPermit, ExecutionCapacityGate,
+    ExecutionCapacityMode, LeaseSlot, MapEntry, NoGate, ReadyToStart, RequestContext, SnapshotMap,
 };
 use tollgate_auth::{CredentialVerifier, HmacRegistry, SessionCredential};
 use tollgate_client::{
@@ -154,7 +155,19 @@ struct Problem {
 /// The request body plus the evidence obtained before Axum consumes it.
 struct PriceInput {
     request: PriceRequest,
-    staged: Option<(RequestContext, UsagePermit)>,
+    staged: Option<Staged>,
+}
+
+/// What admission produced before Axum consumed the body, plus the state the
+/// handler needs to finish the request.
+///
+/// The handler takes no `State` extractor — everything reaches it through this
+/// — so the gate has to travel with the evidence. One `Arc` clone per admitted
+/// request, which is a refcount bump.
+struct Staged {
+    context: RequestContext,
+    permit: UsagePermit,
+    state: Arc<AppState>,
 }
 
 impl FromRequest<Arc<AppState>> for PriceInput {
@@ -211,7 +224,11 @@ impl FromRequest<Arc<AppState>> for PriceInput {
             .map_err(IntoResponse::into_response)?;
         Ok(Self {
             request,
-            staged: Some((context, permit)),
+            staged: Some(Staged {
+                context,
+                permit,
+                state: Arc::clone(state),
+            }),
         })
     }
 }
@@ -224,11 +241,30 @@ struct AppState {
     /// counters and the slot's contents say what actually happened, which is
     /// why neither ever needed an `expect`.
     engine: AdmissionEngine<Arc<ArcSwapSnapshotMap>>,
+    /// The primary tenant's slot — the account `DEMO_API_KEY` reaches, and the
+    /// one the flat metrics fields describe.
     slot: Arc<LeaseSlot>,
+    /// Every tenant this instance serves. Readiness is a claim about all of
+    /// them, so it reads this rather than the primary alone.
+    tenants: Vec<TenantView>,
+    /// The execution-capacity gate, or `None` for
+    /// [`ExecutionCapacityMode::Disabled`] — the `Option` *is* the switch, as
+    /// it is for `admission` below, so nothing else can disagree with it.
+    ///
+    /// The library monomorphizes over a gate type chosen at startup; this
+    /// example must serve both configurations from one binary because the load
+    /// gate compares them, and pays one `Option` check per request for it.
+    capacity: Option<ExecutionCapacityGate>,
     /// `None` is the no-admission baseline the load gate compares against:
     /// same transport, same kernel, zero quota machinery. The `Option` *is*
     /// the switch, so there is no separate flag left to disagree with it.
     admission: Option<AdmissionRuntime>,
+}
+
+/// One tenant as the request path and readiness see it.
+struct TenantView {
+    principal: Principal,
+    slot: Arc<LeaseSlot>,
 }
 
 /// Everything the quota machinery installs, held together because it is
@@ -236,8 +272,10 @@ struct AppState {
 /// unprovable, and a request handler paid for it with an `expect`.
 struct AdmissionRuntime {
     recorder: UsageRecorder,
-    /// Refill-task health; channel closure exposes panic or abort.
-    lease_manager_health: tokio::sync::watch::Receiver<bool>,
+    /// Every refill task's health; channel closure exposes panic or abort.
+    /// One per tenant, because one dead plane withdraws the instance whichever
+    /// account it was refilling.
+    lease_manager_health: Vec<tokio::sync::watch::Receiver<bool>>,
     /// Snapshot-manager readiness: true while every tracked principal has a
     /// fresh resolution; channel closure also exposes task failure.
     snapshots_ready: tokio::sync::watch::Receiver<bool>,
@@ -259,12 +297,12 @@ pub struct AppRuntime {
 /// INVARIANTS.md requirement, and as three independent `Option`s it held only
 /// so long as all three agreed.
 struct Background {
-    manager: LeaseManager,
+    managers: Vec<LeaseManager>,
     writer: UsageWriter,
     snapshots: SnapshotManager,
-    /// Demo control plane: periodically republishes the account snapshot
+    /// Demo control plane: periodically republishes each account's snapshot
     /// with extended validity and a bumped generation.
-    republisher: tokio::task::JoinHandle<()>,
+    republishers: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl AppRuntime {
@@ -272,7 +310,9 @@ impl AppRuntime {
         let Some(background) = self.background else {
             return;
         };
-        background.republisher.abort();
+        for republisher in &background.republishers {
+            republisher.abort();
+        }
         // Always reported: a clean shutdown is itself the operator's evidence
         // that nothing was lost or left unresolved, and a dead writer must
         // never look like one.
@@ -296,19 +336,76 @@ impl AppRuntime {
         // Reported unconditionally, like the writer's line above: the released
         // count is the operator's evidence that leases came back, not just the
         // absence of bad news.
-        let report = background.manager.shutdown().await;
-        tracing::info!(
-            released = report.released,
-            abandoned = report.abandoned,
-            task_died = report.task_died,
-            "lease-manager shutdown; abandoned leases settle at TTL reclaim"
-        );
+        // Every manager is shut down, and every report logged: a tenant whose
+        // lease was abandoned is exactly the one an operator needs told about,
+        // and stopping at the first would hide the rest.
+        for manager in background.managers {
+            let report = manager.shutdown().await;
+            tracing::info!(
+                released = report.released,
+                abandoned = report.abandoned,
+                task_died = report.task_died,
+                "lease-manager shutdown; abandoned leases settle at TTL reclaim"
+            );
+        }
         background.snapshots.shutdown().await;
     }
 }
 
 pub const DEMO_API_KEY: &str = "demo-key-1";
 pub const DEMO_ACCOUNT: AccountId = AccountId(1);
+
+/// One demo tenant: an account, the credential that reaches it, and the
+/// execution-capacity class its work belongs to.
+///
+/// The example served exactly one account until #99, which is why the two
+/// `load/` witnesses could not be written: capacity class is *account-owned*,
+/// so a publish carrying a class the ledger disagrees with is refused. Mixed
+/// assured and best-effort traffic therefore needs more than one account —
+/// and so, in turn, more than one lease manager, slot, and republisher. That
+/// is the shape this type generalises, not a knob added for its own sake.
+#[derive(Clone, Debug)]
+pub struct DemoTenant {
+    pub account: AccountId,
+    pub api_key: String,
+    pub capacity_class: CapacityClass,
+}
+
+/// The single assured tenant the example has always served.
+#[must_use]
+pub fn demo_tenant() -> DemoTenant {
+    DemoTenant {
+        account: DEMO_ACCOUNT,
+        api_key: DEMO_API_KEY.to_owned(),
+        capacity_class: CapacityClass::Assured,
+    }
+}
+
+/// `assured` assured tenants followed by `best_effort` best-effort ones.
+///
+/// The first is always [`demo_tenant`], so every existing caller and test
+/// keeps the account and key it already uses; the rest are numbered from
+/// there. Accounts are distinct because the class is, and keys are distinct
+/// because a principal is what a request arrives as.
+#[must_use]
+pub fn demo_tenants(assured: usize, best_effort: usize) -> Vec<DemoTenant> {
+    // No special case for the first tenant: index zero already yields
+    // `DEMO_ACCOUNT` and `DEMO_API_KEY` from the numbering below, so
+    // short-circuiting to `demo_tenant()` was a second spelling of the same
+    // rule — and a wrong one, because it also forced the class. It returned an
+    // *assured* tenant for `demo_tenants(0, 1)`.
+    (0..assured + best_effort)
+        .map(|index| DemoTenant {
+            account: AccountId(index as u128 + 1),
+            api_key: format!("demo-key-{}", index + 1),
+            capacity_class: if index < assured {
+                CapacityClass::Assured
+            } else {
+                CapacityClass::BestEffort
+            },
+        })
+        .collect()
+}
 
 /// The example's application-policy identity (#94). A real publisher would
 /// hash the resolved product records it compiled into the snapshot; a fixed
@@ -331,8 +428,9 @@ const REPUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3
 /// would silently stop extending validity rather than fail visibly.
 async fn republish_snapshots(
     store: Arc<MemoryStore>,
+    tenant: DemoTenant,
     principal: Principal,
-    compile: impl Fn(u64) -> PublishableSnapshot,
+    compile: impl Fn(&DemoTenant, u64) -> PublishableSnapshot,
     period: std::time::Duration,
 ) {
     let mut generation = 1u64;
@@ -342,7 +440,7 @@ async fn republish_snapshots(
     loop {
         tick.tick().await;
         generation += 1;
-        store.publish_snapshot(principal, compile(generation));
+        store.publish_snapshot(principal, compile(&tenant, generation));
     }
 }
 
@@ -367,6 +465,8 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
         admission_enabled,
         EnforcementMode::Strict,
         LocalSharding::SINGLE,
+        &[demo_tenant()],
+        ExecutionCapacityMode::Disabled,
     )
 }
 
@@ -387,6 +487,8 @@ pub fn build_app_with_mode(
         admission_enabled,
         enforcement_mode,
         LocalSharding::SINGLE,
+        &[demo_tenant()],
+        ExecutionCapacityMode::Disabled,
     )
 }
 
@@ -402,6 +504,33 @@ pub fn build_app_with_sharding(
         admission_enabled,
         EnforcementMode::Strict,
         sharding,
+        &[demo_tenant()],
+        ExecutionCapacityMode::Disabled,
+    )
+}
+
+/// The multi-tenant, capacity-gated stack: what #99's load witnesses measure.
+///
+/// Separate from the builders above because it varies the two knobs they fix
+/// by construction — how many accounts exist and how their classes are
+/// divided, and whether an execution-capacity gate is installed at all. A
+/// mixed-class workload needs both: the class is account-owned, so assured and
+/// best-effort traffic cannot share an account, and it changes no outcome
+/// unless a gate is configured to run out of capacity.
+pub fn build_app_with_capacity(
+    deposit: u64,
+    admission_enabled: bool,
+    sharding: LocalSharding,
+    tenants: &[DemoTenant],
+    capacity: ExecutionCapacityMode,
+) -> (axum::Router, AppRuntime) {
+    build_app_with(
+        deposit,
+        admission_enabled,
+        EnforcementMode::Strict,
+        sharding,
+        tenants,
+        capacity,
     )
 }
 
@@ -413,14 +542,25 @@ fn build_app_with(
     admission_enabled: bool,
     enforcement_mode: EnforcementMode,
     sharding: LocalSharding,
+    tenants: &[DemoTenant],
+    capacity: ExecutionCapacityMode,
 ) -> (axum::Router, AppRuntime) {
+    assert!(
+        !tenants.is_empty(),
+        "a service with no tenant can serve nobody"
+    );
     let store = MemoryStore::new(GrantPolicy::default()).expect("default grant policy is valid");
-    store.create_account(AccountConfig {
-        account_id: DEMO_ACCOUNT,
-        initial_balance: CostUnits(deposit),
-        status: AccountStatus::Active,
-        capacity_class: CapacityClass::Assured,
-    });
+    for tenant in tenants {
+        store.create_account(AccountConfig {
+            account_id: tenant.account,
+            initial_balance: CostUnits(deposit),
+            status: AccountStatus::Active,
+            // The ledger owns the class; every snapshot published below only
+            // carries it. Creating the account with it is what lets the two
+            // agree (#99).
+            capacity_class: tenant.capacity_class,
+        });
+    }
 
     // Startup compilation: the service's schedule and entitlements become a
     // CostTable + AccountSnapshot once per policy generation — never per
@@ -430,10 +570,10 @@ fn build_app_with(
     let clock: Arc<SystemClock> = Arc::new(SystemClock);
     let compile_snapshot = {
         let clock = Arc::clone(&clock);
-        move |generation: u64| {
+        move |tenant: &DemoTenant, generation: u64| {
             let snapshot = Arc::new(
                 AccountSnapshot::builder(
-                    DEMO_ACCOUNT,
+                    tenant.account,
                     Generation(generation),
                     AccountStatus::Active,
                     clock
@@ -449,6 +589,10 @@ fn build_app_with(
                     ),
                 )
                 .enforcement_mode(enforcement_mode)
+                // Carried, never chosen here: the ledger decided it at
+                // account creation, and a snapshot that disagreed would be
+                // refused at publication (#99).
+                .capacity_class(tenant.capacity_class)
                 // A real publisher hashes the product records it compiled;
                 // this example states a fixed one, which is enough to show
                 // the value reaching both the response and the bill (#94).
@@ -461,13 +605,29 @@ fn build_app_with(
     };
 
     let auth = HmacRegistry::new(b"demo-server-secret-rotate-me");
-    let principal = auth.install_credentials([DEMO_API_KEY.as_bytes()])[0];
-    store.publish_snapshot(principal, compile_snapshot(1));
+    let principals =
+        auth.install_credentials(tenants.iter().map(|tenant| tenant.api_key.as_bytes()));
+    for (tenant, principal) in tenants.iter().zip(&principals) {
+        store.publish_snapshot(*principal, compile_snapshot(tenant, 1));
+    }
 
     let map = Arc::new(ArcSwapSnapshotMap::with_sharding(sharding));
     let engine = AdmissionEngine::new(Arc::clone(&map));
     let slots = SlotRegistry::with_sharding(sharding);
-    let slot = slots.slot(DEMO_ACCOUNT);
+    let views: Vec<TenantView> = tenants
+        .iter()
+        .zip(&principals)
+        .map(|(tenant, principal)| TenantView {
+            principal: *principal,
+            slot: slots.slot(tenant.account),
+        })
+        .collect();
+    let slot = Arc::clone(&views[0].slot);
+
+    // `Disabled` composes no gate at all rather than one that always admits,
+    // so a demo that never configures capacity allocates no pool (#99).
+    let capacity = ExecutionCapacityGate::new(capacity, sharding)
+        .expect("example capacity configuration is valid");
 
     // Either the whole quota machinery is installed, or none of it is. The
     // branch yields both halves — what the handlers read and what shutdown
@@ -485,7 +645,7 @@ fn build_app_with(
                 // example still works against a source that cannot
                 // enumerate.
                 principals: TrackedPrincipals::All {
-                    seed: vec![principal],
+                    seed: principals.clone(),
                 },
                 refresh_interval: std::time::Duration::from_secs(30),
                 unknown_ttl: SignedDuration::from_secs(60),
@@ -505,29 +665,39 @@ fn build_app_with(
             },
         )
         .expect("snapshot-manager configuration is valid");
-        let republisher = tokio::spawn(republish_snapshots(
-            store.clone(),
-            principal,
-            compile_snapshot.clone(),
-            REPUBLISH_INTERVAL,
-        ));
         let (target_grant, low_water) = refill_sizing(deposit);
-        let manager = LeaseManager::spawn(
-            store.clone(),
-            Arc::clone(&slot),
-            clock.clone(),
-            LeaseManagerConfig {
-                account: DEMO_ACCOUNT,
-                target_grant,
-                low_water,
-                lease_ttl: SignedDuration::from_secs(60),
-                expiry_safety_margin: SignedDuration::from_secs(2),
-                poll_interval: std::time::Duration::from_millis(20),
-                store_call_timeout: std::time::Duration::from_secs(5),
-                shutdown_release_deadline: std::time::Duration::from_secs(10),
-            },
-        )
-        .expect("lease-manager configuration is valid");
+        // One refill task and one republisher per tenant, because both are
+        // per-account contracts: a lease funds one account's spend, and a
+        // republish bumps one account's generation.
+        let mut republishers = Vec::with_capacity(tenants.len());
+        let mut managers = Vec::with_capacity(tenants.len());
+        for (tenant, view) in tenants.iter().zip(&views) {
+            republishers.push(tokio::spawn(republish_snapshots(
+                store.clone(),
+                tenant.clone(),
+                view.principal,
+                compile_snapshot.clone(),
+                REPUBLISH_INTERVAL,
+            )));
+            managers.push(
+                LeaseManager::spawn(
+                    store.clone(),
+                    Arc::clone(&view.slot),
+                    clock.clone(),
+                    LeaseManagerConfig {
+                        account: tenant.account,
+                        target_grant,
+                        low_water,
+                        lease_ttl: SignedDuration::from_secs(60),
+                        expiry_safety_margin: SignedDuration::from_secs(2),
+                        poll_interval: std::time::Duration::from_millis(20),
+                        store_call_timeout: std::time::Duration::from_secs(5),
+                        shutdown_release_deadline: std::time::Duration::from_secs(10),
+                    },
+                )
+                .expect("lease-manager configuration is valid"),
+            );
+        }
         let (recorder, writer) = UsageWriter::spawn(
             store.clone(),
             clock,
@@ -547,16 +717,19 @@ fn build_app_with(
         // tasks, so a handler keeps reading after a plane dies.
         let admission = AdmissionRuntime {
             recorder,
-            lease_manager_health: manager.health(),
+            // Every refill task's health, not the first one's: readiness is a
+            // claim about serving *any* tenant, and one dead plane withdraws
+            // the instance whichever account it belonged to.
+            lease_manager_health: managers.iter().map(LeaseManager::health).collect(),
             snapshots_ready: snapshots.ready(),
-            lease_counters: manager.counters(),
+            lease_counters: managers[0].counters(),
             snapshot_counters: snapshots.counters(),
         };
         let background = Background {
-            manager,
+            managers,
             writer,
             snapshots,
-            republisher,
+            republishers,
         };
         (Some(admission), Some(background))
     } else {
@@ -567,6 +740,8 @@ fn build_app_with(
         auth,
         engine,
         slot,
+        tenants: views,
+        capacity,
         admission,
     });
 
@@ -589,14 +764,20 @@ async fn readyz(State(state): State<Arc<AppState>>) -> StatusCode {
         // Serving at all is the whole condition.
         return StatusCode::OK;
     };
+    let now = Timestamp::now();
     let readiness = Readiness {
         snapshots_fresh: plane_healthy(&admission.snapshots_ready),
-        lease_usable: quota_usable(
-            &state.slot,
-            enforcement_mode(state.as_ref()),
-            Timestamp::now(),
-        ),
-        refill_healthy: plane_healthy(&admission.lease_manager_health),
+        // Every tenant, each against *its own* published mode: an elastic
+        // account with headroom is admissible where a strict one beside it is
+        // not, and readiness must agree with admission for both (#10).
+        lease_usable: state.tenants.iter().all(|tenant| {
+            quota_usable(
+                &tenant.slot,
+                enforcement_mode_of(state.as_ref(), tenant.principal),
+                now,
+            )
+        }),
+        refill_healthy: admission.lease_manager_health.iter().all(plane_healthy),
         writer_healthy: !admission.recorder.is_closed(),
     };
     if readiness.is_ready() {
@@ -661,6 +842,7 @@ fn quota_usable(slot: &LeaseSlot, mode: EnforcementMode, now: Timestamp) -> bool
 /// answering from a stale copy is precisely the disagreement between
 /// readiness and admission that INVARIANTS.md #10 forbids.
 fn enforcement_mode(state: &AppState) -> EnforcementMode {
+    // The primary tenant's, which is what the flat metrics fields describe.
     // `CredentialVerifier::verify` takes the credential bytes, and returns
     // the validity alongside the identity; readiness only needs the identity.
     let Some(principal) = state
@@ -670,10 +852,31 @@ fn enforcement_mode(state: &AppState) -> EnforcementMode {
     else {
         return EnforcementMode::Strict;
     };
+    enforcement_mode_of(state, principal)
+}
+
+/// One principal's currently published mode, read from the snapshot the
+/// request path itself would read.
+fn enforcement_mode_of(state: &AppState, principal: Principal) -> EnforcementMode {
     match state.engine.map().get(&principal) {
         Some(MapEntry::Present(admission)) => admission.snapshot.enforcement_mode,
         _ => EnforcementMode::Strict,
     }
+}
+
+/// The execution-capacity gate's configuration and current occupancy, mirrored
+/// for the wire the way `Accounting` and `Refill` mirror their library stats.
+///
+/// Pool sizes and counts only: a capacity metric labelled by account is a
+/// cardinality incident waiting for a busy tenant. The free counts are live
+/// reads and therefore estimates — no decision reads them.
+#[derive(Debug, Serialize)]
+pub struct Capacity {
+    pub shared_total: u32,
+    pub shared_available: u32,
+    /// Zero under `Uniform`, which has no reserve rather than an empty one.
+    pub reserve_total: u32,
+    pub reserve_available: u32,
 }
 
 /// What this instance admitted, refused, and has left to spend.
@@ -710,6 +913,16 @@ pub struct Metrics {
     pub canceled_before_start: u64,
     pub capacity_shed: u64,
     pub refused_at_start: u64,
+    /// The two capacity outcomes broken down by class, labelled by the enum
+    /// tags alone so cardinality stays bounded (#99). Each sums to the total
+    /// beside it; neither replaces one, so a reader never has to add two
+    /// numbers to get one.
+    pub execution_started_by_class: BTreeMap<&'static str, u64>,
+    pub capacity_shed_by_class: BTreeMap<&'static str, u64>,
+    /// Configured pools and free units, or `None` when no gate is installed —
+    /// which is the honest answer for a disabled instance, rather than zeroes
+    /// that read as an exhausted one.
+    pub capacity: Option<Capacity>,
     /// Refusals at execution start by reason, in the same always-present,
     /// ordered form as `denials`.
     pub commit_refusals: BTreeMap<&'static str, u64>,
@@ -853,6 +1066,17 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Json<Metrics> {
         execution_started: counters.execution_started,
         canceled_before_start: counters.canceled_before_start,
         capacity_shed: counters.capacity_shed,
+        execution_started_by_class: counters.execution_started_by_class_name().collect(),
+        capacity_shed_by_class: counters.capacity_shed_by_class_name().collect(),
+        capacity: state.capacity.as_ref().map(|gate| {
+            let occupancy = gate.occupancy();
+            Capacity {
+                shared_total: occupancy.shared_total,
+                shared_available: occupancy.shared_available,
+                reserve_total: occupancy.reserve_total,
+                reserve_available: occupancy.reserve_available,
+            }
+        }),
         refused_at_start: counters.refused_at_start(),
         commit_refusals: counters.commit_refusals_by_name().collect(),
         committed_at_overage: counters.committed_at_overage,
@@ -980,7 +1204,12 @@ async fn price(input: PriceInput) -> Response {
     // agree with it: the same `let` that rules out the baseline is what hands
     // this handler the recorder (#16).
     let PriceInput { request, staged } = input;
-    let Some((context, permit)) = staged else {
+    let Some(Staged {
+        context,
+        permit,
+        state,
+    }) = staged
+    else {
         // Load-gate baseline: transport + kernel only.
         let prices: Vec<f64> = request.contracts.iter().map(black_scholes_call).collect();
         return Json(PriceResponse {
@@ -1002,11 +1231,29 @@ async fn price(input: PriceInput) -> Response {
         Ok(pending) => pending,
         Err(reason) => return deny_response(reason),
     };
-    let ready = match pending.acquire_capacity(&NoGate) {
-        Ok(ready) => ready,
-        Err((reason, _released)) => return deny_response(reason),
-    };
+    // Two gate types, one execution path. The library monomorphizes over the
+    // gate chosen at startup; this example must serve both configurations from
+    // one binary because the load gate compares them, so it branches once here
+    // and hands both arms to the same generic function rather than keeping two
+    // copies of the commit sequence that would have to agree.
+    match state.capacity.as_ref() {
+        Some(gate) => match pending.acquire_capacity(gate) {
+            Ok(ready) => execute(ready, &request),
+            Err((reason, _released)) => deny_response(reason),
+        },
+        None => match pending.acquire_capacity(&NoGate) {
+            Ok(ready) => execute(ready, &request),
+            Err((reason, _released)) => deny_response(reason),
+        },
+    }
+}
 
+/// Commit, run the kernel, and answer — the part that does not care which gate
+/// issued the permit.
+fn execute<P: CapacityPermit>(
+    ready: ReadyToStart<UsagePermit, P>,
+    request: &PriceRequest,
+) -> Response {
     // Execution starts only after the type-state owns funding, accounting,
     // account concurrency, and the selected execution-capacity permit.
     // Random 128-bit ids: idempotency keys are global, so ids must be
@@ -1071,6 +1318,7 @@ fn erf(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use tollgate_core::{
         CommitFunding, FencingToken, LeaseGrant, LeaseId, LocalLease, Reservation,
     };
@@ -1337,10 +1585,10 @@ mod tests {
     async fn republishing_advances_the_generation_each_time() {
         let store = MemoryStore::new(GrantPolicy::default()).expect("valid policy");
         let principal = Principal(7);
-        let compile = |generation: u64| {
+        let compile = |tenant: &DemoTenant, generation: u64| {
             PublishableSnapshot::try_new(Arc::new(
                 AccountSnapshot::builder(
-                    DEMO_ACCOUNT,
+                    tenant.account,
                     Generation(generation),
                     AccountStatus::Active,
                     Timestamp::now()
@@ -1358,10 +1606,12 @@ mod tests {
             ))
             .expect("schedule fits inside its burst")
         };
-        store.publish_snapshot(principal, compile(1));
+        let tenant = demo_tenant();
+        store.publish_snapshot(principal, compile(&tenant, 1));
 
         let task = tokio::spawn(republish_snapshots(
             store.clone(),
+            tenant,
             principal,
             compile,
             std::time::Duration::from_millis(1),
@@ -1389,5 +1639,65 @@ mod tests {
             generation.0 >= 3,
             "the republisher must keep advancing; reached {generation:?}",
         );
+    }
+
+    /// `demo_tenants` produces the split it promises: the primary first, then
+    /// the assured, then the best-effort, on distinct accounts and keys.
+    ///
+    /// Mutation testing asked for it — `assured + best_effort` could become a
+    /// subtraction and `index < assured` could invert, with every other test
+    /// still green because nothing counted what came out.
+    #[test]
+    fn demo_tenants_splits_assured_before_best_effort() {
+        for (assured, best_effort) in [(1usize, 1usize), (2, 3), (5, 5), (1, 0), (0, 1)] {
+            let tenants = demo_tenants(assured, best_effort);
+            assert_eq!(
+                tenants.len(),
+                assured + best_effort,
+                "{assured}+{best_effort} produced {} tenants",
+                tenants.len()
+            );
+            for (index, tenant) in tenants.iter().enumerate() {
+                let expected = if index < assured {
+                    CapacityClass::Assured
+                } else {
+                    CapacityClass::BestEffort
+                };
+                assert_eq!(tenant.capacity_class, expected, "tenant {index}");
+            }
+            // Distinct accounts and distinct credentials, because the class is
+            // account-owned and a request arrives as a principal.
+            let accounts: BTreeSet<_> = tenants.iter().map(|t| t.account).collect();
+            let keys: BTreeSet<_> = tenants.iter().map(|t| t.api_key.clone()).collect();
+            assert_eq!(accounts.len(), tenants.len());
+            assert_eq!(keys.len(), tenants.len());
+        }
+
+        // The first tenant is always the one every existing caller and test
+        // already uses, so nothing they pinned moved.
+        let first = &demo_tenants(3, 2)[0];
+        assert_eq!(first.account, DEMO_ACCOUNT);
+        assert_eq!(first.api_key, DEMO_API_KEY);
+        assert_eq!(first.capacity_class, CapacityClass::Assured);
+    }
+
+    /// #99's refusal reaches a caller as 503 `capacity-unavailable`.
+    ///
+    /// Deliberately not 429: the caller did nothing wrong and slowing down
+    /// would not help, because capacity returns as requests finish rather than
+    /// as a quota refills. Nothing else pinned this arm — the load gate is
+    /// where the shed is *produced*, and a scenario that must saturate a pool
+    /// to assert a status code would be a flaky home for the contract.
+    #[tokio::test]
+    async fn a_capacity_refusal_is_a_retryable_503_and_not_a_rate_limit() {
+        let response = deny_response(DenyReason::CapacityUnavailable);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("a problem document is small");
+        let problem: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("problem documents are JSON");
+        assert_eq!(problem["code"], "capacity-unavailable");
     }
 }
