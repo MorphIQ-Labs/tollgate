@@ -1,0 +1,81 @@
+-- Execution capacity class (#99): which of two classes an account's work
+-- belongs to when an instance decides what it can afford to start.
+--
+-- A separate axis from `status` and from enforcement mode. Status says whether
+-- the account may transact at all; enforcement mode says whether a request can
+-- be funded; this says whether an instance should *start* an already-funded
+-- request with the compute capacity it has right now. An assured account may
+-- be strict, and a best-effort account still spends quota and is billed
+-- normally whenever it does execute.
+--
+-- Column notes:
+--
+-- 1. `capacity_class TEXT NOT NULL DEFAULT 'Assured'` on `tollgate_accounts`.
+--    Named strings rather than ordinals, for the reason `status` uses them
+--    (0006): three consumers compare these exact spellings -- this CHECK, the
+--    JSONB predicate deciding which snapshots a class change rewrites, and the
+--    admin wire DTO -- and an ordinal would make a reordered enum silently
+--    reclassify every account.
+--
+-- 2. The default is `Assured`, and it is the safe direction rather than the
+--    neutral one. An account that predates this feature has whatever
+--    availability it has today, which is unconditional; `Assured` preserves
+--    that. `BestEffort` would silently make every existing account's traffic
+--    sheddable the moment an operator enabled a capacity gate -- a change in
+--    behaviour nobody asked for, delivered by a backfill.
+--
+-- 3. The CHECK is the same shape as `tollgate_accounts_status_known`. A value
+--    outside the pair means the row was written outside this code, and the
+--    Rust decoder refuses it rather than defaulting: admitting an unknown
+--    class as `Assured` would turn corruption into free capacity, exactly as
+--    `decode_status` refuses to turn corruption into service.
+--
+-- 4. No index. Nothing queries by class: the request path reads the class off
+--    an already-resolved snapshot, and the only statement that filters on it
+--    is the republish below, which is already keyed by `account_id`.
+--
+-- 5. `tollgate_snapshots` needs no column. The class rides inside the JSONB
+--    document beside `enforcement_mode`, `budget` and `policy_revision`, and
+--    the Rust storage DTO defaults the key when absent, so pre-existing
+--    documents decode unchanged.
+--
+--    One consequence worth stating: the republish predicate is
+--    `snapshot ->> 'capacity_class' IS DISTINCT FROM $2::text`, and a
+--    pre-#99 document has SQL NULL there. `IS DISTINCT FROM` therefore matches
+--    every such row, so the first class change on an account rewrites all of
+--    its snapshots exactly once even when the class it is "changing to" is the
+--    default they already behave as. That is correct -- the documents really
+--    do not carry the field yet -- and it converges: the second call rewrites
+--    nothing.
+--
+-- Locks and rewrite: `ADD COLUMN ... DEFAULT` uses PostgreSQL 11+
+-- non-rewriting defaults, so this records the default in the catalogue and
+-- returns it for existing rows without touching heap pages. The ACCESS
+-- EXCLUSIVE lock is held for the catalogue update only. The CHECK is validated
+-- against those rows, and none can fail it: every one takes the default.
+--
+-- Compatibility: additive and forward-only. An old writer omits the column and
+-- gets `Assured`, which is what it means. A new writer against an old schema
+-- fails loudly on an unknown column rather than silently dropping the class.
+-- The rollout order is schema, then every serving instance, then classifying
+-- accounts as `BestEffort` -- and the last step is the one that cannot be
+-- rolled back through: an instance binary that predates #99 ignores the field
+-- and silently restores assured treatment to best-effort accounts. That is a
+-- capacity decision quietly reverting, not a data loss, but it is an explicit
+-- rollback constraint and it is why classification comes last.
+--
+-- Recovery: reversible; nothing outside this feature reads the column.
+--
+--   ALTER TABLE tollgate_accounts
+--       DROP CONSTRAINT IF EXISTS tollgate_accounts_capacity_class_known,
+--       DROP COLUMN IF EXISTS capacity_class;
+--   DELETE FROM _sqlx_migrations WHERE version = 12;
+--
+-- Dropping the column discards every classification; the accounts, their
+-- balances, and their usage are untouched, because the class funds nothing and
+-- appears in no conservation term.
+
+ALTER TABLE tollgate_accounts
+    ADD COLUMN capacity_class TEXT NOT NULL DEFAULT 'Assured',
+    ADD CONSTRAINT tollgate_accounts_capacity_class_known
+        CHECK (capacity_class IN ('Assured', 'BestEffort'));

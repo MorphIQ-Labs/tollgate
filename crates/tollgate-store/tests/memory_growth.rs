@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex, Once};
 
 use jiff::{SignedDuration, Timestamp};
 
-use tollgate_core::{AccountId, AccountStatus, CostUnits, PolicyRevision, UsageSource};
+use tollgate_core::{
+    AccountId, AccountStatus, CapacityClass, CostUnits, PolicyRevision, UsageSource,
+};
 use tollgate_store::{
     AccountConfig, GrantPolicy, LeaseAllocator, MemoryStore, StoredRecords, UsageSink,
 };
@@ -153,6 +155,7 @@ fn store() -> Arc<MemoryStore> {
         account_id: ACCOUNT,
         initial_balance: CostUnits(1_000_000),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
     store
 }

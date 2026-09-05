@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use jiff::{SignedDuration, Timestamp};
 use tollgate_auth::{CredentialVerifier, HmacRegistry};
-use tollgate_core::{AccountId, AccountStatus, CostUnits, KeyId};
+use tollgate_core::{AccountId, AccountStatus, CapacityClass, CostUnits, KeyId};
 use tollgate_store::{
     AccountConfig, AdminStore, GrantPolicy, KeyDirectory, KeyError, KeyRecord, MemoryStore,
     Revocation,
@@ -35,6 +35,7 @@ async fn store() -> Arc<MemoryStore> {
             account_id: ACCOUNT,
             initial_balance: CostUnits(10_000),
             status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
         },
     )
     .await

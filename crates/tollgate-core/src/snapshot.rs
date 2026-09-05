@@ -51,6 +51,69 @@ impl AccountStatus {
     }
 }
 
+/// Which execution-capacity class an account's work belongs to (#99).
+///
+/// A separate axis from [`EnforcementMode`], and the two must not be
+/// conflated. Enforcement mode answers whether an account can *fund* a
+/// request; this answers whether an instance should *start* an already-valid
+/// request with the compute capacity it has right now. An assured account may
+/// be strict, and a best-effort account still spends quota and emits ordinary
+/// usage whenever it does execute.
+///
+/// The vocabulary is deliberately semantic rather than commercial. Tollgate
+/// has no `Paid`/`Free` and no open-ended priority integer: the product maps
+/// its plans onto these two, and which customers are assured is a decision
+/// that stays outside an enforcement substrate.
+///
+/// # Assured is the default, and that is a compatibility choice
+///
+/// An account that states no class gets the availability every account has
+/// today. The unsafe direction would be defaulting to `BestEffort`, which
+/// would silently make existing traffic sheddable the moment a capacity gate
+/// was enabled — the same reasoning that makes [`AccountStatus`] required at
+/// construction and [`EnforcementMode`] default to `Strict`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum CapacityClass {
+    /// Work that may use the whole instance, including the reserve kept for
+    /// it. The default.
+    #[default]
+    Assured,
+    /// Work that may use only capacity not reserved for assured traffic, and
+    /// is shed first under load.
+    BestEffort,
+}
+
+impl CapacityClass {
+    /// The one spelling of each class: serde's, the ledger column's, and the
+    /// operator-facing one.
+    ///
+    /// The same three-consumer argument [`AccountStatus::as_str`] makes — the
+    /// `tollgate_accounts.capacity_class` `CHECK` constraint, the JSONB
+    /// predicate deciding which snapshots a class change rewrites, and the
+    /// admin wire DTO all compare these strings, so they all read from here.
+    /// It is also the metric label: capacity counters distinguish the classes
+    /// by these two tags and nothing else, which is what keeps their
+    /// cardinality bounded (#99).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CapacityClass::Assured => "Assured",
+            CapacityClass::BestEffort => "BestEffort",
+        }
+    }
+
+    /// Whether work of this class may draw on the assured reserve.
+    ///
+    /// Stated once, here, rather than re-derived as `== Assured` at each pool
+    /// decision: the reserve's whole purpose is that exactly one class reaches
+    /// it, and a second spelling of that rule is how the two drift.
+    #[must_use]
+    pub const fn may_use_assured_reserve(self) -> bool {
+        matches!(self, CapacityClass::Assured)
+    }
+}
+
 /// What an account does when its local lease cannot fund a quote.
 ///
 /// This is the one axis of the fail-closed rule that is per-account rather than
@@ -491,6 +554,21 @@ impl From<ResolvedLimits> for WireResolvedLimits {
 #[non_exhaustive]
 pub struct AccountSnapshot {
     pub status: AccountStatus,
+    /// Which execution-capacity class this account's work belongs to (#99).
+    ///
+    /// Declared beside `status` because the capacity gate reads it on the same
+    /// cache line admission already touches, and because it costs nothing to
+    /// do so: `AccountStatus` is a one-byte enum and `permissions` is
+    /// `u64`-aligned, so a second one-byte enum lands in padding that already
+    /// existed.
+    ///
+    /// Defaults on the wire as well as in storage, the precedent
+    /// `enforcement_mode` set. An absent class decodes to
+    /// [`CapacityClass::Assured`] — the availability every account has today,
+    /// and the only safe direction: defaulting to `BestEffort` would make
+    /// existing traffic sheddable the moment a gate was enabled.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub capacity_class: CapacityClass,
     pub permissions: PermissionBits,
     /// Hard staleness bound: past this instant the snapshot denies
     /// (INVARIANTS.md #5) until the control plane delivers a successor.
@@ -558,6 +636,7 @@ pub struct AccountSnapshotBuilder {
     key_id: Option<KeyId>,
     generation: Generation,
     status: AccountStatus,
+    capacity_class: CapacityClass,
     enforcement_mode: EnforcementMode,
     valid_until: Timestamp,
     permissions: PermissionBits,
@@ -576,6 +655,18 @@ impl AccountSnapshotBuilder {
     #[must_use]
     pub const fn enforcement_mode(mut self, enforcement_mode: EnforcementMode) -> Self {
         self.enforcement_mode = enforcement_mode;
+        self
+    }
+
+    /// Set the account's execution-capacity class (#99).
+    ///
+    /// Optional, and omitting it leaves [`CapacityClass::Assured`]. The class
+    /// is an account-owned fact: the control plane derives it from the ledger
+    /// rather than each publisher choosing one, and a snapshot whose class
+    /// contradicts its account is refused at publication.
+    #[must_use]
+    pub const fn capacity_class(mut self, capacity_class: CapacityClass) -> Self {
+        self.capacity_class = capacity_class;
         self
     }
 
@@ -598,6 +689,7 @@ impl AccountSnapshotBuilder {
             key_id: self.key_id,
             generation: self.generation,
             status: self.status,
+            capacity_class: self.capacity_class,
             enforcement_mode: self.enforcement_mode,
             valid_until: self.valid_until,
             permissions: self.permissions,
@@ -827,6 +919,28 @@ impl PublishableSnapshot {
             maximum_quote: self.maximum_quote,
         }
     }
+
+    /// The same publication proof at a new execution-capacity class and
+    /// generation (#99).
+    ///
+    /// Infallible for the reason [`restamped`](Self::restamped) is, and the
+    /// reason is worth stating rather than inferring from the signature:
+    /// [`try_new`](Self::try_new) validates the weighted-rate domain and the
+    /// cost table's worst quote against burst and any overage cap. A capacity
+    /// class participates in none of that — it decides whether an instance
+    /// *starts* already-funded work, not what that work costs — so the proof
+    /// carries over unchanged. Re-stamping the enforcement mode would not,
+    /// which is why there is no method for it.
+    #[must_use]
+    pub fn reclassified(&self, class: CapacityClass, generation: Generation) -> Self {
+        let mut snapshot = AccountSnapshot::clone(&self.snapshot);
+        snapshot.capacity_class = class;
+        snapshot.generation = generation;
+        PublishableSnapshot {
+            snapshot: Arc::new(snapshot),
+            maximum_quote: self.maximum_quote,
+        }
+    }
 }
 
 impl std::ops::Deref for PublishableSnapshot {
@@ -872,6 +986,7 @@ impl AccountSnapshot {
             key_id: None,
             generation,
             status,
+            capacity_class: CapacityClass::Assured,
             enforcement_mode: EnforcementMode::Strict,
             valid_until,
             permissions,
@@ -924,6 +1039,127 @@ mod tests {
                 "{status:?} disagrees with its serde spelling"
             );
         }
+    }
+
+    /// The class's spellings must agree with serde's for the reason the
+    /// status's must: the SQL `CHECK`, the JSONB republish predicate, the
+    /// admin wire DTO, and the metric label all compare these exact strings.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn capacity_class_text_matches_its_serde_spelling() {
+        for class in [CapacityClass::Assured, CapacityClass::BestEffort] {
+            assert_eq!(
+                serde_json::to_value(class).expect("a unit variant serializes"),
+                serde_json::Value::String(class.as_str().to_owned()),
+                "{class:?} disagrees with its serde spelling"
+            );
+        }
+    }
+
+    /// An unstated class is `Assured`, and that direction is the whole
+    /// compatibility argument: it preserves the availability every account
+    /// has today. `BestEffort` would make existing traffic sheddable the
+    /// moment a gate was enabled.
+    #[test]
+    fn the_default_class_is_assured() {
+        assert_eq!(CapacityClass::default(), CapacityClass::Assured);
+        assert!(CapacityClass::Assured.may_use_assured_reserve());
+        assert!(!CapacityClass::BestEffort.may_use_assured_reserve());
+    }
+
+    /// A snapshot from a control plane that predates #99 carries no class, and
+    /// must decode as `Assured` rather than failing — the reader-first half of
+    /// the rollout.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_snapshot_without_a_capacity_class_key_decodes_as_assured() {
+        let snapshot = AccountSnapshot::builder(
+            AccountId(1),
+            Generation(1),
+            AccountStatus::Active,
+            Timestamp::from_second(10_000).unwrap(),
+            PermissionBits::ALL,
+            ResolvedLimits::new(64).with_weighted_rate(1_000, 1_000),
+            Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+        )
+        .capacity_class(CapacityClass::BestEffort)
+        .build();
+
+        let mut value = serde_json::to_value(&snapshot).expect("a snapshot serializes");
+        assert_eq!(
+            value["capacity_class"],
+            serde_json::Value::String("BestEffort".to_owned()),
+            "a stated class is on the wire in its canonical spelling"
+        );
+        assert!(
+            value
+                .as_object_mut()
+                .expect("a snapshot is a JSON object")
+                .remove("capacity_class")
+                .is_some()
+        );
+
+        let decoded: AccountSnapshot =
+            serde_json::from_value(value).expect("an older payload still decodes");
+        assert_eq!(decoded.capacity_class, CapacityClass::Assured);
+    }
+
+    /// A builder that states no class states `Assured` rather than inventing
+    /// one, and the class survives a re-stamp of the other account-owned fact.
+    #[test]
+    fn a_class_survives_a_status_restamp() {
+        let snapshot = AccountSnapshot::builder(
+            AccountId(1),
+            Generation(1),
+            AccountStatus::Active,
+            Timestamp::from_second(10_000).unwrap(),
+            PermissionBits::ALL,
+            ResolvedLimits::new(64).with_weighted_rate(1_000, 1_000),
+            Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+        );
+        assert_eq!(
+            snapshot.build().capacity_class,
+            CapacityClass::Assured,
+            "an unstated class is assured"
+        );
+
+        let publishable = PublishableSnapshot::try_new(Arc::new(
+            AccountSnapshot::builder(
+                AccountId(1),
+                Generation(1),
+                AccountStatus::Active,
+                Timestamp::from_second(10_000).unwrap(),
+                PermissionBits::ALL,
+                ResolvedLimits::new(64).with_weighted_rate(1_000, 1_000),
+                Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+            )
+            .capacity_class(CapacityClass::BestEffort)
+            .build(),
+        ))
+        .expect("the fixture publishes");
+
+        let restamped = publishable.restamped(AccountStatus::Suspended, Generation(2));
+        assert_eq!(
+            restamped.as_snapshot().capacity_class,
+            CapacityClass::BestEffort,
+            "a status change must not silently reclassify the account"
+        );
+
+        // And the mirror: a class change leaves the status alone.
+        let reclassified = publishable.reclassified(CapacityClass::Assured, Generation(3));
+        assert_eq!(
+            reclassified.as_snapshot().capacity_class,
+            CapacityClass::Assured
+        );
+        assert_eq!(reclassified.as_snapshot().status, AccountStatus::Active);
+        assert_eq!(reclassified.as_snapshot().generation, Generation(3));
+        assert!(
+            PublishableSnapshot::try_new(Arc::new(AccountSnapshot::clone(
+                reclassified.as_snapshot()
+            )))
+            .is_ok(),
+            "reclassifying preserves the publication proof"
+        );
     }
 
     /// A payload from a control plane that predates periodic budgets. It must

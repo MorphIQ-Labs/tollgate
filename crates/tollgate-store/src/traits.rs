@@ -7,8 +7,8 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountStatus, BudgetSchedule, CostUnits, FencingToken, Generation, KeyId,
-    LeaseGrant, LeaseId, Principal, PublishableSnapshot, UsageEvent,
+    AccountId, AccountStatus, BudgetSchedule, CapacityClass, CostUnits, FencingToken, Generation,
+    KeyId, LeaseGrant, LeaseId, Principal, PublishableSnapshot, UsageEvent,
 };
 
 /// Backend failure unrelated to domain rules (connection lost, transaction
@@ -139,6 +139,13 @@ pub struct AccountConfig {
     /// column; the bool could not express `Closed`, which is what let
     /// terminality be a convention instead of a check (#51).
     pub status: AccountStatus,
+    /// The account's execution-capacity class at birth (#99).
+    ///
+    /// Present at creation for the reason `status` is: creation and
+    /// [`AdminStore::set_capacity_class`] speak one vocabulary about one
+    /// column, so there is no window in which an account exists without a
+    /// class and no second place that decides the default.
+    pub capacity_class: CapacityClass,
 }
 
 /// Per-account conservation view for reconciliation.
@@ -743,6 +750,16 @@ pub enum PublishSnapshotError {
         ledger: AccountStatus,
         submitted: AccountStatus,
     },
+    /// The snapshot's execution-capacity class disagrees with the account
+    /// ledger (#99). The class is an account-owned fact changed through
+    /// [`AdminStore::set_capacity_class`], which republishes; a publish may
+    /// carry the current class but may not change it. Two writers for one
+    /// fact is the divergence the status guard above already exists to
+    /// abolish, and a second field must not reintroduce it.
+    CapacityClassMismatch {
+        ledger: CapacityClass,
+        submitted: CapacityClass,
+    },
     Storage(StoreError),
 }
 
@@ -752,6 +769,12 @@ impl std::fmt::Display for PublishSnapshotError {
             PublishSnapshotError::StatusMismatch { ledger, submitted } => write!(
                 f,
                 "snapshot status {} contradicts account status {}",
+                submitted.as_str(),
+                ledger.as_str()
+            ),
+            PublishSnapshotError::CapacityClassMismatch { ledger, submitted } => write!(
+                f,
+                "snapshot capacity class {} contradicts account capacity class {}",
                 submitted.as_str(),
                 ledger.as_str()
             ),
@@ -802,6 +825,41 @@ pub trait AdminStore: Send + Sync {
         &self,
         account: AccountId,
         status: AccountStatus,
+    ) -> Result<StatusChange, SetStatusError>;
+
+    /// Set an existing account's execution-capacity class, in one
+    /// transaction: the ledger's class, and a republication of every *live*
+    /// snapshot of that account carrying the new class at `generation + 1`
+    /// (#99).
+    ///
+    /// The same operator action, and the same ownership argument, as
+    /// [`set_account_status`](Self::set_account_status): the class is one
+    /// fact with one writer. A control plane that published it per credential
+    /// instead would recreate exactly the divergence #51 abolished — some of
+    /// an account's principals assured and some best-effort, with nothing
+    /// checking them against each other, and a request's treatment depending
+    /// on which credential it arrived with.
+    ///
+    /// Rules, all enforced here rather than by caller discipline:
+    /// - A missing account is [`SetStatusError::UnknownAccount`].
+    /// - A closed account is [`SetStatusError::AccountClosed`]. Reclassifying
+    ///   a terminally closed account is meaningless and the refusal changes
+    ///   nothing, exactly as it does for a status change.
+    /// - Revoked principals are never republished (INVARIANTS.md #15).
+    /// - Snapshots already at the target class are not rewritten, so a repeat
+    ///   converges and bumps no generation.
+    /// - Nothing about funding changes. The class decides whether an instance
+    ///   starts an already-funded request, so quota, leases, and outstanding
+    ///   usage are untouched — an account reclassified mid-flight keeps every
+    ///   charge it has already committed.
+    ///
+    /// Reuses [`SetStatusError`] rather than declaring a near-identical twin:
+    /// the two refusals are the same two conditions about the same ledger row,
+    /// and a second enum would be two vocabularies for one answer.
+    async fn set_capacity_class(
+        &self,
+        account: AccountId,
+        class: CapacityClass,
     ) -> Result<StatusChange, SetStatusError>;
 
     /// Give an account a periodic allowance, or take it away.

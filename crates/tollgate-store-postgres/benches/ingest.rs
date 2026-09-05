@@ -18,7 +18,8 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use jiff::{SignedDuration, Timestamp};
 
 use tollgate_core::{
-    AccountId, AccountStatus, CostUnits, PolicyRevision, RequestId, UsageEvent, UsageSource,
+    AccountId, AccountStatus, CapacityClass, CostUnits, PolicyRevision, RequestId, UsageEvent,
+    UsageSource,
 };
 use tollgate_store::{AccountConfig, AdminStore, GrantPolicy, LeaseAllocator, UsageSink};
 use tollgate_store_postgres::PostgresStore;
@@ -69,6 +70,7 @@ fn bench_ingest(c: &mut Criterion) {
                     account_id,
                     initial_balance: CostUnits(1_000_000_000),
                     status: AccountStatus::Active,
+                    capacity_class: CapacityClass::Assured,
                 },
             )
             .await

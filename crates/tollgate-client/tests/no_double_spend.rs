@@ -12,8 +12,8 @@ use tollgate_client::{
     LeaseManager, LeaseManagerConfig, ManualClock, UsageRecorder, UsageWriter, UsageWriterConfig,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, Generation,
-    OpIndex, PermissionBits, Principal, RequestId, ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, CapacityClass, CostTable, CostUnits, DenyReason,
+    Generation, OpIndex, PermissionBits, Principal, RequestId, ResolvedLimits,
 };
 use tollgate_store::{AccountConfig, GrantPolicy, MemoryStore};
 
@@ -154,6 +154,7 @@ async fn two_instances_never_overspend_one_account() {
         account_id: ACCOUNT,
         initial_balance: CostUnits(DEPOSIT),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
     let clock = Arc::new(ManualClock::new(t(0)));
 

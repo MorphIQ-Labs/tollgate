@@ -43,9 +43,9 @@ use tollgate_client::{
     UsageRecorder, UsageWriter, UsageWriterConfig,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CommitError, CostTable, CostUnits, DenyReason,
-    EnforcementMode, Generation, LocalSharding, OpIndex, PermissionBits, PolicyRevision, Principal,
-    PublishableSnapshot, RequestId, ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, CapacityClass, CommitError, CostTable, CostUnits,
+    DenyReason, EnforcementMode, Generation, LocalSharding, OpIndex, PermissionBits,
+    PolicyRevision, Principal, PublishableSnapshot, RequestId, ResolvedLimits,
 };
 use tollgate_store::{AccountConfig, GrantPolicy, MemoryStore};
 
@@ -419,6 +419,7 @@ fn build_app_with(
         account_id: DEMO_ACCOUNT,
         initial_balance: CostUnits(deposit),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
 
     // Startup compilation: the service's schedule and entitlements become a

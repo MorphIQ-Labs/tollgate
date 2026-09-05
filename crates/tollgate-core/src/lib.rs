@@ -46,9 +46,9 @@ pub use reservation::{
 };
 pub use sharding::{LocalSharding, Locality};
 pub use snapshot::{
-    AccountRatePolicy, AccountSnapshot, AccountSnapshotBuilder, AccountStatus, EnforcementMode,
-    PermissionBits, PublishableSnapshot, RequestRateLimit, ResolvedLimits, ResolvedLimitsError,
-    SnapshotValidationError, WeightedRateLimit,
+    AccountRatePolicy, AccountSnapshot, AccountSnapshotBuilder, AccountStatus, CapacityClass,
+    EnforcementMode, PermissionBits, PublishableSnapshot, RequestRateLimit, ResolvedLimits,
+    ResolvedLimitsError, SnapshotValidationError, WeightedRateLimit,
 };
 pub use units::CostUnits;
 pub use usage::{DiscardedUsage, DiscardedUsageSlot, UsageEvent, UsageSlot, UsageSource};

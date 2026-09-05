@@ -48,8 +48,9 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountStatus, BudgetSchedule, BudgetView, CostUnits, FencingToken, Generation,
-    KeyId, LeaseGrant, LeaseId, Principal, PublishableSnapshot, UsageEvent, UsageSource,
+    AccountId, AccountStatus, BudgetSchedule, BudgetView, CapacityClass, CostUnits, FencingToken,
+    Generation, KeyId, LeaseGrant, LeaseId, Principal, PublishableSnapshot, UsageEvent,
+    UsageSource,
 };
 
 use crate::leases::{LeaseRecord, Leases, Settled};
@@ -139,6 +140,11 @@ struct AccountRecord {
     /// bool so `Closed` is representable and terminality can be checked here
     /// instead of inferred from snapshots (#51).
     status: AccountStatus,
+    /// Mirrors `tollgate_accounts.capacity_class`. The account-owned fact a
+    /// snapshot's `capacity_class` is a copy of, and the reason a publish
+    /// carrying a different one is refused: two writers for one fact is the
+    /// divergence #51 abolished for status (#99).
+    capacity_class: CapacityClass,
     next_fence: u64,
     /// Usage accepted into the billing ledger.
     usage_recorded: CostUnits,
@@ -380,6 +386,7 @@ impl MemoryStore {
                 period_start: Timestamp::UNIX_EPOCH,
                 expired: CostUnits::ZERO,
                 status: config.status,
+                capacity_class: config.capacity_class,
                 next_fence: 1,
                 usage_recorded: CostUnits::ZERO,
                 overage_recorded: CostUnits::ZERO,
@@ -819,8 +826,40 @@ fn publish_locked(
     Some(snapshot)
 }
 
-/// Plan the re-stamping of every live snapshot of `account` to `status`,
-/// under a lock the caller already holds. Mutates nothing: the caller applies
+/// Which account-owned fact a republication is carrying.
+///
+/// The two operator actions — a status change and a capacity-class change —
+/// differ only in the field they compare and set. Everything that makes the
+/// republication *safe* is identical: the two-phase overflow check, the
+/// tombstone skip, the already-at-target skip, and the deterministic ordering.
+/// Writing that twice is how the two would drift, and the half that drifted
+/// would be the half nobody was looking at.
+#[derive(Debug, Clone, Copy)]
+enum Restamp {
+    Status(AccountStatus),
+    CapacityClass(CapacityClass),
+}
+
+impl Restamp {
+    /// Whether this snapshot already carries the target, and so must not be
+    /// rewritten — that is what makes a repeated call converge.
+    fn already_applied(self, snapshot: &tollgate_core::AccountSnapshot) -> bool {
+        match self {
+            Restamp::Status(status) => snapshot.status == status,
+            Restamp::CapacityClass(class) => snapshot.capacity_class == class,
+        }
+    }
+
+    fn apply(self, snapshot: &PublishableSnapshot, generation: Generation) -> PublishableSnapshot {
+        match self {
+            Restamp::Status(status) => snapshot.restamped(status, generation),
+            Restamp::CapacityClass(class) => snapshot.reclassified(class, generation),
+        }
+    }
+}
+
+/// Plan the re-stamping of every live snapshot of `account`, under a lock the
+/// caller already holds. Mutates nothing: the caller applies
 /// the plan only once every fallible step has succeeded.
 ///
 /// **Two-phase on purpose.** Every new generation is computed, and every
@@ -837,15 +876,15 @@ fn publish_locked(
 /// different mechanisms, identical behaviour, which is what the mirrored
 /// tests pin.
 ///
-/// Rows already at the target status are left alone, so a repeated call
-/// converges and bumps no generation.
+/// Rows already at the target are left alone, so a repeated call converges
+/// and bumps no generation.
 ///
 /// Returned sorted by principal so both backends emit pushes in the same
 /// order and a mirrored test need not assert on incidental ordering.
 fn plan_republish(
     inner: &Inner,
     account: AccountId,
-    status: AccountStatus,
+    restamp: Restamp,
 ) -> Result<Vec<(Principal, PublishableSnapshot)>, SetStatusError> {
     let mut planned = Vec::new();
     for (principal, record) in &inner.snapshots {
@@ -854,7 +893,7 @@ fn plan_republish(
         let SnapshotRecord::Present(snapshot) = record else {
             continue;
         };
-        if snapshot.account_id != account || snapshot.status == status {
+        if snapshot.account_id != account || restamp.already_applied(snapshot) {
             continue;
         }
         let generation = snapshot
@@ -867,7 +906,7 @@ fn plan_republish(
             })?;
         // The restamped snapshot carries the new generation; the plan does not
         // carry a second copy of it (#54).
-        planned.push((*principal, snapshot.restamped(status, generation)));
+        planned.push((*principal, restamp.apply(snapshot, generation)));
     }
     planned.sort_unstable_by_key(|(principal, _)| *principal);
     Ok(planned)
@@ -996,7 +1035,7 @@ impl AdminStore for MemoryStore {
             // would leave the account suspended with Active snapshots -- the
             // divergence INVARIANTS.md #22 forbids, in the very backend that
             // serves as its reference.
-            let planned = plan_republish(&inner, account, status)?;
+            let planned = plan_republish(&inner, account, Restamp::Status(status))?;
             // Phase 3: apply. Nothing below this line can fail.
             inner
                 .accounts
@@ -1032,6 +1071,58 @@ impl AdminStore for MemoryStore {
         })
     }
 
+    async fn set_capacity_class(
+        &self,
+        account: AccountId,
+        class: CapacityClass,
+    ) -> Result<StatusChange, SetStatusError> {
+        // Structurally identical to `set_account_status`, deliberately: one
+        // lock across both records, refusals before anything moves, the whole
+        // snapshot plan computed before the ledger is touched. What differs is
+        // one field, and that difference lives in `Restamp` rather than in a
+        // second copy of this procedure.
+        let republished = {
+            let mut inner = self.lock();
+            let record = inner
+                .accounts
+                .get(&account)
+                .ok_or(SetStatusError::UnknownAccount)?;
+            // A closed account is terminal. Reclassifying one is meaningless,
+            // and refusing costs nothing that a caller wanted.
+            if record.status == AccountStatus::Closed {
+                return Err(SetStatusError::AccountClosed);
+            }
+            let planned = plan_republish(&inner, account, Restamp::CapacityClass(class))?;
+            inner
+                .accounts
+                .get_mut(&account)
+                .expect("the account was found under this same guard")
+                .capacity_class = class;
+            apply_republish(&mut inner, planned)
+        };
+        if pushes_exceed_capacity(republished.len()) {
+            tracing::warn!(
+                %account,
+                principals = republished.len(),
+                capacity = PUSH_CHANNEL_CAPACITY,
+                "capacity class change emitted more pushes than the channel holds; \
+                 subscribers will resync"
+            );
+        }
+        let planned_pushes = republished;
+        let republished = planned_pushes.len();
+        for (principal, snapshot) in planned_pushes {
+            self.push_to_subscribers(SnapshotPush {
+                principal,
+                resolution: SnapshotResolution::Present(snapshot),
+            });
+        }
+        Ok(StatusChange {
+            republished,
+            unreadable: 0,
+        })
+    }
+
     async fn publish_snapshot(
         &self,
         principal: Principal,
@@ -1055,13 +1146,22 @@ impl AdminStore for MemoryStore {
             // could be pulled apart again one principal at a time (#51).
             // An account the ledger does not hold publishes unchanged: this
             // adds no account-existence requirement.
-            if let Some(record) = inner.accounts.get(&snapshot.account_id)
-                && record.status != snapshot.status
-            {
-                return Err(PublishSnapshotError::StatusMismatch {
-                    ledger: record.status,
-                    submitted: snapshot.status,
-                });
+            if let Some(record) = inner.accounts.get(&snapshot.account_id) {
+                if record.status != snapshot.status {
+                    return Err(PublishSnapshotError::StatusMismatch {
+                        ledger: record.status,
+                        submitted: snapshot.status,
+                    });
+                }
+                // The capacity class is the same kind of fact and gets the
+                // same guard (#99): the ledger owns it, a publish may carry
+                // it, and only `set_capacity_class` may change it.
+                if record.capacity_class != snapshot.capacity_class {
+                    return Err(PublishSnapshotError::CapacityClassMismatch {
+                        ledger: record.capacity_class,
+                        submitted: snapshot.capacity_class,
+                    });
+                }
             }
             publish_locked(&mut inner, principal, snapshot)
         };
@@ -1395,6 +1495,7 @@ mod tests {
             account_id: ACCOUNT,
             initial_balance: CostUnits(balance),
             status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
         });
         store
     }

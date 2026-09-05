@@ -15,9 +15,9 @@ use tollgate_client::{
     TrackedPrincipals,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, DiscardedUsage,
-    FencingToken, Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex,
-    PermissionBits, Principal, PublishableSnapshot, ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, CapacityClass, CostTable, CostUnits, DenyReason,
+    DiscardedUsage, FencingToken, Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding,
+    OpIndex, PermissionBits, Principal, PublishableSnapshot, ResolvedLimits,
 };
 use tollgate_store::{
     AccountConfig, GrantPolicy, MemoryStore, SnapshotPush, SnapshotResolution, SnapshotSource,
@@ -102,6 +102,7 @@ fn base_store() -> Arc<MemoryStore> {
         account_id: ACCOUNT,
         initial_balance: CostUnits(1_000_000),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
     store
 }
