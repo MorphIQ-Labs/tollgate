@@ -1,6 +1,8 @@
 //! Contract tests for the example service: the embedding is where the
 //! product's guarantees become user-visible HTTP behavior.
 
+use std::num::NonZeroU32;
+
 use axum::body::Body;
 use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request, StatusCode, header};
@@ -10,10 +12,10 @@ use tower::ServiceExt;
 
 use pricing_api::{
     AppRuntime, DEMO_ACCOUNT, DEMO_API_KEY, DEMO_POLICY_REVISION, PricingConnection, build_app,
-    build_app_with_mode,
+    build_app_with_capacity, build_app_with_mode, demo_tenants,
 };
-use tollgate_admission::CommitRefusal;
-use tollgate_core::{CostUnits, DenyReason, EnforcementMode, RequestId};
+use tollgate_admission::{CommitRefusal, ExecutionCapacityMode};
+use tollgate_core::{CostUnits, DenyReason, EnforcementMode, LocalSharding, RequestId};
 use tollgate_store::SnapshotSource;
 
 /// Every test router needs a connection to authenticate against, because the
@@ -703,6 +705,88 @@ async fn baseline_metrics_omit_the_uninstalled_planes() {
         body["denials"].as_object().unwrap().len(),
         DenyReason::COUNT
     );
+
+    runtime.shutdown().await;
+}
+
+/// #99 end to end: two accounts of different classes serve one instance, and
+/// each start is attributed to the class that made it.
+///
+/// The pool arithmetic is proved by unit tests and the shedding by the load
+/// gate's mixed-saturation scenario, which can actually saturate. What this
+/// adds is that the class survives the whole embedding — account creation,
+/// snapshot publication against a ledger that owns the class, credential
+/// resolution, admission, and the gate — and reaches the metrics an operator
+/// reads. It is the first test here where two accounts of *different* classes
+/// serve one instance, which is the situation the class exists for.
+#[tokio::test]
+async fn two_classes_share_an_instance_and_each_start_is_attributed() {
+    let tenants = demo_tenants(1, 1);
+    let (assured, best_effort) = (tenants[0].clone(), tenants[1].clone());
+    let (router, runtime) = build_app_with_capacity(
+        1_000_000,
+        true,
+        LocalSharding::SINGLE,
+        &tenants,
+        // One shared unit and one reserve unit: the smallest configuration in
+        // which the class changes an outcome at all.
+        ExecutionCapacityMode::Reserved {
+            total: NonZeroU32::new(2).unwrap(),
+            assured_reserve: NonZeroU32::new(1).unwrap(),
+        },
+    );
+    let router = router.layer(MockConnectInfo(PricingConnection::default()));
+    // Readiness now covers every tenant, so this waits for both accounts'
+    // leases and snapshots rather than only the primary's.
+    wait_ready(&router).await;
+
+    // Both classes are served while capacity is free: the reserve exists to
+    // be unreachable under load, not to refuse work there is room for.
+    for tenant in [&assured, &best_effort] {
+        let (status, _) = call(&router, Some(&tenant.api_key), price_body(1)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{} must be served while the instance has room",
+            tenant.api_key
+        );
+    }
+
+    let metrics = metrics(&router).await;
+    assert_eq!(metrics["capacity"]["shared_total"], 1);
+    assert_eq!(metrics["capacity"]["reserve_total"], 1);
+    // Every permit was released on drop, so the instance is idle again.
+    assert_eq!(metrics["capacity"]["shared_available"], 1);
+    assert_eq!(metrics["capacity"]["reserve_available"], 1);
+    // The per-class breakdown attributes each start to the class that made
+    // it, and sums to the total beside it.
+    assert_eq!(metrics["execution_started_by_class"]["Assured"], 1);
+    assert_eq!(metrics["execution_started_by_class"]["BestEffort"], 1);
+    assert_eq!(metrics["execution_started"], 2);
+
+    runtime.shutdown().await;
+}
+
+/// A disabled instance reports no capacity at all, rather than zeroes that
+/// read as an exhausted one.
+#[tokio::test]
+async fn a_disabled_instance_reports_no_capacity_rather_than_an_empty_one() {
+    let (router, runtime) = build_test_app(1_000_000, true);
+    wait_ready(&router).await;
+    let (status, _) = call(&router, Some(DEMO_API_KEY), price_body(1)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let metrics = metrics(&router).await;
+    assert!(
+        metrics["capacity"].is_null(),
+        "a disabled gate has no pools to report: {}",
+        metrics["capacity"]
+    );
+    // The class breakdown is still present and still sums, because the
+    // counters exist whether or not a gate does.
+    assert_eq!(metrics["execution_started_by_class"]["Assured"], 1);
+    assert_eq!(metrics["execution_started_by_class"]["BestEffort"], 0);
+    assert_eq!(metrics["capacity_shed"], 0);
 
     runtime.shutdown().await;
 }

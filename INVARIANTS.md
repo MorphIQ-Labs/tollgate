@@ -1324,5 +1324,12 @@ exists to detect corrupt state and must not be able to launder it.
     `capacity/shed` scopes at zero under `./scripts/check_allocations.sh`, and
     the `capacity/disabled` : `admission/full_check` same-run ratio in
     `testing/perf_thresholds.json` bounds what the gate call costs when the
-    gate is `NoGate`.
+    gate is `NoGate`. End to end, `load/mixed_saturation` drives assured and
+    best-effort traffic at one instance and requires best-effort work to be
+    shed several times more often than assured work, with a class-blind
+    `Uniform` pool of the same size as the control that says the advantage
+    belongs to the class; `api::two_classes_share_an_instance_and_each_start_is_attributed`
+    carries the class through the whole embedding, and
+    `a_capacity_refusal_is_a_retryable_503_and_not_a_rate_limit` pins what a
+    caller is told.
     *Proof:* `formal/lean/Tollgate/ExecutionCapacity.lean`.

@@ -1,5 +1,5 @@
 {
-  "_comment": "Persistent-loopback gates for examples/pricing-api under the production profile. Request counts are totals per scenario. Absolute latency ceilings and throughput floors are provisional controlled-laptop bounds; each admitted-vs-baseline p50 ratio is portable only when its configured connection count is held constant.",
+  "_comment": "Persistent-loopback gates for examples/pricing-api under the production profile. #99 adds the distinct-account and mixed-saturation scenarios; their two p50 ratios stay null until a calibrated controlled-host run records them, while the shed thresholds gate everywhere because they are comparative: they ask whether the reserve changed the outcome, not how fast the machine is. Request counts are totals per scenario. Absolute latency ceilings and throughput floors are provisional controlled-laptop bounds; each admitted-vs-baseline p50 ratio is portable only when its configured connection count is held constant.",
   "warmup_requests": 1000,
   "measured_requests": 5000,
   "concurrent_connections": 10,
@@ -8,5 +8,10 @@
   "max_p50_ns": 200000.0,
   "max_p99_ns": 2000000.0,
   "min_throughput_requests_per_second": 20000.0,
-  "min_concurrent_throughput_requests_per_second": 60000.0
+  "min_concurrent_throughput_requests_per_second": 60000.0,
+  "max_distinct_account_p50_overhead_ratio": null,
+  "max_mixed_assured_p50_overhead_ratio": null,
+  "min_best_effort_shed_fraction": 0.02,
+  "min_assured_shed_advantage": 4.0,
+  "max_uniform_shed_advantage": 2.0
 }

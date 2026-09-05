@@ -657,6 +657,24 @@ impl CountersSnapshot {
     pub fn refused_at_start(&self) -> u64 {
         self.commit_refusals.iter().sum()
     }
+
+    /// Execution starts paired with their class labels, in slot order (#99).
+    pub fn execution_started_by_class_name(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        CAPACITY_CLASS_NAMES
+            .iter()
+            .copied()
+            .zip(self.execution_started_by_class.iter().copied())
+    }
+
+    /// Capacity sheds paired with their class labels, in slot order (#99).
+    pub fn capacity_shed_by_class_name(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        CAPACITY_CLASS_NAMES
+            .iter()
+            .copied()
+            .zip(self.capacity_shed_by_class.iter().copied())
+    }
 }
 
 #[cfg(test)]
@@ -801,6 +819,19 @@ mod tests {
         let snapshot = counters.snapshot();
         assert_eq!(snapshot.capacity_shed_by_class, [1, 3]);
         assert_eq!(snapshot.execution_started_by_class, [2, 1]);
+        // The labelled views are what an exporter reads, and they must carry
+        // the same numbers under the same names — an exporter reading an empty
+        // or invented pair would show a reserve doing nothing.
+        assert_eq!(
+            snapshot.capacity_shed_by_class_name().collect::<Vec<_>>(),
+            vec![("Assured", 1), ("BestEffort", 3)]
+        );
+        assert_eq!(
+            snapshot
+                .execution_started_by_class_name()
+                .collect::<Vec<_>>(),
+            vec![("Assured", 2), ("BestEffort", 1)]
+        );
         // The breakdown never replaces the total: a reader must not have to
         // add two numbers to get one.
         assert_eq!(

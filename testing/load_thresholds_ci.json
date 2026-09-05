@@ -1,5 +1,5 @@
 {
-  "_comment": "Automated, non-gating shared-CI evidence for examples/pricing-api. Workload and ratio ceilings intentionally match load_thresholds.json. Absolute p50/p99 ceilings and throughput floors are explicitly disabled because shared-runner performance is not calibrated; evidence mode records ratio misses without failing the job, while null values are reported as disabled rather than treated as passing measurements.",
+  "_comment": "Automated, non-gating shared-CI evidence for examples/pricing-api. #99 adds two scenarios: the distinct-account and mixed-assured p50 ratios are null until calibrated on the controlled host, and null reports as disabled rather than as passing. The shed thresholds are comparative and set in both manifests: best-effort work must be shed several times more often than assured work under a reserve, that advantage must vanish under a class-blind uniform pool of the same size, and a run that sheds no best-effort work has not saturated and has proved nothing. Workload and ratio ceilings intentionally match load_thresholds.json. Absolute p50/p99 ceilings and throughput floors are explicitly disabled because shared-runner performance is not calibrated; evidence mode records ratio misses without failing the job, while null values are reported as disabled rather than treated as passing measurements.",
   "warmup_requests": 1000,
   "measured_requests": 5000,
   "concurrent_connections": 10,
@@ -8,5 +8,10 @@
   "max_p50_ns": null,
   "max_p99_ns": null,
   "min_throughput_requests_per_second": null,
-  "min_concurrent_throughput_requests_per_second": null
+  "min_concurrent_throughput_requests_per_second": null,
+  "max_distinct_account_p50_overhead_ratio": null,
+  "max_mixed_assured_p50_overhead_ratio": null,
+  "min_best_effort_shed_fraction": 0.02,
+  "min_assured_shed_advantage": 4.0,
+  "max_uniform_shed_advantage": 2.0
 }
