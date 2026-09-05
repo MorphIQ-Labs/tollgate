@@ -28,7 +28,8 @@ fi
 # Wipe only the groups this gate owns, so unrelated criterion output (if any)
 # cannot satisfy the checker.
 rm -rf "$CRITERION_ROOT/cost_table" "$CRITERION_ROOT/snapshot" "$CRITERION_ROOT/lease" \
-       "$CRITERION_ROOT/reservation" "$CRITERION_ROOT/admission" "$CRITERION_ROOT/credential" \
+       "$CRITERION_ROOT/reservation" "$CRITERION_ROOT/admission" "$CRITERION_ROOT/capacity" \
+       "$CRITERION_ROOT/credential" \
        "$CRITERION_ROOT/credential_digest"
 mkdir -p "$(dirname "$MARKER")"
 touch "$MARKER"

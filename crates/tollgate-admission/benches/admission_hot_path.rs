@@ -21,8 +21,8 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use jiff::Timestamp;
 
 use tollgate_admission::{
-    AdmissionEngine, ArcSwapSnapshotMap, LeaseSlot, MokaSnapshotMap, Pending, Principal,
-    SnapshotMap,
+    AdmissionEngine, ArcSwapSnapshotMap, CapacityGate, ExecutionCapacityGate,
+    ExecutionCapacityMode, LeaseSlot, MokaSnapshotMap, NoGate, Pending, Principal, SnapshotMap,
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, FencingToken,
@@ -232,6 +232,21 @@ fn admit_once(engine: &AdmissionEngine<ArcSwapSnapshotMap>, principal: Principal
     black_box(admitted.cancel());
 }
 
+/// `admit_once` plus the capacity gate, then cancel — the same shape, one
+/// stage further along. Cancelling from `ReadyToStart` releases the permit and
+/// the lease debit together, so a sustained run neither drains the lease nor
+/// leaks capacity.
+fn admit_and_start_once<G: CapacityGate>(
+    engine: &AdmissionEngine<ArcSwapSnapshotMap>,
+    gate: &G,
+    principal: Principal,
+    now: Timestamp,
+) {
+    let admitted = staged_admission(engine, principal, 64, now).unwrap();
+    let ready = admitted.acquire_capacity(gate).unwrap();
+    black_box(ready.cancel());
+}
+
 fn staged_admission(
     engine: &AdmissionEngine<ArcSwapSnapshotMap>,
     principal: Principal,
@@ -271,6 +286,21 @@ fn spawn_contenders(
     engine: AdmissionEngine<ArcSwapSnapshotMap>,
     principals: impl IntoIterator<Item = Principal>,
 ) -> Contended {
+    spawn_contenders_with(engine, principals, admit_once)
+}
+
+/// The background load is a parameter because #99's capacity fixtures need
+/// their contenders to go through the gate too: measuring a gated foreground
+/// request against ungated background threads would price the gate's
+/// uncontended path and call it contention. The existing `admit_once`
+/// contenders are left exactly as they were — their manifest rows are
+/// calibrated against background threads that do not call a gate, and
+/// silently changing the load would redefine those baselines.
+fn spawn_contenders_with(
+    engine: AdmissionEngine<ArcSwapSnapshotMap>,
+    principals: impl IntoIterator<Item = Principal>,
+    work: impl Fn(&AdmissionEngine<ArcSwapSnapshotMap>, Principal, Timestamp) + Clone + Send + 'static,
+) -> Contended {
     let now = Timestamp::from_second(1_755_600_000).unwrap();
     let engine = Arc::new(engine);
     let stop = Arc::new(AtomicBool::new(false));
@@ -279,9 +309,10 @@ fn spawn_contenders(
         .map(|principal| {
             let engine = Arc::clone(&engine);
             let stop = Arc::clone(&stop);
+            let work = work.clone();
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    admit_once(&engine, principal, now);
+                    work(&engine, principal, now);
                 }
             })
         })
@@ -441,6 +472,146 @@ fn bench_full_check(c: &mut Criterion) {
     group.finish();
 }
 
+/// Execution capacity (#99), gated as its own `capacity` group.
+///
+/// The group exists so a product that selects `Disabled` is never charged for
+/// a feature it did not enable, and so the enabled modes are priced
+/// separately rather than averaged into one "capacity" number.
+///
+/// `disabled` is deliberately `admission/full_check` plus one call to
+/// `acquire_capacity`, on the same engine and the same fixture. `full_check`
+/// does not reach the gate at all, so it is a genuine denominator rather than
+/// a second measurement of the same path — the trap #102 removed. The
+/// manifest ratio between them is what holds `Disabled` to costing nothing.
+fn bench_capacity(c: &mut Criterion) {
+    let mut group = c.benchmark_group("capacity");
+    let now = Timestamp::from_second(1_755_600_000).unwrap();
+
+    let sharded = LocalSharding::new(NonZeroUsize::new(8).unwrap());
+    let enabled = |mode| {
+        ExecutionCapacityGate::new(mode, LocalSharding::SINGLE)
+            .expect("a valid capacity configuration")
+            .expect("an enabled mode builds a gate")
+    };
+    let units = |units: u32| NonZeroU32::new(units).unwrap();
+
+    // The same engine and the same 114-unit quote as `admission/full_check`,
+    // so the only difference between that row and `capacity/disabled` is the
+    // gate call itself.
+    let uncontended = engine(LocalSharding::SINGLE);
+    group.bench_function("disabled", |b| {
+        b.iter(|| admit_and_start_once(&uncontended, &NoGate, black_box(Principal(97)), now))
+    });
+
+    let uniform = enabled(ExecutionCapacityMode::Uniform {
+        total: units(4_096),
+    });
+    group.bench_function("uniform", |b| {
+        b.iter(|| admit_and_start_once(&uncontended, &uniform, black_box(Principal(97)), now))
+    });
+
+    // Reserved with room in shared: the path essentially every request under
+    // this mode takes, and the one the reserve is supposed to leave alone.
+    let reserved = enabled(ExecutionCapacityMode::Reserved {
+        total: units(4_096),
+        assured_reserve: units(64),
+    });
+    assert_eq!(
+        reserved.occupancy().shared_available,
+        4_096 - 64,
+        "reserved_shared must measure an acquisition shared can serve"
+    );
+    group.bench_function("reserved_shared", |b| {
+        b.iter(|| admit_and_start_once(&uncontended, &reserved, black_box(Principal(97)), now))
+    });
+
+    // Reserved with shared exhausted: the assured fallback, which is the only
+    // path in the system where a class changes an outcome. Shared is one unit
+    // and a single admission holds it for the whole benchmark, so every
+    // measured acquisition fails the shared compare-exchange and reaches the
+    // reserve. Saturating through a real admission rather than a fabricated
+    // permit is not incidental: `CapacityEvidence` has no public constructor,
+    // which is exactly the property that stops caller input claiming a class.
+    {
+        let saturated = enabled(ExecutionCapacityMode::Reserved {
+            total: units(2),
+            assured_reserve: units(1),
+        });
+        let holding_shared = staged_admission(&uncontended, Principal(97), 64, now)
+            .unwrap()
+            .acquire_capacity(&saturated)
+            .unwrap();
+        // A fixture that silently measured the shared path would be
+        // indistinguishable from `reserved_shared` and would report the
+        // fallback as free. The pool says which path this is.
+        assert_eq!(
+            saturated.occupancy().shared_available,
+            0,
+            "reserved_fallback must measure the reserve, not a shared pool that still has room"
+        );
+        group.bench_function("reserved_fallback", |b| {
+            b.iter(|| admit_and_start_once(&uncontended, &saturated, black_box(Principal(97)), now))
+        });
+        drop(holding_shared);
+    }
+
+    // Eight simultaneous requests across eight accounts, every one of them
+    // through the gate, against `admission/full_check_contended_8_distinct_
+    // accounts` as the same-workload denominator.
+    //
+    // The map stays on its shipped default single-counter topology, matching
+    // that denominator exactly. The *pool* is sharded, because the two are
+    // independent axes: the map partitions per-account state, while the gate
+    // is one instance-global pool every request of every account touches, so
+    // sharding it is not an opt-in layout but the configuration it is meant
+    // to run in — the reason #99 sharded it at all. The unsharded pool is
+    // measured too, and recorded in `docs/DESIGN.md` as what the sharding
+    // buys rather than gated as a topology nobody should deploy.
+    for (label, mode) in [
+        (
+            "full_check_contended_8_distinct_accounts_uniform",
+            ExecutionCapacityMode::Uniform {
+                total: units(4_096),
+            },
+        ),
+        (
+            "full_check_contended_8_distinct_accounts_reserved",
+            ExecutionCapacityMode::Reserved {
+                total: units(4_096),
+                assured_reserve: units(64),
+            },
+        ),
+    ] {
+        let gate = Arc::new(
+            ExecutionCapacityGate::new(mode, sharded)
+                .expect("a valid capacity configuration")
+                .expect("an enabled mode builds a gate"),
+        );
+        let background = Arc::clone(&gate);
+        // Principal 0 stays reserved for the foreground request, as in the
+        // ungated pair, so what is measured is engine-global contention.
+        let contended = spawn_contenders_with(
+            distinct_engine(LocalSharding::SINGLE),
+            (1..=7).map(Principal),
+            move |engine, principal, now| {
+                admit_and_start_once(engine, background.as_ref(), principal, now);
+            },
+        );
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                admit_and_start_once(
+                    contended.engine(),
+                    gate.as_ref(),
+                    black_box(Principal(0)),
+                    now,
+                )
+            })
+        });
+    }
+
+    group.finish();
+}
+
 /// A populated map whose benched principal holds a live but *empty* lease, so
 /// every admission reaches the quota step and fails it.
 fn exhausted_engine(mode: EnforcementMode) -> AdmissionEngine<ArcSwapSnapshotMap> {
@@ -553,5 +724,11 @@ fn bench_bulk_install(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_lookup, bench_full_check, bench_bulk_install);
+criterion_group!(
+    benches,
+    bench_lookup,
+    bench_full_check,
+    bench_capacity,
+    bench_bulk_install
+);
 criterion_main!(benches);

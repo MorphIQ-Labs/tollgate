@@ -3,6 +3,7 @@
   "recorded_at": "2026-09-01T13:15:10Z",
   "git_revision": "3fcac1263499e859f0ce28426645040ae7cd01cc",
   "profile": "criterion release",
+  "_comment": "Rows are recorded by the change that lands their benchmark, so the header names this file's first calibration rather than every row's. The #99 capacity rows below were measured on the same host by a full `check_perf_thresholds.sh` run, which is the only context these means are comparable in: a filtered run measures the same code materially differently.",
   "benchmarks": [
     { "id": "cost_table/quote", "mean_ns": 1.696 },
     { "id": "snapshot/admit", "mean_ns": 1.123 },
@@ -23,6 +24,12 @@
     { "id": "admission/full_check_lease_exhausted_elastic", "mean_ns": 121.074 },
     { "id": "admission/request_rate_token", "mean_ns": 108.588 },
     { "id": "admission/concurrency_acquire", "mean_ns": 2971.886 },
-    { "id": "credential/verify_cached", "mean_ns": 16.111 }
+    { "id": "credential/verify_cached", "mean_ns": 16.111 },
+    { "id": "capacity/disabled", "mean_ns": 123.611 },
+    { "id": "capacity/uniform", "mean_ns": 134.676 },
+    { "id": "capacity/reserved_shared", "mean_ns": 133.748 },
+    { "id": "capacity/reserved_fallback", "mean_ns": 132.628 },
+    { "id": "capacity/full_check_contended_8_distinct_accounts_uniform", "mean_ns": 1452.628, "max_regression": 0.15 },
+    { "id": "capacity/full_check_contended_8_distinct_accounts_reserved", "mean_ns": 1456.763, "max_regression": 0.15 }
   ]
 }
