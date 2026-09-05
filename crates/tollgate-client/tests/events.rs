@@ -15,7 +15,9 @@ use jiff::{SignedDuration, Timestamp};
 
 use tollgate_admission::LeaseSlot;
 use tollgate_client::{LeaseManager, LeaseManagerConfig, ManualClock, UsageWriter};
-use tollgate_core::{AccountId, AccountStatus, CostUnits, PolicyRevision, UsageEvent, UsageSource};
+use tollgate_core::{
+    AccountId, AccountStatus, CapacityClass, CostUnits, PolicyRevision, UsageEvent, UsageSource,
+};
 use tollgate_store::{
     AccountConfig, AllocateError, GrantPolicy, IngestError, IngestReport, LeaseAllocator,
     MemoryStore, ReclaimBatch, StoreError, UsageSink,
@@ -168,6 +170,7 @@ fn store(balance: u64) -> Arc<MemoryStore> {
         account_id: ACCOUNT,
         initial_balance: CostUnits(balance),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
     store
 }

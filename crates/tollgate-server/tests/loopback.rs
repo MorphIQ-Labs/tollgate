@@ -21,10 +21,10 @@ use tollgate_client::{
     SnapshotManagerConfig, SystemClock, TrackedPrincipals, UsageWriter, UsageWriterConfig,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, DiscardedUsage,
-    FencingToken, Generation, KeyId, LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits,
-    PolicyRevision, Principal, PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent,
-    UsageSource,
+    AccountId, AccountSnapshot, AccountStatus, CapacityClass, CostTable, CostUnits, DenyReason,
+    DiscardedUsage, FencingToken, Generation, KeyId, LeaseGrant, LeaseId, LocalLease, OpIndex,
+    PermissionBits, PolicyRevision, Principal, PublishableSnapshot, RequestId, ResolvedLimits,
+    UsageEvent, UsageSource,
 };
 use tollgate_store::wire::{API_PREFIX, MAX_INGEST_BODY_BYTES};
 use tollgate_store::{
@@ -274,6 +274,7 @@ async fn full_stack_over_loopback_http() {
         account_id: ACCOUNT,
         initial_balance: CostUnits(DEPOSIT),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
     store.publish_snapshot(PRINCIPAL, publishable(snapshot()));
 
@@ -427,6 +428,7 @@ async fn http_instance_discovers_a_principal_published_after_it_started() {
         account_id: ACCOUNT,
         initial_balance: CostUnits(1_000_000),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
     store.publish_snapshot(PRINCIPAL, publishable(snapshot()));
 
@@ -517,6 +519,7 @@ async fn an_oversized_batch_comes_back_refused_not_retryable() {
         account_id: ACCOUNT,
         initial_balance: CostUnits(1_000_000),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
     let app = router(ServerState {
         store: Arc::clone(&store),

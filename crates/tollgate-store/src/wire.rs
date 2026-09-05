@@ -12,8 +12,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostUnits, FencingToken, Generation, LeaseGrant,
-    LeaseId, UsageEvent,
+    AccountId, AccountSnapshot, AccountStatus, CapacityClass, CostUnits, FencingToken, Generation,
+    LeaseGrant, LeaseId, UsageEvent,
 };
 
 /// Current HTTP wire-contract prefix.
@@ -137,6 +137,22 @@ pub struct DepositRequest {
 /// forbid, so the field is renamed and an old body fails loudly.
 pub struct SetStatusRequest {
     pub status: AccountStatus,
+}
+
+/// The one operator action for an account's execution-capacity class (#99).
+///
+/// Its own request type rather than an optional field on
+/// [`SetStatusRequest`]: the two are different operator decisions about
+/// different axes, and a combined body would make "change the status" and
+/// "change the class" indistinguishable from "change the status and leave the
+/// class alone" without a nested `Option` nobody would enjoy reading.
+///
+/// The response is [`SetStatusResponse`], reused deliberately: both actions
+/// answer the same question — how many live snapshots did this move, and how
+/// many rows could not be pushed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SetCapacityClassRequest {
+    pub capacity_class: CapacityClass,
 }
 
 /// What a status change did, so an operator learns its blast radius at the

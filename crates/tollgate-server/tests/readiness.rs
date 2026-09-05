@@ -9,7 +9,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
 
-use tollgate_core::{AccountId, AccountStatus, CostUnits, Principal, PublishableSnapshot};
+use tollgate_core::{
+    AccountId, AccountStatus, CapacityClass, CostUnits, Principal, PublishableSnapshot,
+};
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, CreateAccountError, IngestError, IngestReport,
     LeaseAllocator, PublishSnapshotError, ReclaimBatch, SetStatusError, SnapshotPush,
@@ -103,6 +105,14 @@ impl AdminStore for PingOnlyStore {
         &self,
         _account: AccountId,
         _status: AccountStatus,
+    ) -> Result<StatusChange, SetStatusError> {
+        unreachable!("readiness never administers")
+    }
+
+    async fn set_capacity_class(
+        &self,
+        _account: AccountId,
+        _class: CapacityClass,
     ) -> Result<StatusChange, SetStatusError> {
         unreachable!("readiness never administers")
     }

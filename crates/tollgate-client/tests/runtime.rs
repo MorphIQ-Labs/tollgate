@@ -16,9 +16,9 @@ use tollgate_client::{
     UsageWriterConfig,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, DenyReason, Generation,
-    LeaseGrant, LocalLease, LocalSharding, OpIndex, PermissionBits, PolicyRevision, Principal,
-    RequestId, ResolvedLimits, UsageEvent, UsageSource,
+    AccountId, AccountSnapshot, AccountStatus, CapacityClass, CostTable, CostUnits, DenyReason,
+    Generation, LeaseGrant, LocalLease, LocalSharding, OpIndex, PermissionBits, PolicyRevision,
+    Principal, RequestId, ResolvedLimits, UsageEvent, UsageSource,
 };
 use tollgate_store::{
     AccountConfig, GrantPolicy, IngestError, IngestReport, LeaseAllocator, MemoryStore,
@@ -85,6 +85,7 @@ fn store(balance: u64) -> Arc<MemoryStore> {
         account_id: ACCOUNT,
         initial_balance: CostUnits(balance),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
     store
 }
@@ -216,6 +217,7 @@ async fn adaptive_tail_grant_does_not_rotate_while_unspent() {
         account_id: ACCOUNT,
         initial_balance: CostUnits(50),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
     let clock = Arc::new(ManualClock::new(t(0)));
     let slot = LeaseSlot::for_account(ACCOUNT);
@@ -333,6 +335,7 @@ async fn usability_window_rollover_returns_unspent_capacity() {
         account_id: ACCOUNT,
         initial_balance: CostUnits(1_000),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
     let slot = LeaseSlot::for_account(ACCOUNT);
     let clock = Arc::new(ManualClock::new(t(0)));

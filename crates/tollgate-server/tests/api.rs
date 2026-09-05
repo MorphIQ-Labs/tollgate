@@ -11,7 +11,7 @@ use jiff::Timestamp;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use tollgate_core::{AccountId, AccountStatus, CostUnits, Principal};
+use tollgate_core::{AccountId, AccountStatus, CapacityClass, CostUnits, Principal};
 use tollgate_store::wire::API_PREFIX;
 use tollgate_store::{AccountConfig, GrantPolicy, ManualClock, MemoryStore};
 
@@ -75,6 +75,7 @@ async fn lease_lifecycle_over_http() {
         account_id: AccountId(1),
         initial_balance: CostUnits(1_000),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
 
     let (status, grant) = call(
@@ -124,6 +125,7 @@ async fn problem_codes_are_stable() {
         account_id: AccountId(8),
         initial_balance: CostUnits(100),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
     let (status, problem) = call(
         &router,
@@ -141,6 +143,7 @@ async fn problem_codes_are_stable() {
         account_id: AccountId(1),
         initial_balance: CostUnits(100),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
     let (_, grant) = call(
         &router,
@@ -325,6 +328,7 @@ async fn admin_preserves_new_limit_fields_over_http() {
         account_id: AccountId(1),
         initial_balance: CostUnits(1_000),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
     let snapshot = json!({
         "account_id": id(1),
@@ -392,6 +396,7 @@ async fn admin_preserves_the_policy_revision_over_http() {
         account_id: AccountId(1),
         initial_balance: CostUnits(1_000),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
     let revision = "5c".repeat(32);
     let base = json!({
@@ -462,6 +467,7 @@ async fn admin_refuses_a_noncanonical_policy_revision() {
         account_id: AccountId(1),
         initial_balance: CostUnits(1_000),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
     for bad in [
         "5C".repeat(32), // uppercase

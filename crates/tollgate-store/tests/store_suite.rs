@@ -9,9 +9,9 @@ use std::sync::Arc;
 use jiff::{SignedDuration, Timestamp};
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, BudgetSchedule, BudgetView, CostTable, CostUnits,
-    FencingToken, Generation, KeyId, LeaseId, PermissionBits, PolicyRevision, Principal,
-    PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent, UsageSource,
+    AccountId, AccountSnapshot, AccountStatus, BudgetSchedule, BudgetView, CapacityClass,
+    CostTable, CostUnits, FencingToken, Generation, KeyId, LeaseId, PermissionBits, PolicyRevision,
+    Principal, PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent, UsageSource,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, BudgetError, Conservation, CreateAccountError,
@@ -73,6 +73,7 @@ fn store_with_balance(policy: GrantPolicy, balance: u64) -> Arc<MemoryStore> {
         account_id: ACCOUNT,
         initial_balance: CostUnits(balance),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
     store
 }
@@ -269,6 +270,7 @@ async fn usage_rejects_mismatched_lease_capability() {
             account_id: OTHER,
             initial_balance: CostUnits(100),
             status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
         },
     )
     .await
@@ -350,6 +352,7 @@ async fn expired_backlog_is_reclaimed_in_bounded_batches() {
             account_id: OTHER,
             initial_balance: CostUnits(400),
             status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
         },
     )
     .await
@@ -455,6 +458,7 @@ async fn mixed_usage_batch_preserves_partial_acceptance() {
             account_id: OTHER,
             initial_balance: CostUnits(400),
             status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
         },
     )
     .await
@@ -685,6 +689,7 @@ async fn recreate_account_is_refused_and_nondestructive() {
                 account_id: ACCOUNT,
                 initial_balance: CostUnits(5),
                 status: AccountStatus::Active,
+                capacity_class: CapacityClass::Assured,
             },
         )
         .await
@@ -761,6 +766,7 @@ async fn creating_a_suspended_account_denies_from_birth() {
             account_id: ACCOUNT,
             initial_balance: CostUnits(1_000),
             status: AccountStatus::Suspended,
+            capacity_class: CapacityClass::Assured,
         })
         .expect("creation succeeds");
 
@@ -1109,6 +1115,7 @@ async fn suspension_republishes_only_the_suspended_accounts_snapshots() {
         account_id: other_account,
         initial_balance: CostUnits(1_000),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
     let mine = Principal(10);
     let theirs = Principal(20);
@@ -1287,6 +1294,316 @@ async fn a_closed_account_cannot_be_reactivated() {
 /// Convergent, not merely idempotent: a repeat rewrites nothing, so it bumps
 /// no generation and emits no push. Generation churn on every retry would
 /// invalidate every instance's cache for no change.
+/// The class is one fact with one writer, and the operator action moves both
+/// records (#99). Exactly the ownership `set_account_status` established: a
+/// control plane publishing it per credential would leave some of an account's
+/// principals assured and some best-effort, with a request's treatment
+/// depending on which credential it arrived with.
+#[tokio::test]
+async fn a_capacity_class_change_republishes_every_live_snapshot() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let first = Principal(10);
+    let second = Principal(11);
+    for principal in [first, second] {
+        AdminStore::publish_snapshot(
+            &*store,
+            principal,
+            publishable(Arc::new(account_snapshot(
+                ACCOUNT,
+                3,
+                AccountStatus::Active,
+            ))),
+        )
+        .await
+        .unwrap();
+    }
+
+    let change = AdminStore::set_capacity_class(&*store, ACCOUNT, CapacityClass::BestEffort)
+        .await
+        .unwrap();
+    assert_eq!((change.republished, change.unreadable), (2, 0));
+
+    for principal in [first, second] {
+        let SnapshotResolution::Present(snapshot) = store.snapshot(principal).await.unwrap() else {
+            panic!("the snapshot must be present");
+        };
+        assert_eq!(snapshot.capacity_class, CapacityClass::BestEffort);
+        assert_eq!(snapshot.generation, Generation(4));
+        assert_eq!(
+            snapshot.status,
+            AccountStatus::Active,
+            "a class change must not touch the other account-owned fact"
+        );
+    }
+}
+
+/// A repeat converges: nothing is rewritten and no generation moves, so an
+/// operator retrying a class change does not invalidate every instance's
+/// pinned snapshot for nothing.
+#[tokio::test]
+async fn repeating_a_capacity_class_change_publishes_nothing_new() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let principal = Principal(10);
+    AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            3,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+    AdminStore::set_capacity_class(&*store, ACCOUNT, CapacityClass::BestEffort)
+        .await
+        .unwrap();
+
+    let change = AdminStore::set_capacity_class(&*store, ACCOUNT, CapacityClass::BestEffort)
+        .await
+        .unwrap();
+    assert_eq!((change.republished, change.unreadable), (0, 0));
+
+    let SnapshotResolution::Present(snapshot) = store.snapshot(principal).await.unwrap() else {
+        panic!("the snapshot must be present");
+    };
+    assert_eq!(
+        snapshot.generation,
+        Generation(4),
+        "the repeat bumped nothing"
+    );
+}
+
+/// Reclassifying must not resurrect a tombstone (INVARIANTS.md #15) — the same
+/// rule a status change follows, and the reason `plan_republish` skips revoked
+/// records rather than filtering by account alone.
+#[tokio::test]
+async fn a_capacity_class_change_does_not_resurrect_revoked_principals() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let live = Principal(10);
+    let revoked = Principal(11);
+    for principal in [live, revoked] {
+        AdminStore::publish_snapshot(
+            &*store,
+            principal,
+            publishable(Arc::new(account_snapshot(
+                ACCOUNT,
+                3,
+                AccountStatus::Active,
+            ))),
+        )
+        .await
+        .unwrap();
+    }
+    AdminStore::remove_snapshot(&*store, revoked).await.unwrap();
+
+    let change = AdminStore::set_capacity_class(&*store, ACCOUNT, CapacityClass::BestEffort)
+        .await
+        .unwrap();
+    assert_eq!(change.republished, 1, "only the live principal moved");
+    assert!(matches!(
+        store.snapshot(revoked).await.unwrap(),
+        SnapshotResolution::Revoked { .. }
+    ));
+}
+
+/// One writer for one fact: a publish may *carry* the account's class but may
+/// not change it. Without this guard a control plane could reintroduce, one
+/// principal at a time, exactly the divergence the account-wide mutation
+/// exists to abolish.
+#[tokio::test]
+async fn a_publish_contradicting_the_ledger_class_is_refused() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let principal = Principal(10);
+
+    let mut snapshot = account_snapshot(ACCOUNT, 3, AccountStatus::Active);
+    snapshot.capacity_class = CapacityClass::BestEffort;
+    let error = AdminStore::publish_snapshot(&*store, principal, publishable(Arc::new(snapshot)))
+        .await
+        .expect_err("a publish may not change the account's class");
+    assert!(matches!(
+        error,
+        PublishSnapshotError::CapacityClassMismatch {
+            ledger: CapacityClass::Assured,
+            submitted: CapacityClass::BestEffort,
+        }
+    ));
+
+    // Carrying the current class is fine.
+    AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            3,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .expect("a publish carrying the ledger's class is accepted");
+}
+
+/// The other half of one-writer-for-one-fact: once the ledger *has* been
+/// reclassified, a publish carrying the new class is accepted and one carrying
+/// the old one is refused.
+///
+/// The refusal test above only ever reads an `Assured` ledger, so a backend
+/// that recognized `Assured` and nothing else would satisfy it. That is not a
+/// hypothetical shape: PostgreSQL reads the class back from a stored string,
+/// and mutation testing showed its `BestEffort` arm could be deleted with
+/// every class test still green.
+#[tokio::test]
+async fn a_publish_matching_a_reclassified_ledger_is_accepted() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let principal = Principal(10);
+    AdminStore::set_capacity_class(&*store, ACCOUNT, CapacityClass::BestEffort)
+        .await
+        .unwrap();
+
+    let mut matching = account_snapshot(ACCOUNT, 3, AccountStatus::Active);
+    matching.capacity_class = CapacityClass::BestEffort;
+    AdminStore::publish_snapshot(&*store, principal, publishable(Arc::new(matching)))
+        .await
+        .expect("a publish carrying the ledger's current class is accepted");
+
+    // And the default is now the contradiction, in the direction the first
+    // test cannot reach.
+    let error = AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            4,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .expect_err("`Assured` now contradicts the ledger");
+    assert!(matches!(
+        error,
+        PublishSnapshotError::CapacityClassMismatch {
+            ledger: CapacityClass::BestEffort,
+            submitted: CapacityClass::Assured,
+        }
+    ));
+}
+
+/// An account is *born* with its class, not merely reclassified into one.
+///
+/// `AccountConfig` carries the field, and nothing else read it back: every
+/// existing scenario creates an `Assured` account, so a `create_account` that
+/// ignored the config and stored the default would satisfy the entire suite.
+/// This is the class sibling of `creating_a_suspended_account_denies_from_birth`.
+#[tokio::test]
+async fn an_account_can_be_born_best_effort() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let born = AccountId(77);
+    store.create_account(AccountConfig {
+        account_id: born,
+        initial_balance: CostUnits(1_000),
+        status: AccountStatus::Active,
+        capacity_class: CapacityClass::BestEffort,
+    });
+
+    let mut snapshot = account_snapshot(born, 3, AccountStatus::Active);
+    snapshot.capacity_class = CapacityClass::BestEffort;
+    AdminStore::publish_snapshot(&*store, Principal(20), publishable(Arc::new(snapshot)))
+        .await
+        .expect("the account was created best-effort, so a matching publish is accepted");
+
+    let error = AdminStore::publish_snapshot(
+        &*store,
+        Principal(21),
+        publishable(Arc::new(account_snapshot(born, 3, AccountStatus::Active))),
+    )
+    .await
+    .expect_err("`Assured` contradicts the class the account was born with");
+    assert!(matches!(
+        error,
+        PublishSnapshotError::CapacityClassMismatch {
+            ledger: CapacityClass::BestEffort,
+            submitted: CapacityClass::Assured,
+        }
+    ));
+}
+
+/// The class sibling of `a_status_change_that_cannot_republish_moves_neither_record`.
+///
+/// The two transitions share one republish routine, so the *plan-before-apply*
+/// rule is proved once for both; what this adds is that the class change's own
+/// ledger write is inside that atomicity rather than beside it. Writing the
+/// column and then republishing would leave a best-effort account with assured
+/// snapshots behind an overflow — the divergence INVARIANTS.md #22 forbids,
+/// reached from inside the mechanism that exists to prevent it.
+#[tokio::test]
+async fn a_capacity_class_change_that_cannot_republish_moves_neither_record() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let principal = Principal(10);
+    AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            u64::MAX,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+
+    let error = AdminStore::set_capacity_class(&*store, ACCOUNT, CapacityClass::BestEffort)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, SetStatusError::Storage(_)),
+        "an unrepublishable snapshot surfaces, rather than being skipped: {error:?}"
+    );
+
+    let SnapshotResolution::Present(snapshot) = store.snapshot(principal).await.unwrap() else {
+        panic!("the snapshot must still be present");
+    };
+    assert_eq!(
+        (snapshot.capacity_class, snapshot.generation),
+        (CapacityClass::Assured, Generation(u64::MAX)),
+        "the snapshot half did not move"
+    );
+
+    // And neither did the ledger: a publish carrying `Assured` is still the
+    // one that matches.
+    AdminStore::publish_snapshot(
+        &*store,
+        Principal(11),
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            3,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .expect("the ledger half did not move either");
+}
+
+/// An unknown account is a refusal, never a silent no-op, and a closed account
+/// is terminal — the same two conditions `set_account_status` enforces, which
+/// is why they share `SetStatusError`.
+#[tokio::test]
+async fn reclassifying_an_unknown_or_closed_account_is_refused() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    assert!(matches!(
+        AdminStore::set_capacity_class(&*store, AccountId(u128::MAX), CapacityClass::BestEffort)
+            .await,
+        Err(SetStatusError::UnknownAccount)
+    ));
+
+    AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Closed)
+        .await
+        .unwrap();
+    assert!(matches!(
+        AdminStore::set_capacity_class(&*store, ACCOUNT, CapacityClass::BestEffort).await,
+        Err(SetStatusError::AccountClosed)
+    ));
+}
+
 #[tokio::test]
 async fn repeating_a_status_change_publishes_nothing_new() {
     let store = store_with_balance(GrantPolicy::default(), 1_000);
@@ -1872,6 +2189,7 @@ async fn a_refused_deposit_moves_neither_column() {
         account_id: ACCOUNT,
         initial_balance: CostUnits(u64::MAX),
         status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
     });
     // Spend some balance so `balance < deposited`, which is the ordering that
     // makes `deposited` overflow while `balance` still has room.
@@ -2433,6 +2751,7 @@ async fn the_rollover_pass_is_bounded_and_saturation_says_there_is_more() {
             account_id: AccountId(id),
             initial_balance: CostUnits::ZERO,
             status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
         });
         store
             .set_budget_schedule(AccountId(id), Some(monthly(100)))
@@ -2475,6 +2794,7 @@ async fn an_unscheduled_account_is_never_selected() {
             account_id: AccountId(id),
             initial_balance: CostUnits(10),
             status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
         });
     }
     store

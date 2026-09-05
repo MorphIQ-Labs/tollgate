@@ -32,11 +32,12 @@ use axum::{Json, Router};
 use jiff::SignedDuration;
 use tracing::Instrument as _;
 
-use tollgate_core::{AccountId, CostUnits, Principal, PublishableSnapshot};
+use tollgate_core::{AccountId, CapacityClass, CostUnits, Principal, PublishableSnapshot};
 use tollgate_store::wire::{
     API_PREFIX, AcquireRequest, AcquireResponse, CreateAccountRequest, DepositRequest,
     IngestRequest, MAX_INGEST_BODY_BYTES, MAX_SNAPSHOT_BODY_BYTES, PrincipalsResponse,
-    PublishSnapshotRequest, ReleaseRequest, SetStatusRequest, SetStatusResponse,
+    PublishSnapshotRequest, ReleaseRequest, SetCapacityClassRequest, SetStatusRequest,
+    SetStatusResponse,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, Clock, DEFAULT_RECLAIM_BATCH_LIMIT, DEFAULT_ROLLOVER_BATCH_LIMIT,
@@ -105,6 +106,10 @@ pub fn router<S: Backend>(state: ServerState<S>) -> Router {
                 .route("/admin/accounts", post(create_account::<S>))
                 .route("/admin/accounts/{account}/deposit", post(deposit::<S>))
                 .route("/admin/accounts/{account}/status", post(set_status::<S>))
+                .route(
+                    "/admin/accounts/{account}/capacity-class",
+                    post(set_capacity_class::<S>),
+                )
                 // A snapshot carries its whole cost table, so its worst
                 // case grows with the number of priced classes rather than
                 // with a batch size. Given its own limit for the same reason
@@ -446,6 +451,7 @@ async fn create_account<S: Backend>(
             account_id: request.account_id,
             initial_balance: request.initial_balance,
             status: request.status,
+            capacity_class: CapacityClass::Assured,
         })
         .await?;
     Ok(StatusCode::CREATED)
@@ -477,6 +483,24 @@ async fn set_status<S: Backend>(
     let change = state
         .store
         .set_account_status(account, request.status)
+        .await?;
+    Ok(Json(SetStatusResponse {
+        republished: change.republished,
+        unreadable: change.unreadable,
+    }))
+}
+
+async fn set_capacity_class<S: Backend>(
+    State(state): State<ServerState<S>>,
+    ApiPath(account): ApiPath<AccountId>,
+    ApiJson(request): ApiJson<SetCapacityClassRequest>,
+) -> Result<Json<SetStatusResponse>, ApiError> {
+    // 200 with the blast radius, for the reason `set_status` returns one: the
+    // ledger half is one row and the snapshot half is however many credentials
+    // the account has (#99).
+    let change = state
+        .store
+        .set_capacity_class(account, request.capacity_class)
         .await?;
     Ok(Json(SetStatusResponse {
         republished: change.republished,

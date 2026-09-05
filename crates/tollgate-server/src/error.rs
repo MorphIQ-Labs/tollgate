@@ -220,6 +220,16 @@ impl From<PublishSnapshotError> for ApiError {
                 title: e.to_string(),
                 generation: None,
             },
+            // 409 for the reason the status mismatch is: the request is
+            // well-formed and the operator is not at fault — the account
+            // simply owns this fact, and it is changed through its own
+            // endpoint (#99).
+            PublishSnapshotError::CapacityClassMismatch { .. } => ApiError {
+                status: StatusCode::CONFLICT,
+                code: "snapshot-capacity-class-mismatch",
+                title: e.to_string(),
+                generation: None,
+            },
             PublishSnapshotError::Storage(inner) => ApiError::from(inner),
         }
     }

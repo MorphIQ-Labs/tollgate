@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, Generation, PermissionBits,
-    Principal, PublishableSnapshot, ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, CapacityClass, CostTable, CostUnits, Generation,
+    PermissionBits, Principal, PublishableSnapshot, ResolvedLimits,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, GrantPolicy, MemoryStore, SetStatusError, SnapshotResolution,
@@ -67,6 +67,7 @@ proptest! {
                     account_id: *account,
                     initial_balance: CostUnits(1_000),
                     status: AccountStatus::Active,
+                    capacity_class: CapacityClass::Assured,
                 });
                 for slot in 0..principals {
                     let principal = Principal((index * principals + slot) as u128 + 1);

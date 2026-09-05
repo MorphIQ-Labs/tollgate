@@ -36,9 +36,10 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, BudgetSchedule, BudgetView, CostTable, CostUnits,
-    EnforcementMode, FencingToken, Generation, KeyId, LeaseGrant, LeaseId, Period, PermissionBits,
-    PolicyRevision, Principal, PublishableSnapshot, ResolvedLimits, Rollover, UsageEvent,
+    AccountId, AccountSnapshot, AccountStatus, BudgetSchedule, BudgetView, CapacityClass,
+    CostTable, CostUnits, EnforcementMode, FencingToken, Generation, KeyId, LeaseGrant, LeaseId,
+    Period, PermissionBits, PolicyRevision, Principal, PublishableSnapshot, ResolvedLimits,
+    Rollover, UsageEvent,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, BudgetError, Conservation, CreateAccountError,
@@ -262,6 +263,9 @@ struct StoredSnapshotRef<'a> {
     account_id: StoredId,
     key_id: Option<StoredId>,
     status: &'a AccountStatus,
+    /// The account-owned execution-capacity class (#99). Rides the JSONB
+    /// document; omitting it here would drop it on every publish.
+    capacity_class: &'a CapacityClass,
     enforcement_mode: &'a EnforcementMode,
     valid_until: &'a Timestamp,
     permissions: &'a PermissionBits,
@@ -284,6 +288,7 @@ impl<'a> From<&'a AccountSnapshot> for StoredSnapshotRef<'a> {
             account_id: StoredId(snapshot.account_id.0),
             key_id: snapshot.key_id.map(|id| StoredId(id.0)),
             status: &snapshot.status,
+            capacity_class: &snapshot.capacity_class,
             enforcement_mode: &snapshot.enforcement_mode,
             valid_until: &snapshot.valid_until,
             permissions: &snapshot.permissions,
@@ -303,6 +308,13 @@ struct StoredSnapshot {
     account_id: StoredId,
     key_id: Option<StoredId>,
     status: AccountStatus,
+    /// Absent from every row written before #99, and `default` for the reason
+    /// the fields below are: a required field would make every pre-existing
+    /// row fail to decode and deny every principal until the whole catalogue
+    /// was republished. `Assured` is the safe default — the availability every
+    /// account already has.
+    #[serde(default)]
+    capacity_class: CapacityClass,
     /// Absent from every row written before elastic mode existed, and those
     /// rows are the overwhelming majority the first time this ships.
     ///
@@ -352,6 +364,7 @@ impl StoredSnapshot {
             self.cost_table,
         )
         .enforcement_mode(self.enforcement_mode)
+        .capacity_class(self.capacity_class)
         .policy_revision(self.policy_revision);
         match self.key_id {
             Some(key_id) => builder.key_id(tollgate_core::KeyId(key_id.0)).build(),
@@ -1738,6 +1751,22 @@ fn decode_status(stored: String) -> Result<AccountStatus, StoreError> {
     }
 }
 
+/// The ledger's execution-capacity class, or a refusal for a spelling the
+/// vocabulary does not contain (#99).
+///
+/// Never defaults to `Assured`, for the reason [`decode_status`] never defaults
+/// to `Active`. A value the `CHECK` constraint should have made impossible
+/// means the row was written outside this code, and admitting it as `Assured`
+/// would turn corruption into unconditional capacity — the permissive answer,
+/// arrived at by accident.
+fn decode_capacity_class(stored: String) -> Result<CapacityClass, StoreError> {
+    match stored.as_str() {
+        s if s == CapacityClass::Assured.as_str() => Ok(CapacityClass::Assured),
+        s if s == CapacityClass::BestEffort.as_str() => Ok(CapacityClass::BestEffort),
+        other => Err(StoreError(format!("unrecognized capacity class {other:?}"))),
+    }
+}
+
 /// Rebuild an account's schedule from its three stored columns.
 ///
 /// `None` is "no schedule", and it is only reachable when all three are NULL:
@@ -1942,19 +1971,103 @@ impl StoreHealth for PostgresStore {
     }
 }
 
+/// Re-stamp every live snapshot of `account`, patching one JSON key, and
+/// report which principals to push and how many rows could not be decoded.
+///
+/// Shared by the two account-owned facts that republish — status (#51) and
+/// execution-capacity class (#99). They differ in their precondition and their
+/// ledger column; everything below is identical, and it is the part where the
+/// subtlety lives, so it is written once.
+///
+/// `jsonb_set` rather than read-modify-write in Rust, for three reasons any
+/// one of which decides it:
+///
+/// 1. RMW reintroduces #51's own bug. A concurrent `publish_snapshot` landing
+///    between the read and the write makes `generation + 1` no longer greater
+///    than stored, and the monotonic guard then *silently drops the change*
+///    for that principal.
+/// 2. RMW loses fields. `StoredSnapshot` has no `flatten`, so decoding and
+///    re-serialising a row written by a newer binary discards what this one
+///    does not know about.
+/// 3. RMW fails whole on one bad row. A safety operation must not be blockable
+///    by one unrelated corrupt credential.
+///
+/// Only the named key is patched. The generation lives in the column alone
+/// (#54), and `RETURNING generation` carries the new value out to the push.
+///
+/// `deleted = FALSE` leaves tombstones alone: republishing one would resurrect
+/// a revoked principal (INVARIANTS.md #15), and revocation stays its own
+/// per-credential mechanism. `IS DISTINCT FROM` makes a repeat converge,
+/// bumping nothing — and note that a document predating the key has SQL NULL
+/// there, so the first change of a newly added fact rewrites every row once.
+async fn republish_patched_snapshots(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account: AccountId,
+    json_path: &'static str,
+    value: &str,
+) -> Result<(Vec<(Principal, PublishableSnapshot)>, usize), SetStatusError> {
+    let rows = sqlx::query(
+        "UPDATE tollgate_snapshots
+            SET generation = generation + 1,
+                snapshot   = jsonb_set(snapshot, $3::text[], to_jsonb($2::text))
+          WHERE account_id = $1
+            AND deleted = FALSE
+            AND snapshot #>> $3::text[] IS DISTINCT FROM $2::text
+        RETURNING principal, generation, snapshot",
+    )
+    .bind(id_bytes(account.0))
+    .bind(value)
+    .bind(json_path)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(storage)?;
+
+    let mut republished = Vec::with_capacity(rows.len());
+    let mut unreadable = 0usize;
+    for row in rows {
+        let principal = Principal(id_from(row.get::<Vec<u8>, _>(0).as_slice()));
+        match decode_publishable(
+            principal,
+            row.get::<i64, _>(1),
+            row.get::<serde_json::Value, _>(2),
+        ) {
+            Ok(snapshot) => republished.push((principal, snapshot)),
+            // Skipped for push, not fatal: this row was already unreadable
+            // before the change touched it, and refusing to suspend or
+            // reclassify an account because one of its credentials is corrupt
+            // is the worse outcome. Reported, never silent (INVARIANTS.md
+            // #19). Counted as well as logged: the row changed durably but
+            // will not be pushed, so those principals converge only at their
+            // next refresh.
+            Err(error) => {
+                unreadable += 1;
+                tracing::warn!(
+                    %principal,
+                    %error,
+                    "restamped snapshot could not be decoded for push"
+                );
+            }
+        }
+    }
+    // Ordered, so both backends emit the same sequence and a mirrored test
+    // need not assert on incidental ordering.
+    republished.sort_unstable_by_key(|(principal, _)| *principal);
+    Ok((republished, unreadable))
+}
 #[async_trait]
 impl AdminStore for PostgresStore {
     async fn create_account(&self, config: AccountConfig) -> Result<(), CreateAccountError> {
         let result = sqlx::query(
             "INSERT INTO tollgate_accounts
-             (account_id, balance, deposited, status, next_fence, usage_recorded,
-              settlement_loss, overage_recorded)
-             VALUES ($1, $2, $2, $3, 1, 0, 0, 0)
+             (account_id, balance, deposited, status, capacity_class, next_fence,
+              usage_recorded, settlement_loss, overage_recorded)
+             VALUES ($1, $2, $2, $3, $4, 1, 0, 0, 0)
              ON CONFLICT (account_id) DO NOTHING",
         )
         .bind(id_bytes(config.account_id.0))
         .bind(to_i64(config.initial_balance, "balance").map_err(CreateAccountError::Storage)?)
         .bind(config.status.as_str())
+        .bind(config.capacity_class.as_str())
         .execute(&self.pool)
         .await
         .map_err(|e| CreateAccountError::Storage(storage(e)))?;
@@ -2119,77 +2232,7 @@ impl AdminStore for PostgresStore {
                 .await
                 .map_err(storage)?;
 
-            // `jsonb_set` rather than read-modify-write in Rust, for three
-            // reasons any one of which decides it:
-            //
-            // 1. RMW reintroduces this issue's own bug. A concurrent
-            //    `publish_snapshot` landing between the read and the write
-            //    makes `generation + 1` no longer greater than stored, and the
-            //    monotonic guard then *silently drops the status change* for
-            //    that principal.
-            // 2. RMW loses fields. `StoredSnapshot` has no `flatten`, so
-            //    decoding and re-serialising a row written by a newer binary
-            //    discards what this one does not know about.
-            // 3. RMW fails whole on one bad row. A safety operation must not
-            //    be blockable by one unrelated corrupt credential.
-            //
-            // Only `status` is patched into the JSON. The generation lives in
-            // the column alone (#54), so this no longer has to keep a second
-            // copy in step -- and `RETURNING generation` is what carries the
-            // new value out to the push.
-            //
-            // `deleted = FALSE` leaves tombstones alone: republishing one
-            // would resurrect a revoked principal (INVARIANTS.md #15), and
-            // revocation stays its own per-credential mechanism.
-            // `IS DISTINCT FROM` makes a repeat converge, bumping nothing.
-            let rows = sqlx::query(
-                "UPDATE tollgate_snapshots
-                    SET generation = generation + 1,
-                        snapshot   = jsonb_set(snapshot, '{status}', to_jsonb($2::text))
-                  WHERE account_id = $1
-                    AND deleted = FALSE
-                    AND snapshot ->> 'status' IS DISTINCT FROM $2::text
-                RETURNING principal, generation, snapshot",
-            )
-            .bind(id_bytes(account.0))
-            .bind(status.as_str())
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(storage)?;
-
-            let mut republished = Vec::with_capacity(rows.len());
-            let mut unreadable = 0usize;
-            for row in rows {
-                let principal = Principal(id_from(row.get::<Vec<u8>, _>(0).as_slice()));
-                match decode_publishable(
-                    principal,
-                    row.get::<i64, _>(1),
-                    row.get::<serde_json::Value, _>(2),
-                ) {
-                    Ok(snapshot) => republished.push((principal, snapshot)),
-                    // Skipped for push, not fatal: this row was already
-                    // unreadable before the status change touched it, and
-                    // refusing to suspend an account because one of its
-                    // credentials is corrupt is the worse outcome. Reported,
-                    // never silent (INVARIANTS.md #19).
-                    // Counted as well as logged: the row changed durably but
-                    // will not be pushed, so those principals converge only at
-                    // their next refresh. Reported to the caller rather than
-                    // absorbed into a log line nobody is reading.
-                    Err(error) => {
-                        unreadable += 1;
-                        tracing::warn!(
-                            %principal,
-                            %error,
-                            "restamped snapshot could not be decoded for push"
-                        );
-                    }
-                }
-            }
-            // Ordered, so both backends emit the same sequence and a mirrored
-            // test need not assert on incidental ordering.
-            republished.sort_unstable_by_key(|(principal, _)| *principal);
-            Ok((republished, unreadable))
+            republish_patched_snapshots(&mut tx, account, "{status}", status.as_str()).await
         }
         .await;
 
@@ -2219,6 +2262,73 @@ impl AdminStore for PostgresStore {
         })
     }
 
+    async fn set_capacity_class(
+        &self,
+        account: AccountId,
+        class: CapacityClass,
+    ) -> Result<StatusChange, SetStatusError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let result = async {
+            // `FOR UPDATE` for the reason `set_account_status` takes it: the
+            // account row's lock is the serialization point, so two concurrent
+            // class changes cannot interleave their snapshot updates and leave
+            // the ledger saying one thing while some snapshots say another.
+            // It also serialises against a concurrent status change, which is
+            // what keeps the two account-owned facts from racing each other's
+            // republications.
+            let row = sqlx::query(
+                "SELECT status FROM tollgate_accounts WHERE account_id = $1 FOR UPDATE",
+            )
+            .bind(id_bytes(account.0))
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(storage)?
+            .ok_or(SetStatusError::UnknownAccount)?;
+
+            // Closed is terminal, so reclassifying is meaningless. Unlike a
+            // status change there is no "already at the target" escape: every
+            // class is equally meaningless on a closed account. Rolling back
+            // here is what makes the refusal change nothing.
+            if decode_status(row.get::<String, _>(0))? == AccountStatus::Closed {
+                return Err(SetStatusError::AccountClosed);
+            }
+
+            sqlx::query("UPDATE tollgate_accounts SET capacity_class = $2 WHERE account_id = $1")
+                .bind(id_bytes(account.0))
+                .bind(class.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?;
+
+            republish_patched_snapshots(&mut tx, account, "{capacity_class}", class.as_str()).await
+        }
+        .await;
+
+        let (republished, unreadable) = finish_transaction(tx, result).await?;
+        if pushes_exceed_capacity(republished.len()) {
+            tracing::warn!(
+                %account,
+                principals = republished.len(),
+                capacity = PUSH_CHANNEL_CAPACITY,
+                "capacity class change emitted more pushes than the channel holds; \
+                 subscribers will resync"
+            );
+        }
+        let count = republished.len();
+        for (principal, snapshot) in republished {
+            self.push_to_subscribers(SnapshotPush {
+                principal,
+                resolution: SnapshotResolution::Present(snapshot),
+            });
+        }
+        Ok(StatusChange {
+            // Rows that changed durably, whether or not they could be decoded
+            // for a push — the same accounting `set_account_status` reports.
+            republished: count + unreadable,
+            unreadable,
+        })
+    }
+
     async fn publish_snapshot(
         &self,
         principal: Principal,
@@ -2243,7 +2353,8 @@ impl AdminStore for PostgresStore {
             // could straddle a lease or a rollover (#97).
             let ledger = sqlx::query(
                 "SELECT status, deposited, overage_recorded, usage_recorded, settlement_loss,
-                        expired, budget_allowance, budget_period, budget_rollover, period_start_us
+                        expired, budget_allowance, budget_period, budget_rollover, period_start_us,
+                        capacity_class
                  FROM tollgate_accounts WHERE account_id = $1 FOR SHARE",
             )
             .bind(id_bytes(snapshot.account_id.0))
@@ -2265,6 +2376,16 @@ impl AdminStore for PostgresStore {
                         return Err(PublishSnapshotError::StatusMismatch {
                             ledger,
                             submitted: snapshot.status,
+                        });
+                    }
+                    // The capacity class is the same kind of fact and gets the
+                    // same guard (#99): the ledger owns it, a publish may
+                    // carry it, and only `set_capacity_class` may change it.
+                    let ledger_class = decode_capacity_class(row.get::<String, _>(10))?;
+                    if ledger_class != snapshot.capacity_class {
+                        return Err(PublishSnapshotError::CapacityClassMismatch {
+                            ledger: ledger_class,
+                            submitted: snapshot.capacity_class,
                         });
                     }
                     Some(budget_view(row)?)
