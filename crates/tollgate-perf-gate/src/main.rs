@@ -27,7 +27,7 @@
 //! benchmark was read as a real threshold breach, and how a baseline captured
 //! on a loaded machine made a later change look 16% faster than it was.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::SystemTime;
@@ -129,6 +129,11 @@ struct TrustPolicy {
     /// its own measurement is too unstable to read.
     #[serde(default = "default_ci_width")]
     max_ci_width: f64,
+    /// Fraction of benchmarks that must be individually unreadable before the
+    /// whole run is. The history-free counterpart to `moved_fraction`, and the
+    /// only breadth signal shared CI can produce.
+    #[serde(default = "default_unstable_fraction")]
+    unstable_fraction: f64,
 }
 
 fn default_shift() -> f64 {
@@ -140,6 +145,9 @@ fn default_fraction() -> f64 {
 fn default_ci_width() -> f64 {
     0.10
 }
+fn default_unstable_fraction() -> f64 {
+    0.10
+}
 
 impl Default for TrustPolicy {
     fn default() -> Self {
@@ -147,6 +155,7 @@ impl Default for TrustPolicy {
             moved_shift: default_shift(),
             moved_fraction: default_fraction(),
             max_ci_width: default_ci_width(),
+            unstable_fraction: default_unstable_fraction(),
         }
     }
 }
@@ -194,6 +203,15 @@ enum Trust {
         moved: usize,
         compared: usize,
     },
+    /// Too much of the run was individually unreadable to believe any of it.
+    ///
+    /// The same breadth argument as `Untrusted`, on the one signal that needs
+    /// no history — which is what makes it the verdict shared CI can actually
+    /// reach (#112).
+    Unreadable {
+        unstable: usize,
+        measured: usize,
+    },
 }
 
 /// Decide whether this run can be believed, by asking how much of it moved.
@@ -206,8 +224,33 @@ enum Trust {
 fn assess_trust(
     current: &BTreeMap<String, f64>,
     previous: &BTreeMap<String, f64>,
+    unstable: usize,
+    measured: usize,
     policy: &TrustPolicy,
 ) -> Trust {
+    // Checked first, and without history, because this is the only one of the
+    // two verdicts shared CI can reach: every job starts from a clean
+    // workspace, so `previous` is always empty there and the shift comparison
+    // below returns `NoHistory` no matter how contaminated the run was.
+    //
+    // Same discriminator as the shift rule — breadth. Calibrated on three
+    // observed runs of one unchanged tree: a clean pipeline had 0 of 39
+    // benchmarks individually unreadable, while the two that reported false
+    // ratio failures had 8 of 33 and 6 of 33. A quiet controlled host still
+    // marks the odd contention benchmark, so the fraction sits below those
+    // 18-24% and above that handful.
+    #[allow(clippy::cast_precision_loss)]
+    // `measured > 0` is load-bearing rather than defensive: the division below
+    // is what decides the verdict, and a run that measured nothing would make
+    // it NaN or infinite — either of which compares its way to "unreadable"
+    // and condemns a run that produced no benchmarks for a reason the host
+    // cannot explain.
+    let widely_unreadable = unstable > 1
+        && measured > 0
+        && (unstable as f64) / (measured as f64) >= policy.unstable_fraction;
+    if widely_unreadable {
+        return Trust::Unreadable { unstable, measured };
+    }
     let shifts: Vec<f64> = current
         .iter()
         .filter_map(|(id, now)| {
@@ -250,21 +293,60 @@ fn all_results_passed(
     regressions: &[RegressionRow],
 ) -> bool {
     all_passed(rows)
-        && ratios.iter().all(|ratio| ratio.status == "pass")
+        // `inconclusive` is not a pass; it is the absence of a verdict, and it
+        // is allowed through only because the alternative is a verdict from a
+        // measurement the gate has already called unreadable (#112). The
+        // whole-run guard below is what stops that becoming a gate that can
+        // never fail.
+        && ratios
+            .iter()
+            .all(|ratio| matches!(ratio.status, "pass" | "inconclusive"))
+        && ratios_reached_a_verdict(ratios)
         && regressions
             .iter()
             .all(|regression| regression.status != "regressed")
 }
 
-fn evaluate_ratio(bound: &RatioBound, means: &BTreeMap<String, f64>) -> RatioRow {
+/// A ratio is only as readable as the two measurements it divides.
+///
+/// `unstable` carries the ids whose own confidence interval was too wide to
+/// read — the judgement `ReportRow::unstable` already makes and prints. Until
+/// #112 that judgement stopped there: the gate declared a measurement
+/// unreadable and then divided it anyway, and a shared runner that widened one
+/// side's spread produced a verdict about the code from a number the gate had
+/// already said nothing could be concluded from. It failed a merge request
+/// whose diff could not touch either mechanism, twice measuring the *same*
+/// code at ×3.40 and ×13.11.
+///
+/// So an unstable side yields `inconclusive`, not `pass` and not `over-ratio`.
+/// This is the per-measurement form of the whole-run `Trust::Untrusted` rule,
+/// and it exists because that rule needs a previous run on the same host to
+/// fire — which shared CI, with a fresh workspace every time, never has. The
+/// confidence interval is evidence that needs no history.
+///
+/// An inconclusive ratio is reported loudly and does not fail the gate; a run
+/// in which *every* ratio is inconclusive does fail, because a gate that
+/// measured nothing must not read as a gate that passed.
+fn evaluate_ratio(
+    bound: &RatioBound,
+    means: &BTreeMap<String, f64>,
+    unstable: &BTreeSet<String>,
+) -> RatioRow {
     let numerator_ns = means.get(&bound.numerator).copied();
     let denominator_ns = means.get(&bound.denominator).copied();
+    let numerator_unstable = unstable.contains(&bound.numerator);
+    let denominator_unstable = unstable.contains(&bound.denominator);
     let ratio = numerator_ns
         .zip(denominator_ns)
         .and_then(|(numerator, denominator)| {
             (denominator > 0.0).then_some(numerator / denominator)
         });
     let status = match ratio {
+        // Checked before the bound, deliberately: an unstable measurement that
+        // happens to land under the ceiling is no more readable than one that
+        // lands over it, and calling it `pass` would be the same mistake in
+        // the direction nobody notices.
+        Some(_) if numerator_unstable || denominator_unstable => "inconclusive",
         Some(ratio) if bound.max_ratio > 0.0 && ratio <= bound.max_ratio => "pass",
         Some(_) if bound.max_ratio > 0.0 => "over-ratio",
         Some(_) => "invalid-manifest",
@@ -275,10 +357,85 @@ fn evaluate_ratio(bound: &RatioBound, means: &BTreeMap<String, f64>) -> RatioRow
         denominator: bound.denominator.clone(),
         numerator_ns,
         denominator_ns,
+        numerator_unstable,
+        denominator_unstable,
         ratio,
         max_ratio: bound.max_ratio,
         status,
     }
+}
+
+/// What an unreadable run means, which depends on where it ran.
+///
+/// On a controlled host it is a failure with an action attached: the machine
+/// is available, so re-run it idle. Shared CI has no idle host to re-run on,
+/// so failing there reports nothing about the change and blocks a merge
+/// request for the state of a runner — the whole defect #112 exists to
+/// remove, and renaming FAIL to UNREADABLE would not have removed it. It is
+/// the same trade the loopback load lane already makes, for the same reason,
+/// and the message prints on every affected pipeline so a runner that is
+/// unreadable forever stays visible rather than silently unguarded.
+///
+/// An unreadable run abstains from *measurement* verdicts only. `structural`
+/// carries the failures that are never about the host — a benchmark the run
+/// did not produce, or produced stale — and those still fail everywhere,
+/// because a missing measurement is a configuration defect that a quiet
+/// machine would not have fixed.
+const fn unreadable_exit(mode: GateMode, structural: bool) -> u8 {
+    match mode {
+        GateMode::Full => UNTRUSTED_EXIT,
+        GateMode::RatiosOnly if structural => 1,
+        GateMode::RatiosOnly => 0,
+    }
+}
+
+/// What an unreadable run should *say*, alongside what it returns.
+///
+/// The message is the only signal an operator gets from a run that declined to
+/// judge, so which one prints is a decision and not formatting. Left inline in
+/// `main` it was reachable by no test: mutation testing deleted the negation
+/// guarding one and inverted the mode comparison guarding the other, and the
+/// suite stayed green both times.
+const fn unreadable_note(mode: GateMode, structural: bool) -> &'static str {
+    match mode {
+        _ if structural => {
+            "perf-gate: FAIL — a benchmark is missing or stale, which no amount of quiet \
+             would have fixed. That is not the host."
+        }
+        GateMode::RatiosOnly => {
+            "perf-gate: no verdict (shared CI has no idle host to re-run on; every readable \
+             ratio is in the report as evidence)"
+        }
+        GateMode::Full => "perf-gate: re-run on an idle host.",
+    }
+}
+
+/// What to say when no ratio reached a verdict, or `None` when some did.
+const fn no_verdict_note(reached_a_verdict: bool) -> Option<&'static str> {
+    if reached_a_verdict {
+        None
+    } else {
+        Some(
+            "perf-gate: every ratio was inconclusive — this run measured nothing readable, \
+             so it cannot stand as evidence. Re-run on an idle host.",
+        )
+    }
+}
+
+/// A failure the host cannot explain: the run did not produce a benchmark the
+/// manifest requires, or produced one older than this run's freshness marker.
+fn has_structural_failure(rows: &[ReportRow]) -> bool {
+    rows.iter().any(|row| row.status == "missing-or-stale")
+}
+
+/// Whether the ratio rows produced any verdict at all.
+///
+/// Every ratio inconclusive means the run measured nothing readable, and a
+/// gate that measured nothing must be red rather than quietly green — the same
+/// reason `check_ci_rules.sh` exists. An empty manifest is not that case:
+/// there was nothing to conclude.
+fn ratios_reached_a_verdict(ratios: &[RatioRow]) -> bool {
+    ratios.is_empty() || ratios.iter().any(|ratio| ratio.status != "inconclusive")
 }
 
 /// How far a measurement has moved from its previous value, as a fraction.
@@ -506,6 +663,10 @@ struct RatioRow {
     denominator: String,
     numerator_ns: Option<f64>,
     denominator_ns: Option<f64>,
+    /// Which side, if either, the gate could not read — so the artifact
+    /// explains an `inconclusive` without needing the console log beside it.
+    numerator_unstable: bool,
+    denominator_unstable: bool,
     ratio: Option<f64>,
     max_ratio: f64,
     status: &'static str,
@@ -740,16 +901,34 @@ fn main() -> ExitCode {
         rows.push(row);
     }
 
+    // The same instability the rows above already reported, now reaching the
+    // verdicts computed from them (#112).
+    let unstable: BTreeSet<String> = rows
+        .iter()
+        .filter(|row| row.unstable)
+        .map(|row| row.id.clone())
+        .collect();
     let ratios: Vec<_> = manifest
         .ratios
         .iter()
-        .map(|bound| evaluate_ratio(bound, &current))
+        .map(|bound| evaluate_ratio(bound, &current, &unstable))
         .collect();
     for ratio in &ratios {
+        let because = match (ratio.numerator_unstable, ratio.denominator_unstable) {
+            (true, true) => " — both sides too unstable to read",
+            (true, false) => " — numerator too unstable to read",
+            (false, true) => " — denominator too unstable to read",
+            (false, false) => "",
+        };
         match ratio.ratio {
             Some(measured) => println!(
-                "perf-gate: {}/{}: ratio {:.2} (max {:.2}) — {}",
-                ratio.numerator, ratio.denominator, measured, ratio.max_ratio, ratio.status
+                "perf-gate: {}/{}: ratio {:.2} (max {:.2}) — {}{}",
+                ratio.numerator,
+                ratio.denominator,
+                measured,
+                ratio.max_ratio,
+                ratio.status,
+                because
             ),
             None => eprintln!(
                 "perf-gate: {}/{}: ratio unavailable — {}",
@@ -757,7 +936,17 @@ fn main() -> ExitCode {
             ),
         }
     }
-    let trust = assess_trust(&current, &previous, &manifest.trust);
+    if let Some(note) = no_verdict_note(ratios_reached_a_verdict(&ratios)) {
+        eprintln!("{note}");
+    }
+    let measured = rows.iter().filter(|row| row.mean_ns.is_some()).count();
+    let trust = assess_trust(
+        &current,
+        &previous,
+        unstable.len(),
+        measured,
+        &manifest.trust,
+    );
 
     let active_host = std::env::var("TOLLGATE_PERF_HOST").ok();
     let untrusted = matches!(trust, Trust::Untrusted { .. });
@@ -821,6 +1010,21 @@ fn main() -> ExitCode {
             "cannot write report {}: {e}",
             report_path.display()
         ));
+    }
+
+    if let Trust::Unreadable { unstable, measured } = trust {
+        // History is not written from a run that could not read itself, for
+        // the same reason UNTRUSTED does not write it.
+        eprintln!(
+            "perf-gate: UNREADABLE — {unstable} of {measured} benchmarks had a confidence \
+             interval wider than {:.0}% of their own mean. That is the host, not the code: \
+             a change makes one or two benchmarks noisy, a disturbed machine makes many. \
+             No ratio from this run is evidence.",
+            manifest.trust.max_ci_width * 100.0,
+        );
+        let structural = has_structural_failure(&report.rows);
+        eprintln!("{}", unreadable_note(mode, structural));
+        return ExitCode::from(unreadable_exit(mode, structural));
     }
 
     if let Trust::Untrusted { moved, compared } = trust {
@@ -1242,7 +1446,13 @@ mod tests {
         }
 
         assert_eq!(
-            assess_trust(&contaminated, &quiet(), &TrustPolicy::default()),
+            assess_trust(
+                &contaminated,
+                &quiet(),
+                0,
+                contaminated.len(),
+                &TrustPolicy::default()
+            ),
             Trust::Untrusted {
                 moved: 4,
                 compared: 9
@@ -1262,7 +1472,7 @@ mod tests {
         }
 
         assert!(matches!(
-            assess_trust(&fast, &quiet(), &TrustPolicy::default()),
+            assess_trust(&fast, &quiet(), 0, fast.len(), &TrustPolicy::default()),
             Trust::Untrusted { .. }
         ));
     }
@@ -1277,7 +1487,13 @@ mod tests {
         *regressed.get_mut("admission/full_check").unwrap() = 400.0;
 
         assert_eq!(
-            assess_trust(&regressed, &quiet(), &TrustPolicy::default()),
+            assess_trust(
+                &regressed,
+                &quiet(),
+                0,
+                regressed.len(),
+                &TrustPolicy::default()
+            ),
             Trust::Trusted {
                 moved: 1,
                 compared: 9
@@ -1295,7 +1511,13 @@ mod tests {
         *regressed.get_mut("lease/reserve_cancel").unwrap() = 88.0;
 
         assert!(matches!(
-            assess_trust(&regressed, &quiet(), &TrustPolicy::default()),
+            assess_trust(
+                &regressed,
+                &quiet(),
+                0,
+                regressed.len(),
+                &TrustPolicy::default()
+            ),
             Trust::Trusted { .. }
         ));
     }
@@ -1311,7 +1533,7 @@ mod tests {
         }
 
         assert!(matches!(
-            assess_trust(&nudged, &quiet(), &TrustPolicy::default()),
+            assess_trust(&nudged, &quiet(), 0, nudged.len(), &TrustPolicy::default()),
             Trust::Trusted { .. }
         ));
     }
@@ -1321,7 +1543,13 @@ mod tests {
     #[test]
     fn without_history_there_is_no_trust_verdict() {
         assert_eq!(
-            assess_trust(&quiet(), &BTreeMap::new(), &TrustPolicy::default()),
+            assess_trust(
+                &quiet(),
+                &BTreeMap::new(),
+                0,
+                quiet().len(),
+                &TrustPolicy::default()
+            ),
             Trust::NoHistory
         );
         // A history for entirely different benchmark ids is no history at all.
@@ -1329,6 +1557,8 @@ mod tests {
             assess_trust(
                 &quiet(),
                 &means(&[("renamed/bench", 5.0)]),
+                0,
+                quiet().len(),
                 &TrustPolicy::default()
             ),
             Trust::NoHistory
@@ -1343,7 +1573,7 @@ mod tests {
         let after = means(&[("a", 100.0), ("b", 20.0)]);
 
         assert_eq!(
-            assess_trust(&after, &before, &TrustPolicy::default()),
+            assess_trust(&after, &before, 0, after.len(), &TrustPolicy::default()),
             Trust::Trusted {
                 moved: 1,
                 compared: 2
@@ -1359,7 +1589,7 @@ mod tests {
         let after = means(&[("a", 10.0), ("b", 20.0)]);
 
         assert_eq!(
-            assess_trust(&after, &before, &TrustPolicy::default()),
+            assess_trust(&after, &before, 0, after.len(), &TrustPolicy::default()),
             Trust::Trusted {
                 moved: 0,
                 compared: 1
@@ -1392,7 +1622,7 @@ mod tests {
         let before = means(&[("a", 100.0), ("b", 100.0), ("c", 100.0)]);
         let exactly = means(&[("a", 140.0), ("b", 140.0), ("c", 140.0)]);
         assert_eq!(
-            assess_trust(&exactly, &before, &policy),
+            assess_trust(&exactly, &before, 0, exactly.len(), &policy),
             Trust::Trusted {
                 moved: 0,
                 compared: 3
@@ -1401,7 +1631,7 @@ mod tests {
         // A hair past it, and the same run is condemned.
         let past = means(&[("a", 141.0), ("b", 141.0), ("c", 141.0)]);
         assert!(matches!(
-            assess_trust(&past, &before, &policy),
+            assess_trust(&past, &before, 0, past.len(), &policy),
             Trust::Untrusted { .. }
         ));
 
@@ -1455,6 +1685,162 @@ mod tests {
         assert!(all_passed(&[]), "nothing to fail");
     }
 
+    /// No measurement in the run was too unstable to read — the ordinary
+    /// case, named so the ratio tests below say which world they are in.
+    fn steady() -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
+    /// Shared CI can never reach the shift-based verdict, so instability
+    /// breadth is the one it can.
+    ///
+    /// #112: every CI job starts from a clean workspace, so `previous` is
+    /// always empty there and `assess_trust` answered `NoHistory` however
+    /// contaminated the run was. Calibrated on three observed runs of one
+    /// unchanged tree — a clean pipeline had 0 of 39 benchmarks individually
+    /// unreadable, the two that reported false ratio failures had 8 of 33 and
+    /// 6 of 33.
+    #[test]
+    fn a_widely_unreadable_run_is_untrusted_even_with_no_history() {
+        let policy = TrustPolicy::default();
+        let nothing = BTreeMap::new();
+
+        assert!(matches!(
+            assess_trust(&nothing, &nothing, 8, 33, &policy),
+            Trust::Unreadable {
+                unstable: 8,
+                measured: 33
+            }
+        ));
+        assert!(matches!(
+            assess_trust(&nothing, &nothing, 6, 33, &policy),
+            Trust::Unreadable { .. }
+        ));
+        // The clean run stays believable, and so does the quiet host that
+        // marks the odd contention benchmark.
+        assert!(matches!(
+            assess_trust(&nothing, &nothing, 0, 39, &policy),
+            Trust::NoHistory
+        ));
+        assert!(matches!(
+            assess_trust(&nothing, &nothing, 2, 39, &policy),
+            Trust::NoHistory
+        ));
+        // One unreadable benchmark is never a verdict about the machine, at
+        // any population size — the same degenerate-case guard the shift rule
+        // carries.
+        assert!(matches!(
+            assess_trust(&nothing, &nothing, 1, 2, &policy),
+            Trust::NoHistory
+        ));
+        // And it outranks the shift rule: a run that cannot read itself is
+        // not made readable by having history to compare against.
+        let quiet_history = means(&[("a", 100.0), ("b", 100.0)]);
+        assert!(matches!(
+            assess_trust(&quiet_history, &quiet_history, 8, 33, &policy),
+            Trust::Unreadable { .. }
+        ));
+    }
+
+    /// A run that measured nothing is not an unreadable run.
+    ///
+    /// The `measured > 0` guard decides that, and mutation testing showed it
+    /// was doing nothing a test could see: dividing by zero yields NaN or an
+    /// infinity, and both compare their way past the fraction, condemning a
+    /// run whose real problem is that it produced no benchmarks at all — which
+    /// the missing/stale rows already report, for a reason no quiet host
+    /// fixes.
+    #[test]
+    fn a_run_with_no_measurements_is_not_blamed_on_the_host() {
+        let policy = TrustPolicy::default();
+        let nothing = BTreeMap::new();
+        assert!(matches!(
+            assess_trust(&nothing, &nothing, 2, 0, &policy),
+            Trust::NoHistory
+        ));
+        // And one benchmark measured, with more claimed unstable than exist,
+        // still is not a fraction anybody can read.
+        assert!(matches!(
+            assess_trust(&nothing, &nothing, 2, 1, &policy),
+            Trust::Unreadable { .. }
+        ));
+    }
+
+    /// The message an unreadable run prints is a decision, not formatting.
+    ///
+    /// It is the only signal an operator gets from a run that declined to
+    /// judge, and inline in `main` no test could reach it — mutation testing
+    /// deleted one guard and inverted the other with the suite still green.
+    #[test]
+    fn an_unreadable_run_says_which_kind_of_unreadable_it_was() {
+        // A structural failure is named as not-the-host, in either mode,
+        // because that is the one an operator must not wait out.
+        for mode in [GateMode::Full, GateMode::RatiosOnly] {
+            let note = unreadable_note(mode, true);
+            assert!(note.contains("missing or stale"), "{mode:?}: {note}");
+            assert!(note.contains("not the host"), "{mode:?}: {note}");
+        }
+
+        // Shared CI says it drew no verdict and points at the report.
+        let abstained = unreadable_note(GateMode::RatiosOnly, false);
+        assert!(abstained.contains("no verdict"));
+        assert!(abstained.contains("evidence"));
+        assert!(!abstained.contains("missing or stale"));
+
+        // A controlled host says what to do instead, because it can.
+        let controlled = unreadable_note(GateMode::Full, false);
+        assert!(controlled.contains("idle host"));
+        assert_ne!(controlled, abstained);
+    }
+
+    /// The no-verdict note appears exactly when there was no verdict.
+    #[test]
+    fn a_run_that_concluded_something_says_nothing_about_concluding_nothing() {
+        assert_eq!(no_verdict_note(true), None);
+        let note = no_verdict_note(false).expect("a run with no verdict must say so");
+        assert!(note.contains("every ratio was inconclusive"));
+    }
+
+    /// An unreadable run abstains where abstaining is the only honest answer,
+    /// and never where the failure is not the host's fault.
+    ///
+    /// Renaming FAIL to UNREADABLE would have left #112 exactly where it was:
+    /// shared CI has no idle host to re-run on, so a non-zero exit there still
+    /// blocks a merge request for the state of a runner. A controlled host
+    /// does have one, and there the action is to use it.
+    #[test]
+    fn an_unreadable_run_abstains_on_shared_ci_and_fails_on_a_controlled_host() {
+        assert_eq!(unreadable_exit(GateMode::RatiosOnly, false), 0);
+        assert_eq!(unreadable_exit(GateMode::Full, false), UNTRUSTED_EXIT);
+
+        // A missing or stale benchmark is a configuration defect. No amount of
+        // quiet would have fixed it, so it fails in both modes — the freshness
+        // marker exists precisely so this cannot pass unnoticed.
+        assert_ne!(unreadable_exit(GateMode::RatiosOnly, true), 0);
+        assert_eq!(unreadable_exit(GateMode::Full, true), UNTRUSTED_EXIT);
+
+        let row = |status| ReportRow {
+            id: "admission/full_check".to_owned(),
+            mean_ns: Some(100.0),
+            target_ns: 100.0,
+            threshold_ns: 200.0,
+            status,
+            previous_ns: None,
+            shift: None,
+            ci_width: None,
+            unstable: false,
+        };
+        assert!(!has_structural_failure(&[row("pass")]));
+        assert!(has_structural_failure(&[
+            row("pass"),
+            row("missing-or-stale")
+        ]));
+        // An over-threshold row is a measurement verdict, not a structural
+        // one: it is exactly what an unreadable run must not be trusted to
+        // pronounce.
+        assert!(!has_structural_failure(&[row("over-threshold")]));
+    }
+
     #[test]
     fn a_same_run_ratio_enforces_the_portable_contention_budget() {
         let bound = RatioBound {
@@ -1465,15 +1851,18 @@ mod tests {
         let within = means(&[("contended", 300.0), ("uncontended", 100.0)]);
         let over = means(&[("contended", 301.0), ("uncontended", 100.0)]);
 
-        assert_eq!(evaluate_ratio(&bound, &within).status, "pass");
-        assert_eq!(evaluate_ratio(&bound, &over).status, "over-ratio");
+        assert_eq!(evaluate_ratio(&bound, &within, &steady()).status, "pass");
         assert_eq!(
-            evaluate_ratio(&bound, &BTreeMap::new()).status,
+            evaluate_ratio(&bound, &over, &steady()).status,
+            "over-ratio"
+        );
+        assert_eq!(
+            evaluate_ratio(&bound, &BTreeMap::new(), &steady()).status,
             "missing-or-zero-denominator"
         );
         for denominator in [0.0, -1.0] {
             let unusable = means(&[("contended", 300.0), ("uncontended", denominator)]);
-            let row = evaluate_ratio(&bound, &unusable);
+            let row = evaluate_ratio(&bound, &unusable, &steady());
             assert_eq!(row.status, "missing-or-zero-denominator");
             assert_eq!(row.ratio, None);
         }
@@ -1489,11 +1878,102 @@ mod tests {
                 max_ratio,
             };
             assert_eq!(
-                evaluate_ratio(&invalid, &zero_measurement).status,
+                evaluate_ratio(&invalid, &zero_measurement, &steady()).status,
                 "invalid-manifest"
             );
-            assert_eq!(evaluate_ratio(&invalid, &over).status, "invalid-manifest");
+            assert_eq!(
+                evaluate_ratio(&invalid, &over, &steady()).status,
+                "invalid-manifest"
+            );
         }
+    }
+
+    /// A ratio computed from a measurement the gate itself called unreadable
+    /// is not a verdict, in either direction.
+    ///
+    /// This is #112. Two pipelines on the same shared runner measured the same
+    /// unchanged code at ×3.40 and ×13.11, and the second failed a merge
+    /// request whose diff could not touch the mechanism — because the gate
+    /// printed "UNSTABLE spread" for one side and then divided it anyway.
+    #[test]
+    fn an_unstable_side_makes_a_ratio_inconclusive_rather_than_a_verdict() {
+        let bound = RatioBound {
+            numerator: "contended".to_string(),
+            denominator: "uncontended".to_string(),
+            max_ratio: 3.0,
+        };
+        let over = means(&[("contended", 1300.0), ("uncontended", 100.0)]);
+        let within = means(&[("contended", 100.0), ("uncontended", 100.0)]);
+        let unstable = |id: &str| BTreeSet::from([id.to_string()]);
+
+        // Either side, and both, withdraw the verdict.
+        for shaky in [
+            unstable("contended"),
+            unstable("uncontended"),
+            BTreeSet::from(["contended".to_string(), "uncontended".to_string()]),
+        ] {
+            assert_eq!(
+                evaluate_ratio(&bound, &over, &shaky).status,
+                "inconclusive",
+                "an unreadable measurement must not condemn the code"
+            );
+            // And the direction nobody notices: an unstable measurement that
+            // lands under the ceiling is no more readable than one over it.
+            assert_eq!(
+                evaluate_ratio(&bound, &within, &shaky).status,
+                "inconclusive",
+                "an unreadable measurement must not clear the code either"
+            );
+        }
+
+        // The row carries which side, so the artifact explains itself.
+        let row = evaluate_ratio(&bound, &over, &unstable("uncontended"));
+        assert!(!row.numerator_unstable && row.denominator_unstable);
+        assert_eq!(row.ratio, Some(13.0), "the measurement is still reported");
+
+        // An unrelated benchmark being unstable changes nothing.
+        assert_eq!(
+            evaluate_ratio(&bound, &over, &unstable("something/else")).status,
+            "over-ratio"
+        );
+    }
+
+    /// Inconclusive is survivable; a run where *every* ratio is inconclusive
+    /// is not. A gate that measured nothing must be red rather than quietly
+    /// green.
+    #[test]
+    fn a_run_that_concluded_nothing_is_not_a_pass() {
+        let row = |status| RatioRow {
+            numerator: "contended".to_string(),
+            denominator: "uncontended".to_string(),
+            numerator_ns: Some(100.0),
+            denominator_ns: Some(100.0),
+            numerator_unstable: status == "inconclusive",
+            denominator_unstable: false,
+            ratio: Some(1.0),
+            max_ratio: 3.0,
+            status,
+        };
+
+        assert!(ratios_reached_a_verdict(&[]), "nothing to conclude");
+        assert!(ratios_reached_a_verdict(&[row("pass")]));
+        assert!(ratios_reached_a_verdict(&[
+            row("inconclusive"),
+            row("pass")
+        ]));
+        assert!(!ratios_reached_a_verdict(&[
+            row("inconclusive"),
+            row("inconclusive")
+        ]));
+
+        // And the aggregate agrees on both halves.
+        assert!(all_results_passed(
+            &[],
+            &[row("inconclusive"), row("pass")],
+            &[]
+        ));
+        assert!(!all_results_passed(&[], &[row("inconclusive")], &[]));
+        assert!(!all_results_passed(&[], &[row("over-ratio")], &[]));
     }
 
     #[test]
@@ -1518,6 +1998,8 @@ mod tests {
             denominator: "uncontended".to_string(),
             numerator_ns: Some(100.0),
             denominator_ns: Some(100.0),
+            numerator_unstable: false,
+            denominator_unstable: false,
             ratio: Some(1.0),
             max_ratio: 3.0,
             status,
