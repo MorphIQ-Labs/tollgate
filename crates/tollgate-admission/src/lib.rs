@@ -28,17 +28,19 @@
 //! the design review deliberately treats the cache choice as an empirical
 //! question for the perf gate, not a foregone conclusion.
 
+pub mod capacity;
 pub mod counters;
 pub mod engine;
 pub mod generation_model;
 pub mod maps;
 pub mod state;
 
-pub use counters::{AdmissionCounters, CommitRefusal, CountersSnapshot};
-pub use engine::{
-    AdmissionEngine, CapacityEvidence, CapacityGate, CapacityPermit, Committed, NoCapacityPermit,
-    NoGate, Pending, ReadyToStart, Released, RequestContext,
+pub use capacity::{
+    CapacityConfigError, CapacityEvidence, CapacityGate, CapacityOccupancy, CapacityPermit,
+    ExecutionCapacityGate, ExecutionCapacityMode, ExecutionPermit, NoCapacityPermit, NoGate,
 };
+pub use counters::{AdmissionCounters, CommitRefusal, CountersSnapshot};
+pub use engine::{AdmissionEngine, Committed, Pending, ReadyToStart, Released, RequestContext};
 pub use generation_model::{Watermark, accept_positive, accept_revoked, accept_unknown};
 pub use maps::{ArcSwapSnapshotMap, MokaSnapshotMap};
 pub use state::{
