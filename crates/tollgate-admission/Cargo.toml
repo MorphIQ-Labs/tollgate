@@ -9,7 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-tollgate-core = { path = "../tollgate-core", version = "=0.14.4" }
+tollgate-core = { path = "../tollgate-core", version = "=0.14.5" }
 arc-swap = { workspace = true }
 foldhash = { workspace = true }
 moka = { workspace = true }

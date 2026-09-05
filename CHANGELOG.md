@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.14.5](https://github.com/MorphIQ-Labs/tollgate/compare/v0.14.4...v0.14.5) - 2026-09-05
+
+### Added
+
+- *(core)* #99 make execution capacity class an account-owned fact
+
 ## [0.14.4](https://github.com/MorphIQ-Labs/tollgate/compare/v0.14.3...v0.14.4) - 2026-09-04
 
 ### Fixed
