@@ -36,7 +36,7 @@
 //! ten localities would leave shards holding zero, and every acquisition would
 //! degrade to a full sibling scan — the fast path never fast.
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -210,6 +210,14 @@ struct CapacityShard {
 #[derive(Debug)]
 struct Pool {
     shards: Box<[CapacityShard]>,
+    /// The shard count as the non-zero it always is.
+    ///
+    /// Stored rather than recovered from `shards.len()` per acquisition. The
+    /// count is fixed at construction and cannot be zero, so carrying the
+    /// proof removes both a request-path zero test and the cold panic arm an
+    /// `expect` would have compiled in — an internal invariant made
+    /// unrepresentable instead of checked.
+    sharding: LocalSharding,
     total: u32,
 }
 
@@ -230,6 +238,9 @@ impl Pool {
             .into_boxed_slice();
         Self {
             shards: partitioned,
+            sharding: LocalSharding::new(
+                NonZeroUsize::new(shards).expect("the shard count is clamped to at least one"),
+            ),
             total,
         }
     }
@@ -245,13 +256,18 @@ impl Pool {
     #[inline]
     fn try_acquire(&self, locality: Locality) -> Option<usize> {
         let count = self.shards.len();
-        let first = locality.index(LocalSharding::new(
-            std::num::NonZeroUsize::new(count).expect("a pool has one shard"),
-        ));
-        for offset in 0..count {
-            let index = (first + offset) % count;
+        // The walk wraps by comparison rather than by `% count`. A modulo on
+        // a count only known at runtime compiles to a division, and it would
+        // sit on the fast path — the first, usually only, iteration — to
+        // compute an index that is already `first`.
+        let mut index = locality.index(self.sharding);
+        for _ in 0..count {
             if self.take(index) {
                 return Some(index);
+            }
+            index += 1;
+            if index == count {
+                index = 0;
             }
         }
         None

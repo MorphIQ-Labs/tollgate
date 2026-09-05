@@ -8,12 +8,6 @@
       "reservation/commit_split"
     ],
     "#99": [
-      "capacity/disabled",
-      "capacity/uniform",
-      "capacity/reserved_shared",
-      "capacity/reserved_fallback",
-      "capacity/full_check_contended_8_distinct_accounts_uniform",
-      "capacity/full_check_contended_8_distinct_accounts_reserved",
       "load/concurrent_distinct_accounts",
       "load/mixed_saturation"
     ]
@@ -204,6 +198,42 @@
       "threshold_ns": 10000.0
     },
     {
+      "_comment": "#99 leg two of the disabled-gate proof. This is `admission/full_check` plus one call to `acquire_capacity`, on the same engine and the same fixture; `full_check` never reaches the gate, so it is a genuine denominator rather than a second measurement of the same path (the trap #102 removed). Measured 123.61ns against that benchmark's same-run 122.47ns \u2014 a ratio of 1.01. The portable claim is the ratio below; this absolute is a backstop.",
+      "id": "capacity/disabled",
+      "target_ns": 125.0,
+      "threshold_ns": 240.0
+    },
+    {
+      "_comment": "#99 an enabled uniform pool, uncontended: one compare-exchange on the local shard, an `Arc` refcount bump, and the matching release on drop. Measured 134.68ns against the same run's 123.61ns disabled, so roughly 11ns for the gate itself.",
+      "id": "capacity/uniform",
+      "target_ns": 135.0,
+      "threshold_ns": 260.0
+    },
+    {
+      "_comment": "#99 reserved mode with room in shared \u2014 the path essentially every request under this mode takes. Measured 133.75ns, indistinguishable from uniform, because a reserve nobody is reaching costs the shared acquisition nothing.",
+      "id": "capacity/reserved_shared",
+      "target_ns": 135.0,
+      "threshold_ns": 260.0
+    },
+    {
+      "_comment": "#99 the assured fallback: shared exhausted, so the acquisition reaches the reserve. This is the only path in the system where a class changes an outcome. Measured 132.63ns, a ratio of 0.99 against reserved_shared, because a shard with nothing left fails its `checked_sub` before it ever attempts a compare-exchange \u2014 the miss costs a load, not a write.",
+      "id": "capacity/reserved_fallback",
+      "target_ns": 135.0,
+      "threshold_ns": 260.0
+    },
+    {
+      "_comment": "#99 eight simultaneous requests across eight accounts, every one through the gate, against `admission/full_check_contended_8_distinct_accounts` as the same-workload denominator. The map stays on its shipped single-counter default; the pool is sharded eight ways, because the two are independent axes \u2014 the map partitions per-account state, while the gate is one instance-global pool every request of every account touches. Measured 1.453us against that benchmark's 680.69ns. A separate paired run put the sharded pool at x2.11 and an unsharded one at x2.83 over the same denominator, which is what the sharding buys.",
+      "id": "capacity/full_check_contended_8_distinct_accounts_uniform",
+      "target_ns": 1600.0,
+      "threshold_ns": 5000.0
+    },
+    {
+      "_comment": "#99 the same fixture with a reserve configured. Measured 1.457us: reserved costs contended throughput nothing over uniform, because both classes take shared first and only a saturated shared pool reaches the second lookup.",
+      "id": "capacity/full_check_contended_8_distinct_accounts_reserved",
+      "target_ns": 1600.0,
+      "threshold_ns": 5000.0
+    },
+    {
       "_comment": "Added by #2, and measured in `tollgate-auth` where the mechanism lives. The credential step after a cache hit: one atomic load and one constant-time comparison. Gated because a regression here is otherwise invisible \u2014 if the cache stops being consulted every test still passes and only the clock changes, while the uncached path measures ~800ns, 50x this. The threshold catches that collapse, not tens of nanoseconds. Laptop numbers, provisional like every other absolute here.",
       "id": "credential/verify_cached",
       "target_ns": 25.0,
@@ -286,6 +316,42 @@
       "numerator": "reservation/commit_cancel_race_contended_2",
       "denominator": "reservation/commit_cancel_race_control_2",
       "max_ratio": 5.0
+    },
+    {
+      "_comment": "#99's disabled-gate proof, leg two of three. `Disabled` composes a different gate *type*, so the claim is that a product which never configures capacity pays nothing for the feature. Measured x1.01 (123.61ns against 122.47ns). The 1.05 bound leaves room for host noise and none for a branch or an atomic; leg one is the zero allocation scope `capacity/disabled`, and leg three is the recorded assembly inspection, in which `NoGate`'s acquisition compiles to three instructions with no atomic and no branch.",
+      "numerator": "capacity/disabled",
+      "denominator": "admission/full_check",
+      "max_ratio": 1.05
+    },
+    {
+      "_comment": "What an enabled pool costs when nothing is contending it, stated portably. Measured x1.09 \u2014 one compare-exchange, one refcount bump and one release. The bound rejects a gate that grew a lock or a second lookup without pretending the mechanism is free.",
+      "numerator": "capacity/uniform",
+      "denominator": "capacity/disabled",
+      "max_ratio": 1.35
+    },
+    {
+      "_comment": "The reserve costs the ordinary shared acquisition nothing: measured x0.99 against uniform. A reserved instance under normal load must not pay for a fallback it is not taking.",
+      "numerator": "capacity/reserved_shared",
+      "denominator": "capacity/uniform",
+      "max_ratio": 1.15
+    },
+    {
+      "_comment": "The fallback against the shared acquisition it replaces. Measured x0.99: an exhausted shard refuses on a load, so reaching the reserve costs one extra read and one compare-exchange on a different line. The bound keeps that a small constant rather than asserting it is free.",
+      "numerator": "capacity/reserved_fallback",
+      "denominator": "capacity/reserved_shared",
+      "max_ratio": 1.25
+    },
+    {
+      "_comment": "Enabling the gate under eight-way different-account contention, against the same workload without it. Measured x2.13 (uniform) and x2.14 (reserved) on the controlled host; a separate paired run put an unsharded pool at x2.83 against x2.11 sharded. The 4.0 bound is the cross-host allowance the other contention ratios use \u2014 a shared runner exposes contention differently \u2014 while still rejecting a gate that serialized the instance.",
+      "numerator": "capacity/full_check_contended_8_distinct_accounts_uniform",
+      "denominator": "admission/full_check_contended_8_distinct_accounts",
+      "max_ratio": 4.0
+    },
+    {
+      "_comment": "The reserved gate under the same contention, against the same denominator. Measured x2.14 \u2014 reserved and uniform are one acquisition path, and this is what says so under load rather than only at rest.",
+      "numerator": "capacity/full_check_contended_8_distinct_accounts_reserved",
+      "denominator": "admission/full_check_contended_8_distinct_accounts",
+      "max_ratio": 4.0
     },
     {
       "_comment": "#92 the fold is O(distinct classes), not O(table). Eight classes measured 3.56x one class, sub-linear because the fixed term and the call dominate. Six permits host variance and a future per-class check; a scan of the compiled table would miss this by orders of magnitude, which is the failure this ratio exists to catch.",

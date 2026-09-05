@@ -1316,5 +1316,13 @@ exists to detect corrupt state and must not be able to launder it.
     `concurrent_acquisition_never_exceeds_the_total`,
     `concurrent_best_effort_load_leaves_the_reserve_reachable`,
     `engine::tests::a_capacity_shed_is_counted_without_a_second_denial`, and
-    the account-ownership witnesses named in 22.
+    the account-ownership witnesses named in 22. The allocation-free and
+    disabled-costs-nothing claims are gated rather than asserted:
+    `tests::allocations::acquiring_and_refusing_execution_capacity_allocates_nothing`
+    records the `capacity/disabled`, `capacity/uniform`,
+    `capacity/reserved_shared`, `capacity/reserved_fallback` and
+    `capacity/shed` scopes at zero under `./scripts/check_allocations.sh`, and
+    the `capacity/disabled` : `admission/full_check` same-run ratio in
+    `testing/perf_thresholds.json` bounds what the gate call costs when the
+    gate is `NoGate`.
     *Proof:* `formal/lean/Tollgate/ExecutionCapacity.lean`.

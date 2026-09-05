@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use jiff::Timestamp;
 use tollgate_admission::{
-    AdmissionEngine, ArcSwapSnapshotMap, LeaseSlot, MapEntry, MokaSnapshotMap, NoGate, Principal,
-    PublishableSnapshotUpdate, SnapshotMap, SnapshotUpdate,
+    AdmissionEngine, ArcSwapSnapshotMap, ExecutionCapacityGate, ExecutionCapacityMode, LeaseSlot,
+    MapEntry, MokaSnapshotMap, NoGate, Principal, PublishableSnapshotUpdate, SnapshotMap,
+    SnapshotUpdate,
 };
 use tollgate_alloc_count::AllocScope;
 use tollgate_core::{
@@ -128,13 +129,24 @@ fn engine(
     engine
 }
 
-fn admit_and_cancel(engine: &AdmissionEngine<ArcSwapSnapshotMap>, principal: Principal) {
-    let pending = engine
+fn admit(
+    engine: &AdmissionEngine<ArcSwapSnapshotMap>,
+    principal: Principal,
+) -> tollgate_admission::Pending<AllocationSlot> {
+    engine
         .begin(principal, PermissionBits::bit(0), now())
         .unwrap()
         .admit(&[(PriceOp, 64)], AllocationSlot, now())
-        .unwrap();
-    black_box(pending.acquire_capacity(&NoGate).unwrap().cancel());
+        .unwrap()
+}
+
+fn admit_and_cancel(engine: &AdmissionEngine<ArcSwapSnapshotMap>, principal: Principal) {
+    black_box(
+        admit(engine, principal)
+            .acquire_capacity(&NoGate)
+            .unwrap()
+            .cancel(),
+    );
 }
 
 fn assert_zero(scope: &str, operation: impl FnOnce()) {
@@ -249,6 +261,108 @@ fn admission_allocates_nothing_on_the_arc_swap_default() {
     assert_zero("admission/arc_swap_lease_exhausted_elastic", || {
         admit_and_cancel(&elastic_exhausted, Principal(1));
     });
+}
+
+/// The first leg of #99's three-part disabled proof, and the same claim for
+/// every enabled mode: acquiring or refusing execution capacity allocates
+/// nothing.
+///
+/// The permit carries an `Arc` clone of the pools, which is a refcount bump
+/// rather than an allocation — this is what says so. The refusal scope
+/// matters just as much: a fail-closed path that allocated would make an
+/// overloaded instance allocate hardest exactly when it is shedding.
+#[test]
+fn acquiring_and_refusing_execution_capacity_allocates_nothing() {
+    black_box(Locality::current());
+    let admitted = engine(
+        LocalSharding::SINGLE,
+        Principal(1),
+        EnforcementMode::Strict,
+        CostUnits(u64::MAX / 2),
+    );
+    let enabled = |mode| {
+        ExecutionCapacityGate::new(mode, LocalSharding::SINGLE)
+            .unwrap()
+            .unwrap()
+    };
+    let units = |units: u32| NonZeroU32::new(units).unwrap();
+
+    let uniform = enabled(ExecutionCapacityMode::Uniform {
+        total: units(4_096),
+    });
+    let reserved = enabled(ExecutionCapacityMode::Reserved {
+        total: units(4_096),
+        assured_reserve: units(64),
+    });
+    // Shared holds one unit and an admission keeps it, so assured work here
+    // always reaches the reserve.
+    let fallback = enabled(ExecutionCapacityMode::Reserved {
+        total: units(2),
+        assured_reserve: units(1),
+    });
+    let holding_shared = admit(&admitted, Principal(1))
+        .acquire_capacity(&fallback)
+        .unwrap();
+    // One unit, held, so every further acquisition is refused.
+    let full = enabled(ExecutionCapacityMode::Uniform { total: units(1) });
+    let holding_only_unit = admit(&admitted, Principal(1))
+        .acquire_capacity(&full)
+        .unwrap();
+
+    // Warm every path before attribution, as the neighbouring tests do.
+    for gate in [&uniform, &reserved, &fallback] {
+        black_box(
+            admit(&admitted, Principal(1))
+                .acquire_capacity(gate)
+                .unwrap()
+                .cancel(),
+        );
+    }
+    black_box(
+        admit(&admitted, Principal(1))
+            .acquire_capacity(&full)
+            .map(|_| ())
+            .unwrap_err(),
+    );
+
+    assert_zero("capacity/disabled", || {
+        admit_and_cancel(&admitted, Principal(1));
+    });
+    assert_zero("capacity/uniform", || {
+        black_box(
+            admit(&admitted, Principal(1))
+                .acquire_capacity(&uniform)
+                .unwrap()
+                .cancel(),
+        );
+    });
+    assert_zero("capacity/reserved_shared", || {
+        black_box(
+            admit(&admitted, Principal(1))
+                .acquire_capacity(&reserved)
+                .unwrap()
+                .cancel(),
+        );
+    });
+    assert_zero("capacity/reserved_fallback", || {
+        black_box(
+            admit(&admitted, Principal(1))
+                .acquire_capacity(&fallback)
+                .unwrap()
+                .cancel(),
+        );
+    });
+    assert_zero("capacity/shed", || {
+        black_box(
+            admit(&admitted, Principal(1))
+                .acquire_capacity(&full)
+                .map(|_| ())
+                .unwrap_err(),
+        );
+    });
+
+    drop(holding_shared);
+    drop(holding_only_unit);
 }
 
 #[test]
