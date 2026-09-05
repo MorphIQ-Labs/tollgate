@@ -141,7 +141,7 @@
       "threshold_ns": 10000.0
     },
     {
-      "_comment": "#3, opt-in eight-shard topology, uncontended: the price of sharding when nothing is contending. Measured 116.6/124.3ns against the same run's 103.2/110.2ns default, so roughly 10-15% for the locality read and shard indexing. Provisional laptop bounds taken under load average 17-26; recalibrate on the controlled host.",
+      "_comment": "#3, opt-in eight-shard topology, uncontended: the price of sharding when nothing is contending. Measured 116.6/124.3ns against the same run's 103.2/110.2ns default, so roughly 10-15% for the locality read and shard indexing. Provisional laptop bounds taken under load average 17-26; recalibrate on the controlled host. #111 removed a 64-bit division from that locality read -- `Locality::index` tested `is_power_of_two` per lookup and LLVM speculated both arms, emitting the `udiv` unconditionally -- and three interleaved pairs measured 140.48ns before against 137.18ns after (-2.3%), non-overlapping.",
       "id": "admission/full_check_sharded",
       "target_ns": 125.0,
       "threshold_ns": 280.0
