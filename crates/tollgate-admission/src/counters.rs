@@ -19,7 +19,26 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tollgate_core::{CommitError, CostUnits, DenyReason, LocalSharding, Locality};
+use tollgate_core::{CapacityClass, CommitError, CostUnits, DenyReason, LocalSharding, Locality};
+
+/// How many execution-capacity classes exist, and their stable label order.
+///
+/// Two, and the labels are the enum tags alone — the whole bounded-cardinality
+/// rule for capacity metrics (#99). A dense pair rather than a
+/// `DenyReason`-shaped table, for the reason `CommitRefusal` gives.
+pub const CAPACITY_CLASS_COUNT: usize = 2;
+
+/// The class labels, in slot order.
+pub const CAPACITY_CLASS_NAMES: [&str; CAPACITY_CLASS_COUNT] = ["Assured", "BestEffort"];
+
+/// The counter slot for a class. Exhaustive by construction: a third class
+/// would fail to compile until it had one.
+const fn class_slot(class: CapacityClass) -> usize {
+    match class {
+        CapacityClass::Assured => 0,
+        CapacityClass::BestEffort => 1,
+    }
+}
 
 /// One counter on its own cache line.
 ///
@@ -140,7 +159,27 @@ impl CommitRefusal {
 /// admissions a second the `admitted` counter would need roughly 584 years to
 /// reach the wrap; adding a branch on the request path to guard against it
 /// would cost more than it could ever save.
+/// # Layout
+///
+/// `repr(C)`, so the declaration order below *is* the layout. Without it the
+/// compiler arranges the fields however it likes, and adding one silently
+/// rearranges the rest — which is not theoretical: #99's two per-class arrays
+/// moved the request-path counters and cost `admission/full_check` 3.5%
+/// (122.30 ns to 126.55 ns, three runs each on the controlled host) while
+/// touching no code that benchmark executes. Restoring the order gave all of
+/// it back.
+///
+/// So the arrangement below is *calibrated*, not derived: it is the order the
+/// recorded baselines were measured against, and new counters are appended
+/// after every field that predates them rather than filed next to the ones
+/// they relate to. Hoisting the two per-request counters to the front was
+/// tried and measured 1.5% worse than leaving them where they are, which is
+/// the point — this is not a layout to reason about from first principles.
+/// The padding buys false-sharing isolation between counters; `repr(C)` is
+/// what stops the arrangement itself from being a lottery each new field
+/// re-enters.
 #[derive(Debug)]
+#[repr(C)]
 pub struct AdmissionCounters {
     admitted: Padded,
     units_admitted: Padded,
@@ -167,6 +206,15 @@ pub struct AdmissionCounters {
     committed_at_overage: Padded,
     units_committed_at_overage: Padded,
     commit_refusals: [Padded; CommitRefusal::COUNT],
+    /// The per-class breakdown of the two capacity outcomes (#99).
+    ///
+    /// Two classes, so a small dense array rather than a `DenyReason`-shaped
+    /// table — the reasoning `CommitRefusal` records. Inline rather than
+    /// sharded: a shed is a bounded exception, and an execution start already
+    /// shards through `execution_started`, so these carry the *breakdown*
+    /// beside totals that are already partitioned.
+    capacity_shed_by_class: [Padded; CAPACITY_CLASS_COUNT],
+    execution_started_by_class: [Padded; CAPACITY_CLASS_COUNT],
     shards: Option<Box<[CounterShard]>>,
 }
 
@@ -208,6 +256,8 @@ impl AdmissionCounters {
             canceled_before_start: Padded::zero(),
             contexts_abandoned: Padded::zero(),
             capacity_shed: Padded::zero(),
+            capacity_shed_by_class: [const { Padded::zero() }; CAPACITY_CLASS_COUNT],
+            execution_started_by_class: [const { Padded::zero() }; CAPACITY_CLASS_COUNT],
             committed_at_overage: Padded::zero(),
             units_committed_at_overage: Padded::zero(),
             commit_refusals: [const { Padded::zero() }; CommitRefusal::COUNT],
@@ -232,6 +282,8 @@ impl AdmissionCounters {
             canceled_before_start: Padded::zero(),
             contexts_abandoned: Padded::zero(),
             capacity_shed: Padded::zero(),
+            capacity_shed_by_class: [const { Padded::zero() }; CAPACITY_CLASS_COUNT],
+            execution_started_by_class: [const { Padded::zero() }; CAPACITY_CLASS_COUNT],
             committed_at_overage: Padded::zero(),
             units_committed_at_overage: Padded::zero(),
             commit_refusals: [const { Padded::zero() }; CommitRefusal::COUNT],
@@ -319,7 +371,21 @@ impl AdmissionCounters {
     /// `admitted`; #99 adds the per-class breakdown on top of this total.
     #[inline]
     pub fn record_capacity_shed(&self) {
+        self.record_capacity_shed_for(CapacityClass::Assured);
+    }
+
+    /// Record a shed against the class whose work was refused (#99).
+    #[inline]
+    pub(crate) fn record_capacity_shed_for(&self, class: CapacityClass) {
         self.capacity_shed.bump(1);
+        self.capacity_shed_by_class[class_slot(class)].bump(1);
+    }
+
+    /// Record an execution start against the class that started it (#99).
+    #[inline]
+    pub(crate) fn record_execution_started_for(&self, class: CapacityClass, locality: Locality) {
+        self.record_execution_started_at(locality);
+        self.execution_started_by_class[class_slot(class)].bump(1);
     }
 
     /// Record a request that resolved for zero after admission and before
@@ -440,6 +506,12 @@ impl AdmissionCounters {
                 canceled_before_start: 0,
                 contexts_abandoned: self.contexts_abandoned.get(),
                 capacity_shed: self.capacity_shed.get(),
+                capacity_shed_by_class: std::array::from_fn(|slot| {
+                    self.capacity_shed_by_class[slot].get()
+                }),
+                execution_started_by_class: std::array::from_fn(|slot| {
+                    self.execution_started_by_class[slot].get()
+                }),
                 committed_at_overage: self.committed_at_overage.get(),
                 units_committed_at_overage: self.units_committed_at_overage.get(),
                 commit_refusals: std::array::from_fn(|slot| self.commit_refusals[slot].get()),
@@ -473,6 +545,12 @@ impl AdmissionCounters {
             canceled_before_start: self.canceled_before_start.get(),
             contexts_abandoned: self.contexts_abandoned.get(),
             capacity_shed: self.capacity_shed.get(),
+            capacity_shed_by_class: std::array::from_fn(|slot| {
+                self.capacity_shed_by_class[slot].get()
+            }),
+            execution_started_by_class: std::array::from_fn(|slot| {
+                self.execution_started_by_class[slot].get()
+            }),
             committed_at_overage: self.committed_at_overage.get(),
             units_committed_at_overage: self.units_committed_at_overage.get(),
             commit_refusals: std::array::from_fn(|slot| self.commit_refusals[slot].get()),
@@ -521,6 +599,11 @@ pub struct CountersSnapshot {
     /// Admitted requests refused by the execution-capacity gate, released for
     /// zero. #99 adds the per-class breakdown.
     pub capacity_shed: u64,
+    /// Sheds and starts split by class (#99), in [`CAPACITY_CLASS_NAMES`]
+    /// order. Each sums to the total beside it; neither replaces it, so a
+    /// reader never has to add two numbers to get one.
+    pub capacity_shed_by_class: [u64; CAPACITY_CLASS_COUNT],
+    pub execution_started_by_class: [u64; CAPACITY_CLASS_COUNT],
     /// Admitted requests that resolved for zero between admission and
     /// execution start — cancelled, or abandoned while pending.
     pub canceled_before_start: u64,
@@ -632,6 +715,102 @@ mod tests {
         assert_eq!(CommitRefusal::NAMES[1], "overage_cap_exhausted");
         assert_eq!(CommitRefusal::NAMES[2], "overage_cap_temporarily_exhausted");
         assert_eq!(CommitRefusal::NAMES[3], "cancelled");
+    }
+
+    /// A counter added later sits after every counter that predates it.
+    ///
+    /// `repr(C)` makes the declaration order binding; this makes *appending*
+    /// binding. Both are needed, and the failure mode is silent: #99's two
+    /// per-class arrays were first filed beside the totals they break down,
+    /// which moved the counters a request touches on every admission and cost
+    /// `admission/full_check` 3.5% while executing no new code on that path.
+    /// Appending them gave it back.
+    #[test]
+    fn later_counters_are_appended_after_the_ones_they_break_down() {
+        use std::mem::offset_of;
+        let head = offset_of!(AdmissionCounters, admitted);
+        assert_eq!(head, 0, "the first counter anchors the calibrated layout");
+        for (name, offset) in [
+            (
+                "capacity_shed_by_class",
+                offset_of!(AdmissionCounters, capacity_shed_by_class),
+            ),
+            (
+                "execution_started_by_class",
+                offset_of!(AdmissionCounters, execution_started_by_class),
+            ),
+        ] {
+            for (older, older_offset) in [
+                ("admitted", head),
+                (
+                    "canceled_before_start",
+                    offset_of!(AdmissionCounters, canceled_before_start),
+                ),
+                (
+                    "capacity_shed",
+                    offset_of!(AdmissionCounters, capacity_shed),
+                ),
+                (
+                    "commit_refusals",
+                    offset_of!(AdmissionCounters, commit_refusals),
+                ),
+            ] {
+                assert!(
+                    offset > older_offset,
+                    "{name} was filed ahead of {older}, moving a counter calibrated where it is"
+                );
+            }
+        }
+    }
+
+    /// The class slots are a contract with whatever reads the exported
+    /// counters, pinned by literal for the reason the refusal slots are.
+    /// Renumbering `class_slot` and `CAPACITY_CLASS_NAMES` together stays
+    /// internally consistent while silently re-attributing every best-effort
+    /// shed to the assured dashboard.
+    #[test]
+    fn shipped_capacity_class_slots_and_labels_never_move() {
+        assert_eq!(class_slot(CapacityClass::Assured), 0);
+        assert_eq!(class_slot(CapacityClass::BestEffort), 1);
+        assert_eq!(CAPACITY_CLASS_NAMES[0], "Assured");
+        assert_eq!(CAPACITY_CLASS_NAMES[1], "BestEffort");
+    }
+
+    /// Each class lands in its own slot, and each per-class pair sums to the
+    /// total beside it.
+    ///
+    /// Mutation testing is what made this necessary: `class_slot` could be
+    /// replaced with a constant `0` or `1` — collapsing both classes onto one
+    /// counter — and every test stayed green, because the only assertions
+    /// anywhere read the *totals*. A breakdown that does not break anything
+    /// down is worse than no breakdown: an operator reads it to decide whether
+    /// the reserve is doing its job.
+    #[test]
+    fn every_capacity_class_tallies_in_its_own_slot() {
+        let counters = AdmissionCounters::new();
+        let locality = Locality::current();
+        counters.record_capacity_shed_for(CapacityClass::Assured);
+        for _ in 0..3 {
+            counters.record_capacity_shed_for(CapacityClass::BestEffort);
+        }
+        for _ in 0..2 {
+            counters.record_execution_started_for(CapacityClass::Assured, locality);
+        }
+        counters.record_execution_started_for(CapacityClass::BestEffort, locality);
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.capacity_shed_by_class, [1, 3]);
+        assert_eq!(snapshot.execution_started_by_class, [2, 1]);
+        // The breakdown never replaces the total: a reader must not have to
+        // add two numbers to get one.
+        assert_eq!(
+            snapshot.capacity_shed,
+            snapshot.capacity_shed_by_class.iter().sum::<u64>()
+        );
+        assert_eq!(
+            snapshot.execution_started,
+            snapshot.execution_started_by_class.iter().sum::<u64>()
+        );
     }
 
     /// Every funding refusal core can produce at execution start reaches a

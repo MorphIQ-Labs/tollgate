@@ -965,6 +965,12 @@ fn deny_response(reason: DenyReason) -> Response {
         DenyReason::FundingExpiredAtStart => {
             (StatusCode::SERVICE_UNAVAILABLE, "funding-expired-at-start")
         }
+        // 503, not 429: the caller did nothing wrong and slowing down would
+        // not help — the instance is full, and capacity returns as requests
+        // finish rather than as a quota refills (#99).
+        DenyReason::CapacityUnavailable => {
+            (StatusCode::SERVICE_UNAVAILABLE, "capacity-unavailable")
+        }
     };
     problem(status, code, reason.to_string())
 }

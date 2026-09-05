@@ -11,6 +11,7 @@ use tollgate_core::{
     Reservation, SharedCharge, UsageEvent, UsageSlot, UsageSource,
 };
 
+use crate::capacity::{CapacityEvidence, CapacityGate, CapacityPermit};
 use crate::counters::{AdmissionCounters, CommitRefusal};
 use crate::state::{AccountAdmissionState, ConcurrencyGuard, MapEntry, Principal, SnapshotMap};
 
@@ -266,7 +267,13 @@ impl<S: UsageSlot> Pending<S> {
         self,
         gate: &G,
     ) -> Result<ReadyToStart<S, G::Permit>, (DenyReason, Released)> {
-        let evidence = CapacityEvidence { _private: () };
+        // Built from the same immutable snapshot that authorized and priced
+        // this request, so the class cannot come from caller input and cannot
+        // change between admission and the gate's decision (#99, and the
+        // generation pinning of INVARIANTS.md #26).
+        let snapshot = &self.concurrency.state().snapshot;
+        let evidence =
+            CapacityEvidence::new(snapshot.capacity_class, snapshot.generation, self.locality);
         match gate.acquire(evidence) {
             Ok(permit) => Ok(ReadyToStart {
                 pending: self,
@@ -278,7 +285,12 @@ impl<S: UsageSlot> Pending<S> {
                 // claims the terminal slot, so the guard's `Drop` does not
                 // also report a cancellation for the same request.
                 let mut pending = self;
-                pending.counters().record_capacity_shed();
+                // Against the class whose work was refused, so an operator can
+                // see whether the reserve is doing its job or the instance is
+                // simply too small (#99).
+                pending
+                    .counters()
+                    .record_capacity_shed_for(pending.concurrency.state().snapshot.capacity_class);
                 pending.concurrency.mark_terminal_recorded();
                 Err((denied, Released))
             }
@@ -295,47 +307,6 @@ impl<S: UsageSlot> Pending<S> {
     #[inline]
     fn counters(&self) -> &AdmissionCounters {
         &self.concurrency.state().counters
-    }
-}
-
-mod private {
-    pub trait Sealed {}
-}
-
-/// Tollgate-owned execution-capacity evidence.
-pub trait CapacityPermit: private::Sealed + Send + 'static {}
-
-/// A startup-selected execution-capacity policy.
-pub trait CapacityGate: private::Sealed + Send + Sync + 'static {
-    type Permit: CapacityPermit;
-
-    fn acquire(&self, evidence: CapacityEvidence) -> Result<Self::Permit, DenyReason>;
-}
-
-/// Opaque evidence retained from the pinned request context.
-#[derive(Debug, Clone, Copy)]
-pub struct CapacityEvidence {
-    _private: (),
-}
-
-/// Disabled execution-capacity policy. This is a zero-sized startup choice.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoGate;
-
-/// Permit produced by [`NoGate`]; callers cannot construct one directly.
-#[derive(Debug)]
-pub struct NoCapacityPermit(());
-
-impl private::Sealed for NoGate {}
-impl private::Sealed for NoCapacityPermit {}
-impl CapacityPermit for NoCapacityPermit {}
-
-impl CapacityGate for NoGate {
-    type Permit = NoCapacityPermit;
-
-    #[inline]
-    fn acquire(&self, _evidence: CapacityEvidence) -> Result<Self::Permit, DenyReason> {
-        Ok(NoCapacityPermit(()))
     }
 }
 
@@ -415,7 +386,7 @@ impl<S: UsageSlot, P: CapacityPermit> ReadyToStart<S, P> {
         concurrency
             .state()
             .counters
-            .record_execution_started_at(locality);
+            .record_execution_started_for(concurrency.state().snapshot.capacity_class, locality);
         if admitted_on_lease && event.source == UsageSource::Overage {
             concurrency
                 .state()
@@ -964,13 +935,14 @@ fn reserve_from_overage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capacity::{ExecutionCapacityGate, ExecutionCapacityMode, ExecutionPermit, NoGate};
     use crate::maps::{ArcSwapSnapshotMap, MokaSnapshotMap};
     use crate::state::LeaseSlot;
     use tollgate_core::EnforcementMode;
     use tollgate_core::{
-        AccountId, AccountStatus, BudgetView, CancelOutcome, CostTable, CostUnits, DiscardedUsage,
-        DiscardedUsageSlot, FencingToken, Generation, LeaseGrant, LeaseId, LocalLease,
-        LocalSharding, PublishableSnapshot, ResolvedLimits, Retry,
+        AccountId, AccountStatus, BudgetView, CancelOutcome, CapacityClass, CostTable, CostUnits,
+        DiscardedUsage, DiscardedUsageSlot, FencingToken, Generation, LeaseGrant, LeaseId,
+        LocalLease, LocalSharding, PublishableSnapshot, ResolvedLimits, Retry,
     };
 
     #[derive(Clone, Copy)]
@@ -1810,31 +1782,30 @@ mod tests {
             .unwrap();
     }
 
-    /// A capacity gate that always refuses.
+    /// A real gate with no capacity left, which is what a shed looks like in
+    /// production.
     ///
-    /// `NoGate` is infallible, so without this the shed path is unreachable
-    /// and its counter could only ever export zero — which reads as "this
-    /// never happens" rather than "nothing can produce it". The gate traits
-    /// are sealed against external implementations, so the witness has to live
-    /// beside them. #99 replaces it with real pools and adds
-    /// `CapacityUnavailable`; until then the reason below stands in, because
-    /// what is under test is the tally, not the vocabulary.
-    #[derive(Debug)]
-    struct RefusingGate;
-
-    #[derive(Debug)]
-    struct RefusedPermit;
-
-    impl private::Sealed for RefusingGate {}
-    impl private::Sealed for RefusedPermit {}
-    impl CapacityPermit for RefusedPermit {}
-
-    impl CapacityGate for RefusingGate {
-        type Permit = RefusedPermit;
-
-        fn acquire(&self, _evidence: CapacityEvidence) -> Result<Self::Permit, DenyReason> {
-            Err(DenyReason::ConcurrencyLimited)
-        }
+    /// #93 needed a `RefusingGate` double because `NoGate` is infallible and
+    /// the traits are sealed, so nothing could reach the shed path. #99 makes
+    /// the double unnecessary: a `Uniform` gate of one unit, with that unit
+    /// held, refuses for the real reason through the real code.
+    fn saturated_gate() -> (ExecutionCapacityGate, ExecutionPermit) {
+        let gate = ExecutionCapacityGate::new(
+            ExecutionCapacityMode::Uniform {
+                total: NonZeroU32::new(1).unwrap(),
+            },
+            LocalSharding::SINGLE,
+        )
+        .expect("one unit is a valid configuration")
+        .expect("an enabled mode yields a gate");
+        let held = gate
+            .acquire(CapacityEvidence::new(
+                CapacityClass::Assured,
+                Generation(1),
+                Locality::current(),
+            ))
+            .expect("the only unit is free");
+        (gate, held)
     }
 
     /// A shed request is counted at the stage that shed it, released for zero,
@@ -1851,12 +1822,19 @@ mod tests {
             .install(Principal(1), snapshot(AccountStatus::Active), slot);
         let before = installed.remaining();
 
+        let (gate, _held) = saturated_gate();
         let (reason, _released) = engine
             .admit_one(request(1), t(0))
             .expect("the request admits")
-            .acquire_capacity(&RefusingGate)
-            .expect_err("this gate refuses everything");
-        assert_eq!(reason, DenyReason::ConcurrencyLimited);
+            .acquire_capacity(&gate)
+            .expect_err("a saturated gate refuses");
+        assert_eq!(
+            reason,
+            DenyReason::CapacityUnavailable,
+            "a shed says the instance is full, not that the account did \
+             something wrong"
+        );
+        assert_eq!(reason.retry(), Retry::Transient);
 
         let counters = engine.counters().snapshot();
         assert_eq!(counters.admitted, 1);

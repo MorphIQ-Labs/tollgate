@@ -1,5 +1,6 @@
 import Tollgate.CommitFallback
 import Tollgate.Conservation
+import Tollgate.ExecutionCapacity
 import Tollgate.ConcurrencyGauge
 import Tollgate.LeaseShards
 import Tollgate.OveragePublication

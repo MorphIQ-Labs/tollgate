@@ -1257,3 +1257,64 @@ exists to detect corrupt state and must not be able to launder it.
     `admin_refuses_a_noncanonical_policy_revision`,
     `full_stack_over_loopback_http`, and
     `the_response_and_the_bill_name_the_same_policy_revision`.
+
+30. **Execution capacity is conserved, and the reserve is reachable.** An
+    instance may bound how much work it *starts*, separately from what an
+    account may fund. Capacity is two exactly partitioned pools — shared plus
+    an assured reserve — and at every instant live permits from both sum to at
+    most the configured total. Each successful acquisition returns exactly its
+    unit, to the shard and pool that issued it, exactly once when its permit
+    drops.
+
+    **Best effort cannot consume the assured reserve.** Under every concurrent
+    interleaving, best-effort permits are funded only from shared. A saturated
+    best-effort flood therefore leaves the configured reserve reachable by
+    assured work — which is the entire point of the feature, and is why the
+    reserve transition takes the class's permission as a precondition rather
+    than checking it. Both classes try shared first, so an instance with no
+    best-effort traffic is not partitioned against itself: assured work reaches
+    shared *and* reserve.
+
+    **A capacity refusal is zero-charge.** A request that never obtains
+    capacity returns all pending funding, resolves its writer permit without an
+    event, and records neither settled usage nor overage. Rate tokens stay
+    consumed — the request arrived and was priced, and refunding them would
+    amplify an overload retry loop. It is counted as `capacity_shed`, its own
+    terminal outcome, never as a second pre-admission denial (20).
+
+    **Classification is verified and generation-pinned.** The class comes from
+    the same immutable snapshot that authorized and priced the request, through
+    evidence with no public constructor. It is never re-derived from caller
+    input or a second lookup, and it is an account-owned fact with one writer
+    (22's ownership, applied to a second field): a snapshot whose class
+    contradicts its account is refused at publication.
+
+    **The gate is request-path local.** Acquisition is synchronous and
+    fail-fast: bounded in the configured shard count, no I/O, no blocking lock,
+    no allocation, no clock. There is deliberately no queue — holding a request
+    that cannot start would convert a capacity bound into an unbounded latency
+    tail. Pools are sharded on cache-isolated lines for the reason leases are:
+    this gate is global to the instance, so a single atomic would put every
+    core on one line exactly during the overload it exists to handle.
+
+    **Disabled means absent.** Under `ExecutionCapacityMode::Disabled` the
+    service composes a zero-sized gate: no capacity state is allocated, no
+    class branch runs, and no capacity atomic is touched. Classification cannot
+    change an outcome because there is nothing for it to change. That is a
+    startup composition boundary rather than a runtime enum, because a branch
+    matched inside every request could not honestly promise it.
+    *Tests:*
+    `capacity::tests::disabled_never_refuses_and_ignores_the_class`,
+    `uniform_bounds_total_and_treats_both_classes_alike`,
+    `a_best_effort_flood_cannot_consume_the_assured_reserve`,
+    `assured_work_reaches_shared_and_reserve_when_alone`,
+    `assured_work_spends_shared_before_its_reserve`,
+    `a_sharded_pool_strands_no_capacity`,
+    `shards_are_capped_at_the_pools_units`,
+    `a_partition_sums_to_the_whole`,
+    `a_reserve_that_swallows_the_instance_is_refused`,
+    `concurrent_acquisition_never_exceeds_the_total`,
+    `concurrent_best_effort_load_leaves_the_reserve_reachable`,
+    `engine::tests::a_capacity_shed_is_counted_without_a_second_denial`, and
+    the account-ownership witnesses named in 22.
+    *Proof:* `formal/lean/Tollgate/ExecutionCapacity.lean`.

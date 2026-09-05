@@ -133,6 +133,16 @@ pub enum DenyReason {
     /// started. Only the staged lifecycle can produce this — the one-shot API
     /// leaves no interval between admission and start for it to happen in.
     FundingExpiredAtStart,
+    /// This instance has no execution capacity to start the request with
+    /// (#99). The account is valid, funded, and within every limit of its
+    /// own — the instance simply cannot afford to begin the work now.
+    ///
+    /// Deliberately not aliased to `RateLimited`, `LeaseExhausted`, or
+    /// `AccountingBackpressure`: those say something about the *account*, and
+    /// a caller told one of them would look at its own quota for a condition
+    /// that has nothing to do with it. Transient, and honestly so — capacity
+    /// is returned by every request that finishes.
+    CapacityUnavailable,
 }
 
 impl DenyReason {
@@ -166,10 +176,11 @@ impl DenyReason {
         "overage_commit_in_progress",
         "empty_workload",
         "funding_expired_at_start",
+        "capacity_unavailable",
     ];
 
     /// How many distinct reasons exist — the width of any per-reason array.
-    pub const COUNT: usize = 21;
+    pub const COUNT: usize = 22;
 
     /// This reason's dense slot, for direct-indexed per-reason tallies.
     ///
@@ -202,6 +213,7 @@ impl DenyReason {
             DenyReason::OverageCommitInProgress { .. } => 18,
             DenyReason::EmptyWorkload => 19,
             DenyReason::FundingExpiredAtStart => 20,
+            DenyReason::CapacityUnavailable => 21,
         }
     }
 
@@ -224,7 +236,8 @@ impl DenyReason {
             | DenyReason::LeaseExhausted { .. }
             | DenyReason::AccountingBackpressure
             | DenyReason::OverageCapExhausted { .. }
-            | DenyReason::OverageCapTemporarilyExhausted { .. } => Retry::Transient,
+            | DenyReason::OverageCapTemporarilyExhausted { .. }
+            | DenyReason::CapacityUnavailable => Retry::Transient,
             DenyReason::OverageCommitInProgress { .. } => Retry::AfterInFlight,
             DenyReason::FundingExpiredAtStart => Retry::Transient,
             DenyReason::UnknownPrincipal
@@ -252,6 +265,9 @@ impl fmt::Display for DenyReason {
                 write!(f, "request exceeds batch cap ({max_items} items)")
             }
             DenyReason::UnpricedOperation => f.write_str("operation is not priced"),
+            DenyReason::CapacityUnavailable => {
+                f.write_str("no execution capacity available on this instance")
+            }
             DenyReason::RateLimited => f.write_str("rate limited"),
             DenyReason::RequestRateLimited => f.write_str("request rate limited"),
             DenyReason::ConcurrencyLimited => f.write_str("concurrency limit reached"),
@@ -336,6 +352,7 @@ mod tests {
         },
         DenyReason::EmptyWorkload,
         DenyReason::FundingExpiredAtStart,
+        DenyReason::CapacityUnavailable,
     ];
 
     /// The indices must be a permutation of `0..COUNT`. Two reasons sharing a
@@ -451,6 +468,7 @@ mod tests {
                 20,
                 "funding_expired_at_start",
             ),
+            (DenyReason::CapacityUnavailable, 21, "capacity_unavailable"),
         ];
 
         for (reason, slot, label) in shipped {
@@ -468,7 +486,7 @@ mod tests {
 
         assert_eq!(
             DenyReason::COUNT,
-            21,
+            22,
             "COUNT may only grow, and only by appending"
         );
     }
@@ -564,7 +582,8 @@ mod tests {
                 | DenyReason::LeaseExhausted { .. }
                 | DenyReason::AccountingBackpressure
                 | DenyReason::OverageCapExhausted { .. }
-                | DenyReason::OverageCapTemporarilyExhausted { .. } => Retry::Transient,
+                | DenyReason::OverageCapTemporarilyExhausted { .. }
+                | DenyReason::CapacityUnavailable => Retry::Transient,
                 DenyReason::UnknownPrincipal
                 | DenyReason::AccountSuspended
                 | DenyReason::AccountClosed
