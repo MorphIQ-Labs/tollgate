@@ -56,7 +56,7 @@ use tokio::sync::watch;
 use tracing::Instrument as _;
 
 use tollgate_admission::LeaseSlot;
-use tollgate_core::{AccountId, CostUnits, LocalLease, RefillSignal};
+use tollgate_core::{AccountId, CostUnits, LeaseGrant, LocalLease, RefillSignal, RefillVerdict};
 use tollgate_store::{AllocateError, LeaseAllocator};
 
 use tollgate_store::Clock;
@@ -256,11 +256,14 @@ pub struct LeaseCounters {
     acquired: AtomicU64,
     acquired_units: AtomicU64,
     acquire_timeouts: AtomicU64,
+    uncertain_acquires: AtomicU64,
     acquire_pending: AtomicBool,
     integrity_fault: AtomicBool,
     acquire_refused: [AtomicU64; AllocateError::COUNT],
     released: AtomicU64,
     abandoned: AtomicU64,
+    consolidated: AtomicU64,
+    consolidations_deferred: AtomicU64,
 }
 
 impl LeaseCounters {
@@ -270,11 +273,14 @@ impl LeaseCounters {
             acquired: AtomicU64::new(0),
             acquired_units: AtomicU64::new(0),
             acquire_timeouts: AtomicU64::new(0),
+            uncertain_acquires: AtomicU64::new(0),
             acquire_pending: AtomicBool::new(false),
             integrity_fault: AtomicBool::new(false),
             acquire_refused: [const { AtomicU64::new(0) }; AllocateError::COUNT],
             released: AtomicU64::new(0),
             abandoned: AtomicU64::new(0),
+            consolidated: AtomicU64::new(0),
+            consolidations_deferred: AtomicU64::new(0),
         }
     }
 
@@ -302,10 +308,27 @@ impl LeaseCounters {
     /// well have granted the lease and simply failed to say so in time.
     fn record_acquire_timeout(&self) {
         self.acquire_timeouts.fetch_add(1, Ordering::Relaxed);
+        self.uncertain_acquires.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record both sides of a completed consolidation together: one grant
+    /// acquired and its predecessor settled. Omitting either side corrupts
+    /// the runtime's terminal grant inventory.
+    fn record_consolidated(&self, units: CostUnits) {
+        self.record_acquired(units);
+        self.record_released();
+        self.consolidated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_consolidation_deferred(&self) {
+        self.consolidations_deferred.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_acquire_refused(&self, error: &AllocateError) {
         self.acquire_refused[error.index()].fetch_add(1, Ordering::Relaxed);
+        if matches!(error, AllocateError::Storage(_)) {
+            self.uncertain_acquires.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// A lease the allocator is no longer holding open for this instance —
@@ -324,11 +347,14 @@ impl LeaseCounters {
             acquired: self.acquired.load(Ordering::Relaxed),
             acquired_units: self.acquired_units.load(Ordering::Relaxed),
             acquire_timeouts: self.acquire_timeouts.load(Ordering::Relaxed),
+            uncertain_acquires: self.uncertain_acquires.load(Ordering::Relaxed),
             acquire_refused: std::array::from_fn(|slot| {
                 self.acquire_refused[slot].load(Ordering::Relaxed)
             }),
             released: self.released.load(Ordering::Relaxed),
             abandoned: self.abandoned.load(Ordering::Relaxed),
+            consolidated: self.consolidated.load(Ordering::Relaxed),
+            consolidations_deferred: self.consolidations_deferred.load(Ordering::Relaxed),
         }
     }
 }
@@ -349,6 +375,11 @@ pub struct LeaseStats {
     pub acquired_units: u64,
     /// Acquires the allocator did not answer within `store_call_timeout`.
     pub acquire_timeouts: u64,
+    /// Acquires or consolidations that timed out or returned `Storage`.
+    /// Each may have committed an unanswered grant; the count survives a
+    /// clean shutdown as well as task death. An interrupted in-flight call
+    /// is tracked separately until the runtime joins its manager.
+    pub uncertain_acquires: u64,
     /// Acquire refusals per [`AllocateError::index`] slot.
     pub acquire_refused: [u64; AllocateError::COUNT],
     /// Leases the allocator no longer holds open for this instance.
@@ -357,6 +388,17 @@ pub struct LeaseStats {
     /// TTL reclaim (INVARIANTS.md #9). Like the writer's `lost`, this can only
     /// move at shutdown — it is a confirmation, not an early warning.
     pub abandoned: u64,
+    /// Rotations that folded a refused lease's unspent units into their
+    /// replacement, counted apart from `acquired` because each one records
+    /// that this instance *did* refuse work the account could fund. A rising
+    /// rate is the signal that `target_grant` is undersized against the
+    /// largest quote the service prices (#109).
+    pub consolidated: u64,
+    /// Consolidations that could not run because the refused lease still had
+    /// a reservation in flight, so the slot kept serving it. Retried on the
+    /// next refusal or tick; a rising count against a flat `consolidated`
+    /// means requests never leave the lease idle long enough.
+    pub consolidations_deferred: u64,
 }
 
 impl LeaseStats {
@@ -364,9 +406,12 @@ impl LeaseStats {
         acquired: 0,
         acquired_units: 0,
         acquire_timeouts: 0,
+        uncertain_acquires: 0,
         acquire_refused: [0; AllocateError::COUNT],
         released: 0,
         abandoned: 0,
+        consolidated: 0,
+        consolidations_deferred: 0,
     };
 
     /// Aggregate observations without wrapping an operator's counter.
@@ -383,9 +428,16 @@ impl LeaseStats {
             acquired: self.acquired.checked_add(other.acquired)?,
             acquired_units: self.acquired_units.checked_add(other.acquired_units)?,
             acquire_timeouts: self.acquire_timeouts.checked_add(other.acquire_timeouts)?,
+            uncertain_acquires: self
+                .uncertain_acquires
+                .checked_add(other.uncertain_acquires)?,
             acquire_refused,
             released: self.released.checked_add(other.released)?,
             abandoned: self.abandoned.checked_add(other.abandoned)?,
+            consolidated: self.consolidated.checked_add(other.consolidated)?,
+            consolidations_deferred: self
+                .consolidations_deferred
+                .checked_add(other.consolidations_deferred)?,
         })
     }
     /// Refusals paired with their stable labels, in slot order.
@@ -588,8 +640,8 @@ async fn run(
         {
             break;
         }
-        let needs_acquire = match slot.load() {
-            None => true,
+        let rotation = match slot.load() {
+            None => Rotation::Acquire,
             Some(lease) if now >= lease.usable_until() => {
                 // This inspection is not an in-flight request. Keeping its
                 // Arc through the release pass would make our own grant
@@ -620,11 +672,20 @@ async fn run(
                 {
                     break;
                 }
-                true
+                Rotation::Acquire
             }
-            Some(lease) => lease.refill_due_or_rearm(),
+            Some(lease) => match lease.refill_due_or_rearm() {
+                RefillVerdict::Idle => Rotation::Idle,
+                RefillVerdict::Draining => Rotation::Acquire,
+                // The lease refused work this account may well be able to
+                // fund, so the units it still holds are the ones the next
+                // grant needs. Acquiring beside it would ask for a grant
+                // sized against a balance those units are missing from, and
+                // install the smaller answer (#109).
+                RefillVerdict::Refused => Rotation::Consolidate,
+            },
         };
-        if !needs_acquire {
+        if rotation == Rotation::Idle {
             continue;
         }
 
@@ -636,6 +697,29 @@ async fn run(
         // shutdown phase is about to drain anyway (#78).
         if paused.load(Ordering::Acquire) || *shutdown.borrow() {
             continue;
+        }
+
+        if rotation == Rotation::Consolidate {
+            match consolidate_live_lease(
+                &allocator,
+                &mut parked,
+                &clock,
+                &config,
+                &slot,
+                &refill,
+                health,
+                counters,
+                &mut shutdown,
+            )
+            .await
+            {
+                Consolidation::ShutdownObserved => break,
+                Consolidation::Installed | Consolidation::KeptServing => continue,
+                // The grant this would have folded in is gone, so the fold has
+                // nothing left to protect and the ordinary path below is both
+                // correct and what an empty slot needs.
+                Consolidation::AcquireInstead => {}
+            }
         }
         counters.acquire_pending.store(true, Ordering::Release);
         let acquire = tokio::time::timeout(
@@ -654,33 +738,8 @@ async fn run(
             Ok(Ok(grant)) => {
                 counters.record_acquired(grant.units);
                 // Rotation: install the fresh lease and park the superseded
-                // one until it quiesces (module docs). Adaptive allocation
-                // may return less than target_grant; cap low-water below the
-                // actual grant so a fresh tail grant does not immediately
-                // rotate without serving any work.
-                let low_water = CostUnits(
-                    config
-                        .low_water
-                        .get()
-                        .min(grant.units.get().saturating_sub(1)),
-                );
-                let fresh = Arc::new(
-                    LocalLease::with_sharding(
-                        grant,
-                        low_water,
-                        config.expiry_safety_margin,
-                        slot.sharding(),
-                    )
-                    // Each fresh lease gets the doorbell and its own
-                    // unrung shard flags. A single-counter lease therefore
-                    // rings once for the whole rotation; a sharded one rings
-                    // at most once per shard between aggregate checks, which
-                    // is what `refill_due_or_rearm` above clears whenever the
-                    // aggregate shows an early crossing was premature
-                    // (INVARIANTS.md #6).
-                    .with_refill(Arc::clone(&refill) as Arc<dyn RefillSignal>),
-                );
-                if let Some(old) = slot.replace(fresh) {
+                // one until it quiesces (module docs).
+                if let Some(old) = slot.replace(install_lease(grant, &config, &slot, &refill)) {
                     parked.push(old);
                 }
             }
@@ -840,6 +899,244 @@ fn release_failure(error: &AllocateError) -> ReleaseFailure {
         | AllocateError::InsufficientBalance
         | AllocateError::InvalidTtl => ReleaseFailure::Integrity,
     }
+}
+
+/// Wrap a fresh grant for local spending, in this slot's layout and wired to
+/// this task's doorbell.
+///
+/// Adaptive allocation may return less than `target_grant`; low water is
+/// capped below the actual grant so a fresh tail grant does not rotate again
+/// without serving any work. That cap is also why a refusal has to be its own
+/// signal: it puts a shrunken grant *above* its own mark, where no crossing
+/// can ever occur (#109).
+///
+/// Each fresh lease gets its own unrung flags. A single-counter lease
+/// therefore rings once for the whole rotation; a sharded one rings at most
+/// once per shard between aggregate checks, which is what
+/// `LocalLease::refill_due_or_rearm` clears whenever the aggregate shows an
+/// early crossing was premature (INVARIANTS.md #6).
+fn install_lease(
+    grant: LeaseGrant,
+    config: &LeaseManagerConfig,
+    slot: &Arc<LeaseSlot>,
+    refill: &Arc<RefillRequests>,
+) -> Arc<LocalLease> {
+    let low_water = CostUnits(
+        config
+            .low_water
+            .get()
+            .min(grant.units.get().saturating_sub(1)),
+    );
+    Arc::new(
+        LocalLease::with_sharding(
+            grant,
+            low_water,
+            config.expiry_safety_margin,
+            slot.sharding(),
+        )
+        .with_refill(Arc::clone(refill) as Arc<dyn RefillSignal>),
+    )
+}
+
+/// What the refill loop should do with the slot this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rotation {
+    /// Nothing asked for anything.
+    Idle,
+    /// Acquire the next lease. The slot keeps serving whatever it has while
+    /// the call is in flight, which is what makes an anticipatory low-water
+    /// rotation invisible to requests.
+    Acquire,
+    /// Fold the live lease's unspent units into its replacement, because it
+    /// refused work rather than merely approached its mark (#109).
+    Consolidate,
+}
+
+/// What a failed consolidation left behind, which decides whether the lease
+/// may go back into the slot.
+///
+/// The distinction that matters is not "did it work" but "does this instance
+/// still own spendable units". Reinstating a lease the store already settled
+/// would spend units it has credited back to the account — a double spend, and
+/// the one outcome worse than the refusal being fixed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsolidationFailure {
+    /// A domain answer from inside the transaction, so it rolled back and the
+    /// lease is still active and still ours.
+    RolledBack,
+    /// The lease is settled, or was never ours to settle. Nothing to put back.
+    Settled,
+    /// The store never answered. The transaction may have committed, so the
+    /// lease must not serve again; it may equally still be active, so it must
+    /// not be dropped. Park it and let the release pass find out which.
+    Ambiguous,
+    /// The unspent claim did not fit the lease the store holds. The
+    /// transaction rolled back, so the lease is still ours, but this instance
+    /// and the ledger disagree about a grant — the same accounting fault a
+    /// bad release reports.
+    Integrity,
+}
+
+fn consolidation_failure(error: &AllocateError) -> ConsolidationFailure {
+    match error {
+        AllocateError::UnknownLease | AllocateError::LeaseNotActive | AllocateError::Fenced => {
+            ConsolidationFailure::Settled
+        }
+        // Legitimate near a period's end and the reason consolidation was
+        // attempted at all: the account has nothing left to add. Not the
+        // integrity fault the same code means for a *release*, which never
+        // draws a grant (#109).
+        AllocateError::InsufficientBalance
+        | AllocateError::UnknownAccount
+        | AllocateError::AccountInactive
+        | AllocateError::InvalidTtl => ConsolidationFailure::RolledBack,
+        AllocateError::InvalidRelease => ConsolidationFailure::Integrity,
+        AllocateError::Storage(_) => ConsolidationFailure::Ambiguous,
+    }
+}
+
+/// Fold the live lease's unspent units into its replacement, atomically.
+///
+/// The slot is emptied first, because `unspent` has to be exact and a lease
+/// still reachable from the slot can still be debited. That is a deny window,
+/// so it is kept to the take-and-check itself: quiescence is *tested*, never
+/// waited for. A lease with a reservation in flight goes straight back and the
+/// next refused debit rings again — and in the state this exists to fix there
+/// are no successful requests holding the lease, so the test passes on the
+/// first attempt exactly when it matters.
+#[allow(clippy::too_many_arguments)]
+async fn consolidate_live_lease(
+    allocator: &Arc<dyn LeaseAllocator>,
+    parked: &mut Vec<Arc<LocalLease>>,
+    clock: &Arc<dyn Clock>,
+    config: &LeaseManagerConfig,
+    slot: &Arc<LeaseSlot>,
+    refill: &Arc<RefillRequests>,
+    health: &watch::Sender<bool>,
+    counters: &LeaseCounters,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Consolidation {
+    let Some(live) = slot.take() else {
+        // Another path emptied the slot between the verdict and here; an
+        // ordinary acquire is what an empty slot needs.
+        return Consolidation::AcquireInstead;
+    };
+    if Arc::strong_count(&live) > 1 || !live.is_only_local_view() {
+        counters.record_consolidation_deferred();
+        slot.install(live);
+        return Consolidation::KeptServing;
+    }
+    // Exact: the predicate above establishes that no request can debit or
+    // refund, which is the condition `LocalLease::remaining` documents.
+    let unspent = live.remaining();
+    let grant = *live.grant();
+    counters.acquire_pending.store(true, Ordering::Release);
+    let call = tokio::time::timeout(
+        config.store_call_timeout,
+        allocator.consolidate(
+            grant.lease_id,
+            grant.fencing_token,
+            unspent,
+            config.target_grant,
+            config.lease_ttl,
+            clock.now(),
+        ),
+    );
+    let outcome = tokio::select! {
+        outcome = call => outcome,
+        _ = shutdown.changed() => {
+            tracing::debug!(
+                lease = %grant.lease_id,
+                "shutdown observed during a consolidation; parking the grant"
+            );
+            // Abandoned mid-call, so the same ambiguity as a timeout: the
+            // shutdown phase releases it and learns whether it was settled.
+            // Keep acquire_pending: the replacement capability may already
+            // exist, and releasing the predecessor cannot recover that grant.
+            parked.push(live);
+            return Consolidation::ShutdownObserved;
+        }
+    };
+    counters.acquire_pending.store(false, Ordering::Release);
+
+    let error: AllocateError = match outcome {
+        Ok(Ok(fresh)) => {
+            counters.record_consolidated(fresh.units);
+            tracing::debug!(
+                superseded = %grant.lease_id,
+                lease = %fresh.lease_id,
+                folded = unspent.get(),
+                units = fresh.units.get(),
+                "consolidated a refused lease into a larger grant"
+            );
+            // The store settled `live` inside the same transaction that issued
+            // this grant, so it must not be parked: releasing it again would
+            // claim units the ledger has already credited back.
+            drop(live);
+            slot.install(install_lease(fresh, config, slot, refill));
+            return Consolidation::Installed;
+        }
+        Ok(Err(error)) => error,
+        Err(_) => {
+            counters.record_acquire_timeout();
+            tracing::warn!(
+                lease = %grant.lease_id,
+                "consolidation timed out; parking the grant because the store may have settled it"
+            );
+            parked.push(live);
+            return Consolidation::KeptServing;
+        }
+    };
+    counters.record_acquire_refused(&error);
+    match consolidation_failure(&error) {
+        ConsolidationFailure::RolledBack => {
+            tracing::debug!(
+                lease = %grant.lease_id, %error,
+                "consolidation refused; the grant is untouched and keeps serving"
+            );
+            slot.install(live);
+            Consolidation::KeptServing
+        }
+        ConsolidationFailure::Integrity => {
+            counters.record_integrity_fault(health);
+            tracing::error!(
+                lease = %grant.lease_id, units = unspent.get(), %error,
+                "consolidation violated the allocator contract; readiness withdrawn"
+            );
+            slot.install(live);
+            Consolidation::KeptServing
+        }
+        ConsolidationFailure::Settled => {
+            counters.record_released();
+            tracing::warn!(
+                lease = %grant.lease_id, %error,
+                "the store no longer holds this grant open; acquiring a fresh one"
+            );
+            drop(live);
+            Consolidation::AcquireInstead
+        }
+        ConsolidationFailure::Ambiguous => {
+            tracing::warn!(
+                lease = %grant.lease_id, %error,
+                "consolidation failed without saying whether it committed; parking the grant"
+            );
+            parked.push(live);
+            Consolidation::KeptServing
+        }
+    }
+}
+
+/// The outcome of one consolidation attempt, in the terms the loop acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Consolidation {
+    /// A larger grant is in the slot.
+    Installed,
+    /// The slot holds a lease that may still serve, or the grant is parked for
+    /// the release pass. Either way this tick is done.
+    KeptServing,
+    /// There is nothing to fold in; take the ordinary acquire path.
+    AcquireInstead,
+    ShutdownObserved,
 }
 
 /// Whether `lease` has quiesced, waiting until `deadline` for it to.
@@ -1031,6 +1328,11 @@ mod tests {
         assert!(left.checked_add(right).is_none());
         right.acquire_refused[1] = 0;
         assert_eq!(left.checked_add(right).unwrap().refused(), u64::MAX);
+        left = super::LeaseStats::ZERO;
+        right = super::LeaseStats::ZERO;
+        left.uncertain_acquires = u64::MAX;
+        right.uncertain_acquires = 1;
+        assert!(left.checked_add(right).is_none());
     }
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -1041,6 +1343,28 @@ mod tests {
     use tollgate_store::{AllocateError, ReclaimBatch, StoreError, SystemClock};
 
     use super::*;
+
+    #[test]
+    fn only_ambiguous_acquire_outcomes_increase_uncertainty() {
+        let counters = LeaseCounters::new();
+        for error in [
+            AllocateError::UnknownAccount,
+            AllocateError::AccountInactive,
+            AllocateError::InsufficientBalance,
+            AllocateError::UnknownLease,
+            AllocateError::Fenced,
+            AllocateError::LeaseNotActive,
+            AllocateError::InvalidRelease,
+            AllocateError::InvalidTtl,
+        ] {
+            counters.record_acquire_refused(&error);
+        }
+        assert_eq!(counters.snapshot().uncertain_acquires, 0);
+        counters.record_acquire_refused(&AllocateError::Storage(StoreError("lost reply".into())));
+        assert_eq!(counters.snapshot().uncertain_acquires, 1);
+        counters.record_acquire_timeout();
+        assert_eq!(counters.snapshot().uncertain_acquires, 2);
+    }
 
     /// The doorbell's two orderings, tested directly rather than inferred from
     /// end-to-end behaviour: a lost request would show up only as refill
@@ -1176,6 +1500,18 @@ mod tests {
             }
         }
 
+        async fn consolidate(
+            &self,
+            _lease_id: LeaseId,
+            _fencing_token: FencingToken,
+            _unspent: CostUnits,
+            _requested: CostUnits,
+            _ttl: SignedDuration,
+            _now: Timestamp,
+        ) -> Result<LeaseGrant, AllocateError> {
+            unreachable!("release_quiesced never consolidates")
+        }
+
         async fn reclaim_expired_batch(
             &self,
             _now: Timestamp,
@@ -1183,6 +1519,264 @@ mod tests {
         ) -> Result<ReclaimBatch, StoreError> {
             unreachable!("release_quiesced never reclaims")
         }
+    }
+
+    /// Answers consolidations from a script, so each failure mode can be
+    /// tested for the thing that actually matters: whether the lease is put
+    /// back where requests can reach it.
+    struct ConsolidatingAllocator {
+        answer: Mutex<Option<Result<LeaseGrant, AllocateError>>>,
+        calls: AtomicU64,
+    }
+
+    impl ConsolidatingAllocator {
+        fn new(answer: Result<LeaseGrant, AllocateError>) -> Arc<Self> {
+            Arc::new(Self {
+                answer: Mutex::new(Some(answer)),
+                calls: AtomicU64::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl LeaseAllocator for ConsolidatingAllocator {
+        async fn acquire(
+            &self,
+            _account: AccountId,
+            _requested: CostUnits,
+            _ttl: SignedDuration,
+            _now: Timestamp,
+        ) -> Result<LeaseGrant, AllocateError> {
+            unreachable!("these tests drive consolidation directly")
+        }
+
+        async fn release(
+            &self,
+            _lease_id: LeaseId,
+            _fencing_token: FencingToken,
+            _unspent: CostUnits,
+            _now: Timestamp,
+        ) -> Result<(), AllocateError> {
+            Ok(())
+        }
+
+        async fn consolidate(
+            &self,
+            _lease_id: LeaseId,
+            _fencing_token: FencingToken,
+            _unspent: CostUnits,
+            _requested: CostUnits,
+            _ttl: SignedDuration,
+            _now: Timestamp,
+        ) -> Result<LeaseGrant, AllocateError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.answer
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one scripted consolidation per test")
+        }
+
+        async fn reclaim_expired_batch(
+            &self,
+            _now: Timestamp,
+            _limit: std::num::NonZeroUsize,
+        ) -> Result<ReclaimBatch, StoreError> {
+            unreachable!("these tests never reclaim")
+        }
+    }
+
+    fn grant(id: u128, units: u64) -> LeaseGrant {
+        LeaseGrant {
+            lease_id: LeaseId(id),
+            account_id: AccountId(1),
+            fencing_token: FencingToken(1),
+            units: CostUnits(units),
+            expires_at: Timestamp::from_second(3_600).unwrap(),
+        }
+    }
+
+    /// Drive one consolidation against a slot holding `lease`, and report what
+    /// the slot and the parked list hold afterwards.
+    async fn consolidate_once(
+        allocator: Arc<dyn LeaseAllocator>,
+        harness: &Harness,
+        lease: Arc<LocalLease>,
+    ) -> (Consolidation, Option<u128>, Vec<u128>) {
+        harness.slot.install(lease);
+        let mut parked = Vec::new();
+        let (_tx, mut shutdown) = watch::channel(false);
+        let outcome = consolidate_live_lease(
+            &allocator,
+            &mut parked,
+            &clock(),
+            &harness.config,
+            &harness.slot,
+            &Arc::new(RefillRequests::default()),
+            &harness.health,
+            &harness.counters,
+            &mut shutdown,
+        )
+        .await;
+        let served = harness.slot.load().map(|l| l.grant().lease_id.0);
+        let parked_ids = parked.iter().map(|l| l.grant().lease_id.0).collect();
+        (outcome, served, parked_ids)
+    }
+
+    /// The happy path: the store settled the old lease inside the same
+    /// transaction that issued the new one, so parking it would release units
+    /// the ledger has already credited back — a double refund.
+    #[tokio::test(start_paused = true)]
+    async fn a_successful_consolidation_installs_the_grant_and_parks_nothing() {
+        let harness = Harness::new();
+        let allocator = ConsolidatingAllocator::new(Ok(grant(2, 500)));
+        let (outcome, served, parked) = consolidate_once(
+            Arc::clone(&allocator) as Arc<dyn LeaseAllocator>,
+            &harness,
+            parked_lease(1),
+        )
+        .await;
+
+        assert_eq!(outcome, Consolidation::Installed);
+        assert_eq!(served, Some(2), "the larger grant is serving");
+        assert!(
+            parked.is_empty(),
+            "the superseded lease was already settled"
+        );
+        let stats = harness.stats();
+        assert_eq!(stats.consolidated, 1);
+        assert_eq!(stats.acquired, 1);
+        assert_eq!(stats.released, 1, "consolidation settled its predecessor");
+        assert!(!harness.counters.acquire_pending());
+        assert_eq!(stats.acquired_units, 500);
+    }
+
+    /// A refusal from inside the transaction rolled it back, so the lease is
+    /// still active and still ours: it goes back into the slot rather than
+    /// leaving this instance denying everything until the next acquire.
+    #[tokio::test(start_paused = true)]
+    async fn a_rolled_back_consolidation_returns_the_lease_to_the_slot() {
+        for error in [
+            AllocateError::InsufficientBalance,
+            AllocateError::AccountInactive,
+            AllocateError::UnknownAccount,
+        ] {
+            let harness = Harness::new();
+            let allocator = ConsolidatingAllocator::new(Err(error.clone()));
+            let (outcome, served, parked) = consolidate_once(
+                Arc::clone(&allocator) as Arc<dyn LeaseAllocator>,
+                &harness,
+                parked_lease(1),
+            )
+            .await;
+
+            assert_eq!(outcome, Consolidation::KeptServing, "{error}");
+            assert_eq!(
+                served,
+                Some(1),
+                "still serving the untouched lease: {error}"
+            );
+            assert!(parked.is_empty(), "{error}");
+            assert!(harness.is_healthy(), "an ordinary refusal is not a fault");
+        }
+    }
+
+    /// The store may have committed. Reinstating would spend units it has
+    /// already credited back, and dropping would strand them — so the grant is
+    /// parked and the release pass finds out which happened.
+    #[tokio::test(start_paused = true)]
+    async fn an_ambiguous_consolidation_parks_the_grant_rather_than_reinstating_it() {
+        let harness = Harness::new();
+        let allocator = ConsolidatingAllocator::new(Err(AllocateError::Storage(StoreError(
+            "connection reset".into(),
+        ))));
+        let (outcome, served, parked) = consolidate_once(
+            Arc::clone(&allocator) as Arc<dyn LeaseAllocator>,
+            &harness,
+            parked_lease(1),
+        )
+        .await;
+
+        assert_eq!(outcome, Consolidation::KeptServing);
+        assert_eq!(
+            served, None,
+            "the slot fails closed rather than double-spending"
+        );
+        assert_eq!(parked, vec![1], "and the release pass settles it");
+    }
+
+    /// A capability the store no longer honours is not ours to reinstate, and
+    /// there is nothing to fold in either — so the ordinary acquire path is
+    /// what an empty slot needs.
+    #[tokio::test(start_paused = true)]
+    async fn a_settled_lease_falls_through_to_an_ordinary_acquire() {
+        for error in [
+            AllocateError::UnknownLease,
+            AllocateError::LeaseNotActive,
+            AllocateError::Fenced,
+        ] {
+            let harness = Harness::new();
+            let allocator = ConsolidatingAllocator::new(Err(error.clone()));
+            let (outcome, served, parked) = consolidate_once(
+                Arc::clone(&allocator) as Arc<dyn LeaseAllocator>,
+                &harness,
+                parked_lease(1),
+            )
+            .await;
+
+            assert_eq!(outcome, Consolidation::AcquireInstead, "{error}");
+            assert_eq!(served, None, "{error}");
+            assert!(parked.is_empty(), "the store already settled it: {error}");
+        }
+    }
+
+    /// An over-claimed fold is a client accounting bug, and it is reported as
+    /// one — but the transaction still rolled back, so the lease keeps serving
+    /// while readiness is withdrawn.
+    #[tokio::test(start_paused = true)]
+    async fn an_over_claimed_fold_withdraws_readiness_and_keeps_serving() {
+        let harness = Harness::new();
+        let allocator = ConsolidatingAllocator::new(Err(AllocateError::InvalidRelease));
+        let (outcome, served, parked) = consolidate_once(
+            Arc::clone(&allocator) as Arc<dyn LeaseAllocator>,
+            &harness,
+            parked_lease(1),
+        )
+        .await;
+
+        assert_eq!(outcome, Consolidation::KeptServing);
+        assert_eq!(served, Some(1));
+        assert!(parked.is_empty());
+        assert!(!harness.is_healthy(), "an accounting fault is never silent");
+    }
+
+    /// `unspent` has to be exact, so a lease a request can still debit is not
+    /// one this may fold. It goes straight back — the deny window is the
+    /// take-and-check, never a wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_consolidation_defers_while_a_reservation_is_in_flight() {
+        let harness = Harness::new();
+        let allocator = ConsolidatingAllocator::new(Ok(grant(2, 500)));
+        let lease = parked_lease(1);
+        // Stands in for a request that loaded the lease and has not finished.
+        let _in_flight = Arc::clone(&lease);
+
+        let (outcome, served, parked) = consolidate_once(
+            Arc::clone(&allocator) as Arc<dyn LeaseAllocator>,
+            &harness,
+            lease,
+        )
+        .await;
+
+        assert_eq!(outcome, Consolidation::KeptServing);
+        assert_eq!(served, Some(1), "the slot keeps serving it");
+        assert!(parked.is_empty());
+        assert_eq!(
+            allocator.calls.load(Ordering::SeqCst),
+            0,
+            "no store call is made against an inexact aggregate"
+        );
+        assert_eq!(harness.stats().consolidations_deferred, 1);
     }
 
     /// `release_quiesced`'s collaborators, with the parts these tests do not

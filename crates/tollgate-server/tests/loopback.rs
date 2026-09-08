@@ -28,7 +28,8 @@ use tollgate_core::{
 };
 use tollgate_store::wire::{API_PREFIX, MAX_INGEST_BODY_BYTES};
 use tollgate_store::{
-    AccountConfig, GrantPolicy, MemoryStore, SnapshotResolution, SnapshotSource as _, UsageSink,
+    AccountConfig, AllocateError, GrantPolicy, LeaseAllocator as _, MemoryStore,
+    SnapshotResolution, SnapshotSource as _, UsageSink,
 };
 
 use tollgate_server::{ServerState, router, serve};
@@ -261,6 +262,78 @@ async fn http_negative_ttl_refetches_without_push() {
     ));
 
     manager.shutdown().await;
+    let _ = stop_tx.send(());
+    server.await.unwrap().unwrap();
+}
+
+/// #109: the fold has to survive the transport, and as *one* request. Split
+/// into a release and an acquire over HTTP it would reopen exactly the gap the
+/// operation closes — another instance taking the returned units, and the
+/// grant policy sizing the replacement below what was handed back. Pinned here
+/// because it is a wire contract: a server that does not route
+/// `/leases/consolidate` leaves the via-server topology stranding the tail of
+/// every allowance while the direct-store topology does not.
+#[tokio::test]
+async fn a_consolidation_folds_the_tail_grant_over_http() {
+    let store = MemoryStore::new(GrantPolicy {
+        shrink_divisor: 1,
+        min_grant: CostUnits(1),
+        max_ttl: SignedDuration::from_secs(3_600),
+        reclaim_grace: SignedDuration::ZERO,
+    })
+    .unwrap();
+    store.create_account(AccountConfig {
+        account_id: ACCOUNT,
+        initial_balance: CostUnits(58),
+        status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
+    });
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerState {
+            store: Arc::clone(&store),
+            clock: Arc::new(SystemClock),
+        },
+        std::time::Duration::from_millis(200),
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
+    let http = HttpStore::new(format!("http://{address}"));
+
+    let tail = http
+        .acquire(ACCOUNT, CostUnits(49), SignedDuration::from_secs(60), at(0))
+        .await
+        .unwrap();
+    assert_eq!(tail.units, CostUnits(49), "49 held, 9 left in the ledger");
+
+    let folded = http
+        .consolidate(
+            tail.lease_id,
+            tail.fencing_token,
+            tail.units,
+            CostUnits(100),
+            SignedDuration::from_secs(60),
+            at(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(folded.units, CostUnits(58), "one lease, the whole balance");
+    assert_ne!(folded.lease_id, tail.lease_id);
+
+    // The old capability is spent server-side, so the transport carried the
+    // settlement half too and not just the grant.
+    assert_eq!(
+        http.release(tail.lease_id, tail.fencing_token, CostUnits(0), at(2))
+            .await
+            .unwrap_err(),
+        AllocateError::LeaseNotActive
+    );
+
     let _ = stop_tx.send(());
     server.await.unwrap().unwrap();
 }

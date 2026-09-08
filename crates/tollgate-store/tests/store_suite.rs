@@ -582,6 +582,218 @@ async fn graceful_release_returns_unspent() {
     );
 }
 
+/// #109: consolidation is `release` then `acquire` in one transaction, and
+/// the whole reason it is not those two calls is that the exchange must never
+/// hand back less than it took. Under the default `shrink_divisor` of 2 the
+/// separated form does exactly that: 29 unspent returned into a balance of 29
+/// re-grants 29, and with a smaller balance it would re-grant less than was
+/// returned. The floor is applied to the policy's answer, never to the
+/// balance test.
+#[tokio::test]
+async fn consolidation_never_grants_less_than_it_folded_in() {
+    let store = store_with_balance(GrantPolicy::default(), 58);
+    let first = store
+        .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
+        .await
+        .unwrap();
+    assert_eq!(first.units, CostUnits(29), "the policy shrinks by half");
+    assert_eq!(store.balance(ACCOUNT), CostUnits(29));
+
+    let folded = store
+        .consolidate(
+            first.lease_id,
+            first.fencing_token,
+            first.units,
+            CostUnits(100),
+            TTL,
+            t(1),
+        )
+        .await
+        .unwrap();
+    assert!(
+        folded.units >= first.units,
+        "{} folded in, {} granted",
+        first.units.get(),
+        folded.units.get()
+    );
+    assert_ne!(folded.lease_id, first.lease_id, "a new lease, not a resize");
+    assert!(folded.fencing_token > first.fencing_token);
+    assert_conserved(&store);
+
+    // The old capability is spent: the same transaction settled it, so a
+    // holder cannot spend both halves of the exchange.
+    assert_eq!(
+        store
+            .release(first.lease_id, first.fencing_token, CostUnits(0), t(2))
+            .await
+            .unwrap_err(),
+        AllocateError::LeaseNotActive
+    );
+}
+
+/// The case the issue reports, at the store. An instance holding a tail grant
+/// that cannot fund the next quote ends up with one lease sized to everything
+/// the account can still fund, rather than two fragments neither of which can.
+#[tokio::test]
+async fn consolidation_folds_the_tail_grant_and_the_ledger_into_one_lease() {
+    let store = store_with_balance(full_grant_policy(), 58);
+    // The stranded state exactly: 49 held by this instance, 9 left in the
+    // ledger, and a 51-unit quote that neither can fund alone.
+    let tail = store
+        .acquire(ACCOUNT, CostUnits(49), TTL, t(0))
+        .await
+        .unwrap();
+    assert_eq!(tail.units, CostUnits(49));
+    assert_eq!(store.balance(ACCOUNT), CostUnits(9));
+
+    let folded = store
+        .consolidate(
+            tail.lease_id,
+            tail.fencing_token,
+            tail.units,
+            CostUnits(100),
+            TTL,
+            t(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        folded.units,
+        CostUnits(58),
+        "49 held plus 9 in the ledger, in one lease that can fund 51"
+    );
+    assert_eq!(store.balance(ACCOUNT), CostUnits::ZERO);
+    assert_conserved(&store);
+}
+
+/// Failure is all-or-nothing, and which way it fails decides whether the
+/// holder may keep serving. A refusal from inside the transaction rolls back,
+/// so the lease is still active and still the caller's — the client relies on
+/// exactly this to put it back in the slot.
+#[tokio::test]
+async fn a_refused_consolidation_leaves_the_original_lease_spendable() {
+    let store = store_with_balance(full_grant_policy(), 100);
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
+        .await
+        .unwrap();
+    assert_eq!(store.balance(ACCOUNT), CostUnits::ZERO);
+
+    // Nothing held and nothing in the ledger: there is no grant to make.
+    assert_eq!(
+        store
+            .consolidate(
+                lease.lease_id,
+                lease.fencing_token,
+                CostUnits::ZERO,
+                CostUnits(100),
+                TTL,
+                t(1),
+            )
+            .await
+            .unwrap_err(),
+        AllocateError::InsufficientBalance
+    );
+    // Rolled back: the lease is untouched, and a later honest release still
+    // returns its units.
+    store
+        .release(lease.lease_id, lease.fencing_token, CostUnits(100), t(2))
+        .await
+        .unwrap();
+    assert_eq!(store.balance(ACCOUNT), CostUnits(100));
+    assert_conserved(&store);
+}
+
+/// A stale or unknown capability consolidates nothing, exactly as it releases
+/// nothing (INVARIANTS.md #4). The account's balance must not move on the
+/// strength of a token the ledger does not recognise.
+#[tokio::test]
+async fn consolidating_without_the_lease_capability_moves_no_units() {
+    let store = store_with_balance(full_grant_policy(), 1_000);
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap();
+    let before = store.balance(ACCOUNT);
+
+    assert_eq!(
+        store
+            .consolidate(
+                lease.lease_id,
+                FencingToken(lease.fencing_token.0 + 7),
+                CostUnits(400),
+                CostUnits(400),
+                TTL,
+                t(1),
+            )
+            .await
+            .unwrap_err(),
+        AllocateError::Fenced
+    );
+    assert_eq!(
+        store
+            .consolidate(
+                LeaseId(9_999),
+                lease.fencing_token,
+                CostUnits(400),
+                CostUnits(400),
+                TTL,
+                t(1),
+            )
+            .await
+            .unwrap_err(),
+        AllocateError::UnknownLease
+    );
+    // An over-claim is a client accounting bug on the release half, and it
+    // must refuse before the acquire half draws anything.
+    assert_eq!(
+        store
+            .consolidate(
+                lease.lease_id,
+                lease.fencing_token,
+                CostUnits(401),
+                CostUnits(400),
+                TTL,
+                t(1),
+            )
+            .await
+            .unwrap_err(),
+        AllocateError::InvalidRelease
+    );
+    assert_eq!(store.balance(ACCOUNT), before, "no half committed alone");
+    assert_conserved(&store);
+}
+
+/// An invalid TTL is rejected before the ledger moves at all, which is what
+/// stops a consolidation from settling a lease it then cannot replace.
+#[tokio::test]
+async fn a_consolidation_with_an_invalid_ttl_settles_nothing() {
+    let store = store_with_balance(full_grant_policy(), 1_000);
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .consolidate(
+                lease.lease_id,
+                lease.fencing_token,
+                CostUnits(400),
+                CostUnits(400),
+                SignedDuration::ZERO,
+                t(1),
+            )
+            .await
+            .unwrap_err(),
+        AllocateError::InvalidTtl
+    );
+    store
+        .release(lease.lease_id, lease.fencing_token, CostUnits(400), t(2))
+        .await
+        .expect("the lease was never settled");
+    assert_conserved(&store);
+}
+
 /// Review finding #1, store half: reclaim waits out the grace window past
 /// expiry, so work committed inside the holder's usability window (which
 /// ends *before* expiry) has margin + grace to be flushed and billed; a
@@ -2901,6 +3113,155 @@ async fn a_lease_released_inside_its_own_period_expires_nothing() {
         store.balance(ACCOUNT),
         CostUnits(500),
         "the allowance is whole again"
+    );
+    assert_conserved(&store);
+}
+
+/// The mutation gate's finding, and the common case: a consolidation *inside*
+/// a lease's own period expires nothing, so the whole allowance half funds the
+/// replacement. Only the cross-boundary case was witnessed, which left the
+/// boundary comparison free to move — a `<=` there would have quietly expired
+/// the allowance of every consolidation, which is every one #109 performs.
+#[tokio::test]
+async fn consolidating_inside_a_lease_own_period_expires_nothing() {
+    let store = store_with_balance(full_grant_policy(), 0);
+    store
+        .set_budget_schedule(ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(200), TTL, t(JAN + 2))
+        .await
+        .unwrap();
+    assert_eq!(lease.units, CostUnits(200), "drawn from the allowance");
+
+    let folded = store
+        .consolidate(
+            lease.lease_id,
+            lease.fencing_token,
+            lease.units,
+            CostUnits(500),
+            TTL,
+            t(JAN + 3),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        folded.units,
+        CostUnits(500),
+        "the returned allowance is spendable again inside its own period"
+    );
+    assert_eq!(
+        store.conservation(ACCOUNT).unwrap().expired,
+        CostUnits::ZERO,
+        "nothing lapsed"
+    );
+    assert_conserved(&store);
+}
+
+/// A consolidation is a settlement, so it obeys the boundary rule the same way
+/// a release does (#97): the allowance half of a lease funded by a period that
+/// has since closed expires instead of returning. The replacement grant is
+/// therefore sized against what the credit *restores*, never against the
+/// unspent units nominally handed back — assuming the latter would let a
+/// consolidation re-lease an allowance the account no longer has.
+#[tokio::test]
+async fn consolidating_across_a_boundary_regrants_only_what_the_credit_restores() {
+    // A lease long enough to straddle the boundary is the whole scenario:
+    // an active lease keeps serving to its own TTL across a rollover (#97).
+    const LONG: SignedDuration = SignedDuration::from_secs(60 * 24 * 3_600);
+    let store = store_with_balance(
+        GrantPolicy {
+            max_ttl: LONG,
+            ..full_grant_policy()
+        },
+        0,
+    );
+    store
+        .set_budget_schedule(ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+    // Half allowance, half a top-up that never expires.
+    store.deposit(ACCOUNT, CostUnits(100)).unwrap();
+
+    let january = store
+        .acquire(ACCOUNT, CostUnits(600), LONG, t(JAN + 2))
+        .await
+        .unwrap();
+    assert_eq!(
+        january.units,
+        CostUnits(600),
+        "500 allowance plus 100 top-up"
+    );
+
+    roll(&store, FEB + 1).await;
+    let february = store
+        .consolidate(
+            january.lease_id,
+            january.fencing_token,
+            CostUnits(600),
+            CostUnits(1_000),
+            LONG,
+            t(FEB + 2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        february.units,
+        CostUnits(600),
+        "January's expired allowance half is gone, but February's fresh 500 \
+         and the surviving 100 top-up fund the replacement"
+    );
+    assert_eq!(
+        store.conservation(ACCOUNT).unwrap().expired,
+        CostUnits(500),
+        "and the lapsed allowance is written off, not re-leased"
+    );
+    assert_conserved(&store);
+}
+
+/// A budget reduction makes the old allowance larger than the new policy's
+/// grant. Expired units cannot supply a floor against that smaller balance.
+#[tokio::test]
+async fn consolidation_after_a_budget_reduction_uses_only_restored_credit_as_floor() {
+    const LONG: SignedDuration = SignedDuration::from_secs(60 * 24 * 3_600);
+    let policy = GrantPolicy {
+        shrink_divisor: 2,
+        max_ttl: LONG,
+        ..full_grant_policy()
+    };
+    let store = store_with_balance(policy, 0);
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(500)))
+        .await
+        .unwrap();
+    roll(&store, JAN + 1).await;
+    let old = store
+        .acquire(ACCOUNT, CostUnits(500), LONG, t(JAN + 2))
+        .await
+        .unwrap();
+    assert_eq!(old.units, CostUnits(250));
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(100)))
+        .await
+        .unwrap();
+    roll(&store, FEB + 1).await;
+    let fresh = store
+        .consolidate(
+            old.lease_id,
+            old.fencing_token,
+            old.units,
+            CostUnits(1_000),
+            LONG,
+            t(FEB + 2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh.units,
+        CostUnits(50),
+        "expired allowance cannot increase the policy floor"
     );
     assert_conserved(&store);
 }

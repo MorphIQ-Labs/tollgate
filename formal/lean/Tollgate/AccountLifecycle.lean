@@ -111,4 +111,12 @@ theorem parked_inventory (opening acquired released abandoned current parked : N
     opening + acquired - released - abandoned - current = parked := by
   omega
 
+/-- A successful consolidation settles one known grant and acquires one.
+Both counters advance, leaving the parked inventory unchanged. -/
+theorem consolidation_preserves_parked_inventory
+    (opening acquired released abandoned current parked : Nat)
+    (h : opening + acquired = released + abandoned + current + parked) :
+    opening + (acquired + 1) - (released + 1) - abandoned - current = parked := by
+  omega
+
 end Tollgate.AccountLifecycle

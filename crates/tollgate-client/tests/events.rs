@@ -213,6 +213,18 @@ impl LeaseAllocator for RefusingAllocator {
         Ok(())
     }
 
+    async fn consolidate(
+        &self,
+        _lease_id: tollgate_core::LeaseId,
+        _fencing_token: tollgate_core::FencingToken,
+        _unspent: tollgate_core::CostUnits,
+        _requested: tollgate_core::CostUnits,
+        _ttl: jiff::SignedDuration,
+        _now: jiff::Timestamp,
+    ) -> Result<tollgate_core::LeaseGrant, tollgate_store::AllocateError> {
+        unreachable!("these fixtures never consolidate")
+    }
+
     async fn reclaim_expired_batch(
         &self,
         _now: Timestamp,
@@ -413,6 +425,18 @@ impl LeaseAllocator for FencedReleaseAllocator {
         _now: Timestamp,
     ) -> Result<(), AllocateError> {
         Err(AllocateError::Fenced)
+    }
+
+    async fn consolidate(
+        &self,
+        _lease_id: tollgate_core::LeaseId,
+        _fencing_token: tollgate_core::FencingToken,
+        _unspent: tollgate_core::CostUnits,
+        _requested: tollgate_core::CostUnits,
+        _ttl: jiff::SignedDuration,
+        _now: jiff::Timestamp,
+    ) -> Result<tollgate_core::LeaseGrant, tollgate_store::AllocateError> {
+        unreachable!("these fixtures never consolidate")
     }
 
     async fn reclaim_expired_batch(

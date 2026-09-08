@@ -23,7 +23,8 @@ use tollgate_core::{
     PublishableSnapshot, UsageEvent,
 };
 use tollgate_store::wire::{
-    API_PREFIX, AcquireRequest, IngestRequestRef, PrincipalsResponse, Problem, ReleaseRequest,
+    API_PREFIX, AcquireRequest, ConsolidateRequest, IngestRequestRef, PrincipalsResponse, Problem,
+    ReleaseRequest,
 };
 use tollgate_store::{
     AllocateError, IngestError, IngestReport, LeaseAllocator, ReclaimBatch, SnapshotPush,
@@ -164,6 +165,39 @@ impl LeaseAllocator for HttpStore {
             return Err(read_problem(response).await);
         }
         Ok(())
+    }
+
+    async fn consolidate(
+        &self,
+        lease_id: LeaseId,
+        fencing_token: FencingToken,
+        unspent: CostUnits,
+        requested: CostUnits,
+        ttl: SignedDuration,
+        _now: Timestamp,
+    ) -> Result<LeaseGrant, AllocateError> {
+        // One request, because the guarantee is transactional: two calls over
+        // this transport would reintroduce exactly the gap the operation
+        // exists to close. The server stamps its own clock, as it does for
+        // acquire and release.
+        let ttl_seconds = u32::try_from(ttl.as_secs().max(0)).unwrap_or(u32::MAX);
+        let response = self
+            .client
+            .post(self.api_url("/leases/consolidate"))
+            .json(&ConsolidateRequest {
+                lease_id,
+                fencing_token,
+                unspent,
+                requested,
+                ttl_seconds,
+            })
+            .send()
+            .await
+            .map_err(transport_error)?;
+        if !response.status().is_success() {
+            return Err(read_problem(response).await);
+        }
+        response.json().await.map_err(transport_error)
     }
 
     async fn reclaim_expired_batch(
