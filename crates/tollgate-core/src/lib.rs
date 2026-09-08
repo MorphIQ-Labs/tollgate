@@ -40,7 +40,7 @@ pub use ids::{
     AccountId, FencingToken, Generation, KeyId, LeaseId, ParseIdError, PolicyRevision, Principal,
     RequestId,
 };
-pub use lease::{AccountOverage, LeaseGrant, LocalLease, RefillSignal};
+pub use lease::{AccountOverage, LeaseGrant, LocalLease, RefillSignal, RefillVerdict};
 pub use reservation::{
     CancelHandle, CancelOutcome, CommitError, CommitFunding, Reservation, SharedCharge,
 };

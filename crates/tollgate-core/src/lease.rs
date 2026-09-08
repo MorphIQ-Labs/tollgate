@@ -360,6 +360,31 @@ pub trait RefillSignal: Send + Sync + core::fmt::Debug {
     fn request_refill(&self);
 }
 
+/// What the refill plane should do about a lease, from
+/// [`LocalLease::refill_due_or_rearm`].
+///
+/// The two active verdicts are not degrees of the same thing. `Draining` says
+/// the lease is still serving and should be replaced *before* it refuses
+/// anything; `Refused` says it already refused work the account could fund,
+/// which is a statement about the grant's size rather than its depletion and
+/// needs the holder's unspent units folded back in before the next one is
+/// sized (INVARIANTS.md #1, #6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefillVerdict {
+    /// The lease is serving and has asked for nothing.
+    Idle,
+    /// Spending crossed low water. Rotate: acquire the next lease while this
+    /// one keeps serving, then release this one once it quiesces.
+    Draining,
+    /// A debit was refused for want of units. However far this lease is from
+    /// its low-water mark, it is too small for the work being offered, and
+    /// the units it still holds are the ones the next grant needs. Rotate by
+    /// *consolidating*: return them and re-grant against the restored
+    /// balance, atomically, so the exchange cannot shrink the holder or lose
+    /// the units to another instance in between.
+    Refused,
+}
+
 /// One lease shard on its own cache line.
 ///
 /// The supported Apple Silicon hosts report 128-byte lines; aligning to 64
@@ -431,6 +456,16 @@ struct LeaseInner {
     /// Refill trigger: when `remaining` falls to or below this, the holder
     /// should acquire its next lease — in the background, never inline.
     low_water: u64,
+    /// Set by a debit this lease could not fund, cleared by the refill plane
+    /// when it reads the verdict.
+    ///
+    /// Lease-wide rather than per-shard, because it reports a fact about the
+    /// *grant* and not about one counter: a refusal already walked every
+    /// shard (see [`LocalLease::try_reserve_at`]), so no sibling is holding
+    /// the units that would have funded it. It doubles as the refusal
+    /// doorbell's once-token, which is why a refusal wakes the plane even
+    /// when a low-water crossing already spent this lease's shard flags.
+    refused: AtomicBool,
     /// Local end of life: `expires_at - safety margin`. Debits and commits
     /// stop here, *before* the server-stamped expiry, so clock skew between
     /// allocator and holder plus in-flight request time fit inside the
@@ -501,6 +536,7 @@ impl LocalLease {
             inner: Arc::new(LeaseInner {
                 balance: LeaseBalance::Single(LeaseShard::new(grant.units.get(), low_water.get())),
                 low_water: low_water.get(),
+                refused: AtomicBool::new(false),
                 usable_until,
                 refill: OnceLock::new(),
                 grant,
@@ -540,6 +576,7 @@ impl LocalLease {
                 balance: LeaseBalance::Sharded(shards),
                 refill: OnceLock::new(),
                 low_water: low_water.get(),
+                refused: AtomicBool::new(false),
                 usable_until,
             }),
         }
@@ -615,24 +652,44 @@ impl LocalLease {
         self.remaining().get() <= self.inner.low_water
     }
 
-    /// Re-arm shard-local low-water signals after the refill plane proves an
-    /// early shard crossing did not yet mean the aggregate was low.
+    /// What the refill plane should do about this lease, clearing whatever
+    /// the lease was holding to tell it.
     ///
-    /// The second aggregate read closes the race with a debit that observed a
-    /// still-set flag just before this method cleared it: that debit is either
-    /// included in the recheck, or a later debit sees the cleared flag and
-    /// rings the doorbell itself.
+    /// [`RefillVerdict::Refused`] is tested first and outranks a low-water
+    /// crossing, because the two verdicts ask for different actions and only
+    /// one of them is still preventable. A crossing is an *anticipatory*
+    /// signal — the lease can still serve, so the plane acquires alongside it
+    /// and no request is refused between ticks. A refusal is the failure that
+    /// crossing exists to avoid, already happened: there is nothing left to
+    /// preserve, and acquiring alongside a grant that could not fund the work
+    /// would install a *smaller* one beside it (see
+    /// [`Self::signal_refusal`]).
+    ///
+    /// Re-arming: for the crossing case the second aggregate read closes the
+    /// race with a debit that observed a still-set flag just before this
+    /// method cleared it — that debit is either included in the recheck, or a
+    /// later debit sees the cleared flag and rings the doorbell itself.
     #[must_use]
-    pub fn refill_due_or_rearm(&self) -> bool {
+    pub fn refill_due_or_rearm(&self) -> RefillVerdict {
+        // Acquires the refused debit's counter reads before the plane acts on
+        // them, and consumes the doorbell so a plane that answers this
+        // verdict is not woken again for the same refusal.
+        if self.inner.refused.swap(false, Ordering::AcqRel) {
+            return RefillVerdict::Refused;
+        }
         if self.needs_refill() {
-            return true;
+            return RefillVerdict::Draining;
         }
         for shard in self.inner.balance.as_slice() {
             // Reading `true` acquires the debit published by the signal's
             // release RMW before clearing its doorbell.
             shard.signalled.swap(false, Ordering::AcqRel);
         }
-        self.needs_refill()
+        if self.needs_refill() {
+            RefillVerdict::Draining
+        } else {
+            RefillVerdict::Idle
+        }
     }
 
     /// Debit `units` if the lease is live and has capacity. Lock-free; the
@@ -655,6 +712,11 @@ impl LocalLease {
         locality: Locality,
     ) -> Result<LeaseDebit, DenyReason> {
         if now >= self.inner.usable_until {
+            // The same silence as the exhaustion exit below, for the same
+            // reason: a lease that can no longer serve must say so rather
+            // than wait to be discovered. Rotation keeps the poll interval as
+            // its backstop for a lease no request touches (INVARIANTS.md #6).
+            self.signal_refusal();
             return Err(DenyReason::LeaseExpired);
         }
         let want = units.get();
@@ -696,6 +758,9 @@ impl LocalLease {
         }
 
         self.credit_to(first, want - needed);
+        // Reported after the rollback, so the plane that answers this refusal
+        // reads the restored aggregate rather than a torn one.
+        self.signal_refusal();
         Err(DenyReason::LeaseExhausted {
             remaining: self.remaining(),
         })
@@ -751,6 +816,35 @@ impl LocalLease {
     fn maybe_signal_refill(&self, shard_index: usize, next: u64) {
         if next <= self.inner.balance.as_slice()[shard_index].low_water {
             self.signal_refill(shard_index);
+        }
+    }
+
+    /// Report a debit this lease could not fund, and ring the doorbell the
+    /// first time.
+    ///
+    /// A refusal is the one lease event that *proves* the grant can no longer
+    /// serve the work being offered, so it is the one event the refill plane
+    /// most needs and, before #109, the only one it was never told about.
+    /// Low water cannot stand in for it: the mark counts units and the
+    /// refusal is about a quote, so a lease holding more units than its mark
+    /// can refuse every request until its TTL while the account has the
+    /// balance to fund them.
+    ///
+    /// Cold, and once per lease: the flag is both the report the plane reads
+    /// and the token that keeps a refusal storm from becoming a wake storm.
+    /// A refusal arriving while an earlier one is still unanswered adds
+    /// nothing — the plane's response does not depend on how many there were.
+    #[cold]
+    #[inline(never)]
+    fn signal_refusal(&self) {
+        // Release publishes the preceding counter reads to the plane that
+        // clears this flag; a swap that observes `true` means an unanswered
+        // report already stands.
+        if self.inner.refused.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(signal) = self.inner.refill.get() {
+            signal.request_refill();
         }
     }
 
@@ -1226,15 +1320,19 @@ mod tests {
 
         l.try_debit(CostUnits(40), t(0)).unwrap();
         assert_eq!(signal.count(), 1, "the first shard crossed its share");
-        assert!(!l.refill_due_or_rearm(), "sixty aggregate units remain");
+        assert_eq!(
+            l.refill_due_or_rearm(),
+            RefillVerdict::Idle,
+            "sixty aggregate units remain"
+        );
 
         l.try_debit(CostUnits(1), t(0)).unwrap();
         assert_eq!(signal.count(), 2, "the control-plane check rearmed it");
-        assert!(!l.refill_due_or_rearm());
+        assert_eq!(l.refill_due_or_rearm(), RefillVerdict::Idle);
 
         l.try_debit(CostUnits(40), t(0)).unwrap();
         assert_eq!(l.remaining(), CostUnits(19));
-        assert!(l.refill_due_or_rearm());
+        assert_eq!(l.refill_due_or_rearm(), RefillVerdict::Draining);
     }
 
     #[test]
@@ -1310,6 +1408,127 @@ mod tests {
         assert_eq!(signal.count(), 1, "landing exactly on low water crosses it");
     }
 
+    /// #109: the refusal is the one lease event that *proves* the grant can
+    /// no longer serve the work offered, and it was the one event the refill
+    /// plane was never told about. A low-water crossing cannot stand in for
+    /// it: this lease is comfortably above its mark and still cannot fund the
+    /// quote, so nothing crosses, and before this the plane learned nothing.
+    #[test]
+    fn a_refused_debit_tells_the_refill_plane_rather_than_waiting_to_be_polled() {
+        let signal = Arc::new(CountingSignal::default());
+        let l = lease(49, 1_000, 25).with_refill(signal.clone());
+
+        assert!(matches!(
+            l.try_debit(CostUnits(51), t(0)),
+            Err(DenyReason::LeaseExhausted { .. })
+        ));
+        assert_eq!(signal.count(), 1, "the refusal rang the doorbell");
+        assert!(
+            !l.needs_refill(),
+            "and it rang from above the mark, which is the whole point"
+        );
+        assert_eq!(
+            l.refill_due_or_rearm(),
+            RefillVerdict::Refused,
+            "the plane is told the grant is mis-sized, not that it is draining"
+        );
+        assert_eq!(
+            l.refill_due_or_rearm(),
+            RefillVerdict::Idle,
+            "reading the verdict consumes it; one refusal is one rotation"
+        );
+        assert_eq!(
+            l.remaining(),
+            CostUnits(49),
+            "a refusal is still zero-charge"
+        );
+    }
+
+    /// The doorbell is rung once however hard the caller retries: the plane's
+    /// response does not depend on how many requests were refused, and a
+    /// refusal storm must not become a wake storm on the refill task.
+    #[test]
+    fn a_refusal_storm_rings_once_and_reports_once() {
+        let signal = Arc::new(CountingSignal::default());
+        let l = lease(49, 1_000, 25).with_refill(signal.clone());
+
+        for _ in 0..1_000 {
+            assert!(l.try_debit(CostUnits(51), t(0)).is_err());
+        }
+        assert_eq!(signal.count(), 1);
+        assert_eq!(l.refill_due_or_rearm(), RefillVerdict::Refused);
+
+        // Cleared, so a later refusal is a fresh report the plane must act on.
+        assert!(l.try_debit(CostUnits(51), t(0)).is_err());
+        assert_eq!(signal.count(), 2);
+        assert_eq!(l.refill_due_or_rearm(), RefillVerdict::Refused);
+    }
+
+    /// A refusal outranks a crossing because the two ask for different things
+    /// and only one is still preventable. Rotating *alongside* a lease that
+    /// already refused work would size the next grant against a balance this
+    /// lease's unspent units are missing from (#109).
+    #[test]
+    fn a_refusal_outranks_a_low_water_crossing() {
+        let l = lease(100, 1_000, 90);
+
+        // One debit both crosses low water and leaves too little for the next.
+        l.try_debit(CostUnits(20), t(0)).unwrap();
+        assert!(l.needs_refill(), "80 remaining is below the 90 mark");
+        assert!(l.try_debit(CostUnits(81), t(0)).is_err());
+
+        assert_eq!(l.refill_due_or_rearm(), RefillVerdict::Refused);
+        assert_eq!(
+            l.refill_due_or_rearm(),
+            RefillVerdict::Draining,
+            "the crossing is still there once the refusal has been answered"
+        );
+    }
+
+    /// The expiry refusal was silent for the same reason the exhaustion one
+    /// was, and is the same defect. Rollover keeps the poll interval as its
+    /// backstop for a lease no request touches; a lease requests *are*
+    /// reaching now says so on the first one (INVARIANTS.md #6).
+    #[test]
+    fn an_expired_lease_reports_its_refusal_rather_than_waiting_for_the_tick() {
+        let signal = Arc::new(CountingSignal::default());
+        let l = lease(100, 1_000, 25).with_refill(signal.clone());
+
+        assert_eq!(
+            l.try_debit(CostUnits(1), t(2_000)),
+            Err(DenyReason::LeaseExpired)
+        );
+        assert_eq!(signal.count(), 1);
+        assert_eq!(l.refill_due_or_rearm(), RefillVerdict::Refused);
+    }
+
+    /// A lease nobody refills still records the refusal, exactly as it records
+    /// a crossing: the verdict is lease state, and attaching a doorbell only
+    /// decides whether the plane hears about it sooner.
+    #[test]
+    fn a_lease_with_no_doorbell_still_records_its_refusal() {
+        let l = lease(49, 1_000, 25);
+        assert!(l.try_debit(CostUnits(51), t(0)).is_err());
+        assert_eq!(l.refill_due_or_rearm(), RefillVerdict::Refused);
+    }
+
+    /// A sharded lease refuses only after walking every sibling, so the report
+    /// is about the grant and not about one counter — which is why the flag is
+    /// lease-wide and one refusal is one report however many shards it tried.
+    #[test]
+    fn a_sharded_refusal_reports_once_for_the_whole_grant() {
+        let signal = Arc::new(CountingSignal::default());
+        let l = sharded_lease(40, 4, 4).with_refill(signal.clone());
+
+        assert!(matches!(
+            l.try_debit(CostUnits(41), t(0)),
+            Err(DenyReason::LeaseExhausted { .. })
+        ));
+        assert_eq!(signal.count(), 1);
+        assert_eq!(l.remaining(), CostUnits(40), "the rollback restored it all");
+        assert_eq!(l.refill_due_or_rearm(), RefillVerdict::Refused);
+    }
+
     /// A lease is replaced rather than refilled, so "at most once" needs no
     /// reset protocol — but it does need proving, since every later debit on
     /// a drained lease still tests the branch.
@@ -1337,19 +1556,40 @@ mod tests {
         assert_eq!(signal.count(), 2);
     }
 
-    /// A refused debit changes no counter, so it must not claim a crossing.
+    /// A refused debit changes no counter, so it must never claim a
+    /// *crossing* — and it must still report the refusal.
+    ///
+    /// This test used to assert the silence outright (`a_refused_debit_never
+    /// _signals`), on the reasoning that a debit which moved no counter has
+    /// nothing to announce. The premise held for crossings and hid #109: it
+    /// read the doorbell as "low water was crossed" when what the refill
+    /// plane needs is "act on this lease", and those differ exactly here.
+    /// Both facts are now representable at once, so neither has to be given
+    /// up: the verdict distinguishes them and the shard flags stay clear.
     #[test]
-    fn a_refused_debit_never_signals() {
+    fn a_refused_debit_reports_a_refusal_and_never_a_crossing() {
         let signal = Arc::new(CountingSignal::default());
         let l = lease(100, 1_000, 25).with_refill(signal.clone());
 
         assert!(l.try_debit(CostUnits(500), t(0)).is_err(), "exhausted");
+        assert_eq!(signal.count(), 1, "the plane is told once");
         assert!(
             l.try_debit(CostUnits(10), t(10_000)).is_err(),
             "past the usability window"
         );
-        assert_eq!(signal.count(), 0);
-        assert_eq!(l.remaining(), CostUnits(100));
+        assert_eq!(
+            signal.count(),
+            1,
+            "and not again while that report still stands"
+        );
+        assert_eq!(l.remaining(), CostUnits(100), "still zero-charge");
+
+        assert_eq!(l.refill_due_or_rearm(), RefillVerdict::Refused);
+        assert_eq!(
+            l.refill_due_or_rearm(),
+            RefillVerdict::Idle,
+            "seventy-five units above the mark: no crossing was ever claimed"
+        );
     }
 
     /// A lease with no signal attached is the pre-#10 behaviour: the crossing

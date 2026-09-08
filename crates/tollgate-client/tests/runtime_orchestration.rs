@@ -372,6 +372,26 @@ impl LeaseAllocator for ScriptedAllocator {
         }
         self.store.release(lease, fence, remaining, now).await
     }
+    /// Delegated, and subject to the same injected `invalid_release`: a
+    /// consolidation is a release and an acquire, so a fixture that refuses
+    /// one half must refuse it here too.
+    async fn consolidate(
+        &self,
+        lease: tollgate_core::LeaseId,
+        fence: tollgate_core::FencingToken,
+        unspent: CostUnits,
+        requested: CostUnits,
+        ttl: SignedDuration,
+        now: Timestamp,
+    ) -> Result<tollgate_core::LeaseGrant, AllocateError> {
+        if self.invalid_release {
+            return Err(AllocateError::InvalidRelease);
+        }
+        self.store
+            .consolidate(lease, fence, unspent, requested, ttl, now)
+            .await
+    }
+
     async fn reclaim_expired_batch(
         &self,
         now: Timestamp,
@@ -1294,5 +1314,207 @@ async fn integrity_faults_in_idle_and_final_release_are_reported_as_terminal() {
         assert_eq!(handle.report().restarting_accounts, 0);
         assert!(!handle.readiness(t(100)).background_healthy);
         assert_eq!(handle.report().refill.unwrap().abandoned, 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_consolidated_predecessor_is_not_reported_as_crash_exposure() {
+    let store = MemoryStore::new(GrantPolicy {
+        shrink_divisor: 1,
+        min_grant: CostUnits(1),
+        ..GrantPolicy::default()
+    })
+    .unwrap();
+    account(&store, 1, 160);
+    publish(&store, 11, 1, 1, EnforcementMode::Strict);
+    let allocator = Arc::new(ScriptedAllocator {
+        store: store.clone(),
+        panic: AtomicBool::new(false),
+        invalid_release: false,
+        release_block: None,
+    });
+    let mut cfg = config();
+    cfg.leases.target_grant = CostUnits(100);
+    cfg.leases.low_water = CostUnits(50);
+    let (runtime, handle) = InstanceRuntime::spawn(
+        store.clone(),
+        allocator.clone(),
+        store.clone(),
+        Arc::new(ManualClock::new(t(100))),
+        cfg,
+    )
+    .unwrap();
+    wait(|| handle.readiness(t(100)).is_ready()).await;
+    for id in 1..=2 {
+        charge(&handle, 11, id, 51);
+        wait(|| handle.report().refill.unwrap().acquired == id as u64 + 1).await;
+    }
+    let request = handle
+        .begin(Principal(11), PermissionBits::bit(0), t(100))
+        .unwrap();
+    assert!(matches!(
+        request.admit(
+            &[(Op, 51)],
+            handle.recorder().try_reserve().unwrap(),
+            t(100)
+        ),
+        Err(tollgate_core::DenyReason::LeaseExhausted { .. })
+    ));
+    wait(|| handle.report().refill.unwrap().consolidated == 1).await;
+    allocator.panic.store(true, Ordering::SeqCst);
+    charge(&handle, 11, 3, 51);
+    wait(|| handle.report().restarting_accounts == 1).await;
+    assert_eq!(handle.report().unrecovered_grants, 0);
+    assert_eq!(handle.report().uncertain_acquires, 1);
+    wait(|| handle.readiness(t(100)).is_ready()).await;
+    let stopped = runtime.shutdown().await.unwrap();
+    assert!(!stopped.deadline_expired);
+    let counters = handle.report().refill.unwrap();
+    assert_eq!(counters.acquired, counters.released);
+    assert_eq!(store.balance(AccountId(1)), CostUnits(7));
+}
+
+/// Commits the exchange and then loses its reply, as a transport can.
+struct UnansweredConsolidation {
+    store: Arc<MemoryStore>,
+    committed: AtomicBool,
+    reply_error: bool,
+}
+#[async_trait]
+impl LeaseAllocator for UnansweredConsolidation {
+    async fn acquire(
+        &self,
+        account: AccountId,
+        requested: CostUnits,
+        ttl: SignedDuration,
+        now: Timestamp,
+    ) -> Result<tollgate_core::LeaseGrant, AllocateError> {
+        self.store.acquire(account, requested, ttl, now).await
+    }
+    async fn release(
+        &self,
+        lease: tollgate_core::LeaseId,
+        fence: tollgate_core::FencingToken,
+        unspent: CostUnits,
+        now: Timestamp,
+    ) -> Result<(), AllocateError> {
+        self.store.release(lease, fence, unspent, now).await
+    }
+    async fn consolidate(
+        &self,
+        lease: tollgate_core::LeaseId,
+        fence: tollgate_core::FencingToken,
+        unspent: CostUnits,
+        requested: CostUnits,
+        ttl: SignedDuration,
+        now: Timestamp,
+    ) -> Result<tollgate_core::LeaseGrant, AllocateError> {
+        let _fresh = self
+            .store
+            .consolidate(lease, fence, unspent, requested, ttl, now)
+            .await?;
+        self.committed.store(true, Ordering::SeqCst);
+        if self.reply_error {
+            return Err(AllocateError::Storage(tollgate_store::StoreError(
+                "reply lost after commit".into(),
+            )));
+        }
+        std::future::pending().await
+    }
+    async fn reclaim_expired_batch(
+        &self,
+        now: Timestamp,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<ReclaimBatch, tollgate_store::StoreError> {
+        self.store.reclaim_expired_batch(now, limit).await
+    }
+}
+async fn unanswered_consolidation(
+    reply_error: bool,
+) -> (InstanceRuntime, RuntimeHandle, Arc<MemoryStore>) {
+    let store = store();
+    account(&store, 1, 100);
+    publish(&store, 11, 1, 1, EnforcementMode::Strict);
+    let allocator = Arc::new(UnansweredConsolidation {
+        store: store.clone(),
+        committed: AtomicBool::new(false),
+        reply_error,
+    });
+    let (runtime, handle) = InstanceRuntime::spawn(
+        store.clone(),
+        allocator.clone(),
+        store.clone(),
+        Arc::new(ManualClock::new(t(100))),
+        config(),
+    )
+    .unwrap();
+    wait(|| handle.readiness(t(100)).is_ready()).await;
+    let request = handle
+        .begin(Principal(11), PermissionBits::bit(0), t(100))
+        .unwrap();
+    assert!(
+        request
+            .admit(
+                &[(Op, 60)],
+                handle.recorder().try_reserve().unwrap(),
+                t(100)
+            )
+            .is_err()
+    );
+    wait(|| allocator.committed.load(Ordering::SeqCst)).await;
+    (runtime, handle, store)
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_reports_an_unanswered_consolidation_grant() {
+    let (runtime, handle, store) = unanswered_consolidation(false).await;
+    let stopped = runtime.shutdown().await.unwrap();
+    assert!(!stopped.deadline_expired);
+    assert_eq!(
+        store.balance(AccountId(1)),
+        CostUnits(50),
+        "the unanswered replacement still holds 50 units"
+    );
+    assert_eq!(
+        handle.report().uncertain_acquires,
+        1,
+        "shutdown must expose the lost replacement capability"
+    );
+    assert_eq!(
+        handle.report().unrecovered_grants,
+        0,
+        "the replacement size was never confirmed"
+    );
+    let reclaimed = store.reclaim_expired(t(10_000)).await.unwrap();
+    assert_eq!(
+        reclaimed.len(),
+        1,
+        "only the unanswered replacement remains active"
+    );
+    assert_eq!(store.balance(AccountId(1)), CostUnits(100));
+}
+
+#[tokio::test(start_paused = true)]
+async fn ambiguous_consolidations_remain_visible_after_a_clean_shutdown() {
+    for reply_error in [false, true] {
+        let (runtime, handle, store) = unanswered_consolidation(reply_error).await;
+        wait(|| handle.report().uncertain_acquires == 1).await;
+        assert_eq!(handle.account_reports(t(100))[0].uncertain_acquires, 1);
+        assert_eq!(
+            handle.report().refill.unwrap().acquire_timeouts,
+            u64::from(!reply_error)
+        );
+        let stopped = runtime.shutdown().await.unwrap();
+        assert!(!stopped.deadline_expired);
+        assert_eq!(
+            handle.report().uncertain_acquires,
+            1,
+            "retirement counts each ambiguous outcome once"
+        );
+        assert_eq!(handle.account_reports(t(100))[0].uncertain_acquires, 1);
+        assert_eq!(store.balance(AccountId(1)), CostUnits(50));
+        let reclaimed = store.reclaim_expired(t(10_000)).await.unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(store.balance(AccountId(1)), CostUnits(100));
     }
 }

@@ -761,6 +761,13 @@ struct AccountCredit {
     expiring: i64,
 }
 
+/// Settlement evidence from the account update inside the current transaction.
+/// Consolidation uses the credit that survived the period boundary as its floor.
+struct ReleasedCredit {
+    account: AccountId,
+    restored: CostUnits,
+}
+
 impl AccountCredit {
     /// Fold one lease's settlement in, deciding the allowance half against the
     /// account's current period.
@@ -827,6 +834,232 @@ async fn lock_lease(
     }))
 }
 
+impl PostgresStore {
+    /// One grant, inside a caller-owned transaction.
+    ///
+    /// `floor` is the units the caller is returning to this same account in
+    /// this same transaction, which the grant policy's shrink cap may not size
+    /// the result below (see [`LeaseAllocator::consolidate`]). A plain acquire
+    /// returns nothing and passes zero, leaving the policy's answer untouched.
+    async fn acquire_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        account: AccountId,
+        requested: CostUnits,
+        expires_at: Timestamp,
+        floor: CostUnits,
+    ) -> Result<LeaseGrant, AllocateError> {
+        let row = sqlx::query(
+            "SELECT balance, status, next_fence, allowance_balance, period_start_us
+             FROM tollgate_accounts WHERE account_id = $1 FOR UPDATE",
+        )
+        .bind(id_bytes(account.0))
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(alloc_storage)?
+        .ok_or(AllocateError::UnknownAccount)?;
+
+        // Suspended and Closed both refuse, under one deny reason: no
+        // client acts on the distinction, and splitting it would widen
+        // `AllocateError`'s per-reason tally for nothing (#51).
+        if decode_status(row.get::<String, _>(1)).map_err(AllocateError::Storage)?
+            != AccountStatus::Active
+        {
+            return Err(AllocateError::AccountInactive);
+        }
+        let balance =
+            to_units(row.get::<i64, _>(0), "account balance").map_err(AllocateError::Storage)?;
+        // The floor is applied to the policy's answer, not to the
+        // balance test: the units the caller returned rejoined `balance`
+        // earlier in this same transaction, so a floor can only re-select
+        // capacity the account demonstrably has, and an account with
+        // nothing left still refuses.
+        let granted = self
+            .policy
+            .grant(requested, balance)
+            .ok_or(AllocateError::InsufficientBalance)?
+            .max(floor.min(balance));
+        // Allowance first: the units with an expiry date are spent
+        // before the manual credits sitting beside them, and the lease
+        // remembers the split so settlement can return each half to where
+        // it came from (#97).
+        let granted_i = to_i64(granted, "grant").map_err(AllocateError::Storage)?;
+        let allowance_balance = row.get::<i64, _>(3);
+        let from_allowance = granted_i.min(allowance_balance);
+        let period_start_us = row.get::<i64, _>(4);
+        let fence = row.get::<i64, _>(2);
+        // Fence counters are seeded at 1 and only incremented; a negative
+        // stored value is corruption, never a token to alias to 0.
+        let fence_token = u64::try_from(fence).map(FencingToken).map_err(|_| {
+            AllocateError::Storage(StoreError(format!(
+                "stored fencing token is negative: {fence}"
+            )))
+        })?;
+
+        let lease_id = LeaseId(uuid::Uuid::new_v4().as_u128());
+
+        sqlx::query(
+            "UPDATE tollgate_accounts
+             SET balance = balance - $2,
+                 allowance_balance = allowance_balance - $3,
+                 next_fence = next_fence + 1
+             WHERE account_id = $1",
+        )
+        .bind(id_bytes(account.0))
+        .bind(granted_i)
+        .bind(from_allowance)
+        .execute(&mut **tx)
+        .await
+        .map_err(alloc_storage)?;
+        sqlx::query(
+            "INSERT INTO tollgate_leases
+             (lease_id, account_id, fencing_token, granted, used, credited, expires_at_us,
+              state, from_allowance, period_start_us)
+             VALUES ($1, $2, $3, $4, 0, 0, $5, 0, $6, $7)",
+        )
+        .bind(id_bytes(lease_id.0))
+        .bind(id_bytes(account.0))
+        .bind(fence)
+        .bind(granted_i)
+        .bind(ts_micros(expires_at))
+        .bind(from_allowance)
+        .bind(period_start_us)
+        .execute(&mut **tx)
+        .await
+        .map_err(alloc_storage)?;
+
+        Ok(LeaseGrant {
+            lease_id,
+            account_id: account,
+            fencing_token: fence_token,
+            units: granted,
+            expires_at,
+        })
+    }
+
+    /// One release, returning its account and the credit the account update
+    /// actually restored, inside the caller-owned transaction.
+    async fn release_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        lease_id: LeaseId,
+        fencing_token: FencingToken,
+        unspent: CostUnits,
+        now: Timestamp,
+    ) -> Result<ReleasedCredit, AllocateError> {
+        let LockedLeaseRow {
+            account_id,
+            fencing_token: fence,
+            granted,
+            used,
+            credited: _credited,
+            expires_at_us,
+            state,
+            from_allowance,
+            period_start_us,
+        } = lock_lease(tx, lease_id)
+            .await
+            .map_err(alloc_storage)?
+            .ok_or(AllocateError::UnknownLease)?;
+
+        let stored_fence = u64::try_from(fence).map_err(|_| {
+            AllocateError::Storage(StoreError(format!(
+                "stored fencing token is negative: {fence}"
+            )))
+        })?;
+        if stored_fence != fencing_token.0 {
+            return Err(AllocateError::Fenced);
+        }
+        // Releases are accepted through the grace window (see GrantPolicy::
+        // reclaim_grace) — only a settled or grace-exhausted lease refuses.
+        let release_deadline_us = expires_at_us.saturating_add(self.reclaim_grace_us);
+        if state != STATE_ACTIVE || ts_micros(now) >= release_deadline_us {
+            return Err(AllocateError::LeaseNotActive);
+        }
+        // Decoded before the byte form is consumed by the credit below, and
+        // returned so a consolidation draws its replacement grant from the
+        // account this lease named rather than one a caller supplied.
+        let account = AccountId(id_from(&account_id));
+        let unspent_i = to_i64(unspent, "unspent").map_err(AllocateError::Storage)?;
+        let loss = granted
+            .checked_sub(
+                used.checked_add(unspent_i)
+                    .ok_or(AllocateError::InvalidRelease)?,
+            )
+            .filter(|l| *l >= 0)
+            .ok_or(AllocateError::InvalidRelease)?;
+
+        sqlx::query("UPDATE tollgate_leases SET state = $2, credited = $3 WHERE lease_id = $1")
+            .bind(id_bytes(lease_id.0))
+            .bind(STATE_RELEASED)
+            .bind(unspent_i)
+            .execute(&mut **tx)
+            .await
+            .map_err(alloc_storage)?;
+        // The lease's usage is charged in the order the account spends,
+        // allowance first, so the top-up half is what survives a partly
+        // spent lease. Crediting the allowance half back first would close
+        // the equation just as well while moving durable credits into the
+        // bucket that expires at the next boundary (#97).
+        let from_topup = granted
+            .checked_sub(from_allowance)
+            .filter(|t| *t >= 0)
+            .ok_or_else(|| {
+                AllocateError::Storage(StoreError(format!(
+                    "lease allowance funding {from_allowance} exceeds its grant {granted}"
+                )))
+            })?;
+        let to_topup = from_topup.min(unspent_i);
+        let to_allowance = unspent_i - to_topup;
+
+        // One statement, and the `CASE` is the whole boundary rule: if the
+        // account has moved on to a later period, the allowance half is
+        // expired instead of returned. Deciding it in SQL against the
+        // row's own `period_start_us` keeps the read and the write in one
+        // atomic step, so a rollover committing between them cannot make
+        // this credit an allowance the account no longer has.
+        let restored: i64 = sqlx::query_scalar(
+            "UPDATE tollgate_accounts SET
+                 balance = balance + $2
+                     + CASE WHEN period_start_us > $5 THEN 0 ELSE $3 END,
+                 allowance_balance = allowance_balance
+                     + CASE WHEN period_start_us > $5 THEN 0 ELSE $3 END,
+                 expired = expired + CASE WHEN period_start_us > $5 THEN $3 ELSE 0 END,
+                 settlement_loss = settlement_loss + $4
+             WHERE account_id = $1
+             RETURNING $2 + CASE WHEN period_start_us > $5 THEN 0 ELSE $3 END",
+        )
+        .bind(account_id)
+        .bind(to_topup)
+        .bind(to_allowance)
+        .bind(loss)
+        .bind(period_start_us)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(alloc_storage)?;
+        Ok(ReleasedCredit {
+            account,
+            restored: to_units(restored, "restored release credit")
+                .map_err(AllocateError::Storage)?,
+        })
+    }
+
+    /// The expiry a grant issued now would carry, clamping to the policy's
+    /// `max_ttl`. Fallible before any transaction opens, so a bad TTL never
+    /// settles a lease it cannot replace.
+    fn grant_expiry(
+        &self,
+        ttl: SignedDuration,
+        now: Timestamp,
+    ) -> Result<Timestamp, AllocateError> {
+        if ttl <= SignedDuration::ZERO {
+            return Err(AllocateError::InvalidTtl);
+        }
+        now.checked_add(ttl.min(self.policy.max_ttl))
+            .map_err(|e| AllocateError::Storage(StoreError(format!("ttl overflow: {e}"))))
+    }
+}
+
 #[async_trait]
 impl LeaseAllocator for PostgresStore {
     async fn acquire(
@@ -836,101 +1069,11 @@ impl LeaseAllocator for PostgresStore {
         ttl: SignedDuration,
         now: Timestamp,
     ) -> Result<LeaseGrant, AllocateError> {
-        if ttl <= SignedDuration::ZERO {
-            return Err(AllocateError::InvalidTtl);
-        }
+        let expires_at = self.grant_expiry(ttl, now)?;
         let mut tx = self.pool.begin().await.map_err(alloc_storage)?;
-        let result = async {
-            let row = sqlx::query(
-                "SELECT balance, status, next_fence, allowance_balance, period_start_us
-                 FROM tollgate_accounts WHERE account_id = $1 FOR UPDATE",
-            )
-            .bind(id_bytes(account.0))
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(alloc_storage)?
-            .ok_or(AllocateError::UnknownAccount)?;
-
-            // Suspended and Closed both refuse, under one deny reason: no
-            // client acts on the distinction, and splitting it would widen
-            // `AllocateError`'s per-reason tally for nothing (#51).
-            if decode_status(row.get::<String, _>(1)).map_err(AllocateError::Storage)?
-                != AccountStatus::Active
-            {
-                return Err(AllocateError::AccountInactive);
-            }
-            let balance = to_units(row.get::<i64, _>(0), "account balance")
-                .map_err(AllocateError::Storage)?;
-            let granted = self
-                .policy
-                .grant(requested, balance)
-                .ok_or(AllocateError::InsufficientBalance)?;
-            // Allowance first: the units with an expiry date are spent
-            // before the manual credits sitting beside them, and the lease
-            // remembers the split so settlement can return each half to where
-            // it came from (#97).
-            let granted_i = to_i64(granted, "grant").map_err(AllocateError::Storage)?;
-            let allowance_balance = row.get::<i64, _>(3);
-            let from_allowance = granted_i.min(allowance_balance);
-            let period_start_us = row.get::<i64, _>(4);
-            let fence = row.get::<i64, _>(2);
-            // Fence counters are seeded at 1 and only incremented; a negative
-            // stored value is corruption, never a token to alias to 0.
-            let fence_token = u64::try_from(fence).map(FencingToken).map_err(|_| {
-                AllocateError::Storage(StoreError(format!(
-                    "stored fencing token is negative: {fence}"
-                )))
-            })?;
-
-            let ttl = if ttl > self.policy.max_ttl {
-                self.policy.max_ttl
-            } else {
-                ttl
-            };
-            let expires_at = now
-                .checked_add(ttl)
-                .map_err(|e| AllocateError::Storage(StoreError(format!("ttl overflow: {e}"))))?;
-            let lease_id = LeaseId(uuid::Uuid::new_v4().as_u128());
-
-            sqlx::query(
-                "UPDATE tollgate_accounts
-                 SET balance = balance - $2,
-                     allowance_balance = allowance_balance - $3,
-                     next_fence = next_fence + 1
-                 WHERE account_id = $1",
-            )
-            .bind(id_bytes(account.0))
-            .bind(granted_i)
-            .bind(from_allowance)
-            .execute(&mut *tx)
-            .await
-            .map_err(alloc_storage)?;
-            sqlx::query(
-                "INSERT INTO tollgate_leases
-                 (lease_id, account_id, fencing_token, granted, used, credited, expires_at_us,
-                  state, from_allowance, period_start_us)
-                 VALUES ($1, $2, $3, $4, 0, 0, $5, 0, $6, $7)",
-            )
-            .bind(id_bytes(lease_id.0))
-            .bind(id_bytes(account.0))
-            .bind(fence)
-            .bind(granted_i)
-            .bind(ts_micros(expires_at))
-            .bind(from_allowance)
-            .bind(period_start_us)
-            .execute(&mut *tx)
-            .await
-            .map_err(alloc_storage)?;
-
-            Ok(LeaseGrant {
-                lease_id,
-                account_id: account,
-                fencing_token: fence_token,
-                units: granted,
-                expires_at,
-            })
-        }
-        .await;
+        let result = self
+            .acquire_in_tx(&mut tx, account, requested, expires_at, CostUnits::ZERO)
+            .await;
         finish_transaction(tx, result).await
     }
 
@@ -942,93 +1085,44 @@ impl LeaseAllocator for PostgresStore {
         now: Timestamp,
     ) -> Result<(), AllocateError> {
         let mut tx = self.pool.begin().await.map_err(alloc_storage)?;
-        let result = async {
-            let LockedLeaseRow {
-                account_id,
-                fencing_token: fence,
-                granted,
-                used,
-                credited: _credited,
-                expires_at_us,
-                state,
-                from_allowance,
-                period_start_us,
-            } = lock_lease(&mut tx, lease_id)
-                .await
-                .map_err(alloc_storage)?
-                .ok_or(AllocateError::UnknownLease)?;
-
-            let stored_fence = u64::try_from(fence).map_err(|_| {
-                AllocateError::Storage(StoreError(format!(
-                    "stored fencing token is negative: {fence}"
-                )))
-            })?;
-            if stored_fence != fencing_token.0 {
-                return Err(AllocateError::Fenced);
-            }
-            // Releases are accepted through the grace window (see GrantPolicy::
-            // reclaim_grace) — only a settled or grace-exhausted lease refuses.
-            let release_deadline_us = expires_at_us.saturating_add(self.reclaim_grace_us);
-            if state != STATE_ACTIVE || ts_micros(now) >= release_deadline_us {
-                return Err(AllocateError::LeaseNotActive);
-            }
-            let unspent_i = to_i64(unspent, "unspent").map_err(AllocateError::Storage)?;
-            let loss = granted
-                .checked_sub(
-                    used.checked_add(unspent_i)
-                        .ok_or(AllocateError::InvalidRelease)?,
-                )
-                .filter(|l| *l >= 0)
-                .ok_or(AllocateError::InvalidRelease)?;
-
-            sqlx::query("UPDATE tollgate_leases SET state = $2, credited = $3 WHERE lease_id = $1")
-                .bind(id_bytes(lease_id.0))
-                .bind(STATE_RELEASED)
-                .bind(unspent_i)
-                .execute(&mut *tx)
-                .await
-                .map_err(alloc_storage)?;
-            // The lease's usage is charged in the order the account spends,
-            // allowance first, so the top-up half is what survives a partly
-            // spent lease. Crediting the allowance half back first would close
-            // the equation just as well while moving durable credits into the
-            // bucket that expires at the next boundary (#97).
-            let from_topup = granted
-                .checked_sub(from_allowance)
-                .filter(|t| *t >= 0)
-                .ok_or_else(|| {
-                    AllocateError::Storage(StoreError(format!(
-                        "lease allowance funding {from_allowance} exceeds its grant {granted}"
-                    )))
-                })?;
-            let to_topup = from_topup.min(unspent_i);
-            let to_allowance = unspent_i - to_topup;
-
-            // One statement, and the `CASE` is the whole boundary rule: if the
-            // account has moved on to a later period, the allowance half is
-            // expired instead of returned. Deciding it in SQL against the
-            // row's own `period_start_us` keeps the read and the write in one
-            // atomic step, so a rollover committing between them cannot make
-            // this credit an allowance the account no longer has.
-            sqlx::query(
-                "UPDATE tollgate_accounts SET
-                     balance = balance + $2
-                         + CASE WHEN period_start_us > $5 THEN 0 ELSE $3 END,
-                     allowance_balance = allowance_balance
-                         + CASE WHEN period_start_us > $5 THEN 0 ELSE $3 END,
-                     expired = expired + CASE WHEN period_start_us > $5 THEN $3 ELSE 0 END,
-                     settlement_loss = settlement_loss + $4
-                 WHERE account_id = $1",
-            )
-            .bind(account_id)
-            .bind(to_topup)
-            .bind(to_allowance)
-            .bind(loss)
-            .bind(period_start_us)
-            .execute(&mut *tx)
+        let result = self
+            .release_in_tx(&mut tx, lease_id, fencing_token, unspent, now)
             .await
-            .map_err(alloc_storage)?;
-            Ok(())
+            .map(|_| ());
+        finish_transaction(tx, result).await
+    }
+
+    async fn consolidate(
+        &self,
+        lease_id: LeaseId,
+        fencing_token: FencingToken,
+        unspent: CostUnits,
+        requested: CostUnits,
+        ttl: SignedDuration,
+        now: Timestamp,
+    ) -> Result<LeaseGrant, AllocateError> {
+        let expires_at = self.grant_expiry(ttl, now)?;
+        let mut tx = self.pool.begin().await.map_err(alloc_storage)?;
+        // One transaction for both halves is the whole point. Lease row first
+        // and account row second, which is the order `release` already takes,
+        // so a consolidation cannot invert the lock order against a concurrent
+        // release of a sibling lease on the same account.
+        //
+        // The new grant is drawn from the account the released lease named,
+        // never one the caller supplied, so the two halves cannot disagree
+        // about whose balance moved.
+        let result = async {
+            let released = self
+                .release_in_tx(&mut tx, lease_id, fencing_token, unspent, now)
+                .await?;
+            self.acquire_in_tx(
+                &mut tx,
+                released.account,
+                requested,
+                expires_at,
+                released.restored,
+            )
+            .await
         }
         .await;
         finish_transaction(tx, result).await

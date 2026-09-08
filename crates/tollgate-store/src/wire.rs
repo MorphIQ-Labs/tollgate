@@ -94,6 +94,22 @@ pub struct ReleaseRequest {
     pub unspent: CostUnits,
 }
 
+/// A lease returned and re-granted in one server-side transaction.
+///
+/// Deliberately not an `AcquireRequest` plus a `ReleaseRequest`: the account
+/// is the one the released lease names, so there is no field for a client to
+/// disagree with the ledger about (see `LeaseAllocator::consolidate`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ConsolidateRequest {
+    pub lease_id: LeaseId,
+    pub fencing_token: FencingToken,
+    pub unspent: CostUnits,
+    pub requested: CostUnits,
+    pub ttl_seconds: u32,
+}
+
+pub type ConsolidateResponse = LeaseGrant;
+
 /// The owned form, which the server needs: axum's `Json<T>` extractor requires
 /// `DeserializeOwned`, so the receiving side cannot borrow from the body.
 #[derive(Debug, Clone, Serialize, Deserialize)]

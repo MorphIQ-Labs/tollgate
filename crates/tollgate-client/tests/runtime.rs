@@ -1586,6 +1586,18 @@ impl LeaseAllocator for HangingAcquireAllocator {
         Ok(())
     }
 
+    async fn consolidate(
+        &self,
+        _lease_id: tollgate_core::LeaseId,
+        _fencing_token: tollgate_core::FencingToken,
+        _unspent: tollgate_core::CostUnits,
+        _requested: tollgate_core::CostUnits,
+        _ttl: jiff::SignedDuration,
+        _now: jiff::Timestamp,
+    ) -> Result<tollgate_core::LeaseGrant, tollgate_store::AllocateError> {
+        unreachable!("this fixture never consolidates")
+    }
+
     async fn reclaim_expired_batch(
         &self,
         _now: Timestamp,
@@ -1701,6 +1713,18 @@ impl LeaseAllocator for HangingReleaseAllocator {
         _now: Timestamp,
     ) -> Result<(), tollgate_store::AllocateError> {
         std::future::pending().await
+    }
+
+    async fn consolidate(
+        &self,
+        _lease_id: tollgate_core::LeaseId,
+        _fencing_token: tollgate_core::FencingToken,
+        _unspent: tollgate_core::CostUnits,
+        _requested: tollgate_core::CostUnits,
+        _ttl: jiff::SignedDuration,
+        _now: jiff::Timestamp,
+    ) -> Result<tollgate_core::LeaseGrant, tollgate_store::AllocateError> {
+        unreachable!("this fixture never consolidates")
     }
 
     async fn reclaim_expired_batch(
@@ -2252,5 +2276,135 @@ async fn cancelling_lease_shutdown_aborts_the_owned_release_task() {
     assert!(
         health.has_changed().is_err(),
         "cancelled shutdown must not detach its manager"
+    );
+}
+
+/// Issue #109: near the end of an allowance the allocator shrinks the grant,
+/// and `install_lease` caps low water below it, so the tail lease sits *above*
+/// its own mark. Nothing crosses, and before this change a refused debit said
+/// nothing either — the instance answered `LeaseExhausted` until the TTL while
+/// lease and ledger together could fund the request.
+///
+/// The reporter's numbers exactly: allowance 160, target 100, low water 50,
+/// three 51-unit requests. Grants run 100 → 60 → 49, and the third request
+/// meets a 49-unit lease with 9 units still in the ledger.
+#[tokio::test(start_paused = true)]
+async fn a_refused_lease_consolidates_rather_than_stranding_the_tail() {
+    let store = store(160);
+    let slot = LeaseSlot::for_account(ACCOUNT);
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let manager = LeaseManager::spawn(
+        store.clone(),
+        Arc::clone(&slot),
+        clock,
+        LeaseManagerConfig {
+            target_grant: CostUnits(100),
+            low_water: CostUnits(50),
+            // A minute is far longer than this test runs, so no tick can
+            // explain a rotation. Only the refusal can.
+            poll_interval: std::time::Duration::from_secs(60),
+            ..manager_config()
+        },
+    )
+    .unwrap();
+
+    settle().await;
+    for spent in 1..=2 {
+        let lease = slot.load().expect("a lease is installed");
+        lease
+            .try_debit(CostUnits(51), t(0))
+            .unwrap_or_else(|e| panic!("debit {spent} should be funded: {e:?}"));
+        drop(lease);
+        settle().await;
+    }
+
+    let tail = slot.load().expect("a lease is installed");
+    assert_eq!(
+        tail.remaining(),
+        CostUnits(49),
+        "the shrunken tail grant is the state the defect needs"
+    );
+    assert!(
+        !tail.needs_refill(),
+        "and it sits above its own capped low-water mark, so nothing crosses"
+    );
+    let refused = tail.try_debit(CostUnits(51), t(0));
+    assert!(
+        matches!(refused, Err(DenyReason::LeaseExhausted { .. })),
+        "this one debit is still refused: {refused:?}"
+    );
+    drop(tail);
+
+    settle().await;
+    let consolidated = slot.load().expect("a lease is installed");
+    assert_eq!(
+        consolidated.remaining(),
+        CostUnits(58),
+        "the refusal folded the tail's 49 unspent units back in with the \
+         ledger's 9, so the account's whole remaining balance is reachable"
+    );
+    consolidated
+        .try_debit(CostUnits(51), t(0))
+        .expect("the request the account could always fund is now admitted");
+    drop(consolidated);
+
+    let stats = manager.counters().snapshot();
+    assert_eq!(stats.consolidated, 1, "exactly one consolidating rotation");
+    assert_eq!(
+        stats.consolidations_deferred, 0,
+        "nothing was in flight to defer it"
+    );
+    manager.shutdown().await;
+}
+
+/// The units are folded in *atomically*, which is the half a holder cannot do
+/// for itself. With the default `shrink_divisor` of 2, releasing 49 into a
+/// balance of 9 and then acquiring re-grants only 29 — a consolidation that
+/// shrank the holder. The floor is what forbids that.
+#[tokio::test(start_paused = true)]
+async fn consolidation_under_a_shrinking_policy_never_returns_less_than_it_folded() {
+    let store = Arc::new(
+        MemoryStore::new(GrantPolicy {
+            shrink_divisor: 2,
+            min_grant: CostUnits(1),
+            max_ttl: SignedDuration::from_secs(3_600),
+            reclaim_grace: SignedDuration::ZERO,
+        })
+        .unwrap(),
+    );
+    store.create_account(AccountConfig {
+        account_id: ACCOUNT,
+        initial_balance: CostUnits(58),
+        status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
+    });
+    let grant = store
+        .acquire(ACCOUNT, CostUnits(49), SignedDuration::from_secs(60), t(0))
+        .await
+        .expect("the first grant is funded");
+    assert_eq!(grant.units, CostUnits(29), "the policy shrinks it by half");
+
+    let folded = store
+        .consolidate(
+            grant.lease_id,
+            grant.fencing_token,
+            grant.units,
+            CostUnits(100),
+            SignedDuration::from_secs(60),
+            t(1),
+        )
+        .await
+        .expect("consolidation is funded by the units it returns");
+    assert!(
+        folded.units >= grant.units,
+        "a consolidation may grow the holding or leave it alone, never shrink it: \
+         {} folded in, {} granted",
+        grant.units.get(),
+        folded.units.get()
+    );
+    assert_eq!(
+        folded.units,
+        CostUnits(29),
+        "the policy still caps growth at balance/2; the floor only forbids the downgrade"
     );
 }

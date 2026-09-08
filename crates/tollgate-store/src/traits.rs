@@ -412,6 +412,55 @@ pub trait LeaseAllocator: Send + Sync {
         now: Timestamp,
     ) -> Result<(), AllocateError>;
 
+    /// Atomically return an active lease's `unspent` units and re-grant
+    /// against the restored balance: [`release`](Self::release) followed by
+    /// [`acquire`](Self::acquire), in one transaction, for the same account
+    /// the lease names.
+    ///
+    /// This exists because the holder cannot compose it from the two calls.
+    /// A holder whose grant is too small for the work it is being offered is
+    /// holding exactly the units the next grant needs, and separating the
+    /// return from the request loses them twice over: the
+    /// [`GrantPolicy`] re-sizes against a balance the returned units have
+    /// already rejoined, so a `shrink_divisor` above one can hand back
+    /// *less* than was returned (49 units returned into a balance of 58
+    /// re-grants 29 under the default policy), and in the gap between the two
+    /// calls another instance can take them. Neither is recoverable by the
+    /// holder, which is why the exchange belongs to the component that owns
+    /// both the policy and the transaction (INVARIANTS.md #1, #6).
+    ///
+    /// **The grant is never smaller than the credit actually restored.**
+    /// Allowance funded by a closed period expires at settlement; only its
+    /// surviving top-up credit supplies a floor. Otherwise all `unspent`
+    /// units return. The result is the larger of this floor and the ordinary
+    /// policy grant, so it can exceed `requested` when preserving a larger
+    /// holding. A zero request or a balance unable to fund any grant refuses
+    /// the whole exchange.
+    ///
+    /// The transaction applies both halves or neither. A domain refusal
+    /// (`InsufficientBalance`, `UnknownAccount`, `AccountInactive`, or
+    /// `InvalidTtl`) leaves the original lease unchanged. `InvalidRelease`
+    /// also leaves it unchanged but reports an accounting-integrity fault.
+    /// `UnknownLease`, `Fenced`, and `LeaseNotActive` provide no authority to
+    /// resume spending from the old lease.
+    ///
+    /// **`Storage`, timeouts, and cancellation have an ambiguous outcome.**
+    /// The transaction may have committed before its reply was lost, including
+    /// during an HTTP response or transaction-commit failure. A holder must
+    /// keep the old lease out of service and attempt its release; reinstating
+    /// it could spend credited units twice. The unanswered replacement grant
+    /// cannot be recovered through the old capability, must be reported as
+    /// uncertain, and remains bounded by TTL reclaim.
+    async fn consolidate(
+        &self,
+        lease_id: LeaseId,
+        fencing_token: FencingToken,
+        unspent: CostUnits,
+        requested: CostUnits,
+        ttl: SignedDuration,
+        now: Timestamp,
+    ) -> Result<LeaseGrant, AllocateError>;
+
     /// Settle at most `limit` active leases whose TTL (plus the policy's
     /// reclaim grace) has lapsed, crediting `granted - recorded usage` back
     /// to each account (INVARIANTS.md #9). One call is one bounded atomic
@@ -1158,6 +1207,18 @@ mod tests {
             _now: Timestamp,
         ) -> Result<(), AllocateError> {
             unreachable!("the full-drain tests only reclaim")
+        }
+
+        async fn consolidate(
+            &self,
+            _lease_id: LeaseId,
+            _fencing_token: FencingToken,
+            _unspent: CostUnits,
+            _requested: CostUnits,
+            _ttl: SignedDuration,
+            _now: Timestamp,
+        ) -> Result<LeaseGrant, AllocateError> {
+            unreachable!("the reclaim drain never consolidates")
         }
 
         async fn reclaim_expired_batch(

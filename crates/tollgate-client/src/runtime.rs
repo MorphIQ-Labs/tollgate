@@ -112,6 +112,8 @@ pub struct AccountReport {
     /// Known grants lost with a dead task, excluding its recoverable current
     /// slot. Unanswered acquires are reported separately, never counted exact.
     pub unrecovered_grants: u64,
+    /// Attempts whose grant outcome is unknown, including interrupted calls.
+    /// This counts uncertain attempts, not confirmed grants or units.
     pub uncertain_acquires: u64,
     /// None reports counter overflow, never a wrapped or partial total.
     pub refill: Option<LeaseStats>,
@@ -188,6 +190,14 @@ fn add_counter(counter: &mut u64, value: u64, overflow: &mut bool) {
 }
 
 impl Observation {
+    fn uncertain_acquires(&self) -> Option<u64> {
+        self.uncertain.checked_add(
+            self.counters
+                .as_ref()
+                .map_or(0, |c| c.snapshot().uncertain_acquires),
+        )
+    }
+
     fn stats(&self) -> Option<LeaseStats> {
         self.settled?.checked_add(
             self.counters
@@ -359,7 +369,7 @@ impl RuntimeHandle {
                     task_healthy: o.healthy(),
                     restarts: o.restarts,
                     unrecovered_grants: o.unrecovered,
-                    uncertain_acquires: o.uncertain,
+                    uncertain_acquires: o.uncertain_acquires().unwrap_or(u64::MAX),
                     refill: o.stats(),
                 }
             })
@@ -389,6 +399,8 @@ impl RuntimeHandle {
         };
         for o in observations.values() {
             report.counter_overflow |= o.overflow;
+            let uncertain = o.uncertain_acquires();
+            report.counter_overflow |= uncertain.is_none();
             match o.phase {
                 AccountPhase::Running => report.managed_accounts += 1,
                 AccountPhase::Lingering => {
@@ -403,7 +415,10 @@ impl RuntimeHandle {
             for (sum, value) in [
                 (&mut report.manager_restarts, o.restarts),
                 (&mut report.unrecovered_grants, o.unrecovered),
-                (&mut report.uncertain_acquires, o.uncertain),
+                (
+                    &mut report.uncertain_acquires,
+                    uncertain.unwrap_or(u64::MAX),
+                ),
             ] {
                 if let Some(next) = sum.checked_add(value) {
                     *sum = next;
@@ -700,6 +715,7 @@ impl Supervisor {
         let pending = o.counters.as_ref().is_some_and(|c| c.acquire_pending());
         let last = o.counters.take().map_or(LeaseStats::ZERO, |c| c.snapshot());
         add_counter(&mut o.uncertain, u64::from(pending), &mut o.overflow);
+        add_counter(&mut o.uncertain, last.uncertain_acquires, &mut o.overflow);
         if exit.report.task_died {
             // At task termination these counters are stable. Current slot
             // ownership survives; parked grants and unknown acquire outcomes
@@ -717,12 +733,11 @@ impl Supervisor {
                 u64::MAX
             });
             add_counter(&mut o.unrecovered, unresolved, &mut o.overflow);
-            add_counter(&mut o.uncertain, last.acquire_timeouts, &mut o.overflow);
             self.accounts
                 .get_mut(&account)
                 .expect("managed account")
                 .restart_after_death = true;
-            tracing::error!(%account, unrecovered_grants = unresolved, uncertain_acquires = last.acquire_timeouts,
+            tracing::error!(%account, unrecovered_grants = unresolved, uncertain_acquires = o.uncertain,
                 "lease manager died; unrecovered grants return only at TTL reclaim");
         }
         o.settled = o.settled.and_then(|old| old.checked_add(last));

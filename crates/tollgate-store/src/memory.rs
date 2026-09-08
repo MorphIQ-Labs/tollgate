@@ -206,6 +206,15 @@ impl AccountRecord {
     }
 }
 
+/// Whether the period that funded a lease had already closed by the time the
+/// lease settles.
+///
+/// Both settlement and consolidation use this decision so the credited bucket
+/// and the replacement grant's floor agree about which units are spendable.
+fn allowance_lapsed(record: &AccountRecord, period_start: Timestamp) -> bool {
+    period_start < record.period_start
+}
+
 /// Return a settled lease's unspent units to the account — expiring the
 /// allowance half, if the period that funded it has closed (#97).
 ///
@@ -241,7 +250,7 @@ fn credit_settlement(
         .checked_add(to_topup)
         .expect("settlement credit overflow");
     // The only thing the boundary decides.
-    let bucket = if period_start < record.period_start {
+    let bucket = if allowance_lapsed(record, period_start) {
         &mut record.expired
     } else {
         &mut record.balance.allowance
@@ -345,6 +354,25 @@ impl MemoryStore {
             policy,
             push,
         }))
+    }
+
+    /// The expiry a grant issued now would carry, clamping the request to the
+    /// policy's `max_ttl`.
+    ///
+    /// Every fallible value is computed before the ledger moves: an overflow
+    /// must not debit a balance without creating a lease, nor settle a lease
+    /// without replacing it.
+    fn grant_expiry(
+        &self,
+        ttl: SignedDuration,
+        now: Timestamp,
+    ) -> Result<Timestamp, AllocateError> {
+        if ttl <= SignedDuration::ZERO {
+            return Err(AllocateError::InvalidTtl);
+        }
+        let ttl = ttl.min(self.policy.max_ttl);
+        now.checked_add(ttl)
+            .map_err(|e| AllocateError::Storage(StoreError(format!("ttl overflow: {e}"))))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -577,6 +605,204 @@ impl MemoryStore {
     }
 }
 
+/// The part of a settled lease's `unspent` that returns to *spendable*
+/// balance.
+///
+/// Not always all of it: the allowance half of a lease funded by a period that
+/// has since closed expires instead of coming back (#97, and
+/// [`credit_settlement`], which applies the same rule). A caller sizing a
+/// grant against the credit it is about to make must ask this rather than
+/// assume `unspent`.
+fn spendable_credit(
+    record: &AccountRecord,
+    funding: Drawn,
+    period_start: Timestamp,
+    unspent: CostUnits,
+) -> CostUnits {
+    if allowance_lapsed(record, period_start) {
+        funding.from_topup.min(unspent)
+    } else {
+        unspent
+    }
+}
+
+/// A validated release, decided before anything moves.
+///
+/// The reference backend holds one mutex where the SQL backend holds a
+/// transaction, so it has nothing to roll back: every way an operation can
+/// refuse is established here, and applying is infallible. That is what makes
+/// a consolidation all-or-nothing in both backends for the same reason rather
+/// than by coincidence.
+struct ReleasePlan {
+    account_id: AccountId,
+    funding: Drawn,
+    period_start: Timestamp,
+    unspent: CostUnits,
+    loss: CostUnits,
+}
+
+/// A validated grant, decided before anything moves. See [`ReleasePlan`].
+struct GrantPlan {
+    granted: CostUnits,
+    fencing_token: FencingToken,
+    next_fence: u64,
+    next_lease_id: u128,
+}
+
+fn plan_release(
+    inner: &Inner,
+    policy: &GrantPolicy,
+    lease_id: LeaseId,
+    fencing_token: FencingToken,
+    unspent: CostUnits,
+    now: Timestamp,
+) -> Result<ReleasePlan, AllocateError> {
+    let lease = inner
+        .leases
+        .get(lease_id)
+        .ok_or(AllocateError::UnknownLease)?;
+    if lease.fencing_token != fencing_token {
+        return Err(AllocateError::Fenced);
+    }
+    // A lease that lapsed before the release arrived settles by expiry
+    // reclaim instead; the late releaser is told, not silently absorbed.
+    // Releases are accepted through the grace window: a holder shutting down
+    // slowly may reach here after `expires_at` but before the sweep settles
+    // the lease. Only a settled (or grace-exhausted) lease refuses.
+    let release_deadline = lease
+        .expires_at
+        .checked_add(policy.reclaim_grace)
+        .unwrap_or(Timestamp::MAX);
+    if !lease.is_active() || now >= release_deadline {
+        return Err(AllocateError::LeaseNotActive);
+    }
+    // granted = used + unspent + loss; a claim that doesn't fit is a client
+    // accounting bug. The loss is *provisional*: usage events for this lease
+    // that were committed but not yet flushed at release time still fit in the
+    // gap and convert loss back into billed usage when they arrive (see
+    // `ingest`).
+    let spent_plus_unspent = lease
+        .used
+        .checked_add(unspent)
+        .ok_or(AllocateError::InvalidRelease)?;
+    let loss = lease
+        .granted
+        .checked_sub(spent_plus_unspent)
+        .ok_or(AllocateError::InvalidRelease)?;
+    Ok(ReleasePlan {
+        account_id: lease.account_id,
+        funding: lease.funding,
+        period_start: lease.period_start,
+        unspent,
+        loss,
+    })
+}
+
+fn apply_release(inner: &mut Inner, lease_id: LeaseId, plan: &ReleasePlan) {
+    assert!(
+        inner
+            .leases
+            .settle(lease_id, Settled::Released, plan.unspent),
+        "the plan validated this lease as active under this same lock"
+    );
+    let record = inner
+        .accounts
+        .get_mut(&plan.account_id)
+        .expect("lease account exists");
+    credit_settlement(record, plan.funding, plan.period_start, plan.unspent);
+    record.settlement_loss = record
+        .settlement_loss
+        .checked_add(plan.loss)
+        .expect("loss overflow");
+}
+
+/// Size one grant against `account`'s balance.
+///
+/// `incoming` is units this same operation is about to credit to this same
+/// account — a consolidation's returned tail. It counts twice, and
+/// deliberately: as part of the balance the policy sizes against, and as the
+/// floor that answer may not fall below, so the exchange can grow a holding or
+/// leave it alone but never shrink it (see [`LeaseAllocator::consolidate`]).
+/// A plain acquire credits nothing and passes zero, leaving the policy's
+/// answer exactly as it was.
+fn plan_grant(
+    inner: &Inner,
+    policy: &GrantPolicy,
+    account: AccountId,
+    requested: CostUnits,
+    incoming: CostUnits,
+) -> Result<GrantPlan, AllocateError> {
+    let next_lease_id = inner
+        .next_lease_id
+        .checked_add(1)
+        .ok_or_else(|| AllocateError::Storage(StoreError("lease id overflow".into())))?;
+    let record = inner
+        .accounts
+        .get(&account)
+        .ok_or(AllocateError::UnknownAccount)?;
+    if record.status != AccountStatus::Active {
+        return Err(AllocateError::AccountInactive);
+    }
+    let balance = record
+        .balance
+        .total()
+        .checked_add(incoming)
+        .ok_or_else(|| AllocateError::Storage(StoreError("account balance overflow".into())))?;
+    // The floor is applied to the policy's answer, never to the balance test:
+    // an account with nothing left still refuses, and `incoming` is capped by
+    // the balance it is part of, so a floor can only re-select capacity the
+    // account demonstrably has.
+    let granted = policy
+        .grant(requested, balance)
+        .ok_or(AllocateError::InsufficientBalance)?
+        .max(incoming.min(balance));
+    let next_fence = record
+        .next_fence
+        .checked_add(1)
+        .ok_or_else(|| AllocateError::Storage(StoreError("fencing token overflow".into())))?;
+    Ok(GrantPlan {
+        granted,
+        fencing_token: FencingToken(record.next_fence),
+        next_fence,
+        next_lease_id,
+    })
+}
+
+fn apply_grant(
+    inner: &mut Inner,
+    account: AccountId,
+    plan: GrantPlan,
+    expires_at: Timestamp,
+) -> LeaseGrant {
+    let record = inner
+        .accounts
+        .get_mut(&account)
+        .expect("the plan validated this account under this same lock");
+    // Allowance first, and the split travels with the lease so settlement
+    // returns each half where it came from (#97).
+    let drawn = record
+        .balance
+        .take(plan.granted)
+        .expect("grant never exceeds the balance the plan sized it against");
+    let period_start = record.period_start;
+    record.next_fence = plan.next_fence;
+
+    inner.next_lease_id = plan.next_lease_id;
+    let lease_id = LeaseId(plan.next_lease_id);
+    inner.leases.open(
+        lease_id,
+        LeaseRecord::opened(account, plan.fencing_token, plan.granted, expires_at)
+            .funded_by(drawn, period_start),
+    );
+    LeaseGrant {
+        lease_id,
+        account_id: account,
+        fencing_token: plan.fencing_token,
+        units: plan.granted,
+        expires_at,
+    }
+}
+
 #[async_trait]
 impl LeaseAllocator for MemoryStore {
     async fn acquire(
@@ -586,63 +812,10 @@ impl LeaseAllocator for MemoryStore {
         ttl: SignedDuration,
         now: Timestamp,
     ) -> Result<LeaseGrant, AllocateError> {
-        if ttl <= SignedDuration::ZERO {
-            return Err(AllocateError::InvalidTtl);
-        }
-        let policy = self.policy;
-        let ttl = if ttl > policy.max_ttl {
-            policy.max_ttl
-        } else {
-            ttl
-        };
-        // Compute every fallible value before mutating the in-memory ledger;
-        // an overflow must not debit balance without creating a lease.
-        let expires_at = now
-            .checked_add(ttl)
-            .map_err(|e| AllocateError::Storage(StoreError(format!("ttl overflow: {e}"))))?;
+        let expires_at = self.grant_expiry(ttl, now)?;
         let mut inner = self.lock();
-        let next_lease_id = inner
-            .next_lease_id
-            .checked_add(1)
-            .ok_or_else(|| AllocateError::Storage(StoreError("lease id overflow".into())))?;
-        let record = inner
-            .accounts
-            .get_mut(&account)
-            .ok_or(AllocateError::UnknownAccount)?;
-        if record.status != AccountStatus::Active {
-            return Err(AllocateError::AccountInactive);
-        }
-        let granted = policy
-            .grant(requested, record.balance.total())
-            .ok_or(AllocateError::InsufficientBalance)?;
-        let next_fence = record
-            .next_fence
-            .checked_add(1)
-            .ok_or_else(|| AllocateError::Storage(StoreError("fencing token overflow".into())))?;
-        // Allowance first, and the split travels with the lease so settlement
-        // returns each half where it came from (#97).
-        let drawn = record
-            .balance
-            .take(granted)
-            .expect("grant never exceeds balance");
-        let period_start = record.period_start;
-        let fencing_token = FencingToken(record.next_fence);
-        record.next_fence = next_fence;
-
-        inner.next_lease_id = next_lease_id;
-        let lease_id = LeaseId(next_lease_id);
-        inner.leases.open(
-            lease_id,
-            LeaseRecord::opened(account, fencing_token, granted, expires_at)
-                .funded_by(drawn, period_start),
-        );
-        Ok(LeaseGrant {
-            lease_id,
-            account_id: account,
-            fencing_token,
-            units: granted,
-            expires_at,
-        })
+        let plan = plan_grant(&inner, &self.policy, account, requested, CostUnits::ZERO)?;
+        Ok(apply_grant(&mut inner, account, plan, expires_at))
     }
 
     async fn release(
@@ -653,56 +826,41 @@ impl LeaseAllocator for MemoryStore {
         now: Timestamp,
     ) -> Result<(), AllocateError> {
         let mut inner = self.lock();
-        let lease = inner
-            .leases
-            .get(lease_id)
-            .ok_or(AllocateError::UnknownLease)?;
-        if lease.fencing_token != fencing_token {
-            return Err(AllocateError::Fenced);
-        }
-        // A lease that lapsed before the release arrived settles by expiry
-        // reclaim instead; the late releaser is told, not silently absorbed.
-        // Releases are accepted through the grace window: a holder shutting
-        // down slowly may reach here after `expires_at` but before the sweep
-        // settles the lease. Only a settled (or grace-exhausted) lease
-        // refuses.
-        let release_deadline = lease
-            .expires_at
-            .checked_add(self.policy.reclaim_grace)
-            .unwrap_or(Timestamp::MAX);
-        if !lease.is_active() || now >= release_deadline {
-            return Err(AllocateError::LeaseNotActive);
-        }
-        // granted = used + unspent + loss; a claim that doesn't fit is a
-        // client accounting bug. The loss is *provisional*: usage events for
-        // this lease that were committed but not yet flushed at release time
-        // still fit in the gap and convert loss back into billed usage when
-        // they arrive (see `ingest`).
-        let spent_plus_unspent = lease
-            .used
-            .checked_add(unspent)
-            .ok_or(AllocateError::InvalidRelease)?;
-        let loss = lease
-            .granted
-            .checked_sub(spent_plus_unspent)
-            .ok_or(AllocateError::InvalidRelease)?;
-        let account_id = lease.account_id;
-        let funding = lease.funding;
-        let period_start = lease.period_start;
-        assert!(
-            inner.leases.settle(lease_id, Settled::Released, unspent),
-            "the lease was active a line ago, under this same lock"
-        );
+        let plan = plan_release(&inner, &self.policy, lease_id, fencing_token, unspent, now)?;
+        apply_release(&mut inner, lease_id, &plan);
+        Ok(())
+    }
+
+    async fn consolidate(
+        &self,
+        lease_id: LeaseId,
+        fencing_token: FencingToken,
+        unspent: CostUnits,
+        requested: CostUnits,
+        ttl: SignedDuration,
+        now: Timestamp,
+    ) -> Result<LeaseGrant, AllocateError> {
+        let expires_at = self.grant_expiry(ttl, now)?;
+        let mut inner = self.lock();
+        // Both halves are planned before either is applied. The reference
+        // backend has no rollback, so a grant that refuses after the release
+        // had already moved units would settle a lease it cannot replace —
+        // which is the one failure this operation exists to prevent, arriving
+        // by a different door.
+        let release = plan_release(&inner, &self.policy, lease_id, fencing_token, unspent, now)?;
+        let account = release.account_id;
         let record = inner
             .accounts
-            .get_mut(&account_id)
-            .expect("lease account exists");
-        credit_settlement(record, funding, period_start, unspent);
-        record.settlement_loss = record
-            .settlement_loss
-            .checked_add(loss)
-            .expect("loss overflow");
-        Ok(())
+            .get(&account)
+            .ok_or(AllocateError::UnknownAccount)?;
+        // Not `unspent`: the allowance half of a lease funded by a closed
+        // period expires rather than returning, so the grant is sized against
+        // what the credit will actually restore (#97).
+        let restored = spendable_credit(record, release.funding, release.period_start, unspent);
+        let grant = plan_grant(&inner, &self.policy, account, requested, restored)?;
+
+        apply_release(&mut inner, lease_id, &release);
+        Ok(apply_grant(&mut inner, account, grant, expires_at))
     }
 
     async fn reclaim_expired_batch(

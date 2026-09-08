@@ -8,7 +8,8 @@
 //!
 //! Surface (`/v1`):
 //! - `POST /v1/leases/acquire`, `POST /v1/leases/release`,
-//!   `POST /v1/leases/reclaim` — fenced lease lifecycle.
+//!   `POST /v1/leases/consolidate`, `POST /v1/leases/reclaim` — fenced lease
+//!   lifecycle.
 //! - `GET /v1/snapshots` — the principal catalogue (#48).
 //! - `GET /v1/snapshots/{principal}` — compiled snapshot fetch.
 //! - `POST /v1/usage/ingest` — idempotent usage batches.
@@ -34,10 +35,10 @@ use tracing::Instrument as _;
 
 use tollgate_core::{AccountId, CapacityClass, CostUnits, Principal, PublishableSnapshot};
 use tollgate_store::wire::{
-    API_PREFIX, AcquireRequest, AcquireResponse, CreateAccountRequest, DepositRequest,
-    IngestRequest, MAX_INGEST_BODY_BYTES, MAX_SNAPSHOT_BODY_BYTES, PrincipalsResponse,
-    PublishSnapshotRequest, ReleaseRequest, SetCapacityClassRequest, SetStatusRequest,
-    SetStatusResponse,
+    API_PREFIX, AcquireRequest, AcquireResponse, ConsolidateRequest, ConsolidateResponse,
+    CreateAccountRequest, DepositRequest, IngestRequest, MAX_INGEST_BODY_BYTES,
+    MAX_SNAPSHOT_BODY_BYTES, PrincipalsResponse, PublishSnapshotRequest, ReleaseRequest,
+    SetCapacityClassRequest, SetStatusRequest, SetStatusResponse,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, Clock, DEFAULT_RECLAIM_BATCH_LIMIT, DEFAULT_ROLLOVER_BATCH_LIMIT,
@@ -89,6 +90,7 @@ pub fn router<S: Backend>(state: ServerState<S>) -> Router {
             Router::new()
                 .route("/leases/acquire", post(acquire::<S>))
                 .route("/leases/release", post(release::<S>))
+                .route("/leases/consolidate", post(consolidate::<S>))
                 .route("/leases/reclaim", post(reclaim::<S>))
                 .route("/snapshots", get(list_principals::<S>))
                 .route("/snapshots/{principal}", get(fetch_snapshot::<S>))
@@ -391,6 +393,31 @@ async fn release<S: Backend>(
         )
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Return a lease's unspent units and re-grant against the restored balance,
+/// in one backend transaction.
+///
+/// It is a route rather than two calls the instance could make itself for the
+/// reason the trait method exists: split across the wire, another instance can
+/// take the returned units in the gap, and the grant policy can hand back less
+/// than was returned (`LeaseAllocator::consolidate`).
+async fn consolidate<S: Backend>(
+    State(state): State<ServerState<S>>,
+    ApiJson(request): ApiJson<ConsolidateRequest>,
+) -> Result<Json<ConsolidateResponse>, ApiError> {
+    let grant = state
+        .store
+        .consolidate(
+            request.lease_id,
+            request.fencing_token,
+            request.unspent,
+            request.requested,
+            SignedDuration::from_secs(i64::from(request.ttl_seconds)),
+            state.clock.now(),
+        )
+        .await?;
+    Ok(Json(grant))
 }
 
 async fn reclaim<S: Backend>(

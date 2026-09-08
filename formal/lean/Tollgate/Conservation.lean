@@ -132,6 +132,33 @@ theorem settle_preserves_conservation
         Bool.false_eq_true, if_true, if_false] at *
       omega
 
+/-- Consolidation's floor is the spendable credit from settlement. Expired
+allowance has no contribution, even when the replacement draws a new period's
+allowance. These are natural-number bounds; backend tests cover SQL and u64. -/
+def consolidationCredit (toAllowance toTopup : Nat) (samePeriod : Bool) : Nat :=
+  toTopup + if samePeriod then toAllowance else 0
+
+theorem settlement_restores_consolidation_credit
+    (l : Ledger) (used toAllowance toTopup lost : Nat) (samePeriod : Bool) :
+    (settle l used toAllowance toTopup lost samePeriod).balance =
+      l.balance + consolidationCredit toAllowance toTopup samePeriod := by
+  cases samePeriod <;> simp [settle, Ledger.balance, consolidationCredit] <;> omega
+
+theorem consolidation_grant_respects_restored_balance
+    (balance policyGrant toAllowance toTopup : Nat) (samePeriod : Bool)
+    (policy_funded : policyGrant ≤ balance + consolidationCredit toAllowance toTopup samePeriod) :
+    consolidationCredit toAllowance toTopup samePeriod ≤
+        max policyGrant (consolidationCredit toAllowance toTopup samePeriod) ∧
+      max policyGrant (consolidationCredit toAllowance toTopup samePeriod) ≤
+        balance + consolidationCredit toAllowance toTopup samePeriod := by
+  omega
+
+theorem expired_allowance_cannot_enlarge_consolidation
+    (policyGrant toAllowance toTopup : Nat) :
+    max policyGrant (consolidationCredit toAllowance toTopup false) =
+      max policyGrant toTopup := by
+  simp [consolidationCredit]
+
 /-- Releasing a lease inside its own period: the shape the ledger had before
 budgets, kept under its own name because INVARIANTS.md #4 cites it. -/
 def release (l : Ledger) (_granted used unspent lost : Nat) : Ledger :=

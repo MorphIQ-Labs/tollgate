@@ -17,6 +17,50 @@ until it has one.
    has passed or not yet reached — so it is clamped to the grant, never asserted
    against it; settlement reads it only at quiescence, where it is exact.
 
+   **A funded unit is reachable.** Sharding partitions a grant and never
+   strands a positive aggregate at exhaustion; the refill plane partitions an
+   account's allowance the same way, between what one instance holds and what
+   is left in the ledger, and owes the same guarantee. It is not free: an
+   instance holding a tail grant too small for the quote it is offered is
+   holding exactly the units the next grant needs, and asking for one while
+   still holding them sizes it against a balance they are missing from. So the
+   two halves are exchanged in one allocator transaction — the unspent units
+   returned and the replacement granted against the restored balance — with the
+   grant policy's shrink cap applied as a floor against what was returned. The
+   exchange preserves at least the spendable credit it restores, and
+   no other instance can take the returned units in between. Neither property
+   is available to a holder composing `release` and `acquire` itself, which is
+   why the operation belongs to the component that owns both the policy and the
+   transaction. What still bounds reachability is the policy: under a
+   `shrink_divisor` above one a quote larger than `balance / shrink_divisor` is
+   deliberately unfundable by any single lease, which is that policy's fairness
+   trade across instances and not a stranding.
+
+   A consolidation is a settlement, so the boundary rule applies to it in full:
+   the allowance half of a lease funded by a period that has since closed
+   expires rather than returning (28), and the replacement is sized against
+   what the credit *restores*, never against the units nominally handed back.
+   *Tests:* `consolidation_never_grants_less_than_it_folded_in`,
+   `consolidation_folds_the_tail_grant_and_the_ledger_into_one_lease`,
+   `a_refused_consolidation_leaves_the_original_lease_spendable`,
+   `consolidating_without_the_lease_capability_moves_no_units`,
+   `a_consolidation_with_an_invalid_ttl_settles_nothing`,
+   `consolidating_across_a_boundary_regrants_only_what_the_credit_restores`,
+   `consolidation_after_a_budget_reduction_uses_only_restored_credit_as_floor`
+   (memory and Postgres variants),
+   `consolidation_under_a_shrinking_policy_never_returns_less_than_it_folded`,
+   and `a_consolidation_folds_the_tail_grant_over_http` for the wire. The
+   reference backend holds a mutex where the SQL backend holds a transaction
+   and so has nothing to roll back: it establishes all-or-nothing by planning
+   both halves before applying either, which
+   `a_refused_consolidation_leaves_the_original_lease_spendable` is what pins.
+   Postgres returns the restored credit from the same account update that
+   settles the old grant; the replacement consumes that evidence.
+   `Conservation.settlement_restores_consolidation_credit`,
+   `consolidation_grant_respects_restored_balance`, and
+   `expired_allowance_cannot_enlarge_consolidation` prove the exact-model
+   credit and floor bounds; the mirrored tests witness backend arithmetic.
+
    Under `EnforcementMode::Elastic { overage_cap }` an account may spend beyond
    its allocation, and the bound becomes a different one: **at most
    `overage_cap` unfunded units per service instance**, so a fleet of `N`
@@ -275,16 +319,53 @@ until it has one.
    discovered by it — the debit that crosses low water raises a signal whose
    implementation is contractually non-blocking — so refill latency is no
    longer bounded below by the poll interval, and a funded account is not
-   refused between ticks. Cold start and usability-window rollover keep the
-   interval as their backstop, having no debit to announce them. In a sharded
+   refused between ticks. Cold start keeps the interval as its backstop,
+   having no debit to announce it. In a sharded
    lease, an early local low-water crossing wakes at most once per shard; if
    the aggregate is not low yet, the manager clears those doorbells and
    rechecks the aggregate so a concurrent crossing cannot be lost. Publishing
    The doorbell only removes that floor if nothing in the loop body puts one
    back: the release pass carries a single `store_call_timeout` across every
    parked lease, so a wedged backend cannot make refill latency grow with the
-   parked count (#78). Publishing
-   a lease to N locality views is N swaps, so mutators are serialized: a
+   parked count (#78).
+   **A refusal is announced, and it is announced as a different thing.** A
+   debit the lease cannot fund — for units or because its usability window has
+   lapsed — raises the same doorbell, once per lease, and the plane is told
+   *which* happened. The two are not degrees of one signal and cannot share a
+   response. A crossing is anticipatory: the lease still serves, so the plane
+   acquires alongside it and no request is refused meanwhile. A refusal is that
+   failure already realised, and it is a statement about the grant's *size*
+   rather than its depletion — a lease can sit above every threshold and still
+   be too small for the quote offered, which is precisely the state adaptive
+   allocation produces at the end of an allowance and low water then caps
+   itself below. Acquiring alongside such a lease sizes the next grant against
+   a balance its own unspent units are missing from, and installs the smaller
+   answer; the plane must instead *consolidate*, folding those units back in as
+   it re-grants (1's reachability clause).
+
+   The units are exact only once the lease has quiesced, so consolidation takes
+   it out of the slot first. That is a deny window, so quiescence is tested and
+   never waited for: a lease with a reservation in flight goes straight back
+   and the next refusal rings again. A consolidation whose outcome the store
+   did not report is parked, never reinstated — the transaction may have
+   committed, and serving from a lease the ledger has already credited back is
+   the one outcome worse than the refusal being repaired.
+   A consolidation interrupted by shutdown retains its pending-acquire marker:
+   settling the predecessor cannot recover an unanswered replacement, whose
+   capability remains uncertain until TTL reclaim. Successful consolidation
+   records acquisition and settlement together inside `LeaseCounters`, so
+   the runtime's terminal inventory excludes the settled predecessor.
+   Timeouts and `Storage` acquisition errors also remain counted as uncertain
+   while a manager runs and after a clean join; domain refusals do not. The
+   same counter owner classifies ordinary and consolidating acquisitions.
+   Witnesses: `shutdown_reports_an_unanswered_consolidation_grant` and
+   `a_consolidated_predecessor_is_not_reported_as_crash_exposure`,
+   `ambiguous_consolidations_remain_visible_after_a_clean_shutdown`, and
+   `only_ambiguous_acquire_outcomes_increase_uncertainty`, with
+   `AccountLifecycle.consolidation_preserves_parked_inventory` proving the
+   exact-model inventory transition.
+
+   Publishing a lease to N locality views is N swaps, so mutators are serialized: a
    reader straddles one publication exactly as it straddled the single-view
    slot's one swap, but the slot never *ends* a publication holding two
    different leases, which is what would let a locality keep spending past a
@@ -308,6 +389,20 @@ until it has one.
    `a_lease_signals_at_most_once_however_long_it_drains`,
    `an_early_shard_signal_is_rearmed_until_the_aggregate_crosses`,
    `rotation_at_low_water_installs_fresh_lease`,
+   `a_refused_debit_reports_a_refusal_and_never_a_crossing`,
+   `a_refused_debit_tells_the_refill_plane_rather_than_waiting_to_be_polled`,
+   `a_refusal_storm_rings_once_and_reports_once`,
+   `a_refusal_outranks_a_low_water_crossing`,
+   `a_sharded_refusal_reports_once_for_the_whole_grant`,
+   `a_lease_with_no_doorbell_still_records_its_refusal`,
+   `an_expired_lease_reports_its_refusal_rather_than_waiting_for_the_tick`,
+   `a_refused_lease_consolidates_rather_than_stranding_the_tail`,
+   `a_successful_consolidation_installs_the_grant_and_parks_nothing`,
+   `a_rolled_back_consolidation_returns_the_lease_to_the_slot`,
+   `an_ambiguous_consolidation_parks_the_grant_rather_than_reinstating_it`,
+   `a_settled_lease_falls_through_to_an_ordinary_acquire`,
+   `an_over_claimed_fold_withdraws_readiness_and_keeps_serving`,
+   `a_consolidation_defers_while_a_reservation_is_in_flight`,
    `shutdown_releases_unspent_units`,
    `sharded_slot_keeps_release_parked_while_any_local_view_is_held`,
    `racing_mutators_never_leave_a_slot_holding_two_answers`, and the
