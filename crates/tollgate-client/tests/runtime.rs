@@ -1754,6 +1754,8 @@ async fn a_refill_does_not_wait_behind_the_release_pass() {
         .await;
         installed.expect("the manager must install a lease after each rotation");
     }
+    assert_eq!(manager.counters().snapshot().acquired, 6);
+    assert_eq!(manager.counters().snapshot().released, 0);
     let before = slot.load().expect("a lease is installed");
     assert!(
         !before.needs_refill(),
@@ -1831,15 +1833,20 @@ async fn hung_release_cannot_stall_shutdown() {
     assert!(slot.load().is_some());
     assert_eq!(counters.snapshot().abandoned, 0, "nothing abandoned yet");
 
-    // Park more leases by rotating the slot: each expiry supersedes the
-    // current lease, and a hung release keeps every superseded one on the
-    // books. This is the shape issue #78 is about — the old loop paid
-    // `parked.len()` sequential timeouts before it could even look at the
-    // shutdown signal.
+    // In-flight readers retain each superseded grant while the slot rotates.
+    // Once they finish, every parked grant reaches the hanging backend. This
+    // is the shape #78 bounds: the old loop paid `parked.len()` sequential
+    // timeouts before it could even inspect the shutdown signal.
+    let mut readers = Vec::new();
     for tick in 1..=5 {
+        readers.push(
+            slot.load()
+                .expect("the preceding rotation installed a grant"),
+        );
         clock.set(t(tick * 120));
         settle().await;
     }
+    drop(readers);
     let parked = counters.snapshot();
     assert_eq!(parked.released, 0, "a hung release settles nothing");
 
@@ -2125,6 +2132,12 @@ async fn a_refused_batch_is_counted_lost_rather_than_retried_forever() {
         "a refused batch must be attempted once, not retried"
     );
 
+    assert_eq!(
+        recorder.health().unaccounted,
+        0,
+        "a reported loss is a completed accounting outcome"
+    );
+
     // The queue keeps working: a later event is not stuck behind the refusal.
     recorder
         .try_reserve()
@@ -2136,5 +2149,108 @@ async fn a_refused_batch_is_counted_lost_rather_than_retried_forever() {
     assert!(
         stats.lost >= 2,
         "refused events are counted lost, never silently dropped; got {stats:?}"
+    );
+}
+
+struct ObservedHungSink(Arc<AtomicUsize>);
+#[async_trait]
+impl UsageSink for ObservedHungSink {
+    async fn ingest(
+        &self,
+        _events: &[UsageEvent],
+        _now: Timestamp,
+    ) -> Result<IngestReport, IngestError> {
+        struct Active(Arc<AtomicUsize>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        self.0.fetch_add(1, Ordering::AcqRel);
+        let _active = Active(self.0.clone());
+        std::future::pending().await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_writer_shutdown_aborts_the_owned_ingest_task() {
+    let active = Arc::new(AtomicUsize::new(0));
+    let mut config = writer_config(8);
+    config.max_batch = 1;
+    config.ingest_timeout = std::time::Duration::from_secs(120);
+    config.shutdown_drain_deadline = std::time::Duration::from_secs(60);
+    let (recorder, writer) = UsageWriter::spawn(
+        Arc::new(ObservedHungSink(active.clone())),
+        Arc::new(ManualClock::new(t(0))),
+        config,
+    )
+    .unwrap();
+    recorder.try_reserve().unwrap().record(refused_event(1));
+    settle().await;
+    assert_eq!(active.load(Ordering::Acquire), 1);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(1), writer.shutdown())
+            .await
+            .is_err()
+    );
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        active.load(Ordering::Acquire),
+        0,
+        "cancelled shutdown must not detach its writer"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_interrupts_normal_ingest_before_its_long_timeout() {
+    let active = Arc::new(AtomicUsize::new(0));
+    let mut config = writer_config(8);
+    config.max_batch = 1;
+    config.ingest_timeout = std::time::Duration::from_secs(120);
+    config.shutdown_drain_deadline = std::time::Duration::from_millis(10);
+    let (recorder, writer) = UsageWriter::spawn(
+        Arc::new(ObservedHungSink(active.clone())),
+        Arc::new(ManualClock::new(t(0))),
+        config,
+    )
+    .unwrap();
+    recorder.try_reserve().unwrap().record(refused_event(1));
+    settle().await;
+    assert_eq!(active.load(Ordering::Acquire), 1);
+    let result = tokio::time::timeout(std::time::Duration::from_millis(11), writer.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.lost, 1);
+    assert_eq!(active.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_lease_shutdown_aborts_the_owned_release_task() {
+    let store = store(10_000);
+    let slot = LeaseSlot::for_account(ACCOUNT);
+    let manager = LeaseManager::spawn(
+        Arc::new(HangingReleaseAllocator { inner: store }),
+        slot.clone(),
+        Arc::new(ManualClock::new(t(0))),
+        manager_config(),
+    )
+    .unwrap();
+    let health = manager.health();
+    settle().await;
+    assert!(slot.load().is_some());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(1), manager.shutdown())
+            .await
+            .is_err()
+    );
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        health.has_changed().is_err(),
+        "cancelled shutdown must not detach its manager"
     );
 }

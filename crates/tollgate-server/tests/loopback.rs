@@ -15,10 +15,10 @@ use std::sync::Arc;
 
 use jiff::{SignedDuration, Timestamp};
 
-use tollgate_admission::{AdmissionEngine, ArcSwapSnapshotMap, LeaseSlot, NoGate, SnapshotMap};
+use tollgate_admission::{AdmissionEngine, ArcSwapSnapshotMap, NoGate, SnapshotMap};
 use tollgate_client::{
-    HttpStore, LeaseManager, LeaseManagerConfig, SlotRegistry, SnapshotManager,
-    SnapshotManagerConfig, SystemClock, TrackedPrincipals, UsageWriter, UsageWriterConfig,
+    HttpStore, SlotRegistry, SnapshotManager, SnapshotManagerConfig, SystemClock,
+    TrackedPrincipals, UsageWriterConfig,
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CapacityClass, CostTable, CostUnits, DenyReason,
@@ -312,41 +312,56 @@ async fn full_stack_over_loopback_http() {
         SnapshotResolution::Unknown
     ));
 
-    let slot = LeaseSlot::for_account(ACCOUNT);
-    let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
-    engine
-        .map()
-        .install(PRINCIPAL, fetched.into_inner(), Arc::clone(&slot));
-
-    let manager = LeaseManager::spawn(
+    let (runtime, engine) = tollgate_client::InstanceRuntime::spawn(
         http.clone(),
-        Arc::clone(&slot),
-        clock.clone(),
-        LeaseManagerConfig {
-            account: ACCOUNT,
-            target_grant: CostUnits(2_000),
-            low_water: CostUnits(500),
-            lease_ttl: SignedDuration::from_secs(3_600),
-            expiry_safety_margin: SignedDuration::from_secs(2),
-            poll_interval: std::time::Duration::from_millis(10),
-            store_call_timeout: std::time::Duration::from_secs(5),
-            shutdown_release_deadline: std::time::Duration::from_secs(10),
-        },
-    )
-    .unwrap();
-    let (recorder, writer) = UsageWriter::spawn(
+        http.clone(),
         http.clone(),
         clock,
-        UsageWriterConfig {
-            queue_capacity: 64,
-            max_batch: 16,
-            flush_interval: std::time::Duration::from_millis(10),
-            retry_backoff: std::time::Duration::from_millis(10),
-            shutdown_drain_deadline: std::time::Duration::from_secs(60),
-            ingest_timeout: std::time::Duration::from_secs(5),
+        tollgate_client::InstanceRuntimeConfig {
+            snapshots: SnapshotManagerConfig {
+                principals: TrackedPrincipals::All {
+                    seed: vec![PRINCIPAL],
+                },
+                refresh_interval: std::time::Duration::from_millis(20),
+                unknown_ttl: SignedDuration::from_secs(1),
+                revoked_ttl: SignedDuration::from_secs(1),
+                retry_backoff: std::time::Duration::from_millis(10),
+                max_concurrent_fetches: 4,
+                fetch_timeout: std::time::Duration::from_secs(5),
+                enumeration_timeout: std::time::Duration::from_secs(5),
+            },
+            leases: tollgate_client::AccountLeaseConfig {
+                target_grant: CostUnits(2_000),
+                low_water: CostUnits(500),
+                lease_ttl: SignedDuration::from_secs(3_600),
+                expiry_safety_margin: SignedDuration::from_secs(2),
+                poll_interval: std::time::Duration::from_millis(10),
+                store_call_timeout: std::time::Duration::from_secs(5),
+                shutdown_release_deadline: std::time::Duration::from_secs(10),
+            },
+            usage: UsageWriterConfig {
+                queue_capacity: 64,
+                max_batch: 16,
+                flush_interval: std::time::Duration::from_millis(10),
+                retry_backoff: std::time::Duration::from_millis(10),
+                shutdown_drain_deadline: std::time::Duration::from_secs(60),
+                ingest_timeout: std::time::Duration::from_secs(5),
+            },
+            sharding: tollgate_core::LocalSharding::SINGLE,
+            idle_account_linger: std::time::Duration::from_millis(30),
+            manager_restart_backoff: std::time::Duration::from_millis(10),
+            shutdown_deadline: std::time::Duration::from_secs(70),
         },
     )
     .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !engine.readiness(Timestamp::now()).is_ready() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let recorder = engine.recorder();
 
     // Spend the account down to stable denial through the admission engine.
     let mut committed_units = 0u64;
@@ -399,10 +414,11 @@ async fn full_stack_over_loopback_http() {
 
     // Orderly shutdown: flush billing, then release leases, then stop the
     // server.
-    let stats = writer.shutdown().await.unwrap();
+    let report = runtime.shutdown().await.unwrap();
+    assert!(report.unfinished_accounts.is_empty());
+    let stats = report.usage.unwrap();
     assert_eq!(stats.lost, 0);
     assert_eq!(stats.rejected, 0);
-    manager.shutdown().await;
     let _ = stop_tx.send(());
     server.await.unwrap().unwrap();
 

@@ -351,6 +351,10 @@ impl UsageRecorder {
         self.tx.is_closed()
     }
 
+    pub(crate) async fn closed(&self) {
+        self.tx.closed().await;
+    }
+
     /// The writer's accounting health, readable at any time.
     ///
     /// Deliberately on the *recorder*: a service holds this handle in its
@@ -449,6 +453,7 @@ impl std::error::Error for WriterShutdownError {}
 /// Handle to the writer task.
 pub struct UsageWriter {
     shutdown: watch::Sender<bool>,
+    deadline: Arc<crate::ShutdownDeadline>,
     handle: Option<tokio::task::JoinHandle<WriterStats>>,
     counters: Arc<WriterCounters>,
     /// Only to read the queue's depth for [`UsageWriter::health`] — weak, so
@@ -470,6 +475,7 @@ impl UsageWriter {
         let weak = tx.downgrade();
         let (shutdown, shutdown_rx) = watch::channel(false);
         let counters = Arc::new(WriterCounters::new());
+        let deadline = Arc::new(crate::ShutdownDeadline::default());
         let handle = tokio::spawn(
             run(
                 Writer {
@@ -477,6 +483,7 @@ impl UsageWriter {
                     clock,
                     config,
                     counters: Arc::clone(&counters),
+                    deadline: Arc::clone(&deadline),
                 },
                 rx,
                 weak.clone(),
@@ -497,6 +504,7 @@ impl UsageWriter {
             },
             UsageWriter {
                 shutdown,
+                deadline,
                 handle: Some(handle),
                 counters,
                 queue: weak,
@@ -526,15 +534,23 @@ impl UsageWriter {
     /// a clean shutdown (INVARIANTS.md #8).
     pub async fn shutdown(mut self) -> Result<WriterStats, WriterShutdownError> {
         crate::signal(&self.shutdown, true, "usage-writer shutdown");
-        let Some(handle) = self.handle.take() else {
+        let Some(handle) = self.handle.as_mut() else {
             // Unreachable through the public API: `shutdown` consumes the
             // handle, and `Drop` runs only afterwards.
             return Err(self.died(false));
         };
+        // Borrow the handle so cancelling this future cannot detach billing.
         match handle.await {
             Ok(stats) => Ok(stats),
             Err(join) => Err(self.died(join.is_panic())),
         }
+    }
+
+    /// Constrain cleanup before signalling it, so a runtime's total budget
+    /// governs the actual receives, ingests, and backoffs.
+    pub(crate) fn stop_at(&self, deadline: tokio::time::Instant) {
+        self.deadline.constrain(deadline);
+        crate::signal(&self.shutdown, true, "usage-writer shutdown");
     }
 
     fn died(&self, panicked: bool) -> WriterShutdownError {
@@ -570,6 +586,7 @@ struct Writer {
     clock: Arc<dyn Clock>,
     config: UsageWriterConfig,
     counters: Arc<WriterCounters>,
+    deadline: Arc<crate::ShutdownDeadline>,
 }
 
 impl Writer {
@@ -653,6 +670,7 @@ async fn flush_retrying(
         clock,
         config,
         counters,
+        ..
     } = writer;
     // An outage is a *duration*, not an event: retrying forever is the
     // designed behavior, so the only way it becomes visible is by reporting
@@ -667,7 +685,12 @@ async fn flush_retrying(
         // the last time the sink answered, so the health reading and the
         // ledger agree about when this batch happened.
         let now = clock.now();
-        match tokio::time::timeout(config.ingest_timeout, sink.ingest(batch, now)).await {
+        let ingest = tokio::time::timeout(config.ingest_timeout, sink.ingest(batch, now));
+        let outcome = tokio::select! {
+            outcome = ingest => outcome,
+            _ = shutdown.changed() => return,
+        };
+        match outcome {
             Ok(Ok(report)) => {
                 if let Some((began, attempts)) = outage {
                     tracing::info!(
@@ -700,6 +723,7 @@ async fn flush_retrying(
                     "usage sink refused this batch and will refuse it again; \
                      counted lost so later events are not blocked behind it"
                 );
+                writer.account_for(batch);
                 batch.clear();
                 return;
             }
@@ -769,7 +793,7 @@ async fn final_flush(
     // indistinguishable from "done") yields None only once every one of
     // them has sent or dropped.
     rx.close();
-    let deadline = tokio::time::Instant::now() + config.shutdown_drain_deadline;
+    let deadline = writer.deadline.within(config.shutdown_drain_deadline);
     let mut drained = false;
     let mut expired = false;
     loop {
@@ -808,6 +832,7 @@ async fn flush_bounded(
         clock,
         config,
         counters,
+        ..
     } = writer;
     const FINAL_FLUSH_ATTEMPTS: u32 = 3;
     let mut delivered = false;
@@ -872,7 +897,38 @@ fn outstanding_permits(weak: &mpsc::WeakSender<UsageEvent>) -> u64 {
 
 #[cfg(test)]
 mod layout_tests {
-    use super::Contended;
+    use super::{Contended, UsageWriter, UsageWriterConfig};
+    use jiff::Timestamp;
+    use std::sync::Arc;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_runtime_stop_closes_the_queue_and_bounds_the_actual_drain() {
+        let (recorder, writer) = UsageWriter::spawn(
+            tollgate_store::MemoryStore::new(tollgate_store::GrantPolicy::default()).unwrap(),
+            Arc::new(crate::ManualClock::new(
+                Timestamp::from_second(100).unwrap(),
+            )),
+            UsageWriterConfig {
+                queue_capacity: 1,
+                max_batch: 1,
+                flush_interval: std::time::Duration::from_millis(1),
+                retry_backoff: std::time::Duration::from_millis(1),
+                shutdown_drain_deadline: std::time::Duration::from_millis(100),
+                ingest_timeout: std::time::Duration::from_millis(1),
+            },
+        )
+        .unwrap();
+        let permit = recorder.try_reserve().unwrap();
+        let began = tokio::time::Instant::now();
+        writer.stop_at(began + std::time::Duration::from_millis(5));
+        tokio::time::timeout(std::time::Duration::from_millis(1), recorder.closed())
+            .await
+            .unwrap();
+        let stats = writer.shutdown().await.unwrap();
+        assert_eq!(stats.unresolved, 1);
+        assert_eq!(began.elapsed(), std::time::Duration::from_millis(5));
+        drop(permit);
+    }
 
     #[test]
     fn request_path_counters_are_isolated_on_supported_cache_lines() {

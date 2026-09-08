@@ -1512,6 +1512,14 @@ pub trait SnapshotMap: Send + Sync {
     /// generation, evicted or not.
     fn remove(&self, principal: &Principal);
 
+    /// Evict a catalogue slice while retaining generation watermarks.
+    /// Copy-on-write maps override this to clone once for the whole removal.
+    fn remove_many(&self, principals: &[Principal]) {
+        for principal in principals {
+            self.remove(principal);
+        }
+    }
+
     /// Install a batch in one logical write. The default loops over
     /// [`install`](SnapshotMap::install); copy-on-write implementations
     /// override it to pay their clone cost once per batch instead of once
@@ -1585,6 +1593,9 @@ pub trait SnapshotMap: Send + Sync {
 // A shared map is still a map: lets an `AdmissionEngine<Arc<M>>` and a
 // background snapshot manager hold the same map instance.
 impl<T: SnapshotMap + ?Sized> SnapshotMap for Arc<T> {
+    fn remove_many(&self, principals: &[Principal]) {
+        (**self).remove_many(principals);
+    }
     fn get(&self, principal: &Principal) -> Option<MapEntry> {
         (**self).get(principal)
     }

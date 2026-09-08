@@ -814,13 +814,7 @@ async fn measure(
     }
     .await;
 
-    let _ = stop_tx.send(());
-    let server_result = match server.await {
-        Ok(result) => result.map_err(|error| format!("load-gate server failed: {error}")),
-        Err(error) => Err(format!("load-gate server task failed: {error}")),
-    };
-    runtime.shutdown().await;
-    server_result?;
+    runtime.shutdown_server(server, stop_tx).await?;
 
     samples
 }

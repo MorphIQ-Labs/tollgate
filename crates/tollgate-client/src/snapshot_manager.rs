@@ -25,8 +25,8 @@
 //! `LeaseManager` refills.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 use jiff::SignedDuration;
 use tokio::sync::watch;
@@ -34,55 +34,13 @@ use tokio::task::JoinSet;
 use tracing::Instrument as _;
 
 use tollgate_admission::{
-    LeaseSlot, PublishableSnapshotUpdate, SnapshotMap, Watermark, accept_positive, accept_revoked,
+    PublishableSnapshotUpdate, SnapshotMap, Watermark, accept_positive, accept_revoked,
     accept_unknown,
 };
-use tollgate_core::{AccountId, Generation, LocalSharding, Principal};
+use tollgate_core::{Generation, Principal};
 use tollgate_store::{Clock, SnapshotResolution, SnapshotSource, StoreError};
 
-/// Account → lease-slot registry shared between the snapshot manager (which
-/// installs the slot into admission state) and lease managers (which stock
-/// it).
-#[derive(Default)]
-pub struct SlotRegistry {
-    inner: Mutex<HashMap<AccountId, Arc<LeaseSlot>>>,
-    sharding: LocalSharding,
-}
-
-impl SlotRegistry {
-    #[must_use]
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    /// Create a registry whose account slots request the same local shard
-    /// layout. The value is fixed for the registry's life so every principal
-    /// of an account observes one coherent slot configuration.
-    #[must_use]
-    pub fn with_sharding(sharding: LocalSharding) -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(HashMap::new()),
-            sharding,
-        })
-    }
-
-    /// The account's slot, created empty on first use.
-    #[must_use]
-    pub fn slot(&self, account: AccountId) -> Arc<LeaseSlot> {
-        Arc::clone(
-            self.inner
-                .lock()
-                .expect("slot registry poisoned")
-                .entry(account)
-                .or_insert_with(|| LeaseSlot::with_sharding(account, self.sharding)),
-        )
-    }
-
-    #[must_use]
-    pub fn sharding(&self) -> LocalSharding {
-        self.sharding
-    }
-}
+pub use crate::registry::SlotRegistry;
 
 /// Which principals an instance serves.
 ///
@@ -442,9 +400,11 @@ impl SnapshotManager {
     /// control plane with nothing to say (issue #36).
     pub async fn shutdown(mut self) -> SnapshotManagerReport {
         crate::signal(&self.shutdown, true, "snapshot-manager shutdown");
-        let Some(handle) = self.handle.take() else {
+        let Some(handle) = self.handle.as_mut() else {
             return SnapshotManagerReport { task_died: true };
         };
+        // Keep ownership in `self` across the await: cancelling shutdown must
+        // run Drop's abort, rather than detach a taken JoinHandle.
         match handle.await {
             Ok(()) => SnapshotManagerReport { task_died: false },
             Err(error) => {
@@ -513,6 +473,42 @@ impl Resolution {
 /// When nothing is scheduled: re-examine in an hour rather than never.
 const IDLE_WAKEUP: std::time::Duration = std::time::Duration::from_secs(3_600);
 
+/// The running manager's sole publication boundary. Runtime membership is
+/// observed only after the map has applied its generation acceptance rule.
+struct Publication {
+    map: Arc<dyn SnapshotMap>,
+    slots: Arc<SlotRegistry>,
+}
+
+impl std::fmt::Debug for Publication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Publication").finish_non_exhaustive()
+    }
+}
+
+impl Publication {
+    fn apply(&self, updates: Vec<PublishableSnapshotUpdate>, now: jiff::Timestamp) {
+        let principals: Vec<_> = if self.slots.observes() {
+            updates
+                .iter()
+                .map(|update| match update {
+                    PublishableSnapshotUpdate::Present { principal, .. }
+                    | PublishableSnapshotUpdate::Revoked { principal, .. }
+                    | PublishableSnapshotUpdate::Unknown { principal, .. } => *principal,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.map.apply_publishable_many_at(updates, now);
+        self.slots.observe_many(
+            principals
+                .into_iter()
+                .map(|principal| (principal, self.map.get(&principal))),
+        );
+    }
+}
+
 /// The tracked principals' resolutions, with the three ordered questions the
 /// manager asks of them answered by index rather than by rescanning.
 ///
@@ -533,6 +529,7 @@ const IDLE_WAKEUP: std::time::Duration = std::time::Duration::from_secs(3_600);
 /// `Ord`, so two principals sharing an instant cannot collide.
 #[derive(Debug)]
 struct Resolutions {
+    publication: Option<Publication>,
     /// The principals this instance tracks — the denominator readiness is
     /// measured against.
     ///
@@ -559,12 +556,31 @@ impl Resolutions {
     fn new(tracked: impl IntoIterator<Item = Principal>) -> Self {
         let tracked: HashSet<Principal> = tracked.into_iter().collect();
         Resolutions {
+            publication: None,
             by_principal: HashMap::with_capacity(tracked.len()),
             tracked,
             present: BTreeSet::new(),
             negative: BTreeSet::new(),
             refetch: BTreeSet::new(),
         }
+    }
+
+    fn publishing(
+        tracked: impl IntoIterator<Item = Principal>,
+        map: Arc<dyn SnapshotMap>,
+        slots: Arc<SlotRegistry>,
+    ) -> Self {
+        let mut resolutions = Self::new(tracked);
+        slots.retain(&resolutions.tracked);
+        resolutions.publication = Some(Publication { map, slots });
+        resolutions
+    }
+
+    fn publish(&self, updates: Vec<PublishableSnapshotUpdate>, now: jiff::Timestamp) {
+        self.publication
+            .as_ref()
+            .expect("a running manager owns publication")
+            .apply(updates, now);
     }
 
     fn is_tracked(&self, principal: Principal) -> bool {
@@ -575,6 +591,9 @@ impl Resolutions {
     /// enumeration. Idempotent, and leaves an existing resolution alone.
     fn track(&mut self, principal: Principal) {
         self.tracked.insert(principal);
+        if let Some(publication) = &self.publication {
+            publication.slots.track(principal);
+        }
     }
 
     /// Adopt a discovered set.
@@ -592,10 +611,21 @@ impl Resolutions {
             .difference(&discovered)
             .copied()
             .collect::<Vec<_>>();
+        if let Some(publication) = &self.publication {
+            publication.map.remove_many(&removed);
+            if publication.slots.observes() {
+                publication
+                    .slots
+                    .observe_many(removed.iter().map(|&principal| (principal, None)));
+            }
+        }
         for principal in removed {
             if let Some(previous) = self.by_principal.remove(&principal) {
                 self.forget(principal, previous);
             }
+        }
+        if let Some(publication) = &self.publication {
+            publication.slots.retain(&discovered);
         }
         self.tracked = discovered;
     }
@@ -938,7 +968,6 @@ fn negative_deadline(
 #[allow(clippy::too_many_arguments)]
 async fn refresh_all_cancellable(
     source: &Arc<dyn SnapshotSource>,
-    map: &Arc<dyn SnapshotMap>,
     slots: &Arc<SlotRegistry>,
     clock: &Arc<dyn Clock>,
     config: &SnapshotManagerConfig,
@@ -1140,7 +1169,7 @@ async fn refresh_all_cancellable(
         }
     }
     if !updates.is_empty() {
-        map.apply_publishable_many_at(updates, clock.now());
+        resolutions.publish(updates, clock.now());
     }
     Some(
         principals
@@ -1232,7 +1261,11 @@ async fn run(
     counters: Arc<SnapshotCounters>,
 ) {
     let mut updates = source.subscribe();
-    let mut resolutions = Resolutions::new(config.principals.initial().iter().copied());
+    let mut resolutions = Resolutions::publishing(
+        config.principals.initial().iter().copied(),
+        Arc::clone(&map),
+        Arc::clone(&slots),
+    );
 
     // Discover before the initial load, so a stateless instance starts from
     // the real set rather than its (usually empty) seed. Enumeration failure
@@ -1256,7 +1289,6 @@ async fn run(
         }
         let Some(failed) = refresh_all_cancellable(
             &source,
-            &map,
             &slots,
             &clock,
             &config,
@@ -1333,7 +1365,7 @@ async fn run(
                                         generation: snapshot.generation,
                                     },
                                 );
-                                map.apply_publishable_many_at(
+                                resolutions.publish(
                                     vec![PublishableSnapshotUpdate::Present {
                                         principal: push.principal,
                                         snapshot,
@@ -1381,7 +1413,7 @@ async fn run(
                                         until,
                                     },
                                 };
-                                map.apply_publishable_many_at(vec![update], now);
+                                resolutions.publish(vec![update], now);
                             }
                         }
                         update_ready(&ready, &mut resolutions, &clock, &counters, &config.principals);
@@ -1393,7 +1425,7 @@ async fn run(
                 // that is the one thing a filtered sweep would never revisit.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     if refresh_all_cancellable(
-                        &source, &map, &slots, &clock, &config, &resolutions.all_tracked(),
+                        &source, &slots, &clock, &config, &resolutions.all_tracked(),
                         &mut resolutions, &mut shutdown,
                         &ready,
                         &counters,
@@ -1421,7 +1453,7 @@ async fn run(
                     return;
                 }
                 if refresh_all_cancellable(
-                    &source, &map, &slots, &clock, &config, &resolutions.due_for_sweep(),
+                    &source, &slots, &clock, &config, &resolutions.due_for_sweep(),
                     &mut resolutions, &mut shutdown,
                     &ready,
                     &counters,
@@ -1436,7 +1468,7 @@ async fn run(
                 let due = resolutions.due_for_refetch(now, config.max_concurrent_fetches);
                 if !due.is_empty() {
                     let Some(failed) = refresh_all_cancellable(
-                        &source, &map, &slots, &clock, &config, &due,
+                        &source, &slots, &clock, &config, &due,
                         &mut resolutions, &mut shutdown, &ready, &counters,
                     ).await else {
                         return;

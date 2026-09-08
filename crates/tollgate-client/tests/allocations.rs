@@ -2,20 +2,19 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use jiff::Timestamp;
-use tollgate_admission::{
-    AdmissionEngine, ArcSwapSnapshotMap, LeaseSlot, NoGate, Principal, SnapshotMap,
-};
+use jiff::{SignedDuration, Timestamp};
+use tollgate_admission::{NoGate, Principal};
 use tollgate_alloc_count::{AllocScope, Allocations};
 use tollgate_auth::{HmacRegistry, SessionCredential};
-use tollgate_client::{ManualClock, UsageRecorder, UsageWriter, UsageWriterConfig};
-use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
-    LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, PolicyRevision, RequestId,
-    ResolvedLimits, UsageEvent, UsageSource,
+use tollgate_client::{
+    AccountLeaseConfig, InstanceRuntime, InstanceRuntimeConfig, ManualClock, RuntimeHandle,
+    SnapshotManagerConfig, TrackedPrincipals, UsageRecorder, UsageWriterConfig,
 };
-use tollgate_store::{IngestError, IngestReport, UsageSink};
+use tollgate_core::{
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, Generation, OpIndex,
+    PermissionBits, PolicyRevision, RequestId, ResolvedLimits, UsageEvent, UsageSource,
+};
+use tollgate_store::{AccountConfig, GrantPolicy, MemoryStore};
 
 tollgate_alloc_count::install!();
 
@@ -25,23 +24,6 @@ struct PriceOp;
 impl OpIndex for PriceOp {
     fn index(&self) -> usize {
         0
-    }
-}
-
-struct AcceptAll;
-
-#[async_trait]
-impl UsageSink for AcceptAll {
-    async fn ingest(
-        &self,
-        events: &[UsageEvent],
-        _now: Timestamp,
-    ) -> Result<IngestReport, IngestError> {
-        Ok(IngestReport {
-            accepted: u64::try_from(events.len()).unwrap(),
-            duplicate: 0,
-            rejected: 0,
-        })
     }
 }
 
@@ -86,8 +68,7 @@ async fn wait_until_drained(recorder: &UsageRecorder) {
     panic!("usage writer did not drain its warm-up event");
 }
 
-fn install_admission(principal: Principal) -> AdmissionEngine<ArcSwapSnapshotMap> {
-    let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+async fn install_admission(principal: Principal) -> (InstanceRuntime, RuntimeHandle) {
     let snapshot = Arc::new(
         AccountSnapshot::builder(
             AccountId(1),
@@ -104,20 +85,58 @@ fn install_admission(principal: Principal) -> AdmissionEngine<ArcSwapSnapshotMap
         )
         .build(),
     );
-    let lease = Arc::new(LocalLease::new(
-        LeaseGrant {
-            lease_id: LeaseId(7),
-            account_id: AccountId(1),
-            fencing_token: FencingToken(3),
-            units: CostUnits(u64::MAX / 2),
-            expires_at: far_future(),
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    store.create_account(AccountConfig {
+        account_id: AccountId(1),
+        initial_balance: CostUnits(1_000_000),
+        status: AccountStatus::Active,
+        capacity_class: tollgate_core::CapacityClass::Assured,
+    });
+    store.publish_snapshot(
+        principal,
+        tollgate_core::PublishableSnapshot::try_new(snapshot).unwrap(),
+    );
+    let (runtime, handle) = InstanceRuntime::spawn(
+        store.clone(),
+        store.clone(),
+        store,
+        Arc::new(ManualClock::new(now())),
+        InstanceRuntimeConfig {
+            snapshots: SnapshotManagerConfig {
+                principals: TrackedPrincipals::Fixed(vec![principal]),
+                refresh_interval: Duration::from_secs(30),
+                unknown_ttl: SignedDuration::from_secs(1),
+                revoked_ttl: SignedDuration::from_secs(1),
+                retry_backoff: Duration::from_millis(5),
+                max_concurrent_fetches: 4,
+                fetch_timeout: Duration::from_secs(1),
+                enumeration_timeout: Duration::from_secs(1),
+            },
+            leases: AccountLeaseConfig {
+                target_grant: CostUnits(100_000),
+                low_water: CostUnits(1_000),
+                lease_ttl: SignedDuration::from_secs(3_600),
+                expiry_safety_margin: SignedDuration::from_secs(1),
+                poll_interval: Duration::from_millis(10),
+                store_call_timeout: Duration::from_secs(1),
+                shutdown_release_deadline: Duration::from_secs(1),
+            },
+            usage: writer_config(),
+            sharding: tollgate_core::LocalSharding::SINGLE,
+            idle_account_linger: Duration::from_secs(1),
+            manager_restart_backoff: Duration::from_millis(10),
+            shutdown_deadline: Duration::from_secs(6),
         },
-        CostUnits::ZERO,
-    ));
-    let slot = LeaseSlot::for_account(AccountId(1));
-    slot.install(lease);
-    engine.map().install(principal, snapshot, slot);
-    engine
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !handle.readiness(now()).is_ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    (runtime, handle)
 }
 
 fn record(scope: &str, attribution: &str, allocations: Allocations) {
@@ -126,22 +145,18 @@ fn record(scope: &str, attribution: &str, allocations: Allocations) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn embedding_path_allocates_nothing_after_warmup() {
-    let clock = Arc::new(ManualClock::new(now()));
-    let (recorder, writer) =
-        UsageWriter::spawn(Arc::new(AcceptAll), clock, writer_config()).unwrap();
-
-    // Exercise more than one Tokio mpsc block boundary, with at most one
-    // event in flight so released blocks are available for reuse.
+    let registry = HmacRegistry::new(b"allocation-test-secret");
+    let principal = registry.install_credentials([b"credential-one".as_slice()])[0];
+    let (runtime, engine) = install_admission(principal).await;
+    let recorder = engine.recorder();
+    // Cross Tokio queue block boundaries before measuring the warmed request.
     for request_id in 0..65 {
         recorder
             .try_reserve()
             .unwrap()
             .record(warm_event(request_id));
-        wait_until_drained(&recorder).await;
+        wait_until_drained(recorder).await;
     }
-
-    let registry = HmacRegistry::new(b"allocation-test-secret");
-    let principal = registry.install_credentials([b"credential-one".as_slice()])[0];
     let session = SessionCredential::new();
     session
         .authenticate(Some(b"credential-one"), &registry, now())
@@ -152,7 +167,6 @@ async fn embedding_path_allocates_nothing_after_warmup() {
             .expect("warm cached credential"),
     );
 
-    let engine = install_admission(principal);
     let warm = engine
         .begin(principal, PermissionBits::bit(0), now())
         .unwrap()
@@ -199,7 +213,7 @@ async fn embedding_path_allocates_nothing_after_warmup() {
         tollgate.is_allocation_free(),
         "warmed embedding path allocated: {tollgate:?}"
     );
-    wait_until_drained(&recorder).await;
+    wait_until_drained(recorder).await;
 
     let (job, executor) = AllocScope::measure(|| tokio::spawn(async { black_box(()) }));
     record("consumer/executor_job", "consumer_executor", executor);
@@ -209,6 +223,5 @@ async fn embedding_path_allocates_nothing_after_warmup() {
     );
     job.await.unwrap();
 
-    drop(recorder);
-    writer.shutdown().await.unwrap();
+    runtime.shutdown().await.unwrap().usage.unwrap();
 }

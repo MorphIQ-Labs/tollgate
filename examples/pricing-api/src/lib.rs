@@ -34,14 +34,12 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use tollgate_admission::{
-    AdmissionEngine, ArcSwapSnapshotMap, CapacityPermit, ExecutionCapacityGate,
-    ExecutionCapacityMode, LeaseSlot, MapEntry, NoGate, ReadyToStart, RequestContext, SnapshotMap,
+    CapacityPermit, ExecutionCapacityGate, ExecutionCapacityMode, NoGate, ReadyToStart,
+    RequestContext,
 };
-use tollgate_auth::{CredentialVerifier, HmacRegistry, SessionCredential};
+use tollgate_auth::{HmacRegistry, SessionCredential};
 use tollgate_client::{
-    Clock, LeaseCounters, LeaseManager, LeaseManagerConfig, SlotRegistry, SnapshotCounters,
-    SnapshotManager, SnapshotManagerConfig, SystemClock, TrackedPrincipals, UsagePermit,
-    UsageRecorder, UsageWriter, UsageWriterConfig,
+    Clock, SnapshotManagerConfig, SystemClock, TrackedPrincipals, UsagePermit, UsageWriterConfig,
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CapacityClass, CommitError, CostTable, CostUnits,
@@ -152,6 +150,30 @@ struct Problem {
     units_charged: u64,
 }
 
+/// All JSON input failures use the service's problem response contract.
+struct ApiJson<T>(T);
+impl<T: serde::de::DeserializeOwned + Send> FromRequest<Arc<AppState>> for ApiJson<T> {
+    type Rejection = Response;
+    async fn from_request(
+        request: Request<axum::body::Body>,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Response> {
+        Json::<T>::from_request(request, state)
+            .await
+            .map(|Json(value)| Self(value))
+            .map_err(|error| {
+                let status = error.status();
+                let (index, code) = match status {
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE => (1, "unsupported-media-type"),
+                    StatusCode::PAYLOAD_TOO_LARGE => (2, "body-too-large"),
+                    _ => (0, "malformed-body"),
+                };
+                state.input_rejections[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                problem(status, code, error.body_text())
+            })
+    }
+}
+
 /// The request body plus the evidence obtained before Axum consumes it.
 struct PriceInput {
     request: PriceRequest,
@@ -178,9 +200,7 @@ impl FromRequest<Arc<AppState>> for PriceInput {
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
         if state.admission.is_none() {
-            let Json(request) = Json::<PriceRequest>::from_request(request, state)
-                .await
-                .map_err(IntoResponse::into_response)?;
+            let ApiJson(request) = ApiJson::<PriceRequest>::from_request(request, state).await?;
             return Ok(Self {
                 request,
                 staged: None,
@@ -191,37 +211,40 @@ impl FromRequest<Arc<AppState>> for PriceInput {
         let ConnectInfo(connection) =
             ConnectInfo::<PricingConnection>::from_request_parts(&mut parts, state)
                 .await
-                .map_err(IntoResponse::into_response)?;
+                .map_err(|_| {
+                    state.input_rejections[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    problem(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "missing-connection-state",
+                        "Connection authentication state is unavailable",
+                    )
+                })?;
         let now = Timestamp::now();
         let Some(principal) =
             connection.authenticate(parts.headers.get(header::AUTHORIZATION), &state.auth, now)
         else {
-            state
-                .engine
-                .counters()
-                .record_deny(&DenyReason::UnknownPrincipal);
+            state.counters().record_deny(&DenyReason::UnknownPrincipal);
             return Err(deny_response(DenyReason::UnknownPrincipal));
         };
         let context = state
-            .engine
+            .admission
+            .as_ref()
+            .expect("admission enabled")
             .begin(principal, PERMISSION_PRICE, now)
             .map_err(deny_response)?;
         let admission = state
             .admission
             .as_ref()
             .expect("the branch above proved admission is enabled");
-        let permit = admission.recorder.try_reserve().map_err(|_| {
+        let permit = admission.recorder().try_reserve().map_err(|_| {
             state
-                .engine
                 .counters()
                 .record_deny(&DenyReason::AccountingBackpressure);
             deny_response(DenyReason::AccountingBackpressure)
         })?;
 
         let request = Request::from_parts(parts, body);
-        let Json(request) = Json::<PriceRequest>::from_request(request, state)
-            .await
-            .map_err(IntoResponse::into_response)?;
+        let ApiJson(request) = ApiJson::<PriceRequest>::from_request(request, state).await?;
         Ok(Self {
             request,
             staged: Some(Staged {
@@ -237,53 +260,18 @@ impl FromRequest<Arc<AppState>> for PriceInput {
 
 struct AppState {
     auth: HmacRegistry,
-    /// Built in both configurations and honest to read in either: the engine's
-    /// counters and the slot's contents say what actually happened, which is
-    /// why neither ever needed an `expect`.
-    engine: AdmissionEngine<Arc<ArcSwapSnapshotMap>>,
-    /// The primary tenant's slot — the account `DEMO_API_KEY` reaches, and the
-    /// one the flat metrics fields describe.
-    slot: Arc<LeaseSlot>,
-    /// Every tenant this instance serves. Readiness is a claim about all of
-    /// them, so it reads this rather than the primary alone.
-    tenants: Vec<TenantView>,
-    /// The execution-capacity gate, or `None` for
-    /// [`ExecutionCapacityMode::Disabled`] — the `Option` *is* the switch, as
-    /// it is for `admission` below, so nothing else can disagree with it.
-    ///
-    /// The library monomorphizes over a gate type chosen at startup; this
-    /// example must serve both configurations from one binary because the load
-    /// gate compares them, and pays one `Option` check per request for it.
+    baseline_counters: tollgate_admission::AdmissionCounters,
     capacity: Option<ExecutionCapacityGate>,
-    /// `None` is the no-admission baseline the load gate compares against:
-    /// same transport, same kernel, zero quota machinery. The `Option` *is*
-    /// the switch, so there is no separate flag left to disagree with it.
-    admission: Option<AdmissionRuntime>,
+    admission: Option<tollgate_client::RuntimeHandle>,
+    input_rejections: [std::sync::atomic::AtomicU64; 4],
 }
 
-/// One tenant as the request path and readiness see it.
-struct TenantView {
-    principal: Principal,
-    slot: Arc<LeaseSlot>,
-}
-
-/// Everything the quota machinery installs, held together because it is
-/// installed together (#16). As parallel `Option`s the correlation was
-/// unprovable, and a request handler paid for it with an `expect`.
-struct AdmissionRuntime {
-    recorder: UsageRecorder,
-    /// Every refill task's health; channel closure exposes panic or abort.
-    /// One per tenant, because one dead plane withdraws the instance whichever
-    /// account it was refilling.
-    lease_manager_health: Vec<tokio::sync::watch::Receiver<bool>>,
-    /// Snapshot-manager readiness: true while every tracked principal has a
-    /// fresh resolution; channel closure also exposes task failure.
-    snapshots_ready: tokio::sync::watch::Receiver<bool>,
-    /// Refill and snapshot counters. Held as the shared handles rather than
-    /// the managers themselves, which are moved into `AppRuntime` for
-    /// shutdown and so are out of a handler's reach.
-    lease_counters: Arc<LeaseCounters>,
-    snapshot_counters: Arc<SnapshotCounters>,
+impl AppState {
+    fn counters(&self) -> &tollgate_admission::AdmissionCounters {
+        self.admission
+            .as_ref()
+            .map_or(&self.baseline_counters, |runtime| runtime.counters())
+    }
 }
 
 pub struct AppRuntime {
@@ -291,64 +279,61 @@ pub struct AppRuntime {
     background: Option<Background>,
 }
 
-/// The background tasks, present or absent as one — the same collapse
-/// `AdmissionRuntime` makes on the state side (#16). Shutdown ordering is the
-/// reason it matters here: writer (flush) before manager (release) is an
-/// INVARIANTS.md requirement, and as three independent `Option`s it held only
-/// so long as all three agreed.
 struct Background {
-    managers: Vec<LeaseManager>,
-    writer: UsageWriter,
-    snapshots: SnapshotManager,
-    /// Demo control plane: periodically republishes each account's snapshot
-    /// with extended validity and a bumped generation.
-    republishers: Vec<tokio::task::JoinHandle<()>>,
+    runtime: tollgate_client::InstanceRuntime,
+    republishers: tokio::task::JoinSet<()>,
+}
+
+/// Keeps server ownership across cancellation, including before first poll.
+struct ServerTask(tokio::task::JoinHandle<std::io::Result<()>>);
+impl Drop for ServerTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl AppRuntime {
     pub async fn shutdown(self) {
-        let Some(background) = self.background else {
-            return;
-        };
-        for republisher in &background.republishers {
-            republisher.abort();
-        }
-        // Always reported: a clean shutdown is itself the operator's evidence
-        // that nothing was lost or left unresolved, and a dead writer must
-        // never look like one.
-        match background.writer.shutdown().await {
-            Ok(stats) => tracing::info!(
-                accepted = stats.accepted,
-                duplicate = stats.duplicate,
-                rejected = stats.rejected,
-                lost = stats.lost,
-                unresolved = stats.unresolved,
-                "usage-writer shutdown"
-            ),
-            Err(error) => {
-                tracing::error!(
-                    unaccounted = error.unaccounted,
-                    panicked = error.panicked,
-                    "usage-writer shutdown failed"
-                );
+        if let Some(mut background) = self.background {
+            background.republishers.abort_all();
+            match background.runtime.shutdown().await {
+                Ok(report) => tracing::info!(?report, "instance-runtime shutdown"),
+                Err(error) => tracing::error!(%error, "instance supervisor died during shutdown"),
             }
         }
-        // Reported unconditionally, like the writer's line above: the released
-        // count is the operator's evidence that leases came back, not just the
-        // absence of bad news.
-        // Every manager is shut down, and every report logged: a tenant whose
-        // lease was abandoned is exactly the one an operator needs told about,
-        // and stopping at the first would hide the rest.
-        for manager in background.managers {
-            let report = manager.shutdown().await;
-            tracing::info!(
-                released = report.released,
-                abandoned = report.abandoned,
-                task_died = report.task_died,
-                "lease-manager shutdown; abandoned leases settle at TTL reclaim"
+    }
+
+    /// Stop HTTP and accounting admission together, bounding HTTP quiescence
+    /// by the same deadline that drains billing and releases grants.
+    pub fn shutdown_server(
+        self,
+        server: tokio::task::JoinHandle<std::io::Result<()>>,
+        stop: tokio::sync::oneshot::Sender<()>,
+    ) -> impl std::future::Future<Output = Result<(), String>> {
+        let server = ServerTask(server);
+        async move {
+            let mut server = server;
+            let deadline = self.background.as_ref().map_or_else(
+                || tokio::time::Instant::now() + std::time::Duration::from_secs(15),
+                |background| background.runtime.handle().request_shutdown(),
             );
+            if stop.send(()).is_err() {
+                tracing::debug!("HTTP server already stopped");
+            }
+            let result = match tokio::time::timeout_at(deadline, &mut server.0).await {
+                Ok(Ok(result)) => result.map_err(|error| error.to_string()),
+                Ok(Err(error)) => Err(format!("HTTP server task failed: {error}")),
+                Err(_) => {
+                    server.0.abort();
+                    if let Err(error) = (&mut server.0).await {
+                        tracing::warn!(%error, "HTTP quiescence deadline expired");
+                    }
+                    Err("HTTP quiescence deadline expired".into())
+                }
+            };
+            self.shutdown().await;
+            result
         }
-        background.snapshots.shutdown().await;
     }
 }
 
@@ -611,19 +596,6 @@ fn build_app_with(
         store.publish_snapshot(*principal, compile_snapshot(tenant, 1));
     }
 
-    let map = Arc::new(ArcSwapSnapshotMap::with_sharding(sharding));
-    let engine = AdmissionEngine::new(Arc::clone(&map));
-    let slots = SlotRegistry::with_sharding(sharding);
-    let views: Vec<TenantView> = tenants
-        .iter()
-        .zip(&principals)
-        .map(|(tenant, principal)| TenantView {
-            principal: *principal,
-            slot: slots.slot(tenant.account),
-        })
-        .collect();
-    let slot = Arc::clone(&views[0].slot);
-
     // `Disabled` composes no gate at all rather than one that always admits,
     // so a demo that never configures capacity allocates no pool (#99).
     let capacity = ExecutionCapacityGate::new(capacity, sharding)
@@ -633,102 +605,74 @@ fn build_app_with(
     // branch yields both halves — what the handlers read and what shutdown
     // owns — so no caller downstream has to re-establish that they agree.
     let (admission, background) = if admission_enabled {
-        let snapshots = SnapshotManager::spawn(
-            store.clone(),
-            map,
-            Arc::clone(&slots),
-            clock.clone(),
-            SnapshotManagerConfig {
-                // Stateless: any instance may serve any customer, so this
-                // one tracks everything the store knows rather than a list
-                // fixed at boot (#48). Seeded with the demo key so the
-                // example still works against a source that cannot
-                // enumerate.
-                principals: TrackedPrincipals::All {
-                    seed: principals.clone(),
-                },
-                refresh_interval: std::time::Duration::from_secs(30),
-                unknown_ttl: SignedDuration::from_secs(60),
-                revoked_ttl: SignedDuration::from_secs(3_600),
-                retry_backoff: std::time::Duration::from_millis(200),
-                max_concurrent_fetches: 16,
-                // Above the slowest fetch this deployment's source
-                // legitimately makes, not against its fast path: an
-                // abandoned fetch keeps the principal's previous resolution
-                // and retries with backoff, so a value under real source
-                // latency would refresh nothing while looking healthy. Five
-                // seconds against an in-process store that answers in
-                // microseconds is deliberate headroom — the bound exists to
-                // keep the sweep returning (#103), not to police latency.
-                fetch_timeout: std::time::Duration::from_secs(5),
-                enumeration_timeout: std::time::Duration::from_secs(30),
-            },
-        )
-        .expect("snapshot-manager configuration is valid");
         let (target_grant, low_water) = refill_sizing(deposit);
-        // One refill task and one republisher per tenant, because both are
-        // per-account contracts: a lease funds one account's spend, and a
-        // republish bumps one account's generation.
-        let mut republishers = Vec::with_capacity(tenants.len());
-        let mut managers = Vec::with_capacity(tenants.len());
-        for (tenant, view) in tenants.iter().zip(&views) {
-            republishers.push(tokio::spawn(republish_snapshots(
-                store.clone(),
-                tenant.clone(),
-                view.principal,
-                compile_snapshot.clone(),
-                REPUBLISH_INTERVAL,
-            )));
-            managers.push(
-                LeaseManager::spawn(
-                    store.clone(),
-                    Arc::clone(&view.slot),
-                    clock.clone(),
-                    LeaseManagerConfig {
-                        account: tenant.account,
-                        target_grant,
-                        low_water,
-                        lease_ttl: SignedDuration::from_secs(60),
-                        expiry_safety_margin: SignedDuration::from_secs(2),
-                        poll_interval: std::time::Duration::from_millis(20),
-                        store_call_timeout: std::time::Duration::from_secs(5),
-                        shutdown_release_deadline: std::time::Duration::from_secs(10),
-                    },
-                )
-                .expect("lease-manager configuration is valid"),
-            );
-        }
-        let (recorder, writer) = UsageWriter::spawn(
+        let (runtime, admission) = tollgate_client::InstanceRuntime::spawn(
+            store.clone(),
+            store.clone(),
             store.clone(),
             clock,
-            UsageWriterConfig {
-                queue_capacity: 4_096,
-                max_batch: 256,
-                flush_interval: std::time::Duration::from_millis(25),
-                retry_backoff: std::time::Duration::from_millis(50),
-                // Bounded well inside the lease TTL so late events are
-                // still billable against a live lease.
-                shutdown_drain_deadline: std::time::Duration::from_secs(5),
-                ingest_timeout: std::time::Duration::from_secs(5),
+            tollgate_client::InstanceRuntimeConfig {
+                snapshots: SnapshotManagerConfig {
+                    // Stateless: any instance may serve any customer, so this
+                    // one tracks everything the store knows rather than a list
+                    // fixed at boot (#48). Seeded with the demo key so the
+                    // example still works against a source that cannot
+                    // enumerate.
+                    principals: TrackedPrincipals::All {
+                        seed: principals.clone(),
+                    },
+                    refresh_interval: std::time::Duration::from_secs(30),
+                    unknown_ttl: SignedDuration::from_secs(60),
+                    revoked_ttl: SignedDuration::from_secs(3_600),
+                    retry_backoff: std::time::Duration::from_millis(200),
+                    max_concurrent_fetches: 16,
+                    // Above the slowest fetch this deployment's source
+                    // legitimately makes, not against its fast path: an
+                    // abandoned fetch keeps the principal's previous resolution
+                    // and retries with backoff, so a value under real source
+                    // latency would refresh nothing while looking healthy. Five
+                    // seconds against an in-process store that answers in
+                    // microseconds is deliberate headroom — the bound exists to
+                    // keep the sweep returning (#103), not to police latency.
+                    fetch_timeout: std::time::Duration::from_secs(5),
+                    enumeration_timeout: std::time::Duration::from_secs(30),
+                },
+                leases: tollgate_client::AccountLeaseConfig {
+                    target_grant,
+                    low_water,
+                    lease_ttl: SignedDuration::from_secs(60),
+                    expiry_safety_margin: SignedDuration::from_secs(2),
+                    poll_interval: std::time::Duration::from_millis(20),
+                    store_call_timeout: std::time::Duration::from_secs(5),
+                    shutdown_release_deadline: std::time::Duration::from_secs(10),
+                },
+                usage: UsageWriterConfig {
+                    queue_capacity: 4_096,
+                    max_batch: 256,
+                    flush_interval: std::time::Duration::from_millis(25),
+                    retry_backoff: std::time::Duration::from_millis(50),
+                    shutdown_drain_deadline: std::time::Duration::from_secs(5),
+                    ingest_timeout: std::time::Duration::from_secs(5),
+                },
+                sharding,
+                idle_account_linger: std::time::Duration::from_secs(1),
+                manager_restart_backoff: std::time::Duration::from_millis(200),
+                shutdown_deadline: std::time::Duration::from_secs(15),
             },
         )
-        .expect("usage-writer configuration is valid");
-        // Read while the managers are still in scope; the handles outlive the
-        // tasks, so a handler keeps reading after a plane dies.
-        let admission = AdmissionRuntime {
-            recorder,
-            // Every refill task's health, not the first one's: readiness is a
-            // claim about serving *any* tenant, and one dead plane withdraws
-            // the instance whichever account it belonged to.
-            lease_manager_health: managers.iter().map(LeaseManager::health).collect(),
-            snapshots_ready: snapshots.ready(),
-            lease_counters: managers[0].counters(),
-            snapshot_counters: snapshots.counters(),
-        };
+        .expect("example runtime configuration is valid");
+        let mut republishers = tokio::task::JoinSet::new();
+        for (tenant, principal) in tenants.iter().zip(&principals) {
+            republishers.spawn(republish_snapshots(
+                store.clone(),
+                tenant.clone(),
+                *principal,
+                compile_snapshot.clone(),
+                REPUBLISH_INTERVAL,
+            ));
+        }
         let background = Background {
-            managers,
-            writer,
-            snapshots,
+            runtime,
             republishers,
         };
         (Some(admission), Some(background))
@@ -738,9 +682,8 @@ fn build_app_with(
 
     let state = Arc::new(AppState {
         auth,
-        engine,
-        slot,
-        tenants: views,
+        baseline_counters: tollgate_admission::AdmissionCounters::default(),
+        input_rejections: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
         capacity,
         admission,
     });
@@ -754,113 +697,15 @@ fn build_app_with(
     (router, AppRuntime { store, background })
 }
 
-/// INVARIANTS.md #10: fail-closed correctness must not masquerade as
-/// availability. Snapshot freshness/task health, lease usability, and the
-/// accounting writer must all be healthy.
 async fn readyz(State(state): State<Arc<AppState>>) -> StatusCode {
-    let Some(admission) = state.admission.as_ref() else {
-        // The load-gate baseline installs no quota machinery, so there is no
-        // snapshot to go stale, no lease to exhaust and no queue to back up.
-        // Serving at all is the whole condition.
-        return StatusCode::OK;
-    };
-    let now = Timestamp::now();
-    let readiness = Readiness {
-        snapshots_fresh: plane_healthy(&admission.snapshots_ready),
-        // Every tenant, each against *its own* published mode: an elastic
-        // account with headroom is admissible where a strict one beside it is
-        // not, and readiness must agree with admission for both (#10).
-        lease_usable: state.tenants.iter().all(|tenant| {
-            quota_usable(
-                &tenant.slot,
-                enforcement_mode_of(state.as_ref(), tenant.principal),
-                now,
-            )
-        }),
-        refill_healthy: admission.lease_manager_health.iter().all(plane_healthy),
-        writer_healthy: !admission.recorder.is_closed(),
-    };
-    if readiness.is_ready() {
+    if state
+        .admission
+        .as_ref()
+        .is_none_or(|runtime| runtime.readiness(Timestamp::now()).is_ready())
+    {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
-    }
-}
-
-/// The four independent conditions readiness rests on, named rather than
-/// positional.
-struct Readiness {
-    snapshots_fresh: bool,
-    lease_usable: bool,
-    refill_healthy: bool,
-    writer_healthy: bool,
-}
-
-impl Readiness {
-    /// Any one condition false withdraws the instance from rotation. Pure, so
-    /// each can be pinned on its own: through the HTTP surface these four only
-    /// ever move together, because the demo's grant policy never shrinks a
-    /// lease to exactly zero while its planes are alive.
-    fn is_ready(&self) -> bool {
-        self.snapshots_fresh && self.lease_usable && self.refill_healthy && self.writer_healthy
-    }
-}
-
-/// A background plane's health bit. Both halves are load-bearing: a task that
-/// panicked or was aborted drops its sender, but its last published value
-/// stays readable forever, so `borrow()` alone would report a dead plane as
-/// healthy for the rest of the process's life.
-fn plane_healthy(health: &tokio::sync::watch::Receiver<bool>) -> bool {
-    health.has_changed().is_ok() && *health.borrow()
-}
-
-/// Whether this instance can still fund work for the demo account — the same
-/// comparisons the request path makes, so readiness and admission cannot
-/// disagree about the boundary. "Usable *through* `expires_at - margin`"
-/// (INVARIANTS.md #12) is `now < usable_until`: at that instant exactly, the
-/// request path already denies, and readiness must not still be advertising.
-///
-/// Under `EnforcementMode::Elastic` an empty or absent lease is not the end of
-/// the answer. An elastic account with overage headroom *is* admissible, and
-/// reporting it unready would pull from rotation exactly the instances the
-/// mode exists to keep serving — turning a feature that prevents false denials
-/// into one that causes them (INVARIANTS.md #10).
-fn quota_usable(slot: &LeaseSlot, mode: EnforcementMode, now: Timestamp) -> bool {
-    let lease_usable = slot
-        .load()
-        .is_some_and(|lease| now < lease.usable_until() && !lease.remaining().is_zero());
-    lease_usable
-        || mode
-            .overage_cap()
-            .is_some_and(|cap| !slot.overage().headroom(cap).is_zero())
-}
-
-/// The demo account's currently published enforcement mode, read from the
-/// snapshot the request path itself would read.
-///
-/// Not cached beside the slot: a republish changes the mode, and readiness
-/// answering from a stale copy is precisely the disagreement between
-/// readiness and admission that INVARIANTS.md #10 forbids.
-fn enforcement_mode(state: &AppState) -> EnforcementMode {
-    // The primary tenant's, which is what the flat metrics fields describe.
-    // `CredentialVerifier::verify` takes the credential bytes, and returns
-    // the validity alongside the identity; readiness only needs the identity.
-    let Some(principal) = state
-        .auth
-        .verify(DEMO_API_KEY.as_bytes())
-        .map(|verified| verified.principal)
-    else {
-        return EnforcementMode::Strict;
-    };
-    enforcement_mode_of(state, principal)
-}
-
-/// One principal's currently published mode, read from the snapshot the
-/// request path itself would read.
-fn enforcement_mode_of(state: &AppState, principal: Principal) -> EnforcementMode {
-    match state.engine.map().get(&principal) {
-        Some(MapEntry::Present(admission)) => admission.snapshot.enforcement_mode,
-        _ => EnforcementMode::Strict,
     }
 }
 
@@ -892,7 +737,8 @@ pub struct Metrics {
     /// are billing truth; a request admitted and then cancelled before
     /// execution is counted here and charged nothing.
     pub units_admitted: u64,
-    /// Every refusal, whatever the reason.
+    /// Pre-admission policy and authentication refusals. Extractor failures
+    /// have their own input_rejections counters.
     pub denied: u64,
     /// Refusals by reason. Every reason is present, so a zero says "this has
     /// not happened" rather than leaving the reader to guess whether the
@@ -906,6 +752,12 @@ pub struct Metrics {
     /// a refusal, and visible so a flood of them cannot look like an idle
     /// instance.
     pub contexts_abandoned: u64,
+    /// Extractor refusals, labelled only by the four fixed service codes.
+    pub input_rejections: BTreeMap<&'static str, u64>,
+    /// Aggregate diagnostic counters could not be represented exactly.
+    pub counter_overflow: bool,
+    pub managed_accounts: usize,
+    pub unfundable_accounts: usize,
     /// What became of every admitted request. These four partition `admitted`
     /// exactly, so an operator can see where work is going without inferring
     /// it from a difference.
@@ -935,10 +787,9 @@ pub struct Metrics {
     /// invoice; they mean different things about why.
     pub committed_at_overage: u64,
     pub units_committed_at_overage: u64,
-    /// Units left on the installed lease, absent when no lease is installed
-    /// (cold start, expiry, or control-plane invalidation). Read off the
-    /// shared slot, never from the request path.
-    pub lease_remaining: Option<u64>,
+    /// Sum of units on all installed instance leases; absent when none exist.
+    /// Diagnostic estimates are read off-path.
+    pub total_lease_remaining: Option<u128>,
     /// Requests admitted with no lease behind them, and the units they were
     /// quoted. Included in `admitted` / `units_admitted`, never instead of
     /// them.
@@ -948,20 +799,14 @@ pub struct Metrics {
     /// way `accounting.rejected` is a leading indicator of billing loss.
     pub admitted_overage: u64,
     pub units_admitted_overage: u64,
-    /// Unfunded units currently outstanding on this instance, and the cap
-    /// bounding them.
-    ///
-    /// **Per instance.** Fleet exposure is this cap times the number of
-    /// instances, because the counter behind it is a local atomic — the same
-    /// scope every other local mechanism here has. `null` for a strict
-    /// account, which extends no credit at all.
-    pub overage_spent: u64,
-    pub overage_cap: Option<u64>,
-    /// How long the installed lease may still be spent against — the
-    /// `expires_at - safety_margin` bound of INVARIANTS.md #12, not the raw
-    /// expiry. Paired with `lease_remaining`, since a lease can be refused
-    /// for either reason.
-    pub lease_usable_until: Option<String>,
+    /// Lifetime overage spent across retained account slots, and the sum of
+    /// currently eligible accounts' largest published elastic caps. Neither
+    /// aggregate is a fleet limit or an admission decision.
+    pub total_overage_spent: u128,
+    pub total_overage_cap: Option<u128>,
+    /// Earliest installed lease usability deadline among eligible accounts.
+    /// Uses `expires_at - safety_margin`, the same boundary as admission.
+    pub earliest_lease_usable_until: Option<String>,
     /// Billing health, absent only when admission is disabled (the load-gate
     /// baseline runs no accounting at all).
     pub accounting: Option<Accounting>,
@@ -988,8 +833,7 @@ pub struct Refill {
     pub refusals: BTreeMap<&'static str, u64>,
     /// Leases the allocator no longer holds open for this instance.
     pub released: u64,
-    /// Leases a shutdown budget could not return. Like `accounting.lost`,
-    /// this can only move at shutdown.
+    /// Leases retirement or shutdown could not return within its budget.
     pub abandoned: u64,
 }
 
@@ -1051,18 +895,41 @@ pub struct Accounting {
 /// does the loads, the formatting and the allocation that INVARIANTS.md #5
 /// keeps out of `admit`.
 async fn metrics(State(state): State<Arc<AppState>>) -> Json<Metrics> {
-    let counters = state.engine.counters().snapshot();
-    let lease = state.slot.load();
+    let counters = state.counters().snapshot();
     let now = Timestamp::now();
     // Three views of one plane, so they are absent together or present
     // together — a guarantee of the type now, not of this handler.
     let admission = state.admission.as_ref();
+    let report = admission.map(|runtime| runtime.report());
+    let funding = admission
+        .map(|runtime| runtime.funding(now))
+        .unwrap_or_default();
     Json(Metrics {
         admitted: counters.admitted,
         units_admitted: counters.units_admitted,
         denied: counters.denied(),
         denials: counters.denials_by_name().collect(),
         contexts_abandoned: counters.contexts_abandoned,
+        input_rejections: [
+            "malformed-body",
+            "unsupported-media-type",
+            "body-too-large",
+            "missing-connection-state",
+        ]
+        .into_iter()
+        .zip(
+            state
+                .input_rejections
+                .iter()
+                .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed)),
+        )
+        .collect(),
+        counter_overflow: report
+            .as_ref()
+            .is_some_and(|report| report.counter_overflow),
+        managed_accounts: report.as_ref().map_or(0, |report| report.managed_accounts),
+        unfundable_accounts: admission
+            .map_or(0, |runtime| runtime.readiness(now).unfundable_accounts),
         execution_started: counters.execution_started,
         canceled_before_start: counters.canceled_before_start,
         capacity_shed: counters.capacity_shed,
@@ -1081,16 +948,14 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Json<Metrics> {
         commit_refusals: counters.commit_refusals_by_name().collect(),
         committed_at_overage: counters.committed_at_overage,
         units_committed_at_overage: counters.units_committed_at_overage,
-        lease_remaining: lease.as_ref().map(|lease| lease.remaining().get()),
+        total_lease_remaining: funding.total_lease_remaining,
         admitted_overage: counters.admitted_overage,
         units_admitted_overage: counters.units_admitted_overage,
-        overage_spent: state.slot.overage().spent().get(),
-        overage_cap: enforcement_mode(state.as_ref())
-            .overage_cap()
-            .map(CostUnits::get),
-        lease_usable_until: lease.map(|lease| lease.usable_until().to_string()),
+        total_overage_spent: funding.total_overage_spent,
+        total_overage_cap: funding.total_overage_cap,
+        earliest_lease_usable_until: funding.earliest_lease_usable_until.map(|at| at.to_string()),
         accounting: admission.map(|admission| {
-            let health = admission.recorder.health();
+            let health = admission.recorder().health();
             Accounting {
                 accepted: health.stats.accepted,
                 duplicate: health.stats.duplicate,
@@ -1104,9 +969,9 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Json<Metrics> {
                 ingest_age_seconds: health.ingest_age(now).map(|age| age.as_secs()),
             }
         }),
-        refill: admission.map(|admission| {
-            let stats = admission.lease_counters.snapshot();
-            Refill {
+        refill: report.as_ref().and_then(|report| {
+            let stats = report.refill?;
+            Some(Refill {
                 acquired: stats.acquired,
                 acquired_units: stats.acquired_units,
                 acquire_timeouts: stats.acquire_timeouts,
@@ -1114,10 +979,10 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Json<Metrics> {
                 refusals: stats.refusals_by_name().collect(),
                 released: stats.released,
                 abandoned: stats.abandoned,
-            }
+            })
         }),
-        snapshots: admission.map(|admission| {
-            let stats = admission.snapshot_counters.snapshot();
+        snapshots: report.as_ref().map(|report| {
+            let stats = report.snapshots;
             Snapshots {
                 refresh_attempts: stats.refresh_attempts,
                 refresh_failures: stats.refresh_failures,
@@ -1319,9 +1184,6 @@ fn erf(x: f64) -> f64 {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
-    use tollgate_core::{
-        CommitFunding, FencingToken, LeaseGrant, LeaseId, LocalLease, Reservation,
-    };
     use tollgate_store::{SnapshotResolution, SnapshotSource};
 
     #[test]
@@ -1341,15 +1203,6 @@ mod tests {
     // lives. What remains this crate's to prove is the wiring: that the
     // connection factory is installed, and that a cached principal is still
     // subject to admission on every request.
-
-    fn healthy() -> Readiness {
-        Readiness {
-            snapshots_fresh: true,
-            lease_usable: true,
-            refill_healthy: true,
-            writer_healthy: true,
-        }
-    }
 
     /// The canonical embedder must preserve the core retry contract. Both
     /// refundable and committed local saturation are operational because a
@@ -1408,152 +1261,6 @@ mod tests {
         let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(problem["code"], "policy-stale");
         assert_eq!(problem["units_charged"], 0);
-    }
-
-    /// INVARIANTS.md #10: fail-closed correctness must not masquerade as
-    /// availability. Each condition alone is sufficient to withdraw the
-    /// instance from rotation — asserted here because the HTTP surface can
-    /// never exhibit them one at a time.
-    #[test]
-    fn any_single_unhealthy_condition_withdraws_from_rotation() {
-        assert!(healthy().is_ready());
-
-        let mut snapshots = healthy();
-        snapshots.snapshots_fresh = false;
-        assert!(
-            !snapshots.is_ready(),
-            "a stale snapshot denies every request"
-        );
-
-        let mut lease = healthy();
-        lease.lease_usable = false;
-        assert!(!lease.is_ready(), "no usable lease denies every request");
-
-        let mut refill = healthy();
-        refill.refill_healthy = false;
-        assert!(!refill.is_ready(), "a dead refill task cannot restock");
-
-        let mut writer = healthy();
-        writer.writer_healthy = false;
-        assert!(!writer.is_ready(), "a closed queue sheds every request");
-    }
-
-    /// A panicked or aborted task drops its sender but leaves its last value
-    /// readable forever, so the published bit alone would report a dead plane
-    /// as healthy for the rest of the process's life.
-    #[test]
-    fn a_plane_that_died_while_healthy_is_not_healthy() {
-        let (sender, receiver) = tokio::sync::watch::channel(true);
-        assert!(plane_healthy(&receiver));
-
-        sender.send_replace(false);
-        assert!(!plane_healthy(&receiver), "the plane said it is unhealthy");
-
-        let (sender, receiver) = tokio::sync::watch::channel(true);
-        drop(sender);
-        assert!(
-            !plane_healthy(&receiver),
-            "the last value still reads true; the closed channel is the evidence"
-        );
-    }
-
-    fn lease_expiring_at(expires_at: Timestamp, units: u64) -> Arc<LocalLease> {
-        Arc::new(LocalLease::new(
-            LeaseGrant {
-                lease_id: LeaseId(1),
-                account_id: DEMO_ACCOUNT,
-                fencing_token: FencingToken(1),
-                units: CostUnits(units),
-                expires_at,
-            },
-            CostUnits(0),
-        ))
-    }
-
-    /// Readiness and the request path must agree about the window's edge:
-    /// `LocalLease::try_debit` denies at `now >= usable_until`, so readiness
-    /// must stop advertising at the same instant rather than one tick later
-    /// (INVARIANTS.md #12).
-    #[test]
-    fn readiness_closes_the_lease_window_exactly_when_debits_do() {
-        let now = Timestamp::now();
-        let slot = LeaseSlot::for_account(DEMO_ACCOUNT);
-        assert!(
-            !quota_usable(&slot, EnforcementMode::Strict, now),
-            "an empty slot funds nothing"
-        );
-
-        let lease = lease_expiring_at(now, 100);
-        slot.install(Arc::clone(&lease));
-        assert!(
-            lease.try_debit(CostUnits(1), now).is_err(),
-            "the request path denies at the boundary",
-        );
-        assert!(
-            !quota_usable(&slot, EnforcementMode::Strict, now),
-            "so readiness must not still be advertising at it",
-        );
-
-        slot.install(lease_expiring_at(
-            now.checked_add(SignedDuration::from_secs(60)).unwrap(),
-            100,
-        ));
-        assert!(quota_usable(&slot, EnforcementMode::Strict, now));
-
-        slot.install(lease_expiring_at(
-            now.checked_add(SignedDuration::from_secs(60)).unwrap(),
-            0,
-        ));
-        assert!(
-            !quota_usable(&slot, EnforcementMode::Strict, now),
-            "a live lease with nothing left funds nothing either",
-        );
-    }
-
-    /// The mode's whole purpose, stated as a readiness property: an elastic
-    /// account with headroom keeps its instance in rotation on exactly the
-    /// states a strict one is withdrawn for, and leaves rotation when the
-    /// headroom is gone (INVARIANTS.md #10).
-    #[test]
-    fn readiness_counts_overage_headroom_for_an_elastic_account() {
-        let now = Timestamp::now();
-        let elastic = EnforcementMode::Elastic {
-            overage_cap: CostUnits(100),
-        };
-        let slot = LeaseSlot::for_account(DEMO_ACCOUNT);
-
-        // No lease at all, and a live lease with nothing left: both deny under
-        // `Strict`, and both are exactly what elastic mode serves through.
-        assert!(!quota_usable(&slot, EnforcementMode::Strict, now));
-        assert!(quota_usable(&slot, elastic, now));
-
-        slot.install(lease_expiring_at(
-            now.checked_add(SignedDuration::from_secs(60)).unwrap(),
-            0,
-        ));
-        assert!(!quota_usable(&slot, EnforcementMode::Strict, now));
-        assert!(quota_usable(&slot, elastic, now));
-
-        // Spending the cap withdraws the instance, because at that point it
-        // really cannot admit anything.
-        let overage =
-            Reservation::reserve_overage(slot.overage(), CostUnits(100), CostUnits(100)).unwrap();
-        overage
-            .commit_at_execution_start(now, CommitFunding::LeaseOnly)
-            .unwrap();
-        assert!(
-            !quota_usable(&slot, elastic, now),
-            "a spent cap is not admissible, and readiness must say so"
-        );
-
-        // A cap raised by a republish restores readiness with no other change.
-        assert!(quota_usable(
-            &slot,
-            EnforcementMode::Elastic {
-                overage_cap: CostUnits(200)
-            },
-            now
-        ));
     }
 
     /// Early refill only means something while `low_water` sits below the
