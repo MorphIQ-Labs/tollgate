@@ -7,6 +7,17 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.14.7](https://github.com/MorphIQ-Labs/tollgate/compare/v0.14.6...v0.14.7) - 2026-09-07
+
+### Added
+
+- *(example)* #99 measure the reserve under mixed-class load
+
+### Other
+
+- *(core)* #111 decide the shard reduction once instead of per lookup
+- *(ci)* #99 measure the capacity gate enabled and disabled
+
 ## [0.14.6](https://github.com/MorphIQ-Labs/tollgate/compare/v0.14.5...v0.14.6) - 2026-09-05
 
 ### Added
