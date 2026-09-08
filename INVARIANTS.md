@@ -423,6 +423,19 @@ until it has one.
     because the map already denies fail-closed for anything unresolved. An
     instance tracking nobody is healthy, not broken.
 
+    `InstanceRuntime` applies the same split to funding: `All` requires some
+    fresh active account with usable lease units or elastic headroom; `Fixed`
+    requires every eligible account to be fundable. Freshness and funding must
+    belong to the same account. The runtime evaluates resolution deadlines at
+    the probe's supplied timestamp and reports unresolved and unfundable
+    counts alongside readiness. With no positive snapshots, the instance is
+    healthy once its tracked resolutions and background tasks meet their
+    requirements. Positive snapshots that are all inactive or stale do not
+    advertise available funding.
+    Tests: `an_exhausted_account_withdraws_a_fixed_instance_but_not_a_discovering_one`,
+    `readiness_checks_freshness_at_the_callers_time_before_a_background_wakeup`, and
+    `a_fixed_instance_with_only_inactive_accounts_does_not_advertise_funding`.
+
     Readiness is a single bit either way, so it says *that* an instance is
     unready and never *how much* is unresolved; the count of principals
     without a valid resolution is exported alongside it and is derived from
@@ -499,6 +512,29 @@ until it has one.
     order is: stop admitting, quiesce request tasks holding permits or
     guards, shut the usage writer down, then release leases. A spent lease
     with no billing event requires losing the whole process.
+
+    `InstanceRuntime` owns this order under one total deadline: stop snapshot
+    discovery and pause refills, close the accounting queue and drain issued
+    permits/guards, then release all account leases concurrently. A task still
+    holding a lease prevents its release and is reported at the deadline.
+    Concurrent requests and background failures share the immutable deadline
+    sampled inside the first shutdown publication.
+    Dropping the owner or cancelling shutdown aborts owned tasks; the three
+    component shutdown futures retain their join handles until completion.
+    HTTP embedders start their own bounded quiescence with the runtime's first
+    shutdown request, rather than awaiting an unbounded server drain first.
+    Tests: `shutdown_waits_for_committed_usage_before_returning_the_grant`,
+    `shutdown_with_an_unresolved_permit_still_obeys_the_total_deadline`, and
+    `a_shutdown_deadline_shorter_than_its_phases_is_rejected`,
+    `cancelling_writer_shutdown_aborts_the_owned_ingest_task`,
+    `cancelling_lease_shutdown_aborts_the_owned_release_task`, and
+    `shutdown_interrupts_normal_ingest_before_its_long_timeout`,
+    `repeated_shutdown_requests_share_the_first_deadline`,
+    `http_shutdown_joins_the_listener_and_settles_usage_before_returning`, and
+    `http_quiescence_is_bounded_by_the_runtime_deadline`,
+    `a_runtime_stop_closes_the_queue_and_bounds_the_actual_drain`, and
+    `a_held_reservation_exhausts_and_reports_the_shared_shutdown_deadline`, and
+    `cancelling_http_shutdown_aborts_the_server_before_or_after_first_poll`.
 
     Unwinding is safe on Tollgate's side by construction: the event is built at
     commit rather than at drop, so `Drop` takes no lock that could be poisoned,
@@ -1333,3 +1369,44 @@ exists to detect corrupt state and must not be able to launder it.
     `a_capacity_refusal_is_a_retryable_503_and_not_a_rate_limit` pins what a
     caller is told.
     *Proof:* `formal/lean/Tollgate/ExecutionCapacity.lean`.
+
+
+31. **An account has at most one owned refill manager, including retirement.**
+    Runtime membership follows the snapshot map's accepted publication, never
+    a candidate that generation ordering rejected. Catalogue removal withdraws
+    admission and membership together. A fresh active principal makes its
+    account eligible; removal, revocation, suspension, or freshness expiry of
+    its last eligible principal arms a configurable linger. Reactivation
+    cancels linger. After retirement begins, a replacement waits for the prior
+    task's join and backoff. Notifications are matched to their task identity,
+    so an old task cannot retire a new one. Unexpected task death is visible;
+    accounting-integrity faults shut down the instance instead of being erased
+    by restart. Stable slots retain irreversible overage spend for the process
+    lifetime. Tasks and pending transitions scale with eligible, lingering, and
+    retiring accounts; slot and diagnostic history scale with accounts ever seen.
+
+    Enforcement: the runtime owns publication and one supervisor owns manager
+    handles and indexed timers; coalesced registry notifications carry no
+    historical event backlog. `formal/lean/Tollgate/AccountLifecycle.lean`
+    proves ownership conservation, at most one owner, retirement before
+    replacement, and inert duplicate joins in the abstract transition system.
+    It does not prove Tokio scheduling or Rust refinement. Implementation
+    witnesses: `arbitrary_catalogue_churn_retires_each_owner_once`,
+    `sibling_principals_share_one_manager_and_refresh_does_not_restart_it`,
+    `reactivation_during_linger_reuses_the_manager_and_later_reactivation_releases_then_refills`,
+    `retiring_an_elastic_account_does_not_reset_its_spend_cap`,
+    `a_dead_manager_is_joined_then_restarted_with_backoff`, and
+    `a_refresh_outage_preserves_a_fresh_accounts_manager`,
+    `catalogue_removal_withdraws_a_still_fresh_map_entry_and_can_restore_it`,
+    `suspension_retires_funding_and_reinstatement_starts_it_again`, and
+    `shutdown_racing_onboarding_joins_every_started_manager`,
+    `membership_wakes_once_per_publication_and_expires_at_its_exact_deadline`,
+    `repeated_shutdown_requests_share_the_first_deadline`,
+    `shutdown_pauses_refills_while_previously_issued_permits_drain`, and
+    `an_in_flight_release_cannot_start_a_refill_after_shutdown_pauses_it`, and
+    `a_second_crash_reports_parked_grants_after_releasing_an_inherited_capability`,
+    `repeated_inactive_publications_do_not_extend_the_initial_linger`, and
+    `supervisor_exit_withdraws_readiness_before_children_receive_their_abort`, and
+    `removing_the_last_principal_cancels_a_pending_manager_restart`, and
+    `integrity_faults_in_idle_and_final_release_are_reported_as_terminal`, and
+    `shutdown_distinguishes_settled_leases_from_unconfirmed_or_invalid_releases`.

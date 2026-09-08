@@ -7,10 +7,12 @@ use std::sync::Arc;
 
 use jiff::{SignedDuration, Timestamp};
 
-use tollgate_admission::{AdmissionEngine, ArcSwapSnapshotMap, LeaseSlot, NoGate, SnapshotMap};
+use tollgate_admission::NoGate;
 use tollgate_client::{
-    LeaseManager, LeaseManagerConfig, ManualClock, UsageRecorder, UsageWriter, UsageWriterConfig,
+    AccountLeaseConfig, InstanceRuntime, InstanceRuntimeConfig, ManualClock, RuntimeHandle,
+    SnapshotManagerConfig, TrackedPrincipals, UsageWriterConfig,
 };
+
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CapacityClass, CostTable, CostUnits, DenyReason,
     Generation, OpIndex, PermissionBits, Principal, RequestId, ResolvedLimits,
@@ -55,54 +57,55 @@ fn snapshot() -> Arc<AccountSnapshot> {
 }
 
 struct Instance {
-    engine: AdmissionEngine<ArcSwapSnapshotMap>,
-    recorder: UsageRecorder,
-    manager: LeaseManager,
-    writer: UsageWriter,
+    engine: RuntimeHandle,
+    runtime: InstanceRuntime,
     committed: u64,
 }
 
 fn spawn_instance(store: &Arc<MemoryStore>, clock: &Arc<ManualClock>) -> Instance {
-    let slot = LeaseSlot::for_account(ACCOUNT);
-    let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
-    engine
-        .map()
-        .install(PRINCIPAL, snapshot(), Arc::clone(&slot));
-
-    let manager = LeaseManager::spawn(
+    let (runtime, engine) = InstanceRuntime::spawn(
         store.clone(),
-        Arc::clone(&slot),
-        Arc::clone(clock) as _,
-        LeaseManagerConfig {
-            account: ACCOUNT,
-            target_grant: CostUnits(2_000),
-            low_water: CostUnits(500),
-            lease_ttl: SignedDuration::from_secs(3_600),
-            expiry_safety_margin: SignedDuration::ZERO,
-            poll_interval: std::time::Duration::from_millis(5),
-            store_call_timeout: std::time::Duration::from_secs(5),
-            shutdown_release_deadline: std::time::Duration::from_secs(10),
-        },
-    )
-    .unwrap();
-    let (recorder, writer) = UsageWriter::spawn(
         store.clone(),
-        Arc::clone(clock) as _,
-        UsageWriterConfig {
-            queue_capacity: 64,
-            max_batch: 16,
-            flush_interval: std::time::Duration::from_millis(5),
-            retry_backoff: std::time::Duration::from_millis(5),
-            shutdown_drain_deadline: std::time::Duration::from_secs(60),
-            ingest_timeout: std::time::Duration::from_secs(5),
+        store.clone(),
+        clock.clone(),
+        InstanceRuntimeConfig {
+            snapshots: SnapshotManagerConfig {
+                principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
+                refresh_interval: std::time::Duration::from_secs(30),
+                unknown_ttl: SignedDuration::from_secs(1),
+                revoked_ttl: SignedDuration::from_secs(1),
+                retry_backoff: std::time::Duration::from_millis(5),
+                max_concurrent_fetches: 4,
+                fetch_timeout: std::time::Duration::from_secs(5),
+                enumeration_timeout: std::time::Duration::from_secs(5),
+            },
+            leases: AccountLeaseConfig {
+                target_grant: CostUnits(2_000),
+                low_water: CostUnits(500),
+                lease_ttl: SignedDuration::from_secs(3_600),
+                expiry_safety_margin: SignedDuration::ZERO,
+                poll_interval: std::time::Duration::from_millis(5),
+                store_call_timeout: std::time::Duration::from_secs(5),
+                shutdown_release_deadline: std::time::Duration::from_secs(10),
+            },
+            usage: UsageWriterConfig {
+                queue_capacity: 64,
+                max_batch: 16,
+                flush_interval: std::time::Duration::from_millis(5),
+                retry_backoff: std::time::Duration::from_millis(5),
+                shutdown_drain_deadline: std::time::Duration::from_secs(60),
+                ingest_timeout: std::time::Duration::from_secs(5),
+            },
+            sharding: tollgate_core::LocalSharding::SINGLE,
+            idle_account_linger: std::time::Duration::from_millis(30),
+            manager_restart_backoff: std::time::Duration::from_millis(10),
+            shutdown_deadline: std::time::Duration::from_secs(70),
         },
     )
     .unwrap();
     Instance {
         engine,
-        recorder,
-        manager,
-        writer,
+        runtime,
         committed: 0,
     }
 }
@@ -116,7 +119,7 @@ fn hammer(instance: &mut Instance, burst: usize) -> usize {
     for _ in 0..burst {
         // INVARIANTS.md #8 ordering: accounting capacity is reserved before
         // admission.
-        let Ok(permit) = instance.recorder.try_reserve() else {
+        let Ok(permit) = instance.engine.recorder().try_reserve() else {
             continue;
         };
         let admitted = instance
@@ -156,12 +159,25 @@ async fn two_instances_never_overspend_one_account() {
         status: AccountStatus::Active,
         capacity_class: CapacityClass::Assured,
     });
+    store.publish_snapshot(
+        PRINCIPAL,
+        tollgate_core::PublishableSnapshot::try_new(snapshot()).unwrap(),
+    );
     let clock = Arc::new(ManualClock::new(t(0)));
 
     let mut instances = [
         spawn_instance(&store, &clock),
         spawn_instance(&store, &clock),
     ];
+    for instance in &instances {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !instance.engine.readiness(t(0)).is_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
     // Rounds of interleaved spending; between rounds the paused runtime
     // auto-advances so managers refill and writers flush.
     let mut quiet_rounds = 0;
@@ -197,14 +213,13 @@ async fn two_instances_never_overspend_one_account() {
 
     // Orderly shutdown: flush usage first, then release leases.
     let [a, b] = instances;
-    let stats_a = a.writer.shutdown().await.unwrap();
-    let stats_b = b.writer.shutdown().await.unwrap();
+    let (a, b) = tokio::join!(a.runtime.shutdown(), b.runtime.shutdown());
+    let stats_a = a.unwrap().usage.unwrap();
+    let stats_b = b.unwrap().usage.unwrap();
     assert_eq!(stats_a.lost + stats_b.lost, 0);
     assert_eq!(stats_a.rejected + stats_b.rejected, 0);
     // Independent generators must never collide into duplicates.
     assert_eq!(stats_a.duplicate + stats_b.duplicate, 0);
-    a.manager.shutdown().await;
-    b.manager.shutdown().await;
 
     // The billing ledger equals committed admission exactly (leases bound
     // spend; usage events are the record; drift is zero).

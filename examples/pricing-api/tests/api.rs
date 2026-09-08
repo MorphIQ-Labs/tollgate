@@ -263,6 +263,14 @@ async fn price_route_requires_connection_context() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/problem+json"
+    );
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["code"], "missing-connection-state");
+    assert_eq!(body["units_charged"], 0);
 
     runtime.shutdown().await;
 }
@@ -372,7 +380,7 @@ async fn an_elastic_account_serves_past_its_deposit_and_bills_the_overage() {
     wait_ready(&router).await;
 
     assert_eq!(
-        metrics(&router).await["overage_cap"],
+        metrics(&router).await["total_overage_cap"],
         json!(CAP),
         "the published mode must reach the operator surface"
     );
@@ -411,7 +419,7 @@ async fn an_elastic_account_serves_past_its_deposit_and_bills_the_overage() {
         "the lease funded the first requests, so `admitted` is the total and \
          `admitted_overage` a qualifier inside it — never a sibling to add"
     );
-    assert!(after["overage_spent"].as_u64().unwrap() <= CAP);
+    assert!(after["total_overage_spent"].as_u64().unwrap() <= CAP);
     assert_eq!(
         after["denials"]["overage_cap_exhausted"],
         json!(capacity_unavailable)
@@ -482,8 +490,8 @@ async fn metrics_separate_admissions_from_each_kind_of_refusal() {
     );
     // The off-path gauges: what is left to spend, and until when. A lease can
     // be refused for either reason, so both are exported.
-    assert!(after["lease_remaining"].as_u64().is_some());
-    assert!(after["lease_usable_until"].as_str().is_some());
+    assert!(after["total_lease_remaining"].as_u64().is_some());
+    assert!(after["earliest_lease_usable_until"].as_str().is_some());
 
     // The later phases are exported too, and they partition `admitted`
     // exactly. Both requests ran their kernel to completion, so nothing was
@@ -695,8 +703,8 @@ async fn baseline_metrics_omit_the_uninstalled_planes() {
     );
     // Nothing ever stocked the slot, so the gauges read off it report absence
     // rather than a zero that would read as an exhausted lease.
-    assert!(body["lease_remaining"].is_null());
-    assert!(body["lease_usable_until"].is_null());
+    assert!(body["total_lease_remaining"].is_null());
+    assert!(body["earliest_lease_usable_until"].is_null());
     // The request-path counters stay present: the engine is built in both
     // configurations, and a baseline request simply never reaches it.
     assert_eq!(body["admitted"], 0);
@@ -789,4 +797,168 @@ async fn a_disabled_instance_reports_no_capacity_rather_than_an_empty_one() {
     assert_eq!(metrics["capacity_shed"], 0);
 
     runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn extractor_failures_are_zero_charge_problem_json_with_fixed_counters() {
+    for (content_type, body, status, code) in [
+        (
+            "application/json",
+            "{".to_owned(),
+            StatusCode::BAD_REQUEST,
+            "malformed-body",
+        ),
+        (
+            "text/plain",
+            "{}".to_owned(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported-media-type",
+        ),
+        (
+            "application/json",
+            " ".repeat(2 * 1024 * 1024 + 1),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body-too-large",
+        ),
+    ] {
+        let (router, runtime) = build_test_app(10_000, true);
+        wait_ready(&router).await;
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/price")
+                    .header(header::AUTHORIZATION, format!("Bearer {DEMO_API_KEY}"))
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["code"], code);
+        assert_eq!(body["units_charged"], 0);
+        let counters = metrics(&router).await;
+        assert_eq!(counters["input_rejections"][code], 1);
+        assert_eq!(counters["contexts_abandoned"], 1);
+        assert_eq!(counters["admitted"], 0);
+        runtime.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn http_shutdown_joins_the_listener_and_settles_usage_before_returning() {
+    let (router, runtime) = build_test_app(10_000, true);
+    wait_ready(&router).await;
+    let store = runtime.store.clone();
+    let (status, response) = call(&router, Some(DEMO_API_KEY), price_body(1)).await;
+    assert_eq!(status, StatusCode::OK);
+    let charged = response["metadata"]["units_charged"].as_u64().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server_router = router.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, server_router)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    runtime.shutdown_server(server, stop).await.unwrap();
+    assert_eq!(store.usage_recorded(DEMO_ACCOUNT), CostUnits(charged));
+    assert_eq!(store.balance(DEMO_ACCOUNT), CostUnits(10_000 - charged));
+    assert_eq!(ready(&router).await, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(tokio::net::TcpStream::connect(address).await.is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn http_quiescence_is_bounded_by_the_runtime_deadline() {
+    struct Exited(Option<tokio::sync::oneshot::Sender<()>>);
+    impl Drop for Exited {
+        fn drop(&mut self) {
+            let _ = self.0.take().unwrap().send(());
+        }
+    }
+    let (router, runtime) = build_test_app(10_000, true);
+    wait_ready(&router).await;
+    let store = runtime.store.clone();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let (exited, exit) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let _exited = Exited(Some(exited));
+        let _ = stopped.await;
+        std::future::pending::<std::io::Result<()>>().await
+    });
+    let began = tokio::time::Instant::now();
+    let error = runtime.shutdown_server(server, stop).await.unwrap_err();
+    assert_eq!(error, "HTTP quiescence deadline expired");
+    assert_eq!(began.elapsed(), std::time::Duration::from_secs(15));
+    exit.await.unwrap();
+    assert_eq!(store.balance(DEMO_ACCOUNT), CostUnits(10_000));
+    assert_eq!(ready(&router).await, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_http_shutdown_aborts_the_server_before_or_after_first_poll() {
+    struct Exited(Option<tokio::sync::oneshot::Sender<()>>);
+    impl Drop for Exited {
+        fn drop(&mut self) {
+            let _ = self.0.take().unwrap().send(());
+        }
+    }
+    for poll in [false, true] {
+        let (router, runtime) = build_test_app(10_000, true);
+        wait_ready(&router).await;
+        let store = runtime.store.clone();
+        let principals = store.principals().await.unwrap().unwrap();
+        let principal = principals[0];
+        let tollgate_store::SnapshotResolution::Present(before) =
+            store.snapshot(principal).await.unwrap()
+        else {
+            panic!("demo principal must resolve");
+        };
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let (draining, drain) = tokio::sync::oneshot::channel();
+        let (exited, exit) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let _exited = Exited(Some(exited));
+            entered.send(()).unwrap();
+            let _ = stopped.await;
+            let _ = draining.send(());
+            std::future::pending::<std::io::Result<()>>().await
+        });
+        entry.await.unwrap();
+        let shutdown = runtime.shutdown_server(server, stop);
+        if poll {
+            let shutdown = tokio::spawn(shutdown);
+            drain.await.unwrap();
+            shutdown.abort();
+            assert!(shutdown.await.unwrap_err().is_cancelled());
+        } else {
+            drop(shutdown);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), exit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready(&router).await, StatusCode::SERVICE_UNAVAILABLE);
+        tokio::time::advance(std::time::Duration::from_secs(3_600)).await;
+        tokio::task::yield_now().await;
+        let tollgate_store::SnapshotResolution::Present(after) =
+            store.snapshot(principal).await.unwrap()
+        else {
+            panic!("shutdown preserves the published snapshot");
+        };
+        assert_eq!(after.generation, before.generation);
+    }
 }

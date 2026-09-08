@@ -89,6 +89,39 @@ pub struct LeaseManagerConfig {
     pub shutdown_release_deadline: std::time::Duration,
 }
 
+/// Instance-wide lease settings applied to each discovered account.
+/// Field semantics and validation are those of [`LeaseManagerConfig`].
+#[derive(Debug, Clone, Copy)]
+pub struct AccountLeaseConfig {
+    pub target_grant: CostUnits,
+    pub low_water: CostUnits,
+    pub lease_ttl: SignedDuration,
+    pub expiry_safety_margin: SignedDuration,
+    pub poll_interval: std::time::Duration,
+    pub store_call_timeout: std::time::Duration,
+    pub shutdown_release_deadline: std::time::Duration,
+}
+
+impl AccountLeaseConfig {
+    #[must_use]
+    pub fn for_account(self, account: AccountId) -> LeaseManagerConfig {
+        LeaseManagerConfig {
+            account,
+            target_grant: self.target_grant,
+            low_water: self.low_water,
+            lease_ttl: self.lease_ttl,
+            expiry_safety_margin: self.expiry_safety_margin,
+            poll_interval: self.poll_interval,
+            store_call_timeout: self.store_call_timeout,
+            shutdown_release_deadline: self.shutdown_release_deadline,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), LeaseManagerConfigError> {
+        self.for_account(AccountId(0)).validate()
+    }
+}
+
 /// What a graceful shutdown managed to return.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeaseManagerReport {
@@ -217,12 +250,14 @@ impl RefillRequests {
 ///
 /// Written only by the refill task, so unlike the usage writer's counters they
 /// need no cache-line padding: one writer cannot contend with itself.
-/// `Relaxed` throughout — nothing is published through them.
+/// Statistics use `Relaxed`; control-state evidence uses acquire/release.
 #[derive(Debug)]
 pub struct LeaseCounters {
     acquired: AtomicU64,
     acquired_units: AtomicU64,
     acquire_timeouts: AtomicU64,
+    acquire_pending: AtomicBool,
+    integrity_fault: AtomicBool,
     acquire_refused: [AtomicU64; AllocateError::COUNT],
     released: AtomicU64,
     abandoned: AtomicU64,
@@ -235,10 +270,25 @@ impl LeaseCounters {
             acquired: AtomicU64::new(0),
             acquired_units: AtomicU64::new(0),
             acquire_timeouts: AtomicU64::new(0),
+            acquire_pending: AtomicBool::new(false),
+            integrity_fault: AtomicBool::new(false),
             acquire_refused: [const { AtomicU64::new(0) }; AllocateError::COUNT],
             released: AtomicU64::new(0),
             abandoned: AtomicU64::new(0),
         }
+    }
+
+    pub(crate) fn acquire_pending(&self) -> bool {
+        self.acquire_pending.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn integrity_fault(&self) -> bool {
+        self.integrity_fault.load(Ordering::Acquire)
+    }
+
+    fn record_integrity_fault(&self, health: &watch::Sender<bool>) {
+        self.integrity_fault.store(true, Ordering::Release);
+        crate::signal(health, false, "lease-manager health");
     }
 
     fn record_acquired(&self, units: CostUnits) {
@@ -310,6 +360,34 @@ pub struct LeaseStats {
 }
 
 impl LeaseStats {
+    pub const ZERO: Self = Self {
+        acquired: 0,
+        acquired_units: 0,
+        acquire_timeouts: 0,
+        acquire_refused: [0; AllocateError::COUNT],
+        released: 0,
+        abandoned: 0,
+    };
+
+    /// Aggregate observations without wrapping an operator's counter.
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        let mut acquire_refused = [0; AllocateError::COUNT];
+        for (i, value) in acquire_refused.iter_mut().enumerate() {
+            *value = self.acquire_refused[i].checked_add(other.acquire_refused[i])?;
+        }
+        // The public refused() total must also remain representable.
+        acquire_refused
+            .iter()
+            .try_fold(0_u64, |sum, value| sum.checked_add(*value))?;
+        Some(Self {
+            acquired: self.acquired.checked_add(other.acquired)?,
+            acquired_units: self.acquired_units.checked_add(other.acquired_units)?,
+            acquire_timeouts: self.acquire_timeouts.checked_add(other.acquire_timeouts)?,
+            acquire_refused,
+            released: self.released.checked_add(other.released)?,
+            abandoned: self.abandoned.checked_add(other.abandoned)?,
+        })
+    }
     /// Refusals paired with their stable labels, in slot order.
     pub fn refusals_by_name(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
         AllocateError::NAMES
@@ -331,6 +409,8 @@ pub struct LeaseManager {
     health: watch::Receiver<bool>,
     handle: Option<tokio::task::JoinHandle<LeaseManagerReport>>,
     counters: Arc<LeaseCounters>,
+    deadline: Arc<crate::ShutdownDeadline>,
+    paused: Arc<AtomicBool>,
 }
 
 impl LeaseManager {
@@ -346,6 +426,10 @@ impl LeaseManager {
         let account = config.account;
         let counters = Arc::new(LeaseCounters::new());
         let task_counters = Arc::clone(&counters);
+        let deadline = Arc::new(crate::ShutdownDeadline::default());
+        let task_deadline = Arc::clone(&deadline);
+        let paused = Arc::new(AtomicBool::new(false));
+        let task_paused = Arc::clone(&paused);
         let handle = tokio::spawn(
             async move {
                 let report = run(
@@ -356,6 +440,8 @@ impl LeaseManager {
                     shutdown_rx,
                     &health_tx,
                     &task_counters,
+                    &task_deadline,
+                    &task_paused,
                 )
                 .await;
                 crate::signal(&health_tx, false, "lease-manager health");
@@ -368,6 +454,8 @@ impl LeaseManager {
             health,
             handle: Some(handle),
             counters,
+            deadline,
+            paused,
         })
     }
 
@@ -391,6 +479,17 @@ impl LeaseManager {
         self.health.clone()
     }
 
+    /// Stop initiating refills while the runtime drains accounting. A call
+    /// already in flight remains owned and is bounded by store_call_timeout.
+    pub(crate) fn pause_refills(&self) {
+        self.paused.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn stop_at(&self, deadline: tokio::time::Instant) {
+        self.deadline.constrain(deadline);
+        crate::signal(&self.shutdown, true, "lease-manager shutdown");
+    }
+
     /// Signal the task, wait for it to return what it can of its leases, and
     /// report what it managed. Bounded by `shutdown_release_deadline`: a hung
     /// allocator cannot stall this call.
@@ -401,7 +500,8 @@ impl LeaseManager {
             abandoned: 0,
             task_died: true,
         };
-        match self.handle.take() {
+        // Borrow the handle so cancellation still runs Drop's abort.
+        match self.handle.as_mut() {
             // A task that died reports nothing it can substantiate; the flag
             // says so rather than a zero that reads like a clean run (#41).
             Some(handle) => handle.await.unwrap_or(died),
@@ -421,6 +521,7 @@ impl Drop for LeaseManager {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     allocator: Arc<dyn LeaseAllocator>,
     slot: Arc<LeaseSlot>,
@@ -429,6 +530,8 @@ async fn run(
     mut shutdown: watch::Receiver<bool>,
     health: &watch::Sender<bool>,
     counters: &LeaseCounters,
+    shutdown_deadline: &crate::ShutdownDeadline,
+    paused: &AtomicBool,
 ) -> LeaseManagerReport {
     let mut tick = tokio::time::interval(config.poll_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -460,6 +563,10 @@ async fn run(
             break;
         }
 
+        if paused.load(Ordering::Acquire) {
+            continue;
+        }
+
         let now = clock.now();
         // One budget for the pass, so a wedged backend costs this tick one
         // store call's worth of wall clock whatever `parked.len()` is, and
@@ -484,6 +591,10 @@ async fn run(
         let needs_acquire = match slot.load() {
             None => true,
             Some(lease) if now >= lease.usable_until() => {
+                // This inspection is not an in-flight request. Keeping its
+                // Arc through the release pass would make our own grant
+                // appear busy and defer its refund until after acquisition.
+                drop(lease);
                 // Close the slot, but retain the grant: while it is still in
                 // the allocator's grace window its unspent capacity can be
                 // released and immediately reused. Reservations that loaded
@@ -523,6 +634,10 @@ async fn run(
         // reason it is raced inside the release pass — an acquire abandoned
         // here settles nothing, and the slot it would have filled is one the
         // shutdown phase is about to drain anyway (#78).
+        if paused.load(Ordering::Acquire) || *shutdown.borrow() {
+            continue;
+        }
+        counters.acquire_pending.store(true, Ordering::Release);
         let acquire = tokio::time::timeout(
             config.store_call_timeout,
             allocator.acquire(config.account, config.target_grant, config.lease_ttl, now),
@@ -534,6 +649,7 @@ async fn run(
                 break;
             }
         };
+        counters.acquire_pending.store(false, Ordering::Release);
         match acquired {
             Ok(Ok(grant)) => {
                 counters.record_acquired(grant.units);
@@ -624,7 +740,7 @@ async fn run(
     if let Some(lease) = slot.take() {
         parked.push(lease);
     }
-    let deadline = tokio::time::Instant::now() + config.shutdown_release_deadline;
+    let deadline = shutdown_deadline.within(config.shutdown_release_deadline);
     let mut report = LeaseManagerReport {
         released: 0,
         abandoned: 0,
@@ -664,23 +780,31 @@ async fn run(
         )
         .await
         {
-            // A refusal still means the store is no longer holding this lease
-            // open for us — only an unfinished call leaves it outstanding.
-            // The count says how many; the event says which refusal, which
-            // the count alone cannot distinguish from a clean release.
             Ok(Ok(())) => {
                 report.released += 1;
                 counters.record_released();
             }
-            Ok(Err(error)) => {
-                report.released += 1;
-                counters.record_released();
-                tracing::warn!(
-                    lease = %grant.lease_id,
-                    %error,
-                    "lease refused at shutdown; the store considers it settled"
-                );
-            }
+            Ok(Err(error)) => match release_failure(&error) {
+                ReleaseFailure::Settled | ReleaseFailure::Fenced => {
+                    report.released += 1;
+                    counters.record_released();
+                    tracing::warn!(lease = %grant.lease_id, %error,
+                        "lease no longer belongs to this manager; considered settled");
+                }
+                ReleaseFailure::Retryable => {
+                    report.abandoned += 1;
+                    counters.record_abandoned();
+                    tracing::warn!(lease = %grant.lease_id, %error,
+                        "release unconfirmed at shutdown; grant requires TTL reclaim");
+                }
+                ReleaseFailure::Integrity => {
+                    report.abandoned += 1;
+                    counters.record_abandoned();
+                    counters.record_integrity_fault(health);
+                    tracing::error!(lease = %grant.lease_id, %error,
+                        "release violated the allocator contract; grant abandoned and integrity fault retained");
+                }
+            },
             Err(_) => {
                 report.abandoned += 1;
                 counters.record_abandoned();
@@ -694,6 +818,28 @@ async fn run(
         }
     }
     report
+}
+
+/// The same refusal has the same ownership meaning during refill and
+/// shutdown. Only the decision to retry a storage failure depends on phase.
+#[derive(Clone, Copy)]
+enum ReleaseFailure {
+    Settled,
+    Fenced,
+    Retryable,
+    Integrity,
+}
+fn release_failure(error: &AllocateError) -> ReleaseFailure {
+    match error {
+        AllocateError::UnknownLease | AllocateError::LeaseNotActive => ReleaseFailure::Settled,
+        AllocateError::Fenced => ReleaseFailure::Fenced,
+        AllocateError::Storage(_) => ReleaseFailure::Retryable,
+        AllocateError::InvalidRelease
+        | AllocateError::UnknownAccount
+        | AllocateError::AccountInactive
+        | AllocateError::InsufficientBalance
+        | AllocateError::InvalidTtl => ReleaseFailure::Integrity,
+    }
 }
 
 /// Whether `lease` has quiesced, waiting until `deadline` for it to.
@@ -829,75 +975,38 @@ async fn release_quiesced(
             }
         };
         match call_outcome {
-            // Unfinished or unreachable: nothing was settled, try next tick.
             Err(_) => {
                 tracing::debug!(lease = %lease_id, "release timed out; retrying next tick");
                 retry.push(lease);
             }
-            Ok(Err(AllocateError::Storage(error))) => {
-                tracing::warn!(
-                    lease = %lease_id,
-                    %error,
-                    "release failed against the store; retrying next tick"
-                );
-                retry.push(lease);
-            }
-            // Settled, or nothing to settle. Every arm below stops tracking
-            // the lease, so each counts as released; only the two retry arms
-            // above leave it on our books.
             Ok(Ok(())) => counters.record_released(),
-            Ok(Err(error @ (AllocateError::LeaseNotActive | AllocateError::UnknownLease))) => {
-                counters.record_released();
-                tracing::debug!(lease = %lease_id, %error, "lease was already settled");
-            }
-            Ok(Err(AllocateError::Fenced)) => {
-                counters.record_released();
-                tracing::warn!(
-                    lease = %lease_id,
-                    "store rejected this lease's capability; clearing the slot so this instance stops serving"
-                );
-                // The slot holds a *different* lease from the fenced one —
-                // this loop walks `parked`, and the current lease is whatever
-                // the last rotation installed. Discarding what `take` hands
-                // back dropped a live, funded lease on the floor: never
-                // released, never re-parked, never counted abandoned, and
-                // named by no event, so an operator saw `released += 1` and
-                // `abandoned == 0` while its units stranded for a full TTL
-                // (#62).
-                //
-                // Parked rather than released here, so the quiescence guard at
-                // the top of this loop applies to it on the next pass: a
-                // request that loaded it before the slot was cleared still
-                // holds a view.
-                //
-                // `Option` is not `#[must_use]`, so the workspace's
-                // `let_underscore_must_use` deny — invariant 19's mechanical
-                // half — could not see this. Binding it is what makes the
-                // discard impossible to write again by accident.
-                if let Some(current) = slot.take() {
-                    retry.push(current);
+            Ok(Err(error)) => match release_failure(&error) {
+                ReleaseFailure::Retryable => {
+                    tracing::warn!(lease = %lease_id, %error, "release failed; retrying next tick");
+                    retry.push(lease);
                 }
-            }
-            Ok(Err(AllocateError::InvalidRelease)) => {
-                counters.record_released();
-                tracing::error!(
-                    lease = %lease_id,
-                    units = lease.remaining().get(),
-                    "the store rejected this release as an accounting error; \
-                     local counts disagree with the ledger and readiness is dropping"
-                );
-                crate::signal(health, false, "lease-manager health");
-            }
-            // Acquire-only refusals; a release cannot produce them. Reaching
-            // this arm means the allocator's contract changed under us.
-            Ok(Err(error)) => {
-                counters.record_released();
-                tracing::error!(
-                    lease = %lease_id,
-                    %error,
-                    "allocator returned an acquire-only refusal to a release"
-                );
-            }
+                ReleaseFailure::Settled => {
+                    counters.record_released();
+                    tracing::debug!(lease = %lease_id, %error, "lease was already settled");
+                }
+                ReleaseFailure::Fenced => {
+                    counters.record_released();
+                    tracing::warn!(lease = %lease_id,
+                        "store rejected this lease's capability; clearing the slot so this instance stops serving");
+                    // The current slot is a different funded grant. Keep it
+                    // parked until its own request readers quiesce; dropping
+                    // it here silently stranded its units (#62).
+                    if let Some(current) = slot.take() {
+                        retry.push(current);
+                    }
+                }
+                ReleaseFailure::Integrity => {
+                    counters.record_abandoned();
+                    counters.record_integrity_fault(health);
+                    tracing::error!(lease = %lease_id, units = lease.remaining().get(), %error,
+                        "release violated the allocator contract; grant abandoned and readiness withdrawn");
+                }
+            },
         }
     }
     // Reached only by examining every lease; the two early returns above own
@@ -908,6 +1017,21 @@ async fn release_quiesced(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn aggregate_refill_counters_reject_overflow_in_fields_and_totals() {
+        let mut left = super::LeaseStats::ZERO;
+        left.acquired_units = u64::MAX;
+        let mut right = super::LeaseStats::ZERO;
+        right.acquired_units = 1;
+        assert!(left.checked_add(right).is_none());
+        left = super::LeaseStats::ZERO;
+        right = super::LeaseStats::ZERO;
+        left.acquire_refused[0] = u64::MAX;
+        right.acquire_refused[1] = 1;
+        assert!(left.checked_add(right).is_none());
+        right.acquire_refused[1] = 0;
+        assert_eq!(left.checked_add(right).unwrap().refused(), u64::MAX);
+    }
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -1150,6 +1274,61 @@ mod tests {
         Arc::new(SystemClock)
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_distinguishes_settled_leases_from_unconfirmed_or_invalid_releases() {
+        for (refusal, released, faulted) in [
+            (Refusal::Storage, 0, false),
+            (Refusal::Fenced, 1, false),
+            (Refusal::InvalidRelease, 0, true),
+            (Refusal::LeaseNotActive, 1, false),
+            (Refusal::UnknownLease, 1, false),
+            (Refusal::Hang, 0, false),
+        ] {
+            let harness = Harness::new();
+            harness.slot.install(parked_lease(1));
+            let manager = LeaseManager::spawn(
+                ScriptedAllocator::new([(LeaseId(1), refusal)]),
+                harness.slot,
+                Arc::new(crate::ManualClock::new(Timestamp::from_second(0).unwrap())),
+                harness.config,
+            )
+            .unwrap();
+            let counters = manager.counters();
+            let health = manager.health();
+            let report = manager.shutdown().await;
+            assert_eq!(report.released, released);
+            assert_eq!(report.abandoned, 1 - released);
+            assert_eq!(counters.snapshot().released, released);
+            assert_eq!(counters.snapshot().abandoned, 1 - released);
+            assert_eq!(counters.integrity_fault(), faulted);
+            assert!(
+                !*health.borrow(),
+                "every stopped task is unhealthy, including clean stops"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_deadline_shortens_the_managers_actual_release_pass() {
+        let harness = Harness::new();
+        harness.slot.install(parked_lease(1));
+        let manager = LeaseManager::spawn(
+            ScriptedAllocator::new([(LeaseId(1), Refusal::Hang)]),
+            harness.slot,
+            Arc::new(crate::ManualClock::new(Timestamp::from_second(0).unwrap())),
+            harness.config,
+        )
+        .unwrap();
+        let began = tokio::time::Instant::now();
+        manager.stop_at(began + std::time::Duration::from_millis(5));
+        let report = tokio::time::timeout(std::time::Duration::from_millis(6), manager.shutdown())
+            .await
+            .unwrap();
+        assert_eq!(report.abandoned, 1);
+        assert!(!report.task_died);
+        assert_eq!(began.elapsed(), std::time::Duration::from_millis(5));
+    }
+
     #[tokio::test]
     async fn storage_failure_does_not_skip_the_next_parked_lease() {
         let scripted = ScriptedAllocator::new([(LeaseId(1), Refusal::Storage)]);
@@ -1269,6 +1448,9 @@ mod tests {
             !harness.is_healthy(),
             "accounting divergence must drop readiness"
         );
+        assert!(harness.counters.integrity_fault());
+        assert_eq!(harness.counters.snapshot().abandoned, 1);
+        assert_eq!(harness.counters.snapshot().released, 0);
     }
 
     /// A wedged backend cannot park the refill loop: the call is bounded and

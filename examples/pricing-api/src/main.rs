@@ -56,15 +56,32 @@ async fn main() -> std::io::Result<()> {
     // connection its own `PricingConnection`, and therefore its own credential
     // cache. Serving the router directly would silently fall back to
     // per-request HMAC (#2).
-    axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<PricingConnection>(),
-    )
-    .with_graceful_shutdown(async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
-    .await?;
-    // Flush billing, then release leases (order matters — INVARIANTS.md).
-    runtime.shutdown().await;
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let mut server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<PricingConnection>(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = stopped.await;
+        })
+        .await
+    });
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            if let Err(error) = signal {
+                runtime.shutdown_server(server, stop).await.map_err(std::io::Error::other)?;
+                return Err(error);
+            }
+        }
+        result = &mut server => {
+            runtime.shutdown().await;
+            return result.map_err(std::io::Error::other)?;
+        }
+    }
+    runtime
+        .shutdown_server(server, stop)
+        .await
+        .map_err(std::io::Error::other)?;
     Ok(())
 }

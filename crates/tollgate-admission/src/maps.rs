@@ -666,10 +666,19 @@ impl SnapshotMap for ArcSwapSnapshotMap {
     }
 
     fn remove(&self, principal: &Principal) {
+        self.remove_many(std::slice::from_ref(principal));
+    }
+
+    fn remove_many(&self, principals: &[Principal]) {
+        if principals.is_empty() {
+            return;
+        }
         let _watermarks = self.watermarks.lock().expect("watermarks poisoned");
         let current = self.map.load_full();
         let mut next = PrincipalMap::clone(&current);
-        next.remove(principal);
+        for principal in principals {
+            next.remove(principal);
+        }
         self.map.store(Arc::new(next));
     }
 
@@ -1333,6 +1342,44 @@ mod tests {
 
         map.remove(&Principal(1));
         assert!(map.get(&Principal(1)).is_none());
+    }
+
+    #[test]
+    fn bulk_removal_withdraws_every_entry_and_preserves_revocation_watermarks() {
+        exercises_bulk_removal(Arc::new(ArcSwapSnapshotMap::new()));
+        exercises_bulk_removal(Arc::new(MokaSnapshotMap::new(100)));
+    }
+
+    fn exercises_bulk_removal(map: impl SnapshotMap) {
+        for id in 1..=3 {
+            map.install(
+                Principal(id),
+                snapshot(1),
+                LeaseSlot::for_account(AccountId(1)),
+            );
+        }
+        map.install_revoked(Principal(2), t(100), Generation(2));
+        map.remove_many(&[Principal(1), Principal(2), Principal(999)]);
+        assert!(map.get(&Principal(1)).is_none());
+        assert!(map.get(&Principal(2)).is_none());
+        assert_eq!(generation_of(&map, &Principal(3)), Some(1));
+        map.install(
+            Principal(2),
+            snapshot(2),
+            LeaseSlot::for_account(AccountId(1)),
+        );
+        assert!(
+            map.get(&Principal(2)).is_none(),
+            "removal must preserve the tombstone watermark"
+        );
+        map.install(
+            Principal(2),
+            snapshot(3),
+            LeaseSlot::for_account(AccountId(1)),
+        );
+        assert_eq!(generation_of(&map, &Principal(2)), Some(3));
+        map.remove_many(&[]);
+        assert_eq!(generation_of(&map, &Principal(3)), Some(1));
     }
 
     #[test]
