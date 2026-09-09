@@ -843,10 +843,24 @@ impl From<StoreError> for PublishSnapshotError {
 /// Administrative writes: the control plane's mutation surface. Kept apart
 /// from the data-plane traits so a read-only replica can implement those
 /// without this.
+///
+/// HTTP-facing mutations return [`crate::AdminReceipt`] captured at the same
+/// serialization point as the write. Its `outcome` contains the operation's
+/// result; before/after describe the fields owned by that operation. A separate
+/// read before or after the transaction is not a valid receipt under concurrency.
+/// No-op receipts have equal states; errors carry no confirmed transition.
+/// Direct callers attach their own actor and audit delivery policy.
 #[async_trait]
 pub trait AdminStore: Send + Sync {
-    async fn create_account(&self, config: AccountConfig) -> Result<(), CreateAccountError>;
-    async fn deposit(&self, account: AccountId, units: CostUnits) -> Result<(), AllocateError>;
+    async fn create_account(
+        &self,
+        config: AccountConfig,
+    ) -> Result<crate::AdminReceipt<()>, CreateAccountError>;
+    async fn deposit(
+        &self,
+        account: AccountId,
+        units: CostUnits,
+    ) -> Result<crate::AdminReceipt<()>, AllocateError>;
     /// Set an existing account's administrative status, in one transaction:
     /// the ledger's status, and a republication of every *live* snapshot of
     /// that account carrying the new status at `generation + 1`.
@@ -874,7 +888,7 @@ pub trait AdminStore: Send + Sync {
         &self,
         account: AccountId,
         status: AccountStatus,
-    ) -> Result<StatusChange, SetStatusError>;
+    ) -> Result<crate::AdminReceipt<StatusChange>, SetStatusError>;
 
     /// Set an existing account's execution-capacity class, in one
     /// transaction: the ledger's class, and a republication of every *live*
@@ -909,7 +923,7 @@ pub trait AdminStore: Send + Sync {
         &self,
         account: AccountId,
         class: CapacityClass,
-    ) -> Result<StatusChange, SetStatusError>;
+    ) -> Result<crate::AdminReceipt<StatusChange>, SetStatusError>;
 
     /// Give an account a periodic allowance, or take it away.
     ///
@@ -964,8 +978,11 @@ pub trait AdminStore: Send + Sync {
         &self,
         principal: Principal,
         snapshot: PublishableSnapshot,
-    ) -> Result<(), PublishSnapshotError>;
-    async fn remove_snapshot(&self, principal: Principal) -> Result<(), StoreError>;
+    ) -> Result<crate::AdminReceipt<()>, PublishSnapshotError>;
+    async fn remove_snapshot(
+        &self,
+        principal: Principal,
+    ) -> Result<crate::AdminReceipt<()>, StoreError>;
 }
 
 /// Outcome of one ingest batch.

@@ -33,45 +33,115 @@ use tollgate_store::{
 
 pub struct HttpStore {
     base: String,
+    transport: arc_swap::ArcSwap<HttpTransport>,
+}
+
+struct HttpTransport {
     client: reqwest::Client,
+    bearer: Option<Arc<dyn crate::http_security::BearerProvider>>,
+    request_timeout: std::time::Duration,
 }
 
 impl HttpStore {
-    /// Connect with default deadlines (2s connect, 10s per request). A hung
-    /// control-plane request must never stall refill, billing, or shutdown
-    /// indefinitely — background tasks rely on these bounds.
-    #[must_use]
-    pub fn new(base_url: impl Into<String>) -> Arc<Self> {
-        Self::with_timeouts(
-            base_url,
-            std::time::Duration::from_secs(2),
-            std::time::Duration::from_secs(10),
-        )
+    /// Connect with default deadlines. Unauthenticated calls are refused by
+    /// tollgate-server; use `with_config` to supply credentials or mTLS.
+    pub fn new(base_url: impl Into<String>) -> Result<Arc<Self>, StoreError> {
+        Self::with_config(base_url, crate::http_security::HttpStoreConfig::default())
     }
 
-    #[must_use]
     pub fn with_timeouts(
         base_url: impl Into<String>,
         connect_timeout: std::time::Duration,
         request_timeout: std::time::Duration,
-    ) -> Arc<Self> {
-        Arc::new(HttpStore {
-            base: base_url.into().trim_end_matches('/').to_string(),
-            client: reqwest::Client::builder()
-                .connect_timeout(connect_timeout)
-                .timeout(request_timeout)
-                .build()
-                .expect("static client configuration"),
-        })
+    ) -> Result<Arc<Self>, StoreError> {
+        Self::with_config(
+            base_url,
+            crate::http_security::HttpStoreConfig {
+                connect_timeout,
+                request_timeout,
+                ..Default::default()
+            },
+        )
     }
 
-    fn api_url(&self, path: &str) -> String {
-        format!("{}{API_PREFIX}{path}", self.base)
+    pub fn with_config(
+        base_url: impl Into<String>,
+        config: crate::http_security::HttpStoreConfig,
+    ) -> Result<Arc<Self>, StoreError> {
+        let (base, client) = crate::http_security::client(&base_url.into(), &config)?;
+        Ok(Arc::new(Self {
+            base,
+            transport: arc_swap::ArcSwap::from_pointee(HttpTransport {
+                client,
+                bearer: config.bearer,
+                request_timeout: config.request_timeout,
+            }),
+        }))
+    }
+
+    /// Rotate TLS roots, the client certificate and/or credential provider as
+    /// one generation. In-flight calls retain their original generation; future
+    /// calls use the new one through the same Arc held by background managers.
+    pub fn reconfigure(
+        &self,
+        config: crate::http_security::HttpStoreConfig,
+    ) -> Result<(), StoreError> {
+        let (_, client) = crate::http_security::client(&self.base, &config)?;
+        self.transport.store(Arc::new(HttpTransport {
+            client,
+            bearer: config.bearer,
+            request_timeout: config.request_timeout,
+        }));
+        Ok(())
+    }
+
+    fn request(&self, method: reqwest::Method, path: &str) -> HttpRequest {
+        let transport = self.transport.load_full();
+        let request = transport
+            .client
+            .request(method, format!("{}{API_PREFIX}{path}", self.base));
+        HttpRequest { transport, request }
+    }
+}
+
+// The builder owns the same generation that supplies its credentials and
+// deadline. Call sites cannot combine a new bearer with an old mTLS identity.
+struct HttpRequest {
+    transport: Arc<HttpTransport>,
+    request: reqwest::RequestBuilder,
+}
+
+impl HttpRequest {
+    fn json<T: serde::Serialize + ?Sized>(mut self, body: &T) -> Self {
+        self.request = self.request.json(body);
+        self
+    }
+
+    async fn send(self) -> Result<reqwest::Response, StoreError> {
+        let mut request = self.request;
+        let deadline = tokio::time::Instant::now() + self.transport.request_timeout;
+        if let Some(provider) = &self.transport.bearer {
+            let token = tokio::time::timeout_at(deadline, provider.token())
+                .await
+                .map_err(|_| StoreError("control-plane credential deadline expired".into()))??;
+            request = request.header(reqwest::header::AUTHORIZATION, token.header());
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(StoreError("control-plane request deadline expired".into()));
+        }
+        // Reqwest's deadline includes reading the response body. Reduce it by
+        // credential time so a slow identity provider cannot double the budget.
+        request
+            .timeout(remaining)
+            .send()
+            .await
+            .map_err(|e| StoreError(format!("http: {}", e.without_url())))
     }
 }
 
 fn transport_error(e: reqwest::Error) -> AllocateError {
-    AllocateError::Storage(StoreError(format!("http: {e}")))
+    AllocateError::Storage(StoreError(format!("http: {}", e.without_url())))
 }
 
 /// Map a server problem back into the domain vocabulary. Unknown codes are
@@ -127,16 +197,14 @@ impl LeaseAllocator for HttpStore {
         // The server stamps its own clock; `now` stays local-only.
         let ttl_seconds = u32::try_from(ttl.as_secs().max(0)).unwrap_or(u32::MAX);
         let response = self
-            .client
-            .post(self.api_url("/leases/acquire"))
+            .request(reqwest::Method::POST, "/leases/acquire")
             .json(&AcquireRequest {
                 account_id: account,
                 requested,
                 ttl_seconds,
             })
             .send()
-            .await
-            .map_err(transport_error)?;
+            .await?;
         if !response.status().is_success() {
             return Err(read_problem(response).await);
         }
@@ -151,16 +219,14 @@ impl LeaseAllocator for HttpStore {
         _now: Timestamp,
     ) -> Result<(), AllocateError> {
         let response = self
-            .client
-            .post(self.api_url("/leases/release"))
+            .request(reqwest::Method::POST, "/leases/release")
             .json(&ReleaseRequest {
                 lease_id,
                 fencing_token,
                 unspent,
             })
             .send()
-            .await
-            .map_err(transport_error)?;
+            .await?;
         if !response.status().is_success() {
             return Err(read_problem(response).await);
         }
@@ -182,8 +248,7 @@ impl LeaseAllocator for HttpStore {
         // acquire and release.
         let ttl_seconds = u32::try_from(ttl.as_secs().max(0)).unwrap_or(u32::MAX);
         let response = self
-            .client
-            .post(self.api_url("/leases/consolidate"))
+            .request(reqwest::Method::POST, "/leases/consolidate")
             .json(&ConsolidateRequest {
                 lease_id,
                 fencing_token,
@@ -192,8 +257,7 @@ impl LeaseAllocator for HttpStore {
                 ttl_seconds,
             })
             .send()
-            .await
-            .map_err(transport_error)?;
+            .await?;
         if !response.status().is_success() {
             return Err(read_problem(response).await);
         }
@@ -217,15 +281,13 @@ impl LeaseAllocator for HttpStore {
 impl SnapshotSource for HttpStore {
     async fn snapshot(&self, principal: Principal) -> Result<SnapshotResolution, StoreError> {
         let response = self
-            .client
-            .get(self.api_url(&format!("/snapshots/{principal}")))
+            .request(reqwest::Method::GET, &format!("/snapshots/{principal}"))
             .send()
-            .await
-            .map_err(|e| StoreError(format!("http: {e}")))?;
+            .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             let problem: Problem = response.json().await.map_err(|e| {
                 StoreError(format!(
-                    "snapshot endpoint returned an unstructured 404, not a confirmed unknown principal: {e}"
+                    "snapshot endpoint returned an unstructured 404, not a confirmed unknown principal: {}", e.without_url()
                 ))
             })?;
             if problem.code == "unknown-principal" {
@@ -240,7 +302,7 @@ impl SnapshotSource for HttpStore {
             let problem: Problem = response
                 .json()
                 .await
-                .map_err(|e| StoreError(format!("http: {e}")))?;
+                .map_err(|e| StoreError(format!("http: {}", e.without_url())))?;
             if problem.code != "revoked-principal" {
                 return Err(StoreError(format!(
                     "server {}: {}",
@@ -253,12 +315,12 @@ impl SnapshotSource for HttpStore {
             return Ok(SnapshotResolution::Revoked { generation });
         }
         if !response.status().is_success() {
-            return Err(StoreError(format!("server returned {}", response.status())));
+            return Err(StoreError(problem_detail(response).await));
         }
         let snapshot: AccountSnapshot = response
             .json()
             .await
-            .map_err(|e| StoreError(format!("http: {e}")))?;
+            .map_err(|e| StoreError(format!("http: {}", e.without_url())))?;
         let snapshot = PublishableSnapshot::try_new(Arc::new(snapshot))
             .map_err(|error| StoreError(format!("invalid snapshot from server: {error}")))?;
         Ok(SnapshotResolution::Present(snapshot))
@@ -279,21 +341,19 @@ impl SnapshotSource for HttpStore {
     /// catalogue, which would mean "forget everyone".
     async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
         let response = self
-            .client
-            .get(self.api_url("/snapshots"))
+            .request(reqwest::Method::GET, "/snapshots")
             .send()
-            .await
-            .map_err(|e| StoreError(format!("http: {e}")))?;
+            .await?;
         if response.status() == reqwest::StatusCode::NOT_IMPLEMENTED {
             return Ok(None);
         }
         if !response.status().is_success() {
-            return Err(StoreError(format!("server returned {}", response.status())));
+            return Err(StoreError(problem_detail(response).await));
         }
         let body: PrincipalsResponse = response
             .json()
             .await
-            .map_err(|e| StoreError(format!("http: {e}")))?;
+            .map_err(|e| StoreError(format!("http: {}", e.without_url())))?;
         Ok(Some(body.principals))
     }
 }
@@ -306,12 +366,10 @@ impl UsageSink for HttpStore {
         _now: Timestamp,
     ) -> Result<IngestReport, IngestError> {
         let response = self
-            .client
-            .post(self.api_url("/usage/ingest"))
+            .request(reqwest::Method::POST, "/usage/ingest")
             .json(&IngestRequestRef { events })
             .send()
-            .await
-            .map_err(|e| StoreError(format!("http: {e}")))?;
+            .await?;
         let status = response.status();
         if !status.is_success() {
             let detail = problem_detail(response).await;
@@ -319,12 +377,15 @@ impl UsageSink for HttpStore {
             // undecodable, a contract it does not implement. Replaying it
             // unchanged earns the same answer forever, so it is refused rather
             // than retried — the wedge #61 describes is a writer looping on
-            // exactly this. The two exceptions are the 4xx statuses that
+            // exactly this. The exceptions are the 4xx statuses that
             // describe the moment rather than the payload: 408 and 429 are
-            // invitations to try again.
+            // invitations to try again. 401/403 describe credentials, which
+            // can rotate without changing or discarding the batch.
             let terminal = status.is_client_error()
                 && status != reqwest::StatusCode::REQUEST_TIMEOUT
-                && status != reqwest::StatusCode::TOO_MANY_REQUESTS;
+                && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                && status != reqwest::StatusCode::UNAUTHORIZED
+                && status != reqwest::StatusCode::FORBIDDEN;
             let error = StoreError(detail);
             return Err(if terminal {
                 IngestError::Refused(error)
@@ -335,6 +396,6 @@ impl UsageSink for HttpStore {
         response
             .json()
             .await
-            .map_err(|e| StoreError(format!("http: {e}")).into())
+            .map_err(|e| StoreError(format!("http: {}", e.without_url())).into())
     }
 }

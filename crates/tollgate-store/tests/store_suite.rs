@@ -1294,7 +1294,7 @@ async fn suspending_an_account_stops_leases_and_republishes_its_snapshots() {
         .await
         .unwrap();
     assert_eq!(
-        (change.republished, change.unreadable),
+        (change.outcome.republished, change.outcome.unreadable),
         (2, 0),
         "the reported blast radius is both live principals"
     );
@@ -1533,7 +1533,10 @@ async fn a_capacity_class_change_republishes_every_live_snapshot() {
     let change = AdminStore::set_capacity_class(&*store, ACCOUNT, CapacityClass::BestEffort)
         .await
         .unwrap();
-    assert_eq!((change.republished, change.unreadable), (2, 0));
+    assert_eq!(
+        (change.outcome.republished, change.outcome.unreadable),
+        (2, 0)
+    );
 
     for principal in [first, second] {
         let SnapshotResolution::Present(snapshot) = store.snapshot(principal).await.unwrap() else {
@@ -1574,7 +1577,10 @@ async fn repeating_a_capacity_class_change_publishes_nothing_new() {
     let change = AdminStore::set_capacity_class(&*store, ACCOUNT, CapacityClass::BestEffort)
         .await
         .unwrap();
-    assert_eq!((change.republished, change.unreadable), (0, 0));
+    assert_eq!(
+        (change.outcome.republished, change.outcome.unreadable),
+        (0, 0)
+    );
 
     let SnapshotResolution::Present(snapshot) = store.snapshot(principal).await.unwrap() else {
         panic!("the snapshot must be present");
@@ -1612,7 +1618,10 @@ async fn a_capacity_class_change_does_not_resurrect_revoked_principals() {
     let change = AdminStore::set_capacity_class(&*store, ACCOUNT, CapacityClass::BestEffort)
         .await
         .unwrap();
-    assert_eq!(change.republished, 1, "only the live principal moved");
+    assert_eq!(
+        change.outcome.republished, 1,
+        "only the live principal moved"
+    );
     assert!(matches!(
         store.snapshot(revoked).await.unwrap(),
         SnapshotResolution::Revoked { .. }
@@ -1840,7 +1849,7 @@ async fn repeating_a_status_change_publishes_nothing_new() {
         .await
         .unwrap();
     assert_eq!(
-        change.republished, 0,
+        change.outcome.republished, 0,
         "a repeat reports zero, which is how an operator sees it changed nothing"
     );
 
@@ -1883,7 +1892,7 @@ async fn a_status_change_pushes_every_republished_principal() {
         .await
         .unwrap();
     assert_eq!(
-        change.republished, 2,
+        change.outcome.republished, 2,
         "the tombstone is not republished, so it is not counted either"
     );
 
@@ -2535,7 +2544,7 @@ async fn a_publish_racing_a_suspension_never_leaves_the_records_disagreeing() {
                 )
                 .await
                 {
-                    Ok(()) | Err(PublishSnapshotError::StatusMismatch { .. }) => {}
+                    Ok(_) | Err(PublishSnapshotError::StatusMismatch { .. }) => {}
                     Err(other) => panic!("unexpected publish failure: {other}"),
                 }
             }
@@ -2564,7 +2573,7 @@ async fn a_publish_racing_a_suspension_never_leaves_the_records_disagreeing() {
         )
         .await
         {
-            Ok(()) => AccountStatus::Active,
+            Ok(_) => AccountStatus::Active,
             Err(PublishSnapshotError::StatusMismatch { ledger, .. }) => ledger,
             Err(other) => panic!("the probe publish must not fail for storage: {other}"),
         };
@@ -3600,4 +3609,216 @@ async fn the_budget_view_writes_off_settlement_loss() {
         "1000 funded, less the 150 billed and the 50 written off"
     );
     assert_conserved(&store);
+}
+
+#[tokio::test]
+async fn admin_receipts_identify_the_state_each_operation_replaced() {
+    let store = MemoryStore::new(full_grant_policy()).unwrap();
+    store.create_account(AccountConfig {
+        account_id: ACCOUNT,
+        initial_balance: CostUnits(100),
+        status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
+    });
+    use tollgate_store::AdminState;
+    let created = AdminStore::create_account(
+        &*store,
+        AccountConfig {
+            account_id: AccountId(2),
+            initial_balance: CostUnits(10),
+            status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(created.before, AdminState::Absent);
+    assert_eq!(
+        created.after,
+        AdminState::AccountCreated {
+            initial_balance: CostUnits(10),
+            status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured
+        }
+    );
+    let deposit = AdminStore::deposit(&*store, ACCOUNT, CostUnits(25))
+        .await
+        .unwrap();
+    assert_eq!(
+        deposit.before,
+        AdminState::Funding {
+            topup: CostUnits(100),
+            deposited: CostUnits(100)
+        }
+    );
+    assert_eq!(
+        deposit.after,
+        AdminState::Funding {
+            topup: CostUnits(125),
+            deposited: CostUnits(125)
+        }
+    );
+    let status = AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
+        .await
+        .unwrap();
+    assert_eq!(
+        status.before,
+        AdminState::Status {
+            status: AccountStatus::Active
+        }
+    );
+    assert_eq!(
+        status.after,
+        AdminState::Status {
+            status: AccountStatus::Suspended
+        }
+    );
+    let repeated = AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
+        .await
+        .unwrap();
+    assert_eq!(repeated.before, repeated.after);
+    let class = AdminStore::set_capacity_class(&*store, ACCOUNT, CapacityClass::BestEffort)
+        .await
+        .unwrap();
+    assert_eq!(
+        class.before,
+        AdminState::CapacityClass {
+            capacity_class: CapacityClass::Assured
+        }
+    );
+    assert_eq!(
+        class.after,
+        AdminState::CapacityClass {
+            capacity_class: CapacityClass::BestEffort
+        }
+    );
+    let unknown = AdminStore::remove_snapshot(&*store, Principal(99))
+        .await
+        .unwrap();
+    assert_eq!(unknown.before, AdminState::Absent);
+    assert_eq!(unknown.after, AdminState::Absent);
+}
+
+#[tokio::test]
+async fn concurrent_deposit_receipts_form_one_exact_funding_history() {
+    let store = MemoryStore::new(full_grant_policy()).unwrap();
+    store.create_account(AccountConfig {
+        account_id: ACCOUNT,
+        initial_balance: CostUnits(100),
+        status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
+    });
+    use tollgate_store::AdminState;
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..32 {
+        let store = Arc::clone(&store);
+        tasks.spawn(async move {
+            AdminStore::deposit(&*store, ACCOUNT, CostUnits(7))
+                .await
+                .unwrap()
+        });
+    }
+    let mut receipts = Vec::new();
+    while let Some(receipt) = tasks.join_next().await {
+        receipts.push(receipt.unwrap());
+    }
+    receipts.sort_by_key(|receipt| match receipt.before {
+        AdminState::Funding { deposited, .. } => deposited.get(),
+        _ => panic!("wrong receipt state"),
+    });
+    for (index, receipt) in receipts.iter().enumerate() {
+        let before = 100 + index as u64 * 7;
+        assert_eq!(
+            receipt.before,
+            AdminState::Funding {
+                topup: CostUnits(before),
+                deposited: CostUnits(before)
+            }
+        );
+        assert_eq!(
+            receipt.after,
+            AdminState::Funding {
+                topup: CostUnits(before + 7),
+                deposited: CostUnits(before + 7)
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn racing_publication_and_revocation_receipts_name_the_actual_predecessor() {
+    let store = MemoryStore::new(full_grant_policy()).unwrap();
+    store.create_account(AccountConfig {
+        account_id: ACCOUNT,
+        initial_balance: CostUnits(100),
+        status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
+    });
+    use tollgate_store::AdminState;
+    let mut tasks = tokio::task::JoinSet::new();
+    for generation in 1..=24 {
+        let publisher = Arc::clone(&store);
+        tasks.spawn(async move {
+            let snapshot = publishable(Arc::new(
+                AccountSnapshot::builder(
+                    ACCOUNT,
+                    Generation(generation),
+                    AccountStatus::Active,
+                    t(1000),
+                    PermissionBits(0),
+                    ResolvedLimits::new(1),
+                    Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+                )
+                .build(),
+            ));
+            AdminStore::publish_snapshot(&*publisher, Principal(99), snapshot)
+                .await
+                .unwrap()
+        });
+        if generation % 3 == 0 {
+            let store = Arc::clone(&store);
+            tasks.spawn(async move {
+                AdminStore::remove_snapshot(&*store, Principal(99))
+                    .await
+                    .unwrap()
+            });
+        }
+    }
+    let mut changed = Vec::new();
+    while let Some(receipt) = tasks.join_next().await {
+        let receipt = receipt.unwrap();
+        if receipt.before != receipt.after {
+            changed.push(receipt);
+        }
+    }
+    changed.sort_by_key(|receipt| match receipt.after {
+        AdminState::Snapshot {
+            generation,
+            revoked,
+        } => (generation.0, revoked),
+        _ => panic!("wrong publication receipt"),
+    });
+    let mut previous = AdminState::Absent;
+    for receipt in changed {
+        assert_eq!(
+            receipt.before, previous,
+            "receipts must describe one serialized history"
+        );
+        previous = receipt.after;
+    }
+    let final_state = match SnapshotSource::snapshot(&*store, Principal(99))
+        .await
+        .unwrap()
+    {
+        SnapshotResolution::Present(snapshot) => AdminState::Snapshot {
+            generation: snapshot.generation,
+            revoked: false,
+        },
+        SnapshotResolution::Revoked { generation } => AdminState::Snapshot {
+            generation,
+            revoked: true,
+        },
+        SnapshotResolution::Unknown => AdminState::Absent,
+    };
+    assert_eq!(previous, final_state);
 }

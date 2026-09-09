@@ -15,14 +15,21 @@
 //! - `POST /v1/usage/ingest` — idempotent usage batches.
 //! - `POST /v1/admin/accounts`, `POST /v1/admin/accounts/{id}/deposit`,
 //!   `POST /v1/admin/accounts/{id}/status`,
+//!   `POST /v1/admin/accounts/{id}/capacity-class`,
 //!   `PUT/DELETE /v1/admin/snapshots/{principal}` — administration.
 //! - `GET /livez`, `GET /readyz` — probes.
 //!
-//! The PoC binds to loopback and carries no authentication of its own; the
-//! control-plane credential story (HMAC-verified operator keys) is a
-//! documented seam in `docs/DESIGN.md`, not an accident.
+//! All protected handlers require verified instance or operator evidence.
+//! [`serve`] owns TLS and refuses exposed plaintext; [`security::ServerSecurity`]
+//! atomically rotates roles, credentials and TLS. Administrative audit events
+//! carry receipts captured by the backend at mutation. See
+//! `docs/CONTROL_PLANE_SECURITY.md` for deployment and audit collection.
 
+pub mod config;
 pub mod error;
+pub mod google;
+pub mod security;
+pub mod transport;
 
 use std::sync::Arc;
 
@@ -47,12 +54,14 @@ use tollgate_store::{
 };
 
 use crate::error::{ApiError, ApiJson, ApiPath};
+use crate::security::{Authorization, InstanceIdentity, OperatorIdentity, Role, ServerSecurity};
 
 /// Everything the handlers need. `S` is the storage backend; the clock is the
 /// single place wall time enters the server.
 pub struct ServerState<S> {
     pub store: Arc<S>,
     pub clock: Arc<dyn Clock>,
+    pub security: Arc<ServerSecurity>,
 }
 
 impl<S> Clone for ServerState<S> {
@@ -60,6 +69,7 @@ impl<S> Clone for ServerState<S> {
         ServerState {
             store: Arc::clone(&self.store),
             clock: Arc::clone(&self.clock),
+            security: Arc::clone(&self.security),
         }
     }
 }
@@ -82,48 +92,48 @@ impl<T> Backend for T where
 }
 
 pub fn router<S: Backend>(state: ServerState<S>) -> Router {
+    let authorization = |role| Authorization {
+        security: Arc::clone(&state.security),
+        clock: Arc::clone(&state.clock),
+        role,
+    };
+    let instance = Router::new()
+        .route("/leases/acquire", post(acquire::<S>))
+        .route("/leases/release", post(release::<S>))
+        .route("/leases/consolidate", post(consolidate::<S>))
+        .route("/leases/reclaim", post(reclaim::<S>))
+        .route("/snapshots", get(list_principals::<S>))
+        .route("/snapshots/{principal}", get(fetch_snapshot::<S>))
+        .route(
+            "/usage/ingest",
+            post(ingest::<S>).layer(DefaultBodyLimit::max(MAX_INGEST_BODY_BYTES)),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            authorization(Role::Instance),
+            security::authorize,
+        ));
+    let operator = Router::new()
+        .route("/accounts", post(create_account::<S>))
+        .route("/accounts/{account}/deposit", post(deposit::<S>))
+        .route("/accounts/{account}/status", post(set_status::<S>))
+        .route(
+            "/accounts/{account}/capacity-class",
+            post(set_capacity_class::<S>),
+        )
+        .route(
+            "/snapshots/{principal}",
+            put(publish_snapshot::<S>)
+                .delete(remove_snapshot::<S>)
+                .layer(DefaultBodyLimit::max(MAX_SNAPSHOT_BODY_BYTES)),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            authorization(Role::Operator),
+            security::authorize,
+        ));
     Router::new()
         .route("/livez", get(async || StatusCode::OK))
         .route("/readyz", get(readyz::<S>))
-        .nest(
-            API_PREFIX,
-            Router::new()
-                .route("/leases/acquire", post(acquire::<S>))
-                .route("/leases/release", post(release::<S>))
-                .route("/leases/consolidate", post(consolidate::<S>))
-                .route("/leases/reclaim", post(reclaim::<S>))
-                .route("/snapshots", get(list_principals::<S>))
-                .route("/snapshots/{principal}", get(fetch_snapshot::<S>))
-                // Declared, not inherited. Without this the endpoint ran on
-                // axum's implicit 2 MiB default: a limit no document stated,
-                // that no client could discover, and that the server reported
-                // as malformed JSON when it bit (#61). The value is derived
-                // from the batch cap and the widest event, both in `wire`, so
-                // the number a client validates against and the number the
-                // server enforces cannot drift apart.
-                .route(
-                    "/usage/ingest",
-                    post(ingest::<S>).layer(DefaultBodyLimit::max(MAX_INGEST_BODY_BYTES)),
-                )
-                .route("/admin/accounts", post(create_account::<S>))
-                .route("/admin/accounts/{account}/deposit", post(deposit::<S>))
-                .route("/admin/accounts/{account}/status", post(set_status::<S>))
-                .route(
-                    "/admin/accounts/{account}/capacity-class",
-                    post(set_capacity_class::<S>),
-                )
-                // A snapshot carries its whole cost table, so its worst
-                // case grows with the number of priced classes rather than
-                // with a batch size. Given its own limit for the same reason
-                // as the one above: an operator publishing a large catalogue
-                // should be refused by a stated number or not at all.
-                .route(
-                    "/admin/snapshots/{principal}",
-                    put(publish_snapshot::<S>)
-                        .delete(remove_snapshot::<S>)
-                        .layer(DefaultBodyLimit::max(MAX_SNAPSHOT_BODY_BYTES)),
-                ),
-        )
+        .nest(API_PREFIX, instance.nest("/admin", operator))
         .with_state(state)
 }
 
@@ -141,21 +151,32 @@ pub async fn serve<S: Backend>(
             "reclaim_interval must be positive",
         ));
     }
+    let listener = transport::SecureListener::new(listener, Arc::clone(&state.security))?;
     let sweep_store = Arc::clone(&state.store);
     let sweep_clock = Arc::clone(&state.clock);
-    let sweeper = tokio::spawn(
+    let sweeper = MaintenanceTask(tokio::spawn(
         maintenance_sweep(sweep_store, sweep_clock, reclaim_interval).instrument(
             tracing::info_span!(
                 "maintenance_sweep",
                 interval_ms = reclaim_interval.as_millis()
             ),
         ),
-    );
-    let result = axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown)
-        .await;
-    sweeper.abort();
+    ));
+    let result = axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<transport::PeerIdentity>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await;
+    drop(sweeper);
     result
+}
+
+struct MaintenanceTask(tokio::task::JoinHandle<()>);
+impl Drop for MaintenanceTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Reclaim expired leases and roll due budget periods forever, on the
@@ -364,6 +385,7 @@ async fn readyz<S: Backend>(State(state): State<ServerState<S>>) -> StatusCode {
 }
 
 async fn acquire<S: Backend>(
+    _identity: InstanceIdentity,
     State(state): State<ServerState<S>>,
     ApiJson(request): ApiJson<AcquireRequest>,
 ) -> Result<Json<AcquireResponse>, ApiError> {
@@ -380,6 +402,7 @@ async fn acquire<S: Backend>(
 }
 
 async fn release<S: Backend>(
+    _identity: InstanceIdentity,
     State(state): State<ServerState<S>>,
     ApiJson(request): ApiJson<ReleaseRequest>,
 ) -> Result<StatusCode, ApiError> {
@@ -403,6 +426,7 @@ async fn release<S: Backend>(
 /// take the returned units in the gap, and the grant policy can hand back less
 /// than was returned (`LeaseAllocator::consolidate`).
 async fn consolidate<S: Backend>(
+    _identity: InstanceIdentity,
     State(state): State<ServerState<S>>,
     ApiJson(request): ApiJson<ConsolidateRequest>,
 ) -> Result<Json<ConsolidateResponse>, ApiError> {
@@ -421,12 +445,14 @@ async fn consolidate<S: Backend>(
 }
 
 async fn reclaim<S: Backend>(
+    _identity: InstanceIdentity,
     State(state): State<ServerState<S>>,
 ) -> Result<Json<Vec<ReclaimedLease>>, ApiError> {
     Ok(Json(state.store.reclaim_expired(state.clock.now()).await?))
 }
 
 async fn fetch_snapshot<S: Backend>(
+    _identity: InstanceIdentity,
     State(state): State<ServerState<S>>,
     ApiPath(principal): ApiPath<Principal>,
 ) -> Result<Json<Arc<tollgate_core::AccountSnapshot>>, ApiError> {
@@ -445,6 +471,7 @@ async fn fetch_snapshot<S: Backend>(
 /// conclusions — forget everything, or keep what you were configured with —
 /// and conflating them would silently strand it on a stale set.
 async fn list_principals<S: Backend>(
+    _identity: InstanceIdentity,
     State(state): State<ServerState<S>>,
 ) -> Result<Json<PrincipalsResponse>, ApiError> {
     match state.store.principals().await? {
@@ -457,6 +484,7 @@ async fn list_principals<S: Backend>(
 }
 
 async fn ingest<S: Backend>(
+    _identity: InstanceIdentity,
     State(state): State<ServerState<S>>,
     ApiJson(request): ApiJson<IngestRequest>,
 ) -> Result<Json<IngestReport>, ApiError> {
@@ -469,22 +497,28 @@ async fn ingest<S: Backend>(
 }
 
 async fn create_account<S: Backend>(
+    operator: OperatorIdentity,
     State(state): State<ServerState<S>>,
     ApiJson(request): ApiJson<CreateAccountRequest>,
 ) -> Result<StatusCode, ApiError> {
-    state
-        .store
-        .create_account(AccountConfig {
-            account_id: request.account_id,
-            initial_balance: request.initial_balance,
-            status: request.status,
-            capacity_class: CapacityClass::Assured,
-        })
+    operator
+        .run(
+            "create_account",
+            request.account_id,
+            state.clock.as_ref(),
+            state.store.create_account(AccountConfig {
+                account_id: request.account_id,
+                initial_balance: request.initial_balance,
+                status: request.status,
+                capacity_class: CapacityClass::Assured,
+            }),
+        )
         .await?;
     Ok(StatusCode::CREATED)
 }
 
 async fn deposit<S: Backend>(
+    operator: OperatorIdentity,
     State(state): State<ServerState<S>>,
     ApiPath(account): ApiPath<AccountId>,
     ApiJson(request): ApiJson<DepositRequest>,
@@ -495,11 +529,19 @@ async fn deposit<S: Backend>(
             "deposit must be positive",
         ));
     }
-    state.store.deposit(account, request.units).await?;
+    operator
+        .run(
+            "deposit",
+            account,
+            state.clock.as_ref(),
+            state.store.deposit(account, request.units),
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn set_status<S: Backend>(
+    operator: OperatorIdentity,
     State(state): State<ServerState<S>>,
     ApiPath(account): ApiPath<AccountId>,
     ApiJson(request): ApiJson<SetStatusRequest>,
@@ -507,9 +549,13 @@ async fn set_status<S: Backend>(
     // 200 with the blast radius, not 204: the ledger half is one row, but the
     // snapshot half is however many credentials the account has, and an
     // operator has no other way to learn which (#51).
-    let change = state
-        .store
-        .set_account_status(account, request.status)
+    let change = operator
+        .run(
+            "set_account_status",
+            account,
+            state.clock.as_ref(),
+            state.store.set_account_status(account, request.status),
+        )
         .await?;
     Ok(Json(SetStatusResponse {
         republished: change.republished,
@@ -518,6 +564,7 @@ async fn set_status<S: Backend>(
 }
 
 async fn set_capacity_class<S: Backend>(
+    operator: OperatorIdentity,
     State(state): State<ServerState<S>>,
     ApiPath(account): ApiPath<AccountId>,
     ApiJson(request): ApiJson<SetCapacityClassRequest>,
@@ -525,9 +572,15 @@ async fn set_capacity_class<S: Backend>(
     // 200 with the blast radius, for the reason `set_status` returns one: the
     // ledger half is one row and the snapshot half is however many credentials
     // the account has (#99).
-    let change = state
-        .store
-        .set_capacity_class(account, request.capacity_class)
+    let change = operator
+        .run(
+            "set_capacity_class",
+            account,
+            state.clock.as_ref(),
+            state
+                .store
+                .set_capacity_class(account, request.capacity_class),
+        )
         .await?;
     Ok(Json(SetStatusResponse {
         republished: change.republished,
@@ -536,19 +589,35 @@ async fn set_capacity_class<S: Backend>(
 }
 
 async fn publish_snapshot<S: Backend>(
+    operator: OperatorIdentity,
     State(state): State<ServerState<S>>,
     ApiPath(principal): ApiPath<Principal>,
     ApiJson(request): ApiJson<PublishSnapshotRequest>,
 ) -> Result<StatusCode, ApiError> {
     let snapshot = PublishableSnapshot::try_new(request.snapshot)?;
-    state.store.publish_snapshot(principal, snapshot).await?;
+    operator
+        .run(
+            "publish_snapshot",
+            principal,
+            state.clock.as_ref(),
+            state.store.publish_snapshot(principal, snapshot),
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn remove_snapshot<S: Backend>(
+    operator: OperatorIdentity,
     State(state): State<ServerState<S>>,
     ApiPath(principal): ApiPath<Principal>,
 ) -> Result<StatusCode, ApiError> {
-    state.store.remove_snapshot(principal).await?;
+    operator
+        .run(
+            "remove_snapshot",
+            principal,
+            state.clock.as_ref(),
+            state.store.remove_snapshot(principal),
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }

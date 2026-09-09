@@ -48,6 +48,8 @@ pub mod usage_writer;
 
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "http")]
+pub mod http_security;
 
 pub use period_roller::{
     PeriodRoller, PeriodRollerConfig, PeriodRollerConfigError, PeriodRollerHealth,
@@ -63,6 +65,10 @@ pub use tollgate_store::{Clock, ManualClock, SystemClock};
 
 #[cfg(feature = "http")]
 pub use http::HttpStore;
+#[cfg(feature = "http")]
+pub use http_security::{
+    BearerProvider, BearerToken, GoogleIdentity, HttpStoreConfig, StaticBearer,
+};
 pub use lease_manager::{
     AccountLeaseConfig, LeaseCounters, LeaseManager, LeaseManagerConfig, LeaseManagerConfigError,
     LeaseManagerReport, LeaseStats,

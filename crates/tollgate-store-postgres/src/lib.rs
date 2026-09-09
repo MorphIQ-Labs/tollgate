@@ -42,11 +42,11 @@ use tollgate_core::{
     Rollover, UsageEvent,
 };
 use tollgate_store::{
-    AccountConfig, AdminStore, AllocateError, BudgetError, Conservation, CreateAccountError,
-    GrantPolicy, IngestError, IngestReport, KeyDirectory, KeyError, KeyRecord, LeaseAllocator,
-    PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation,
-    RolledAccount, RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource,
-    StatusChange, StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
+    AccountConfig, AdminReceipt, AdminState, AdminStore, AllocateError, BudgetError, Conservation,
+    CreateAccountError, GrantPolicy, IngestError, IngestReport, KeyDirectory, KeyError, KeyRecord,
+    LeaseAllocator, PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease,
+    Revocation, RolledAccount, RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution,
+    SnapshotSource, StatusChange, StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
 };
 
 const STATE_ACTIVE: i16 = 0;
@@ -2150,7 +2150,10 @@ async fn republish_patched_snapshots(
 }
 #[async_trait]
 impl AdminStore for PostgresStore {
-    async fn create_account(&self, config: AccountConfig) -> Result<(), CreateAccountError> {
+    async fn create_account(
+        &self,
+        config: AccountConfig,
+    ) -> Result<tollgate_store::AdminReceipt<()>, CreateAccountError> {
         let result = sqlx::query(
             "INSERT INTO tollgate_accounts
              (account_id, balance, deposited, status, capacity_class, next_fence,
@@ -2168,24 +2171,46 @@ impl AdminStore for PostgresStore {
         if result.rows_affected() == 0 {
             return Err(CreateAccountError::AlreadyExists);
         }
-        Ok(())
+        Ok(AdminReceipt::new(
+            (),
+            AdminState::Absent,
+            AdminState::AccountCreated {
+                initial_balance: config.initial_balance,
+                status: config.status,
+                capacity_class: config.capacity_class,
+            },
+        ))
     }
 
-    async fn deposit(&self, account: AccountId, units: CostUnits) -> Result<(), AllocateError> {
-        let result = sqlx::query(
+    async fn deposit(
+        &self,
+        account: AccountId,
+        units: CostUnits,
+    ) -> Result<AdminReceipt<()>, AllocateError> {
+        let row = sqlx::query(
             "UPDATE tollgate_accounts
              SET balance = balance + $2, deposited = deposited + $2
-             WHERE account_id = $1",
+             WHERE account_id = $1
+             RETURNING balance - $2 AS old_topup, deposited - $2 AS old_deposited,
+                       balance AS new_topup, deposited AS new_deposited",
         )
         .bind(id_bytes(account.0))
         .bind(to_i64(units, "deposit").map_err(AllocateError::Storage)?)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
-        .map_err(alloc_storage)?;
-        if result.rows_affected() == 0 {
-            return Err(AllocateError::UnknownAccount);
-        }
-        Ok(())
+        .map_err(alloc_storage)?
+        .ok_or(AllocateError::UnknownAccount)?;
+        let state = |topup: &str, deposited: &str| -> Result<AdminState, StoreError> {
+            Ok(AdminState::Funding {
+                topup: to_units(row.get(topup), "audit topup")?,
+                deposited: to_units(row.get(deposited), "audit deposited")?,
+            })
+        };
+        Ok(AdminReceipt::new(
+            (),
+            state("old_topup", "old_deposited")?,
+            state("new_topup", "new_deposited")?,
+        ))
     }
 
     async fn set_budget_schedule(
@@ -2295,7 +2320,7 @@ impl AdminStore for PostgresStore {
         &self,
         account: AccountId,
         status: AccountStatus,
-    ) -> Result<StatusChange, SetStatusError> {
+    ) -> Result<tollgate_store::AdminReceipt<StatusChange>, SetStatusError> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
         let result = async {
             // The account row first, and its lock is the serialization point:
@@ -2311,9 +2336,8 @@ impl AdminStore for PostgresStore {
             .map_err(storage)?
             .ok_or(SetStatusError::UnknownAccount)?;
 
-            if decode_status(row.get::<String, _>(0))? == AccountStatus::Closed
-                && status != AccountStatus::Closed
-            {
+            let before = decode_status(row.get::<String, _>(0))?;
+            if before == AccountStatus::Closed && status != AccountStatus::Closed {
                 // Terminal, and the refusal changes nothing: no ledger write,
                 // no generation bump. Rolling back here is what makes that so.
                 return Err(SetStatusError::AccountClosed);
@@ -2326,13 +2350,14 @@ impl AdminStore for PostgresStore {
                 .await
                 .map_err(storage)?;
 
-            republish_patched_snapshots(&mut tx, account, "{status}", status.as_str()).await
+            let (republished, unreadable) =
+                republish_patched_snapshots(&mut tx, account, "{status}", status.as_str()).await?;
+            Ok((before, republished, unreadable))
         }
         .await;
 
-        let (republished, unreadable) = finish_transaction(tx, result).await?;
-        // After commit. `publish_snapshot` gets away with pushing before only
-        // because it is a single autocommit statement.
+        let (before, republished, unreadable) = finish_transaction(tx, result).await?;
+        // Publish only after commit, as with snapshot publication itself.
         if pushes_exceed_capacity(republished.len()) {
             tracing::warn!(
                 %account,
@@ -2348,19 +2373,23 @@ impl AdminStore for PostgresStore {
                 resolution: SnapshotResolution::Present(snapshot),
             });
         }
-        Ok(StatusChange {
-            // Rows that changed durably: the ones pushed, plus any that could
-            // not be decoded to push. The caller is told both numbers.
-            republished: count + unreadable,
-            unreadable,
-        })
+        Ok(AdminReceipt::new(
+            StatusChange {
+                // Rows that changed durably: the ones pushed, plus any that could
+                // not be decoded to push. The caller is told both numbers.
+                republished: count + unreadable,
+                unreadable,
+            },
+            AdminState::Status { status: before },
+            AdminState::Status { status },
+        ))
     }
 
     async fn set_capacity_class(
         &self,
         account: AccountId,
         class: CapacityClass,
-    ) -> Result<StatusChange, SetStatusError> {
+    ) -> Result<tollgate_store::AdminReceipt<StatusChange>, SetStatusError> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
         let result = async {
             // `FOR UPDATE` for the reason `set_account_status` takes it: the
@@ -2371,7 +2400,7 @@ impl AdminStore for PostgresStore {
             // what keeps the two account-owned facts from racing each other's
             // republications.
             let row = sqlx::query(
-                "SELECT status FROM tollgate_accounts WHERE account_id = $1 FOR UPDATE",
+                "SELECT status, capacity_class FROM tollgate_accounts WHERE account_id = $1 FOR UPDATE",
             )
             .bind(id_bytes(account.0))
             .fetch_optional(&mut *tx)
@@ -2379,6 +2408,7 @@ impl AdminStore for PostgresStore {
             .map_err(storage)?
             .ok_or(SetStatusError::UnknownAccount)?;
 
+            let before = decode_capacity_class(row.get::<String, _>(1))?;
             // Closed is terminal, so reclassifying is meaningless. Unlike a
             // status change there is no "already at the target" escape: every
             // class is equally meaningless on a closed account. Rolling back
@@ -2394,11 +2424,13 @@ impl AdminStore for PostgresStore {
                 .await
                 .map_err(storage)?;
 
-            republish_patched_snapshots(&mut tx, account, "{capacity_class}", class.as_str()).await
+            let (republished, unreadable) =
+                republish_patched_snapshots(&mut tx, account, "{capacity_class}", class.as_str()).await?;
+            Ok((before, republished, unreadable))
         }
         .await;
 
-        let (republished, unreadable) = finish_transaction(tx, result).await?;
+        let (before, republished, unreadable) = finish_transaction(tx, result).await?;
         if pushes_exceed_capacity(republished.len()) {
             tracing::warn!(
                 %account,
@@ -2415,19 +2447,27 @@ impl AdminStore for PostgresStore {
                 resolution: SnapshotResolution::Present(snapshot),
             });
         }
-        Ok(StatusChange {
-            // Rows that changed durably, whether or not they could be decoded
-            // for a push — the same accounting `set_account_status` reports.
-            republished: count + unreadable,
-            unreadable,
-        })
+        Ok(AdminReceipt::new(
+            StatusChange {
+                // Rows that changed durably, whether or not they could be decoded
+                // for a push — the same accounting `set_account_status` reports.
+                republished: count + unreadable,
+                unreadable,
+            },
+            AdminState::CapacityClass {
+                capacity_class: before,
+            },
+            AdminState::CapacityClass {
+                capacity_class: class,
+            },
+        ))
     }
 
     async fn publish_snapshot(
         &self,
         principal: Principal,
         snapshot: PublishableSnapshot,
-    ) -> Result<(), PublishSnapshotError> {
+    ) -> Result<tollgate_store::AdminReceipt<()>, PublishSnapshotError> {
         let generation = i64::try_from(snapshot.generation.0).map_err(|_| {
             StoreError("snapshot generation exceeds PostgreSQL BIGINT range".into())
         })?;
@@ -2490,25 +2530,13 @@ impl AdminStore for PostgresStore {
             let value = serde_json::to_value(StoredSnapshotRef::from(published.as_snapshot()))
                 .map_err(|e| StoreError(format!("snapshot encode: {e}")))?;
 
-            let result = sqlx::query(
-                "INSERT INTO tollgate_snapshots (principal, generation, snapshot, deleted)
-                 VALUES ($1, $2, $3, FALSE)
-                 ON CONFLICT (principal) DO UPDATE
-                 SET generation = EXCLUDED.generation, snapshot = EXCLUDED.snapshot,
-                     deleted = FALSE
-                 WHERE tollgate_snapshots.generation < EXCLUDED.generation",
-            )
-            .bind(id_bytes(principal.0))
-            .bind(generation)
-            .bind(value)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
-            Ok((result.rows_affected() > 0, published))
+            let (written, before, after) =
+                write_snapshot_audited(&mut tx, principal, generation, value).await?;
+            Ok((written, published, before, after))
         }
         .await;
 
-        let (written, published) = finish_transaction(tx, result).await?;
+        let (written, published, before, after) = finish_transaction(tx, result).await?;
         if written {
             // The stamped snapshot, not the submitted one: a subscriber must
             // receive exactly what was stored, or a pushed instance and a
@@ -2518,27 +2546,113 @@ impl AdminStore for PostgresStore {
                 resolution: SnapshotResolution::Present(published),
             });
         }
-        Ok(())
+        Ok(AdminReceipt::new((), before, after))
     }
 
-    async fn remove_snapshot(&self, principal: Principal) -> Result<(), StoreError> {
-        let row = sqlx::query(
-            "UPDATE tollgate_snapshots SET deleted = TRUE
-             WHERE principal = $1 AND deleted = FALSE RETURNING generation",
-        )
-        .bind(id_bytes(principal.0))
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(storage)?;
-        if let Some(row) = row {
-            let generation = generation_from(row.get::<i64, _>(0))?;
+    async fn remove_snapshot(&self, principal: Principal) -> Result<AdminReceipt<()>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let result = async {
+            let before = snapshot_audit_row(&mut tx, principal).await?;
+            let after = match before {
+                AdminState::Snapshot {
+                    generation,
+                    revoked: false,
+                } => {
+                    sqlx::query(
+                        "UPDATE tollgate_snapshots SET deleted = TRUE WHERE principal = $1",
+                    )
+                    .bind(id_bytes(principal.0))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(storage)?;
+                    AdminState::Snapshot {
+                        generation,
+                        revoked: true,
+                    }
+                }
+                state => state,
+            };
+            Ok(AdminReceipt::new((), before, after))
+        }
+        .await;
+        let receipt = finish_transaction(tx, result).await?;
+        if receipt.before != receipt.after
+            && let AdminState::Snapshot { generation, .. } = receipt.after
+        {
             self.push_to_subscribers(SnapshotPush {
                 principal,
                 resolution: SnapshotResolution::Revoked { generation },
             });
         }
-        Ok(())
+        Ok(receipt)
     }
+}
+
+/// Holding the snapshot row while both observing and replacing it makes the
+/// receipt exact even when another server publishes or revokes concurrently.
+async fn snapshot_audit_row(
+    tx: &mut Transaction<'_, Postgres>,
+    principal: Principal,
+) -> Result<AdminState, StoreError> {
+    let row = sqlx::query(
+        "SELECT generation, deleted FROM tollgate_snapshots WHERE principal = $1 FOR UPDATE",
+    )
+    .bind(id_bytes(principal.0))
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage)?;
+    row.map(|row| {
+        Ok(AdminState::Snapshot {
+            generation: generation_from(row.get(0))?,
+            revoked: row.get(1),
+        })
+    })
+    .unwrap_or(Ok(AdminState::Absent))
+}
+
+async fn write_snapshot_audited(
+    tx: &mut Transaction<'_, Postgres>,
+    principal: Principal,
+    generation: i64,
+    value: serde_json::Value,
+) -> Result<(bool, AdminState, AdminState), StoreError> {
+    let mut before = snapshot_audit_row(tx, principal).await?;
+    let after = AdminState::Snapshot {
+        generation: generation_from(generation)?,
+        revoked: false,
+    };
+    if before == AdminState::Absent {
+        let inserted = sqlx::query(
+            "INSERT INTO tollgate_snapshots (principal, generation, snapshot, deleted)
+            VALUES ($1, $2, $3, FALSE) ON CONFLICT (principal) DO NOTHING",
+        )
+        .bind(id_bytes(principal.0))
+        .bind(generation)
+        .bind(&value)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage)?;
+        if inserted.rows_affected() == 1 {
+            return Ok((true, before, after));
+        }
+        // Another creator won the unique constraint. READ COMMITTED sees its
+        // row here; lock and observe that actual predecessor before replacing.
+        before = snapshot_audit_row(tx, principal).await?;
+    }
+    let AdminState::Snapshot {
+        generation: previous,
+        ..
+    } = before
+    else {
+        return Err(StoreError("snapshot disappeared during publication".into()));
+    };
+    if previous >= generation_from(generation)? {
+        return Ok((false, before, before));
+    }
+    sqlx::query("UPDATE tollgate_snapshots SET generation = $2, snapshot = $3, deleted = FALSE WHERE principal = $1")
+        .bind(id_bytes(principal.0)).bind(generation).bind(value)
+        .execute(&mut **tx).await.map_err(storage)?;
+    Ok((true, before, after))
 }
 
 #[cfg(test)]

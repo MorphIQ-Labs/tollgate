@@ -39,6 +39,7 @@ serde_json = "1.0"
 # Dev/bench
 criterion = "0.5"
 proptest = "1.7"
+tempfile = "3"
 tollgate-alloc-count = { path = "crates/tollgate-alloc-count", version = "=0.15.0" }
 
 # Later members (admission/store/server/client) — declared centrally so every
@@ -69,7 +70,12 @@ axum = "0.8"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "uuid", "json"] }
 getrandom = "0.3"
 hmac = "0.12"
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Control-plane TLS and signed service identities (#98). No native TLS/OpenSSL.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs"] }
+rcgen = "0.14"
 sha2 = "0.10"
 subtle = "2"
 

@@ -38,6 +38,8 @@
 //! [`MemoryStore::stored_records`] reports the numbers, and the server logs
 //! them once per sweep.
 
+use crate::{AdminReceipt, AdminState};
+
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -394,6 +396,14 @@ impl MemoryStore {
     /// balance, ledger totals, fencing sequence, and leases) is left
     /// untouched and the caller told (review finding #7).
     pub fn try_create_account(&self, config: AccountConfig) -> Result<(), CreateAccountError> {
+        self.create_account_audited(config)
+            .map(|receipt| receipt.outcome)
+    }
+
+    fn create_account_audited(
+        &self,
+        config: AccountConfig,
+    ) -> Result<AdminReceipt<()>, CreateAccountError> {
         let mut inner = self.lock();
         if inner.accounts.contains_key(&config.account_id) {
             return Err(CreateAccountError::AlreadyExists);
@@ -421,11 +431,28 @@ impl MemoryStore {
                 settlement_loss: CostUnits::ZERO,
             },
         );
-        Ok(())
+        Ok(AdminReceipt::new(
+            (),
+            AdminState::Absent,
+            AdminState::AccountCreated {
+                initial_balance: config.initial_balance,
+                status: config.status,
+                capacity_class: config.capacity_class,
+            },
+        ))
     }
 
     /// Add balance to an existing account (top-up).
     pub fn deposit(&self, account: AccountId, units: CostUnits) -> Result<(), AllocateError> {
+        self.deposit_audited(account, units)
+            .map(|receipt| receipt.outcome)
+    }
+
+    fn deposit_audited(
+        &self,
+        account: AccountId,
+        units: CostUnits,
+    ) -> Result<AdminReceipt<()>, AllocateError> {
         let mut inner = self.lock();
         let record = inner
             .accounts
@@ -451,9 +478,17 @@ impl MemoryStore {
             .deposited
             .checked_add(units)
             .ok_or_else(|| AllocateError::Storage(StoreError("deposit overflow".into())))?;
+        let before = AdminState::Funding {
+            topup: record.balance.topup,
+            deposited: record.deposited,
+        };
         record.balance.topup = topup;
         record.deposited = deposited;
-        Ok(())
+        Ok(AdminReceipt::new(
+            (),
+            before,
+            AdminState::Funding { topup, deposited },
+        ))
     }
 
     /// Bind (or replace) a principal's compiled snapshot and push it to
@@ -490,27 +525,30 @@ impl MemoryStore {
     }
 
     pub fn remove_snapshot(&self, principal: Principal) {
-        let generation = {
+        self.remove_snapshot_audited(principal);
+    }
+
+    fn remove_snapshot_audited(&self, principal: Principal) -> AdminReceipt<()> {
+        let receipt = {
             let mut inner = self.lock();
-            let Some(record) = inner.snapshots.get_mut(&principal) else {
-                return;
-            };
-            // Already revoked: return without pushing. Dropping this arm would
-            // emit a second `Revoked` push for an unchanged record — harmless
-            // to a generation-monotonic subscriber, but it is a push for a
-            // change that did not happen.
-            let SnapshotRecord::Present(snapshot) = record else {
-                return;
-            };
-            // Read the watermark before the snapshot holding it is replaced.
-            let generation = snapshot.generation;
-            *record = SnapshotRecord::Revoked(generation);
-            generation
+            let before = snapshot_audit(inner.snapshots.get(&principal));
+            if let Some(SnapshotRecord::Present(snapshot)) = inner.snapshots.get(&principal) {
+                let generation = snapshot.generation;
+                inner
+                    .snapshots
+                    .insert(principal, SnapshotRecord::Revoked(generation));
+            }
+            AdminReceipt::new((), before, snapshot_audit(inner.snapshots.get(&principal)))
         };
-        self.push_to_subscribers(SnapshotPush {
-            principal,
-            resolution: SnapshotResolution::Revoked { generation },
-        });
+        if receipt.before != receipt.after
+            && let AdminState::Snapshot { generation, .. } = receipt.after
+        {
+            self.push_to_subscribers(SnapshotPush {
+                principal,
+                resolution: SnapshotResolution::Revoked { generation },
+            });
+        }
+        receipt
     }
 
     // ---- reconciliation / test surface -------------------------------
@@ -1097,12 +1135,19 @@ impl StoreHealth for MemoryStore {
 
 #[async_trait]
 impl AdminStore for MemoryStore {
-    async fn create_account(&self, config: AccountConfig) -> Result<(), CreateAccountError> {
-        MemoryStore::try_create_account(self, config)
+    async fn create_account(
+        &self,
+        config: AccountConfig,
+    ) -> Result<crate::AdminReceipt<()>, CreateAccountError> {
+        self.create_account_audited(config)
     }
 
-    async fn deposit(&self, account: AccountId, units: CostUnits) -> Result<(), AllocateError> {
-        MemoryStore::deposit(self, account, units)
+    async fn deposit(
+        &self,
+        account: AccountId,
+        units: CostUnits,
+    ) -> Result<crate::AdminReceipt<()>, AllocateError> {
+        self.deposit_audited(account, units)
     }
 
     async fn set_budget_schedule(
@@ -1173,11 +1218,11 @@ impl AdminStore for MemoryStore {
         &self,
         account: AccountId,
         status: AccountStatus,
-    ) -> Result<StatusChange, SetStatusError> {
+    ) -> Result<crate::AdminReceipt<StatusChange>, SetStatusError> {
         // One lock for both records. The inherent `publish_snapshot` takes the
         // lock itself, so it cannot be reused here: the whole point is that no
         // observer sees the ledger moved and the snapshots not.
-        let republished = {
+        let (republished, before) = {
             let mut inner = self.lock();
             // Phase 1, read-only: every refusal happens before anything moves.
             let record = inner
@@ -1193,6 +1238,9 @@ impl AdminStore for MemoryStore {
             // would leave the account suspended with Active snapshots -- the
             // divergence INVARIANTS.md #22 forbids, in the very backend that
             // serves as its reference.
+            let before = AdminState::Status {
+                status: record.status,
+            };
             let planned = plan_republish(&inner, account, Restamp::Status(status))?;
             // Phase 3: apply. Nothing below this line can fail.
             inner
@@ -1200,7 +1248,7 @@ impl AdminStore for MemoryStore {
                 .get_mut(&account)
                 .expect("the account was found under this same guard")
                 .status = status;
-            apply_republish(&mut inner, planned)
+            (apply_republish(&mut inner, planned), before)
         };
         // Outside the guard: `push_to_subscribers` must not run under it, and
         // a subscriber must never observe a push for a transition that is
@@ -1221,25 +1269,29 @@ impl AdminStore for MemoryStore {
                 resolution: SnapshotResolution::Present(snapshot),
             });
         }
-        Ok(StatusChange {
-            republished,
-            // This backend holds validated snapshots rather than encoded ones,
-            // so there is nothing here that can fail to decode.
-            unreadable: 0,
-        })
+        Ok(AdminReceipt::new(
+            StatusChange {
+                republished,
+                // This backend holds validated snapshots rather than encoded ones,
+                // so there is nothing here that can fail to decode.
+                unreadable: 0,
+            },
+            before,
+            AdminState::Status { status },
+        ))
     }
 
     async fn set_capacity_class(
         &self,
         account: AccountId,
         class: CapacityClass,
-    ) -> Result<StatusChange, SetStatusError> {
+    ) -> Result<crate::AdminReceipt<StatusChange>, SetStatusError> {
         // Structurally identical to `set_account_status`, deliberately: one
         // lock across both records, refusals before anything moves, the whole
         // snapshot plan computed before the ledger is touched. What differs is
         // one field, and that difference lives in `Restamp` rather than in a
         // second copy of this procedure.
-        let republished = {
+        let (republished, before) = {
             let mut inner = self.lock();
             let record = inner
                 .accounts
@@ -1250,13 +1302,16 @@ impl AdminStore for MemoryStore {
             if record.status == AccountStatus::Closed {
                 return Err(SetStatusError::AccountClosed);
             }
+            let before = AdminState::CapacityClass {
+                capacity_class: record.capacity_class,
+            };
             let planned = plan_republish(&inner, account, Restamp::CapacityClass(class))?;
             inner
                 .accounts
                 .get_mut(&account)
                 .expect("the account was found under this same guard")
                 .capacity_class = class;
-            apply_republish(&mut inner, planned)
+            (apply_republish(&mut inner, planned), before)
         };
         if pushes_exceed_capacity(republished.len()) {
             tracing::warn!(
@@ -1275,17 +1330,23 @@ impl AdminStore for MemoryStore {
                 resolution: SnapshotResolution::Present(snapshot),
             });
         }
-        Ok(StatusChange {
-            republished,
-            unreadable: 0,
-        })
+        Ok(AdminReceipt::new(
+            StatusChange {
+                republished,
+                unreadable: 0,
+            },
+            before,
+            AdminState::CapacityClass {
+                capacity_class: class,
+            },
+        ))
     }
 
     async fn publish_snapshot(
         &self,
         principal: Principal,
         snapshot: PublishableSnapshot,
-    ) -> Result<(), PublishSnapshotError> {
+    ) -> Result<crate::AdminReceipt<()>, PublishSnapshotError> {
         // One guard for the check and the write. Releasing it between them
         // left a window `set_account_status` could run through entirely: a
         // publish that passed the status check, a suspension that restamped
@@ -1297,7 +1358,7 @@ impl AdminStore for MemoryStore {
         // INVARIANTS.md #22's reference. `PostgresStore` holds `FOR SHARE` on
         // the account row across the same pair, which `set_account_status`'s
         // `FOR UPDATE` serialises against.
-        let published = {
+        let (published, before, after) = {
             let mut inner = self.lock();
             // The ledger decides an account's status; a publish may carry it
             // but not change it, or the two records this trait just unified
@@ -1321,7 +1382,13 @@ impl AdminStore for MemoryStore {
                     });
                 }
             }
-            publish_locked(&mut inner, principal, snapshot)
+            let before = snapshot_audit(inner.snapshots.get(&principal));
+            let published = publish_locked(&mut inner, principal, snapshot);
+            (
+                published,
+                before,
+                snapshot_audit(inner.snapshots.get(&principal)),
+            )
         };
         if let Some(snapshot) = published {
             self.push_to_subscribers(SnapshotPush {
@@ -1329,12 +1396,14 @@ impl AdminStore for MemoryStore {
                 resolution: SnapshotResolution::Present(snapshot),
             });
         }
-        Ok(())
+        Ok(AdminReceipt::new((), before, after))
     }
 
-    async fn remove_snapshot(&self, principal: Principal) -> Result<(), StoreError> {
-        MemoryStore::remove_snapshot(self, principal);
-        Ok(())
+    async fn remove_snapshot(
+        &self,
+        principal: Principal,
+    ) -> Result<crate::AdminReceipt<()>, StoreError> {
+        Ok(self.remove_snapshot_audited(principal))
     }
 }
 
@@ -1621,6 +1690,20 @@ impl KeyDirectory for MemoryStore {
         // differ in a way no test would reproduce.
         active.sort_unstable_by_key(|record| record.key_id);
         Ok(active)
+    }
+}
+
+fn snapshot_audit(record: Option<&SnapshotRecord>) -> AdminState {
+    match record {
+        None => AdminState::Absent,
+        Some(SnapshotRecord::Present(snapshot)) => AdminState::Snapshot {
+            generation: snapshot.generation,
+            revoked: false,
+        },
+        Some(SnapshotRecord::Revoked(generation)) => AdminState::Snapshot {
+            generation: *generation,
+            revoked: true,
+        },
     }
 }
 

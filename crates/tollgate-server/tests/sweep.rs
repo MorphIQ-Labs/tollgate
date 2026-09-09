@@ -11,6 +11,8 @@
 //! shutdown misbehaves.
 #![allow(clippy::let_underscore_must_use)]
 
+mod common;
+
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -140,7 +142,7 @@ impl AdminStore for FlakyReclaimStore {
     async fn create_account(
         &self,
         config: AccountConfig,
-    ) -> Result<(), tollgate_store::CreateAccountError> {
+    ) -> Result<tollgate_store::AdminReceipt<()>, tollgate_store::CreateAccountError> {
         AdminStore::create_account(&*self.inner, config).await
     }
 
@@ -148,7 +150,7 @@ impl AdminStore for FlakyReclaimStore {
         &self,
         account: AccountId,
         units: CostUnits,
-    ) -> Result<(), tollgate_store::AllocateError> {
+    ) -> Result<tollgate_store::AdminReceipt<()>, tollgate_store::AllocateError> {
         AdminStore::deposit(&*self.inner, account, units).await
     }
 
@@ -156,7 +158,10 @@ impl AdminStore for FlakyReclaimStore {
         &self,
         account: AccountId,
         status: AccountStatus,
-    ) -> Result<tollgate_store::StatusChange, tollgate_store::SetStatusError> {
+    ) -> Result<
+        tollgate_store::AdminReceipt<tollgate_store::StatusChange>,
+        tollgate_store::SetStatusError,
+    > {
         AdminStore::set_account_status(&*self.inner, account, status).await
     }
 
@@ -164,7 +169,10 @@ impl AdminStore for FlakyReclaimStore {
         &self,
         account: AccountId,
         class: CapacityClass,
-    ) -> Result<tollgate_store::StatusChange, tollgate_store::SetStatusError> {
+    ) -> Result<
+        tollgate_store::AdminReceipt<tollgate_store::StatusChange>,
+        tollgate_store::SetStatusError,
+    > {
         AdminStore::set_capacity_class(&*self.inner, account, class).await
     }
 
@@ -188,11 +196,14 @@ impl AdminStore for FlakyReclaimStore {
         &self,
         principal: tollgate_core::Principal,
         snapshot: tollgate_core::PublishableSnapshot,
-    ) -> Result<(), tollgate_store::PublishSnapshotError> {
+    ) -> Result<tollgate_store::AdminReceipt<()>, tollgate_store::PublishSnapshotError> {
         AdminStore::publish_snapshot(&*self.inner, principal, snapshot).await
     }
 
-    async fn remove_snapshot(&self, principal: tollgate_core::Principal) -> Result<(), StoreError> {
+    async fn remove_snapshot(
+        &self,
+        principal: tollgate_core::Principal,
+    ) -> Result<tollgate_store::AdminReceipt<()>, StoreError> {
         AdminStore::remove_snapshot(&*self.inner, principal).await
     }
 }
@@ -324,7 +335,11 @@ async fn spawn_server(
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(serve(
         listener,
-        ServerState { store, clock },
+        ServerState {
+            security: common::security(),
+            store,
+            clock,
+        },
         reclaim_interval,
         async move {
             let _ = stop_rx.await;
@@ -702,4 +717,36 @@ async fn a_tick_that_rolls_nothing_says_nothing() {
             .any(|event| event.fields.iter().any(|(key, _)| key == "accounts")),
         "an unscheduled account must not produce a rollover event"
     );
+}
+
+#[tokio::test]
+async fn cancelling_the_server_releases_its_owned_maintenance_task() {
+    let store = Arc::new(FlakyReclaimStore {
+        inner: store_with_expired_lease(),
+        failures_left: AtomicU32::new(0),
+        fail_on_call: None,
+        calls: AtomicU32::new(0),
+    });
+    let (server, _stop) = spawn_server(
+        Arc::clone(&store),
+        Arc::new(SystemClock),
+        std::time::Duration::from_secs(3600),
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while store.calls.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while Arc::strong_count(&store) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a detached sweeper would keep holding the backend");
 }
