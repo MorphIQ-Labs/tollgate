@@ -34,15 +34,14 @@ const SECRET_BYTES: usize = 32;
 /// A freshly minted credential, returned exactly once.
 ///
 /// The secret is [`Zeroizing`], so the only copy the process holds is wiped
-/// when this value drops. Everything else here is non-secret and safe to log,
-/// store, or show an operator.
+/// when this value drops. The digest is suitable for durable storage; debug
+/// output exposes only the non-secret identifiers.
 ///
 /// **Nothing can recover the secret from the record.** That is the point of
 /// storing digests, and it is also the constraint on issuance ordering: the
 /// record must be durable *before* the secret is disclosed, because a crash
 /// between the two leaves a credential the server has never heard of and no
 /// reconciliation can repair it.
-#[derive(Debug)]
 pub struct MintedKey {
     /// The non-secret identifier for this credential, used to revoke it.
     pub key_id: KeyId,
@@ -56,8 +55,17 @@ pub struct MintedKey {
     pub secret: Zeroizing<Vec<u8>>,
 }
 
+impl std::fmt::Debug for MintedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MintedKey")
+            .field("key_id", &self.key_id)
+            .field("principal", &self.principal)
+            .finish_non_exhaustive()
+    }
+}
+
 /// One credential as the projection holds it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct ProjectedKey {
     digest: [u8; 32],
     /// Surfaced through [`Verified::reusable_until`], so a session cache
@@ -97,10 +105,17 @@ struct ProjectedKey {
 /// [`CredentialVerifier`] instead.
 ///
 /// [`SessionCredential`]: crate::SessionCredential
-#[derive(Debug)]
 pub struct HmacRegistry {
     secret: Zeroizing<Vec<u8>>,
     keys: ArcSwap<HashMap<u128, ProjectedKey>>,
+}
+
+impl std::fmt::Debug for HmacRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HmacRegistry")
+            .field("projected_keys", &self.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl HmacRegistry {
@@ -128,6 +143,15 @@ impl HmacRegistry {
         u128::from_be_bytes(bytes)
     }
 
+    /// Derive the durable digest and identity of an existing credential without
+    /// installing it. This supports fixture bootstrap and imports; new issuance
+    /// should use [`Self::mint`] so entropy comes from the OS. Persist the digest
+    /// before projecting it, and never persist or log the credential argument.
+    pub fn digest_credential(&self, credential: &[u8]) -> (Principal, [u8; 32]) {
+        let digest = self.digest(credential);
+        (Principal(Self::fingerprint(&digest)), digest)
+    }
+
     /// Generate a credential and return it once, with the non-secret record
     /// its durable half needs.
     ///
@@ -144,10 +168,10 @@ impl HmacRegistry {
     pub fn mint(&self, key_id: KeyId) -> Result<MintedKey, EntropyUnavailable> {
         let mut secret = Zeroizing::new(vec![0u8; SECRET_BYTES]);
         getrandom::fill(secret.as_mut_slice()).map_err(|_| EntropyUnavailable)?;
-        let digest = self.digest(&secret);
+        let (principal, digest) = self.digest_credential(&secret);
         Ok(MintedKey {
             key_id,
-            principal: Principal(Self::fingerprint(&digest)),
+            principal,
             digest,
             secret,
         })
@@ -187,8 +211,8 @@ impl HmacRegistry {
         let projected: Vec<_> = credentials
             .into_iter()
             .map(|credential| {
-                let digest = self.digest(credential.as_ref());
-                (Principal(Self::fingerprint(&digest)), digest, None)
+                let (principal, digest) = self.digest_credential(credential.as_ref());
+                (principal, digest, None)
             })
             .collect();
         let principals = projected.iter().map(|(p, _, _)| *p).collect();
@@ -252,6 +276,23 @@ impl CredentialVerifier for HmacRegistry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn credential_diagnostics_never_disclose_issuer_or_customer_secrets() {
+        let secret = b"fixture-debug-redaction-hmac-secret-108";
+        let registry = HmacRegistry::new(secret);
+        let key = registry.mint(KeyId(1)).unwrap();
+        registry.install([(key.principal, key.digest, None)]);
+        let diagnostic = format!("{registry:?} {key:?}");
+        for protected in [
+            format!("{secret:?}"),
+            format!("{:?}", *key.secret),
+            format!("{:?}", key.digest),
+        ] {
+            assert!(!diagnostic.contains(&protected));
+        }
+        assert!(diagnostic.contains("projected_keys: 1"));
+    }
+
     use super::*;
 
     fn registry() -> HmacRegistry {

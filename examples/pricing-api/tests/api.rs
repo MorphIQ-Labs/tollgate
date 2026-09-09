@@ -22,8 +22,8 @@ use tollgate_store::SnapshotSource;
 /// price route takes `ConnectInfo<PricingConnection>` — that requirement is
 /// deliberate (#2), and `price_route_requires_connection_context` is the test
 /// that keeps it from being quietly optional.
-fn build_test_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRuntime) {
-    let (router, runtime) = build_app(deposit, admission_enabled);
+async fn build_test_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRuntime) {
+    let (router, runtime) = build_app(deposit, admission_enabled).await;
     (
         router.layer(MockConnectInfo(PricingConnection::default())),
         runtime,
@@ -31,12 +31,12 @@ fn build_test_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRu
 }
 
 /// The same, for the enforcement-mode tests #1 added.
-fn build_test_app_with_mode(
+async fn build_test_app_with_mode(
     deposit: u64,
     admission_enabled: bool,
     mode: EnforcementMode,
 ) -> (axum::Router, AppRuntime) {
-    let (router, runtime) = build_app_with_mode(deposit, admission_enabled, mode);
+    let (router, runtime) = build_app_with_mode(deposit, admission_enabled, mode).await;
     (
         router.layer(MockConnectInfo(PricingConnection::default())),
         runtime,
@@ -128,7 +128,7 @@ async fn wait_ready(router: &axum::Router) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authorized_request_prices_and_charges() {
-    let (router, runtime) = build_test_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true).await;
     wait_ready(&router).await;
 
     let (status, body) = call(&router, Some(DEMO_API_KEY), price_body(14)).await;
@@ -158,7 +158,7 @@ async fn authorized_request_prices_and_charges() {
 /// will emit; this test is what keeps that construction from drifting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_response_and_the_bill_name_the_same_policy_revision() {
-    let (router, runtime) = build_test_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true).await;
     wait_ready(&router).await;
 
     let (status, body) = call(&router, Some(DEMO_API_KEY), price_body(14)).await;
@@ -194,7 +194,7 @@ async fn the_response_and_the_bill_name_the_same_policy_revision() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn billing_ledger_matches_charges_after_shutdown() {
-    let (router, runtime) = build_test_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true).await;
     wait_ready(&router).await;
 
     let mut charged = 0u64;
@@ -213,7 +213,7 @@ async fn billing_ledger_matches_charges_after_shutdown() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_or_bad_credentials_deny() {
-    let (router, runtime) = build_test_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true).await;
     wait_ready(&router).await;
 
     let (status, body) = call(&router, None, price_body(1)).await;
@@ -231,7 +231,7 @@ async fn missing_or_bad_credentials_deny() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authentication_and_begin_precede_body_decoding() {
-    let (router, runtime) = build_test_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true).await;
     wait_ready(&router).await;
 
     let (status, body) = call_raw(&router, None, "{ definitely not json").await;
@@ -247,7 +247,7 @@ async fn authentication_and_begin_precede_body_decoding() {
 /// instead of silently restoring per-request verification.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn price_route_requires_connection_context() {
-    let (router, runtime) = build_app(100_000, true);
+    let (router, runtime) = build_app(100_000, true).await;
     wait_ready(&router).await;
 
     let response = router
@@ -281,7 +281,7 @@ async fn price_route_requires_connection_context() {
 /// path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cached_principal_still_observes_snapshot_revocation() {
-    let (router, runtime) = build_test_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true).await;
     wait_ready(&router).await;
 
     for _ in 0..2 {
@@ -321,7 +321,7 @@ async fn cached_principal_still_observes_snapshot_revocation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_cap_denies_with_zero_charge() {
-    let (router, runtime) = build_test_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true).await;
     wait_ready(&router).await;
 
     let (status, body) = call(&router, Some(DEMO_API_KEY), price_body(1_025)).await;
@@ -335,7 +335,7 @@ async fn batch_cap_denies_with_zero_charge() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exhausted_quota_returns_429_and_never_overspends() {
     // Tiny deposit: 200 units funds at most three 51-unit requests.
-    let (router, runtime) = build_test_app(200, true);
+    let (router, runtime) = build_test_app(200, true).await;
     wait_ready(&router).await;
 
     let mut ok = 0;
@@ -376,7 +376,8 @@ async fn an_elastic_account_serves_past_its_deposit_and_bills_the_overage() {
         EnforcementMode::Elastic {
             overage_cap: CostUnits(CAP),
         },
-    );
+    )
+    .await;
     wait_ready(&router).await;
 
     assert_eq!(
@@ -450,7 +451,7 @@ async fn an_elastic_account_serves_past_its_deposit_and_bills_the_overage() {
 /// scrape has to distinguish the two — and attribute each refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metrics_separate_admissions_from_each_kind_of_refusal() {
-    let (router, runtime) = build_test_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true).await;
     wait_ready(&router).await;
 
     let before = metrics(&router).await;
@@ -531,7 +532,7 @@ async fn metrics_separate_admissions_from_each_kind_of_refusal() {
 /// other.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metrics_report_accounting_health_while_running() {
-    let (router, runtime) = build_test_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true).await;
     wait_ready(&router).await;
 
     let before = metrics(&router).await;
@@ -593,7 +594,7 @@ async fn metrics_report_accounting_health_while_running() {
 /// callers presenting keys nobody published.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metrics_report_refill_and_snapshot_health() {
-    let (router, runtime) = build_test_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true).await;
     wait_ready(&router).await;
 
     let body = metrics(&router).await;
@@ -630,7 +631,7 @@ async fn metrics_report_refill_and_snapshot_health() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn not_ready_until_lease_arrives() {
-    let (router, runtime) = build_test_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true).await;
     // Immediately after boot the slot may be empty: readiness must reflect
     // it rather than serving guaranteed denials (INVARIANTS.md #10). We only
     // assert the transition completes.
@@ -641,7 +642,7 @@ async fn not_ready_until_lease_arrives() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn readiness_falls_when_background_planes_stop() {
-    let (router, runtime) = build_test_app(100_000, true);
+    let (router, runtime) = build_test_app(100_000, true).await;
     wait_ready(&router).await;
     runtime.shutdown().await;
     assert_eq!(ready(&router).await, StatusCode::SERVICE_UNAVAILABLE);
@@ -653,7 +654,7 @@ async fn readiness_falls_when_background_planes_stop() {
 /// required, because there is no admission to present one to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn baseline_prices_without_admission() {
-    let (router, runtime) = build_test_app(100_000, false);
+    let (router, runtime) = build_test_app(100_000, false).await;
 
     let (status, body) = call(&router, None, price_body(14)).await;
     assert_eq!(status, StatusCode::OK);
@@ -675,7 +676,7 @@ async fn baseline_prices_without_admission() {
 /// `readiness_falls_when_background_planes_stop`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn baseline_is_ready_before_any_lease() {
-    let (router, runtime) = build_test_app(100_000, false);
+    let (router, runtime) = build_test_app(100_000, false).await;
     assert_eq!(ready(&router).await, StatusCode::OK);
     runtime.shutdown().await;
     assert_eq!(ready(&router).await, StatusCode::OK);
@@ -687,7 +688,7 @@ async fn baseline_is_ready_before_any_lease() {
 /// construction site; #16 made it one `Option`, and this is its witness.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn baseline_metrics_omit_the_uninstalled_planes() {
-    let (router, runtime) = build_test_app(100_000, false);
+    let (router, runtime) = build_test_app(100_000, false).await;
     let (status, _) = call(&router, None, price_body(1)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -742,7 +743,8 @@ async fn two_classes_share_an_instance_and_each_start_is_attributed() {
             total: NonZeroU32::new(2).unwrap(),
             assured_reserve: NonZeroU32::new(1).unwrap(),
         },
-    );
+    )
+    .await;
     let router = router.layer(MockConnectInfo(PricingConnection::default()));
     // Readiness now covers every tenant, so this waits for both accounts'
     // leases and snapshots rather than only the primary's.
@@ -779,7 +781,7 @@ async fn two_classes_share_an_instance_and_each_start_is_attributed() {
 /// read as an exhausted one.
 #[tokio::test]
 async fn a_disabled_instance_reports_no_capacity_rather_than_an_empty_one() {
-    let (router, runtime) = build_test_app(1_000_000, true);
+    let (router, runtime) = build_test_app(1_000_000, true).await;
     wait_ready(&router).await;
     let (status, _) = call(&router, Some(DEMO_API_KEY), price_body(1)).await;
     assert_eq!(status, StatusCode::OK);
@@ -821,7 +823,7 @@ async fn extractor_failures_are_zero_charge_problem_json_with_fixed_counters() {
             "body-too-large",
         ),
     ] {
-        let (router, runtime) = build_test_app(10_000, true);
+        let (router, runtime) = build_test_app(10_000, true).await;
         wait_ready(&router).await;
         let response = router
             .clone()
@@ -856,7 +858,7 @@ async fn extractor_failures_are_zero_charge_problem_json_with_fixed_counters() {
 
 #[tokio::test]
 async fn http_shutdown_joins_the_listener_and_settles_usage_before_returning() {
-    let (router, runtime) = build_test_app(10_000, true);
+    let (router, runtime) = build_test_app(10_000, true).await;
     wait_ready(&router).await;
     let store = runtime.store.clone();
     let (status, response) = call(&router, Some(DEMO_API_KEY), price_body(1)).await;
@@ -888,7 +890,7 @@ async fn http_quiescence_is_bounded_by_the_runtime_deadline() {
             let _ = self.0.take().unwrap().send(());
         }
     }
-    let (router, runtime) = build_test_app(10_000, true);
+    let (router, runtime) = build_test_app(10_000, true).await;
     wait_ready(&router).await;
     let store = runtime.store.clone();
     let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -916,7 +918,7 @@ async fn cancelling_http_shutdown_aborts_the_server_before_or_after_first_poll()
         }
     }
     for poll in [false, true] {
-        let (router, runtime) = build_test_app(10_000, true);
+        let (router, runtime) = build_test_app(10_000, true).await;
         wait_ready(&router).await;
         let store = runtime.store.clone();
         let principals = store.principals().await.unwrap().unwrap();
@@ -961,4 +963,36 @@ async fn cancelling_http_shutdown_aborts_the_server_before_or_after_first_poll()
         };
         assert_eq!(after.generation, before.generation);
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn demo_credentials_are_durable_and_revocation_reaches_new_verification() {
+    use tollgate_store::KeyDirectory;
+    let (router, runtime) = build_test_app(100_000, true).await;
+    let now = jiff::Timestamp::now();
+    let keys = runtime.store.active_keys(now).await.unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].account_id, DEMO_ACCOUNT);
+    wait_ready(&router).await;
+    assert_eq!(
+        call(&router, Some(DEMO_API_KEY), price_body(14)).await.0,
+        StatusCode::OK
+    );
+    runtime.store.revoke_key(keys[0].key_id, now).await.unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+    // Missing credentials clear this connection's cached proof. The next
+    // request must consult the newly replaced verifier, while the account's
+    // snapshot remains active and funded.
+    assert_eq!(
+        call(&router, None, price_body(14)).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&router, Some(DEMO_API_KEY), price_body(14)).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let store = runtime.store.clone();
+    runtime.shutdown().await;
+    assert_eq!(store.usage_recorded(DEMO_ACCOUNT), CostUnits(64));
 }

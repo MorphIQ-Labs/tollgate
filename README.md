@@ -17,10 +17,10 @@ permission bits — never plan names, FCUs, or SQL.
 | `crates/tollgate-core` | Zero-I/O, clock-free hot path: `CostUnits` (checked), `CostTable` (direct-indexed), `AccountSnapshot`, `LocalLease` (fenced, CAS), `Reservation` (pending → committed-at-execution-start \| released) |
 | `crates/tollgate-admission` | One-call pipeline: snapshot map (arc-swap and moka candidates) → permissions → quote → weighted `governor` rate token → lease reservation |
 | `crates/tollgate-auth` | Credential verification: `CredentialVerifier` scheme seam, `HmacRegistry` (digests at rest), `SessionCredential` session cache with a validity bound |
-| `crates/tollgate-store` | `LeaseAllocator` / `SnapshotSource` / `UsageSink` / `AdminStore` traits, `GrantPolicy`, `MemoryStore` reference backend, wire DTOs, `Clock` |
+| `crates/tollgate-store` | `LeaseAllocator` / `SnapshotSource` / `KeySource` / `UsageSink` / `AdminStore` traits, `GrantPolicy`, `MemoryStore` reference backend, wire DTOs, `Clock` |
 | `crates/tollgate-store-postgres` | Transactional Postgres backend (row-locked acquire, set-wise usage ingest, bounded set-wise SKIP LOCKED reclaim) |
 | `crates/tollgate-server` | Authenticated rustls control plane, disjoint instance/operator roles, rotating mTLS/bearer/Google identity, administrative audit |
-| `crates/tollgate-client` | `InstanceRuntime` (dynamic account supervision, readiness, bounded shutdown), staged `RuntimeHandle`, direct-store `PeriodRoller`, lower-level lease/snapshot/usage managers, `HttpStore` with rotatable TLS and service identity |
+| `crates/tollgate-client` | `InstanceRuntime` (dynamic account supervision, readiness, bounded shutdown), staged `RuntimeHandle`, credential `KeyManager`, direct-store `PeriodRoller`, lower-level lease/snapshot/usage managers, `HttpStore` with rotatable TLS and service identity |
 | `crates/tollgate-perf-gate` | Benchmark threshold checker (criterion estimates vs manifest, staleness-guarded) |
 | `examples/pricing-api` | Concrete API embedding the stack: connection-cached HMAC-verified keys, admission, commit-at-execution-start, billing |
 
@@ -33,6 +33,12 @@ bounded batches, and exposes health and shutdown reports. See the
 [direct-store lifecycle example](crates/tollgate-client/src/period_roller.rs).
 `InstanceRuntime` does not receive administrative authority; applications using
 `HttpStore` leave period maintenance to `tollgate-server`.
+
+HTTP-backed applications authenticate customer keys through a read-only
+`KeySource` and own a `KeyManager` beside the runtime. Its immutable
+verifier bounds cached evidence by feed freshness and each key's expiry. See
+[credential projection](docs/CREDENTIAL_PROJECTION.md) for lifecycle composition,
+readiness, revocation windows and rollout.
 
 ## Quickstart
 

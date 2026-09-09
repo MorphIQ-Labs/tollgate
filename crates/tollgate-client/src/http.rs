@@ -317,7 +317,7 @@ impl SnapshotSource for HttpStore {
         if !response.status().is_success() {
             return Err(StoreError(problem_detail(response).await));
         }
-        let snapshot: AccountSnapshot = response
+        let snapshot: AccountSnapshot = require_complete(response)?
             .json()
             .await
             .map_err(|e| StoreError(format!("http: {}", e.without_url())))?;
@@ -350,7 +350,7 @@ impl SnapshotSource for HttpStore {
         if !response.status().is_success() {
             return Err(StoreError(problem_detail(response).await));
         }
-        let body: PrincipalsResponse = response
+        let body: PrincipalsResponse = require_complete(response)?
             .json()
             .await
             .map_err(|e| StoreError(format!("http: {}", e.without_url())))?;
@@ -397,5 +397,97 @@ impl UsageSink for HttpStore {
             .json()
             .await
             .map_err(|e| StoreError(format!("http: {}", e.without_url())).into())
+    }
+}
+
+// Successful partial responses must never become a whole snapshot or catalogue.
+fn require_complete(response: reqwest::Response) -> Result<reqwest::Response, StoreError> {
+    if response.status() != reqwest::StatusCode::OK
+        || response
+            .headers()
+            .contains_key(reqwest::header::CONTENT_RANGE)
+    {
+        return Err(StoreError(
+            "control-plane read requires a complete HTTP 200 response".into(),
+        ));
+    }
+    Ok(response)
+}
+
+async fn bounded_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, StoreError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(StoreError(
+            "credential page body exceeds its wire limit".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| StoreError(format!("credential page transport: {}", e.without_url())))?
+    {
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            return Err(StoreError(
+                "credential page body exceeds its wire limit".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+#[async_trait]
+impl tollgate_store::KeySource for HttpStore {
+    async fn active_keys_page(
+        &self,
+        _now: Timestamp,
+        after: Option<tollgate_core::KeyId>,
+        limit: NonZeroUsize,
+    ) -> Result<tollgate_store::KeyPage, StoreError> {
+        tollgate_store::validate_key_page_limit(limit)?;
+        let mut request = self.request(reqwest::Method::GET, "/keys");
+        request.request = request.request.query(&[("limit", limit.get().to_string())]);
+        if let Some(after) = after {
+            request.request = request.request.query(&[("after", after.to_string())]);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let bytes = bounded_body(response, tollgate_store::wire::MAX_KEYS_BODY_BYTES).await?;
+            let code = serde_json::from_slice::<Problem>(&bytes)
+                .ok()
+                .map(|p| p.code);
+            let safe_code = match code.as_deref() {
+                Some("authentication-required") => "authentication-required",
+                Some("scope-forbidden") => "scope-forbidden",
+                Some("invalid-query") => "invalid-query",
+                Some("invalid-limit") => "invalid-limit",
+                _ => "credential-source-unavailable",
+            };
+            return Err(StoreError(format!(
+                "credential read refused: {status} {safe_code}"
+            )));
+        }
+        let bytes = bounded_body(
+            require_complete(response)?,
+            tollgate_store::wire::MAX_KEYS_BODY_BYTES,
+        )
+        .await?;
+        let body: tollgate_store::wire::KeysResponse = serde_json::from_slice(&bytes)
+            .map_err(|_| StoreError("invalid credential page body".into()))?;
+        tollgate_store::KeyPage::try_new(
+            body.revision,
+            body.as_of,
+            after,
+            limit,
+            body.keys,
+            body.next_after,
+        )
     }
 }

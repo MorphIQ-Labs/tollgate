@@ -792,7 +792,8 @@ async fn measure(
         sharding,
         &workload.tenants,
         workload.capacity,
-    );
+    )
+    .await;
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         axum::serve(

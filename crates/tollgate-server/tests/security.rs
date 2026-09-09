@@ -35,6 +35,7 @@ async fn every_control_plane_route_requires_its_own_role_before_decoding() {
         ("POST", "/v1/leases/consolidate", Role::Instance),
         ("POST", "/v1/leases/reclaim", Role::Instance),
         ("GET", "/v1/snapshots", Role::Instance),
+        ("GET", "/v1/keys", Role::Instance),
         ("GET", "/v1/snapshots/invalid", Role::Instance),
         ("POST", "/v1/usage/ingest", Role::Instance),
         ("POST", "/v1/admin/accounts", Role::Operator),

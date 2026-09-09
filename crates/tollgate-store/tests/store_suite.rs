@@ -3822,3 +3822,158 @@ async fn racing_publication_and_revocation_receipts_name_the_actual_predecessor(
     };
     assert_eq!(previous, final_state);
 }
+
+#[tokio::test]
+async fn credential_projection_preserves_lifecycle_truth_and_refuses_corrupt_identity() {
+    let store = store_with_balance(full_grant_policy(), 100);
+    use tollgate_store::KeySource;
+    for (id, expiry) in [(1u128, None), (2, Some(t(100))), (3, None)] {
+        let mut digest = [0u8; 32];
+        digest[..16].copy_from_slice(&id.to_be_bytes());
+        store
+            .insert_key(KeyRecord {
+                key_id: KeyId(id),
+                account_id: ACCOUNT,
+                principal: Principal(id),
+                digest,
+                not_after: expiry,
+            })
+            .await
+            .unwrap();
+    }
+    store.revoke_key(KeyId(3), t(99)).await.unwrap();
+    let before = store
+        .active_keys_page(t(99), None, tollgate_store::DEFAULT_KEY_PAGE_LIMIT)
+        .await
+        .unwrap();
+    assert_eq!(before.records().len(), 2);
+    assert_eq!(before.records()[0].principal, Principal(1));
+    assert_eq!(before.records()[1].not_after, Some(t(100)));
+    let at_expiry = store
+        .active_keys_page(t(100), None, tollgate_store::DEFAULT_KEY_PAGE_LIMIT)
+        .await
+        .unwrap();
+    assert_eq!(at_expiry.records(), &before.records()[..1]);
+    store.revoke_key(KeyId(1), t(100)).await.unwrap();
+    assert!(
+        store
+            .active_keys_page(t(100), None, tollgate_store::DEFAULT_KEY_PAGE_LIMIT)
+            .await
+            .unwrap()
+            .records()
+            .is_empty()
+    );
+    // Corrupt identity evidence is reported, not silently dropped from a
+    // partially successful projection.
+    store
+        .insert_key(KeyRecord {
+            key_id: KeyId(4),
+            account_id: ACCOUNT,
+            principal: Principal(4),
+            digest: [0; 32],
+            not_after: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        store
+            .active_keys_page(t(100), None, tollgate_store::DEFAULT_KEY_PAGE_LIMIT)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn credential_pages_order_bound_skip_retired_and_expose_every_mutation() {
+    let store = store_with_balance(full_grant_policy(), 100);
+    use tollgate_store::KeySource;
+    let limit = NonZeroUsize::new(2).unwrap();
+    let initial = store.active_keys_page(t(100), None, limit).await.unwrap();
+    let record = |id: u128, expiry| {
+        let mut digest = [0; 32];
+        digest[..16].copy_from_slice(&id.to_be_bytes());
+        KeyRecord {
+            key_id: KeyId(id),
+            account_id: ACCOUNT,
+            principal: Principal(id),
+            digest,
+            not_after: expiry,
+        }
+    };
+    for (id, expiry) in [
+        (8, None),
+        (0, None),
+        (3, Some(t(100))),
+        (4, None),
+        (2, None),
+        (6, None),
+    ] {
+        store.insert_key(record(id, expiry)).await.unwrap();
+    }
+    store.revoke_key(KeyId(4), t(99)).await.unwrap();
+    let first = store.active_keys_page(t(100), None, limit).await.unwrap();
+    assert!(first.revision() > initial.revision());
+    assert_eq!(first.as_of(), t(100));
+    assert_eq!(
+        first.records().iter().map(|k| k.key_id).collect::<Vec<_>>(),
+        vec![KeyId(0), KeyId(2)]
+    );
+    assert_eq!(first.next_after(), Some(KeyId(2)));
+    let last = store
+        .active_keys_page(t(100), first.next_after(), limit)
+        .await
+        .unwrap();
+    assert_eq!(last.revision(), first.revision());
+    assert_eq!(
+        last.records().iter().map(|k| k.key_id).collect::<Vec<_>>(),
+        vec![KeyId(6), KeyId(8)]
+    );
+    assert_eq!(
+        last.next_after(),
+        None,
+        "lookahead makes an exactly full final page terminal"
+    );
+    let empty = store
+        .active_keys_page(t(100), Some(KeyId(8)), limit)
+        .await
+        .unwrap();
+    assert!(empty.records().is_empty());
+    assert_eq!(empty.next_after(), None);
+    assert_eq!(empty.revision(), first.revision());
+    let skipped = store
+        .active_keys_page(t(100), Some(KeyId(3)), limit)
+        .await
+        .unwrap();
+    assert_eq!(skipped.records(), last.records());
+    store.revoke_key(KeyId(0), t(101)).await.unwrap();
+    store.insert_key(record(1, None)).await.unwrap(); // behind an earlier cursor
+    let changed = store.active_keys_page(t(101), None, limit).await.unwrap();
+    assert!(changed.revision() > first.revision());
+    assert_eq!(
+        changed
+            .records()
+            .iter()
+            .map(|k| k.key_id)
+            .collect::<Vec<_>>(),
+        vec![KeyId(1), KeyId(2)]
+    );
+    let mut duplicate = record(0, None);
+    duplicate.key_id = KeyId(99);
+    assert!(
+        matches!(
+            store.insert_key(duplicate).await,
+            Err(KeyError::AlreadyExists)
+        ),
+        "retirement must not free the principal uniqueness index"
+    );
+    assert!(
+        store
+            .active_keys_page(
+                t(100),
+                None,
+                NonZeroUsize::new(tollgate_store::MAX_KEY_PAGE_LIMIT + 1).unwrap()
+            )
+            .await
+            .is_err()
+    );
+}

@@ -3,13 +3,14 @@
 //! Latency-tolerant by design — its contract is correctness (no double-spend,
 //! fencing, idempotent ingest), enforced by whatever [`tollgate_store`] backend
 //! it is built over. The service is generic over that backend: anything
-//! implementing the four store traits serves identically, which is the
+//! satisfying [`Backend`] serves identically, which is the
 //! pluggability seam the Postgres backend drops into.
 //!
 //! Surface (`/v1`):
 //! - `POST /v1/leases/acquire`, `POST /v1/leases/release`,
 //!   `POST /v1/leases/consolidate`, `POST /v1/leases/reclaim` — fenced lease
 //!   lifecycle.
+//! - `GET /v1/keys` — revisioned active credential pages (instance authority only).
 //! - `GET /v1/snapshots` — the principal catalogue (#48).
 //! - `GET /v1/snapshots/{principal}` — compiled snapshot fetch.
 //! - `POST /v1/usage/ingest` — idempotent usage batches.
@@ -49,11 +50,11 @@ use tollgate_store::wire::{
 };
 use tollgate_store::{
     AccountConfig, AdminStore, Clock, DEFAULT_RECLAIM_BATCH_LIMIT, DEFAULT_ROLLOVER_BATCH_LIMIT,
-    IngestReport, LeaseAllocator, ReclaimBatch, ReclaimedLease, SnapshotResolution, SnapshotSource,
-    StoreError, StoreHealth, UsageSink,
+    IngestReport, KeySource, LeaseAllocator, ReclaimBatch, ReclaimedLease, SnapshotResolution,
+    SnapshotSource, StoreError, StoreHealth, UsageSink,
 };
 
-use crate::error::{ApiError, ApiJson, ApiPath};
+use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery};
 use crate::security::{Authorization, InstanceIdentity, OperatorIdentity, Role, ServerSecurity};
 
 /// Everything the handlers need. `S` is the storage backend; the clock is the
@@ -76,7 +77,15 @@ impl<S> Clone for ServerState<S> {
 
 /// The full store bound the server needs from a backend.
 pub trait Backend:
-    LeaseAllocator + SnapshotSource + UsageSink + AdminStore + StoreHealth + Send + Sync + 'static
+    LeaseAllocator
+    + SnapshotSource
+    + UsageSink
+    + AdminStore
+    + KeySource
+    + StoreHealth
+    + Send
+    + Sync
+    + 'static
 {
 }
 impl<T> Backend for T where
@@ -84,6 +93,7 @@ impl<T> Backend for T where
         + SnapshotSource
         + UsageSink
         + AdminStore
+        + KeySource
         + StoreHealth
         + Send
         + Sync
@@ -103,6 +113,7 @@ pub fn router<S: Backend>(state: ServerState<S>) -> Router {
         .route("/leases/consolidate", post(consolidate::<S>))
         .route("/leases/reclaim", post(reclaim::<S>))
         .route("/snapshots", get(list_principals::<S>))
+        .route("/keys", get(active_keys::<S>))
         .route("/snapshots/{principal}", get(fetch_snapshot::<S>))
         .route(
             "/usage/ingest",
@@ -493,6 +504,62 @@ async fn ingest<S: Backend>(
             .store
             .ingest(&request.events, state.clock.now())
             .await?,
+    ))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyQuery {
+    after: Option<tollgate_core::KeyId>,
+    limit: Option<usize>,
+}
+
+async fn active_keys<S: Backend>(
+    _instance: InstanceIdentity,
+    State(state): State<ServerState<S>>,
+    ApiQuery(query): ApiQuery<KeyQuery>,
+) -> Result<impl axum::response::IntoResponse, ApiError> {
+    let limit = std::num::NonZeroUsize::new(
+        query
+            .limit
+            .unwrap_or(tollgate_store::DEFAULT_KEY_PAGE_LIMIT.get()),
+    )
+    .filter(|limit| limit.get() <= tollgate_store::MAX_KEY_PAGE_LIMIT)
+    .ok_or_else(|| ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "invalid-limit",
+        title: "credential page limit must be between 1 and 4096".into(),
+        generation: None,
+    })?;
+    let page = state
+        .store
+        .active_keys_page(state.clock.now(), query.after, limit)
+        .await
+        .and_then(|page| {
+            page.validate_request(query.after, limit)?;
+            Ok(page)
+        })
+        .map_err(|_| {
+            tracing::warn!(
+                operation = "credential-page",
+                "credential source read failed"
+            );
+            ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "credential-source-unavailable",
+                title: "credential source is unavailable".into(),
+                generation: None,
+            }
+        })?;
+    let body = tollgate_store::wire::KeysResponse {
+        revision: page.revision(),
+        as_of: page.as_of(),
+        next_after: page.next_after(),
+        keys: page.into_records(),
+    };
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(body),
     ))
 }
 

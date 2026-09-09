@@ -30,6 +30,18 @@ struct PingOnlyStore {
 }
 
 #[async_trait]
+impl tollgate_store::KeySource for PingOnlyStore {
+    async fn active_keys_page(
+        &self,
+        now: Timestamp,
+        after: Option<tollgate_core::KeyId>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<tollgate_store::KeyPage, StoreError> {
+        tollgate_store::KeyPage::try_new(0, now, after, limit, vec![], None)
+    }
+}
+
+#[async_trait]
 impl StoreHealth for PingOnlyStore {
     async fn ping(&self) -> Result<(), StoreError> {
         if self.healthy {

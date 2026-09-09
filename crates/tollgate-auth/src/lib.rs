@@ -37,8 +37,12 @@
 //!
 //! An answer is also bounded by whatever validity the verifier attached to it,
 //! so an expiring scheme cannot outlive its own `exp` just because the session
-//! stayed open. [`HmacRegistry`] attaches none: a server-issued key is valid
-//! until it is withdrawn, and withdrawal travels by snapshot.
+//! stayed open. [`HmacRegistry::install`] preserves each key's `not_after`;
+//! convenience `install_credentials` attaches no expiry. A distributed
+//! projection can further bound evidence by feed freshness, as the client's
+//! `KeyManager` does. Removing a registry entry affects new verification;
+//! cached evidence retains its original bound, with snapshot withdrawal still
+//! checked on every request.
 //!
 //! ```
 //! use jiff::Timestamp;

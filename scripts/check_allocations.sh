@@ -63,6 +63,8 @@ fi
 #                         boundary between ours and theirs stays visible.
 jq -s -e '
   length > 0
+  and any(.[]; .scope == "auth/projected_cache_hit" and .attribution == "tollgate")
+  and any(.[]; .scope == "auth/projected_expiry" and .attribution == "tollgate")
   and any(.[]; .scope == "caller/request_buffer" and .attribution == "caller")
   and any(.[]; .scope == "consumer/executor_job" and .attribution == "consumer_executor")
   and any(.[]; .scope == "reservation/commit_split" and .attribution == "tollgate_opt_in")

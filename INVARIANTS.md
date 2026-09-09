@@ -1245,7 +1245,9 @@ exists to detect corrupt state and must not be able to launder it.
     the point of storing digests. **Replacement, never merge:** a projection
     that merged would keep verifying a credential the directory has already
     retired, so the directory decides which credentials are live and the
-    registry reflects that set exactly.
+    registry reflects a complete committed revision of that set. A refresh
+    window can lag later commits; failed refresh preserves the prior table
+    without extending its finite deadline (34).
 
     The secret never reaches a store and the server secret never leaves the
     verifier, so neither half alone verifies or mints anything — the property
@@ -1256,8 +1258,11 @@ exists to detect corrupt state and must not be able to launder it.
     retired credential is never resurrected, and issuance refuses to overwrite
     an existing `KeyId` rather than silently retiring what it replaces. A
     credential's own `not_after` is enforced by the directory, so every
-    backend answers "active" the same way and no projection can disagree with
-    the ledger about which credentials are live.
+    backend answers "active" the same way. `KeySource` pages bind records to
+    a revision in the same backend read. The manager accepts only a complete
+    coherent drain and narrows it with source and instance expiry checks. The
+    projection may cross the instance-only secured control-plane link (32);
+    it cannot invent liveness absent from the selected ledger revision.
 
     Per-credential withdrawal reaches the request path by the mechanism that
     already exists: a `Principal` *is* the credential's digest fingerprint, so
@@ -1269,7 +1274,9 @@ exists to detect corrupt state and must not be able to launder it.
     `a_credentials_own_expiry_travels_to_the_verifier`,
     `rotation_keeps_both_credentials_live_until_the_old_one_is_retired`,
     `issuance_refuses_a_duplicate_key_or_an_unknown_account`, and
-    `minting_never_repeats_a_credential`.
+    `minting_never_repeats_a_credential`,
+    `credential_diagnostics_never_disclose_issuer_or_customer_secrets`; plus the paging, freshness and
+    transport witnesses in 34.
 
 28. **A budget period is crossed exactly once, and only its allowance
     expires.** An account may carry a [`BudgetSchedule`]: an allowance
@@ -1626,3 +1633,65 @@ exists to detect corrupt state and must not be able to launder it.
     HTTP witnesses: `every_admin_mutation_logs_its_actor_and_the_backend_receipt`,
     `cancelled_admin_operations_report_an_unknown_commit_without_a_receipt`, and
     `normal_log_verbosity_cannot_silence_the_binarys_audit_target`.
+
+34. **A credential projection cannot renew stale identity evidence.** A single
+    owned publisher replaces the complete validated active-key table. Duplicate
+    principals or a digest naming a different principal reject the entire set;
+    failed, incomplete or expired reads preserve the previous table and its
+    original deadline. A successful empty set withdraws all entries. Every
+    installed credential carries an exclusive evidence deadline equal to the
+    earlier of its source expiry and fetch start plus configured `max_age`.
+    Fetch time consumes freshness. Overflow cannot publish authority.
+
+    `KeyVerifier` exposes verification only. It cannot mint credentials or
+    install an indefinite table. `SessionCredential` checks its evidence at
+    caller-supplied time (23); cached sessions can survive removal only until
+    their original deadline, and snapshot authorization still runs every
+    request. No request fetches credentials or reads a business clock. A live
+    task and a fresh complete table are required for key-manager readiness;
+    readiness reads the same published deadline as verification. A fresh empty
+    catalogue is healthy. Task teardown clears the published table, while
+    already-issued proofs keep their original bound. Manager drop owns abort,
+    including when its consuming shutdown future is never polled.
+
+    The HTTP read requires instance evidence (32), selects active keys at the
+    server's clock, rejects caller-selected cutoffs, and disallows caching.
+    `KeySource` gives instances read authority without lifecycle or
+    administrative mutation capability. Both stores derive the projection from
+    their own coherent revisioned active-key pages; transport reconstructs
+    `KeyPage` identity, ordering, request and expiry evidence. Revision changes
+    discard the candidate and restart within the same pass budget. Budget
+    exhaustion never publishes a partial table or silently succeeds. Installed
+    revisions never move backward. Nullable expiry and continuation fields are
+    required on the wire; partial HTTP responses never become successful reads.
+
+    Enforcement: private `CredentialSet`, immutable `KeyVerifier` projection,
+    single-owner `KeyManager`, and existing session evidence checks. Exact-model
+    proof: `formal/lean/Tollgate/CredentialProjection.lean` establishes expiry
+    bounds and complete replacement/failure semantics, assuming coherent reads,
+    atomic publication, verified digests and accurate clocks. It does not prove
+    cryptography, Tokio, timestamp representation or Rust refinement.
+    Implementation witnesses: `projected_evidence_is_bounded_by_both_source_expiry_and_fetch_start`,
+    `complete_refresh_replaces_keys_and_cached_proofs_keep_their_original_deadline`,
+    `an_outage_never_extends_projection_validity_and_recovery_replaces_it`,
+    `fetch_time_consumes_freshness_and_expired_responses_cannot_replace_the_table`,
+    `timestamp_overflow_cannot_renew_a_previously_valid_projection`,
+    `hung_fetches_timeout_retry_and_shutdown_interrupts_the_pending_read`,
+    `dropping_an_unpolled_shutdown_future_aborts_the_owned_refresh`,
+    `task_death_withdraws_new_verification_and_is_visible_to_the_monitor`,
+    `unusable_key_refresh_configuration_is_rejected_before_starting`,
+    `a_large_legitimate_projection_is_installed_without_truncation`,
+    `revision_change_restarts_from_the_beginning_instead_of_omitting_a_new_key`,
+    `page_budget_and_revision_regression_preserve_the_previous_table_and_deadline`,
+    `page_budget_cannot_publish_an_incomplete_first_table`,
+    `the_instance_clock_narrows_the_server_set_at_publication`,
+    `credential_refresh_failure_is_structured_without_exposing_the_source_body`,
+    `credential_pages_order_bound_skip_retired_and_expose_every_mutation` (both stores),
+    `credential_revision_covers_legacy_writes_rollback_and_overflow` (PostgreSQL),
+    `maximal_key_pages_fit_the_derived_envelope_and_digests_are_canonical`,
+    `cached_projected_credentials_remain_allocation_free_through_expiry`,
+    `only_instances_receive_active_keys_at_the_server_clock_without_caching`,
+    `http_projection_refuses_partial_ambiguous_or_unsuccessful_responses`,
+    the mirrored backend
+    `credential_projection_preserves_lifecycle_truth_and_refuses_corrupt_identity`,
+    and the three full-stack HTTP/TLS/mTLS conservation tests named in 32.

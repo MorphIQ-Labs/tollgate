@@ -1,6 +1,6 @@
 # Control-plane security
 
-`tollgate-server` authenticates every lease, snapshot, usage, and administrative
+`tollgate-server` authenticates every lease, snapshot, credential, usage, and administrative
 route. `/livez` and `/readyz` accept unauthenticated probes. Readiness checks
 storage reachability; it does not certify that every configured identity is
 usable. Monitor security reload warnings separately.
@@ -45,8 +45,15 @@ Use separate instance and operator identities. Roles are disjoint:
 
 | Role | Routes under `/v1` |
 | --- | --- |
-| `instance` | `POST /leases/{acquire,release,consolidate,reclaim}`, `GET /snapshots`, `GET /snapshots/{principal}`, `POST /usage/ingest` |
+| `instance` | `POST /leases/{acquire,release,consolidate,reclaim}`, `GET /snapshots`, `GET /snapshots/{principal}`, `GET /keys`, `POST /usage/ingest` |
 | `operator` | `POST /admin/accounts`, `POST /admin/accounts/{id}/{deposit,status,capacity-class}`, `PUT /admin/snapshots/{principal}`, `DELETE /admin/snapshots/{principal}` |
+
+`GET /keys` serves customer credential digests from the store's `KeyDirectory`.
+That key space is separate from this server's control-plane bearer credentials,
+which are loaded from the security manifest into their own HmacRegistry. The
+route sends neither customer secrets nor the HMAC secret already held by a
+customer verifier. See [credential projection](CREDENTIAL_PROJECTION.md) for
+paging, clock, freshness and rollout contracts.
 
 Static credential files contain 32–16,377 visible ASCII bytes; a trailing newline
 is accepted. Generate at least 256 random bits and store them using a secret

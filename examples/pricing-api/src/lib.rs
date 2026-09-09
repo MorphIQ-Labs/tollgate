@@ -91,7 +91,7 @@ impl PricingConnection {
     fn authenticate(
         &self,
         authorization: Option<&axum::http::HeaderValue>,
-        verifier: &HmacRegistry,
+        verifier: &impl tollgate_auth::CredentialVerifier,
         now: Timestamp,
     ) -> Option<Principal> {
         let credential = authorization
@@ -259,7 +259,8 @@ impl FromRequest<Arc<AppState>> for PriceInput {
 // ---- app ---------------------------------------------------------------
 
 struct AppState {
-    auth: HmacRegistry,
+    auth: tollgate_client::KeyVerifier,
+    keys: Option<tollgate_client::KeyManagerMonitor>,
     baseline_counters: tollgate_admission::AdmissionCounters,
     capacity: Option<ExecutionCapacityGate>,
     admission: Option<tollgate_client::RuntimeHandle>,
@@ -280,6 +281,7 @@ pub struct AppRuntime {
 }
 
 struct Background {
+    keys: tollgate_client::KeyManager,
     runtime: tollgate_client::InstanceRuntime,
     republishers: tokio::task::JoinSet<()>,
 }
@@ -296,6 +298,8 @@ impl AppRuntime {
     pub async fn shutdown(self) {
         if let Some(mut background) = self.background {
             background.republishers.abort_all();
+            let report = background.keys.shutdown().await;
+            tracing::info!(?report, "credential manager shutdown");
             match background.runtime.shutdown().await {
                 Ok(report) => tracing::info!(?report, "instance-runtime shutdown"),
                 Err(error) => tracing::error!(%error, "instance supervisor died during shutdown"),
@@ -444,7 +448,7 @@ fn refill_sizing(deposit: u64) -> (CostUnits, CostUnits) {
 
 /// Build the service. `deposit` funds the demo account; `admission_enabled:
 /// false` is the load-gate baseline.
-pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRuntime) {
+pub async fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRuntime) {
     build_app_with(
         deposit,
         admission_enabled,
@@ -453,6 +457,7 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
         &[demo_tenant()],
         ExecutionCapacityMode::Disabled,
     )
+    .await
 }
 
 /// The demo stack with the account's enforcement mode chosen by the caller.
@@ -462,7 +467,7 @@ pub fn build_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRun
 /// the mode: a `enforcement_mode()` that ignored the snapshot entirely and
 /// returned `Strict` would satisfy every assertion. The mutation gate found
 /// exactly that.
-pub fn build_app_with_mode(
+pub async fn build_app_with_mode(
     deposit: u64,
     admission_enabled: bool,
     enforcement_mode: EnforcementMode,
@@ -475,11 +480,12 @@ pub fn build_app_with_mode(
         &[demo_tenant()],
         ExecutionCapacityMode::Disabled,
     )
+    .await
 }
 
 /// Build the service with an explicit instance-local hot-path shard count.
 /// Keep one shard unless profiling shows sustained same-account saturation.
-pub fn build_app_with_sharding(
+pub async fn build_app_with_sharding(
     deposit: u64,
     admission_enabled: bool,
     sharding: LocalSharding,
@@ -492,6 +498,7 @@ pub fn build_app_with_sharding(
         &[demo_tenant()],
         ExecutionCapacityMode::Disabled,
     )
+    .await
 }
 
 /// The multi-tenant, capacity-gated stack: what #99's load witnesses measure.
@@ -502,7 +509,7 @@ pub fn build_app_with_sharding(
 /// mixed-class workload needs both: the class is account-owned, so assured and
 /// best-effort traffic cannot share an account, and it changes no outcome
 /// unless a gate is configured to run out of capacity.
-pub fn build_app_with_capacity(
+pub async fn build_app_with_capacity(
     deposit: u64,
     admission_enabled: bool,
     sharding: LocalSharding,
@@ -517,12 +524,13 @@ pub fn build_app_with_capacity(
         tenants,
         capacity,
     )
+    .await
 }
 
 /// Both knobs at once. Each public builder above fixes one of them, because
 /// every current caller varies one and takes the default for the other; the
 /// body lives here so neither knob's default is written twice.
-fn build_app_with(
+async fn build_app_with(
     deposit: u64,
     admission_enabled: bool,
     enforcement_mode: EnforcementMode,
@@ -589,12 +597,41 @@ fn build_app_with(
         }
     };
 
-    let auth = HmacRegistry::new(b"demo-server-secret-rotate-me");
-    let principals =
-        auth.install_credentials(tenants.iter().map(|tenant| tenant.api_key.as_bytes()));
-    for (tenant, principal) in tenants.iter().zip(&principals) {
-        store.publish_snapshot(*principal, compile_snapshot(tenant, 1));
+    // Public demo tokens are retained for the documented curl and paired load
+    // fixtures. Production issuance uses mint(); both paths persist digests
+    // before starting the same supported background projection.
+    const DEMO_HMAC_SECRET: &[u8] = b"demo-server-secret-rotate-me-108-fixture";
+    let issuer = HmacRegistry::new(DEMO_HMAC_SECRET);
+    let mut principals = Vec::with_capacity(tenants.len());
+    for tenant in tenants {
+        let (principal, digest) = issuer.digest_credential(tenant.api_key.as_bytes());
+        tollgate_store::KeyDirectory::insert_key(
+            &*store,
+            tollgate_store::KeyRecord {
+                key_id: tollgate_core::KeyId(tenant.account.0),
+                account_id: tenant.account,
+                principal,
+                digest,
+                not_after: None,
+            },
+        )
+        .await
+        .expect("demo tenants have distinct accounts and credentials");
+        principals.push(principal);
+        store.publish_snapshot(principal, compile_snapshot(tenant, 1));
     }
+    let (auth, keys, key_manager) = if admission_enabled {
+        let manager = tollgate_client::KeyManager::spawn(
+            store.clone(),
+            DEMO_HMAC_SECRET,
+            clock.clone(),
+            tollgate_client::KeyManagerConfig::default(),
+        )
+        .expect("demo credential timing configuration is valid");
+        (manager.verifier(), Some(manager.monitor()), Some(manager))
+    } else {
+        (tollgate_client::KeyVerifier::default(), None, None)
+    };
 
     // `Disabled` composes no gate at all rather than one that always admits,
     // so a demo that never configures capacity allocates no pool (#99).
@@ -672,6 +709,7 @@ fn build_app_with(
             ));
         }
         let background = Background {
+            keys: key_manager.expect("admission owns credential refresh"),
             runtime,
             republishers,
         };
@@ -682,6 +720,7 @@ fn build_app_with(
 
     let state = Arc::new(AppState {
         auth,
+        keys,
         baseline_counters: tollgate_admission::AdmissionCounters::default(),
         input_rejections: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
         capacity,
@@ -698,10 +737,15 @@ fn build_app_with(
 }
 
 async fn readyz(State(state): State<Arc<AppState>>) -> StatusCode {
+    let now = Timestamp::now();
     if state
-        .admission
+        .keys
         .as_ref()
-        .is_none_or(|runtime| runtime.readiness(Timestamp::now()).is_ready())
+        .is_none_or(|keys| keys.report(now).ready)
+        && state
+            .admission
+            .as_ref()
+            .is_none_or(|runtime| runtime.readiness(now).is_ready())
     {
         StatusCode::OK
     } else {

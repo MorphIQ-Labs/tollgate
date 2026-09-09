@@ -9,6 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+tollgate-auth = { path = "../tollgate-auth", version = "=0.16.0" }
 tollgate-core = { path = "../tollgate-core", version = "=0.16.0" }
 tollgate-admission = { path = "../tollgate-admission", version = "=0.16.0" }
 tollgate-store = { path = "../tollgate-store", version = "=0.16.0" }
@@ -16,9 +17,10 @@ async-trait = { workspace = true }
 atomic-waker = { workspace = true }
 jiff = { workspace = true }
 reqwest = { workspace = true, optional = true }
-arc-swap = { workspace = true, optional = true }
-zeroize = { workspace = true, optional = true }
+arc-swap = { workspace = true }
+zeroize = { workspace = true }
 serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
@@ -34,14 +36,13 @@ tokio = { workspace = true, features = ["test-util"] }
 # are behavior rather than decoration. Subscribers stay out of the library.
 tracing-subscriber = { workspace = true }
 tollgate-alloc-count = { workspace = true }
-tollgate-auth = { path = "../tollgate-auth", version = "=0.16.0" }
 uuid = { version = "1", features = ["v4"] }
 
 [features]
 # HTTP transport implementing the store traits against a tollgate-server —
 # the "via-server" topology. Off by default: the direct-store topology
 # needs none of it.
-http = ["dep:reqwest", "dep:arc-swap", "dep:zeroize", "dep:serde", "tollgate-store/wire"]
+http = ["dep:reqwest", "dep:serde", "dep:serde_json", "tollgate-store/wire"]
 
 # Control-plane scaling, reported but not gated: unlike the request-path
 # benches this one is not in testing/perf_thresholds.json, because its
@@ -52,3 +53,11 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "managed_credentials"
+harness = false
+
+[[bench]]
+name = "key_projection_scaling"
+harness = false

@@ -1170,7 +1170,7 @@ impl std::error::Error for KeyError {}
 /// so a backend decides what "active" means once, here, rather than in each
 /// reader.
 #[async_trait]
-pub trait KeyDirectory: Send + Sync {
+pub trait KeyDirectory: crate::KeySource {
     /// Record a minted credential. The caller has already generated the
     /// secret and computed its digest; this stores what remains.
     async fn insert_key(&self, record: KeyRecord) -> Result<(), KeyError>;
@@ -1182,8 +1182,9 @@ pub trait KeyDirectory: Send + Sync {
     /// (INVARIANTS.md #15).
     async fn revoke_key(&self, key_id: KeyId, now: Timestamp) -> Result<Revocation, KeyError>;
 
-    /// Every credential valid at `now`: not revoked, and not past its
-    /// `not_after`. This is the projection's source of truth.
+    /// Unbounded operator read of every credential valid at `now`. Serving
+    /// instances use `KeySource` pages and an owned, bounded drain instead.
+    /// Retained for existing direct-store lifecycle tooling; no hidden page cap.
     async fn active_keys(&self, now: Timestamp) -> Result<Vec<KeyRecord>, StoreError>;
 }
 

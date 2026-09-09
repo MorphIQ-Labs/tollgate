@@ -1,10 +1,10 @@
 //! Instance-side quota runtime.
 //!
-//! Everything here runs *off* the request path (INVARIANTS.md #6): a
+//! Background tasks run *off* the request path (INVARIANTS.md #6): a
 //! [`LeaseManager`] task keeps an account's [`LeaseSlot`] stocked from a
 //! [`LeaseAllocator`], and a [`UsageWriter`] task drains a bounded channel of
 //! usage events into a [`UsageSink`] in idempotent batches. The request path
-//! touches only the slot (lock-free load) and the channel (permit
+//! touches published state (lock-free loads) and the channel (permit
 //! reservation) — when the channel is full, admission sheds *before* work is
 //! accepted (INVARIANTS.md #8) via [`UsageRecorder::try_reserve`].
 //!
@@ -20,6 +20,12 @@
 //! beside the admission runtime. Its monitor reports rollover health and
 //! confirmed progress; its shutdown is independent of usage and lease cleanup.
 //! HTTP-backed applications leave period maintenance to `tollgate-server`.
+//! Own a [`KeyManager`] beside the runtime to refresh customer credentials from
+//! a read-only `KeySource`. Use its [`KeyVerifier`] with
+//! `tollgate_auth::SessionCredential`, combine both monitors' readiness, and
+//! include key-manager shutdown in the application's budget. Refresh runs on
+//! the snapshot cadence; cached evidence expires within the configured key
+//! freshness window even when a key is removed or the feed becomes unavailable.
 //!
 //! The runtime enforces one total shutdown deadline. It closes accounting
 //! admission, pauses refills, drains issued permits and guards, and releases
@@ -39,6 +45,7 @@
 //! [`UsageSink`]: tollgate_store::UsageSink
 //! [`LeaseSlot`]: tollgate_admission::LeaseSlot
 
+pub mod key_manager;
 pub mod lease_manager;
 pub mod period_roller;
 mod registry;
@@ -51,6 +58,10 @@ pub mod http;
 #[cfg(feature = "http")]
 pub mod http_security;
 
+pub use key_manager::{
+    KeyManager, KeyManagerConfig, KeyManagerConfigError, KeyManagerHealth, KeyManagerMonitor,
+    KeyManagerReport, KeyManagerShutdownReport, KeyManagerStats, KeyVerifier,
+};
 pub use period_roller::{
     PeriodRoller, PeriodRollerConfig, PeriodRollerConfigError, PeriodRollerHealth,
     PeriodRollerMonitor, PeriodRollerReport, PeriodRollerShutdownReport, PeriodRollerStats,
