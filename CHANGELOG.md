@@ -7,6 +7,16 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.14.7...v0.15.0) - 2026-09-08
+
+### Added
+
+- *(client)* [**breaking**] #95 orchestrate the multi-account admission lifecycle
+
+### Fixed
+
+- *(client)* [**breaking**] #109 fold a refused lease's unspent units into its replacement
+
 ## [0.14.7](https://github.com/MorphIQ-Labs/tollgate/compare/v0.14.6...v0.14.7) - 2026-09-07
 
 ### Added
