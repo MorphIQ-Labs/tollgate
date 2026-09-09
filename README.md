@@ -19,8 +19,8 @@ permission bits — never plan names, FCUs, or SQL.
 | `crates/tollgate-auth` | Credential verification: `CredentialVerifier` scheme seam, `HmacRegistry` (digests at rest), `SessionCredential` session cache with a validity bound |
 | `crates/tollgate-store` | `LeaseAllocator` / `SnapshotSource` / `UsageSink` / `AdminStore` traits, `GrantPolicy`, `MemoryStore` reference backend, wire DTOs, `Clock` |
 | `crates/tollgate-store-postgres` | Transactional Postgres backend (row-locked acquire, set-wise usage ingest, bounded set-wise SKIP LOCKED reclaim) |
-| `crates/tollgate-server` | Axum control plane over any backend; RFC-7807 errors with stable codes |
-| `crates/tollgate-client` | `InstanceRuntime` (dynamic account supervision, readiness, bounded shutdown), staged `RuntimeHandle`, direct-store `PeriodRoller`, lower-level lease/snapshot/usage managers, `HttpStore` transport |
+| `crates/tollgate-server` | Authenticated rustls control plane, disjoint instance/operator roles, rotating mTLS/bearer/Google identity, administrative audit |
+| `crates/tollgate-client` | `InstanceRuntime` (dynamic account supervision, readiness, bounded shutdown), staged `RuntimeHandle`, direct-store `PeriodRoller`, lower-level lease/snapshot/usage managers, `HttpStore` with rotatable TLS and service identity |
 | `crates/tollgate-perf-gate` | Benchmark threshold checker (criterion estimates vs manifest, staleness-guarded) |
 | `examples/pricing-api` | Concrete API embedding the stack: connection-cached HMAC-verified keys, admission, commit-at-execution-start, billing |
 
@@ -64,9 +64,14 @@ curl -s -H 'Authorization: Bearer demo-key-1' -H 'Content-Type: application/json
 # What that instance admitted and refused, by reason:
 curl -s http://127.0.0.1:8081/metrics
 
-# Run the control plane:
-cargo run -p tollgate-server
+# Configure control-plane identities/TLS first; see docs/CONTROL_PLANE_SECURITY.md:
+TOLLGATE_SECURITY_CONFIG=/path/to/security.json cargo run -p tollgate-server
 ```
+
+The [control-plane security runbook](docs/CONTROL_PLANE_SECURITY.md) covers TLS,
+Cloud Run service identity, credential rotation, audit collection, and the Rust
+API/configuration rollout. Remote plaintext and anonymous control-plane calls
+are refused.
 
 ## Supported Rust toolchains
 

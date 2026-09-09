@@ -20,6 +20,7 @@
 //! correctness suite run without infrastructure, and to serve as executable
 //! documentation of the settlement rules a real backend must reproduce.
 
+pub mod audit;
 pub mod clock;
 mod leases;
 pub mod memory;
@@ -27,6 +28,7 @@ pub mod traits;
 #[cfg(feature = "wire")]
 pub mod wire;
 
+pub use audit::{AdminReceipt, AdminState};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use memory::{MemoryStore, StoredRecords};
 pub use traits::{

@@ -5,3 +5,6 @@
 .DS_Store
 # Criterion output and perf-gate reports are build artifacts.
 /reports
+
+# Local control-plane keys and demonstration configuration
+/.local-control/

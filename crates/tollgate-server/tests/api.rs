@@ -2,6 +2,8 @@
 //! codes, and the stable problem `code` strings the client transport relies
 //! on.
 
+mod common;
+
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -32,6 +34,7 @@ fn api(path: &str) -> String {
 fn state() -> (Arc<MemoryStore>, axum::Router) {
     let store = MemoryStore::new(GrantPolicy::default()).unwrap();
     let router = router(ServerState {
+        security: common::security(),
         store: Arc::clone(&store),
         clock: Arc::new(ManualClock::new(t(0))),
     });
@@ -44,16 +47,23 @@ async fn call(
     path: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
+    let token = if path.contains("/admin/") {
+        common::OPERATOR
+    } else {
+        common::INSTANCE
+    };
     let request = match body {
         Some(body) => Request::builder()
             .method(method)
             .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body.to_string()))
             .unwrap(),
         None => Request::builder()
             .method(method)
             .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap(),
     };
@@ -668,6 +678,10 @@ async fn an_oversized_ingest_body_is_refused_as_batch_too_large() {
     let request = Request::builder()
         .method("POST")
         .uri(api("/usage/ingest"))
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", common::INSTANCE),
+        )
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(format!("{{\"events\":\"{filler}\"}}")))
         .unwrap();

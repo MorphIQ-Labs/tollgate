@@ -11,14 +11,16 @@
 //! away is the normal end of a test.
 #![allow(clippy::let_underscore_must_use)]
 
+mod common;
+
 use std::sync::Arc;
 
 use jiff::{SignedDuration, Timestamp};
 
 use tollgate_admission::{AdmissionEngine, ArcSwapSnapshotMap, NoGate, SnapshotMap};
 use tollgate_client::{
-    HttpStore, SlotRegistry, SnapshotManager, SnapshotManagerConfig, SystemClock,
-    TrackedPrincipals, UsageWriterConfig,
+    SlotRegistry, SnapshotManager, SnapshotManagerConfig, SystemClock, TrackedPrincipals,
+    UsageWriterConfig,
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CapacityClass, CostTable, CostUnits, DenyReason,
@@ -46,6 +48,7 @@ async fn zero_reclaim_interval_is_rejected() {
     let error = serve(
         listener,
         ServerState {
+            security: common::security(),
             store,
             clock: Arc::new(SystemClock),
         },
@@ -122,7 +125,7 @@ async fn http_store_rejects_invalid_snapshot_from_legacy_server() {
             .unwrap();
     });
 
-    let http = HttpStore::new(format!("http://{address}"));
+    let http = common::http(format!("http://{address}"));
     let error = http.snapshot(PRINCIPAL).await.unwrap_err();
     assert!(
         error.0.contains("invalid snapshot from server") && error.0.contains("exceeding the burst"),
@@ -148,7 +151,7 @@ async fn an_unstructured_route_404_is_not_a_confirmed_unknown_principal() {
             .unwrap();
     });
 
-    let http = HttpStore::new(format!("http://{address}"));
+    let http = common::http(format!("http://{address}"));
     let error = http.snapshot(PRINCIPAL).await.unwrap_err();
     assert!(
         error.0.contains("unstructured 404") && !error.0.contains("unknown-principal response"),
@@ -168,6 +171,7 @@ async fn http_negative_ttl_refetches_without_push() {
     let server = tokio::spawn(serve(
         listener,
         ServerState {
+            security: common::security(),
             store: Arc::clone(&store),
             clock: Arc::new(SystemClock),
         },
@@ -177,7 +181,7 @@ async fn http_negative_ttl_refetches_without_push() {
         },
     ));
 
-    let http = HttpStore::new(format!("http://{address}"));
+    let http = common::http(format!("http://{address}"));
     let map = Arc::new(ArcSwapSnapshotMap::new());
     let engine = AdmissionEngine::new(Arc::clone(&map));
     let slots = SlotRegistry::new();
@@ -295,6 +299,7 @@ async fn a_consolidation_folds_the_tail_grant_over_http() {
     let server = tokio::spawn(serve(
         listener,
         ServerState {
+            security: common::security(),
             store: Arc::clone(&store),
             clock: Arc::new(SystemClock),
         },
@@ -303,7 +308,7 @@ async fn a_consolidation_folds_the_tail_grant_over_http() {
             let _ = stop_rx.await;
         },
     ));
-    let http = HttpStore::new(format!("http://{address}"));
+    let http = common::http(format!("http://{address}"));
 
     let tail = http
         .acquire(ACCOUNT, CostUnits(49), SignedDuration::from_secs(60), at(0))
@@ -340,6 +345,20 @@ async fn a_consolidation_folds_the_tail_grant_over_http() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_stack_over_loopback_http() {
+    full_stack(common::TransportMode::LoopbackBearer).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_stack_over_tls_bearer() {
+    full_stack(common::TransportMode::TlsBearer).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_stack_over_mtls() {
+    full_stack(common::TransportMode::Mtls).await;
+}
+
+async fn full_stack(mode: common::TransportMode) {
     // Server side: memory backend, system clock, real listener on an
     // ephemeral port.
     let store = MemoryStore::new(GrantPolicy::default()).unwrap();
@@ -353,10 +372,12 @@ async fn full_stack_over_loopback_http() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
+    let (security, http) = common::transport(mode, address);
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(serve(
         listener,
         ServerState {
+            security,
             store: Arc::clone(&store),
             clock: Arc::new(SystemClock),
         },
@@ -367,7 +388,6 @@ async fn full_stack_over_loopback_http() {
     ));
 
     // Instance side: everything over HTTP.
-    let http = HttpStore::new(format!("http://{address}"));
     let clock = Arc::new(SystemClock);
 
     // Cold fetch of the snapshot through the transport (pull path), plus the
@@ -527,6 +547,7 @@ async fn http_instance_discovers_a_principal_published_after_it_started() {
     let server = tokio::spawn(serve(
         listener,
         ServerState {
+            security: common::security(),
             store: Arc::clone(&store),
             clock: Arc::new(SystemClock),
         },
@@ -536,7 +557,7 @@ async fn http_instance_discovers_a_principal_published_after_it_started() {
         },
     ));
 
-    let http = HttpStore::new(format!("http://{address}"));
+    let http = common::http(format!("http://{address}"));
     let map = Arc::new(ArcSwapSnapshotMap::new());
     let slots = SlotRegistry::new();
     let manager = SnapshotManager::spawn(
@@ -611,6 +632,7 @@ async fn an_oversized_batch_comes_back_refused_not_retryable() {
         capacity_class: CapacityClass::Assured,
     });
     let app = router(ServerState {
+        security: common::security(),
         store: Arc::clone(&store),
         clock: Arc::new(tollgate_client::ManualClock::new(at(0))),
     });
@@ -660,7 +682,7 @@ async fn an_oversized_batch_comes_back_refused_not_retryable() {
     let events_needed = MAX_INGEST_BODY_BYTES / encoded_event + 64;
     let events: Vec<UsageEvent> = (0..events_needed as u128).map(event).collect();
 
-    let http = HttpStore::new(format!("http://{address}"));
+    let http = common::http(format!("http://{address}"));
     let error = UsageSink::ingest(&*http, &events, at(0))
         .await
         .expect_err("a body past the limit must be refused");
@@ -710,7 +732,7 @@ async fn a_rate_limited_or_timed_out_ingest_stays_retryable() {
                 .unwrap();
         });
 
-        let http = HttpStore::new(format!("http://{address}"));
+        let http = common::http(format!("http://{address}"));
         let event = UsageEvent::new(
             RequestId(1),
             ACCOUNT,

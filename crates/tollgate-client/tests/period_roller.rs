@@ -179,24 +179,31 @@ impl AdminStore for Scripted {
             _ => Ok(batch),
         }
     }
-    async fn create_account(&self, _: AccountConfig) -> Result<(), CreateAccountError> {
+    async fn create_account(
+        &self,
+        _: AccountConfig,
+    ) -> Result<tollgate_store::AdminReceipt<()>, CreateAccountError> {
         unreachable!("roller never creates accounts")
     }
-    async fn deposit(&self, _: AccountId, _: CostUnits) -> Result<(), AllocateError> {
+    async fn deposit(
+        &self,
+        _: AccountId,
+        _: CostUnits,
+    ) -> Result<tollgate_store::AdminReceipt<()>, AllocateError> {
         unreachable!("roller never deposits directly")
     }
     async fn set_account_status(
         &self,
         _: AccountId,
         _: AccountStatus,
-    ) -> Result<StatusChange, SetStatusError> {
+    ) -> Result<tollgate_store::AdminReceipt<StatusChange>, SetStatusError> {
         unreachable!("roller never changes status")
     }
     async fn set_capacity_class(
         &self,
         _: AccountId,
         _: CapacityClass,
-    ) -> Result<StatusChange, SetStatusError> {
+    ) -> Result<tollgate_store::AdminReceipt<StatusChange>, SetStatusError> {
         unreachable!("roller never changes capacity")
     }
     async fn set_budget_schedule(
@@ -210,10 +217,13 @@ impl AdminStore for Scripted {
         &self,
         _: Principal,
         _: PublishableSnapshot,
-    ) -> Result<(), PublishSnapshotError> {
+    ) -> Result<tollgate_store::AdminReceipt<()>, PublishSnapshotError> {
         unreachable!("roller never publishes snapshots")
     }
-    async fn remove_snapshot(&self, _: Principal) -> Result<(), StoreError> {
+    async fn remove_snapshot(
+        &self,
+        _: Principal,
+    ) -> Result<tollgate_store::AdminReceipt<()>, StoreError> {
         unreachable!("roller never removes snapshots")
     }
 }

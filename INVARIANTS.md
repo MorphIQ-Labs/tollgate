@@ -1543,3 +1543,86 @@ exists to detect corrupt state and must not be able to launder it.
     `removing_the_last_principal_cancels_a_pending_manager_restart`, and
     `integrity_faults_in_idle_and_final_release_are_reported_as_terminal`, and
     `shutdown_distinguishes_settled_leases_from_unconfirmed_or_invalid_releases`.
+
+32. **Control-plane authority is verified before decoding or mutation.** Every
+    protected HTTP handler requires private instance or operator evidence;
+    middleware authenticates and authorizes before body/path extraction. The
+    roles are disjoint. A client certificate must pass TLS key possession and
+    current CA/time validation, and its leaf fingerprint must have a role.
+    Bearer schemes return verified principals with validity bounds, mapped to
+    roles in the same immutable generation. Conflicting evidence, expired
+    evidence, missing credentials, and wrong roles fail closed. Forwarded
+    headers cannot manufacture TLS evidence. Probes carry no authority.
+
+    Exposed server listeners require TLS; clients refuse remote plaintext,
+    redirects, and credential-bearing URLs. A reload stages and validates the
+    entire verifier/role/TLS generation before atomic publication. Failed
+    loads preserve the previous generation and its original expiry. New
+    requests recheck current authority even on existing connections; already
+    authorized requests retain their pinned proof. Client transport replacement
+    atomically rotates roots, identity and provider. Handshake count/time and
+    total HTTP call time (including credential retrieval) are bounded off-path.
+
+    Enforcement: private handler extractors, `ServerSecurity`, `SecureListener`,
+    `SecurityLoader`, and the generation-owning `HttpRequest`. Exact-model proof:
+    `formal/lean/Tollgate/ControlPlane.lean` proves role separation and agreement
+    of presented evidence, assuming verification and atomic generation selection.
+    It does not prove cryptography, rustls, Tokio, clock accuracy or Rust refinement.
+    Implementation witnesses: `every_control_plane_route_requires_its_own_role_before_decoding`,
+    `ambiguous_framing_and_forged_peer_headers_authenticate_nobody`,
+    `exposed_plaintext_is_rejected_before_the_server_starts`,
+    `unsafe_client_urls_and_deadlines_are_rejected_without_io`,
+    `control_plane_redirects_are_not_followed`,
+    `google_tokens_require_signature_issuer_audience_subject_and_live_expiry`,
+    `signing_keys_never_outlive_the_issuer_cache_policy_or_one_hour`,
+    `failed_key_refresh_never_extends_verified_identity_validity`,
+    `security_reload_stages_validates_and_only_then_replaces`,
+    `a_failed_install_is_retried_and_cannot_remove_tls`,
+    `file_boundaries_are_part_of_the_rotation_fingerprint`,
+    `bearer_rotation_changes_existing_connections_and_preserves_usage_for_retry`,
+    `mtls_and_bearer_fund_and_settle_over_tls_and_revocation_affects_keepalive`,
+    `a_hung_credential_provider_is_inside_the_http_deadline`,
+    `google_metadata_cache_refreshes_at_its_exact_deadline_and_never_caches_failure`,
+    `metadata_requires_success_google_provenance_and_a_complete_bounded_token`,
+    `client_validation_rejects_each_unsafe_url_component_independently`,
+    `static_credential_files_enforce_both_length_bounds_and_visible_framing`,
+    `signing_key_refresh_honors_success_cadence_and_failure_backoff`,
+    `initial_signing_key_failure_preserves_the_dependency_error`,
+    `dropping_the_reloader_releases_its_owned_task_and_clock`,
+    `every_signing_key_must_independently_name_an_rs256_signature_key`,
+    `signing_key_transport_enforces_status_cache_policy_and_complete_body_bounds`,
+    `bearer_framing_checks_each_condition_before_scheme_verification`,
+    `overlapping_bearer_schemes_must_agree_on_the_verified_identity`,
+    `certificate_configuration_checks_trust_key_pairs_and_handshake_bounds`,
+    `the_binary_refuses_an_exposed_plaintext_listener_before_opening_the_backend`,
+    `pending_tls_handshakes_are_bounded_expire_and_drop_with_the_listener`,
+    `full_stack_over_tls_bearer` and `full_stack_over_mtls`.
+
+33. **An administrative audit receipt describes its own serialized mutation.**
+    Each successful HTTP-facing `AdminStore` mutation returns a typed receipt
+    alongside its result, captured under the owning memory lock or PostgreSQL
+    transaction. Concurrent operations must name the actual predecessor they
+    replaced; a separate audit read cannot substitute for that evidence.
+    Idempotent no-ops have equal before/after states. Snapshot state is identified
+    by principal, immutable generation and revocation status; receipts do not
+    duplicate complete policy graphs.
+
+    The HTTP operator guard emits actor, operation ID, action, resource and time
+    before a store call, then confirms with the receipt, or reports failure or
+    cancellation without inventing a state transition. Storage errors and
+    cancellation can conceal a commit. Delivery uses the embedder's tracing
+    subscriber; this contract does not claim transactional durability across
+    process death or logging failure. The binary retains audit events separately
+    from normal verbosity; operators retain and monitor their log delivery.
+
+    Enforcement: `AdminReceipt` in trait return types, receipt creation inside
+    both backends, and `OperatorIdentity::run` around every admin mutation.
+    `formal/lean/Tollgate/ControlPlane.lean` proves abstract deposit receipt
+    conservation and predecessor composition; checked arithmetic and database
+    serialization are separate implementation evidence. Mirrored backend tests:
+    `admin_receipts_identify_the_state_each_operation_replaced`,
+    `concurrent_deposit_receipts_form_one_exact_funding_history`, and
+    `racing_publication_and_revocation_receipts_name_the_actual_predecessor`.
+    HTTP witnesses: `every_admin_mutation_logs_its_actor_and_the_backend_receipt`,
+    `cancelled_admin_operations_report_an_unknown_commit_without_a_receipt`, and
+    `normal_log_verbosity_cannot_silence_the_binarys_audit_target`.

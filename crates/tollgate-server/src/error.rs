@@ -67,6 +67,23 @@ where
 }
 
 impl ApiError {
+    pub fn unauthorized() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "authentication-required",
+            title: "valid control-plane credentials required".into(),
+            generation: None,
+        }
+    }
+
+    pub fn forbidden() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "scope-forbidden",
+            title: "credential does not authorize this control-plane operation".into(),
+            generation: None,
+        }
+    }
     pub fn not_found(code: &'static str, title: impl Into<String>) -> Self {
         ApiError {
             status: StatusCode::NOT_FOUND,
@@ -281,6 +298,7 @@ impl From<SnapshotValidationError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let unauthorized = self.status == StatusCode::UNAUTHORIZED;
         let problem = Problem {
             status: self.status.as_u16(),
             code: self.code.to_string(),
@@ -292,6 +310,12 @@ impl IntoResponse for ApiError {
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("application/problem+json"),
         );
+        if unauthorized {
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Bearer realm=\"tollgate-control\""),
+            );
+        }
         response
     }
 }

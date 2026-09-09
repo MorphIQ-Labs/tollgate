@@ -3,6 +3,8 @@
 //! A server whose source of truth is unreachable must not attract traffic,
 //! and — since #36 — must also say *why* rather than only answering 503.
 
+mod common;
+
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -105,11 +107,18 @@ impl UsageSink for PingOnlyStore {
 
 #[async_trait]
 impl AdminStore for PingOnlyStore {
-    async fn create_account(&self, _config: AccountConfig) -> Result<(), CreateAccountError> {
+    async fn create_account(
+        &self,
+        _config: AccountConfig,
+    ) -> Result<tollgate_store::AdminReceipt<()>, CreateAccountError> {
         unreachable!("readiness never administers")
     }
 
-    async fn deposit(&self, _account: AccountId, _units: CostUnits) -> Result<(), AllocateError> {
+    async fn deposit(
+        &self,
+        _account: AccountId,
+        _units: CostUnits,
+    ) -> Result<tollgate_store::AdminReceipt<()>, AllocateError> {
         unreachable!("readiness never administers")
     }
 
@@ -117,7 +126,7 @@ impl AdminStore for PingOnlyStore {
         &self,
         _account: AccountId,
         _status: AccountStatus,
-    ) -> Result<StatusChange, SetStatusError> {
+    ) -> Result<tollgate_store::AdminReceipt<StatusChange>, SetStatusError> {
         unreachable!("readiness never administers")
     }
 
@@ -125,7 +134,7 @@ impl AdminStore for PingOnlyStore {
         &self,
         _account: AccountId,
         _class: CapacityClass,
-    ) -> Result<StatusChange, SetStatusError> {
+    ) -> Result<tollgate_store::AdminReceipt<StatusChange>, SetStatusError> {
         unreachable!("readiness never administers")
     }
 
@@ -149,11 +158,14 @@ impl AdminStore for PingOnlyStore {
         &self,
         _principal: Principal,
         _snapshot: PublishableSnapshot,
-    ) -> Result<(), PublishSnapshotError> {
+    ) -> Result<tollgate_store::AdminReceipt<()>, PublishSnapshotError> {
         unreachable!("readiness never administers")
     }
 
-    async fn remove_snapshot(&self, _principal: Principal) -> Result<(), StoreError> {
+    async fn remove_snapshot(
+        &self,
+        _principal: Principal,
+    ) -> Result<tollgate_store::AdminReceipt<()>, StoreError> {
         unreachable!("readiness never administers")
     }
 }
@@ -162,6 +174,7 @@ async fn readyz_status(healthy: bool) -> axum::http::StatusCode {
     use tower::ServiceExt as _;
 
     let app = router(ServerState {
+        security: common::security(),
         store: Arc::new(PingOnlyStore { healthy }),
         clock: Arc::new(SystemClock),
     });
