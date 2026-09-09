@@ -914,7 +914,7 @@ pub trait AdminStore: Send + Sync {
     /// Give an account a periodic allowance, or take it away.
     ///
     /// Setting a schedule does not deposit anything: the first allowance
-    /// arrives at the first [`roll_period`](Self::roll_period) after the
+    /// arrives at the first [`roll_due_periods`](Self::roll_due_periods) pass after the
     /// schedule exists. Depositing here would make "set a schedule" and "give
     /// this account units now" the same operation, and an operator correcting
     /// a mistyped allowance would fund the account twice.

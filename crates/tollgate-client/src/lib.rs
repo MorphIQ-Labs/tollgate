@@ -16,6 +16,10 @@
 //! [`RuntimeHandle`] provides staged admission, readiness, and reports; retain
 //! the unique runtime owner and await its shutdown. Lower-level managers remain
 //! available for specialized embeddings.
+//! Direct-store applications with budget schedules also own a [`PeriodRoller`]
+//! beside the admission runtime. Its monitor reports rollover health and
+//! confirmed progress; its shutdown is independent of usage and lease cleanup.
+//! HTTP-backed applications leave period maintenance to `tollgate-server`.
 //!
 //! The runtime enforces one total shutdown deadline. It closes accounting
 //! admission, pauses refills, drains issued permits and guards, and releases
@@ -36,6 +40,7 @@
 //! [`LeaseSlot`]: tollgate_admission::LeaseSlot
 
 pub mod lease_manager;
+pub mod period_roller;
 mod registry;
 pub mod runtime;
 pub mod snapshot_manager;
@@ -44,6 +49,10 @@ pub mod usage_writer;
 #[cfg(feature = "http")]
 pub mod http;
 
+pub use period_roller::{
+    PeriodRoller, PeriodRollerConfig, PeriodRollerConfigError, PeriodRollerHealth,
+    PeriodRollerMonitor, PeriodRollerReport, PeriodRollerShutdownReport, PeriodRollerStats,
+};
 pub use runtime::RuntimeFundingReport;
 pub use runtime::{
     AccountPhase, AccountReport, InstanceRuntime, InstanceRuntimeConfig,
