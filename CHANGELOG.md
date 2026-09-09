@@ -7,6 +7,13 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.15.0...v0.16.0) - 2026-09-09
+
+### Added
+
+- *(server)* [**breaking**] secure the control-plane link (#98)
+- *(client)* #107 drive periodic budget rollover
+
 ## [0.15.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.14.7...v0.15.0) - 2026-09-08
 
 ### Added
