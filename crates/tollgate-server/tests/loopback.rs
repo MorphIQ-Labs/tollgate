@@ -368,7 +368,39 @@ async fn full_stack(mode: common::TransportMode) {
         status: AccountStatus::Active,
         capacity_class: CapacityClass::Assured,
     });
-    store.publish_snapshot(PRINCIPAL, publishable(snapshot()));
+    const HMAC_SECRET: &[u8] = b"fixture-customer-credential-hmac-secret-108";
+    let minted = tollgate_auth::HmacRegistry::new(HMAC_SECRET)
+        .mint(tollgate_core::KeyId(108))
+        .unwrap();
+    let principal = minted.principal;
+    tollgate_store::KeyDirectory::insert_key(
+        &*store,
+        tollgate_store::KeyRecord {
+            key_id: minted.key_id,
+            account_id: ACCOUNT,
+            principal,
+            digest: minted.digest,
+            not_after: None,
+        },
+    )
+    .await
+    .unwrap();
+    let second = tollgate_auth::HmacRegistry::new(HMAC_SECRET)
+        .mint(tollgate_core::KeyId(109))
+        .unwrap();
+    tollgate_store::KeyDirectory::insert_key(
+        &*store,
+        tollgate_store::KeyRecord {
+            key_id: second.key_id,
+            account_id: ACCOUNT,
+            principal: second.principal,
+            digest: second.digest,
+            not_after: None,
+        },
+    )
+    .await
+    .unwrap();
+    store.publish_snapshot(principal, publishable(snapshot()));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -389,10 +421,24 @@ async fn full_stack(mode: common::TransportMode) {
 
     // Instance side: everything over HTTP.
     let clock = Arc::new(SystemClock);
+    let keys = tollgate_client::KeyManager::spawn(
+        http.clone(),
+        HMAC_SECRET,
+        clock.clone(),
+        tollgate_client::KeyManagerConfig {
+            refresh_interval: std::time::Duration::from_millis(20),
+            page_limit: std::num::NonZeroUsize::new(1).unwrap(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let verifier = keys.verifier();
+    let key_monitor = keys.monitor();
+    let session = tollgate_auth::SessionCredential::new();
 
     // Cold fetch of the snapshot through the transport (pull path), plus the
     // negative case for an unknown principal.
-    let SnapshotResolution::Present(fetched) = http.snapshot(PRINCIPAL).await.unwrap() else {
+    let SnapshotResolution::Present(fetched) = http.snapshot(principal).await.unwrap() else {
         panic!("published snapshot must be present");
     };
     assert_eq!(fetched.generation, Generation(1));
@@ -413,7 +459,7 @@ async fn full_stack(mode: common::TransportMode) {
         tollgate_client::InstanceRuntimeConfig {
             snapshots: SnapshotManagerConfig {
                 principals: TrackedPrincipals::All {
-                    seed: vec![PRINCIPAL],
+                    seed: vec![principal],
                 },
                 refresh_interval: std::time::Duration::from_millis(20),
                 unknown_ttl: SignedDuration::from_secs(1),
@@ -448,12 +494,23 @@ async fn full_stack(mode: common::TransportMode) {
     )
     .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !engine.readiness(Timestamp::now()).is_ready() {
+        while !(engine.readiness(Timestamp::now()).is_ready()
+            && key_monitor.report(Timestamp::now()).ready)
+        {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     })
     .await
     .unwrap();
+    let projected = key_monitor.report(Timestamp::now());
+    assert_eq!(projected.projected_keys, 2);
+    assert!(projected.stats.pages >= 2);
+    assert_eq!(
+        tollgate_auth::CredentialVerifier::verify(&verifier, &second.secret)
+            .unwrap()
+            .principal,
+        second.principal
+    );
     let recorder = engine.recorder();
 
     // Spend the account down to stable denial through the admission engine.
@@ -466,8 +523,12 @@ async fn full_stack(mode: common::TransportMode) {
             let Ok(permit) = recorder.try_reserve() else {
                 continue;
             };
+            let verified = session
+                .authenticate(Some(&minted.secret), &verifier, Timestamp::now())
+                .expect("HTTP-projected customer key must authenticate");
+            assert_eq!(verified, principal);
             match engine
-                .begin(PRINCIPAL, PermissionBits::bit(0), Timestamp::now())
+                .begin(verified, PermissionBits::bit(0), Timestamp::now())
                 .and_then(|context| context.admit(&[(PriceOp, 1)], permit, Timestamp::now()))
             {
                 Ok(pending) => {
@@ -512,6 +573,8 @@ async fn full_stack(mode: common::TransportMode) {
     let stats = report.usage.unwrap();
     assert_eq!(stats.lost, 0);
     assert_eq!(stats.rejected, 0);
+    let key_shutdown = keys.shutdown().await;
+    assert!(!key_shutdown.task_failed && !key_shutdown.deadline_expired);
     let _ = stop_tx.send(());
     server.await.unwrap().unwrap();
 

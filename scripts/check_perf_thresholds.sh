@@ -29,7 +29,7 @@ fi
 # cannot satisfy the checker.
 rm -rf "$CRITERION_ROOT/cost_table" "$CRITERION_ROOT/snapshot" "$CRITERION_ROOT/lease" \
        "$CRITERION_ROOT/reservation" "$CRITERION_ROOT/admission" "$CRITERION_ROOT/capacity" \
-       "$CRITERION_ROOT/credential" \
+       "$CRITERION_ROOT/credential" "$CRITERION_ROOT/managed_credential" \
        "$CRITERION_ROOT/credential_digest"
 mkdir -p "$(dirname "$MARKER")"
 touch "$MARKER"
@@ -40,6 +40,7 @@ cargo bench --locked -p tollgate-admission --bench admission_hot_path
 # `evaluate` reports it missing-or-stale and the gate fails whatever the code
 # does. Adding a manifest entry without a run here is how that happens (#2).
 cargo bench --locked -p tollgate-auth --bench credential_verification
+cargo bench --locked -p tollgate-client --bench managed_credentials
 
 # Read the load average here rather than in the gate binary: there is no
 # portable way to ask for it from std, and capturing the environment is the

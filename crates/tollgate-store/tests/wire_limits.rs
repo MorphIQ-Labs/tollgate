@@ -114,3 +114,51 @@ impl tollgate_core::OpIndex for Class {
         self.0
     }
 }
+
+#[test]
+fn maximal_key_pages_fit_the_derived_envelope_and_digests_are_canonical() {
+    use tollgate_core::Principal;
+    use tollgate_store::wire::{KeysResponse, MAX_KEY_RECORD_BYTES, MAX_KEYS_BODY_BYTES};
+    use tollgate_store::{CredentialRecord, MAX_KEY_PAGE_LIMIT, MAX_KEY_REVISION};
+    // The negative year and maximum fractional precision are wider than MAX.
+    let expiry: Timestamp = "-009998-01-02T01:02:03.123456789Z".parse().unwrap();
+    let record = CredentialRecord {
+        key_id: KeyId(u128::MAX),
+        principal: Principal(u128::MAX),
+        digest: [0xff; 32],
+        not_after: Some(expiry),
+    };
+    let encoded = serde_json::to_vec(&record).unwrap();
+    assert_eq!(encoded.len(), MAX_KEY_RECORD_BYTES);
+    let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(value["digest"], "f".repeat(64));
+    assert_eq!(
+        serde_json::from_slice::<CredentialRecord>(&encoded).unwrap(),
+        record
+    );
+    let page = KeysResponse {
+        revision: MAX_KEY_REVISION,
+        as_of: expiry,
+        keys: vec![record; MAX_KEY_PAGE_LIMIT],
+        next_after: Some(KeyId(u128::MAX)),
+    };
+    let encoded = serde_json::to_vec(&page).unwrap();
+    assert_eq!(encoded.len(), MAX_KEYS_BODY_BYTES);
+    assert!(encoded.len() > MAX_KEYS_BODY_BYTES / 2);
+    for bad in [
+        "f".repeat(63),
+        "f".repeat(65),
+        "F".repeat(64),
+        "g".repeat(64),
+    ] {
+        let mut invalid = value.clone();
+        invalid["digest"] = serde_json::json!(bad);
+        assert!(serde_json::from_value::<CredentialRecord>(invalid).is_err());
+    }
+    let mut invalid = value;
+    invalid.as_object_mut().unwrap().remove("not_after");
+    assert!(serde_json::from_value::<CredentialRecord>(invalid).is_err());
+    let mut page = serde_json::to_value(page).unwrap();
+    page.as_object_mut().unwrap().remove("next_after");
+    assert!(serde_json::from_value::<KeysResponse>(page).is_err());
+}

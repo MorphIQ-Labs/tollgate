@@ -2879,6 +2879,7 @@ dependencies = [
  "proptest",
  "reqwest",
  "serde",
+ "serde_json",
  "tokio",
  "tollgate-admission",
  "tollgate-alloc-count",

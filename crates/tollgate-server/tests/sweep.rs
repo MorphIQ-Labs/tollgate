@@ -49,6 +49,18 @@ struct FlakyReclaimStore {
 }
 
 #[async_trait]
+impl tollgate_store::KeySource for FlakyReclaimStore {
+    async fn active_keys_page(
+        &self,
+        now: Timestamp,
+        after: Option<tollgate_core::KeyId>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<tollgate_store::KeyPage, StoreError> {
+        tollgate_store::KeySource::active_keys_page(&*self.inner, now, after, limit).await
+    }
+}
+
+#[async_trait]
 impl LeaseAllocator for FlakyReclaimStore {
     async fn acquire(
         &self,

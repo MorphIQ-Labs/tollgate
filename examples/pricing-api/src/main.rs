@@ -49,7 +49,7 @@ async fn main() -> std::io::Result<()> {
         )
         .init();
 
-    let (router, runtime) = build_app_with_sharding(deposit, true, sharding);
+    let (router, runtime) = build_app_with_sharding(deposit, true, sharding).await;
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(%bind, deposit, local_shards = sharding.get(), "pricing-api listening");
     // `into_make_service_with_connect_info` is what gives each accepted

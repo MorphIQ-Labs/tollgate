@@ -18,6 +18,70 @@ use tollgate_store::{AccountConfig, GrantPolicy, MemoryStore};
 
 tollgate_alloc_count::install!();
 
+#[tokio::test(flavor = "current_thread")]
+async fn cached_projected_credentials_remain_allocation_free_through_expiry() {
+    use tollgate_client::{KeyManager, KeyManagerConfig};
+    use tollgate_core::KeyId;
+    use tollgate_store::{KeyDirectory, KeyRecord};
+
+    let secret = b"fixture-allocation-projection-secret-108";
+    let issued = HmacRegistry::new(secret).mint(KeyId(1)).unwrap();
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    store.create_account(AccountConfig {
+        account_id: AccountId(1),
+        initial_balance: CostUnits(100),
+        status: AccountStatus::Active,
+        capacity_class: tollgate_core::CapacityClass::Assured,
+    });
+    store
+        .insert_key(KeyRecord {
+            key_id: issued.key_id,
+            account_id: AccountId(1),
+            principal: issued.principal,
+            digest: issued.digest,
+            not_after: None,
+        })
+        .await
+        .unwrap();
+    let keys = KeyManager::spawn(
+        store,
+        secret,
+        Arc::new(ManualClock::new(now())),
+        KeyManagerConfig::default(),
+    )
+    .unwrap();
+    let verifier = keys.verifier();
+    let mut monitor = keys.monitor();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !monitor.report(now()).ready {
+            monitor.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let session = SessionCredential::new();
+    for _ in 0..2 {
+        assert_eq!(
+            session.authenticate(Some(&issued.secret), &verifier, now()),
+            Some(issued.principal)
+        );
+    }
+    let (result, cached) = AllocScope::measure(|| {
+        black_box(session.authenticate(Some(&issued.secret), &verifier, now()))
+    });
+    assert_eq!(result, Some(issued.principal));
+    record("auth/projected_cache_hit", "tollgate", cached);
+    assert!(cached.is_allocation_free(), "{cached:?}");
+    let until = monitor.report(now()).usable_until.unwrap();
+    let (result, expired) = AllocScope::measure(|| {
+        black_box(session.authenticate(Some(&issued.secret), &verifier, until))
+    });
+    assert!(result.is_none());
+    record("auth/projected_expiry", "tollgate", expired);
+    assert!(expired.is_allocation_free(), "{expired:?}");
+    assert!(!keys.shutdown().await.task_failed);
+}
+
 #[derive(Clone, Copy)]
 struct PriceOp;
 

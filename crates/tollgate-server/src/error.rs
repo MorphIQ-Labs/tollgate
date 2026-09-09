@@ -51,6 +51,27 @@ where
 /// Path input whose parse failures stay distinct from a legitimate 404.
 pub(crate) struct ApiPath<T>(pub T);
 
+/// Query decoding is subject to the same structured external-input contract.
+pub(crate) struct ApiQuery<T>(pub T);
+impl<T, S> FromRequestParts<S> for ApiQuery<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        axum::extract::Query::<T>::from_request_parts(parts, state)
+            .await
+            .map(|axum::extract::Query(value)| Self(value))
+            .map_err(|_| {
+                ApiError::bad_request(
+                    "invalid-query",
+                    "query parameters are malformed or unsupported",
+                )
+            })
+    }
+}
+
 impl<T, S> FromRequestParts<S> for ApiPath<T>
 where
     T: DeserializeOwned + Send,

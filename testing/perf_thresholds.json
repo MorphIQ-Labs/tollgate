@@ -235,6 +235,48 @@
       "id": "credential/verify_cached",
       "target_ns": 25.0,
       "threshold_ns": 120.0
+    },
+    {
+      "_comment": "#108 managed credential witness. Finite proof expiry is included; provisional local bounds, paired with the same-run direct verifier. Renewal allocates new cached evidence. See docs/CREDENTIAL_PROJECTION_EVIDENCE.md.",
+      "id": "managed_credential/cached",
+      "target_ns": 40.0,
+      "threshold_ns": 120.0
+    },
+    {
+      "_comment": "#108 managed credential witness. Finite proof expiry is included; provisional local bounds, paired with the same-run direct verifier. Renewal allocates new cached evidence. See docs/CREDENTIAL_PROJECTION_EVIDENCE.md.",
+      "id": "managed_credential/cached_direct",
+      "target_ns": 40.0,
+      "threshold_ns": 120.0
+    },
+    {
+      "_comment": "#108 managed credential witness. Finite proof expiry is included; provisional local bounds, paired with the same-run direct verifier. Renewal allocates new cached evidence. See docs/CREDENTIAL_PROJECTION_EVIDENCE.md.",
+      "id": "managed_credential/verify",
+      "target_ns": 850.0,
+      "threshold_ns": 2000.0
+    },
+    {
+      "_comment": "#108 managed credential witness. Finite proof expiry is included; provisional local bounds, paired with the same-run direct verifier. Renewal allocates new cached evidence. See docs/CREDENTIAL_PROJECTION_EVIDENCE.md.",
+      "id": "managed_credential/verify_direct",
+      "target_ns": 850.0,
+      "threshold_ns": 2000.0
+    },
+    {
+      "_comment": "#108 managed credential witness. Finite proof expiry is included; provisional local bounds, paired with the same-run direct verifier. Renewal allocates new cached evidence. See docs/CREDENTIAL_PROJECTION_EVIDENCE.md.",
+      "id": "managed_credential/cold_session",
+      "target_ns": 1100.0,
+      "threshold_ns": 2500.0
+    },
+    {
+      "_comment": "#108 managed credential witness. Finite proof expiry is included; provisional local bounds, paired with the same-run direct verifier. Renewal allocates new cached evidence. See docs/CREDENTIAL_PROJECTION_EVIDENCE.md.",
+      "id": "managed_credential/renew_session",
+      "target_ns": 1200.0,
+      "threshold_ns": 3000.0
+    },
+    {
+      "_comment": "#108 managed credential witness. Finite proof expiry is included; provisional local bounds, paired with the same-run direct verifier. Renewal allocates new cached evidence. See docs/CREDENTIAL_PROJECTION_EVIDENCE.md.",
+      "id": "managed_credential/expired_session",
+      "target_ns": 1100.0,
+      "threshold_ns": 2500.0
     }
   ],
   "ratios": [
@@ -281,7 +323,7 @@
       "max_ratio": 3.0
     },
     {
-      "_comment": "The commit-time fallback against the ordinary lease commit it replaces. It is strictly more work — a revocable debit, a publication, and a lease credit — so the contract is that it stays a small bounded factor rather than that it is free. Measured x1.22.",
+      "_comment": "The commit-time fallback against the ordinary lease commit it replaces. It is strictly more work \u2014 a revocable debit, a publication, and a lease credit \u2014 so the contract is that it stays a small bounded factor rather than that it is free. Measured x1.22.",
       "numerator": "lease/overage_commit_fallback",
       "denominator": "lease/reserve_commit",
       "max_ratio": 2.0
@@ -355,6 +397,18 @@
       "numerator": "cost_table/quote_workload_8",
       "denominator": "cost_table/quote_workload_1",
       "max_ratio": 6.0
+    },
+    {
+      "_comment": "#108 same HMAC, token and finite expiry; bounds managed projection overhead independently of host speed.",
+      "numerator": "managed_credential/cached",
+      "denominator": "managed_credential/cached_direct",
+      "max_ratio": 1.25
+    },
+    {
+      "_comment": "#108 same HMAC, token and finite expiry; bounds managed projection overhead independently of host speed.",
+      "numerator": "managed_credential/verify",
+      "denominator": "managed_credential/verify_direct",
+      "max_ratio": 1.25
     }
   ]
 }

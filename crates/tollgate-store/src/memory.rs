@@ -311,6 +311,11 @@ struct Inner {
     /// "already retired" distinguishable from "never existed", and a removed
     /// row would let a replayed issuance resurrect the credential.
     keys: HashMap<KeyId, StoredKey>,
+    /// Ordered unrevoked ids avoid scanning retired history on every page.
+    unrevoked_keys: std::collections::BTreeSet<KeyId>,
+    /// Retained through retirement, like the durable principal UNIQUE index.
+    key_principals: HashMap<Principal, KeyId>,
+    credential_revision: u64,
     next_lease_id: u128,
 }
 
@@ -1639,13 +1644,12 @@ impl KeyDirectory for MemoryStore {
         // it means secret reuse or corruption rather than chance, and the
         // stored backend enforces it with a UNIQUE index — this is the
         // reference implementation of the same rule.
-        if inner
-            .keys
-            .values()
-            .any(|stored| stored.record.principal == record.principal)
-        {
+        if inner.key_principals.contains_key(&record.principal) {
             return Err(KeyError::AlreadyExists);
         }
+        let revision = next_credential_revision(inner.credential_revision)?;
+        inner.key_principals.insert(record.principal, record.key_id);
+        inner.unrevoked_keys.insert(record.key_id);
         inner.keys.insert(
             record.key_id,
             StoredKey {
@@ -1653,27 +1657,35 @@ impl KeyDirectory for MemoryStore {
                 revoked_at: None,
             },
         );
+        inner.credential_revision = revision;
         Ok(())
     }
 
     async fn revoke_key(&self, key_id: KeyId, now: Timestamp) -> Result<Revocation, KeyError> {
         let mut inner = self.lock();
-        let Some(stored) = inner.keys.get_mut(&key_id) else {
+        let Some(stored) = inner.keys.get(&key_id) else {
             return Err(KeyError::UnknownKey);
         };
         if stored.revoked_at.is_some() {
             return Ok(Revocation::AlreadyRetired);
         }
-        stored.revoked_at = Some(now);
+        let revision = next_credential_revision(inner.credential_revision)?;
+        inner
+            .keys
+            .get_mut(&key_id)
+            .expect("key exists under the same guard")
+            .revoked_at = Some(now);
+        inner.unrevoked_keys.remove(&key_id);
+        inner.credential_revision = revision;
         Ok(Revocation::Retired)
     }
 
     async fn active_keys(&self, now: Timestamp) -> Result<Vec<KeyRecord>, StoreError> {
         let inner = self.lock();
-        let mut active: Vec<KeyRecord> = inner
-            .keys
-            .values()
-            .filter(|stored| stored.revoked_at.is_none())
+        let active: Vec<KeyRecord> = inner
+            .unrevoked_keys
+            .iter()
+            .map(|id| &inner.keys[id])
             // Expiry is decided here rather than by each reader, so every
             // backend answers "active" the same way and a projection cannot
             // disagree with the ledger about which credentials are live.
@@ -1688,8 +1700,52 @@ impl KeyDirectory for MemoryStore {
         // Deterministic order: the projection is rebuilt from this, and a
         // backend whose output order wanders makes two instances' tables
         // differ in a way no test would reproduce.
-        active.sort_unstable_by_key(|record| record.key_id);
         Ok(active)
+    }
+}
+
+fn next_credential_revision(revision: u64) -> Result<u64, KeyError> {
+    revision
+        .checked_add(1)
+        .filter(|next| *next <= crate::MAX_KEY_REVISION)
+        .ok_or_else(|| KeyError::Storage(StoreError("credential revision exhausted".into())))
+}
+
+#[async_trait]
+impl crate::KeySource for MemoryStore {
+    async fn active_keys_page(
+        &self,
+        now: Timestamp,
+        after: Option<KeyId>,
+        limit: NonZeroUsize,
+    ) -> Result<crate::KeyPage, StoreError> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        crate::validate_key_page_limit(limit)?;
+        let inner = self.lock();
+        let lower = after.map_or(Unbounded, Excluded);
+        let mut records: Vec<crate::CredentialRecord> = inner
+            .unrevoked_keys
+            .range((lower, Unbounded))
+            .map(|id| &inner.keys[id].record)
+            .filter(|record| record.not_after.is_none_or(|end| now < end))
+            .take(limit.get() + 1)
+            .cloned()
+            .map(Into::into)
+            .collect();
+        let next_after = if records.len() > limit.get() {
+            records.pop();
+            records.last().map(|key| key.key_id)
+        } else {
+            None
+        };
+        crate::KeyPage::try_new(
+            inner.credential_revision,
+            now,
+            after,
+            limit,
+            records,
+            next_after,
+        )
     }
 }
 
@@ -1711,6 +1767,45 @@ fn snapshot_audit(record: Option<&SnapshotRecord>) -> AdminState {
 mod tests {
     use super::*;
     use std::num::NonZeroUsize;
+
+    #[tokio::test]
+    async fn credential_revision_overflow_preserves_records_and_both_indexes() {
+        use crate::KeySource;
+        let store = store_with(100);
+        let record = |id: u128| {
+            let mut digest = [0; 32];
+            digest[..16].copy_from_slice(&id.to_be_bytes());
+            KeyRecord {
+                key_id: KeyId(id),
+                account_id: ACCOUNT,
+                principal: Principal(id),
+                digest,
+                not_after: None,
+            }
+        };
+        store.insert_key(record(1)).await.unwrap();
+        store.inner.lock().unwrap().credential_revision = crate::MAX_KEY_REVISION - 1;
+        store.insert_key(record(2)).await.unwrap();
+        assert!(matches!(
+            store.insert_key(record(3)).await,
+            Err(KeyError::Storage(_))
+        ));
+        assert!(matches!(
+            store.revoke_key(KeyId(1), t(100)).await,
+            Err(KeyError::Storage(_))
+        ));
+        let page = store
+            .active_keys_page(t(100), None, crate::DEFAULT_KEY_PAGE_LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(page.revision(), crate::MAX_KEY_REVISION);
+        assert_eq!(
+            page.records().iter().map(|k| k.key_id).collect::<Vec<_>>(),
+            vec![KeyId(1), KeyId(2)]
+        );
+        store.inner.lock().unwrap().credential_revision = 2;
+        store.insert_key(record(3)).await.unwrap(); // failure left no duplicate-principal index entry
+    }
 
     const ACCOUNT: AccountId = AccountId(1);
     const TTL: SignedDuration = SignedDuration::from_secs(60);

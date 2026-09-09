@@ -30,6 +30,13 @@
     { "id": "capacity/reserved_shared", "mean_ns": 133.748 },
     { "id": "capacity/reserved_fallback", "mean_ns": 132.628 },
     { "id": "capacity/full_check_contended_8_distinct_accounts_uniform", "mean_ns": 1452.628, "max_regression": 0.15 },
-    { "id": "capacity/full_check_contended_8_distinct_accounts_reserved", "mean_ns": 1456.763, "max_regression": 0.15 }
+    { "id": "capacity/full_check_contended_8_distinct_accounts_reserved", "mean_ns": 1456.763, "max_regression": 0.15 },
+    {"id": "managed_credential/cached", "mean_ns": 36.983},
+    {"id": "managed_credential/cached_direct", "mean_ns": 37.263},
+    {"id": "managed_credential/cold_session", "mean_ns": 1022.321},
+    {"id": "managed_credential/expired_session", "mean_ns": 988.269},
+    {"id": "managed_credential/renew_session", "mean_ns": 1088.38},
+    {"id": "managed_credential/verify", "mean_ns": 802.429},
+    {"id": "managed_credential/verify_direct", "mean_ns": 793.494}
   ]
 }

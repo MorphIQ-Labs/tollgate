@@ -1,6 +1,6 @@
 //! Storage abstraction for tollgate.
 //!
-//! Three narrow traits cover everything the data plane needs from a backend:
+//! Narrow traits separate the data plane from lifecycle authority:
 //!
 //! - [`LeaseAllocator`] — atomically debit an account's balance into fenced,
 //!   TTL-bounded leases; settle them by release or expiry reclaim.
@@ -8,8 +8,9 @@
 //!   pushes.
 //! - [`UsageSink`] — idempotent, fencing-checked batch ingest of usage
 //!   events.
-//! - [`KeyDirectory`] — durable credential lifecycle, whose read projection
-//!   is the verifier's digest table.
+//! - [`KeySource`] — validated, revisioned pages of active credential digests.
+//! - [`KeyDirectory`] — durable credential lifecycle; instances do not need
+//!   this mutation authority.
 //!
 //! Every method takes `now` as an argument: the store, like the core, never
 //! reads a clock. That keeps backends deterministic under test and puts the
@@ -22,6 +23,7 @@
 
 pub mod audit;
 pub mod clock;
+pub mod credentials;
 mod leases;
 pub mod memory;
 pub mod traits;
@@ -30,6 +32,10 @@ pub mod wire;
 
 pub use audit::{AdminReceipt, AdminState};
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use credentials::{
+    CredentialRecord, CredentialSet, DEFAULT_KEY_PAGE_LIMIT, KeyPage, KeySource,
+    MAX_KEY_PAGE_LIMIT, MAX_KEY_REVISION, validate_key_page_limit,
+};
 pub use memory::{MemoryStore, StoredRecords};
 pub use traits::{
     AccountConfig, AdminStore, AllocateError, BudgetError, Conservation, CreateAccountError,

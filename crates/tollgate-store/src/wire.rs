@@ -78,6 +78,23 @@ pub const MAX_INGEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// undocumented default reported as bad JSON.
 pub const MAX_SNAPSHOT_BODY_BYTES: usize = 4 * 1024 * 1024;
 
+/// One complete active credential projection. Digests are fixed 32-byte arrays;
+/// HMAC secrets and raw credentials are never part of this response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeysResponse {
+    pub revision: u64,
+    pub as_of: jiff::Timestamp,
+    pub keys: Vec<crate::CredentialRecord>,
+    #[serde(deserialize_with = "crate::credentials::required_option")]
+    pub next_after: Option<tollgate_core::KeyId>,
+}
+
+/// Fixed-width identifiers/digest plus the widest timestamp and JSON framing.
+/// `wire_limits` measures a maximal record and page against these bounds.
+pub const MAX_KEY_RECORD_BYTES: usize = 216;
+/// The maximal envelope is 134 bytes; the first record needs no comma.
+pub const MAX_KEYS_BODY_BYTES: usize = crate::MAX_KEY_PAGE_LIMIT * (MAX_KEY_RECORD_BYTES + 1) + 133;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AcquireRequest {
     pub account_id: AccountId,

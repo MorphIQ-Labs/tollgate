@@ -486,3 +486,63 @@ async fn refused_release_at_shutdown_is_reported() {
         "the event must name the refusal: {refusals:?}"
     );
 }
+
+struct RefusingKeys(std::sync::atomic::AtomicBool);
+#[async_trait]
+impl tollgate_store::KeySource for RefusingKeys {
+    async fn active_keys_page(
+        &self,
+        now: Timestamp,
+        after: Option<tollgate_core::KeyId>,
+        limit: NonZeroUsize,
+    ) -> Result<tollgate_store::KeyPage, StoreError> {
+        if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            tollgate_store::KeyPage::try_new(1, now, after, limit, vec![], None)
+        } else {
+            Err(StoreError("fixture-sensitive-response-body".into()))
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn credential_refresh_failure_is_structured_without_exposing_the_source_body() {
+    let (captor, _guard) = capture();
+    let source = Arc::new(RefusingKeys(std::sync::atomic::AtomicBool::new(false)));
+    let manager = tollgate_client::KeyManager::spawn(
+        source.clone(),
+        b"fixture-events-credential-secret-108",
+        Arc::new(ManualClock::new(t(100))),
+        tollgate_client::KeyManagerConfig::default(),
+    )
+    .unwrap();
+    let mut monitor = manager.monitor();
+    while monitor.report(t(100)).stats.failures == 0 {
+        monitor.changed().await.unwrap();
+    }
+    let events = captor.at_least(Level::WARN, "tollgate_client::key_manager");
+    assert!(
+        events
+            .iter()
+            .any(|event| event.field("reason") == Some("source-read"))
+    );
+    assert!(
+        events
+            .iter()
+            .flat_map(|event| &event.fields)
+            .all(|(_, value)| !value.contains("fixture-sensitive-response-body"))
+    );
+    source.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    for completed in 1..=2 {
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        while monitor.report(t(100)).stats.refreshes < completed {
+            monitor.changed().await.unwrap();
+        }
+        let recoveries = captor
+            .at_least(Level::INFO, "tollgate_client::key_manager")
+            .into_iter()
+            .filter(|event| event.level == Level::INFO)
+            .count();
+        assert_eq!(recoveries, 1, "recovery is emitted once per incident");
+    }
+    manager.shutdown().await;
+}

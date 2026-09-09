@@ -203,27 +203,93 @@ impl KeyDirectory for PostgresStore {
         .await
         .map_err(storage)?;
 
-        rows.into_iter()
-            .map(|row| {
-                let key_id = KeyId(id_from(row.get::<Vec<u8>, _>(0).as_slice()));
-                Ok(KeyRecord {
-                    key_id,
-                    account_id: AccountId(id_from(row.get::<Vec<u8>, _>(1).as_slice())),
-                    principal: Principal(id_from(row.get::<Vec<u8>, _>(2).as_slice())),
-                    digest: digest_from(row.get::<Vec<u8>, _>(3).as_slice(), key_id)?,
-                    not_after: row
-                        .get::<Option<i64>, _>(4)
-                        .map(|us| {
-                            Timestamp::from_microsecond(us).map_err(|_| {
-                                StoreError(format!(
-                                    "credential {key_id} has an undecodable not_after: {us}"
-                                ))
-                            })
-                        })
-                        .transpose()?,
+        rows.into_iter().map(credential_from_row).collect()
+    }
+}
+
+fn credential_from_row(row: sqlx::postgres::PgRow) -> Result<KeyRecord, StoreError> {
+    let id = |index| -> Result<u128, StoreError> {
+        let bytes: Vec<u8> = row.get(index);
+        let fixed: [u8; 16] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError("credential identifier is not 16 bytes".into()))?;
+        Ok(u128::from_be_bytes(fixed))
+    };
+    let key_id = KeyId(id(0)?);
+    Ok(KeyRecord {
+        key_id,
+        account_id: AccountId(id(1)?),
+        principal: Principal(id(2)?),
+        digest: digest_from(row.get::<Vec<u8>, _>(3).as_slice(), key_id)?,
+        not_after: row
+            .get::<Option<i64>, _>(4)
+            .map(|us| {
+                Timestamp::from_microsecond(us).map_err(|_| {
+                    StoreError("credential expiry is outside the timestamp domain".into())
                 })
             })
-            .collect()
+            .transpose()?,
+    })
+}
+
+#[async_trait]
+impl tollgate_store::KeySource for PostgresStore {
+    async fn active_keys_page(
+        &self,
+        now: Timestamp,
+        after: Option<KeyId>,
+        limit: NonZeroUsize,
+    ) -> Result<tollgate_store::KeyPage, StoreError> {
+        tollgate_store::validate_key_page_limit(limit)?;
+        // One short snapshot per page, never a transaction held across HTTP
+        // requests. Revision and records therefore cannot describe two commits.
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+        let revision: i64 =
+            sqlx::query_scalar("SELECT revision FROM tollgate_credential_revision WHERE singleton")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(storage)?;
+        let revision = u64::try_from(revision)
+            .map_err(|_| StoreError("credential revision is negative".into()))?;
+        // Separate SQL shapes preserve an indexable range in prepared plans.
+        let sql = if after.is_some() {
+            "SELECT key_id, account_id, principal, digest, not_after_us
+             FROM tollgate_credential_keys WHERE revoked_at_us IS NULL
+             AND (not_after_us IS NULL OR not_after_us > $1) AND key_id > $2
+             ORDER BY key_id LIMIT $3"
+        } else {
+            "SELECT key_id, account_id, principal, digest, not_after_us
+             FROM tollgate_credential_keys WHERE revoked_at_us IS NULL
+             AND (not_after_us IS NULL OR not_after_us > $1) AND key_id >= $2
+             ORDER BY key_id LIMIT $3"
+        };
+        let rows = sqlx::query(sql)
+            .bind(ts_micros(now))
+            .bind(id_bytes(after.unwrap_or(KeyId(0)).0))
+            .bind((limit.get() + 1) as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(storage)?;
+        tx.commit().await.map_err(storage)?;
+        // Decode lookahead too: corrupt data cannot masquerade as a normal
+        // continuation and silently defer a failure to another request.
+        let mut records = rows
+            .into_iter()
+            .map(credential_from_row)
+            .map(|row| row.map(tollgate_store::CredentialRecord::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_after = if records.len() > limit.get() {
+            records.pop();
+            records.last().map(|record| record.key_id)
+        } else {
+            None
+        };
+        tollgate_store::KeyPage::try_new(revision, now, after, limit, records, next_after)
     }
 }
 

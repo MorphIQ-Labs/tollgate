@@ -1,6 +1,6 @@
 # Tollgate Formal Models
 
-This Lean package contains exact models for seven critical contracts:
+This Lean package contains exact models for critical contracts:
 
 - `LeaseShards` models the aggregate of cache-isolated lease counters and
   exact-total debit/refund receipts. It proves conservation through reserve, cancel,
@@ -49,6 +49,25 @@ This Lean package contains exact models for seven critical contracts:
   weight at the configured batch cap bounds every registered operation at
   every permitted item count. Consequently, a worst-case quote at or below
   the burst keeps all in-limit quotes at or below the burst.
+- `CommitFallback` models single-transition commit funding and its overage
+  fallback, separating terminal accounting outcomes from request ownership.
+- `ExecutionCapacity` models conservation across shared and reserved execution
+  pools and excludes best-effort work from the assured reserve.
+- `AccountLifecycle` models at most one account-manager owner, retirement before
+  replacement, and inert duplicate joins.
+- `PeriodRoller` models bounded independent maintenance: one pending call,
+  a fixed cutoff per pass, and terminal stopping.
+- `ControlPlane` models disjoint role evidence and serialized administrative
+  receipt composition. It assumes credential authenticity and atomic policy
+  selection; it does not prove cryptography or database serialization.
+- `CredentialProjection` models exact integer-time expiry intersection and
+  complete table replacement. It proves that fetch delay consumes freshness,
+  failure preserves original deadlines, and empty success withdraws all keys.
+  The bounded fixed-catalogue drain has no omissions or duplicates; mixed
+  revisions preserve the predecessor. Cached evidence retains its original
+  bound. Ordered cursor refinement, coherent source reads, atomic
+  publication, verified input and accurate clocks are assumptions; Rust tests
+  separately exercise timestamp overflow, transport and session behavior.
 
 Run from the repository root:
 
@@ -56,7 +75,7 @@ Run from the repository root:
 ./scripts/check_formal.sh
 ```
 
-The models use exact natural-number arithmetic and atomic transitions. Rust
+The models use exact natural-number or integer arithmetic and atomic transitions. Rust
 property, cache, manager, HTTP, and backend-parity tests establish the
 proof-to-code argument. The proofs do not model scheduling, data-structure
 internals, the sharded CAS/fixed-receipt algorithm, the maximum-weight scan,
