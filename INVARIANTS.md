@@ -792,6 +792,19 @@ until it has one.
     shutdown_during_a_release_reparks_every_lease}`, and
     `invalid_pool_config_is_rejected_before_connecting`.
 
+    `PeriodRoller` bounds each administrative rollover call and the entire
+    multi-batch pass, including yields between batches. Each pass freezes one
+    business-time cutoff; the next pass starts after a configured pause, so a
+    long pass cannot produce a burst of catch-up retries. Shutdown interrupts
+    the pending call and also has its own total join deadline. These bounds
+    assume store futures cooperate with the executor; synchronous blocking
+    cannot be preempted by a Tokio deadline. Witnesses:
+    `one_pass_budget_bounds_every_batch_and_preserves_its_progress`,
+    `a_pass_deadline_can_interrupt_a_call_before_its_own_timeout`,
+    `a_hung_call_times_out_and_the_next_pass_recovers`,
+    `shutdown_interrupts_a_hung_call_and_reports_its_uncertainty`, and
+    `shutdown_has_a_total_deadline_even_if_its_task_does_not_observe_the_signal`.
+
 19. **A control-plane failure is never silent.** Every fallible call a
     background plane makes either succeeds, is reported through a typed
     result the caller can act on, or emits a structured event — never
@@ -1280,6 +1293,31 @@ exists to detect corrupt state and must not be able to launder it.
     gives it now, not to a backlog. The pass is bounded per transaction and
     its caller drains saturated batches, because every scheduled account comes
     due at the same instant.
+
+    **Direct-store scheduling has an owner.** `PeriodRoller` runs an immediate
+    startup pass and periodic bounded drains through `AdminStore`. It owns no
+    account catalogue or calendar logic. A cloneable monitor retains confirmed
+    progress and derives task death from channel closure, so a stale healthy
+    publication cannot conceal a dead task. A partial batch means this pass
+    completed, not that every account is current: PostgreSQL can skip rows
+    held by another replica. Errors, timeouts, and interrupted calls may have
+    committed unknown work; confirmed totals exclude it and `uncertain_calls`
+    preserves that distinction through recovery and shutdown. Counter overflow
+    is explicit and stops further scheduling. Dropping the owner or cancelling
+    shutdown aborts the owned task. Witnesses:
+    `startup_drains_saturated_batches_without_waiting_for_a_tick`,
+    `a_pass_freezes_its_cutoff_even_when_the_clock_crosses_another_boundary`,
+    `failure_preserves_confirmed_progress_and_waits_before_retrying`,
+    `uncertain_commits_remain_visible_after_recovery_and_shutdown`,
+    `a_task_that_dies_after_a_healthy_pass_is_reported_failed`,
+    `dropping_the_owner_or_an_unpolled_shutdown_aborts_the_task`,
+    `cancelling_a_polled_shutdown_keeps_ownership_of_the_task`,
+    `generated_period_and_failure_traces_preserve_funding_and_observations`,
+    and `counter_overflow_preserves_the_last_known_totals_and_reports_incompleteness`.
+    `Tollgate.PeriodRoller.every_trace_is_safe`,
+    `at_most_one_owned_call`, `cutoff_is_frozen_during_a_pass`, and
+    `stopped_is_terminal` prove the abstract ownership and transition rules;
+    paused-time tests witness actual Rust scheduling and cancellation.
 
     **Leases drain, then expire.** An active lease at a boundary keeps serving
     to its own TTL: there is no admission gap, and the request path still

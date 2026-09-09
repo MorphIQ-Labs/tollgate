@@ -20,12 +20,19 @@ permission bits — never plan names, FCUs, or SQL.
 | `crates/tollgate-store` | `LeaseAllocator` / `SnapshotSource` / `UsageSink` / `AdminStore` traits, `GrantPolicy`, `MemoryStore` reference backend, wire DTOs, `Clock` |
 | `crates/tollgate-store-postgres` | Transactional Postgres backend (row-locked acquire, set-wise usage ingest, bounded set-wise SKIP LOCKED reclaim) |
 | `crates/tollgate-server` | Axum control plane over any backend; RFC-7807 errors with stable codes |
-| `crates/tollgate-client` | `InstanceRuntime` (dynamic account supervision, readiness, bounded shutdown), staged `RuntimeHandle`, lower-level lease/snapshot/usage managers, `HttpStore` transport |
+| `crates/tollgate-client` | `InstanceRuntime` (dynamic account supervision, readiness, bounded shutdown), staged `RuntimeHandle`, direct-store `PeriodRoller`, lower-level lease/snapshot/usage managers, `HttpStore` transport |
 | `crates/tollgate-perf-gate` | Benchmark threshold checker (criterion estimates vs manifest, staleness-guarded) |
 | `examples/pricing-api` | Concrete API embedding the stack: connection-cached HMAC-verified keys, admission, commit-at-execution-start, billing |
 
 Contract: [`INVARIANTS.md`](INVARIANTS.md). Architecture and findings:
 [`docs/DESIGN.md`](docs/DESIGN.md).
+
+Direct-store applications using budget schedules run a `PeriodRoller` beside
+their admission runtime. It funds schedules at startup, rolls due periods in
+bounded batches, and exposes health and shutdown reports. See the
+[direct-store lifecycle example](crates/tollgate-client/src/period_roller.rs).
+`InstanceRuntime` does not receive administrative authority; applications using
+`HttpStore` leave period maintenance to `tollgate-server`.
 
 ## Quickstart
 
