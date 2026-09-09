@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.16.0...v0.17.0) - 2026-09-09
+
+### Added
+
+- *(server/client)* [**breaking**] #108 expose active credential digests to data-plane instances
+
 ## [0.16.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.15.0...v0.16.0) - 2026-09-09
 
 ### Added
