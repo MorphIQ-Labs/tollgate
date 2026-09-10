@@ -86,7 +86,6 @@ fn snapshot() -> Arc<AccountSnapshot> {
                     .build(),
             ),
         )
-        .key_id(KeyId((1u128 << 127) | 2))
         // A stated revision, so the end-to-end path carries a real value
         // rather than the zero an omission would also produce (#94).
         .policy_revision(REVISION)
@@ -219,7 +218,9 @@ async fn http_negative_ttl_refetches_without_push() {
     // HttpStore has no push stream. Publication can therefore become visible
     // only through the negative-TTL targeted pull; the 60s full refresh must
     // not determine recovery latency.
-    store.publish_snapshot(PRINCIPAL, publishable(snapshot()));
+    store
+        .publish_snapshot(PRINCIPAL, publishable(snapshot()))
+        .expect("snapshot fixture matches its account and credential");
     slots.slot(ACCOUNT).install(Arc::new(LocalLease::new(
         LeaseGrant {
             lease_id: LeaseId(1),
@@ -370,7 +371,7 @@ async fn full_stack(mode: common::TransportMode) {
     });
     const HMAC_SECRET: &[u8] = b"fixture-customer-credential-hmac-secret-108";
     let minted = tollgate_auth::HmacRegistry::new(HMAC_SECRET)
-        .mint(tollgate_core::KeyId(108))
+        .mint(KeyId((1u128 << 127) | 108))
         .unwrap();
     let principal = minted.principal;
     tollgate_store::KeyDirectory::insert_key(
@@ -400,7 +401,11 @@ async fn full_stack(mode: common::TransportMode) {
     )
     .await
     .unwrap();
-    store.publish_snapshot(principal, publishable(snapshot()));
+    let mut keyed = (*snapshot()).clone();
+    keyed.key_id = Some(minted.key_id);
+    store
+        .publish_snapshot(principal, publishable(Arc::new(keyed)))
+        .expect("snapshot fixture matches its account and credential");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -573,6 +578,15 @@ async fn full_stack(mode: common::TransportMode) {
     let stats = report.usage.unwrap();
     assert_eq!(stats.lost, 0);
     assert_eq!(stats.rejected, 0);
+    assert_eq!(stats.unattributed, 0);
+    assert_eq!(stats.attribution_unreported_batches, 0);
+    let activity = tollgate_store::KeyDirectory::credential_activity(&*store, &[minted.key_id])
+        .await
+        .unwrap();
+    assert!(matches!(
+        activity[0].state,
+        tollgate_store::CredentialActivityState::Committed { .. }
+    ));
     let key_shutdown = keys.shutdown().await;
     assert!(!key_shutdown.task_failed && !key_shutdown.deadline_expired);
     let _ = stop_tx.send(());
@@ -602,7 +616,9 @@ async fn http_instance_discovers_a_principal_published_after_it_started() {
         status: AccountStatus::Active,
         capacity_class: CapacityClass::Assured,
     });
-    store.publish_snapshot(PRINCIPAL, publishable(snapshot()));
+    store
+        .publish_snapshot(PRINCIPAL, publishable(snapshot()))
+        .expect("snapshot fixture matches its account and credential");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -657,7 +673,9 @@ async fn http_instance_discovers_a_principal_published_after_it_started() {
     assert!(map.get(&LATER).is_none(), "not published yet");
 
     // Provision a customer against the running control plane.
-    store.publish_snapshot(LATER, publishable(snapshot()));
+    store
+        .publish_snapshot(LATER, publishable(snapshot()))
+        .expect("snapshot fixture matches its account and credential");
 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while map.get(&LATER).is_none() {
@@ -736,6 +754,7 @@ async fn an_oversized_batch_comes_back_refused_not_retryable() {
             CostUnits(1),
             at(0),
             PolicyRevision::UNSTATED,
+            None,
         )
     };
     let encoded_event = serde_json::to_string(&event(0))
@@ -803,6 +822,7 @@ async fn a_rate_limited_or_timed_out_ingest_stays_retryable() {
             CostUnits(1),
             at(0),
             PolicyRevision::UNSTATED,
+            None,
         );
         let error = UsageSink::ingest(&*http, &[event], at(0))
             .await

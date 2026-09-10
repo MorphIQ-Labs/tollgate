@@ -995,4 +995,9 @@ async fn demo_credentials_are_durable_and_revocation_reaches_new_verification() 
     let store = runtime.store.clone();
     runtime.shutdown().await;
     assert_eq!(store.usage_recorded(DEMO_ACCOUNT), CostUnits(64));
+    let activity = store.credential_activity(&[keys[0].key_id]).await.unwrap();
+    assert!(matches!(
+        activity[0].state,
+        tollgate_store::CredentialActivityState::Committed { .. }
+    ));
 }

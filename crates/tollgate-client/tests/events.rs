@@ -359,6 +359,7 @@ async fn usage_sink_outage_and_recovery_are_reported() {
         CostUnits(25),
         t(0),
         PolicyRevision::UNSTATED,
+        None,
     ));
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let stats = writer.shutdown().await.unwrap();
@@ -398,6 +399,151 @@ async fn usage_sink_outage_and_recovery_are_reported() {
             .is_some_and(|attempts| attempts.parse::<u64>().unwrap_or(0) >= 3),
         "recovery must report the attempts it took: {recovery:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_credential_attribution_emits_a_structured_coverage_event() {
+    let store = store(100);
+    let (captor, _guard) = capture();
+    let (recorder, writer) = UsageWriter::spawn(
+        store,
+        Arc::new(ManualClock::new(t(0))),
+        tollgate_client::UsageWriterConfig {
+            queue_capacity: 1,
+            max_batch: 1,
+            flush_interval: std::time::Duration::from_millis(1),
+            retry_backoff: std::time::Duration::from_millis(1),
+            ingest_timeout: std::time::Duration::from_millis(10),
+            shutdown_drain_deadline: std::time::Duration::from_secs(1),
+        },
+    )
+    .unwrap();
+    recorder.try_reserve().unwrap().record(UsageEvent::new(
+        tollgate_core::RequestId(105),
+        ACCOUNT,
+        UsageSource::Overage,
+        CostUnits(1),
+        t(0),
+        PolicyRevision::UNSTATED,
+        None,
+    ));
+    let stats = writer.shutdown().await.unwrap();
+    assert_eq!(stats.unattributed, 1);
+    assert!(
+        captor
+            .at_least(Level::WARN, "tollgate_client::usage_writer")
+            .iter()
+            .any(|event| event.field("unattributed") == Some("Some(1)"))
+    );
+}
+
+struct AttributionSink(std::sync::atomic::AtomicU8);
+
+#[async_trait]
+impl UsageSink for AttributionSink {
+    async fn ingest(
+        &self,
+        events: &[UsageEvent],
+        _now: Timestamp,
+    ) -> Result<IngestReport, IngestError> {
+        Ok(IngestReport {
+            accepted: events.len() as u64,
+            duplicate: 0,
+            rejected: 0,
+            unattributed: match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => Some(0),
+                1 => Some(events.len() as u64),
+                _ => None,
+            },
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn attribution_coverage_reports_transitions_without_repeating_incidents() {
+    let (captor, _guard) = capture();
+    let sink = Arc::new(AttributionSink(std::sync::atomic::AtomicU8::new(0)));
+    let (recorder, writer) = UsageWriter::spawn(
+        sink.clone(),
+        Arc::new(ManualClock::new(t(0))),
+        tollgate_client::UsageWriterConfig {
+            queue_capacity: 1,
+            max_batch: 1,
+            flush_interval: std::time::Duration::from_millis(1),
+            retry_backoff: std::time::Duration::from_millis(1),
+            ingest_timeout: std::time::Duration::from_millis(10),
+            shutdown_drain_deadline: std::time::Duration::from_secs(1),
+        },
+    )
+    .unwrap();
+    for (request, (mode, transitions)) in [
+        (0, 0),
+        (0, 0),
+        (1, 1),
+        (1, 1),
+        (0, 2),
+        (0, 2),
+        (2, 3),
+        (2, 3),
+        (0, 4),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        sink.0.store(mode, std::sync::atomic::Ordering::Relaxed);
+        recorder.try_reserve().unwrap().record(UsageEvent::new(
+            tollgate_core::RequestId(request as u128),
+            ACCOUNT,
+            UsageSource::Overage,
+            CostUnits(1),
+            t(0),
+            PolicyRevision::UNSTATED,
+            None,
+        ));
+        for _ in 0..100 {
+            if recorder.health().stats.accepted == request as u64 + 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(recorder.health().stats.accepted, request as u64 + 1);
+        // A persisting gap must not announce recovery. Checking only the
+        // final event sequence would also accept recovery one batch early.
+        assert_eq!(
+            captor
+                .at_least(Level::INFO, "tollgate_client::usage_writer")
+                .iter()
+                .filter(|event| event.field("coverage_complete").is_some())
+                .count(),
+            transitions
+        );
+    }
+    let stats = writer.shutdown().await.unwrap();
+    assert_eq!(
+        (
+            stats.accepted,
+            stats.unattributed,
+            stats.attribution_unreported_batches
+        ),
+        (9, 2, 2)
+    );
+    let transitions: Vec<_> = captor
+        .at_least(Level::INFO, "tollgate_client::usage_writer")
+        .into_iter()
+        .filter(|event| event.field("coverage_complete").is_some())
+        .collect();
+    assert_eq!(transitions.len(), 4);
+    assert_eq!(transitions[0].field("unattributed"), Some("Some(1)"));
+    assert_eq!(transitions[2].field("unattributed"), Some("None"));
+    for (event, (level, complete)) in transitions.iter().zip([
+        (Level::WARN, "false"),
+        (Level::INFO, "true"),
+        (Level::WARN, "false"),
+        (Level::INFO, "true"),
+    ]) {
+        assert_eq!(event.level, level);
+        assert_eq!(event.field("coverage_complete"), Some(complete));
+    }
 }
 
 /// An allocator that grants normally and rejects every release capability.

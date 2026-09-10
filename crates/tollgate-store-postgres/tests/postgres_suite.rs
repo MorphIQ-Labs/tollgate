@@ -156,6 +156,7 @@ fn usage(lease: &tollgate_core::LeaseGrant, request: u128, units: u64, at: i64) 
         CostUnits(units),
         t(at),
         PolicyRevision::UNSTATED,
+        None,
     )
 }
 
@@ -168,6 +169,7 @@ fn overage_usage(account: AccountId, request: u128, units: u64, at: i64) -> Usag
         CostUnits(units),
         t(at),
         PolicyRevision::UNSTATED,
+        None,
     )
 }
 
@@ -1433,6 +1435,18 @@ async fn snapshot_json_preserves_legacy_numbers_and_encodes_high_ids_exactly() {
     };
     let key = KeyId((1u128 << 127) | 2);
     let principal = Principal((1u128 << 127) | 3);
+    let mut digest = [0x77; 32];
+    digest[..16].copy_from_slice(&principal.0.to_be_bytes());
+    store
+        .insert_key(KeyRecord {
+            key_id: key,
+            account_id: ACCOUNT,
+            principal,
+            digest,
+            not_after: None,
+        })
+        .await
+        .unwrap();
     let snapshot = publishable(Arc::new(
         AccountSnapshot::builder(
             ACCOUNT,
@@ -4743,6 +4757,7 @@ async fn a_usage_row_carries_its_policy_revision() {
         CostUnits(40),
         t(1),
         revision,
+        None,
     );
     let report = store.ingest(&[event], t(1)).await.unwrap();
     assert_eq!((report.accepted, report.rejected), (1, 0));
@@ -4770,6 +4785,7 @@ async fn a_usage_row_carries_its_policy_revision() {
         CostUnits(10),
         t(2),
         PolicyRevision::UNSTATED,
+        None,
     );
     store.ingest(&[plain], t(2)).await.unwrap();
     let unstated: Vec<u8> = sqlx::query_scalar(

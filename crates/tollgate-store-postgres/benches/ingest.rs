@@ -18,10 +18,12 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use jiff::{SignedDuration, Timestamp};
 
 use tollgate_core::{
-    AccountId, AccountStatus, CapacityClass, CostUnits, PolicyRevision, RequestId, UsageEvent,
-    UsageSource,
+    AccountId, AccountStatus, CapacityClass, CostUnits, KeyId, PolicyRevision, Principal,
+    RequestId, UsageEvent, UsageSource,
 };
-use tollgate_store::{AccountConfig, AdminStore, GrantPolicy, LeaseAllocator, UsageSink};
+use tollgate_store::{
+    AccountConfig, AdminStore, GrantPolicy, KeyDirectory, KeyRecord, LeaseAllocator, UsageSink,
+};
 use tollgate_store_postgres::PostgresStore;
 
 const BATCH_SIZE: usize = 256;
@@ -75,6 +77,18 @@ fn bench_ingest(c: &mut Criterion) {
             )
             .await
             .unwrap();
+            let mut digest = [0x55; 32];
+            digest[..16].copy_from_slice(&account_id.0.to_be_bytes());
+            store
+                .insert_key(KeyRecord {
+                    key_id: KeyId(account_id.0),
+                    account_id,
+                    principal: Principal(account_id.0),
+                    digest,
+                    not_after: None,
+                })
+                .await
+                .unwrap();
             leases.push(
                 store
                     .acquire(
@@ -92,41 +106,55 @@ fn bench_ingest(c: &mut Criterion) {
     let next_batch = AtomicU64::new(0);
     let expected_accepted = u64::try_from(BATCH_SIZE).unwrap();
     let mut group = c.benchmark_group("postgres_ingest");
-    group.sample_size(10);
+    group.sample_size(20);
     group.warm_up_time(Duration::from_secs(1));
-    group.measurement_time(Duration::from_secs(15));
-    group.bench_function("256_distinct_leases_accounts", |b| {
-        b.iter_batched(
-            || {
-                let batch = u128::from(next_batch.fetch_add(1, Ordering::Relaxed));
-                leases
-                    .iter()
-                    .enumerate()
-                    .map(|(index, lease)| {
-                        UsageEvent::new(
-                            RequestId((batch << 64) | u128::try_from(index).unwrap()),
-                            lease.account_id,
-                            UsageSource::Leased {
-                                lease_id: lease.lease_id,
-                                fencing_token: lease.fencing_token,
-                            },
-                            CostUnits(1),
-                            timestamp(1),
-                            PolicyRevision::UNSTATED,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            },
-            |events| {
-                let report = runtime
-                    .block_on(store.ingest(&events, timestamp(1)))
-                    .unwrap();
-                assert_eq!(report.accepted, expected_accepted);
-                black_box(report)
-            },
-            BatchSize::SmallInput,
-        );
-    });
+    group.measurement_time(Duration::from_secs(5));
+    for (name, distinct, attributed) in [
+        ("256_distinct_leases_accounts", true, false),
+        ("256_distinct_attributed", true, true),
+        ("256_one_account_unattributed", false, false),
+        ("256_one_credential", false, true),
+    ] {
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || {
+                    let batch = next_batch.fetch_add(1, Ordering::Relaxed);
+                    (0..BATCH_SIZE)
+                        .map(|index| {
+                            let lease = &leases[if distinct { index } else { 0 }];
+                            UsageEvent::new(
+                                RequestId((u128::from(batch) << 64) | index as u128),
+                                lease.account_id,
+                                UsageSource::Leased {
+                                    lease_id: lease.lease_id,
+                                    fencing_token: lease.fencing_token,
+                                },
+                                CostUnits(1),
+                                // Every batch advances activity, exercising actual
+                                // writes instead of repeatedly timing equal no-ops.
+                                Timestamp::from_microsecond(i64::try_from(batch).unwrap() + 1)
+                                    .unwrap(),
+                                PolicyRevision::UNSTATED,
+                                if attributed {
+                                    Some(KeyId(lease.account_id.0))
+                                } else {
+                                    None
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                },
+                |events| {
+                    let report = runtime
+                        .block_on(store.ingest(&events, timestamp(1)))
+                        .unwrap();
+                    assert_eq!(report.accepted, expected_accepted);
+                    black_box(report)
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
     group.finish();
 
     drop(leases);

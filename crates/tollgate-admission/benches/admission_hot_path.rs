@@ -26,8 +26,8 @@ use tollgate_admission::{
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, FencingToken,
-    Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex, PermissionBits,
-    PublishableSnapshot, ResolvedLimits, UsageEvent, UsageSlot,
+    Generation, KeyId, LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex, PermissionBits,
+    PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent, UsageSlot,
 };
 
 #[derive(Debug)]
@@ -35,6 +35,88 @@ struct BenchUsageSlot;
 
 impl UsageSlot for BenchUsageSlot {
     fn record(self, _event: UsageEvent) {}
+}
+
+/// Unlike the cancellation fixtures, this sink makes the complete billing
+/// event observable, including the copy performed when the guard emits it.
+#[derive(Debug)]
+struct EmissionSlot;
+
+impl UsageSlot for EmissionSlot {
+    fn record(self, event: UsageEvent) {
+        black_box(event);
+    }
+}
+
+fn bench_commit_usage(c: &mut Criterion) {
+    let mut group = c.benchmark_group("admission");
+    let now = Timestamp::from_second(1_755_600_000).unwrap();
+    for source in ["leased", "overage", "fallback"] {
+        for key in [None, Some(KeyId(7))] {
+            for split in [false, true] {
+                let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+                let mut snapshot = (*contention_snapshot()).clone();
+                snapshot.key_id = key;
+                if source != "leased" {
+                    snapshot.enforcement_mode = EnforcementMode::Elastic {
+                        overage_cap: CostUnits(u64::MAX),
+                    };
+                }
+                let slot = LeaseSlot::for_account(AccountId(1));
+                if source != "overage" {
+                    let expires_at = if source == "fallback" {
+                        now.checked_add(jiff::SignedDuration::from_secs(1)).unwrap()
+                    } else {
+                        far_future()
+                    };
+                    slot.install(Arc::new(LocalLease::new(
+                        LeaseGrant {
+                            lease_id: LeaseId(7),
+                            account_id: AccountId(1),
+                            fencing_token: FencingToken(1),
+                            units: CostUnits(u64::MAX / 2),
+                            expires_at,
+                        },
+                        CostUnits::ZERO,
+                    )));
+                }
+                engine.map().install_publishable(
+                    Principal(1),
+                    PublishableSnapshot::try_new(Arc::new(snapshot)).unwrap(),
+                    slot,
+                );
+                let commit_at = if source == "fallback" {
+                    now.checked_add(jiff::SignedDuration::from_secs(1)).unwrap()
+                } else {
+                    now
+                };
+                let key_name = if key.is_some() { "key" } else { "unattributed" };
+                let ownership = if split { "split" } else { "owned" };
+                group.bench_function(
+                    format!("commit_usage_{source}_{key_name}_{ownership}"),
+                    |b| {
+                        b.iter(|| {
+                            let ready = engine
+                                .begin(Principal(1), PermissionBits::bit(0), now)
+                                .unwrap()
+                                .admit(&[(PriceOp, 1)], EmissionSlot, now)
+                                .unwrap()
+                                .acquire_capacity(&NoGate)
+                                .unwrap();
+                            if split {
+                                let (ready, handle) = ready.split();
+                                drop(ready.commit(RequestId(1), commit_at).unwrap());
+                                black_box(handle.is_cancelled());
+                            } else {
+                                drop(ready.commit(RequestId(1), commit_at).unwrap());
+                            }
+                        });
+                    },
+                );
+            }
+        }
+    }
+    group.finish();
 }
 
 #[derive(Clone, Copy)]
@@ -729,6 +811,7 @@ criterion_group!(
     bench_lookup,
     bench_full_check,
     bench_capacity,
-    bench_bulk_install
+    bench_bulk_install,
+    bench_commit_usage
 );
 criterion_main!(benches);

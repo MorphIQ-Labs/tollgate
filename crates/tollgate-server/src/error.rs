@@ -252,6 +252,12 @@ impl From<SetStatusError> for ApiError {
 impl From<PublishSnapshotError> for ApiError {
     fn from(e: PublishSnapshotError) -> Self {
         match e {
+            PublishSnapshotError::CredentialMismatch { .. } => ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "invalid-credential-binding",
+                title: e.to_string(),
+                generation: None,
+            },
             PublishSnapshotError::StatusMismatch { .. } => ApiError {
                 status: StatusCode::CONFLICT,
                 code: "snapshot-status-mismatch",

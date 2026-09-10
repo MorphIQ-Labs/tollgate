@@ -415,6 +415,9 @@ until it has one.
    events change either ledger, and their grouped lease/account effects stay
    in the same atomic transaction.
 
+   Credential activity consumes that accepted set too (35); a duplicate's
+   changed key ID or timestamp cannot become fresh evidence.
+
    A batch that *fails* changes neither ledger. This is where the reference
    backend has to work for its living: `PostgresStore` gets it from one
    transaction and `finish_transaction`, while `MemoryStore` must reach the
@@ -1249,6 +1252,9 @@ exists to detect corrupt state and must not be able to launder it.
     window can lag later commits; failed refresh preserves the prior table
     without extending its finite deadline (34).
 
+    Last-committed activity is derived separately from canonical accepted
+    usage (35), never from or into this projection.
+
     The secret never reaches a store and the server secret never leaves the
     verifier, so neither half alone verifies or mints anything — the property
     HMAC is paid for, preserved across the persistence boundary rather than
@@ -1695,3 +1701,58 @@ exists to detect corrupt state and must not be able to launder it.
     the mirrored backend
     `credential_projection_preserves_lifecycle_truth_and_refuses_corrupt_identity`,
     and the three full-stack HTTP/TLS/mTLS conservation tests named in 32.
+
+35. **Credential activity derives from canonical accepted commitments.** A
+    pinned snapshot supplies its optional key ID when commitment constructs
+    the usage event. Store publication validates a stated key's principal and
+    account binding; custom snapshot producers remain trusted. Ingest checks
+    account ownership and derives activity only from newly accepted events.
+    Duplicate request IDs cannot replace their original identity or timestamp.
+    Activity advances by maximum at microsecond precision and remains outside
+    the credential revision, snapshots, authorization and conservation equation.
+
+    Missing, unknown or different-account key attribution never rejects an
+    otherwise valid bill. Such accepted events are reported unattributed;
+    older/equal attributable timestamps remain successful no-ops. The count is
+    bounded by accepted events, not the number of credential rows updated.
+    Missing attribution reporting is unknown, never a fabricated zero. Complete
+    report cardinality is validated before a writer releases queued evidence;
+    cumulative outcome overflow saturates and is reported. Storage failures
+    still roll back the complete ingest transaction and remain retryable.
+
+    No observation is proof only of missing recorded evidence, never of non-use.
+    Pre-execution denials/cancellation, unflushed, lost, rejected and unattributed
+    commitments are outside this history. Activity cannot certify that revocation
+    is harmless and never supplies authentication or authorization evidence.
+
+    Enforcement: the shared MemoryStore publication operation and PostgreSQL
+    publication transaction own identity checks; accepted-event classification,
+    the memory plan/apply operation and conditional SQL upsert own activity.
+    UsageWriter validates acknowledgements from every sink. The separate table
+    has no credential-revision trigger; its regression witness checks isolation.
+    `CredentialActivity.lean` proves exact-model max/idempotency laws, first-event
+    replay identity, report partitioning, revision isolation and atomic failure
+    preservation, assuming correct classification and transaction execution.
+    It does not prove authentication, Rust/SQL refinement or lossless delivery.
+
+    *Tests:* the shared memory/PostgreSQL scenarios
+    `committed_usage_attributes_each_event_and_preserves_replay_identity`,
+    `missing_unknown_and_wrong_account_attribution_preserve_billing`,
+    `retired_activity_never_changes_the_credential_revision`,
+    `publication_checks_the_stated_credential_binding`,
+    `concurrent_activity_commits_converge_to_the_maximum`,
+    `activity_uses_durable_microsecond_precision`,
+    `activity_reads_preserve_every_requested_key_and_its_state`, and
+    `a_failed_batch_preserves_activity_and_canonical_events`; PostgreSQL's
+    `activity_failure_rolls_back_billing_and_source_metadata`,
+    `a_commit_failure_after_activity_staging_preserves_the_predecessor`,
+    `activity_and_source_identity_survive_restart_and_reset_together`, and
+    `competing_request_ids_preserve_the_first_attribution`; the core property
+    `committed_evidence_carries_the_supplied_credential`; admission's
+    `emitted_usage_pins_the_key_and_cancelled_work_emits_nothing`; writer's
+    `attribution_and_existing_outcome_counters_saturate_visibly`,
+    `attribution_coverage_reports_transitions_without_repeating_incidents`,
+    and the uncertain-retry/drain scenarios in `usage_attribution`; the HTTP
+    `usage_acknowledgements_require_complete_bounded_valid_evidence` and
+    `invalid_published_key_binding_has_a_structured_code`; the wire-limit,
+    attributed embedding allocation and three full-stack transport witnesses.

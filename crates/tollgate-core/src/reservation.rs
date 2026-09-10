@@ -474,12 +474,16 @@ impl Reservation {
     /// reservation is a request-path value and would carry 32 bytes for a
     /// field only the commit reads, and passing it here keeps the event built
     /// complete in one place instead of assembled and then patched.
+    /// `key_id` follows the same rule: the pinned snapshot's optional
+    /// credential identity reaches only committed events, without enlarging
+    /// the pending reservation. The store owns attribution and replay checks.
     #[must_use]
     pub fn usage_event(
         &self,
         request_id: RequestId,
         now: Timestamp,
         policy_revision: PolicyRevision,
+        key_id: Option<crate::KeyId>,
     ) -> Option<UsageEvent> {
         let source = match self.phase.load(Ordering::Acquire) {
             // Both a natively admitted overage and a commit-time fallback.
@@ -510,6 +514,7 @@ impl Reservation {
             self.units,
             now,
             policy_revision,
+            key_id,
         ))
     }
 }
@@ -669,7 +674,7 @@ mod tests {
             CostUnits(30)
         );
         let event = r
-            .usage_event(RequestId(7), t(1), PolicyRevision::UNSTATED)
+            .usage_event(RequestId(7), t(1), PolicyRevision::UNSTATED, None)
             .unwrap();
         assert_eq!(event.account_id, AccountId(1));
         assert_eq!(event.units, CostUnits(30));
@@ -687,7 +692,7 @@ mod tests {
         assert_eq!(r.cancel(), CancelOutcome::ZeroCharged);
         assert_eq!(o.spent(), CostUnits::ZERO);
         assert_eq!(
-            r.usage_event(RequestId(7), t(1), PolicyRevision::UNSTATED),
+            r.usage_event(RequestId(7), t(1), PolicyRevision::UNSTATED, None),
             None
         );
     }
@@ -758,7 +763,7 @@ mod tests {
         );
         assert_eq!(l.remaining(), CostUnits(70));
         assert!(
-            r.usage_event(RequestId(9), t(1), PolicyRevision::UNSTATED)
+            r.usage_event(RequestId(9), t(1), PolicyRevision::UNSTATED, None)
                 .is_some()
         );
         drop(r);
@@ -791,7 +796,7 @@ mod tests {
             Ok(r.units())
         );
         assert_eq!(
-            r.usage_event(RequestId(1), t(1), PolicyRevision::UNSTATED)
+            r.usage_event(RequestId(1), t(1), PolicyRevision::UNSTATED, None)
                 .unwrap()
                 .units,
             r.units(),
@@ -806,7 +811,7 @@ mod tests {
         assert_eq!(r.cancel(), CancelOutcome::ZeroCharged);
         assert_eq!(l.remaining(), CostUnits(100));
         assert_eq!(
-            r.usage_event(RequestId(9), t(1), PolicyRevision::UNSTATED),
+            r.usage_event(RequestId(9), t(1), PolicyRevision::UNSTATED, None),
             None
         );
         // Idempotent, and no double credit.
@@ -879,7 +884,7 @@ mod tests {
         // Units returned; no usage event can exist; later commit is refused.
         assert_eq!(l.remaining(), CostUnits(100));
         assert_eq!(
-            r.usage_event(RequestId(1), t(1_001), PolicyRevision::UNSTATED),
+            r.usage_event(RequestId(1), t(1_001), PolicyRevision::UNSTATED, None),
             None
         );
         assert_eq!(
@@ -922,7 +927,7 @@ mod tests {
         assert_eq!(o.spent(), CostUnits(30));
 
         let event = r
-            .usage_event(RequestId(7), t(1_000), PolicyRevision::UNSTATED)
+            .usage_event(RequestId(7), t(1_000), PolicyRevision::UNSTATED, None)
             .unwrap();
         assert_eq!(event.units, CostUnits(30));
         assert_eq!(event.account_id, AccountId(1));
@@ -948,7 +953,7 @@ mod tests {
         );
         assert_eq!(l.remaining(), CostUnits(100));
         assert_eq!(
-            r.usage_event(RequestId(7), t(1_000), PolicyRevision::UNSTATED),
+            r.usage_event(RequestId(7), t(1_000), PolicyRevision::UNSTATED, None),
             None
         );
         // Strict took no overage: the counter was never touched.
@@ -982,7 +987,7 @@ mod tests {
         assert_eq!(l.remaining(), CostUnits(100));
         assert_eq!(o.spent(), CostUnits(100));
         assert_eq!(
-            r.usage_event(RequestId(7), t(1_000), PolicyRevision::UNSTATED),
+            r.usage_event(RequestId(7), t(1_000), PolicyRevision::UNSTATED, None),
             None
         );
     }
@@ -1137,7 +1142,7 @@ mod tests {
         // One debit, taken at admission — not a second one at commit.
         assert_eq!(o.spent(), CostUnits(30));
         assert_eq!(
-            r.usage_event(RequestId(1), t(9_999), PolicyRevision::UNSTATED)
+            r.usage_event(RequestId(1), t(9_999), PolicyRevision::UNSTATED, None)
                 .unwrap()
                 .source,
             UsageSource::Overage
@@ -1260,7 +1265,7 @@ mod tests {
                     assert_eq!(l.remaining(), CostUnits(100));
                     assert_eq!(o.spent(), CostUnits(10));
                     assert_eq!(
-                        r.usage_event(RequestId(1), t(1_000), PolicyRevision::UNSTATED)
+                        r.usage_event(RequestId(1), t(1_000), PolicyRevision::UNSTATED, None)
                             .unwrap()
                             .source,
                         UsageSource::Overage
@@ -1272,7 +1277,7 @@ mod tests {
                     assert_eq!(l.remaining(), CostUnits(100));
                     assert_eq!(o.spent(), CostUnits::ZERO);
                     assert_eq!(
-                        r.usage_event(RequestId(1), t(1_000), PolicyRevision::UNSTATED),
+                        r.usage_event(RequestId(1), t(1_000), PolicyRevision::UNSTATED, None),
                         None
                     );
                 }
@@ -1388,7 +1393,7 @@ mod tests {
         assert_eq!(
             shared
                 .reservation()
-                .usage_event(RequestId(1), t(0), PolicyRevision::UNSTATED),
+                .usage_event(RequestId(1), t(0), PolicyRevision::UNSTATED, None),
             None
         );
     }
@@ -1421,7 +1426,7 @@ mod tests {
         assert!(
             shared
                 .reservation()
-                .usage_event(RequestId(1), t(0), PolicyRevision::UNSTATED)
+                .usage_event(RequestId(1), t(0), PolicyRevision::UNSTATED, None)
                 .is_some()
         );
     }

@@ -42,7 +42,10 @@ after the final page's read is subject to the refresh window: this protocol
 provides a coherent committed revision, not a transaction extending through
 publication on the instance.
 
-Apply migration **0013** before enabling the route. It adds a revision table,
+Apply migration **0013** before enabling the route. PostgreSQL embedders must
+also follow the [startup and rollback constraints](CREDENTIAL_ACTIVITY.md#persistence-and-rollout):
+old migration catalogues reject newer applied versions on restart even when
+the schema changes are additive. Migration 0013 adds a revision table,
 a transactional trigger covering old and new writers, and a partial `key_id`
 index. Installation is transactional and may briefly block credential writes
 while the index builds; schedule accordingly for a large existing table. Old
@@ -154,3 +157,11 @@ issuers persist minted records before disclosure and project afterwards. The
 pricing example uses `digest_credential` to import its public `demo-key-N`
 fixtures into MemoryStore before starting this same manager; its asynchronous
 builders ensure bootstrap completes before background reads start.
+
+Credential activity is a separate projection of accepted committed usage.
+Publishers set a matching `AccountSnapshot.key_id`; operator readers distinguish
+unknown keys, missing observations and `last_committed_at`. An absent timestamp
+never proves non-use. The usage writer reports attribution gaps and unavailable
+support. See [Credential activity](CREDENTIAL_ACTIVITY.md) for coverage, atomicity,
+operator reads and rollout. Activity never changes this feed's revision or
+liveness decisions.

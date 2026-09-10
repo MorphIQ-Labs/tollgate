@@ -12,7 +12,7 @@ use std::sync::{
 
 use jiff::Timestamp;
 
-use crate::ids::{AccountId, FencingToken, LeaseId, PolicyRevision, RequestId};
+use crate::ids::{AccountId, FencingToken, KeyId, LeaseId, PolicyRevision, RequestId};
 use crate::units::CostUnits;
 
 /// Pre-reserved capacity for exactly one usage event.
@@ -190,6 +190,11 @@ pub struct UsageEvent {
     /// fields follow.
     #[cfg_attr(feature = "serde", serde(default))]
     pub policy_revision: PolicyRevision,
+    /// Credential named by the pinned, key-scoped snapshot. An absent value
+    /// preserves billing but supplies no credential activity. This metadata
+    /// is never authorization evidence; the sink checks account ownership.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub key_id: Option<KeyId>,
 }
 
 impl UsageEvent {
@@ -212,6 +217,7 @@ impl UsageEvent {
         units: CostUnits,
         occurred_at: Timestamp,
         policy_revision: PolicyRevision,
+        key_id: Option<KeyId>,
     ) -> Self {
         Self {
             request_id,
@@ -220,6 +226,7 @@ impl UsageEvent {
             units,
             occurred_at,
             policy_revision,
+            key_id,
         }
     }
 }
@@ -236,6 +243,7 @@ mod revision_wire_tests {
             CostUnits(70),
             Timestamp::UNIX_EPOCH,
             revision,
+            None,
         )
     }
 
@@ -294,6 +302,7 @@ mod discarded_usage_tests {
             CostUnits(70),
             Timestamp::UNIX_EPOCH,
             PolicyRevision::UNSTATED,
+            None,
         )
     }
 

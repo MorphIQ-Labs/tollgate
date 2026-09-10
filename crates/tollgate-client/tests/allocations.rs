@@ -118,6 +118,7 @@ fn warm_event(request_id: u128) -> UsageEvent {
         CostUnits(1),
         now(),
         PolicyRevision::UNSTATED,
+        None,
     )
 }
 
@@ -147,6 +148,7 @@ async fn install_admission(principal: Principal) -> (InstanceRuntime, RuntimeHan
                     .build(),
             ),
         )
+        .key_id(tollgate_core::KeyId(105))
         .build(),
     );
     let store = MemoryStore::new(GrantPolicy::default()).unwrap();
@@ -156,10 +158,26 @@ async fn install_admission(principal: Principal) -> (InstanceRuntime, RuntimeHan
         status: AccountStatus::Active,
         capacity_class: tollgate_core::CapacityClass::Assured,
     });
-    store.publish_snapshot(
-        principal,
-        tollgate_core::PublishableSnapshot::try_new(snapshot).unwrap(),
-    );
+    let mut digest = [0x55; 32];
+    digest[..16].copy_from_slice(&principal.0.to_be_bytes());
+    tollgate_store::KeyDirectory::insert_key(
+        &*store,
+        tollgate_store::KeyRecord {
+            key_id: tollgate_core::KeyId(105),
+            account_id: AccountId(1),
+            principal,
+            digest,
+            not_after: None,
+        },
+    )
+    .await
+    .unwrap();
+    store
+        .publish_snapshot(
+            principal,
+            tollgate_core::PublishableSnapshot::try_new(snapshot).unwrap(),
+        )
+        .expect("snapshot fixture matches its account and credential");
     let (runtime, handle) = InstanceRuntime::spawn(
         store.clone(),
         store.clone(),
@@ -273,6 +291,11 @@ async fn embedding_path_allocates_nothing_after_warmup() {
         drop(committed);
     });
     record("embedding/cached_auth_through_record", "tollgate", tollgate);
+    record(
+        "embedding/attributed_commit_through_record",
+        "tollgate",
+        tollgate,
+    );
     assert!(
         tollgate.is_allocation_free(),
         "warmed embedding path allocated: {tollgate:?}"

@@ -55,7 +55,7 @@
 //! as `rejected` at the sink rather than silent loss.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use jiff::{SignedDuration, Timestamp};
 use tokio::sync::{mpsc, watch};
@@ -179,6 +179,10 @@ impl Contended {
 /// through them, and atomicity — no lost increments — is all they need.
 #[derive(Debug)]
 pub struct WriterCounters {
+    unattributed: AtomicU64,
+    attribution_unreported_batches: AtomicU64,
+    attribution_degraded: AtomicBool,
+    counter_overflow: AtomicBool,
     // Written only by the writer task, between batches.
     accepted: AtomicU64,
     duplicate: AtomicU64,
@@ -198,6 +202,10 @@ impl WriterCounters {
     #[must_use]
     pub const fn new() -> Self {
         WriterCounters {
+            unattributed: AtomicU64::new(0),
+            attribution_unreported_batches: AtomicU64::new(0),
+            attribution_degraded: AtomicBool::new(false),
+            counter_overflow: AtomicBool::new(false),
             accepted: AtomicU64::new(0),
             duplicate: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
@@ -213,16 +221,49 @@ impl WriterCounters {
     /// refused: `rejected` is an answer, and what this timestamp distinguishes
     /// is a reachable sink from an unreachable one.
     fn record_ingest(&self, report: &tollgate_store::IngestReport, at: Timestamp) {
-        self.accepted.fetch_add(report.accepted, Ordering::Relaxed);
-        self.duplicate
-            .fetch_add(report.duplicate, Ordering::Relaxed);
-        self.rejected.fetch_add(report.rejected, Ordering::Relaxed);
+        self.add_outcome(&self.accepted, report.accepted);
+        self.add_outcome(&self.duplicate, report.duplicate);
+        self.add_outcome(&self.rejected, report.rejected);
+        match report.unattributed {
+            Some(n) => self.add_outcome(&self.unattributed, n),
+            None => self.add_outcome(&self.attribution_unreported_batches, 1),
+        }
+        let degraded = report.unattributed != Some(0);
+        let previous = self.attribution_degraded.swap(degraded, Ordering::Relaxed);
+        if degraded && !previous {
+            tracing::warn!(coverage_complete = false, unattributed = ?report.unattributed,
+                "credential activity coverage is incomplete or unavailable");
+        } else if previous && !degraded {
+            tracing::info!(
+                coverage_complete = true,
+                "credential attribution reporting recovered for this batch"
+            );
+        }
         self.last_ingest_ms
             .store(at.as_millisecond(), Ordering::Relaxed);
     }
 
     fn record_lost(&self, events: u64) {
-        self.lost.fetch_add(events, Ordering::Relaxed);
+        self.add_outcome(&self.lost, events);
+    }
+
+    // Off-path cumulative outcomes saturate visibly. The request-side queue
+    // accounting counters retain their existing mechanism and budget.
+    fn add_outcome(&self, counter: &AtomicU64, delta: u64) {
+        if counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                old.checked_add(delta)
+            })
+            .is_err()
+        {
+            counter.store(u64::MAX, Ordering::Relaxed);
+            if !self.counter_overflow.swap(true, Ordering::Relaxed) {
+                tracing::error!(
+                    counter_overflow = true,
+                    "usage outcome counter overflow; totals are saturated"
+                );
+            }
+        }
     }
 
     fn set_unresolved(&self, permits: u64) {
@@ -251,6 +292,11 @@ impl WriterCounters {
     #[must_use]
     pub fn stats(&self) -> WriterStats {
         WriterStats {
+            unattributed: self.unattributed.load(Ordering::Relaxed),
+            attribution_unreported_batches: self
+                .attribution_unreported_batches
+                .load(Ordering::Relaxed),
+            counter_overflow: self.counter_overflow.load(Ordering::Relaxed),
             accepted: self.accepted.load(Ordering::Relaxed),
             duplicate: self.duplicate.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
@@ -296,7 +342,7 @@ impl Default for WriterCounters {
 /// sink has already refused, and which is bounded billing loss.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriterHealth {
-    /// The same five numbers a clean shutdown returns, read live.
+    /// The same accounting and coverage diagnostics a clean shutdown returns, read live.
     pub stats: WriterStats,
     /// Charges in the queue with no billing outcome yet.
     pub unaccounted: u64,
@@ -405,6 +451,13 @@ impl tollgate_core::UsageSlot for UsagePermit {
 /// when a starting value is genuinely meant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriterStats {
+    /// Confirmed unattributed newly accepted events. Lost acknowledgements
+    /// followed by duplicate replies cannot reconstruct historical counts.
+    pub unattributed: u64,
+    /// Acknowledged batches whose sink did not report attribution support.
+    pub attribution_unreported_batches: u64,
+    /// At least one cumulative outcome exceeded u64; its value is saturated.
+    pub counter_overflow: bool,
     pub accepted: u64,
     pub duplicate: u64,
     pub rejected: u64,
@@ -418,6 +471,9 @@ pub struct WriterStats {
 impl WriterStats {
     /// A writer that has accounted for nothing yet.
     pub const ZERO: WriterStats = WriterStats {
+        unattributed: 0,
+        attribution_unreported_batches: 0,
+        counter_overflow: false,
         accepted: 0,
         duplicate: 0,
         rejected: 0,
@@ -685,7 +741,8 @@ async fn flush_retrying(
         // the last time the sink answered, so the health reading and the
         // ledger agree about when this batch happened.
         let now = clock.now();
-        let ingest = tokio::time::timeout(config.ingest_timeout, sink.ingest(batch, now));
+        let ingest =
+            tokio::time::timeout(config.ingest_timeout, ingest_checked(&**sink, batch, now));
         let outcome = tokio::select! {
             outcome = ingest => outcome,
             _ = shutdown.changed() => return,
@@ -842,7 +899,7 @@ async fn flush_bounded(
         // timed-out call is a failed attempt — never a silent success.
         let attempt_deadline = deadline.min(tokio::time::Instant::now() + config.ingest_timeout);
         let now = clock.now();
-        match tokio::time::timeout_at(attempt_deadline, sink.ingest(batch, now)).await {
+        match tokio::time::timeout_at(attempt_deadline, ingest_checked(&**sink, batch, now)).await {
             Ok(Ok(report)) => {
                 counters.record_ingest(&report, now);
                 delivered = true;
@@ -885,6 +942,18 @@ async fn flush_bounded(
     batch.clear();
 }
 
+async fn ingest_checked(
+    sink: &dyn UsageSink,
+    events: &[UsageEvent],
+    now: Timestamp,
+) -> Result<tollgate_store::IngestReport, tollgate_store::IngestError> {
+    let report = sink.ingest(events, now).await?;
+    report
+        .validate(events.len())
+        .map_err(tollgate_store::IngestError::Unavailable)?;
+    Ok(report)
+}
+
 /// Slots still held at the drain deadline. The upgrade succeeds exactly
 /// while some permit keeps the channel alive — which is when there is
 /// something to report — and the momentary strong sender is dropped
@@ -897,6 +966,87 @@ fn outstanding_permits(weak: &mpsc::WeakSender<UsageEvent>) -> u64 {
 
 #[cfg(test)]
 mod layout_tests {
+    #[test]
+    fn attribution_and_existing_outcome_counters_saturate_visibly() {
+        use super::*;
+        use tracing_subscriber::layer::SubscriberExt;
+        #[derive(Clone)]
+        struct OverflowEvents(Arc<AtomicU64>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for OverflowEvents {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Fields(bool);
+                impl tracing::field::Visit for Fields {
+                    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                    }
+                    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                        if field.name() == "counter_overflow" {
+                            self.0 = value;
+                        }
+                    }
+                }
+                let mut fields = Fields(false);
+                event.record(&mut fields);
+                if fields.0 {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        let events = Arc::new(AtomicU64::new(0));
+        // This unit-test binary has one subscriber. Overflow is reached only
+        // here; global installation also makes tracing's callsite cache stable.
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(OverflowEvents(events.clone())),
+        )
+        .unwrap();
+        let counters = WriterCounters::new();
+        for counter in [
+            &counters.accepted,
+            &counters.duplicate,
+            &counters.rejected,
+            &counters.lost,
+            &counters.unattributed,
+            &counters.attribution_unreported_batches,
+        ] {
+            counter.store(u64::MAX - 1, Ordering::Relaxed);
+            counters.add_outcome(counter, 1);
+            assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+            counters.add_outcome(counter, 1);
+            assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        }
+        assert!(counters.stats().counter_overflow);
+        assert_eq!(events.load(Ordering::Relaxed), 1);
+        let counters = WriterCounters::new();
+        counters.record_ingest(
+            &tollgate_store::IngestReport {
+                accepted: 4,
+                duplicate: 2,
+                rejected: 1,
+                unattributed: Some(3),
+            },
+            Timestamp::UNIX_EPOCH,
+        );
+        counters.record_ingest(
+            &tollgate_store::IngestReport::default(),
+            Timestamp::UNIX_EPOCH,
+        );
+        let stats = counters.stats();
+        assert_eq!(
+            (
+                stats.accepted,
+                stats.duplicate,
+                stats.rejected,
+                stats.unattributed,
+                stats.attribution_unreported_batches
+            ),
+            (4, 2, 1, 3, 1)
+        );
+        assert!(!stats.counter_overflow);
+    }
+
     use super::{Contended, UsageWriter, UsageWriterConfig};
     use jiff::Timestamp;
     use std::sync::Arc;

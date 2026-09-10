@@ -95,10 +95,13 @@ fn source(principals: usize) -> Arc<MemoryStore> {
             Arc::clone(&cost_table),
         )
         .build();
-        store.publish_snapshot(
-            Principal(index),
-            PublishableSnapshot::try_new(Arc::new(snapshot)).expect("fixture snapshot is valid"),
-        );
+        store
+            .publish_snapshot(
+                Principal(index),
+                PublishableSnapshot::try_new(Arc::new(snapshot))
+                    .expect("fixture snapshot is valid"),
+            )
+            .expect("snapshot fixture matches its account and credential");
     }
     store
 }
