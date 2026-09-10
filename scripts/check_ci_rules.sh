@@ -19,14 +19,12 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 CONFIG="$ROOT/.gitlab-ci.yml"
 
 # Blocking gates. Each must run on every merge request, whatever it targets.
-BLOCKING_GATES="formal mutation perf-ratios"
+BLOCKING_GATES="formal mutation"
 
-# The only jobs allowed to carry `.main-merge-request`. Both are pinned to the
-# single controlled host, and neither blocks a merge: `perf-thresholds` is
-# manual (and uses the `-manual` anchor), and `load-thresholds` is explicitly
-# non-gating evidence. Queueing every stacked merge request on one machine
-# would buy no gate.
-HOST_PINNED="load-thresholds"
+# Timed measurements run locally. Compilation and allocation assertions still
+# belong in CI; a remote performance job must not silently restore the policy
+# that made unchanged release builds fail different ratios (#113).
+LOCAL_ONLY="perf-ratios perf-thresholds load-thresholds"
 
 status=0
 
@@ -55,26 +53,39 @@ for job in $BLOCKING_GATES; do
   if ! printf '%s\n' "$block" | grep -E '^  extends: ' | grep -q '\.merge-request\b'; then
     fail "$job must extend .merge-request so it runs for every merge request, not only one targeting the default branch (#106)"
   fi
+  if ! printf '%s\n' "$block" | grep -q '^  allow_failure: false$'; then
+    fail "$job must explicitly remain a blocking gate (allow_failure: false)"
+  fi
 done
 
-# 3. Nothing else may carry the restricting anchor. This is what catches a
-#    *new* gate added later with the wrong rule, rather than only the three
-#    that exist today.
+# 3. No job may restore a restricting performance anchor. This also catches
+#    a new gate added with the old target-dependent rule (#106).
 restricted=$(awk '
   /^[a-z][a-z0-9-]*:$/ { job = substr($0, 1, length($0) - 1) }
-  /^  extends: / && /\.main-merge-request/ && !/\.main-merge-request-manual/ {
+  /^  extends: / && /\.main-merge-request/ {
     if (job != "") print job
   }
 ' "$CONFIG")
 
 for job in $restricted; do
-  case " $HOST_PINNED " in
-    *" $job "*) ;;
-    *) fail "$job extends .main-merge-request, so it does not run for a merge request targeting a feature branch. Blocking gates use .merge-request; only a job pinned to the controlled host may restrict itself, and it must be listed in HOST_PINNED with the reason (#106)" ;;
-  esac
+  fail "$job uses a retired target-dependent anchor; assurance uses .merge-request and timed performance checks run locally"
 done
 
+# 4. Guard the local-only decision, including renamed jobs that invoke one
+#    of the timed wrappers. `cargo bench --no-run` remains permitted.
+for job in $LOCAL_ONLY; do
+  if grep -q "^$job:" "$CONFIG"; then
+    fail "$job belongs in the local performance workflow, not remote CI"
+  fi
+done
+if grep -E '^[[:space:]]*-[[:space:]]*\./scripts/check_(perf|load)_thresholds\.sh' "$CONFIG" > /dev/null; then
+  fail "timed performance wrappers must run locally"
+fi
+if grep -E '^[[:space:]]*-[[:space:]]*cargo bench([[:space:]]|$)' "$CONFIG" | grep -v -- '--no-run' > /dev/null; then
+  fail "CI may compile benchmarks with --no-run, but timed execution is local"
+fi
+
 if [ "$status" -eq 0 ]; then
-  echo "ci rules: OK (blocking gates run on every merge request)"
+  echo "ci rules: OK (formal/mutation block every merge request; timed performance is local)"
 fi
 exit "$status"

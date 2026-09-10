@@ -2,16 +2,15 @@
 # performance compilation, mutation assurance, and machine-checked proofs.
 #
 # The image tag matches rust-toolchain.toml; keep them in lockstep so rustup
-# never downloads a second toolchain inside CI. Criterion and absolute-latency
-# thresholds stay on a controlled host; shared CI blocks on portable Criterion
-# ratios and records the load test's like-for-like sequential and contended
-# ratios as non-gating evidence.
+# never downloads a second toolchain inside CI. Timed Criterion and loopback
+# load checks run locally; reports are reviewed with the merge request. CI
+# retains benchmark compilation and deterministic allocation assertions.
 #
 # Every job carries `dependencies: []`. No job consumes another job's artifacts,
 # and left implicit GitLab makes each later-stage job download every
 # earlier-stage artifact. a sibling workspace lost its entire test stage to a 403 that
 # way, fetching whitepaper PDFs nothing reads. `dependencies` controls downloads
-# only; the mutation, perf and load jobs still publish their reports.
+# only; mutation assurance still publishes its report.
 #
 # Cache: Cargo sources and target artifacts are keyed by Cargo.lock plus the
 # pinned toolchain. Clippy is the sole writer; later build jobs pull read-only,
@@ -59,25 +58,6 @@ variables:
 .merge-request:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - when: never
-
-# Only the two jobs pinned to the controlled host still use this. A *blocking*
-# gate must not, because whether a gate runs would then be a property of where
-# a change is routed rather than of the change itself (#106): a merge request
-# targeting a feature branch got no `assurance` stage at all -- not a skipped
-# job with a visible state, but no jobs created, so the pipeline page showed a
-# complete green pipeline with the column missing. When the parent merged,
-# GitLab retargeted that request to `main` and left the assurance-free pipeline
-# standing as its "pipelines must succeed" evidence.
-.main-merge-request:
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
-    - when: never
-
-.main-merge-request-manual:
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
-      when: manual
     - when: never
 
 .default-branch:
@@ -292,6 +272,7 @@ bench-compile:
     - cargo bench --locked --workspace --no-run
 
 formal:
+  allow_failure: false
   dependencies: []
   extends: .merge-request
   stage: assurance
@@ -313,6 +294,7 @@ formal:
     - ./scripts/check_formal.sh
 
 mutation:
+  allow_failure: false
   dependencies: []
   extends: [.merge-request, .postgres-service]
   stage: assurance
@@ -334,94 +316,6 @@ mutation:
     when: always
     paths:
       - reports/mutations
-
-# Criterion latency is meaningful only on a controlled host. This lane stays
-# visible on default-target MRs for deliberate evidence collection, but is not
-# a merge gate; benchmark compilation remains required in the test stage.
-perf-thresholds:
-  dependencies: []
-  extends: .main-merge-request-manual
-  stage: assurance
-  # The controlled-host runner (`run_untagged: false`) is the controlled host, so only a
-  # tagged job reaches it. Without this the job ran wherever a runner was
-  # free — shared SaaS or the general `local` box — which is exactly the
-  # hardware absolute nanoseconds cannot be read on.
-  tags:
-    - perf-i9-10920x
-  allow_failure: true
-  timeout: 45 minutes
-  cache: *cargo-build-cache
-  variables:
-    # The recorded-baseline half of the gate compares against this; it is
-    # skipped as `host-unset` when unset, which is what it had always been.
-    TOLLGATE_PERF_HOST: perf-i9-10920x
-  script:
-    - ./scripts/check_perf_thresholds.sh
-  artifacts:
-    when: always
-    paths:
-      - reports/perf_gate_report.json
-
-# Same-run Criterion ratios are portable and required. Run after the two
-# CPU-heavy assurance jobs so this pipeline does not contaminate its own
-# denominator; absolute thresholds and the recorded host baseline are
-# explicitly skipped by the mode rather than weakened for shared hardware.
-#
-# Deliberately left untagged. Portability is the point of this gate, so it
-# does not need the controlled host — and it is the only *blocking* one of the
-# three, so pinning it to a single machine would make every merge request wait
-# on that box being online.
-perf-ratios:
-  dependencies: []
-  extends: .merge-request
-  stage: assurance
-  interruptible: true
-  timeout: 45 minutes
-  cache: *cargo-build-cache
-  needs:
-    - job: mutation
-      artifacts: false
-    - job: formal
-      artifacts: false
-  script:
-    - ./scripts/check_perf_thresholds.sh --ratios-only
-  artifacts:
-    when: always
-    paths:
-      - reports/perf_ratio_gate_report.json
-
-load-thresholds:
-  dependencies: []
-  extends: .main-merge-request
-  stage: assurance
-  # Absolute latency ceilings and throughput floors, so the controlled host
-  # for the same reason as `perf-thresholds`.
-  tags:
-    - perf-i9-10920x
-  interruptible: true
-  timeout: 45 minutes
-  cache: *cargo-build-cache
-  variables:
-    TOLLGATE_PERF_HOST: perf-i9-10920x
-  # Ordering, now that this job has the controlled host to itself: nothing
-  # else in the pipeline lands on `perf-i9-10920x`, so the wait is no longer
-  # about our own CPU contention. It stays because the two gates read as one
-  # story — a ratio regression should be reported before the absolute
-  # ceilings that depend on the same measurements.
-  needs:
-    - job: perf-ratios
-      artifacts: false
-  script:
-    # The CI manifest explicitly disables host-dependent absolute ceilings;
-    # paired ratios remain useful evidence, but a shared host can contaminate
-    # their denominator and numerator differently (#49). Evidence mode records
-    # a threshold miss without tainting the pipeline; build, configuration,
-    # execution, and report failures still fail this job.
-    - ./scripts/check_load_thresholds.sh --evidence testing/load_thresholds_ci.json reports/load_gate_report.json
-  artifacts:
-    when: always
-    paths:
-      - reports/load_gate_report.json
 
 # Advances the version; `tag-release` below publishes whatever version the
 # manifest declares. Splitting it this way is what release-plz did, and dropping

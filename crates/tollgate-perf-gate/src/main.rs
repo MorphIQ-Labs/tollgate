@@ -14,7 +14,7 @@
 //! - An optional recorded baseline enforces per-row regressions only when
 //!   `TOLLGATE_PERF_HOST` matches its host id and the run is trusted.
 //! - `--ratios-only` still requires every fresh row but deliberately skips
-//!   absolute thresholds and recorded-baseline decisions for shared CI.
+//!   absolute thresholds and recorded-baseline decisions on other hosts.
 //! - Estimates older than the freshness marker are rejected: the gate must
 //!   never pass on stale output left by a previous run.
 //! - A JSON report is always written; the exit code is nonzero when required
