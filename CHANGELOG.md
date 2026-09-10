@@ -7,6 +7,16 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.18.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.17.0...v0.18.0) - 2026-09-10
+
+### Added
+
+- *(core/store)* [**breaking**] #105 derive credential last-committed from usage
+
+### Changed
+
+- Run timed Criterion and loopback load validation locally; CI retains benchmark compilation, allocation assertions, and formal/mutation assurance.
+
 ## [0.17.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.16.0...v0.17.0) - 2026-09-09
 
 ### Added

@@ -3,7 +3,7 @@
 # production profile (fat LTO, codegen-units 1 — the deployed configuration).
 # Absolute latency and throughput gate on a controlled host; the sequential
 # and configured same-account-concurrency overhead ratios are portable only
-# like-for-like and remain shared-runner evidence under #49.
+# like-for-like. Run locally and retain the report with the merge request.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

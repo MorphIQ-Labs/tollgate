@@ -91,28 +91,24 @@ the primary CI jobs. That pin provides reproducible formatting, linting,
 testing, and release tooling; it does not replace the MSRV contract. Changes
 to the declared minimum and the dedicated `msrv` job must land together.
 
-## The numbers that matter (laptop, provisional)
+## Performance measurements
 
-Full admission — lookup, status, permissions, quote, rate token, lease
-debit — costs **~115 ns** in the opt-in eight-shard uncontended
-microbenchmark and **~132 ns** with eight threads saturating the same account
-on the development host (a same-run **×1.14** ratio; the gate allows ×3).
-The retained single-counter diagnostic was **~106 ns** uncontended and
-**~2.87 µs** contended. Across five
-development-host production-profile loopback repetitions, the paired admitted
-vs no-admission p50 ratio was **×0.997–×1.101** for one persistent connection
-and **×1.015–×1.104** for 10 persistent connections contending on one account.
-Those ranges predate the session-cached credential verification in #2. Its
-recalibration is **still outstanding**: the ratios are only meaningful from a
-controlled host, and none has been run since the change, so the numbers below
-still describe a stack that verified a credential on every request. The load gate retains both
-scenarios and separate ratio ceilings. One lease
-acquire funds thousands of requests; two instances draining one account over
-HTTP finish with **zero drift** between admission's committed units and the
-billing ledger. Gate manifests live in `testing/`; recalibrate on a controlled
-host before treating absolute thresholds as the contract. Default-target
-merge requests record both load ratios with an explicit ratio-only manifest;
-shared-runner threshold misses are evidence rather than merge gates.
+Timed Criterion and production-profile loopback load tests run locally.
+Performance-sensitive merge requests and releases carry the reports and their
+host/revision provenance. CI compiles the benchmarks and checks allocation
+counts; remote timing does not decide whether a change can merge. See
+[the local performance workflow](docs/PERFORMANCE.md).
+
+The September 9 #105 run on an Apple M1 Pro measured full admission at about
+134 ns and the separate owned admission/commit/emission fixtures at 118–126 ns.
+Those fixtures have different workloads and their times are not additive.
+Cached managed credential authentication measured about 38 ns; HMAC verification
+on a cache miss was about 800 ns, with session setup measured separately.
+These are host-specific measurements, not end-to-end HTTP latency guarantees.
+The [credential activity evidence](testing/credential_activity_evidence.json)
+and [projection evidence](docs/CREDENTIAL_PROJECTION_EVIDENCE.md) record the
+workloads and limitations. Gate manifests live in `testing/`; changes to their
+thresholds require deliberate calibration evidence.
 
 ## Design rules
 

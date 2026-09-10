@@ -3,8 +3,9 @@
 # testing/perf_thresholds.json.
 #
 # Absolute-latency and recorded-baseline gating belong on a controlled host.
-# `--ratios-only` is the required shared-CI mode: every fresh measurement must
-# exist, while only same-run ratios decide the performance verdict.
+# Run locally and retain the report with the merge request. `--ratios-only`
+# is a diagnostic mode for other hosts: every fresh measurement must exist,
+# while absolute thresholds and recorded-baseline comparisons are skipped.
 # Mirrors ferro-risk's gate: stale Criterion output is wiped first and a
 # freshness marker rejects anything the current run did not produce.
 set -euo pipefail

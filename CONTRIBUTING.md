@@ -26,7 +26,7 @@ TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
   cargo test -p tollgate-store-postgres
 ```
 
-Performance gates (`./scripts/check_perf_thresholds.sh`, `./scripts/check_load_thresholds.sh`) are calibrated: absolute-latency thresholds are meaningful only on a controlled host, while like-for-like overhead ratios are portable and required in default-target merge-request CI. `AGENTS.md` has the full command inventory.
+Run timed performance checks locally and include their reports in performance-sensitive merge requests and release validation. Remote CI compiles benchmarks and enforces deterministic allocation counts; it does not execute Criterion or load measurements. Absolute thresholds and recorded baselines require their calibrated host, and even ratios need comparable measurement conditions. See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for commands, provenance and review requirements. `AGENTS.md` has the full command inventory.
 
 A backend behavior change must update both the memory and PostgreSQL implementations and their mirrored scenario tests.
 
