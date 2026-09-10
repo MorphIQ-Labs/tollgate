@@ -227,6 +227,7 @@ async fn holdings_climb_with_traffic_while_the_live_count_returns_to_zero() {
     assert_eq!(
         store.stored_records(),
         StoredRecords {
+            credential_activity: 0,
             usage_events: 0,
             leases: 0,
             active_leases: 0,
@@ -251,6 +252,7 @@ async fn holdings_climb_with_traffic_while_the_live_count_returns_to_zero() {
                     CostUnits(3),
                     t(1),
                     PolicyRevision::UNSTATED,
+                    None,
                 )],
                 t(1),
             )
@@ -265,6 +267,7 @@ async fn holdings_climb_with_traffic_while_the_live_count_returns_to_zero() {
     assert_eq!(
         store.stored_records(),
         StoredRecords {
+            credential_activity: 0,
             usage_events: 8,
             leases: 8,
             active_leases: 0,

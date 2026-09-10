@@ -30,8 +30,11 @@ fn widest_event() -> UsageEvent {
             fencing_token: FencingToken(u64::MAX),
         },
         CostUnits(u64::MAX),
-        Timestamp::from_second(253_402_207_200).unwrap(),
+        Timestamp::MIN
+            .checked_add(jiff::SignedDuration::from_nanos(999_999_999))
+            .unwrap(),
         PolicyRevision([0xff; 32]),
+        Some(KeyId(u128::MAX)),
     )
 }
 
@@ -59,6 +62,68 @@ fn a_full_batch_of_the_widest_events_fits_the_declared_body_limit() {
          {MAX_INGEST_BODY_BYTES}: the server would refuse a batch the client \
          is entitled to send"
     );
+    let events = vec![widest_event(); MAX_INGEST_BATCH];
+    let body =
+        serde_json::to_vec(&tollgate_store::wire::IngestRequestRef { events: &events }).unwrap();
+    assert!(body.len() <= MAX_INGEST_BODY_BYTES);
+}
+
+#[test]
+fn activity_wire_preserves_identity_and_distinguishes_unknown_reporting() {
+    #[derive(serde::Deserialize)]
+    struct LegacyUsageEvent {
+        request_id: RequestId,
+        account_id: AccountId,
+        source: UsageSource,
+        units: CostUnits,
+        occurred_at: Timestamp,
+        policy_revision: PolicyRevision,
+    }
+    let original = widest_event();
+    let mut value = serde_json::to_value(original).unwrap();
+    let legacy: LegacyUsageEvent = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(legacy.request_id, original.request_id);
+    assert_eq!(legacy.account_id, original.account_id);
+    assert_eq!(legacy.source, original.source);
+    assert_eq!(legacy.units, original.units);
+    assert_eq!(legacy.occurred_at, original.occurred_at);
+    assert_eq!(legacy.policy_revision, original.policy_revision);
+    assert_eq!(value["key_id"], "f".repeat(32));
+    assert_eq!(
+        serde_json::from_value::<UsageEvent>(value.clone()).unwrap(),
+        original
+    );
+    value.as_object_mut().unwrap().remove("key_id");
+    assert_eq!(
+        serde_json::from_value::<UsageEvent>(value).unwrap().key_id,
+        None
+    );
+
+    let legacy = r#"{"accepted":1,"duplicate":0,"rejected":0}"#;
+    let report: tollgate_store::IngestReport = serde_json::from_str(legacy).unwrap();
+    assert_eq!(report.unattributed, None);
+    report.validate(1).unwrap();
+    let report: tollgate_store::IngestReport =
+        serde_json::from_str(r#"{"accepted":1,"duplicate":0,"rejected":0,"unattributed":0}"#)
+            .unwrap();
+    assert_eq!(report.unattributed, Some(0));
+}
+
+#[test]
+fn maximal_usage_acknowledgement_fits_its_declared_limit() {
+    let report = tollgate_store::IngestReport {
+        accepted: u64::MAX,
+        duplicate: u64::MAX,
+        rejected: u64::MAX,
+        unattributed: Some(u64::MAX),
+    };
+    // A representation bound, not a claim that this is a valid batch report.
+    let encoded = serde_json::to_vec(&report).unwrap();
+    assert!(
+        encoded.len() <= tollgate_store::wire::MAX_INGEST_REPORT_BYTES,
+        "{}",
+        encoded.len()
+    );
 }
 
 /// The snapshot limit admits the catalogue its doc claims it does.
@@ -67,36 +132,39 @@ fn a_full_batch_of_the_widest_events_fits_the_declared_body_limit() {
 /// not a limit — the mutation gate found the constant unconstrained by
 /// anything, so a build that shrank it fourfold would have shipped.
 ///
-/// A snapshot carries its whole cost table, so a catalogue is the input the
-/// number has to admit. Measured: a class costs about eleven bytes on the
-/// wire, the table serialising as parallel arrays rather than as named
-/// objects, so a hundred thousand of them is a little over a megabyte. That
-/// is the size this asserts, and it is what makes the assertion bite: at a
-/// hundred thousand classes the encoding is large enough that a shrunken
-/// limit fails, where the four thousand this first used was not.
+/// A snapshot carries its whole cost table, including per-operation rights.
+/// Full-width weights and permissions cost about 32 bytes per class in the
+/// parallel arrays. The fixture must also pass publication validation: one
+/// maximal quote fits its burst, and every required permission is granted.
 #[test]
 fn the_snapshot_limit_admits_a_hundred_thousand_class_catalogue() {
     const CLASSES: usize = 100_000;
     let mut builder = CostTable::builder(CostUnits(1), CostUnits(1));
     for class in 0..CLASSES {
-        builder = builder.weight(&Class(class), CostUnits(u64::from(u32::MAX)));
+        builder = builder.class(
+            &Class(class),
+            CostUnits(u64::from(u32::MAX - 1)),
+            PermissionBits::ALL,
+        );
     }
     let snapshot = AccountSnapshot::builder(
         AccountId(u128::MAX),
         Generation(u64::MAX),
         AccountStatus::Active,
-        Timestamp::from_second(253_402_207_200).unwrap(),
+        Timestamp::MIN
+            .checked_add(jiff::SignedDuration::from_nanos(999_999_999))
+            .unwrap(),
         PermissionBits::ALL,
-        ResolvedLimits::new(64).with_weighted_rate(1_000_000, 1_000_000),
+        ResolvedLimits::new(1).with_weighted_rate(u64::from(u32::MAX), u64::from(u32::MAX)),
         std::sync::Arc::new(builder.build()),
     )
     .key_id(KeyId(u128::MAX))
     .build();
 
-    let encoded = serde_json::to_string(&PublishSnapshotRequest {
-        snapshot: std::sync::Arc::new(snapshot),
-    })
-    .expect("a snapshot serialises");
+    let snapshot = std::sync::Arc::new(snapshot);
+    tollgate_core::PublishableSnapshot::try_new(snapshot.clone()).unwrap();
+    let encoded =
+        serde_json::to_string(&PublishSnapshotRequest { snapshot }).expect("a snapshot serialises");
     assert!(
         encoded.len() <= MAX_SNAPSHOT_BODY_BYTES,
         "a {CLASSES}-class catalogue is {} bytes against a limit of \

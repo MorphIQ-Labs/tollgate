@@ -791,6 +791,10 @@ impl From<StoreError> for SetStatusError {
 /// [`AdminStore::set_account_status`] exists to abolish.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublishSnapshotError {
+    /// The stated credential is missing or belongs to another principal/account.
+    CredentialMismatch {
+        key_id: KeyId,
+    },
     /// The snapshot's status disagrees with the account ledger. An account's
     /// status is changed through [`AdminStore::set_account_status`], which
     /// republishes; a publish may carry the current status but may not change
@@ -815,6 +819,12 @@ pub enum PublishSnapshotError {
 impl std::fmt::Display for PublishSnapshotError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            PublishSnapshotError::CredentialMismatch { key_id } => {
+                write!(
+                    f,
+                    "credential {key_id} does not bind the published principal and account"
+                )
+            }
             PublishSnapshotError::StatusMismatch { ledger, submitted } => write!(
                 f,
                 "snapshot status {} contradicts account status {}",
@@ -998,6 +1008,31 @@ pub struct IngestReport {
     /// remaining accounting capacity. These are bounded billing loss,
     /// visible to reconciliation.
     pub rejected: u64,
+    /// Newly accepted events with absent, unknown or different-account key
+    /// attribution. Duplicates never supply fresh activity evidence. `None`
+    /// means this sink does not report attribution (including older servers),
+    /// not that every event was attributed.
+    #[cfg_attr(feature = "wire", serde(default))]
+    pub unattributed: Option<u64>,
+}
+
+impl IngestReport {
+    /// A complete acknowledgement partitions this batch exactly once. Validate
+    /// before releasing queued evidence, including replies from custom sinks.
+    pub fn validate(&self, submitted: usize) -> Result<(), StoreError> {
+        let total = self
+            .accepted
+            .checked_add(self.duplicate)
+            .and_then(|n| n.checked_add(self.rejected));
+        if !total.is_some_and(|n| u64::try_from(submitted) == Ok(n))
+            || self.unattributed.is_some_and(|n| n > self.accepted)
+        {
+            return Err(StoreError(
+                "invalid usage acknowledgement cardinality".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The billing ledger's write side.
@@ -1026,7 +1061,7 @@ pub trait UsageSink: Send + Sync {
 /// `principal` is the digest's own truncation, so it is derived rather than
 /// assigned: the request path is keyed by it, and per-credential revocation
 /// is `install_revoked` for exactly this value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct KeyRecord {
     pub key_id: KeyId,
     pub account_id: AccountId,
@@ -1039,6 +1074,35 @@ pub struct KeyRecord {
     /// of revocation. Surfaced to the request path through
     /// `Verified::reusable_until`, so a session cache cannot outlive it.
     pub not_after: Option<Timestamp>,
+}
+
+impl std::fmt::Debug for KeyRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyRecord")
+            .field("key_id", &self.key_id)
+            .field("account_id", &self.account_id)
+            .field("principal", &self.principal)
+            .field("not_after", &self.not_after)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One requested key's activity. No observation is not proof of non-use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CredentialActivity {
+    pub key_id: KeyId,
+    pub state: CredentialActivityState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialActivityState {
+    Unknown,
+    Unobserved,
+    /// Maximum accepted, attributable execution-start time, at microsecond
+    /// precision. Never an authorization or independent server-clock fact.
+    Committed {
+        last_committed_at: Timestamp,
+    },
 }
 
 /// What a revocation actually did.
@@ -1171,6 +1235,15 @@ impl std::error::Error for KeyError {}
 /// reader.
 #[async_trait]
 pub trait KeyDirectory: crate::KeySource {
+    /// Inspect requested keys in input order, including repeated IDs and
+    /// retired keys. Every input has one explicit result or the read fails.
+    /// This operator read uses O(keys.len()) output memory; backends bound
+    /// individual queries internally. Multiple chunks need not share an instant.
+    async fn credential_activity(
+        &self,
+        keys: &[KeyId],
+    ) -> Result<Vec<CredentialActivity>, StoreError>;
+
     /// Record a minted credential. The caller has already generated the
     /// secret and computed its digest; this stores what remains.
     async fn insert_key(&self, record: KeyRecord) -> Result<(), KeyError>;

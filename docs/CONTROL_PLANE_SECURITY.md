@@ -1,5 +1,13 @@
 # Control-plane security
 
+Usage ingestion also derives non-authoritative credential activity from accepted
+events. Its instance role and secured transport are unchanged. A publisher's
+optional key ID must match the snapshot principal/account or publication returns
+422 `invalid-credential-binding`. Unknown attribution at ingestion preserves the
+bill and is reported; activity grants no lifecycle or authorization capability.
+See [Credential activity](CREDENTIAL_ACTIVITY.md) for coverage and mixed-version
+reporting. There is no additional activity HTTP endpoint.
+
 `tollgate-server` authenticates every lease, snapshot, credential, usage, and administrative
 route. `/livez` and `/readyz` accept unauthenticated probes. Readiness checks
 storage reachability; it does not certify that every configured identity is

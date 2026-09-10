@@ -306,6 +306,7 @@ struct Inner {
     leases: Leases,
     snapshots: HashMap<Principal, SnapshotRecord>,
     usage: HashMap<tollgate_core::RequestId, UsageEvent>,
+    credential_activity: HashMap<KeyId, Timestamp>,
     /// Credential records, live and retired alike. A revocation sets
     /// `revoked_at` rather than removing the row: the tombstone is what makes
     /// "already retired" distinguishable from "never existed", and a removed
@@ -335,6 +336,8 @@ struct StoredKey {
 /// than a claim in a doc comment (#23).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoredRecords {
+    /// Credentials with recorded attributable commitments, including retired keys.
+    pub credential_activity: usize,
     /// Usage events retained for idempotency: one per request served, kept
     /// forever. This is the term that grows without bound.
     pub usage_events: usize,
@@ -501,10 +504,14 @@ impl MemoryStore {
     /// carrying an older (or equal) generation is a no-op — matching the
     /// Postgres backend, which enforces the same rule in its upsert (review
     /// finding #5's backend-divergence note).
-    pub fn publish_snapshot(&self, principal: Principal, snapshot: PublishableSnapshot) {
+    pub fn publish_snapshot(
+        &self,
+        principal: Principal,
+        snapshot: PublishableSnapshot,
+    ) -> Result<(), PublishSnapshotError> {
         let published = {
             let mut inner = self.lock();
-            publish_locked(&mut inner, principal, snapshot)
+            publish_locked(&mut inner, principal, snapshot)?
         };
         if let Some(snapshot) = published {
             self.push_to_subscribers(SnapshotPush {
@@ -512,6 +519,7 @@ impl MemoryStore {
                 resolution: SnapshotResolution::Present(snapshot),
             });
         }
+        Ok(())
     }
 
     /// Broadcast a control-plane change. No receivers is not a failure — a
@@ -641,6 +649,7 @@ impl MemoryStore {
     pub fn stored_records(&self) -> StoredRecords {
         let inner = self.lock();
         StoredRecords {
+            credential_activity: inner.credential_activity.len(),
             usage_events: inner.usage.len(),
             leases: inner.leases.len(),
             active_leases: inner.leases.active_len(),
@@ -969,11 +978,13 @@ impl LeaseAllocator for MemoryStore {
         // post-sweep numbers.
         if batch.reclaimed().len() < limit.get() {
             let held = StoredRecords {
+                credential_activity: inner.credential_activity.len(),
                 usage_events: inner.usage.len(),
                 leases: inner.leases.len(),
                 active_leases: inner.leases.active_len(),
             };
             tracing::debug!(
+                credential_activity = held.credential_activity,
                 usage_events = held.usage_events,
                 leases = held.leases,
                 active_leases = held.active_leases,
@@ -1000,11 +1011,32 @@ fn publish_locked(
     inner: &mut Inner,
     principal: Principal,
     snapshot: PublishableSnapshot,
-) -> Option<PublishableSnapshot> {
+) -> Result<Option<PublishableSnapshot>, PublishSnapshotError> {
+    if let Some(key_id) = snapshot.key_id
+        && !inner.keys.get(&key_id).is_some_and(|stored| {
+            stored.record.principal == principal && stored.record.account_id == snapshot.account_id
+        })
+    {
+        return Err(PublishSnapshotError::CredentialMismatch { key_id });
+    }
+    if let Some(record) = inner.accounts.get(&snapshot.account_id) {
+        if record.status != snapshot.status {
+            return Err(PublishSnapshotError::StatusMismatch {
+                ledger: record.status,
+                submitted: snapshot.status,
+            });
+        }
+        if record.capacity_class != snapshot.capacity_class {
+            return Err(PublishSnapshotError::CapacityClassMismatch {
+                ledger: record.capacity_class,
+                submitted: snapshot.capacity_class,
+            });
+        }
+    }
     if let Some(existing) = inner.snapshots.get(&principal)
         && existing.generation() >= snapshot.generation
     {
-        return None;
+        return Ok(None);
     }
     // The store stamps the budget view; a publisher cannot supply one (#97).
     // Done here rather than at each caller so the two publication entry points
@@ -1024,7 +1056,7 @@ fn publish_locked(
     inner
         .snapshots
         .insert(principal, SnapshotRecord::Present(snapshot.clone()));
-    Some(snapshot)
+    Ok(Some(snapshot))
 }
 
 /// Which account-owned fact a republication is carrying.
@@ -1365,30 +1397,8 @@ impl AdminStore for MemoryStore {
         // `FOR UPDATE` serialises against.
         let (published, before, after) = {
             let mut inner = self.lock();
-            // The ledger decides an account's status; a publish may carry it
-            // but not change it, or the two records this trait just unified
-            // could be pulled apart again one principal at a time (#51).
-            // An account the ledger does not hold publishes unchanged: this
-            // adds no account-existence requirement.
-            if let Some(record) = inner.accounts.get(&snapshot.account_id) {
-                if record.status != snapshot.status {
-                    return Err(PublishSnapshotError::StatusMismatch {
-                        ledger: record.status,
-                        submitted: snapshot.status,
-                    });
-                }
-                // The capacity class is the same kind of fact and gets the
-                // same guard (#99): the ledger owns it, a publish may carry
-                // it, and only `set_capacity_class` may change it.
-                if record.capacity_class != snapshot.capacity_class {
-                    return Err(PublishSnapshotError::CapacityClassMismatch {
-                        ledger: record.capacity_class,
-                        submitted: snapshot.capacity_class,
-                    });
-                }
-            }
             let before = snapshot_audit(inner.snapshots.get(&principal));
-            let published = publish_locked(&mut inner, principal, snapshot);
+            let published = publish_locked(&mut inner, principal, snapshot)?;
             (
                 published,
                 before,
@@ -1588,6 +1598,29 @@ impl UsageSink for MemoryStore {
             report.accepted += 1;
         }
 
+        // Attribute only the canonical accepted set. Replays were classified
+        // above before their payload was trusted, and may never change history.
+        let mut activity = HashMap::<KeyId, Timestamp>::new();
+        let mut unattributed = 0;
+        for event in &accepted {
+            if let Some(key_id) = event.key_id
+                && inner
+                    .keys
+                    .get(&key_id)
+                    .is_some_and(|key| key.record.account_id == event.account_id)
+            {
+                let at = crate::clock::timestamp_from_micros(event.occurred_at.as_microsecond())
+                    .expect("truncating a valid Timestamp to microseconds stays representable");
+                activity
+                    .entry(key_id)
+                    .and_modify(|old| *old = (*old).max(at))
+                    .or_insert(at);
+            } else {
+                unattributed += 1;
+            }
+        }
+        report.unattributed = Some(unattributed);
+
         // Apply. Every value here was computed above, so nothing in this block
         // can fail and leave the ledger half-moved.
         for (lease_id, used) in lease_used {
@@ -1621,12 +1654,39 @@ impl UsageSink for MemoryStore {
         for event in accepted {
             inner.usage.insert(event.request_id, event);
         }
+        for (key_id, at) in activity {
+            inner
+                .credential_activity
+                .entry(key_id)
+                .and_modify(|old| *old = (*old).max(at))
+                .or_insert(at);
+        }
         Ok(report)
     }
 }
 
 #[async_trait]
 impl KeyDirectory for MemoryStore {
+    async fn credential_activity(
+        &self,
+        keys: &[KeyId],
+    ) -> Result<Vec<crate::CredentialActivity>, StoreError> {
+        let inner = self.lock();
+        Ok(keys
+            .iter()
+            .map(|&key_id| crate::CredentialActivity {
+                key_id,
+                state: if !inner.keys.contains_key(&key_id) {
+                    crate::CredentialActivityState::Unknown
+                } else if let Some(&last_committed_at) = inner.credential_activity.get(&key_id) {
+                    crate::CredentialActivityState::Committed { last_committed_at }
+                } else {
+                    crate::CredentialActivityState::Unobserved
+                },
+            })
+            .collect())
+    }
+
     async fn insert_key(&self, record: KeyRecord) -> Result<(), KeyError> {
         let mut inner = self.lock();
         if !inner.accounts.contains_key(&record.account_id) {

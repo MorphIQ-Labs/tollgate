@@ -277,6 +277,66 @@
       "id": "managed_credential/expired_session",
       "target_ns": 1100.0,
       "threshold_ns": 2500.0
+    },
+    {
+      "id": "admission/commit_usage_fallback_unattributed_split",
+      "target_ns": 180,
+      "threshold_ns": 400
+    },
+    {
+      "id": "admission/commit_usage_overage_key_owned",
+      "target_ns": 130,
+      "threshold_ns": 260
+    },
+    {
+      "id": "admission/commit_usage_leased_key_owned",
+      "target_ns": 130,
+      "threshold_ns": 260
+    },
+    {
+      "id": "admission/commit_usage_fallback_key_owned",
+      "target_ns": 130,
+      "threshold_ns": 260
+    },
+    {
+      "id": "admission/commit_usage_leased_unattributed_owned",
+      "target_ns": 130,
+      "threshold_ns": 260
+    },
+    {
+      "id": "admission/commit_usage_overage_unattributed_owned",
+      "target_ns": 130,
+      "threshold_ns": 260
+    },
+    {
+      "id": "admission/commit_usage_fallback_key_split",
+      "target_ns": 180,
+      "threshold_ns": 400
+    },
+    {
+      "id": "admission/commit_usage_overage_unattributed_split",
+      "target_ns": 180,
+      "threshold_ns": 400
+    },
+    {
+      "id": "admission/commit_usage_leased_unattributed_split",
+      "target_ns": 180,
+      "threshold_ns": 400
+    },
+    {
+      "id": "admission/commit_usage_overage_key_split",
+      "target_ns": 180,
+      "threshold_ns": 400
+    },
+    {
+      "id": "admission/commit_usage_fallback_unattributed_owned",
+      "target_ns": 130,
+      "threshold_ns": 260
+    },
+    {
+      "id": "admission/commit_usage_leased_key_split",
+      "target_ns": 180,
+      "threshold_ns": 400
     }
   ],
   "ratios": [
@@ -408,6 +468,42 @@
       "_comment": "#108 same HMAC, token and finite expiry; bounds managed projection overhead independently of host speed.",
       "numerator": "managed_credential/verify",
       "denominator": "managed_credential/verify_direct",
+      "max_ratio": 1.25
+    },
+    {
+      "_comment": "#105: same complete commit/emission path with and without a stated key. Both retain zero extra attribution lookups; 1.25 bounds optional identity handling across hosts. Baseline/candidate timings and event layout are recorded separately in credential_activity_evidence.json.",
+      "numerator": "admission/commit_usage_leased_key_owned",
+      "denominator": "admission/commit_usage_leased_unattributed_owned",
+      "max_ratio": 1.25
+    },
+    {
+      "_comment": "#105: same complete commit/emission path with and without a stated key. Both retain zero extra attribution lookups; 1.25 bounds optional identity handling across hosts. Baseline/candidate timings and event layout are recorded separately in credential_activity_evidence.json.",
+      "numerator": "admission/commit_usage_leased_key_split",
+      "denominator": "admission/commit_usage_leased_unattributed_split",
+      "max_ratio": 1.25
+    },
+    {
+      "_comment": "#105: same complete commit/emission path with and without a stated key. Both retain zero extra attribution lookups; 1.25 bounds optional identity handling across hosts. Baseline/candidate timings and event layout are recorded separately in credential_activity_evidence.json.",
+      "numerator": "admission/commit_usage_overage_key_owned",
+      "denominator": "admission/commit_usage_overage_unattributed_owned",
+      "max_ratio": 1.25
+    },
+    {
+      "_comment": "#105: same complete commit/emission path with and without a stated key. Both retain zero extra attribution lookups; 1.25 bounds optional identity handling across hosts. Baseline/candidate timings and event layout are recorded separately in credential_activity_evidence.json.",
+      "numerator": "admission/commit_usage_overage_key_split",
+      "denominator": "admission/commit_usage_overage_unattributed_split",
+      "max_ratio": 1.25
+    },
+    {
+      "_comment": "#105: same complete commit/emission path with and without a stated key. Both retain zero extra attribution lookups; 1.25 bounds optional identity handling across hosts. Baseline/candidate timings and event layout are recorded separately in credential_activity_evidence.json.",
+      "numerator": "admission/commit_usage_fallback_key_owned",
+      "denominator": "admission/commit_usage_fallback_unattributed_owned",
+      "max_ratio": 1.25
+    },
+    {
+      "_comment": "#105: same complete commit/emission path with and without a stated key. Both retain zero extra attribution lookups; 1.25 bounds optional identity handling across hosts. Baseline/candidate timings and event layout are recorded separately in credential_activity_evidence.json.",
+      "numerator": "admission/commit_usage_fallback_key_split",
+      "denominator": "admission/commit_usage_fallback_unattributed_split",
       "max_ratio": 1.25
     }
   ]

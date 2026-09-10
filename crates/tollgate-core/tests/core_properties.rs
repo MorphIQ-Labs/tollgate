@@ -54,6 +54,18 @@ enum Action {
 }
 
 proptest! {
+    #[test]
+    fn committed_evidence_carries_the_supplied_credential(key in any::<u128>()) {
+        let lease = sharded_lease(100, 1);
+        let reservation = Reservation::reserve(&lease, CostUnits(1), t(0)).unwrap();
+        let key = Some(tollgate_core::KeyId(key));
+        prop_assert!(reservation.usage_event(RequestId(105), t(0), PolicyRevision::UNSTATED, key).is_none());
+        reservation.commit_at_execution_start(t(1), CommitFunding::LeaseOnly).unwrap();
+        let event = reservation.usage_event(RequestId(105), t(1), PolicyRevision::UNSTATED, key).unwrap();
+        prop_assert_eq!(event.key_id, key);
+        prop_assert_eq!(event.units, CostUnits(1));
+    }
+
     /// The complete u128 domain has one fixed-width textual representation;
     /// parsing never narrows through a JavaScript-sized integer
     /// (INVARIANTS.md #21).
@@ -262,7 +274,7 @@ proptest! {
                 Action::Commit => {
                     if r.commit_at_execution_start(t(0), CommitFunding::LeaseOnly).is_ok() {
                         lease_committed += units;
-                        let source = r.usage_event(RequestId(1), t(0), PolicyRevision::UNSTATED).unwrap().source;
+                        let source = r.usage_event(RequestId(1), t(0), PolicyRevision::UNSTATED, None).unwrap().source;
                         prop_assert!(
                             matches!(source, UsageSource::Leased { .. }),
                             "an unlapsed commit bills against its lease, got {:?}",
@@ -292,7 +304,7 @@ proptest! {
                     prop_assert!(
                         r.commit_at_execution_start(lapsed, CommitFunding::LeaseOnly).is_err()
                     );
-                    prop_assert!(r.usage_event(RequestId(1), lapsed, PolicyRevision::UNSTATED).is_none());
+                    prop_assert!(r.usage_event(RequestId(1), lapsed, PolicyRevision::UNSTATED, None).is_none());
                 }
                 // Elastic: the charge either moves wholly to overage or is
                 // released wholly; the lease receipt never funds it.
@@ -300,12 +312,12 @@ proptest! {
                     if r.commit_at_execution_start(lapsed, elastic).is_ok() {
                         overage_committed += units;
                         prop_assert_eq!(
-                            r.usage_event(RequestId(1), lapsed, PolicyRevision::UNSTATED).unwrap().source,
+                            r.usage_event(RequestId(1), lapsed, PolicyRevision::UNSTATED, None).unwrap().source,
                             UsageSource::Overage,
                             "a fallback must never bill against its lapsed lease"
                         );
                     } else {
-                        prop_assert!(r.usage_event(RequestId(1), lapsed, PolicyRevision::UNSTATED).is_none());
+                        prop_assert!(r.usage_event(RequestId(1), lapsed, PolicyRevision::UNSTATED, None).is_none());
                     }
                 }
             }

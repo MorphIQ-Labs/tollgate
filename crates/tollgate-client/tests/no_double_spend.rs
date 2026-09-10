@@ -159,10 +159,12 @@ async fn two_instances_never_overspend_one_account() {
         status: AccountStatus::Active,
         capacity_class: CapacityClass::Assured,
     });
-    store.publish_snapshot(
-        PRINCIPAL,
-        tollgate_core::PublishableSnapshot::try_new(snapshot()).unwrap(),
-    );
+    store
+        .publish_snapshot(
+            PRINCIPAL,
+            tollgate_core::PublishableSnapshot::try_new(snapshot()).unwrap(),
+        )
+        .expect("snapshot fixture matches its account and credential");
     let clock = Arc::new(ManualClock::new(t(0)));
 
     let mut instances = [

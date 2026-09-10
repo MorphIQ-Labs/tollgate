@@ -208,7 +208,10 @@ impl LeaseAllocator for HttpStore {
         if !response.status().is_success() {
             return Err(read_problem(response).await);
         }
-        response.json().await.map_err(transport_error)
+        require_complete(response)?
+            .json()
+            .await
+            .map_err(transport_error)
     }
 
     async fn release(
@@ -261,7 +264,10 @@ impl LeaseAllocator for HttpStore {
         if !response.status().is_success() {
             return Err(read_problem(response).await);
         }
-        response.json().await.map_err(transport_error)
+        require_complete(response)?
+            .json()
+            .await
+            .map_err(transport_error)
     }
 
     async fn reclaim_expired_batch(
@@ -393,10 +399,15 @@ impl UsageSink for HttpStore {
                 IngestError::Unavailable(error)
             });
         }
-        response
-            .json()
-            .await
-            .map_err(|e| StoreError(format!("http: {}", e.without_url())).into())
+        let bytes = bounded_body(
+            require_complete(response)?,
+            tollgate_store::wire::MAX_INGEST_REPORT_BYTES,
+        )
+        .await?;
+        let report: IngestReport = serde_json::from_slice(&bytes)
+            .map_err(|_| StoreError("invalid usage acknowledgement JSON".into()))?;
+        report.validate(events.len())?;
+        Ok(report)
     }
 }
 
@@ -408,7 +419,7 @@ fn require_complete(response: reqwest::Response) -> Result<reqwest::Response, St
             .contains_key(reqwest::header::CONTENT_RANGE)
     {
         return Err(StoreError(
-            "control-plane read requires a complete HTTP 200 response".into(),
+            "control-plane response requires a complete HTTP 200 response".into(),
         ));
     }
     Ok(response)
@@ -423,18 +434,18 @@ async fn bounded_body(
         .is_some_and(|length| length > limit as u64)
     {
         return Err(StoreError(
-            "credential page body exceeds its wire limit".into(),
+            "control-plane body exceeds its wire limit".into(),
         ));
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| StoreError(format!("credential page transport: {}", e.without_url())))?
+        .map_err(|e| StoreError(format!("control-plane transport: {}", e.without_url())))?
     {
         if chunk.len() > limit.saturating_sub(bytes.len()) {
             return Err(StoreError(
-                "credential page body exceeds its wire limit".into(),
+                "control-plane body exceeds its wire limit".into(),
             ));
         }
         bytes.extend_from_slice(&chunk);

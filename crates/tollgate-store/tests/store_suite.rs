@@ -110,6 +110,7 @@ fn usage(lease: &tollgate_core::LeaseGrant, request: u128, units: u64, at: i64) 
         CostUnits(units),
         t(at),
         PolicyRevision::UNSTATED,
+        None,
     )
 }
 
@@ -122,6 +123,7 @@ fn overage_usage(account: AccountId, request: u128, units: u64, at: i64) -> Usag
         CostUnits(units),
         t(at),
         PolicyRevision::UNSTATED,
+        None,
     )
 }
 
@@ -1022,8 +1024,12 @@ async fn enumerating_principals_includes_revoked_ones() {
     };
     let live = Principal(1);
     let revoked = Principal(2);
-    store.publish_snapshot(live, snapshot());
-    store.publish_snapshot(revoked, snapshot());
+    store
+        .publish_snapshot(live, snapshot())
+        .expect("snapshot fixture matches its account and credential");
+    store
+        .publish_snapshot(revoked, snapshot())
+        .expect("snapshot fixture matches its account and credential");
     store.remove_snapshot(revoked);
 
     let mut listed = store.principals().await.unwrap().expect("enumerable");
@@ -1132,7 +1138,9 @@ async fn snapshot_publish_fetch_and_push() {
         store.snapshot(principal).await.unwrap(),
         SnapshotResolution::Unknown
     ));
-    store.publish_snapshot(principal, publishable(Arc::clone(&snapshot)));
+    store
+        .publish_snapshot(principal, publishable(Arc::clone(&snapshot)))
+        .expect("snapshot fixture matches its account and credential");
 
     let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
         panic!("published snapshot must be present");
@@ -1150,7 +1158,9 @@ async fn snapshot_publish_fetch_and_push() {
     // pushes an update.
     let mut older = (*snapshot).clone();
     older.generation = Generation(2);
-    store.publish_snapshot(principal, publishable(Arc::new(older)));
+    store
+        .publish_snapshot(principal, publishable(Arc::new(older)))
+        .expect("snapshot fixture matches its account and credential");
     let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
         panic!("newest snapshot must remain present");
     };
@@ -1172,7 +1182,9 @@ async fn snapshot_publish_fetch_and_push() {
     ));
     let mut replayed = (*snapshot).clone();
     replayed.generation = Generation(2);
-    store.publish_snapshot(principal, publishable(Arc::new(replayed)));
+    store
+        .publish_snapshot(principal, publishable(Arc::new(replayed)))
+        .expect("snapshot fixture matches its account and credential");
     assert!(matches!(
         store.snapshot(principal).await.unwrap(),
         SnapshotResolution::Revoked {
@@ -1183,7 +1195,9 @@ async fn snapshot_publish_fetch_and_push() {
 
     let mut newer = (*snapshot).clone();
     newer.generation = Generation(4);
-    store.publish_snapshot(principal, publishable(Arc::new(newer)));
+    store
+        .publish_snapshot(principal, publishable(Arc::new(newer)))
+        .expect("snapshot fixture matches its account and credential");
     let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
         panic!("newer snapshot must supersede revocation");
     };
@@ -1212,7 +1226,9 @@ async fn staged_limits_round_trip_through_the_memory_store() {
         Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
     )
     .build();
-    store.publish_snapshot(principal, publishable(Arc::new(snapshot)));
+    store
+        .publish_snapshot(principal, publishable(Arc::new(snapshot)))
+        .expect("snapshot fixture matches its account and credential");
 
     let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
         panic!("published snapshot must be present");
@@ -3379,6 +3395,7 @@ async fn a_usage_event_is_ingested_with_its_revision_and_conserves() {
         CostUnits(40),
         t(1),
         revision,
+        None,
     );
     let report = store.ingest(&[event], t(1)).await.unwrap();
     assert_eq!((report.accepted, report.rejected), (1, 0));

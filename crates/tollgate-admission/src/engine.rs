@@ -379,9 +379,10 @@ impl<S: UsageSlot, P: CapacityPermit> ReadyToStart<S, P> {
         // The revision comes from the same pinned snapshot that priced the
         // request, so the billing record names the policy the response will.
         let policy_revision = concurrency.state().snapshot.policy_revision;
+        let key_id = concurrency.state().snapshot.key_id;
         let event = funding
             .reservation()
-            .usage_event(request_id, now, policy_revision)
+            .usage_event(request_id, now, policy_revision, key_id)
             .expect("a committed reservation produces usage evidence");
         concurrency
             .state()
@@ -934,6 +935,54 @@ fn reserve_from_overage(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn emitted_usage_pins_the_key_and_cancelled_work_emits_nothing() {
+        #[derive(Debug)]
+        struct Capture(std::sync::mpsc::Sender<UsageEvent>);
+        impl UsageSlot for Capture {
+            fn record(self, event: UsageEvent) {
+                self.0.send(event).unwrap();
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        slot.install(lease(10000));
+        let mut original = (*snapshot(AccountStatus::Active)).clone();
+        original.key_id = Some(tollgate_core::KeyId(1));
+        engine
+            .map()
+            .install(Principal(1), Arc::new(original.clone()), slot.clone());
+        let context = engine
+            .begin(Principal(1), PermissionBits::bit(0), t(0))
+            .unwrap();
+        original.generation = Generation(2);
+        original.key_id = Some(tollgate_core::KeyId(2));
+        engine.map().install(Principal(1), Arc::new(original), slot);
+        let committed = context
+            .admit(&[(Op::Price, 1)], Capture(tx.clone()), t(0))
+            .unwrap()
+            .acquire_capacity(&NoGate)
+            .unwrap()
+            .commit(RequestId(105), t(1))
+            .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "the execution guard still owns emission"
+        );
+        drop(committed);
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.key_id, Some(tollgate_core::KeyId(1)));
+        assert_eq!(event.occurred_at, t(1));
+        let pending = engine
+            .begin(Principal(1), PermissionBits::bit(0), t(2))
+            .unwrap()
+            .admit(&[(Op::Price, 1)], Capture(tx), t(2))
+            .unwrap();
+        pending.cancel();
+        assert!(rx.try_recv().is_err());
+    }
+
     use super::*;
     use crate::capacity::{ExecutionCapacityGate, ExecutionCapacityMode, ExecutionPermit, NoGate};
     use crate::maps::{ArcSwapSnapshotMap, MokaSnapshotMap};

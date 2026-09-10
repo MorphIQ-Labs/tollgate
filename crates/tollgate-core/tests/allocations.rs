@@ -138,7 +138,7 @@ fn core_hot_path_allocates_nothing() {
         );
         black_box(
             reservation
-                .usage_event(RequestId(9), now, PolicyRevision::UNSTATED)
+                .usage_event(RequestId(9), now, PolicyRevision::UNSTATED, None)
                 .expect("committed reservation has usage"),
         );
     });
@@ -164,7 +164,7 @@ fn core_hot_path_allocates_nothing() {
         );
         black_box(
             reservation
-                .usage_event(RequestId(9), lapsed_at, PolicyRevision::UNSTATED)
+                .usage_event(RequestId(9), lapsed_at, PolicyRevision::UNSTATED, None)
                 .expect("a committed fallback has usage"),
         );
     });

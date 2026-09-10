@@ -109,10 +109,12 @@ fn publish_until(
     )
     .enforcement_mode(mode)
     .build();
-    store.publish_snapshot(
-        Principal(principal),
-        PublishableSnapshot::try_new(Arc::new(snapshot)).unwrap(),
-    );
+    store
+        .publish_snapshot(
+            Principal(principal),
+            PublishableSnapshot::try_new(Arc::new(snapshot)).unwrap(),
+        )
+        .expect("snapshot fixture matches its account and credential");
 }
 fn start(
     store: &Arc<MemoryStore>,
@@ -1053,6 +1055,7 @@ impl tollgate_store::UsageSink for RejectingSink {
             ))
         } else {
             Ok(tollgate_store::IngestReport {
+                unattributed: None,
                 accepted: 0,
                 duplicate: 0,
                 rejected: events.len() as u64,

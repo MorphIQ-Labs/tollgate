@@ -3,7 +3,7 @@
   "recorded_at": "2026-09-01T13:15:10Z",
   "git_revision": "3fcac1263499e859f0ce28426645040ae7cd01cc",
   "profile": "criterion release",
-  "_comment": "Rows are recorded by the change that lands their benchmark, so the header names this file's first calibration rather than every row's. The #99 capacity rows below were measured on the same host by a full `check_perf_thresholds.sh` run, which is the only context these means are comparable in: a filtered run measures the same code materially differently.",
+  "_comment": "Rows are recorded by the change that lands their benchmark, so the header names this file's first calibration rather than every row's. The #99 capacity and #105 commit/emission rows below were measured on the same host by a full `check_perf_thresholds.sh` run, which is the only context these means are comparable in: a filtered run measures the same code materially differently.",
   "benchmarks": [
     { "id": "cost_table/quote", "mean_ns": 1.696 },
     { "id": "snapshot/admit", "mean_ns": 1.123 },
@@ -37,6 +37,18 @@
     {"id": "managed_credential/expired_session", "mean_ns": 988.269},
     {"id": "managed_credential/renew_session", "mean_ns": 1088.38},
     {"id": "managed_credential/verify", "mean_ns": 802.429},
-    {"id": "managed_credential/verify_direct", "mean_ns": 793.494}
+    {"id": "managed_credential/verify_direct", "mean_ns": 793.494},
+    {"id": "admission/commit_usage_fallback_unattributed_split", "mean_ns": 167.452 },
+    {"id": "admission/commit_usage_overage_key_owned", "mean_ns": 118.402 },
+    {"id": "admission/commit_usage_leased_key_owned", "mean_ns": 117.574 },
+    {"id": "admission/commit_usage_fallback_key_owned", "mean_ns": 126.42 },
+    {"id": "admission/commit_usage_leased_unattributed_owned", "mean_ns": 117.166 },
+    {"id": "admission/commit_usage_overage_unattributed_owned", "mean_ns": 118.404 },
+    {"id": "admission/commit_usage_fallback_key_split", "mean_ns": 169.192 },
+    {"id": "admission/commit_usage_overage_unattributed_split", "mean_ns": 161.931 },
+    {"id": "admission/commit_usage_leased_unattributed_split", "mean_ns": 160.204 },
+    {"id": "admission/commit_usage_overage_key_split", "mean_ns": 161.774 },
+    {"id": "admission/commit_usage_fallback_unattributed_owned", "mean_ns": 128.932 },
+    {"id": "admission/commit_usage_leased_key_split", "mean_ns": 161.362 }
   ]
 }

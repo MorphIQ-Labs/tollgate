@@ -11,7 +11,6 @@ use zeroize::Zeroize;
 use crate::verifier::{CredentialVerifier, Verified};
 
 /// The credential a session has already had verified, and what it verified as.
-#[derive(Debug)]
 struct VerifiedCredential {
     /// The exact bytes that were verified. Retained so nothing else can reuse
     /// the principal, and so the value compared is always the value verified —
@@ -24,6 +23,14 @@ struct VerifiedCredential {
     /// by the number of open sessions instead of the whole customer base.
     credential: Box<[u8]>,
     verified: Verified,
+}
+
+impl std::fmt::Debug for VerifiedCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedCredential")
+            .field("verified", &self.verified)
+            .finish_non_exhaustive()
+    }
 }
 
 impl VerifiedCredential {
@@ -152,6 +159,21 @@ impl SessionCredential {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_debug_never_discloses_cached_credential_bytes() {
+        let bytes = b"fixture-private-session-credential-105";
+        let cached = super::VerifiedCredential {
+            credential: bytes.to_vec().into_boxed_slice(),
+            verified: crate::Verified::indefinite(tollgate_core::Principal(7)),
+        };
+        let session = super::SessionCredential::new();
+        session.verified.store(Some(std::sync::Arc::new(cached)));
+        let rendered = format!("{session:?}");
+        assert!(rendered.contains("verified"));
+        assert!(!rendered.contains(std::str::from_utf8(bytes).unwrap()));
+        assert!(!rendered.contains(&format!("{bytes:?}")));
+    }
+
     use super::*;
     use crate::HmacRegistry;
 

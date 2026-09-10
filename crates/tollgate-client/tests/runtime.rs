@@ -404,6 +404,7 @@ fn event(request: u128, units: u64, lease: &tollgate_core::LeaseGrant) -> UsageE
         CostUnits(units),
         t(0),
         PolicyRevision::UNSTATED,
+        None,
     )
 }
 
@@ -2080,6 +2081,7 @@ fn refused_event(request: u128) -> UsageEvent {
         CostUnits(50),
         t(0),
         PolicyRevision::UNSTATED,
+        None,
     )
 }
 

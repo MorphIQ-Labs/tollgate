@@ -142,7 +142,9 @@ async fn settle() {
 #[tokio::test(start_paused = true)]
 async fn initial_load_gates_readiness_and_installs() {
     let store = base_store();
-    store.publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))));
+    store
+        .publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))))
+        .expect("snapshot fixture matches its account and credential");
     let fixture = fixture(store);
     stock_slot(&fixture);
 
@@ -161,14 +163,18 @@ async fn initial_load_gates_readiness_and_installs() {
 #[tokio::test(start_paused = true)]
 async fn push_update_propagates_permission_change() {
     let store = base_store();
-    store.publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))));
+    store
+        .publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))))
+        .expect("snapshot fixture matches its account and credential");
     let fixture = fixture(store.clone());
     stock_slot(&fixture);
     settle().await;
     assert_eq!(admit(&fixture), Ok(()));
 
     // The control plane strips the permission in generation 2.
-    store.publish_snapshot(PRINCIPAL, publishable(snapshot(2, PermissionBits::NONE)));
+    store
+        .publish_snapshot(PRINCIPAL, publishable(snapshot(2, PermissionBits::NONE)))
+        .expect("snapshot fixture matches its account and credential");
     settle().await;
     assert_eq!(admit(&fixture), Err(DenyReason::MissingPermission));
     fixture.manager.shutdown().await;
@@ -177,7 +183,9 @@ async fn push_update_propagates_permission_change() {
 #[tokio::test(start_paused = true)]
 async fn revocation_reaches_instances_via_refresh() {
     let store = base_store();
-    store.publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))));
+    store
+        .publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))))
+        .expect("snapshot fixture matches its account and credential");
     let fixture = fixture(store.clone());
     stock_slot(&fixture);
     settle().await;
@@ -191,10 +199,14 @@ async fn revocation_reaches_instances_via_refresh() {
 
     // Generation 1 is older than the retained tombstone and cannot
     // resurrect the key. A genuinely newer generation can.
-    store.publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))));
+    store
+        .publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))))
+        .expect("snapshot fixture matches its account and credential");
     settle().await;
     assert_eq!(admit(&fixture), Err(DenyReason::UnknownPrincipal));
-    store.publish_snapshot(PRINCIPAL, publishable(snapshot(2, PermissionBits::bit(0))));
+    store
+        .publish_snapshot(PRINCIPAL, publishable(snapshot(2, PermissionBits::bit(0))))
+        .expect("snapshot fixture matches its account and credential");
     settle().await;
     assert_eq!(admit(&fixture), Ok(()));
     fixture.manager.shutdown().await;
@@ -211,7 +223,9 @@ async fn unknown_principal_resolves_once_published() {
     assert_eq!(admit(&fixture), Err(DenyReason::UnknownPrincipal));
 
     // Publication later is picked up by push/refresh.
-    store.publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))));
+    store
+        .publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))))
+        .expect("snapshot fixture matches its account and credential");
     settle().await;
     assert_eq!(admit(&fixture), Ok(()));
     fixture.manager.shutdown().await;
@@ -732,7 +746,9 @@ fn admit_as(fixture: &Fixture, principal: Principal) -> Result<(), DenyReason> {
 #[tokio::test(start_paused = true)]
 async fn a_principal_published_after_start_is_discovered_and_served() {
     let store = base_store();
-    store.publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))));
+    store
+        .publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))))
+        .expect("snapshot fixture matches its account and credential");
     let fixture = discovering_fixture(store.clone());
     stock_slot(&fixture);
     settle().await;
@@ -743,10 +759,12 @@ async fn a_principal_published_after_start_is_discovered_and_served() {
         "not published yet, so denied fail-closed"
     );
 
-    store.publish_snapshot(
-        LATER_PRINCIPAL,
-        publishable(snapshot(1, PermissionBits::bit(0))),
-    );
+    store
+        .publish_snapshot(
+            LATER_PRINCIPAL,
+            publishable(snapshot(1, PermissionBits::bit(0))),
+        )
+        .expect("snapshot fixture matches its account and credential");
     settle().await;
 
     assert_eq!(
@@ -766,15 +784,19 @@ async fn a_principal_published_after_start_is_discovered_and_served() {
 #[tokio::test(start_paused = true)]
 async fn a_fixed_instance_ignores_principals_it_was_not_configured_with() {
     let store = base_store();
-    store.publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))));
+    store
+        .publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))))
+        .expect("snapshot fixture matches its account and credential");
     let fixture = fixture(store.clone());
     stock_slot(&fixture);
     settle().await;
 
-    store.publish_snapshot(
-        LATER_PRINCIPAL,
-        publishable(snapshot(1, PermissionBits::bit(0))),
-    );
+    store
+        .publish_snapshot(
+            LATER_PRINCIPAL,
+            publishable(snapshot(1, PermissionBits::bit(0))),
+        )
+        .expect("snapshot fixture matches its account and credential");
     settle().await;
 
     assert_eq!(
@@ -796,7 +818,9 @@ async fn a_fixed_instance_ignores_principals_it_was_not_configured_with() {
 #[tokio::test(start_paused = true)]
 async fn a_revoked_principal_stays_tracked_and_cannot_be_resurrected() {
     let store = base_store();
-    store.publish_snapshot(PRINCIPAL, publishable(snapshot(5, PermissionBits::bit(0))));
+    store
+        .publish_snapshot(PRINCIPAL, publishable(snapshot(5, PermissionBits::bit(0))))
+        .expect("snapshot fixture matches its account and credential");
     let fixture = discovering_fixture(store.clone());
     stock_slot(&fixture);
     settle().await;
@@ -811,7 +835,9 @@ async fn a_revoked_principal_stays_tracked_and_cannot_be_resurrected() {
     );
 
     // A delayed publish at an older generation must not bring it back.
-    store.publish_snapshot(PRINCIPAL, publishable(snapshot(4, PermissionBits::bit(0))));
+    store
+        .publish_snapshot(PRINCIPAL, publishable(snapshot(4, PermissionBits::bit(0))))
+        .expect("snapshot fixture matches its account and credential");
     settle().await;
     assert_eq!(
         admit_as(&fixture, PRINCIPAL),
@@ -824,7 +850,9 @@ async fn a_revoked_principal_stays_tracked_and_cannot_be_resurrected() {
     // dead, but a revocation declared exactly this one dead. Nothing pinned
     // equality here before — every recovery test stepped strictly over the
     // watermark — so the accept side had never been exercised at it.
-    store.publish_snapshot(PRINCIPAL, publishable(snapshot(5, PermissionBits::bit(0))));
+    store
+        .publish_snapshot(PRINCIPAL, publishable(snapshot(5, PermissionBits::bit(0))))
+        .expect("snapshot fixture matches its account and credential");
     settle().await;
     assert_eq!(
         admit_as(&fixture, PRINCIPAL),
@@ -833,7 +861,9 @@ async fn a_revoked_principal_stays_tracked_and_cannot_be_resurrected() {
     );
 
     // A genuinely newer one does.
-    store.publish_snapshot(PRINCIPAL, publishable(snapshot(6, PermissionBits::bit(0))));
+    store
+        .publish_snapshot(PRINCIPAL, publishable(snapshot(6, PermissionBits::bit(0))))
+        .expect("snapshot fixture matches its account and credential");
     settle().await;
     assert_eq!(admit_as(&fixture, PRINCIPAL), Ok(()));
 }
@@ -1430,7 +1460,9 @@ async fn a_failing_enumeration_is_counted_and_keeps_the_current_set() {
 #[tokio::test(start_paused = true)]
 async fn a_push_discovers_the_principal_it_names() {
     let store = base_store();
-    store.publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))));
+    store
+        .publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))))
+        .expect("snapshot fixture matches its account and credential");
     let fixture = spawn_with(store.clone(), discovering_config(600_000));
     stock_slot(&fixture);
     settle().await;
@@ -1439,10 +1471,12 @@ async fn a_push_discovers_the_principal_it_names() {
         Err(DenyReason::UnknownPrincipal)
     );
 
-    store.publish_snapshot(
-        LATER_PRINCIPAL,
-        publishable(snapshot(1, PermissionBits::bit(0))),
-    );
+    store
+        .publish_snapshot(
+            LATER_PRINCIPAL,
+            publishable(snapshot(1, PermissionBits::bit(0))),
+        )
+        .expect("snapshot fixture matches its account and credential");
     settle().await;
 
     assert_eq!(

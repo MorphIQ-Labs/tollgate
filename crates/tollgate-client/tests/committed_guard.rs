@@ -42,6 +42,7 @@ impl UsageSink for AcceptAll {
         _now: Timestamp,
     ) -> Result<IngestReport, IngestError> {
         Ok(IngestReport {
+            unattributed: None,
             accepted: u64::try_from(events.len()).unwrap(),
             duplicate: 0,
             rejected: 0,

@@ -4,6 +4,18 @@ use std::sync::Mutex;
 
 use jiff::{SignedDuration, Timestamp};
 
+/// Decode durable microseconds, including the fractional final second of
+/// Timestamp::MAX. The seconds/nanoseconds constructor checks the full domain;
+/// Jiff's microsecond constructor omits that final fraction from its bound.
+/// Euclidean division preserves pre-epoch timestamps too.
+pub fn timestamp_from_micros(value: i64) -> Result<Timestamp, crate::StoreError> {
+    Timestamp::new(
+        value.div_euclid(1_000_000),
+        (value.rem_euclid(1_000_000) * 1_000) as i32,
+    )
+    .map_err(|_| crate::StoreError("stored microseconds exceed the timestamp domain".into()))
+}
+
 /// Supplies `now` to the background planes. The core and admission layers
 /// take timestamps as arguments; implementations of this trait are the only
 /// code that decides what those timestamps are.

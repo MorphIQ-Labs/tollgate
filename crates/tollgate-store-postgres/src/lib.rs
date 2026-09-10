@@ -119,6 +119,53 @@ fn digest_from(bytes: &[u8], key_id: KeyId) -> Result<[u8; 32], StoreError> {
 
 #[async_trait]
 impl KeyDirectory for PostgresStore {
+    async fn credential_activity(
+        &self,
+        keys: &[KeyId],
+    ) -> Result<Vec<tollgate_store::CredentialActivity>, StoreError> {
+        use tollgate_store::{CredentialActivity, CredentialActivityState};
+        let mut result = Vec::with_capacity(keys.len());
+        // Reuse the bulk-work budget, not a total operator-list cap. Each
+        // input has one row, including duplicates and missing credentials.
+        for chunk in keys.chunks(tollgate_store::MAX_INGEST_BATCH) {
+            let ids: Vec<_> = chunk.iter().map(|id| id_bytes(id.0)).collect();
+            let rows = sqlx::query(
+                // Each lateral lookup is bounded by the credential PK. The
+                // explicit one-row bound prevents a bulk join from choosing
+                // a catalogue-wide hash scan for a moderately sized directory.
+                "SELECT evidence.key_id IS NOT NULL, evidence.last_committed_at_us
+                 FROM UNNEST($1::bytea[]) WITH ORDINALITY AS requested(key_id, ordinal)
+                 LEFT JOIN LATERAL (
+                    SELECT k.key_id, a.last_committed_at_us
+                    FROM tollgate_credential_keys k
+                    LEFT JOIN tollgate_credential_activity a ON a.key_id = k.key_id
+                    WHERE k.key_id = requested.key_id LIMIT 1
+                 ) AS evidence ON true
+                 ORDER BY requested.ordinal",
+            )
+            .bind(&ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)?;
+            if rows.len() != chunk.len() {
+                return Err(StoreError("incomplete credential activity read".into()));
+            }
+            for (&key_id, row) in chunk.iter().zip(rows) {
+                let state = if !row.get::<bool, _>(0) {
+                    CredentialActivityState::Unknown
+                } else if let Some(at) = row.get::<Option<i64>, _>(1) {
+                    CredentialActivityState::Committed {
+                        last_committed_at: micros_ts(at, "credential activity")?,
+                    }
+                } else {
+                    CredentialActivityState::Unobserved
+                };
+                result.push(CredentialActivity { key_id, state });
+            }
+        }
+        Ok(result)
+    }
+
     async fn insert_key(&self, record: KeyRecord) -> Result<(), KeyError> {
         // The account reference is checked by the foreign key rather than by a
         // prior SELECT: a check-then-insert would admit a credential against
@@ -224,11 +271,7 @@ fn credential_from_row(row: sqlx::postgres::PgRow) -> Result<KeyRecord, StoreErr
         digest: digest_from(row.get::<Vec<u8>, _>(3).as_slice(), key_id)?,
         not_after: row
             .get::<Option<i64>, _>(4)
-            .map(|us| {
-                Timestamp::from_microsecond(us).map_err(|_| {
-                    StoreError("credential expiry is outside the timestamp domain".into())
-                })
-            })
+            .map(|us| micros_ts(us, "credential expiry"))
             .transpose()?,
     })
 }
@@ -490,7 +533,7 @@ fn ts_micros(ts: Timestamp) -> i64 {
 /// The inverse of [`ts_micros`]. A stored value outside the representable
 /// range is corruption to report, never an instant to clamp to.
 fn micros_ts(value: i64, what: &str) -> Result<Timestamp, StoreError> {
-    Timestamp::from_microsecond(value).map_err(|e| {
+    tollgate_store::clock::timestamp_from_micros(value).map_err(|e| {
         StoreError(format!(
             "{what} is not a representable instant: {value} ({e})"
         ))
@@ -1397,7 +1440,10 @@ impl UsageSink for PostgresStore {
         // lands via one bulk insert plus set-wise per-lease/per-account
         // updates. Classification in application code preserves the partial
         // acceptance contract without savepoints.
-        let mut report = IngestReport::default();
+        let mut report = IngestReport {
+            unattributed: Some(0),
+            ..IngestReport::default()
+        };
         if events.is_empty() {
             return Ok(report);
         }
@@ -1411,6 +1457,7 @@ impl UsageSink for PostgresStore {
             event: &'a UsageEvent,
             request_id: Vec<u8>,
             account_id: Vec<u8>,
+            key_id: Option<Vec<u8>>,
             /// `None` for overage, which names no lease. Every phase below
             /// keys off this rather than re-matching on the source, so a lease
             /// id can never be conjured for an event that has none.
@@ -1424,6 +1471,7 @@ impl UsageSink for PostgresStore {
                     event,
                     request_id: id_bytes(event.request_id.0),
                     account_id: id_bytes(event.account_id.0),
+                    key_id: event.key_id.map(|id| id_bytes(id.0)),
                     lease_id: event.source.lease_id().map(|id| id_bytes(id.0)),
                     occurred_at_us: ts_micros(event.occurred_at),
                 })
@@ -1665,7 +1713,8 @@ impl UsageSink for PostgresStore {
             }
 
             // Bulk insert the accepted events.
-            let (mut rid, mut acct, mut lease, mut fence, mut units, mut at, mut revision) = (
+            let (mut rid, mut acct, mut lease, mut fence, mut units, mut at, mut revision, mut keys) = (
+                Vec::with_capacity(accepted.len()),
                 Vec::with_capacity(accepted.len()),
                 Vec::with_capacity(accepted.len()),
                 Vec::with_capacity(accepted.len()),
@@ -1680,6 +1729,7 @@ impl UsageSink for PostgresStore {
                 let event = &prepared[accepted_event.event_index];
                 rid.push(event.request_id.clone());
                 acct.push(event.account_id.clone());
+                keys.push(event.key_id.clone());
                 lease.push(event.lease_id.clone());
                 fence.push(accepted_event.fence);
                 units.push(accepted_event.units);
@@ -1723,8 +1773,8 @@ impl UsageSink for PostgresStore {
             }
             let inserted = sqlx::query(
                 "INSERT INTO tollgate_usage_events
-                 (request_id, account_id, lease_id, fencing_token, units, occurred_at_us, policy_revision)
-                 SELECT * FROM UNNEST($1::bytea[], $2::bytea[], $3::bytea[], $4::bigint[], $5::bigint[], $6::bigint[], $7::bytea[])",
+                 (request_id, account_id, lease_id, fencing_token, units, occurred_at_us, policy_revision, key_id)
+                 SELECT * FROM UNNEST($1::bytea[], $2::bytea[], $3::bytea[], $4::bigint[], $5::bigint[], $6::bigint[], $7::bytea[], $8::bytea[])",
             )
             .bind(&rid)
             .bind(&acct)
@@ -1733,6 +1783,7 @@ impl UsageSink for PostgresStore {
             .bind(&units)
             .bind(&at)
             .bind(&revision)
+            .bind(&keys)
             .execute(&mut *tx)
             .await
             .map_err(storage)?;
@@ -1882,6 +1933,40 @@ impl UsageSink for PostgresStore {
                     account_ids.len()
                 )));
             }
+
+            // Legacy/unscoped batches cannot name activity. Their complete
+            // attribution result is already known, so avoid an empty database
+            // round trip while the ledger transaction still commits normally.
+            if keys.iter().all(Option::is_none) {
+                report.unattributed = Some(expected_event_rows);
+                return Ok(report);
+            }
+
+            // Only newly accepted rows supply evidence. Count events before
+            // grouping: two events for one key are both attributable, even
+            // if neither advances an already-newer maximum. Sort writes to
+            // share one activity-lock order across concurrent transactions.
+            let attributed: i64 = sqlx::query_scalar(
+                "WITH matched AS MATERIALIZED (
+                    SELECT k.key_id, b.occurred_at_us
+                    FROM UNNEST($1::bytea[], $2::bytea[], $3::bigint[])
+                        AS b(key_id, account_id, occurred_at_us)
+                    JOIN LATERAL (
+                        SELECT key_id FROM tollgate_credential_keys
+                        WHERE key_id = b.key_id AND account_id = b.account_id LIMIT 1
+                    ) k ON true
+                 ), updated AS (
+                    INSERT INTO tollgate_credential_activity AS activity (key_id, last_committed_at_us)
+                    SELECT key_id, MAX(occurred_at_us) FROM matched GROUP BY key_id ORDER BY key_id
+                    ON CONFLICT (key_id) DO UPDATE
+                    SET last_committed_at_us = EXCLUDED.last_committed_at_us
+                    WHERE activity.last_committed_at_us < EXCLUDED.last_committed_at_us
+                    RETURNING key_id
+                 ) SELECT COUNT(*) FROM matched"
+            ).bind(&keys).bind(&acct).bind(&at).fetch_one(&mut *tx).await.map_err(storage)?;
+            report.unattributed = Some(expected_event_rows.checked_sub(
+                u64::try_from(attributed).map_err(|_| StoreError("negative attribution count".into()))?
+            ).ok_or_else(|| StoreError("attribution count exceeds accepted events".into()))?);
 
             Ok(report)
         }
@@ -2540,6 +2625,21 @@ impl AdminStore for PostgresStore {
 
         let mut tx = self.pool.begin().await.map_err(storage)?;
         let result = async {
+            if let Some(key_id) = snapshot.key_id {
+                let matches: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM tollgate_credential_keys
+                     WHERE key_id = $1 AND principal = $2 AND account_id = $3)",
+                )
+                .bind(id_bytes(key_id.0))
+                .bind(id_bytes(principal.0))
+                .bind(id_bytes(snapshot.account_id.0))
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(storage)?;
+                if !matches {
+                    return Err(PublishSnapshotError::CredentialMismatch { key_id });
+                }
+            }
             // The ledger decides an account's status; a publish may carry it
             // but not change it, or the two records `set_account_status`
             // unified could be pulled apart again one principal at a time

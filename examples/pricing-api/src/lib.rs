@@ -428,8 +428,15 @@ async fn republish_snapshots(
     tick.tick().await; // immediate first tick — gen 1 published at build time
     loop {
         tick.tick().await;
-        generation += 1;
-        store.publish_snapshot(principal, compile(&tenant, generation));
+        let Some(next) = generation.checked_add(1) else {
+            tracing::error!(%principal, "snapshot publisher exhausted its generation");
+            return;
+        };
+        generation = next;
+        if let Err(error) = store.publish_snapshot(principal, compile(&tenant, generation)) {
+            tracing::warn!(%principal, generation, %error,
+                "snapshot refresh refused; preserving the last published state");
+        }
     }
 }
 
@@ -590,6 +597,7 @@ async fn build_app_with(
                 // this example states a fixed one, which is enough to show
                 // the value reaching both the response and the bill (#94).
                 .policy_revision(DEMO_POLICY_REVISION)
+                .key_id(tollgate_core::KeyId(tenant.account.0))
                 .build(),
             );
             PublishableSnapshot::try_new(snapshot)
@@ -618,7 +626,9 @@ async fn build_app_with(
         .await
         .expect("demo tenants have distinct accounts and credentials");
         principals.push(principal);
-        store.publish_snapshot(principal, compile_snapshot(tenant, 1));
+        store
+            .publish_snapshot(principal, compile_snapshot(tenant, 1))
+            .expect("initial demo snapshot matches the newly created account and credential");
     }
     let (auth, keys, key_manager) = if admission_enabled {
         let manager = tollgate_client::KeyManager::spawn(
@@ -1358,7 +1368,9 @@ mod tests {
             .expect("schedule fits inside its burst")
         };
         let tenant = demo_tenant();
-        store.publish_snapshot(principal, compile(&tenant, 1));
+        store
+            .publish_snapshot(principal, compile(&tenant, 1))
+            .expect("snapshot fixture matches its account and credential");
 
         let task = tokio::spawn(republish_snapshots(
             store.clone(),
