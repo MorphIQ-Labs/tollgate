@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.18.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.18.0...v0.18.1) - 2026-09-11
+
+### Fixed
+
+- *(gates)* enforce baseline provenance and restore direct quoting
+
 ## [0.18.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.17.0...v0.18.0) - 2026-09-10
 
 ### Added
