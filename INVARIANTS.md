@@ -1756,3 +1756,34 @@ exists to detect corrupt state and must not be able to launder it.
     `usage_acknowledgements_require_complete_bounded_valid_evidence` and
     `invalid_published_key_binding_has_a_structured_code`; the wire-limit,
     attributed embedding allocation and three full-stack transport witnesses.
+
+
+36. **Calibration counts comparable benchmark runs, and replacement preserves
+    the previous contract on refusal.** The performance recorder owns a minimum
+    of three distinct, complete readable runs at one committed revision and one
+    host, target, CPU, OS, compiler and profile. Reprocessing a run or copying
+    its sample cannot increase its weight; divergent evidence is an error.
+    Legacy samples lacking identity or environment contribute nothing. Ordinary
+    gate verdicts remain independent of optional sample collection.
+
+    Enforcement: argument validation requires a samples directory for recording;
+    sample publication is atomic and exclusive; loading deduplicates run IDs and
+    matches complete recording contexts. The recorder reserves exclusive staging
+    before validating the actual destination, carries that destination's bounds,
+    and validates the replacement before atomic promotion. A partial current run
+    cannot record using earlier complete samples. Mean inputs must be finite and
+    positive; median arithmetic avoids intermediate overflow.
+
+    *Tests:* `optional_samples_preserve_gate_verdicts_without_recordable_provenance`,
+    `recording_requires_samples_before_reading_input_and_help_still_works`,
+    `checker_retries_cannot_satisfy_the_minimum_run_count`,
+    `samples_from_different_revisions_or_environments_are_not_combined`,
+    `profile_changes_and_legacy_samples_cannot_supply_missing_runs`,
+    `replay_cannot_relabel_a_runs_environment_or_replace_its_measurements`,
+    `concurrent_retries_publish_one_complete_sample`,
+    `recording_validates_the_destination_and_preserves_its_bounds`,
+    `a_foreign_or_invalid_destination_survives_recording_without_baseline_input`,
+    `an_existing_staging_owner_blocks_replacement_without_touching_either_file`,
+    `a_partial_run_cannot_record_using_previous_complete_samples`,
+    `divergent_copies_and_invalid_sample_values_preserve_the_destination`, and
+    `calibration_medians_reject_invalid_means_and_avoid_intermediate_overflow`.

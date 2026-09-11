@@ -100,10 +100,29 @@ impl CostTable {
     }
 
     /// Quote `items` items of `op` as the homogeneous one-entry workload.
+    ///
+    /// Answers the one-class case by direct index, which is what the module
+    /// header promises: two array loads and checked integer arithmetic.
+    ///
+    /// #91 replaced that with a delegation to [`CostTable::quote_workload`],
+    /// and `cost_table/quote` went 1.70 → 2.25 ns (+32%). Nothing caught it:
+    /// the row's recorded baseline had been taken one commit earlier in the
+    /// same issue and was never re-recorded, so the gate compared the new code
+    /// against a number the new code no longer described (#114). Embedders
+    /// pricing a single class call this; the admission engine folds its own
+    /// workload and needs the permission bits only the fold returns, so it
+    /// keeps [`CostTable::quote_workload`] and is unaffected either way.
+    ///
+    /// The arithmetic stays shared — [`CostTable::weight_at`] and
+    /// [`CostTable::quote_weight`] are the same two steps the fold takes — and
+    /// `quote_agrees_with_the_one_entry_workload` holds the two paths to the
+    /// same answer rather than trusting that argument.
     #[inline]
     pub fn quote(&self, op: &impl OpIndex, items: u64) -> Result<CostQuote, QuoteError> {
-        self.quote_workload(&[(op, items)])
-            .map(|(quote, _, _)| quote)
+        if items == 0 {
+            return Err(QuoteError::EmptyWorkload);
+        }
+        self.quote_weight(self.weight_at(op.index())?, items)
     }
 
     /// Quote caller-owned class aggregates, applying the fixed and minimum
@@ -122,10 +141,7 @@ impl CostTable {
             }
             items = items.checked_add(*count).ok_or(QuoteError::Overflow)?;
             let index = op.index();
-            let per_item = match self.weights.get(index) {
-                Some(Some(weight)) => *weight,
-                _ => return Err(QuoteError::UnknownOperation { index }),
-            };
+            let per_item = self.weight_at(index)?;
             let entry = per_item.checked_mul(*count).ok_or(QuoteError::Overflow)?;
             variable = variable.checked_add(entry).ok_or(QuoteError::Overflow)?;
             required = required.union(self.required_at(index));
@@ -146,6 +162,17 @@ impl CostTable {
             items,
             required,
         ))
+    }
+
+    /// The per-item weight of a class, or `UnknownOperation` for a class the
+    /// table does not price. Shared so the one-class path and the workload
+    /// fold cannot disagree about which indices exist.
+    #[inline]
+    fn weight_at(&self, index: usize) -> Result<CostUnits, QuoteError> {
+        match self.weights.get(index) {
+            Some(Some(weight)) => Ok(*weight),
+            _ => Err(QuoteError::UnknownOperation { index }),
+        }
     }
 
     /// Work permissions for a class, or `NONE` past the canonical array's end.
@@ -287,6 +314,28 @@ mod tests {
             .weight(&Op::Price, CostUnits(1))
             .weight(&Op::Greeks, CostUnits(5))
             .build()
+    }
+
+    // The one-class path and the workload fold answer identically, including
+    // which error they answer with.
+    //
+    // `quote` takes the direct index rather than folding a one-element
+    // workload, because delegating cost it 32% (#114). That is only safe while
+    // the two cannot diverge, and "they share `weight_at` and `quote_weight`"
+    // is an argument, not a check — this is the check.
+    proptest::proptest! {
+        #[test]
+        fn quote_agrees_with_the_one_entry_workload(
+            class in 0_usize..3,
+            items in 0_u64..=u64::MAX,
+        ) {
+            let op = [Op::Price, Op::Greeks, Op::Unpriced][class];
+            let table = table();
+            let folded = table
+                .quote_workload(&[(op, items)])
+                .map(|(quote, _, _)| quote);
+            proptest::prop_assert_eq!(table.quote(&op, items), folded);
+        }
     }
 
     #[test]
