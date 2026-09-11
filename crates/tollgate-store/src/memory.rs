@@ -1580,7 +1580,13 @@ impl UsageSink for MemoryStore {
             );
             usage_recorded.insert(
                 account_id,
-                recorded.checked_add(event.units).expect("usage overflow"),
+                recorded.checked_add(event.units).ok_or_else(|| {
+                    IngestError::Refused(StoreError(format!(
+                        "usage accounting overflow for account {:#034x}: recorded usage {} \
+                         cannot absorb {}",
+                        account_id.0, recorded, event.units
+                    )))
+                })?,
             );
             if was_settled {
                 // The units move from provisional loss to billed usage.

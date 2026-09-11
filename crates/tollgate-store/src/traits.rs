@@ -1005,7 +1005,8 @@ pub struct IngestReport {
     /// INVARIANTS.md #7).
     pub duplicate: u64,
     /// Events refused: unknown lease, lease-capability mismatch, or no
-    /// remaining accounting capacity. These are bounded billing loss,
+    /// remaining accounting capacity, or units outside the backend's storage
+    /// domain. These are bounded billing loss,
     /// visible to reconciliation.
     pub rejected: u64,
     /// Newly accepted events with absent, unknown or different-account key
@@ -1042,6 +1043,13 @@ pub trait UsageSink: Send + Sync {
     /// stored `(lease_id, account_id, fencing_token)` capability before lease
     /// state and accounting capacity are checked. Partial acceptance is
     /// normal — the report says what happened.
+    ///
+    /// Duplicates are classified before inspecting their payload. A new event
+    /// outside the backend's unit domain is rejected individually; it is not
+    /// remembered as accepted and cannot poison otherwise valid neighbors.
+    /// MemoryStore supports `u64` units; PostgreSQL supports nonnegative
+    /// `BIGINT` units (`0..=i64::MAX`). A representable event that overflows an
+    /// accumulated accounting total refuses the entire batch atomically.
     async fn ingest(
         &self,
         events: &[UsageEvent],

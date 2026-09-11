@@ -505,6 +505,8 @@ async fn mixed_usage_batch_preserves_partial_acceptance() {
     };
     let batch = [
         usage(&active, 2, 20, 6),
+        usage(&active, 10, i64::MAX as u64 + 1, 6),
+        usage(&active, 11, u64::MAX, 6),
         replay_with_unrepresentable_units,
         wrong_fence,
         unknown_lease,
@@ -523,7 +525,7 @@ async fn mixed_usage_batch_preserves_partial_acceptance() {
     let report = store.ingest(&batch, t(6)).await.unwrap();
     assert_eq!(
         (report.accepted, report.duplicate, report.rejected),
-        (5, 2, 3)
+        (5, 2, 5)
     );
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(100));
     assert_eq!(store.usage_recorded(OTHER), CostUnits(40));
@@ -2137,6 +2139,11 @@ async fn overage_accounting_overflow_is_surfaced() {
         "unexpected error: {error}"
     );
 
+    assert!(
+        !error.is_retryable(),
+        "a monotonic overflow cannot recover on retry"
+    );
+
     let after = store.conservation(ACCOUNT).unwrap();
     assert_eq!(
         (after.overage_recorded, after.settled_usage),
@@ -2460,47 +2467,51 @@ async fn a_refused_deposit_moves_neither_column() {
 /// was told did not land must not come back as a duplicate.
 #[tokio::test]
 async fn a_failed_ingest_batch_leaves_the_ledger_untouched() {
-    let store = store_with_balance(full_grant_policy(), 10_000);
-    let lease = store
-        .acquire(ACCOUNT, CostUnits(1_000), TTL, t(0))
-        .await
-        .unwrap();
-    let before = store.conservation(ACCOUNT).unwrap();
+    for overage_first in [false, true] {
+        let store = store_with_balance(full_grant_policy(), 10_000);
+        let lease = store
+            .acquire(ACCOUNT, CostUnits(1_000), TTL, t(0))
+            .await
+            .unwrap();
+        let before = store.conservation(ACCOUNT).unwrap();
 
-    let failed = store
-        .ingest(
-            &[
-                usage(&lease, 1, 100, 0),
-                overage_usage(ACCOUNT, 2, u64::MAX, 0),
-            ],
-            t(1),
-        )
-        .await;
-    assert!(failed.is_err(), "the overage cannot be represented");
+        let mut events = [
+            usage(&lease, 1, 100, 0),
+            overage_usage(ACCOUNT, 2, u64::MAX, 0),
+        ];
+        if overage_first {
+            events.reverse();
+        }
+        let failed = store.ingest(&events, t(1)).await;
+        assert!(
+            matches!(failed, Err(tollgate_store::IngestError::Refused(_))),
+            "the accounting total cannot be represented: {failed:?}"
+        );
 
-    assert_eq!(
-        store.usage_recorded(ACCOUNT),
-        CostUnits::ZERO,
-        "the first event of a failed batch was applied anyway"
-    );
-    let after = store.conservation(ACCOUNT).unwrap();
-    assert_eq!(after.settled_usage, before.settled_usage);
-    assert!(
-        after.holds(),
-        "conservation after a failed batch: {after:?}"
-    );
+        assert_eq!(
+            store.usage_recorded(ACCOUNT),
+            CostUnits::ZERO,
+            "the first event of a failed batch was applied anyway"
+        );
+        let after = store.conservation(ACCOUNT).unwrap();
+        assert_eq!(after.settled_usage, before.settled_usage);
+        assert!(
+            after.holds(),
+            "conservation after a failed batch: {after:?}"
+        );
 
-    // The decisive one: the caller was told the batch failed, so a replay must
-    // accept the event rather than report it as already recorded.
-    let replay = store
-        .ingest(&[usage(&lease, 1, 100, 0)], t(2))
-        .await
-        .unwrap();
-    assert_eq!(
-        (replay.accepted, replay.duplicate),
-        (1, 0),
-        "an event from a failed batch was left indexed, so the replay saw a duplicate"
-    );
+        // The decisive one: the caller was told the batch failed, so a replay must
+        // accept the event rather than report it as already recorded.
+        let replay = store
+            .ingest(&[usage(&lease, 1, 100, 0)], t(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            (replay.accepted, replay.duplicate),
+            (1, 0),
+            "an event from a failed batch was left indexed, so the replay saw a duplicate"
+        );
+    }
 }
 
 /// Issue #58: a publish and a status transition racing each other must not
@@ -3993,4 +4004,43 @@ async fn credential_pages_order_bound_skip_retired_and_expose_every_mutation() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn usage_accepts_zero_and_the_backends_unit_ceiling() {
+    for leased in [false, true] {
+        let ceiling = u64::MAX;
+        let store = store_with_balance(full_grant_policy(), if leased { ceiling } else { 0 });
+        let lease = if leased {
+            Some(
+                store
+                    .acquire(ACCOUNT, CostUnits(ceiling), TTL, t(0))
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let event = |id, units| {
+            if let Some(lease) = &lease {
+                usage(lease, id, units, 0)
+            } else {
+                overage_usage(ACCOUNT, id, units, 0)
+            }
+        };
+        let batch = [
+            event(1, 0),
+            event(2, ceiling),
+            event(2, u64::MAX),
+            event(3, 0),
+        ];
+        let report = UsageSink::ingest(&*store, &batch, t(1)).await.unwrap();
+        report.validate(batch.len()).unwrap();
+        assert_eq!(
+            (report.accepted, report.duplicate, report.rejected),
+            (3, 1, 0)
+        );
+        assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(ceiling));
+        assert_conserved(&store);
+    }
 }

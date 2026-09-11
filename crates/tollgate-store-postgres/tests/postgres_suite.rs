@@ -556,6 +556,8 @@ async fn mixed_usage_batch_preserves_partial_acceptance() {
     };
     let batch = [
         usage(&active, 2, 20, 6),
+        usage(&active, 10, i64::MAX as u64 + 1, 6),
+        usage(&active, 11, u64::MAX, 6),
         replay_with_unrepresentable_units,
         wrong_fence,
         unknown_lease,
@@ -574,7 +576,7 @@ async fn mixed_usage_batch_preserves_partial_acceptance() {
     let report = store.ingest(&batch, t(6)).await.unwrap();
     assert_eq!(
         (report.accepted, report.duplicate, report.rejected),
-        (5, 2, 3)
+        (5, 2, 5)
     );
     assert_eq!(store.usage_recorded(ACCOUNT).await.unwrap(), CostUnits(100));
     assert_eq!(store.usage_recorded(OTHER).await.unwrap(), CostUnits(40));
@@ -603,6 +605,56 @@ async fn mixed_usage_batch_preserves_partial_acceptance() {
         other_conservation.holds(),
         "conservation violated: {other_conservation:?}"
     );
+}
+
+#[tokio::test]
+async fn unrepresentable_usage_rejects_only_that_event_and_does_not_claim_its_id() {
+    let _guard = DB_LOCK.lock().await;
+    for leased in [false, true] {
+        for invalid in [i64::MAX as u64 + 1, u64::MAX] {
+            let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+                return;
+            };
+            let lease = store
+                .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
+                .await
+                .unwrap();
+            let event = |id, units| {
+                if leased {
+                    usage(&lease, id, units, 0)
+                } else {
+                    overage_usage(ACCOUNT, id, units, 0)
+                }
+            };
+            let batch = [
+                event(1, 10),
+                event(2, invalid),
+                event(2, 20),
+                event(2, invalid),
+                event(3, 30),
+            ];
+            let report = store.ingest(&batch, t(1)).await.unwrap();
+            report.validate(batch.len()).unwrap();
+            assert_eq!(
+                (report.accepted, report.duplicate, report.rejected),
+                (3, 1, 1)
+            );
+            assert_eq!(store.usage_recorded(ACCOUNT).await.unwrap(), CostUnits(60));
+            assert_conserved(&store).await;
+            let replay = store.ingest(&batch, t(2)).await.unwrap();
+            assert_eq!(
+                (replay.accepted, replay.duplicate, replay.rejected),
+                (0, 5, 0)
+            );
+            let pool = corruption_pool().await;
+            let stored: Vec<i64> =
+                sqlx::query_scalar("SELECT units FROM tollgate_usage_events ORDER BY request_id")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(stored, [10, 20, 30]);
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2019,53 +2071,57 @@ async fn straggler_exceeding_recorded_loss_fails_ingest() {
 }
 
 #[tokio::test]
-async fn acquire_surfaces_negative_stored_fence() {
-    let _guard = DB_LOCK.lock().await;
-    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
-        return;
-    };
-    let pool = corruption_pool().await;
-    set_account_column(&pool, "next_fence", -1).await;
+async fn acquire_surfaces_nonpositive_stored_fence() {
+    for invalid in [-1, 0] {
+        let _guard = DB_LOCK.lock().await;
+        let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+            return;
+        };
+        let pool = corruption_pool().await;
+        set_account_column(&pool, "next_fence", invalid).await;
 
-    let err = store
-        .acquire(ACCOUNT, CostUnits(10), TTL, t(0))
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(&err, AllocateError::Storage(e) if e.0.contains("fencing token")),
-        "corrupt fence must surface as storage corruption, got: {err}"
-    );
+        let err = store
+            .acquire(ACCOUNT, CostUnits(10), TTL, t(0))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AllocateError::Storage(e) if e.0.contains("fencing token")),
+            "corrupt fence must surface as storage corruption, got: {err}"
+        );
+    }
 }
 
 #[tokio::test]
-async fn release_and_ingest_surface_negative_stored_fence() {
-    let _guard = DB_LOCK.lock().await;
-    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
-        return;
-    };
-    let lease = store
-        .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
-        .await
-        .unwrap();
-    let pool = corruption_pool().await;
-    set_lease_column(&pool, lease.lease_id.0, "fencing_token", -1).await;
+async fn release_and_ingest_surface_nonpositive_stored_fence() {
+    for invalid in [-1, 0] {
+        let _guard = DB_LOCK.lock().await;
+        let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+            return;
+        };
+        let lease = store
+            .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
+            .await
+            .unwrap();
+        let pool = corruption_pool().await;
+        set_lease_column(&pool, lease.lease_id.0, "fencing_token", invalid).await;
 
-    // A corrupt stored fence is a storage error, not a Fenced rejection that
-    // misattributes the cause to the caller.
-    let err = store
-        .release(lease.lease_id, lease.fencing_token, CostUnits(500), t(1))
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(&err, AllocateError::Storage(e) if e.0.contains("fencing token")),
-        "got: {err}"
-    );
+        // A corrupt stored fence is a storage error, not a Fenced rejection that
+        // misattributes the cause to the caller.
+        let err = store
+            .release(lease.lease_id, lease.fencing_token, CostUnits(500), t(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AllocateError::Storage(e) if e.0.contains("fencing token")),
+            "got: {err}"
+        );
 
-    let err = store
-        .ingest(&[usage(&lease, 1, 10, 2)], t(2))
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("fencing token"), "got: {err}");
+        let err = store
+            .ingest(&[usage(&lease, 1, 10, 2)], t(2))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("fencing token"), "got: {err}");
+    }
 }
 
 #[tokio::test]
@@ -2078,6 +2134,8 @@ async fn checked_ledger_columns_reject_negative_writes() {
         .acquire(ACCOUNT, CostUnits(10), TTL, t(0))
         .await
         .unwrap();
+    let event = usage(&lease, 1, 0, 0);
+    store.ingest(&[event], t(0)).await.unwrap();
     let pool = corruption_pool().await;
 
     let account_columns = [
@@ -2087,9 +2145,19 @@ async fn checked_ledger_columns_reject_negative_writes() {
         "settlement_loss",
         "overage_recorded",
         "next_fence",
+        "allowance_balance",
+        "expired",
+        "budget_allowance",
     ]
     .map(|c| ("tollgate_accounts", c, "account_id", account_bytes()));
-    let lease_columns = ["fencing_token", "granted", "used", "credited"].map(|c| {
+    let lease_columns = [
+        "fencing_token",
+        "granted",
+        "used",
+        "credited",
+        "from_allowance",
+    ]
+    .map(|c| {
         (
             "tollgate_leases",
             c,
@@ -2097,13 +2165,30 @@ async fn checked_ledger_columns_reject_negative_writes() {
             lease.lease_id.0.to_be_bytes().to_vec(),
         )
     });
-    for (table, column, id_column, id) in account_columns.into_iter().chain(lease_columns) {
+    let usage_columns = ["units", "fencing_token"].map(|column| {
+        (
+            "tollgate_usage_events",
+            column,
+            "request_id",
+            event.request_id.0.to_be_bytes().to_vec(),
+        )
+    });
+    for (table, column, id_column, id) in account_columns
+        .into_iter()
+        .chain(lease_columns)
+        .chain(usage_columns)
+    {
         // Only the column's own guard is left standing. A negative balance
         // also violates `allowance_balance <= balance`, and whichever of the
         // two PostgreSQL happened to evaluate first would decide the message —
         // so the cross-column checks step aside and the assertion stays about
         // the one constraint this test is named for.
-        let nonneg = format!("{table}_{column}_nonneg");
+        let suffix = if matches!(column, "next_fence" | "fencing_token") {
+            "positive"
+        } else {
+            "nonneg"
+        };
+        let nonneg = format!("{table}_{column}_{suffix}");
         let dropped = suspend_checks(&pool, table, column, Some(&nonneg)).await;
         let result = sqlx::query(&format!(
             "UPDATE {table} SET {column} = -1 WHERE {id_column} = $1"
@@ -2123,6 +2208,63 @@ async fn checked_ledger_columns_reject_negative_writes() {
             "negative {table}.{column} write must violate its CHECK constraint, got: {err}"
         );
     }
+}
+
+#[tokio::test]
+async fn zero_fences_are_refused_in_every_persisted_capability() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(10), TTL, t(0))
+        .await
+        .unwrap();
+    assert_eq!(lease.fencing_token, FencingToken(1));
+    let event = usage(&lease, 1, 0, 0);
+    store
+        .ingest(&[event, overage_usage(ACCOUNT, 2, 0, 0)], t(0))
+        .await
+        .unwrap();
+    let pool = corruption_pool().await;
+    for (table, column, id_column, id) in [
+        (
+            "tollgate_accounts",
+            "next_fence",
+            "account_id",
+            account_bytes(),
+        ),
+        (
+            "tollgate_leases",
+            "fencing_token",
+            "lease_id",
+            lease.lease_id.0.to_be_bytes().to_vec(),
+        ),
+        (
+            "tollgate_usage_events",
+            "fencing_token",
+            "request_id",
+            event.request_id.0.to_be_bytes().to_vec(),
+        ),
+    ] {
+        let error = sqlx::query(&format!(
+            "UPDATE {table} SET {column} = 0 WHERE {id_column} = $1"
+        ))
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().constraint(),
+            Some(format!("{table}_{column}_positive").as_str())
+        );
+    }
+    let second = store
+        .acquire(ACCOUNT, CostUnits(10), TTL, t(1))
+        .await
+        .unwrap();
+    assert_eq!(second.fencing_token, FencingToken(2));
+    assert_conserved(&store).await;
 }
 
 /// The cross-column guards #97 added: the allowance portion is part of the
@@ -3536,6 +3678,11 @@ async fn overage_accounting_overflow_is_surfaced() {
         "unexpected error: {error}"
     );
 
+    assert!(
+        !error.is_retryable(),
+        "a monotonic overflow cannot recover on retry"
+    );
+
     let after = store.conservation(ACCOUNT).await.unwrap().unwrap();
     assert_eq!(
         (after.overage_recorded, after.settled_usage),
@@ -3895,50 +4042,54 @@ async fn a_refused_deposit_moves_neither_column() {
 
 #[tokio::test]
 async fn a_failed_ingest_batch_leaves_the_ledger_untouched() {
-    let _guard = DB_LOCK.lock().await;
-    let Some(store) = store_with_balance(full_grant_policy(), 10_000).await else {
-        return;
-    };
-    let lease = store
-        .acquire(ACCOUNT, CostUnits(1_000), TTL, t(0))
-        .await
-        .unwrap();
-    let before = store.conservation(ACCOUNT).await.unwrap().unwrap();
+    for overage_first in [false, true] {
+        let _guard = DB_LOCK.lock().await;
+        let Some(store) = store_with_balance(full_grant_policy(), 10_000).await else {
+            return;
+        };
+        let lease = store
+            .acquire(ACCOUNT, CostUnits(1_000), TTL, t(0))
+            .await
+            .unwrap();
+        let before = store.conservation(ACCOUNT).await.unwrap().unwrap();
 
-    let ceiling = u64::try_from(i64::MAX).unwrap();
-    let failed = UsageSink::ingest(
-        &*store,
-        &[
+        let ceiling = u64::try_from(i64::MAX).unwrap();
+        let mut events = [
             usage(&lease, 1, 100, 0),
             overage_usage(ACCOUNT, 2, ceiling, 0),
-        ],
-        t(1),
-    )
-    .await;
-    assert!(failed.is_err(), "the overage cannot be represented");
+        ];
+        if overage_first {
+            events.reverse();
+        }
+        let failed = UsageSink::ingest(&*store, &events, t(1)).await;
+        assert!(
+            matches!(failed, Err(tollgate_store::IngestError::Refused(_))),
+            "the accounting total cannot be represented: {failed:?}"
+        );
 
-    assert_eq!(
-        store.usage_recorded(ACCOUNT).await.unwrap(),
-        CostUnits::ZERO,
-        "the first event of a failed batch was applied anyway"
-    );
-    let after = store.conservation(ACCOUNT).await.unwrap().unwrap();
-    assert_eq!(after.settled_usage, before.settled_usage);
-    assert!(
-        after.holds(),
-        "conservation after a failed batch: {after:?}"
-    );
+        assert_eq!(
+            store.usage_recorded(ACCOUNT).await.unwrap(),
+            CostUnits::ZERO,
+            "the first event of a failed batch was applied anyway"
+        );
+        let after = store.conservation(ACCOUNT).await.unwrap().unwrap();
+        assert_eq!(after.settled_usage, before.settled_usage);
+        assert!(
+            after.holds(),
+            "conservation after a failed batch: {after:?}"
+        );
 
-    // The decisive one: the caller was told the batch failed, so a replay must
-    // accept the event rather than report it as already recorded.
-    let replay = UsageSink::ingest(&*store, &[usage(&lease, 1, 100, 0)], t(2))
-        .await
-        .unwrap();
-    assert_eq!(
-        (replay.accepted, replay.duplicate),
-        (1, 0),
-        "an event from a failed batch was left indexed, so the replay saw a duplicate"
-    );
+        // The decisive one: the caller was told the batch failed, so a replay must
+        // accept the event rather than report it as already recorded.
+        let replay = UsageSink::ingest(&*store, &[usage(&lease, 1, 100, 0)], t(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            (replay.accepted, replay.duplicate),
+            (1, 0),
+            "an event from a failed batch was left indexed, so the replay saw a duplicate"
+        );
+    }
 }
 
 // --- Periodic budgets (#97) -------------------------------------------------
@@ -5608,4 +5759,51 @@ async fn credential_revision_covers_legacy_writes_rollback_and_overflow() {
         .await
         .unwrap();
     assert!(revision().await.unwrap().revision() > revoked.revision());
+}
+
+#[tokio::test]
+async fn usage_accepts_zero_and_the_backends_unit_ceiling() {
+    let _guard = DB_LOCK.lock().await;
+    for leased in [false, true] {
+        let ceiling = i64::MAX as u64;
+        let Some(store) =
+            store_with_balance(full_grant_policy(), if leased { ceiling } else { 0 }).await
+        else {
+            return;
+        };
+        let lease = if leased {
+            Some(
+                store
+                    .acquire(ACCOUNT, CostUnits(ceiling), TTL, t(0))
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let event = |id, units| {
+            if let Some(lease) = &lease {
+                usage(lease, id, units, 0)
+            } else {
+                overage_usage(ACCOUNT, id, units, 0)
+            }
+        };
+        let batch = [
+            event(1, 0),
+            event(2, ceiling),
+            event(2, u64::MAX),
+            event(3, 0),
+        ];
+        let report = UsageSink::ingest(&*store, &batch, t(1)).await.unwrap();
+        report.validate(batch.len()).unwrap();
+        assert_eq!(
+            (report.accepted, report.duplicate, report.rejected),
+            (3, 1, 0)
+        );
+        assert_eq!(
+            store.usage_recorded(ACCOUNT).await.unwrap(),
+            CostUnits(ceiling)
+        );
+        assert_conserved(&store).await;
+    }
 }

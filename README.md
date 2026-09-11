@@ -40,6 +40,9 @@ verifier bounds cached evidence by feed freshness and each key's expiry. See
 [credential projection](docs/CREDENTIAL_PROJECTION.md) for lifecycle composition,
 readiness, revocation windows and rollout.
 
+See [usage accounting](docs/USAGE_ACCOUNTING.md) for batch rejection semantics,
+PostgreSQL numeric limits, and database-guard migration and recovery.
+
 ## Quickstart
 
 ```sh

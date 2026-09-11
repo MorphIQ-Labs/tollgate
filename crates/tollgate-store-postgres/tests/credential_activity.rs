@@ -389,5 +389,6 @@ async fn a_failed_batch_preserves_activity_and_canonical_events() {
     let _guard = DB_LOCK.lock().await;
     let Some(store) = store().await else { return };
     scenarios::setup(&*store).await;
-    scenarios::a_failed_batch_preserves_activity_and_canonical_events(&*store).await;
+    scenarios::a_failed_batch_preserves_activity_and_canonical_events(&*store, i64::MAX as u64)
+        .await;
 }
