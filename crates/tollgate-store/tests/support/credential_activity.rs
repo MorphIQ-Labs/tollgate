@@ -321,16 +321,18 @@ pub async fn activity_uses_durable_microsecond_precision(store: &impl Backend) {
     }
 }
 
-pub async fn a_failed_batch_preserves_activity_and_canonical_events(store: &impl Backend) {
+pub async fn a_failed_batch_preserves_activity_and_canonical_events(
+    store: &impl Backend,
+    unit_ceiling: u64,
+) {
     store.ingest(&[event(1, Some(1), 10)], t(20)).await.unwrap();
     let mut overflow = event(3, Some(1), 30);
-    overflow.units = CostUnits(u64::MAX);
-    assert!(
-        store
-            .ingest(&[event(2, Some(1), 20), overflow], t(40))
-            .await
-            .is_err()
-    );
+    overflow.units = CostUnits(unit_ceiling);
+    let error = store
+        .ingest(&[event(2, Some(1), 20), overflow], t(40))
+        .await
+        .unwrap_err();
+    assert!(!error.is_retryable());
     assert_eq!(
         state(store, 1).await,
         State::Committed {

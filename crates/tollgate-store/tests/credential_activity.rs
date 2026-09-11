@@ -174,6 +174,9 @@ async fn activity_uses_durable_microsecond_precision() {
 async fn a_failed_batch_preserves_activity_and_canonical_events() {
     let store = MemoryStore::new(GrantPolicy::default()).unwrap();
     support::credential_activity::setup(&*store).await;
-    support::credential_activity::a_failed_batch_preserves_activity_and_canonical_events(&*store)
-        .await;
+    support::credential_activity::a_failed_batch_preserves_activity_and_canonical_events(
+        &*store,
+        u64::MAX,
+    )
+    .await;
 }

@@ -203,7 +203,8 @@ until it has one.
 
 4. **Lease capabilities are exact and lease-scoped.** Every acquired lease is
    stamped with the next fencing token in its account's strictly increasing
-   sequence. The sequence is an allocation and audit order, not an
+   sequence, beginning at one; zero is not a persisted capability or counter.
+   The sequence is an allocation and audit order, not an
    account-wide validity epoch: issuing a newer token does not invalidate an
    older lease that is still active. Release accepts only the stored
    `(lease_id, fencing_token)` pair; usage accepts only the stored
@@ -220,10 +221,11 @@ until it has one.
    `usage_rejects_mismatched_lease_capability` (store suites);
    `expired_lease_units_reclaimed`, `straggler_usage_after_release_is_billed`,
    and `fenced_release_clears_the_slot`;
-   `acquire_surfaces_negative_stored_fence` and
-   `release_and_ingest_surface_negative_stored_fence` (Postgres suite; the
-   memory backend stores tokens as `u64`, so the corrupt state is
-   unrepresentable there).
+   `acquire_surfaces_nonpositive_stored_fence` and
+   `release_and_ingest_surface_nonpositive_stored_fence` (Postgres suite; the
+   memory backend owns a counter seeded at one, updated only by checked
+   increments); `zero_fences_are_refused_in_every_persisted_capability`
+   (Postgres schema checks).
 
 5. **Fail closed, zero I/O.** Unknown principal, suspended/closed account,
    expired snapshot, missing permission, cost overflow, accounting
@@ -415,6 +417,14 @@ until it has one.
    events change either ledger, and their grouped lease/account effects stay
    in the same atomic transaction.
 
+   A duplicate is recognized before its payload is examined. A new event
+   outside the backend's unit domain is rejected individually and does not
+   claim its request ID. Memory retains its full `u64` domain; PostgreSQL's
+   nonnegative `BIGINT` domain is `0..=i64::MAX`. Representable events whose
+   combined deltas or resulting monotonic accounting totals overflow refuse
+   the whole batch with `IngestError::Refused`; a retry cannot recover capacity.
+   Stored corruption and operational failures remain retryable store errors.
+
    Credential activity consumes that accepted set too (35); a duplicate's
    changed key ID or timestamp cannot become fresh evidence.
 
@@ -431,9 +441,12 @@ until it has one.
 
    *Tests:* `usage_replay_is_idempotent`,
    `mixed_usage_batch_preserves_partial_acceptance`,
+   `usage_accepts_zero_and_the_backends_unit_ceiling`,
+   `overage_accounting_overflow_is_surfaced`,
    `a_failed_ingest_batch_leaves_the_ledger_untouched`, and
    `a_refused_deposit_moves_neither_column` (all mirrored across both store
-   suites).
+   suites); `unrepresentable_usage_rejects_only_that_event_and_does_not_claim_its_id`
+   (Postgres: `UsageEvent` cannot exceed MemoryStore's `u64` domain).
 
 8. **Accounting backpressure sheds.** When the usage queue is full, new work is
    refused with zero units charged. Usage events are never silently dropped
@@ -557,7 +570,8 @@ until it has one.
     directions: a negative unit column is surfaced as an explicit store
     error, never clamped to zero — clamping would let the conservation
     equation pass over the corruption it exists to detect. The Postgres
-    schema additionally CHECK-constrains unit columns non-negative.
+    schema additionally CHECK-constrains unit columns non-negative, including
+    billing-event units, and every persisted fence strictly positive.
     *Tests:* `tollgate-core` proptests;
     `negative_account_column_fails_conservation_read`,
     `negative_account_column_fails_balance_and_usage_reads`,
@@ -566,7 +580,10 @@ until it has one.
     `reclaim_refuses_negative_credit`,
     `straggler_exceeding_recorded_loss_fails_ingest`, and
     `checked_ledger_columns_reject_negative_writes` (Postgres suite; the
-    memory backend makes negative state unrepresentable via `u64`).
+    memory backend makes negative state unrepresentable via `u64`);
+    `usage_guard_upgrade_preserves_legacy_rows_and_refuses_an_old_catalogue` and
+    `invalid_history_blocks_validation_but_leaves_write_guards_and_can_be_repaired`
+    (Postgres migration suite).
 
 12. **No commit outside the usability window.** A lease is locally usable
     until `expires_at - safety margin`; both debits and commits stop there,

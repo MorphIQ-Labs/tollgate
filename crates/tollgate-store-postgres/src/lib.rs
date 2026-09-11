@@ -517,6 +517,16 @@ fn to_i64(units: CostUnits, what: &str) -> Result<i64, StoreError> {
     i64::try_from(units.get()).map_err(|_| StoreError(format!("{what} exceeds i64 range")))
 }
 
+/// Persisted capabilities are minted from counters seeded at one. Invalid
+/// storage must not become a caller mismatch or mint a zero capability.
+fn stored_fence(value: i64) -> Result<FencingToken, StoreError> {
+    u64::try_from(value)
+        .ok()
+        .filter(|value| *value > 0)
+        .map(FencingToken)
+        .ok_or_else(|| StoreError(format!("stored fencing token is not positive: {value}")))
+}
+
 /// A negative unit column is ledger corruption, never a value to normalise:
 /// clamping it to zero would let the conservation equation pass over exactly
 /// the discrepancy it exists to expose.
@@ -997,13 +1007,7 @@ impl PostgresStore {
         let from_allowance = granted_i.min(allowance_balance);
         let period_start_us = row.get::<i64, _>(4);
         let fence = row.get::<i64, _>(2);
-        // Fence counters are seeded at 1 and only incremented; a negative
-        // stored value is corruption, never a token to alias to 0.
-        let fence_token = u64::try_from(fence).map(FencingToken).map_err(|_| {
-            AllocateError::Storage(StoreError(format!(
-                "stored fencing token is negative: {fence}"
-            )))
-        })?;
+        let fence_token = stored_fence(fence).map_err(AllocateError::Storage)?;
 
         let lease_id = LeaseId(uuid::Uuid::new_v4().as_u128());
 
@@ -1071,12 +1075,7 @@ impl PostgresStore {
             .map_err(alloc_storage)?
             .ok_or(AllocateError::UnknownLease)?;
 
-        let stored_fence = u64::try_from(fence).map_err(|_| {
-            AllocateError::Storage(StoreError(format!(
-                "stored fencing token is negative: {fence}"
-            )))
-        })?;
-        if stored_fence != fencing_token.0 {
+        if stored_fence(fence).map_err(AllocateError::Storage)? != fencing_token {
             return Err(AllocateError::Fenced);
         }
         // Releases are accepted through the grace window (see GrantPolicy::
@@ -1479,7 +1478,7 @@ impl UsageSink for PostgresStore {
             .collect::<Result<_, StoreError>>()?;
 
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        let result = async {
+        let result: Result<_, IngestError> = async {
             // Lock every referenced lease in the same global account/lease
             // order as reclaim. Release touches one lease, so every
             // lease-writing transaction now agrees on this order.
@@ -1590,7 +1589,7 @@ impl UsageSink for PostgresStore {
             struct Accepted {
                 event_index: usize,
                 settled: bool,
-                /// The lease's stored fence, already validated non-negative;
+                /// The lease's stored fence, already validated positive;
                 /// acceptance required the event's token to equal it, so this
                 /// is the event's fence in storage form with no reconversion.
                 /// `None` for overage, whose row carries no capability.
@@ -1621,7 +1620,12 @@ impl UsageSink for PostgresStore {
                         report.rejected += 1;
                         continue;
                     }
-                    let units = to_i64(event.event.units, "units")?;
+                    let Ok(units) = i64::try_from(event.event.units.get()) else {
+                        // Caller data outside this backend's storage domain
+                        // rejects this event, not the valid neighboring work.
+                        report.rejected += 1;
+                        continue;
+                    };
                     seen.insert(event.request_id.clone());
                     accepted.push(Accepted {
                         event_index,
@@ -1640,22 +1644,19 @@ impl UsageSink for PostgresStore {
                     report.rejected += 1;
                     continue;
                 };
-                let stored_fence = u64::try_from(lease.fence).map_err(|_| {
-                    StoreError(format!(
-                        "stored fencing token is negative: {}",
-                        lease.fence
-                    ))
-                })?;
-                if Some(stored_fence) != event.event.source.fencing_token().map(|token| token.0)
+                if Some(stored_fence(lease.fence)?) != event.event.source.fencing_token()
                     || lease.account_id.as_slice() != event.account_id.as_slice()
                 {
                     report.rejected += 1;
                     continue;
                 }
-                let units = to_i64(event.event.units, "units")?;
                 to_units(lease.granted, "lease granted")?;
                 to_units(lease.used, "lease used")?;
                 to_units(lease.credited, "lease credited")?;
+                let Ok(units) = i64::try_from(event.event.units.get()) else {
+                    report.rejected += 1;
+                    continue;
+                };
                 let committed = lease
                     .used
                     .checked_add(lease.used_delta.map_or(0, NonZeroI64::get))
@@ -1748,26 +1749,26 @@ impl UsageSink for PostgresStore {
 
                 let entry = account_deltas.entry(event.account_id.clone()).or_default();
                 entry.usage = entry.usage.checked_add(accepted_event.units).ok_or_else(|| {
-                    StoreError(format!(
+                    IngestError::Refused(StoreError(format!(
                         "usage delta overflow for account {:#034x}",
                         event.event.account_id.0
-                    ))
+                    )))
                 })?;
                 if accepted_event.settled {
                     entry.loss = entry.loss.checked_add(accepted_event.units).ok_or_else(|| {
-                        StoreError(format!(
+                        IngestError::Refused(StoreError(format!(
                             "settlement loss delta overflow for account {:#034x}",
                             event.event.account_id.0
-                        ))
+                        )))
                     })?;
                 }
                 if accepted_event.overage {
                     entry.overage =
                         entry.overage.checked_add(accepted_event.units).ok_or_else(|| {
-                            StoreError(format!(
+                            IngestError::Refused(StoreError(format!(
                                 "overage delta overflow for account {:#034x}",
                                 event.event.account_id.0
-                            ))
+                            )))
                         })?;
                 }
             }
@@ -1790,11 +1791,11 @@ impl UsageSink for PostgresStore {
             let expected_event_rows = u64::try_from(accepted.len())
                 .map_err(|_| StoreError("accepted event count exceeds u64 range".into()))?;
             if inserted.rows_affected() != expected_event_rows {
-                return Err(StoreError(format!(
+                return Err(IngestError::Unavailable(StoreError(format!(
                     "ingest inserted {} of {} accepted usage rows",
                     inserted.rows_affected(),
                     accepted.len()
-                )));
+                ))));
             }
 
             // Every lease row was already locked by the sorted SELECT above,
@@ -1822,11 +1823,11 @@ impl UsageSink for PostgresStore {
                 let expected_lease_rows = u64::try_from(lease_update_ids.len())
                     .map_err(|_| StoreError("ingest lease row count exceeds u64 range".into()))?;
                 if updated_leases.rows_affected() != expected_lease_rows {
-                    return Err(StoreError(format!(
+                    return Err(IngestError::Unavailable(StoreError(format!(
                         "ingest updated {} of {} locked lease rows",
                         updated_leases.rows_affected(),
                         lease_update_ids.len()
-                    )));
+                    ))));
                 }
             }
 
@@ -1857,11 +1858,11 @@ impl UsageSink for PostgresStore {
             .await
             .map_err(storage)?;
             if locked_accounts.len() != account_ids.len() {
-                return Err(StoreError(format!(
+                return Err(IngestError::Unavailable(StoreError(format!(
                     "ingest locked {} of {} referenced account rows",
                     locked_accounts.len(),
                     account_ids.len()
-                )));
+                ))));
             }
 
             // Validate every account before the set-wise mutation. The
@@ -1883,27 +1884,27 @@ impl UsageSink for PostgresStore {
                     ))
                 })?;
                 usage_recorded.checked_add(delta.usage).ok_or_else(|| {
-                    StoreError(format!(
+                    IngestError::Refused(StoreError(format!(
                         "usage_recorded overflow for account {:#034x}",
                         id_from(&account_id)
-                    ))
+                    )))
                 })?;
                 // The funding half of the same units. Both terms must be
                 // representable or neither may move, or the batch would bill
                 // overage it did not fund and leave the equation open.
                 overage_recorded.checked_add(delta.overage).ok_or_else(|| {
-                    StoreError(format!(
+                    IngestError::Refused(StoreError(format!(
                         "overage_recorded overflow for account {:#034x}",
                         id_from(&account_id)
-                    ))
+                    )))
                 })?;
                 if settlement_loss < delta.loss {
-                    return Err(StoreError(format!(
+                    return Err(IngestError::Unavailable(StoreError(format!(
                         "settlement_loss underflow for account {:#034x}: settled straggler \
                          usage {} exceeds recorded loss",
                         id_from(&account_id),
                         delta.loss
-                    )));
+                    ))));
                 }
             }
 
@@ -1927,11 +1928,11 @@ impl UsageSink for PostgresStore {
             let expected_account_rows = u64::try_from(account_ids.len())
                 .map_err(|_| StoreError("ingest account row count exceeds u64 range".into()))?;
             if updated_accounts.rows_affected() != expected_account_rows {
-                return Err(StoreError(format!(
+                return Err(IngestError::Unavailable(StoreError(format!(
                     "ingest updated {} of {} locked account rows",
                     updated_accounts.rows_affected(),
                     account_ids.len()
-                )));
+                ))));
             }
 
             // Legacy/unscoped batches cannot name activity. Their complete
@@ -1971,12 +1972,10 @@ impl UsageSink for PostgresStore {
             Ok(report)
         }
         .await;
-        // Every failure here is a database one — a lost connection, a
-        // serialization failure, a constraint that rolled the transaction
-        // back. None is a judgement about the batch, so all of them retry.
-        finish_transaction(tx, result)
-            .await
-            .map_err(IngestError::from)
+        // Monotonic accounting overflow is a permanent batch refusal. Database
+        // and stored-corruption errors remain retryable, and rollback must
+        // complete before either outcome becomes observable.
+        finish_transaction(tx, result).await
     }
 }
 
@@ -2824,6 +2823,16 @@ async fn write_snapshot_audited(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_fences_use_the_exact_positive_bigint_domain() {
+        for invalid in [i64::MIN, -1, 0] {
+            assert!(stored_fence(invalid).is_err());
+        }
+        for valid in [1, 2, i64::MAX] {
+            assert_eq!(stored_fence(valid).unwrap(), FencingToken(valid as u64));
+        }
+    }
 
     /// A readiness probe is evidence that PostgreSQL answered, not merely that
     /// a store object exists (INVARIANTS.md #19).
