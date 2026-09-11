@@ -9,6 +9,10 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# `--record` stamps a recorded baseline with the instant it was measured.
+# The workspace's clock everywhere else, rather than hand-rolled civil-date
+# arithmetic in a tool that must not be the thing that is wrong.
+jiff = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

@@ -85,6 +85,16 @@ if grep -E '^[[:space:]]*-[[:space:]]*cargo bench([[:space:]]|$)' "$CONFIG" | gr
   fail "CI may compile benchmarks with --no-run, but timed execution is local"
 fi
 
+# 5. The recorded baseline names one physical host. A CI job that sets the
+#    label either activates a host-specific contract on a machine that is not
+#    that host, or — as the retired `perf-thresholds` job did — sets a value
+#    that can never match, so the comparison silently reports
+#    `baseline-skipped` and twelve days of drift accumulate behind a green
+#    pipeline (#114).
+if grep -E '^[[:space:]]*TOLLGATE_PERF_HOST:' "$CONFIG" > /dev/null; then
+  fail "TOLLGATE_PERF_HOST is a local label for the host the baseline names; CI must not set it"
+fi
+
 if [ "$status" -eq 0 ]; then
   echo "ci rules: OK (formal/mutation block every merge request; timed performance is local)"
 fi

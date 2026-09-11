@@ -2,6 +2,7 @@
 //!
 //! Usage:
 //!   check_benchmark_thresholds [--ratios-only] [--baseline <baseline.json>]
+//!     [--samples <dir>] [--record <baseline.json>] [--history <history.json>]
 //!     <manifest.json> <criterion-root> <report.json> <freshness-marker>
 //!
 //! Mirrors ferro-risk's gate semantics:
@@ -12,7 +13,13 @@
 //! - Optional ratio bounds compare two measurements from the same run, so a
 //!   contention budget is portable across otherwise different hosts.
 //! - An optional recorded baseline enforces per-row regressions only when
-//!   `TOLLGATE_PERF_HOST` matches its host id and the run is trusted.
+//!   `TOLLGATE_PERF_HOST` matches its host id and the run is trusted. A full
+//!   run that was *given* a baseline and could not enforce it does not pass:
+//!   see `UNENFORCED_EXIT`.
+//! - `--record` requires `--samples` and rewrites the baseline from at least
+//!   three distinct, compatible full runs, whole. It is the
+//!   only supported way to calibrate, because the alternative — hand-editing
+//!   the rows a change happens to care about — is what #114 diagnosed.
 //! - `--ratios-only` still requires every fresh row but deliberately skips
 //!   absolute thresholds and recorded-baseline decisions on other hosts.
 //! - Estimates older than the freshness marker are rejected: the gate must
@@ -28,6 +35,7 @@
 //! on a loaded machine made a later change look 16% faster than it was.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::SystemTime;
@@ -38,7 +46,17 @@ use serde::{Deserialize, Serialize};
 /// from FAILURE so a caller can tell "your change is slow" from "ask me
 /// again on a quiet machine".
 const UNTRUSTED_EXIT: u8 = 3;
-const USAGE: &str = "usage: check_benchmark_thresholds [--ratios-only] [--baseline <baseline.json>] <manifest.json> <criterion-root> <report.json> <freshness-marker>";
+/// Exit code for a full run that was handed a recorded baseline and did not
+/// enforce it. Distinct from FAILURE because nothing regressed, and distinct
+/// from SUCCESS because nothing host-specific was checked either.
+///
+/// Timed measurement is a local review responsibility (#113), so a full run
+/// *is* the acceptance evidence. Until #114 such a run printed `PASS` and
+/// exited 0 with every regression row marked `baseline-skipped`: the recorded
+/// baseline had in fact never been enforced once, locally or in CI, and twelve
+/// days of drift accumulated behind a green verdict.
+const UNENFORCED_EXIT: u8 = 4;
+const USAGE: &str = "usage: check_benchmark_thresholds [--ratios-only] [--baseline <baseline.json>] [--samples <dir>] [--record <baseline.json>] [--history <history.json>] <manifest.json> <criterion-root> <report.json> <freshness-marker>";
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,6 +73,16 @@ enum Command {
         report_path: PathBuf,
         marker_path: PathBuf,
         baseline_path: Option<PathBuf>,
+        /// Where to rewrite the recorded baseline, whole.
+        record_path: Option<PathBuf>,
+        /// Where readable runs deposit their measurements, and where
+        /// `--record` reads the runs it takes a median over.
+        samples_path: Option<PathBuf>,
+        /// Overrides the default beside the report. An isolated checkout —
+        /// which `docs/PERFORMANCE.md` requires for acceptance runs — starts
+        /// with no history and therefore no trust verdict at all, so the
+        /// reviewer needs a way to carry one between runs.
+        history_path: Option<PathBuf>,
         mode: GateMode,
     },
     Help,
@@ -84,7 +112,7 @@ struct Entry {
     threshold_ns: f64,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 struct BaselineHost {
     id: String,
     architecture: String,
@@ -93,26 +121,62 @@ struct BaselineHost {
     rustc: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct Baseline {
     host: BaselineHost,
     recorded_at: String,
     git_revision: String,
     profile: String,
+    /// How many readable runs the medians were taken over. A baseline that
+    /// cannot say is one nobody can judge.
+    #[serde(default = "one_sample")]
+    samples: usize,
+    #[serde(rename = "_comment", default)]
+    comment: String,
     benchmarks: Vec<BaselineEntry>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct BaselineEntry {
     id: String,
     mean_ns: f64,
-    #[serde(default = "default_max_regression")]
+    /// Written back only where it overrides the default, so a recorded file
+    /// keeps saying which rows carry measured dispersion evidence and which
+    /// simply take the standard bound.
+    #[serde(
+        default = "default_max_regression",
+        skip_serializing_if = "is_default_max_regression"
+    )]
     max_regression: f64,
 }
 
 fn default_max_regression() -> f64 {
     0.05
 }
+
+/// Pre-#114 baselines carry no sample count; they were taken from one run.
+fn one_sample() -> usize {
+    1
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_max_regression(value: &f64) -> bool {
+    *value == default_max_regression()
+}
+
+/// What every recorded baseline says about itself, so the convention that
+/// produced #114 cannot be restated in the file it damaged.
+const BASELINE_COMMENT: &str = "Generated by `check_benchmark_thresholds --record` from repeated full \
+     `check_perf_thresholds.sh` runs on the host named above. Every row is the median of the same \
+     distinct runs in the same measurement environment: rows are never edited one at a time, \
+     because a filtered or partial \
+     run measures the same code materially differently (#114). To recalibrate, re-record the whole \
+     file and validate it with a fresh run.";
+
+/// The profile `scripts/check_perf_thresholds.sh` benches under. Criterion
+/// deliberately keeps the default release profile; the `production` profile
+/// (fat LTO, `panic=abort`) is what the load gate measures.
+const BASELINE_PROFILE: &str = "criterion release";
 
 /// When to stop believing a run.
 #[derive(Deserialize, Serialize, Clone, Copy, Debug)]
@@ -221,6 +285,33 @@ enum Trust {
 /// touches. Comparing against this host's own previous run keeps the check
 /// free of any absolute expectation, which would be as host-dependent as the
 /// thresholds the manifest already calls provisional.
+/// Rows whose own baseline records measured dispersion.
+///
+/// A benchmark that carries a widened `max_regression` was widened because
+/// somebody measured it moving between quiet runs, so a wide confidence
+/// interval is what it does rather than evidence about the host. Counting it
+/// toward the breadth signal below inverts that signal's meaning: across ten
+/// full #114 runs, 39 of 61 unstable flags landed on these thirteen rows, and
+/// `admission/full_check_contended_8_sharded` was flagged in all ten. With a
+/// tenth of the manifest permanently noisy, "many benchmarks are unreadable"
+/// stopped distinguishing a disturbed machine from an ordinary Tuesday, and
+/// half of one session's runs abstained for no reason.
+fn dispersion_prone(entries: Option<&BTreeMap<String, &BaselineEntry>>) -> BTreeSet<String> {
+    entries
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|(_, entry)| entry.max_regression > default_max_regression())
+                .map(|(id, _)| id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `unstable` and `measured` count only the rows that are *normally* steady —
+/// see [`dispersion_prone`]. Rows known to disperse are still flagged
+/// individually and still make their ratios inconclusive; they simply do not
+/// vote on whether the host was disturbed.
 fn assess_trust(
     current: &BTreeMap<String, f64>,
     previous: &BTreeMap<String, f64>,
@@ -302,9 +393,14 @@ fn all_results_passed(
             .iter()
             .all(|ratio| matches!(ratio.status, "pass" | "inconclusive"))
         && ratios_reached_a_verdict(ratios)
+        // `inconclusive` is not a pass here either; it is the absence of a
+        // verdict on a measurement the gate declined to read, allowed through
+        // for the same reason and stopped from becoming a gate that can never
+        // fail by the same kind of whole-run guard.
         && regressions
             .iter()
             .all(|regression| regression.status != "regressed")
+        && regressions_reached_a_verdict(regressions)
 }
 
 /// A ratio is only as readable as the two measurements it divides.
@@ -438,6 +534,20 @@ fn ratios_reached_a_verdict(ratios: &[RatioRow]) -> bool {
     ratios.is_empty() || ratios.iter().any(|ratio| ratio.status != "inconclusive")
 }
 
+/// The recorded-baseline counterpart: an enforced run in which every row it
+/// could compare came back `inconclusive` has measured nothing about this
+/// host, and must not read as a run that passed.
+fn regressions_reached_a_verdict(regressions: &[RegressionRow]) -> bool {
+    let comparable = regressions
+        .iter()
+        .filter(|row| matches!(row.status, "pass" | "regressed" | "inconclusive"))
+        .count();
+    comparable == 0
+        || regressions
+            .iter()
+            .any(|row| matches!(row.status, "pass" | "regressed"))
+}
+
 /// How far a measurement has moved from its previous value, as a fraction.
 ///
 /// `None` when there is nothing to compare against, or when the previous
@@ -513,27 +623,59 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
 
     let mut mode = GateMode::Full;
     let mut baseline_path = None;
+    let mut record_path = None;
+    let mut samples_path = None;
+    let mut history_path = None;
     let mut positional = Vec::new();
     let mut index = 0;
     while index < option_end {
-        match args[index].as_str() {
-            "--ratios-only" if mode == GateMode::Full => mode = GateMode::RatiosOnly,
-            "--ratios-only" => return Err("--ratios-only may be specified only once".to_owned()),
-            "--baseline" if baseline_path.is_none() => {
+        // Each path option is `--name <path>`; the slot it fills is what
+        // differs, so the arity and the "once only" rule live in one place.
+        let slot = match args[index].as_str() {
+            "--ratios-only" if mode == GateMode::Full => {
+                mode = GateMode::RatiosOnly;
                 index += 1;
-                if index >= option_end || args[index].starts_with('-') {
-                    return Err("--baseline requires a path".to_owned());
-                }
-                baseline_path = Some(PathBuf::from(&args[index]));
+                continue;
             }
-            "--baseline" => return Err("--baseline may be specified only once".to_owned()),
+            "--ratios-only" => {
+                return Err("--ratios-only may be specified only once".to_owned());
+            }
+            "--baseline" => &mut baseline_path,
+            "--record" => &mut record_path,
+            "--samples" => &mut samples_path,
+            "--history" => &mut history_path,
             value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
-            _ => positional.push(args[index].clone()),
+            _ => {
+                positional.push(args[index].clone());
+                index += 1;
+                continue;
+            }
+        };
+        let name = args[index].clone();
+        if slot.is_some() {
+            return Err(format!("{name} may be specified only once"));
         }
+        index += 1;
+        if index >= option_end || args[index].starts_with('-') {
+            return Err(format!("{name} requires a path"));
+        }
+        *slot = Some(PathBuf::from(&args[index]));
         index += 1;
     }
     if let Some(separator) = separator {
         positional.extend_from_slice(&args[separator + 1..]);
+    }
+
+    // Recording is an absolute, host-specific measurement of every row. A
+    // ratios-only run deliberately reaches no absolute verdict, so it has
+    // nothing to record from.
+    if record_path.is_some() && mode == GateMode::RatiosOnly {
+        return Err(
+            "--record is a full-run mode; it cannot be combined with --ratios-only".to_owned(),
+        );
+    }
+    if record_path.is_some() && samples_path.is_none() {
+        return Err("--record requires --samples <dir>".to_owned());
     }
 
     match positional.as_slice() {
@@ -543,6 +685,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             report_path: PathBuf::from(report),
             marker_path: PathBuf::from(marker),
             baseline_path,
+            record_path,
+            samples_path,
+            history_path,
             mode,
         }),
         _ => Err(USAGE.to_owned()),
@@ -579,11 +724,451 @@ fn baseline_entries(baseline: &Baseline) -> Result<BTreeMap<String, &BaselineEnt
     Ok(entries)
 }
 
+/// The provenance a recorded baseline must carry, taken from the run that is
+/// about to become it.
+///
+/// Every field is required. Before #114 the file's single header claimed one
+/// `recorded_at` and one `git_revision` for rows measured across four runs on
+/// four revisions, and the revision it named was a tip of an unmerged feature
+/// branch that squash-merge never put on `main`. Provenance that the tool
+/// cannot supply is provenance a person invents, so the gate refuses to record
+/// rather than write a header it made up.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+struct RecordContext {
+    host: BaselineHost,
+    revision: String,
+    profile: String,
+}
+
+/// Whether a revision string identifies a specific, committed tree.
+///
+/// The wrapper marks a dirty worktree rather than hiding it, and a baseline
+/// recorded from uncommitted work names a state nobody can check out again.
+fn is_recordable_revision(revision: &str) -> bool {
+    revision.len() == 40 && revision.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn record_context(var: impl Fn(&str) -> Option<String>) -> Result<RecordContext, String> {
+    let required = |name: &str| -> Result<String, String> {
+        match var(name) {
+            Some(value) if !value.trim().is_empty() => Ok(value.trim().to_owned()),
+            _ => Err(format!(
+                "--record needs {name}; refusing to invent provenance"
+            )),
+        }
+    };
+    let revision = required("TOLLGATE_GATE_REVISION")?;
+    if !is_recordable_revision(&revision) {
+        return Err(format!(
+            "--record needs a committed revision; TOLLGATE_GATE_REVISION was {revision:?}"
+        ));
+    }
+    Ok(RecordContext {
+        host: BaselineHost {
+            id: required("TOLLGATE_PERF_HOST")?,
+            architecture: required("TOLLGATE_GATE_TARGET")?,
+            cpu: required("TOLLGATE_GATE_CPU")?,
+            os: required("TOLLGATE_GATE_OS")?,
+            rustc: required("TOLLGATE_GATE_RUSTC")?,
+        },
+        revision,
+        profile: BASELINE_PROFILE.to_owned(),
+    })
+}
+
+/// The fewest readable runs a recording may be taken from.
+///
+/// One run is not enough, and #114 proved it twice. The recorded file it
+/// replaced was assembled a row at a time; the first attempt to replace it
+/// recorded every row at once but from a single run, which happened to be the
+/// fastest of the session — so `managed_credential/verify` went in at 794.5 ns
+/// against 827-843 ns in every other run, and the next run failed it. A
+/// baseline has to describe where a benchmark usually lands, and one sample
+/// cannot say. `docs/DESIGN.md` has required a median of repeated runs since
+/// #91; this is that requirement made mechanical rather than remembered.
+const MIN_RECORD_SAMPLES: usize = 3;
+
+/// One readable run's measurements, deposited for a later recording.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+struct Sample {
+    /// Nanoseconds since the epoch of the benchmark's freshness marker, not
+    /// the time the checker happened to process its output.
+    run_id: String,
+    context: RecordContext,
+    recorded_at: String,
+    means: BTreeMap<String, f64>,
+}
+
+impl Sample {
+    fn validate(&self) -> Result<(), String> {
+        if self.run_id.is_empty() || !self.run_id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("invalid benchmark run id".to_owned());
+        }
+        if self.means.is_empty() || self.means.values().any(|v| !v.is_finite() || *v <= 0.0) {
+            return Err("sample means must be finite and positive".to_owned());
+        }
+        Ok(())
+    }
+
+    fn same_measurement(&self, other: &Self) -> bool {
+        self.run_id == other.run_id && self.context == other.context && self.means == other.means
+    }
+}
+
+// Old deposits cannot establish independent runs or comparable environments.
+// Recognize them to give an actionable migration warning, never a fake default.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredSample {
+    Current(Sample),
+    Legacy {
+        revision: String,
+        recorded_at: String,
+        means: BTreeMap<String, f64>,
+    },
+}
+
+/// Per-row median across the samples, which is what a baseline row means.
+///
+/// The median rather than the mean: a contaminated run skews a mean and only
+/// displaces a median, and the runs being combined are exactly the ones whose
+/// contamination the gate cannot always detect.
+fn median_of(mut values: Vec<f64>) -> Option<f64> {
+    if values.is_empty()
+        || values
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).expect("finite means are ordered"));
+    let mid = values.len() / 2;
+    Some(if values.len().is_multiple_of(2) {
+        values[mid - 1] + (values[mid] - values[mid - 1]) / 2.0
+    } else {
+        values[mid]
+    })
+}
+
+/// Count each benchmark run once, retaining only exactly matching recording
+/// contexts. A copied file cannot increase the population; divergent copies
+/// of one run are an error rather than an arbitrary winner.
+fn load_samples(dir: &Path, context: &RecordContext) -> Result<Vec<Sample>, String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("cannot read samples {}: {e}", dir.display()))?;
+    let mut samples: BTreeMap<String, Sample> = BTreeMap::new();
+    for entry in entries {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let stored: StoredSample = serde_json::from_str(&text)
+            .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+        let sample = match stored {
+            StoredSample::Current(sample) => sample,
+            StoredSample::Legacy {
+                revision,
+                recorded_at,
+                means,
+            } => {
+                eprintln!(
+                    "perf-gate: skipping legacy sample {} ({} rows at {revision}, {recorded_at}): \
+                     missing run identity and environment; collect a new series with --fresh-samples",
+                    path.display(),
+                    means.len()
+                );
+                continue;
+            }
+        };
+        sample
+            .validate()
+            .map_err(|e| format!("invalid sample {}: {e}", path.display()))?;
+        if let Some(previous) = samples.get(&sample.run_id) {
+            if !previous.same_measurement(&sample) {
+                return Err(format!(
+                    "conflicting samples for benchmark run {}",
+                    sample.run_id
+                ));
+            }
+        } else {
+            samples.insert(sample.run_id.clone(), sample);
+        }
+    }
+    Ok(samples
+        .into_values()
+        .filter(|sample| {
+            if &sample.context == context {
+                true
+            } else {
+                eprintln!(
+                    "perf-gate: skipping sample {}: revision or measurement environment differs",
+                    sample.run_id
+                );
+                false
+            }
+        })
+        .collect())
+}
+
+/// Deposit this run's measurements so a later `--record` can take a median
+/// over it. Only ever called for a run the gate was willing to read.
+fn write_sample(dir: &Path, sample: &Sample) -> Result<(), String> {
+    sample.validate()?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let path = dir.join(format!("run-{}.json", sample.run_id));
+    // A separate staging file per writer, published exclusively by hard link:
+    // readers see complete JSON, and a retry cannot replace original evidence.
+    static NEXT_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = NEXT_STAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut staged = StagedFile::create(
+        path.with_extension(format!("{}-{sequence}.staged", std::process::id())),
+    )?;
+    let text = serde_json::to_string_pretty(sample).map_err(|e| e.to_string())?;
+    staged.write(&text)?;
+    if let Err(error) = std::fs::hard_link(&staged.path, &path) {
+        // Publication is already satisfied only by identical existing evidence,
+        // regardless of which filesystem error prevented this writer's link.
+        let previous: Sample = std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
+            .map_err(|e| {
+                format!(
+                    "cannot publish {}: {error}; cannot read existing sample: {e}",
+                    path.display()
+                )
+            })?;
+        if !previous.same_measurement(sample) {
+            return Err(format!(
+                "conflicting sample for benchmark run {}; original preserved",
+                sample.run_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Exclusive staging also serializes baseline recorders from destination
+/// validation through promotion. An interrupted writer leaves a visible
+/// .staged file; an operator must confirm it has stopped before removing it.
+struct StagedFile {
+    path: PathBuf,
+    file: std::fs::File,
+    cleanup: bool,
+}
+
+impl StagedFile {
+    fn create(path: PathBuf) -> Result<Self, String> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| format!("cannot exclusively stage {}: {e}", path.display()))?;
+        Ok(Self {
+            path,
+            file,
+            cleanup: true,
+        })
+    }
+
+    fn write(&mut self, text: &str) -> Result<(), String> {
+        writeln!(self.file, "{text}")
+            .map_err(|e| format!("cannot write {}: {e}", self.path.display()))
+    }
+
+    fn promote(mut self, path: &Path) -> Result<(), String> {
+        std::fs::rename(&self.path, path)
+            .map_err(|e| format!("cannot promote {}: {e}", path.display()))?;
+        self.cleanup = false;
+        Ok(())
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Build the replacement baseline: every manifest row, from the median of the
+/// samples taken at this revision.
+///
+/// A missing measurement is an error rather than an omitted row. Omitting it
+/// is precisely how the checked-in file came to hold rows from four different
+/// runs, and how thirteen benchmarks the gate runs ended up with no recorded
+/// mean at all.
+fn recorded_baseline(
+    context: &RecordContext,
+    previous: Option<&Baseline>,
+    manifest: &Manifest,
+    samples: &[BTreeMap<String, f64>],
+    recorded_at: String,
+) -> Result<Baseline, String> {
+    if samples.len() < MIN_RECORD_SAMPLES {
+        return Err(format!(
+            "a baseline is recorded from the median of at least {MIN_RECORD_SAMPLES} readable \
+             runs at this revision; {} available. Run the gate again with the same --samples \
+             directory.",
+            samples.len()
+        ));
+    }
+    let mut measured: BTreeMap<String, f64> = BTreeMap::new();
+    for entry in &manifest.benchmarks {
+        let values: Vec<f64> = samples
+            .iter()
+            .filter_map(|sample| sample.get(&entry.id).copied())
+            .collect();
+        // Every sample must have measured every row, or the "median" is taken
+        // over a different population per row.
+        if values.len() == samples.len()
+            && let Some(median) = median_of(values)
+        {
+            measured.insert(entry.id.clone(), median);
+        }
+    }
+    recorded_baseline_from(
+        context,
+        previous,
+        manifest,
+        &measured,
+        recorded_at,
+        samples.len(),
+    )
+}
+
+fn recorded_baseline_from(
+    context: &RecordContext,
+    previous: Option<&Baseline>,
+    manifest: &Manifest,
+    measured: &BTreeMap<String, f64>,
+    recorded_at: String,
+    samples: usize,
+) -> Result<Baseline, String> {
+    if let Some(previous) = previous
+        && previous.host.id != context.host.id
+    {
+        return Err(format!(
+            "refusing to overwrite the baseline for host {:?} with a run on {:?}",
+            previous.host.id, context.host.id
+        ));
+    }
+    let carried: BTreeMap<&str, f64> = previous
+        .map(|previous| {
+            previous
+                .benchmarks
+                .iter()
+                .map(|entry| (entry.id.as_str(), entry.max_regression))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut benchmarks = Vec::with_capacity(manifest.benchmarks.len());
+    let mut missing = Vec::new();
+    for entry in &manifest.benchmarks {
+        match measured.get(&entry.id) {
+            Some(&mean_ns) => benchmarks.push(BaselineEntry {
+                id: entry.id.clone(),
+                mean_ns,
+                max_regression: carried
+                    .get(entry.id.as_str())
+                    .copied()
+                    .unwrap_or_else(default_max_regression),
+            }),
+            None => missing.push(entry.id.as_str()),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "the samples cover {} of {} benchmarks; a baseline is recorded whole or not at all \
+             (missing: {})",
+            benchmarks.len(),
+            manifest.benchmarks.len(),
+            missing.join(", ")
+        ));
+    }
+    Ok(Baseline {
+        host: context.host.clone(),
+        recorded_at,
+        git_revision: context.revision.clone(),
+        profile: context.profile.clone(),
+        samples,
+        comment: BASELINE_COMMENT.to_owned(),
+        benchmarks,
+    })
+}
+
+/// Stage, validate, then promote — so a failed record leaves the previous
+/// last-known-good baseline exactly where it was.
+fn write_baseline(staged: StagedFile, path: &Path, baseline: &Baseline) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(baseline).map_err(|e| e.to_string())?;
+    let mut staged = staged;
+    staged.write(&text)?;
+    std::fs::read_to_string(&staged.path)
+        .map_err(|e| e.to_string())
+        .and_then(|text| serde_json::from_str::<Baseline>(&text).map_err(|e| e.to_string()))
+        .and_then(|parsed| baseline_entries(&parsed).map(|_| ()))
+        .map_err(|e| format!("staged baseline did not validate: {e}"))?;
+    staged.promote(path)
+}
+
+/// Validate the actual destination while exclusively owning its staging slot.
+/// `--baseline` is only the comparison input and cannot authorize replacement.
+fn record_baseline(
+    path: &Path,
+    context: &RecordContext,
+    manifest: &Manifest,
+    samples_dir: &Path,
+) -> Result<usize, String> {
+    let staged = StagedFile::create(path.with_extension("json.staged"))?;
+    let previous: Option<Baseline> = match std::fs::read_to_string(path) {
+        Ok(text) => Some(
+            serde_json::from_str(&text)
+                .map_err(|e| format!("cannot parse destination {}: {e}", path.display()))?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(format!(
+                "cannot read destination {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if let Some(previous) = &previous {
+        baseline_entries(previous)?;
+    }
+    let samples = load_samples(samples_dir, context)?;
+    let means: Vec<_> = samples.into_iter().map(|sample| sample.means).collect();
+    let baseline = recorded_baseline(
+        context,
+        previous.as_ref(),
+        manifest,
+        &means,
+        jiff::Timestamp::now().to_string(),
+    )?;
+    write_baseline(staged, path, &baseline)?;
+    Ok(baseline.samples)
+}
+
+/// Compare one row against its recorded baseline.
+///
+/// `unstable` is the judgement `ReportRow::unstable` already made and printed.
+/// A row whose own confidence interval was too wide to read yields
+/// `inconclusive` rather than `regressed`, for the same reason #112 gave the
+/// ratio path: declaring a measurement unreadable and then drawing a verdict
+/// from it says something about the code on the strength of a number the gate
+/// has said nothing can be concluded from. #114 found the ratio path had been
+/// fixed and this one had not — a validating run failed
+/// `admission/request_rate_token` at 173.1 ns against 126-132 ns in every
+/// neighbouring run, on a row it had flagged unstable in the same report.
 fn evaluate_regression(
     id: &str,
     measured_ns: Option<f64>,
     baseline: Option<&BaselineEntry>,
     enforced: bool,
+    unstable: bool,
 ) -> RegressionRow {
     let (baseline_ns, max_regression) = baseline
         .map(|entry| (Some(entry.mean_ns), Some(entry.max_regression)))
@@ -601,6 +1186,10 @@ fn evaluate_regression(
         {
             "pass"
         }
+        // Checked after the bound, so a row that passes on an unstable
+        // measurement still passes: instability is only ever a reason to
+        // withhold a *failure*, never to manufacture one.
+        (true, Some(_), Some(_)) if unstable => "inconclusive",
         (true, Some(_), Some(_)) => "regressed",
     };
     RegressionRow {
@@ -610,6 +1199,62 @@ fn evaluate_regression(
         ratio,
         max_regression,
         status,
+    }
+}
+
+/// How the whole run sat against the recorded baseline, independent of any
+/// single row's verdict.
+///
+/// #114's failing run put nine rows over their 5% bound while the median of
+/// all forty-five baselined rows sat at ×1.030 — the machine was slow, and the
+/// rows that crossed were simply the ones with the least headroom. Nothing in
+/// the report said so, and reconstructing it took reading every row. A gate
+/// that can distinguish a regression from a busy host should say which it
+/// thinks it saw.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
+struct RunDrift {
+    compared: usize,
+    median_ratio: f64,
+    p25_ratio: f64,
+    p75_ratio: f64,
+}
+
+/// Nearest-rank quartiles over the per-row ratios the regression rows already
+/// carry — including on a run that did not enforce the baseline, because the
+/// ratio is a description of the measurement and not a verdict about it.
+fn run_drift(regressions: &[RegressionRow]) -> Option<RunDrift> {
+    let mut ratios: Vec<f64> = regressions
+        .iter()
+        .filter_map(|regression| regression.ratio)
+        .filter(|ratio| ratio.is_finite())
+        .collect();
+    if ratios.is_empty() {
+        return None;
+    }
+    ratios.sort_by(|a, b| a.partial_cmp(b).expect("finite ratios are ordered"));
+    // The population is nonempty and the only fractions below are 1/4,
+    // 1/2 and 3/4, so each truncated index is strictly below its length.
+    let at = |fraction: f64| -> f64 { ratios[(ratios.len() as f64 * fraction) as usize] };
+    Some(RunDrift {
+        compared: ratios.len(),
+        median_ratio: at(0.5),
+        p25_ratio: at(0.25),
+        p75_ratio: at(0.75),
+    })
+}
+
+/// Whether a full run reached no recorded-baseline verdict at all.
+///
+/// `untrusted-run` is excluded because that run already fails with
+/// `UNTRUSTED_EXIT` and its own explanation; this is about the run that looked
+/// like a pass. `no-baseline-file`, `host-unset` and `host-mismatch` all mean
+/// the same thing to a reviewer holding the report as acceptance evidence:
+/// the host-specific bound was not checked.
+fn baseline_verdict_missing(mode: GateMode, skip_reason: Option<&str>) -> bool {
+    match (mode, skip_reason) {
+        (GateMode::RatiosOnly, _) | (GateMode::Full, None) => false,
+        (GateMode::Full, Some("untrusted-run")) => false,
+        (GateMode::Full, Some(_)) => true,
     }
 }
 
@@ -672,7 +1317,7 @@ struct RatioRow {
     status: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct RegressionRow {
     id: String,
     measured_ns: Option<f64>,
@@ -739,6 +1384,14 @@ struct RunContext {
     /// Captured by the wrapper script, which can read it portably; absent
     /// when the gate is invoked directly.
     load_average: Option<String>,
+    /// Swap in use and free memory, same provenance.
+    ///
+    /// #114 spent an evening attributing wide confidence intervals to load
+    /// average and CPU idle, both of which looked fine, while the host sat at
+    /// 6.5 GB of 8 GB swap with sixty megabytes of free pages. A run taken
+    /// while the machine is paging is not a measurement of the code, and the
+    /// report said nothing that would have shown it.
+    memory: Option<String>,
 }
 
 impl RunContext {
@@ -750,6 +1403,7 @@ impl RunContext {
                 .unwrap_or_default(),
             available_parallelism: std::thread::available_parallelism().ok().map(Into::into),
             load_average: std::env::var("TOLLGATE_GATE_LOAD").ok(),
+            memory: std::env::var("TOLLGATE_GATE_MEMORY").ok(),
         }
     }
 }
@@ -762,6 +1416,8 @@ struct Report {
     passed: bool,
     mode: GateMode,
     baseline: BaselineReport,
+    /// Absent only when no row had a baseline to compare against.
+    drift: Option<RunDrift>,
     trust: Trust,
     policy: TrustPolicy,
     run: RunContext,
@@ -780,36 +1436,55 @@ fn fail(msg: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (manifest_path, criterion_root, report_path, marker_path, baseline_path, mode) =
-        match parse_args(&args) {
-            Ok(Command::Run {
-                manifest_path,
-                criterion_root,
-                report_path,
-                marker_path,
-                baseline_path,
-                mode,
-            }) => (
-                manifest_path,
-                criterion_root,
-                report_path,
-                marker_path,
-                baseline_path,
-                mode,
-            ),
-            Ok(Command::Help) => {
-                println!("{USAGE}");
-                return ExitCode::SUCCESS;
-            }
-            Ok(Command::Version) => {
-                println!("check_benchmark_thresholds {}", env!("CARGO_PKG_VERSION"));
-                return ExitCode::SUCCESS;
-            }
-            Err(error) => return fail(&error),
-        };
-    // Beside the report, not beside the manifest: it is generated output that
-    // describes this host, never a checked-in expectation.
-    let history_path = report_path.with_file_name("perf_gate_history.json");
+    let (
+        manifest_path,
+        criterion_root,
+        report_path,
+        marker_path,
+        baseline_path,
+        record_path,
+        samples_dir,
+        history_override,
+        mode,
+    ) = match parse_args(&args) {
+        Ok(Command::Run {
+            manifest_path,
+            criterion_root,
+            report_path,
+            marker_path,
+            baseline_path,
+            record_path,
+            samples_path,
+            history_path,
+            mode,
+        }) => (
+            manifest_path,
+            criterion_root,
+            report_path,
+            marker_path,
+            baseline_path,
+            record_path,
+            samples_path,
+            history_path,
+            mode,
+        ),
+        Ok(Command::Help) => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Ok(Command::Version) => {
+            println!("check_benchmark_thresholds {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => return fail(&error),
+    };
+    // Beside the report by default, not beside the manifest: it is generated
+    // output that describes this host, never a checked-in expectation. The
+    // override exists because acceptance runs happen in an isolated checkout,
+    // where the default path is empty on every run and the trust verdict is
+    // therefore always `no_history`.
+    let history_path =
+        history_override.unwrap_or_else(|| report_path.with_file_name("perf_gate_history.json"));
 
     let manifest: Manifest = match std::fs::read_to_string(&manifest_path)
         .map_err(|e| e.to_string())
@@ -939,12 +1614,20 @@ fn main() -> ExitCode {
     if let Some(note) = no_verdict_note(ratios_reached_a_verdict(&ratios)) {
         eprintln!("{note}");
     }
-    let measured = rows.iter().filter(|row| row.mean_ns.is_some()).count();
+    // Breadth is judged over the rows that are normally steady, so a manifest
+    // that grew a family of inherently noisy contention benchmarks does not
+    // keep declaring quiet runs unreadable (#114).
+    let prone = dispersion_prone(baseline_by_id.as_ref());
+    let steady_unstable = unstable.iter().filter(|id| !prone.contains(*id)).count();
+    let steady_measured = rows
+        .iter()
+        .filter(|row| row.mean_ns.is_some() && !prone.contains(&row.id))
+        .count();
     let trust = assess_trust(
         &current,
         &previous,
-        unstable.len(),
-        measured,
+        steady_unstable,
+        steady_measured,
         &manifest.trust,
     );
 
@@ -967,6 +1650,7 @@ fn main() -> ExitCode {
                     .as_ref()
                     .and_then(|entries| entries.get(&entry.id).copied()),
                 baseline_enforced,
+                unstable.contains(&entry.id),
             )
         })
         .collect();
@@ -975,13 +1659,24 @@ fn main() -> ExitCode {
             eprintln!("{line}");
         }
     }
-    let passed = all_results_passed(&rows, &ratios, &regressions);
     let skip_reason = baseline_skip_reason(
         mode,
         baseline.as_ref().map(|baseline| baseline.host.id.as_str()),
         active_host.as_deref(),
         untrusted,
     );
+    let drift = run_drift(&regressions);
+    if let Some(drift) = drift {
+        println!(
+            "perf-gate: run drift: median x{:.3} (IQR x{:.3}-x{:.3}) across {} baselined rows",
+            drift.median_ratio, drift.p25_ratio, drift.p75_ratio, drift.compared
+        );
+    }
+    // A full run that reached no baseline verdict is not a pass, whatever the
+    // rows say: the artifact a reviewer holds must not read as evidence for a
+    // check that never ran.
+    let passed = all_results_passed(&rows, &ratios, &regressions)
+        && !baseline_verdict_missing(mode, skip_reason);
 
     let report = Report {
         rows,
@@ -995,6 +1690,7 @@ fn main() -> ExitCode {
             enforced: baseline_enforced,
             skip_reason,
         },
+        drift,
         trust: trust.clone(),
         policy: manifest.trust,
         run: RunContext::capture(),
@@ -1041,6 +1737,77 @@ fn main() -> ExitCode {
         return ExitCode::from(UNTRUSTED_EXIT);
     }
 
+    // Deposit and record only past the trust guards above: a baseline is the
+    // yardstick every later run is judged by, so it is never taken from a run
+    // the gate would not draw a conclusion from.
+    //
+    // The verdict below still describes this run against the *previous*
+    // baseline. That is deliberate — the recorded file is a proposal, and the
+    // fresh run that validates it is the evidence.
+    let record_context = record_context(|name| std::env::var(name).ok());
+    // Only a run that measured the whole manifest is a sample. A partial run
+    // deposited one during #114 — its benchmarks were interrupted after 33 of
+    // 58 rows — and while the completeness check below refused to record from
+    // it, the file sat in the directory poisoning every later attempt.
+    let complete = manifest
+        .benchmarks
+        .iter()
+        .all(|entry| current.contains_key(&entry.id));
+    if let Some(dir) = samples_dir.as_ref().filter(|_| mode == GateMode::Full) {
+        let deposited = (|| {
+            if !complete {
+                return Err(format!(
+                    "this run measured {} of {} benchmarks; every sample must cover the whole manifest",
+                    current.len(),
+                    manifest.benchmarks.len()
+                ));
+            }
+            let context = record_context.as_ref().map_err(Clone::clone)?;
+            let run_id = marker_mtime
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(|e| format!("invalid benchmark run marker: {e}"))?
+                .as_nanos()
+                .to_string();
+            let sample = Sample {
+                run_id,
+                context: context.clone(),
+                recorded_at: jiff::Timestamp::try_from(marker_mtime)
+                    .map_err(|e| e.to_string())?
+                    .to_string(),
+                means: current.clone(),
+            };
+            write_sample(dir, &sample)
+        })();
+        match deposited {
+            Ok(()) => println!(
+                "perf-gate: retained this benchmark run in {} (retries count once)",
+                dir.display()
+            ),
+            Err(error) if record_path.is_some() => {
+                return fail(&format!("cannot deposit sample: {error}"));
+            }
+            Err(error) => {
+                eprintln!("perf-gate: not depositing a sample: {error}; gate verdict unchanged")
+            }
+        }
+    }
+    if let Some(record_path) = record_path.as_ref() {
+        let recorded = record_context.and_then(|context| {
+            let dir = samples_dir
+                .as_deref()
+                .ok_or("--record requires --samples <dir>")?;
+            record_baseline(record_path, &context, &manifest, dir)
+        });
+        match recorded {
+            Ok(samples) => println!(
+                "perf-gate: recorded {} rows to {} from the median of {samples} runs",
+                manifest.benchmarks.len(),
+                record_path.display()
+            ),
+            Err(error) => return fail(&format!("cannot record baseline: {error}")),
+        }
+    }
+
     // Only a believable run is worth remembering.
     if let Err(e) = std::fs::write(
         &history_path,
@@ -1051,6 +1818,17 @@ fn main() -> ExitCode {
              compare against)",
             history_path.display()
         );
+    }
+
+    if baseline_verdict_missing(mode, skip_reason) {
+        eprintln!(
+            "perf-gate: UNENFORCED — a full run skipped the recorded baseline ({}). Absolute \
+             bounds passing is not a passing baseline comparison, and this report is not \
+             performance evidence. Set TOLLGATE_PERF_HOST to the host the baseline names, or \
+             run --ratios-only and say so.",
+            skip_reason.unwrap_or("unknown")
+        );
+        return ExitCode::from(UNENFORCED_EXIT);
     }
 
     if passed {
@@ -1078,6 +1856,12 @@ fn read_estimates(path: &Path, marker_mtime: SystemTime) -> Result<Measurement, 
     let estimates: Estimates =
         serde_json::from_str(&text).map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
     let mean_ns = estimates.mean.point_estimate;
+    if !mean_ns.is_finite() || mean_ns <= 0.0 {
+        return Err(format!(
+            "invalid mean in {}: expected finite positive nanoseconds",
+            path.display()
+        ));
+    }
     Ok(Measurement {
         mean_ns,
         ci_width: relative_ci_width(mean_ns, estimates.mean.confidence_interval),
@@ -1135,6 +1919,9 @@ mod tests {
                 report_path: PathBuf::from("report.json"),
                 marker_path: PathBuf::from("marker"),
                 baseline_path: Some(PathBuf::from("baseline.json")),
+                record_path: None,
+                samples_path: None,
+                history_path: None,
                 mode: GateMode::RatiosOnly,
             })
         );
@@ -1152,6 +1939,9 @@ mod tests {
                 report_path: PathBuf::from("report.json"),
                 marker_path: PathBuf::from("marker"),
                 baseline_path: None,
+                record_path: None,
+                samples_path: None,
+                history_path: None,
                 mode: GateMode::Full,
             })
         );
@@ -1185,6 +1975,72 @@ mod tests {
             Err("unknown option: --wat".to_owned())
         );
         assert_eq!(parse_args(&[]), Err(USAGE.to_owned()));
+        for once in ["--record", "--samples", "--history"] {
+            assert_eq!(
+                parse_args(&strings(&[once])),
+                Err(format!("{once} requires a path"))
+            );
+            assert_eq!(
+                parse_args(&strings(&[
+                    once,
+                    "first.json",
+                    once,
+                    "second.json",
+                    "manifest.json",
+                    "criterion",
+                    "report.json",
+                    "marker"
+                ])),
+                Err(format!("{once} may be specified only once"))
+            );
+        }
+    }
+
+    #[test]
+    fn cli_accepts_recording_and_an_explicit_history_but_not_recording_without_absolutes() {
+        assert_eq!(
+            parse_args(&strings(&[
+                "--baseline",
+                "baseline.json",
+                "--record",
+                "baseline.json",
+                "--samples",
+                "samples",
+                "--history",
+                "history.json",
+                "manifest.json",
+                "criterion",
+                "report.json",
+                "marker"
+            ])),
+            Ok(Command::Run {
+                manifest_path: PathBuf::from("manifest.json"),
+                criterion_root: PathBuf::from("criterion"),
+                report_path: PathBuf::from("report.json"),
+                marker_path: PathBuf::from("marker"),
+                baseline_path: Some(PathBuf::from("baseline.json")),
+                record_path: Some(PathBuf::from("baseline.json")),
+                samples_path: Some(PathBuf::from("samples")),
+                history_path: Some(PathBuf::from("history.json")),
+                mode: GateMode::Full,
+            })
+        );
+        // A ratios-only run reaches no absolute verdict, so it has nothing to
+        // record from.
+        assert_eq!(
+            parse_args(&strings(&[
+                "--ratios-only",
+                "--record",
+                "baseline.json",
+                "--samples",
+                "samples",
+                "manifest.json",
+                "criterion",
+                "report.json",
+                "marker"
+            ])),
+            Err("--record is a full-run mode; it cannot be combined with --ratios-only".to_owned())
+        );
     }
 
     #[test]
@@ -1192,44 +2048,716 @@ mod tests {
         let baseline: BaselineEntry =
             serde_json::from_str(r#"{"id":"admission/full_check","mean_ns":100.0}"#).unwrap();
         assert_eq!(baseline.max_regression, 0.05);
-        let boundary = evaluate_regression(&baseline.id, Some(105.0), Some(&baseline), true);
+        let boundary = evaluate_regression(&baseline.id, Some(105.0), Some(&baseline), true, false);
         assert_eq!(boundary.baseline_ns, Some(100.0));
         assert_eq!(boundary.ratio, Some(1.05));
         assert_eq!(boundary.max_regression, Some(0.05));
         assert_eq!(boundary.status, "pass");
         assert_eq!(
-            evaluate_regression(&baseline.id, Some(105.000_1), Some(&baseline), true).status,
+            evaluate_regression(&baseline.id, Some(105.000_1), Some(&baseline), true, false).status,
             "regressed"
         );
     }
 
     #[test]
-    fn checked_in_baseline_is_a_valid_subset_with_owned_rows_recorded() {
+    fn a_legacy_baseline_reports_one_sample_without_changing_explicit_counts() {
+        let recorded = recorded_baseline(
+            &recording_context(),
+            None,
+            &recording_manifest(&["a"]),
+            &vec![means(&[("a", 100.0)]); 3],
+            "now".to_owned(),
+        )
+        .unwrap();
+        let mut encoded = serde_json::to_value(recorded).unwrap();
+        let decoded: Baseline = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded.samples, 3);
+
+        encoded.as_object_mut().unwrap().remove("samples");
+        let legacy: Baseline = serde_json::from_value(encoded).unwrap();
+        assert_eq!(legacy.samples, 1);
+        assert_eq!(serde_json::to_value(legacy).unwrap()["samples"], 1);
+    }
+
+    /// The checked-in baseline covers the manifest exactly, in both
+    /// directions.
+    ///
+    /// This assertion used to be `entries.len() < manifest.benchmarks.len()` —
+    /// a guardrail that *required* the baseline to be incomplete and would
+    /// have failed the moment anyone finished the job. It passed for twelve
+    /// days while thirteen benchmarks the gate runs had no recorded mean at
+    /// all, and while the rows that did have one had been measured across four
+    /// separate runs (#114).
+    #[test]
+    fn checked_in_baseline_covers_every_benchmark_the_gate_runs() {
         let manifest: Manifest =
             serde_json::from_str(include_str!("../../../testing/perf_thresholds.json")).unwrap();
         let baseline: Baseline =
             serde_json::from_str(include_str!("../../../testing/perf_baseline.json")).unwrap();
         let entries = baseline_entries(&baseline).unwrap();
-        let manifest_ids: std::collections::BTreeSet<_> =
+        let manifest_ids: BTreeSet<&String> =
             manifest.benchmarks.iter().map(|entry| &entry.id).collect();
 
         assert_eq!(baseline.host.id, "mistral-apple-m1-pro");
+        let unknown: Vec<_> = entries
+            .keys()
+            .filter(|id| !manifest_ids.contains(id))
+            .collect();
         assert!(
-            entries.keys().all(|id| manifest_ids.contains(id)),
-            "a baseline row must name a benchmark the gate still runs"
+            unknown.is_empty(),
+            "a baseline row must name a benchmark the gate still runs: {unknown:?}"
         );
-        for owned in [
-            "admission/request_rate_token",
-            "admission/concurrency_acquire",
+        let unrecorded: Vec<_> = manifest_ids
+            .iter()
+            .filter(|id| !entries.contains_key(id.as_str()))
+            .collect();
+        assert!(
+            unrecorded.is_empty(),
+            "every benchmark the gate runs is recorded by the same full run: {unrecorded:?}"
+        );
+    }
+
+    fn record_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let map: BTreeMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |name: &str| map.get(name).cloned()
+    }
+
+    fn complete_record_env() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("TOLLGATE_PERF_HOST", "mistral-apple-m1-pro"),
+            (
+                "TOLLGATE_GATE_REVISION",
+                "6aac1c4000000000000000000000000000000000",
+            ),
+            ("TOLLGATE_GATE_TARGET", "aarch64-apple-darwin"),
+            ("TOLLGATE_GATE_CPU", "Apple M1 Pro (10 logical CPUs)"),
+            ("TOLLGATE_GATE_OS", "macOS 26.6.2 (Darwin 25.6.0)"),
+            ("TOLLGATE_GATE_RUSTC", "rustc 1.97.1"),
+        ]
+    }
+
+    #[test]
+    fn recording_refuses_provenance_it_would_have_to_invent() {
+        assert!(record_context(record_env(&complete_record_env())).is_ok());
+        for dropped in [
+            "TOLLGATE_PERF_HOST",
+            "TOLLGATE_GATE_REVISION",
+            "TOLLGATE_GATE_TARGET",
+            "TOLLGATE_GATE_CPU",
+            "TOLLGATE_GATE_OS",
+            "TOLLGATE_GATE_RUSTC",
         ] {
+            let env: Vec<_> = complete_record_env()
+                .into_iter()
+                .filter(|(name, _)| *name != dropped)
+                .collect();
             assert!(
-                entries.contains_key(owned),
-                "the owner that activates {owned} must record its controlled-host baseline"
+                record_context(record_env(&env)).is_err(),
+                "recording must refuse without {dropped}"
+            );
+            let blank: Vec<_> = complete_record_env()
+                .into_iter()
+                .map(|(name, value)| {
+                    if name == dropped {
+                        (name, " ")
+                    } else {
+                        (name, value)
+                    }
+                })
+                .collect();
+            assert!(
+                record_context(record_env(&blank)).is_err(),
+                "recording must refuse a blank {dropped}"
             );
         }
+    }
+
+    #[test]
+    fn recording_refuses_a_revision_nobody_can_check_out() {
+        assert!(is_recordable_revision(
+            "6aac1c4000000000000000000000000000000000"
+        ));
+        for rejected in [
+            "6aac1c4000000000000000000000000000000000-dirty",
+            "6aac1c4",
+            "",
+            "unknown",
+            "6aac1c400000000000000000000000000000000g",
+        ] {
+            assert!(
+                !is_recordable_revision(rejected),
+                "{rejected:?} does not identify a committed tree"
+            );
+            let env: Vec<_> = complete_record_env()
+                .into_iter()
+                .map(|(name, value)| {
+                    if name == "TOLLGATE_GATE_REVISION" {
+                        (name, rejected)
+                    } else {
+                        (name, value)
+                    }
+                })
+                .collect();
+            assert!(record_context(record_env(&env)).is_err());
+        }
+    }
+
+    fn recording_manifest(ids: &[&str]) -> Manifest {
+        Manifest {
+            benchmarks: ids
+                .iter()
+                .map(|id| Entry {
+                    id: (*id).to_owned(),
+                    target_ns: 10.0,
+                    threshold_ns: 100.0,
+                })
+                .collect(),
+            ratios: Vec::new(),
+            trust: TrustPolicy::default(),
+        }
+    }
+
+    fn recording_context() -> RecordContext {
+        record_context(record_env(&complete_record_env())).unwrap()
+    }
+
+    #[test]
+    fn a_baseline_is_recorded_whole_or_not_at_all() {
+        let manifest = recording_manifest(&["a", "b", "c"]);
+        let context = recording_context();
+        let whole = |m: BTreeMap<String, f64>| vec![m.clone(), m.clone(), m];
+        let partial = whole(means(&[("a", 1.0), ("c", 3.0)]));
+        let error = recorded_baseline(
+            &context,
+            None,
+            &manifest,
+            &partial,
+            "2026-09-10T00:00:00Z".to_owned(),
+        )
+        .expect_err("a partial record is the defect, not a convenience");
         assert!(
-            entries.len() < manifest.benchmarks.len(),
-            "not every historical benchmark has a controlled-host recording yet"
+            error.contains('b'),
+            "the error names what is missing: {error}"
+        );
+
+        let complete = whole(means(&[("a", 1.0), ("b", 2.0), ("c", 3.0)]));
+        let recorded = recorded_baseline(
+            &context,
+            None,
+            &manifest,
+            &complete,
+            "2026-09-10T00:00:00Z".to_owned(),
+        )
+        .expect("every row measured in every sample");
+        assert_eq!(recorded.benchmarks.len(), 3);
+        assert_eq!(recorded.samples, 3);
+        assert_eq!(recorded.git_revision, context.revision);
+        assert_eq!(recorded.host, context.host);
+        assert_eq!(recorded.profile, BASELINE_PROFILE);
+        assert_eq!(recorded.comment, BASELINE_COMMENT);
+        // Manifest order, so the file and the bounds it answers to read
+        // side by side.
+        let ids: Vec<_> = recorded.benchmarks.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn one_run_is_not_enough_to_record_a_baseline() {
+        let manifest = recording_manifest(&["a"]);
+        let sample = means(&[("a", 1.0)]);
+        for count in 0..MIN_RECORD_SAMPLES {
+            let samples = vec![sample.clone(); count];
+            let error = recorded_baseline(
+                &recording_context(),
+                None,
+                &manifest,
+                &samples,
+                "now".to_owned(),
+            )
+            .expect_err("a baseline describes where a benchmark usually lands");
+            assert!(error.contains("at least"), "{error}");
+        }
+        assert!(
+            recorded_baseline(
+                &recording_context(),
+                None,
+                &manifest,
+                &vec![sample; MIN_RECORD_SAMPLES],
+                "now".to_owned(),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_recorded_row_is_the_median_not_the_fastest_run() {
+        // The #114 failure this rule exists for: recording from the quickest
+        // run of a session put `managed_credential/verify` in at 794.5 ns
+        // against 827-843 ns everywhere else, and the next run failed it.
+        let manifest = recording_manifest(&["a"]);
+        let samples = vec![
+            means(&[("a", 794.5)]),
+            means(&[("a", 842.9)]),
+            means(&[("a", 835.2)]),
+        ];
+        let recorded = recorded_baseline(
+            &recording_context(),
+            None,
+            &manifest,
+            &samples,
+            "now".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(recorded.benchmarks[0].mean_ns, 835.2);
+        assert_eq!(median_of(vec![3.0, 1.0, 2.0]), Some(2.0));
+        assert_eq!(median_of(vec![4.0, 1.0, 2.0, 3.0]), Some(2.5));
+        assert_eq!(median_of(Vec::new()), None);
+    }
+
+    #[test]
+    fn calibration_medians_reject_invalid_means_and_avoid_intermediate_overflow() {
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(median_of(vec![1.0, value, 2.0]), None);
+        }
+        assert_eq!(median_of(vec![f64::MAX, f64::MAX]), Some(f64::MAX));
+        assert_eq!(
+            median_of(vec![f64::MIN_POSITIVE; 4]),
+            Some(f64::MIN_POSITIVE)
+        );
+    }
+
+    #[test]
+    fn a_sample_requires_a_safe_identity_and_nonempty_positive_finite_means() {
+        let mut sample = Sample {
+            run_id: "123".to_owned(),
+            context: recording_context(),
+            recorded_at: "2026-09-11T00:00:00Z".to_owned(),
+            means: means(&[("a", 1.0)]),
+        };
+        assert!(sample.validate().is_ok());
+        for id in ["", "../123", "abc"] {
+            sample.run_id = id.to_owned();
+            assert!(sample.validate().is_err());
+        }
+        sample.run_id = "123".to_owned();
+        sample.means.clear();
+        assert!(sample.validate().is_err());
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            sample.means = means(&[("a", value)]);
+            assert!(sample.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn a_row_missing_from_any_sample_is_not_recorded_from_the_rest() {
+        // Otherwise each row's "median" is taken over a different population,
+        // and the file says nothing about which.
+        let manifest = recording_manifest(&["a", "b"]);
+        let samples = vec![
+            means(&[("a", 1.0), ("b", 2.0)]),
+            means(&[("a", 1.0)]),
+            means(&[("a", 1.0), ("b", 2.0)]),
+        ];
+        let error = recorded_baseline(
+            &recording_context(),
+            None,
+            &manifest,
+            &samples,
+            "now".to_owned(),
+        )
+        .expect_err("b was not measured by every sample");
+        assert!(error.contains('b'), "{error}");
+    }
+
+    #[test]
+    fn deposited_samples_are_read_back_only_for_the_revision_being_recorded() {
+        let dir = std::env::temp_dir().join(format!(
+            "tollgate-perf-gate-samples-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let mine = "e0fa2695772f000000000000000000000000abcd";
+        let other = "6aac1c4000000000000000000000000000000000";
+        for (revision, at, value) in [
+            (mine, "2026-09-10T18:00:00Z", 1.0),
+            (mine, "2026-09-10T18:10:00Z", 2.0),
+            // A sample from another revision measured different code; folding
+            // it into the median would describe neither.
+            (other, "2026-09-10T18:20:00Z", 99.0),
+        ] {
+            write_sample(
+                &dir,
+                &Sample {
+                    run_id: format!("{value:.0}"),
+                    context: RecordContext {
+                        revision: revision.to_owned(),
+                        ..recording_context()
+                    },
+                    recorded_at: at.to_owned(),
+                    means: means(&[("a", value)]),
+                },
+            )
+            .unwrap();
+        }
+        // A stray non-JSON file in the directory is ignored, not fatal.
+        std::fs::write(dir.join("notes.txt"), "scratch").unwrap();
+
+        let mut values: Vec<f64> = load_samples(
+            &dir,
+            &RecordContext {
+                revision: mine.to_owned(),
+                ..recording_context()
+            },
+        )
+        .unwrap()
+        .iter()
+        .map(|sample| sample.means["a"])
+        .collect();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(values, vec![1.0, 2.0]);
+        assert_eq!(
+            load_samples(
+                &dir,
+                &RecordContext {
+                    revision: other.to_owned(),
+                    ..recording_context()
+                }
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn recording_carries_forward_measured_regression_bounds() {
+        let manifest = recording_manifest(&["a", "b"]);
+        let previous = Baseline {
+            host: recording_context().host,
+            recorded_at: "old".to_owned(),
+            git_revision: "old".to_owned(),
+            profile: "old".to_owned(),
+            samples: 3,
+            comment: String::new(),
+            benchmarks: vec![BaselineEntry {
+                id: "a".to_owned(),
+                mean_ns: 1.0,
+                max_regression: 0.15,
+            }],
+        };
+        let recorded = recorded_baseline(
+            &recording_context(),
+            Some(&previous),
+            &manifest,
+            &vec![means(&[("a", 2.0), ("b", 3.0)]); 3],
+            "now".to_owned(),
+        )
+        .unwrap();
+        // A widened bound is dispersion evidence someone measured; a
+        // wholesale re-record must not quietly discard it.
+        assert_eq!(recorded.benchmarks[0].max_regression, 0.15);
+        assert_eq!(recorded.benchmarks[0].mean_ns, 2.0);
+        assert_eq!(recorded.benchmarks[1].max_regression, 0.05);
+    }
+
+    #[test]
+    fn recording_refuses_to_overwrite_another_hosts_baseline() {
+        let manifest = recording_manifest(&["a"]);
+        let mut previous = Baseline {
+            host: recording_context().host,
+            recorded_at: "old".to_owned(),
+            git_revision: "old".to_owned(),
+            profile: "old".to_owned(),
+            samples: 3,
+            comment: String::new(),
+            benchmarks: vec![BaselineEntry {
+                id: "a".to_owned(),
+                mean_ns: 1.0,
+                max_regression: 0.05,
+            }],
+        };
+        previous.host.id = "perf-i9-10920x".to_owned();
+        let error = recorded_baseline(
+            &recording_context(),
+            Some(&previous),
+            &manifest,
+            &vec![means(&[("a", 2.0)]); 3],
+            "now".to_owned(),
+        )
+        .expect_err("a run on one host must not replace another host's contract");
+        assert!(error.contains("perf-i9-10920x"), "{error}");
+    }
+
+    #[test]
+    fn a_staged_baseline_is_promoted_only_after_it_validates() {
+        let dir = std::env::temp_dir().join(format!(
+            "tollgate-perf-gate-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("perf_baseline.json");
+        std::fs::write(&path, "{\"previous\": \"good\"}\n").unwrap();
+
+        let mut baseline = recorded_baseline(
+            &recording_context(),
+            None,
+            &recording_manifest(&["a"]),
+            &vec![means(&[("a", 2.0)]); 3],
+            "now".to_owned(),
+        )
+        .unwrap();
+        // Invalid by the same rule the gate reads a baseline with, so the
+        // staged copy must never become the file.
+        baseline.benchmarks[0].mean_ns = 0.0;
+        assert!(
+            write_baseline(
+                StagedFile::create(path.with_extension("json.staged")).unwrap(),
+                &path,
+                &baseline
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"previous\": \"good\"}\n",
+            "a failed record leaves the last known good baseline in place"
+        );
+        assert!(
+            !path.with_extension("json.staged").exists(),
+            "the staged copy is cleaned up"
+        );
+
+        baseline.benchmarks[0].mean_ns = 2.0;
+        write_baseline(
+            StagedFile::create(path.with_extension("json.staged")).unwrap(),
+            &path,
+            &baseline,
+        )
+        .unwrap();
+        let promoted: Baseline =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(promoted.benchmarks[0].mean_ns, 2.0);
+        assert_eq!(promoted.comment, BASELINE_COMMENT);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_recorded_row_writes_its_bound_only_when_it_overrides_the_default() {
+        let recorded = recorded_baseline(
+            &recording_context(),
+            None,
+            &recording_manifest(&["a"]),
+            &vec![means(&[("a", 2.0)]); 3],
+            "now".to_owned(),
+        )
+        .unwrap();
+        let text = serde_json::to_string(&recorded).unwrap();
+        assert!(
+            !text.contains("max_regression"),
+            "the default bound stays implicit: {text}"
+        );
+        let mut widened = recorded;
+        widened.benchmarks[0].max_regression = 0.15;
+        assert!(
+            serde_json::to_string(&widened)
+                .unwrap()
+                .contains("\"max_regression\":0.15")
+        );
+    }
+
+    #[test]
+    fn a_partial_run_is_not_a_sample() {
+        // The deposit rule and the median rule have to agree. #114 had a run
+        // interrupted after 33 of 58 benchmarks deposit a sample that the
+        // recording step then refused for exactly that reason, leaving a file
+        // that would have poisoned every later attempt.
+        let manifest = recording_manifest(&["a", "b"]);
+        let partial = means(&[("a", 1.0)]);
+        assert!(
+            !manifest
+                .benchmarks
+                .iter()
+                .all(|entry| partial.contains_key(&entry.id))
+        );
+        let full = means(&[("a", 1.0), ("b", 2.0)]);
+        assert!(
+            manifest
+                .benchmarks
+                .iter()
+                .all(|entry| full.contains_key(&entry.id))
+        );
+        // And the recording step refuses the partial sample independently.
+        assert!(
+            recorded_baseline(
+                &recording_context(),
+                None,
+                &manifest,
+                &[full.clone(), partial, full],
+                "now".to_owned(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_unreadable_row_withholds_a_failure_but_never_manufactures_one() {
+        let entry = BaselineEntry {
+            id: "admission/request_rate_token".to_owned(),
+            mean_ns: 126.3,
+            max_regression: 0.05,
+        };
+        // The #114 case: the gate flagged this row's own spread unreadable in
+        // the same report it used the number to fail the run.
+        assert_eq!(
+            evaluate_regression(&entry.id, Some(173.1), Some(&entry), true, true).status,
+            "inconclusive"
+        );
+        assert_eq!(
+            evaluate_regression(&entry.id, Some(173.1), Some(&entry), true, false).status,
+            "regressed"
+        );
+        // Instability is a reason to withhold a failure, not to withhold a
+        // pass: a row inside its bound passes however wide its interval was.
+        assert_eq!(
+            evaluate_regression(&entry.id, Some(126.0), Some(&entry), true, true).status,
+            "pass"
+        );
+        // One inconclusive row among rows that did reach a verdict is
+        // tolerated; a run in which *every* comparable row was inconclusive
+        // measured nothing and must not read as a pass.
+        let inconclusive = evaluate_regression(&entry.id, Some(173.1), Some(&entry), true, true);
+        let passing = evaluate_regression("steady", Some(1.0), Some(&entry), true, false);
+        assert!(regressions_reached_a_verdict(&[
+            inconclusive.clone(),
+            passing
+        ]));
+        assert!(!regressions_reached_a_verdict(&[inconclusive]));
+        // A run with no baseline rows at all is not condemned by this guard;
+        // `baseline_verdict_missing` is what speaks to that.
+        assert!(regressions_reached_a_verdict(&[]));
+    }
+
+    #[test]
+    fn rows_known_to_disperse_do_not_vote_on_whether_the_host_was_disturbed() {
+        let entry = |id: &str, bound: f64| BaselineEntry {
+            id: id.to_owned(),
+            mean_ns: 100.0,
+            max_regression: bound,
+        };
+        let rows = [
+            entry("contended_a", 0.15),
+            entry("contended_b", 0.20),
+            entry("steady", 0.05),
+        ];
+        let by_id: BTreeMap<String, &BaselineEntry> =
+            rows.iter().map(|e| (e.id.clone(), e)).collect();
+        let prone = dispersion_prone(Some(&by_id));
+        assert_eq!(
+            prone,
+            BTreeSet::from(["contended_a".to_owned(), "contended_b".to_owned()])
+        );
+        // No baseline to consult means no row is known to disperse, so the
+        // breadth signal falls back to counting everything.
+        assert!(dispersion_prone(None).is_empty());
+
+        let policy = TrustPolicy::default();
+        let none = BTreeMap::new();
+        // The #114 shape: six of fifty-eight rows unstable trips the tenth,
+        // but four of them are the contention family doing what it always
+        // does. Judged over the steady rows alone, the run is readable.
+        assert_eq!(
+            assess_trust(&none, &none, 6, 58, &policy),
+            Trust::Unreadable {
+                unstable: 6,
+                measured: 58
+            }
+        );
+        assert_eq!(assess_trust(&none, &none, 2, 54, &policy), Trust::NoHistory);
+        // A genuinely disturbed host still fails: the steady rows go too.
+        assert!(matches!(
+            assess_trust(&none, &none, 12, 54, &policy),
+            Trust::Unreadable { .. }
+        ));
+    }
+
+    #[test]
+    fn a_full_run_that_reached_no_baseline_verdict_is_not_a_pass() {
+        for skipped in ["no-baseline-file", "host-unset", "host-mismatch"] {
+            assert!(
+                baseline_verdict_missing(GateMode::Full, Some(skipped)),
+                "{skipped} leaves the host-specific bound unchecked"
+            );
+            // A diagnostic run on another host says so in its mode; it is not
+            // being offered as acceptance evidence.
+            assert!(!baseline_verdict_missing(
+                GateMode::RatiosOnly,
+                Some(skipped)
+            ));
+        }
+        // Already reported, with its own exit code and explanation.
+        assert!(!baseline_verdict_missing(
+            GateMode::Full,
+            Some("untrusted-run")
+        ));
+        assert!(!baseline_verdict_missing(GateMode::Full, None));
+    }
+
+    #[test]
+    fn run_drift_summarises_how_the_whole_run_sat_against_the_baseline() {
+        let row = |ratio: Option<f64>| RegressionRow {
+            id: "id".to_owned(),
+            measured_ns: Some(1.0),
+            baseline_ns: ratio.map(|_| 1.0),
+            ratio,
+            max_regression: Some(0.05),
+            status: "pass",
+        };
+        assert_eq!(run_drift(&[]), None);
+        assert_eq!(run_drift(&[row(None)]), None);
+
+        for (ratios, p25, median, p75) in [
+            (vec![1.5], 1.5, 1.5, 1.5),
+            (vec![2.0, 1.0], 1.0, 2.0, 2.0),
+            (vec![3.0, 1.0, 2.0], 1.0, 2.0, 3.0),
+            (vec![4.0, 1.0, 3.0, 2.0], 2.0, 3.0, 4.0),
+        ] {
+            let rows: Vec<_> = ratios.iter().map(|ratio| row(Some(*ratio))).collect();
+            assert_eq!(
+                run_drift(&rows),
+                Some(RunDrift {
+                    compared: ratios.len(),
+                    median_ratio: median,
+                    p25_ratio: p25,
+                    p75_ratio: p75,
+                })
+            );
+        }
+
+        // The #114 shape: most of the run shifted a little, a few rows moved
+        // a lot. The median is what says which of those the run was.
+        let ratios = [1.00, 1.02, 1.03, 1.04, 1.36];
+        let drift = run_drift(&ratios.map(|r| row(Some(r)))).expect("five comparable rows");
+        assert_eq!(drift.compared, 5);
+        assert!((drift.median_ratio - 1.03).abs() < 1e-9);
+        assert!((drift.p25_ratio - 1.02).abs() < 1e-9);
+        assert!((drift.p75_ratio - 1.04).abs() < 1e-9);
+        // Unreadable rows never reach the summary.
+        assert_eq!(
+            run_drift(&[row(Some(f64::NAN)), row(Some(1.5))])
+                .unwrap()
+                .compared,
+            1
         );
     }
 
@@ -1246,6 +2774,8 @@ mod tests {
             recorded_at: "time".to_owned(),
             git_revision: "revision".to_owned(),
             profile: "release".to_owned(),
+            samples: 3,
+            comment: String::new(),
             benchmarks,
         };
         let entry = || BaselineEntry {
@@ -1324,7 +2854,7 @@ mod tests {
             max_regression: 0.05,
         };
         assert_eq!(
-            evaluate_regression("a", Some(1_000.0), Some(&entry), false).status,
+            evaluate_regression("a", Some(1_000.0), Some(&entry), false, false).status,
             "baseline-skipped"
         );
         assert_eq!(
@@ -1403,8 +2933,9 @@ mod tests {
             mean_ns: 100.0,
             max_regression: 0.05,
         };
-        let passing = evaluate_regression(&baseline.id, Some(104.0), Some(&baseline), true);
-        let regressed = evaluate_regression(&baseline.id, Some(106.0), Some(&baseline), true);
+        let passing = evaluate_regression(&baseline.id, Some(104.0), Some(&baseline), true, false);
+        let regressed =
+            evaluate_regression(&baseline.id, Some(106.0), Some(&baseline), true, false);
         assert!(regression_line(&passing).is_none());
         assert!(regression_line(&regressed).unwrap().contains("REGRESSED"));
     }
