@@ -150,6 +150,21 @@ owned worker. Existing `TOLLGATE_RECLAIM_INTERVAL_SECS` retains its scheduling
 meaning. Zero or a duration that cannot fit the monotonic clock is rejected
 before starting tasks. Rolling back restores the old false-ready behavior.
 
+## Instance shutdown accounting
+
+The instance runtime has the same allocation boundary. A successful
+`InstanceRuntime::shutdown` can leave a grant whose acquire or consolidation
+result never reached the manager. Its known leases can all be released while
+that unanswered capability still holds units in the backend. Retain a
+`RuntimeHandle` and inspect `report().uncertain_acquires` and
+`account_reports(now)` after the join, alongside the shutdown report's abandoned
+leases, task failures and usage-drain counters. Uncertainty is a count of
+possible grants, not a unit amount or proof that each call committed. Such units
+remain in active grants until server maintenance reclaims them after expiry and
+grace; do not credit them manually or classify the liquidity difference alone
+as lost billing. Reconcile recorded usage and ledger conservation both before
+and after reclamation. Expiry does not erase the runtime's historical counters.
+
 ## Instance clients and Cloud Run
 
 `HttpStore::with_config` validates its URL, credentials, TLS roots and deadlines
