@@ -29,6 +29,7 @@
 pub mod config;
 pub mod error;
 pub mod google;
+mod maintenance;
 pub mod security;
 pub mod transport;
 
@@ -101,7 +102,16 @@ impl<T> Backend for T where
 {
 }
 
+/// In-process handler router. Without an owned maintenance task `/readyz`
+/// returns 503 even when the store answers; use [`serve`] for a ready service.
 pub fn router<S: Backend>(state: ServerState<S>) -> Router {
+    router_with_maintenance(state, maintenance::Monitor::unmanaged())
+}
+
+fn router_with_maintenance<S: Backend>(
+    state: ServerState<S>,
+    maintenance: maintenance::Monitor,
+) -> Router {
     let authorization = |role| Authorization {
         security: Arc::clone(&state.security),
         clock: Arc::clone(&state.clock),
@@ -143,7 +153,10 @@ pub fn router<S: Backend>(state: ServerState<S>) -> Router {
         ));
     Router::new()
         .route("/livez", get(async || StatusCode::OK))
-        .route("/readyz", get(readyz::<S>))
+        .route(
+            "/readyz",
+            get(readyz::<S>).layer(axum::Extension(maintenance)),
+        )
         .nest(API_PREFIX, instance.nest("/admin", operator))
         .with_state(state)
         .layer(axum::middleware::from_fn(error::report_http_failure))
@@ -157,37 +170,74 @@ pub async fn serve<S: Backend>(
     reclaim_interval: std::time::Duration,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    if reclaim_interval.is_zero() {
+    if reclaim_interval.is_zero()
+        || tokio::time::Instant::now()
+            .checked_add(reclaim_interval)
+            .is_none()
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "reclaim_interval must be positive",
+            "reclaim_interval must be positive and fit the monotonic clock",
         ));
     }
     let listener = transport::SecureListener::new(listener, Arc::clone(&state.security))?;
     let sweep_store = Arc::clone(&state.store);
     let sweep_clock = Arc::clone(&state.clock);
-    let sweeper = MaintenanceTask(tokio::spawn(
-        maintenance_sweep(sweep_store, sweep_clock, reclaim_interval).instrument(
+    let mut sweeper = maintenance::Task::spawn(move |health| {
+        maintenance_sweep(sweep_store, sweep_clock, reclaim_interval, health).instrument(
             tracing::info_span!(
                 "maintenance_sweep",
                 interval_ms = reclaim_interval.as_millis()
             ),
-        ),
-    ));
-    let result = axum::serve(
+        )
+    });
+    // Axum spawns its signal waiter. Hand it only a receiver; retaining the
+    // sender and the caller's future here makes every serve exit close the
+    // signal, including cancellation before the caller requests shutdown.
+    let (signal, signalled) = tokio::sync::oneshot::channel::<()>();
+    let mut signal = Some(signal);
+    let server = axum::serve(
         listener,
-        router(state).into_make_service_with_connect_info::<transport::PeerIdentity>(),
+        router_with_maintenance(state, sweeper.monitor.clone())
+            .into_make_service_with_connect_info::<transport::PeerIdentity>(),
     )
-    .with_graceful_shutdown(shutdown)
-    .await;
-    drop(sweeper);
-    result
-}
-
-struct MaintenanceTask(tokio::task::JoinHandle<()>);
-impl Drop for MaintenanceTask {
-    fn drop(&mut self) {
-        self.0.abort();
+    .with_graceful_shutdown(async move {
+        // Sender drop is also a shutdown signal: it means serve exited.
+        let Ok(()) = signalled.await else { return };
+    });
+    let server = std::future::IntoFuture::into_future(server);
+    tokio::pin!(server, shutdown);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut sweeper.join => {
+                if result.as_ref().is_err_and(|error| error.is_cancelled())
+                    && sweeper.stop.requested()
+                {
+                    // Expected cancellation after the graceful-shutdown signal.
+                    // Readiness was withdrawn before the abort; HTTP may drain.
+                    return server.await;
+                }
+                sweeper.stop.stop();
+                drop(signal.take());
+                let reason = match result {
+                    Err(error) if error.is_panic() => "panic",
+                    Err(_) => "cancelled",
+                    Ok(()) => "unexpected-return",
+                };
+                tracing::error!(
+                    operation = "maintenance",
+                    reason,
+                    "server maintenance task stopped; stopping the listener"
+                );
+                return Err(std::io::Error::other("server maintenance task stopped unexpectedly"));
+            }
+            result = &mut server => return result,
+            () = &mut shutdown, if signal.is_some() => {
+                sweeper.stop.stop();
+                drop(signal.take());
+            }
+        }
     }
 }
 
@@ -195,10 +245,9 @@ impl Drop for MaintenanceTask {
 /// configured interval.
 ///
 /// This is INVARIANTS.md #9's server half, and it is the only thing that
-/// returns units stranded by a crashed holder. A sweep that fails every tick
-/// breaks that guarantee indefinitely while `/readyz` still answers, because
-/// a store can serve `ping` and fail `reclaim_expired` — so the failure must
-/// be said out loud. Both outcomes are reported: silence about success would
+/// returns units stranded by a crashed holder. A store can serve `ping` and
+/// fail maintenance, so each outcome is published to readiness and reported
+/// independently. Silence about success would
 /// leave "the sweep is running but finding nothing" and "the sweep stopped"
 /// indistinguishable.
 ///
@@ -215,6 +264,7 @@ async fn maintenance_sweep<S: Backend>(
     store: Arc<S>,
     clock: Arc<dyn Clock>,
     interval: std::time::Duration,
+    mut health: maintenance::Publisher,
 ) {
     #[derive(Default)]
     struct Progress {
@@ -257,7 +307,6 @@ async fn maintenance_sweep<S: Backend>(
 
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut consecutive_failures: u64 = 0;
     loop {
         tick.tick().await;
         // Freeze the cutoff for this cycle. A continuously advancing cutoff
@@ -271,8 +320,12 @@ async fn maintenance_sweep<S: Backend>(
                 .await
             {
                 Ok(batch) => {
-                    if let Err(error) = progress.record(&batch) {
-                        break Err(error);
+                    if progress.record(&batch).is_err() {
+                        tracing::error!(
+                            operation = "reclaim",
+                            "reclaim progress counter overflowed; stopping maintenance"
+                        );
+                        return;
                     }
                     if !batch.is_saturated() {
                         break Ok(());
@@ -286,16 +339,21 @@ async fn maintenance_sweep<S: Backend>(
             }
         };
 
-        roll_due_periods(store.as_ref(), now).await;
-
+        let Ok(report) = health.record(maintenance::Operation::Reclaim, outcome.is_ok()) else {
+            tracing::error!(
+                operation = "reclaim",
+                "maintenance failure counter exhausted"
+            );
+            return;
+        };
         match outcome {
             Ok(()) => {
-                if consecutive_failures > 0 {
+                if report.recovered_after > 0 {
                     tracing::info!(
-                        after_failures = consecutive_failures,
+                        operation = "reclaim",
+                        after_failures = report.recovered_after,
                         "reclaim sweep recovered"
                     );
-                    consecutive_failures = 0;
                 }
                 if progress.leases > 0 {
                     tracing::info!(
@@ -307,17 +365,31 @@ async fn maintenance_sweep<S: Backend>(
                 }
             }
             Err(_) => {
-                consecutive_failures += 1;
-                tracing::warn!(
-                    operation = "reclaim",
-                    code = "storage",
-                    consecutive_failures,
-                    reclaimed_leases = %progress.leases,
-                    reclaimed_units = %progress.units,
-                    completed_batches = progress.batches,
-                    "reclaim sweep failed; completed batches stay committed and remaining expired leases stay stranded until it recovers"
-                );
+                macro_rules! report_failure {
+                    ($level:ident) => {
+                        tracing::$level!(
+                            operation = "reclaim",
+                            code = "storage",
+                            consecutive_failures = report.failures,
+                            reclaimed_leases = %progress.leases,
+                            reclaimed_units = %progress.units,
+                            completed_batches = progress.batches,
+                            "reclaim sweep failed; completed batches stay committed and remaining expired leases stay stranded until it recovers"
+                        );
+                    };
+                }
+                if report.failures >= maintenance::PERSISTENT_FAILURES {
+                    report_failure!(error);
+                } else {
+                    report_failure!(warn);
+                }
             }
+        }
+        if roll_due_periods(store.as_ref(), now, &mut health)
+            .await
+            .is_break()
+        {
+            return;
         }
     }
 }
@@ -333,8 +405,13 @@ async fn maintenance_sweep<S: Backend>(
 /// Failures are reported and the tick ends. Retrying inside the tick would
 /// spin against a store that is down; the next tick is the retry, and until it
 /// succeeds the affected accounts keep spending last period's allowance, which
-/// is late rather than wrong.
-async fn roll_due_periods<S: Backend>(store: &S, now: jiff::Timestamp) {
+/// is late rather than wrong. Only counter exhaustion breaks maintenance;
+/// a reported backend failure continues to the next scheduled retry.
+async fn roll_due_periods<S: Backend>(
+    store: &S,
+    now: jiff::Timestamp,
+    health: &mut maintenance::Publisher,
+) -> std::ops::ControlFlow<()> {
     let mut accounts: u64 = 0;
     let mut batches: u64 = 0;
     loop {
@@ -352,12 +429,12 @@ async fn roll_due_periods<S: Backend>(store: &S, now: jiff::Timestamp) {
                     // forever, and still not a place to wrap: a counter that
                     // silently restarts would under-report a boundary that
                     // rolled more accounts than it claimed.
-                    tracing::warn!(
+                    tracing::error!(
                         accounts,
                         batches,
-                        "budget rollover progress counter overflowed; stopping this tick"
+                        "budget rollover progress counter overflowed; stopping maintenance"
                     );
-                    return;
+                    return std::ops::ControlFlow::Break(());
                 };
                 (accounts, batches) = (total.0, total.1);
                 if !batch.is_saturated() {
@@ -368,27 +445,59 @@ async fn roll_due_periods<S: Backend>(store: &S, now: jiff::Timestamp) {
                 tokio::task::yield_now().await;
             }
             Err(_) => {
-                tracing::warn!(
-                    operation = "budget-rollover",
-                    code = "storage",
-                    rolled_accounts = accounts,
-                    completed_batches = batches,
-                    "budget rollover failed; accounts past their boundary keep last period's allowance until it recovers"
-                );
-                return;
+                let Ok(report) = health.record(maintenance::Operation::Rollover, false) else {
+                    tracing::error!(
+                        operation = "budget-rollover",
+                        "maintenance failure counter exhausted"
+                    );
+                    return std::ops::ControlFlow::Break(());
+                };
+                macro_rules! report_failure {
+                    ($level:ident) => {
+                        tracing::$level!(
+                            operation = "budget-rollover",
+                            code = "storage",
+                            consecutive_failures = report.failures,
+                            rolled_accounts = accounts,
+                            completed_batches = batches,
+                            "budget rollover failed; accounts past their boundary keep last period's allowance until it recovers"
+                        );
+                    };
+                }
+                if report.failures >= maintenance::PERSISTENT_FAILURES {
+                    report_failure!(error);
+                } else {
+                    report_failure!(warn);
+                }
+                return std::ops::ControlFlow::Continue(());
             }
         }
+    }
+    let report = health
+        .record(maintenance::Operation::Rollover, true)
+        .expect("a successful pass clears its failure counter without arithmetic");
+    if report.recovered_after > 0 {
+        tracing::info!(
+            operation = "budget-rollover",
+            after_failures = report.recovered_after,
+            "budget rollover recovered"
+        );
     }
     if accounts > 0 {
         tracing::info!(accounts, batches, "rolled budget periods");
     }
+    std::ops::ControlFlow::Continue(())
 }
 
 /// Ready only when the backing store answers (review finding #11): a server
-/// whose source of truth is unreachable must not attract traffic.
-async fn readyz<S: Backend>(State(state): State<ServerState<S>>) -> StatusCode {
+/// whose source of truth or maintenance is unavailable must not attract traffic.
+async fn readyz<S: Backend>(
+    State(state): State<ServerState<S>>,
+    axum::Extension(maintenance): axum::Extension<maintenance::Monitor>,
+) -> StatusCode {
     match state.store.ping().await {
-        Ok(()) => StatusCode::OK,
+        Ok(()) if maintenance.healthy() => StatusCode::OK,
+        Ok(()) => StatusCode::SERVICE_UNAVAILABLE,
         Err(_) => {
             tracing::warn!(
                 operation = "readiness",

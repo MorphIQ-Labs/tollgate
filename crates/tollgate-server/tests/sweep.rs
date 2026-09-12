@@ -3,8 +3,8 @@
 //!
 //! The store's own reclaim is covered by both backend suites; what is tested
 //! here is that the *server* actually invokes it on its interval, and that a
-//! sweep failing every tick says so — `/readyz` cannot see it, because a
-//! store can answer `ping` and still fail `reclaim_expired` (issue #36).
+//! sweep failing every tick withdraws readiness even when the store answers
+//! `ping`. Tests synchronize on observed calls and outcomes, never fixed sleeps.
 //!
 //! As in `loopback.rs`, the oneshot teardown signals here are outside the
 //! discard rule this MR installs: the assertions below are what fail if
@@ -15,7 +15,7 @@ mod common;
 
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Once};
 
 use async_trait::async_trait;
@@ -33,7 +33,370 @@ use tracing_subscriber::registry::LookupSpan;
 
 use tollgate_server::{ServerState, serve};
 
+struct Control(tokio::sync::mpsc::UnboundedSender<Call>);
+struct Call {
+    operation: &'static str,
+    reply: tokio::sync::oneshot::Sender<Action>,
+}
+
+#[derive(Clone, Copy)]
+enum Action {
+    Succeed,
+    Fail,
+    Panic,
+}
+
+impl Control {
+    async fn call(&self, operation: &'static str) -> Result<(), StoreError> {
+        let (reply, action) = tokio::sync::oneshot::channel();
+        self.0
+            .send(Call { operation, reply })
+            .expect("test owns call receiver");
+        match action.await.expect("test supplies each call outcome") {
+            Action::Succeed => Ok(()),
+            Action::Fail => Err(StoreError("private-fixture-maintenance-71".into())),
+            Action::Panic => panic!("public test panic fixture"),
+        }
+    }
+}
+
+async fn next_call(
+    calls: &mut tokio::sync::mpsc::UnboundedReceiver<Call>,
+    operation: &str,
+) -> Call {
+    let call = tokio::time::timeout(std::time::Duration::from_secs(2), calls.recv())
+        .await
+        .expect("maintenance must make its next call")
+        .expect("server retains call sender");
+    assert_eq!(call.operation, operation);
+    call
+}
+
+fn complete(call: Call, action: Action) {
+    assert!(
+        call.reply.send(action).is_ok(),
+        "the observed call is still owned by maintenance"
+    );
+}
+
 const ACCOUNT: AccountId = AccountId(1);
+
+/// Each observed call stays pending until the test supplies its outcome.
+/// This pins ordering across awaits without making a scheduler-speed claim.
+struct ControlledServer {
+    store: Arc<FlakyReclaimStore>,
+    calls: tokio::sync::mpsc::UnboundedReceiver<Call>,
+    server: tokio::task::JoinHandle<std::io::Result<()>>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    base: String,
+    client: reqwest::Client,
+}
+
+impl ControlledServer {
+    async fn start() -> Self {
+        install_subscriber();
+        let (calls_tx, calls) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(FlakyReclaimStore {
+            inner: store_with_expired_lease(),
+            failures_left: AtomicU32::new(0),
+            fail_on_call: None,
+            fail_rollover: AtomicBool::new(false),
+            calls: AtomicU32::new(0),
+            called: tokio::sync::Notify::new(),
+            cycles: AtomicU32::new(0),
+            next_cycle: AtomicBool::new(true),
+            control: Some(Control(calls_tx)),
+            ping_healthy: AtomicBool::new(true),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (stop, stopping) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve(
+            listener,
+            ServerState {
+                store: Arc::clone(&store),
+                clock: Arc::new(SystemClock),
+                security: common::security(),
+            },
+            std::time::Duration::from_millis(1),
+            async {
+                let _ = stopping.await;
+            },
+        ));
+        Self {
+            store,
+            calls,
+            server,
+            stop: Some(stop),
+            base,
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .unwrap(),
+        }
+    }
+
+    async fn call(&mut self, operation: &str) -> Call {
+        next_call(&mut self.calls, operation).await
+    }
+
+    async fn probe(&self, path: &str) -> u16 {
+        self.client
+            .get(format!("{}{path}", self.base))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    async fn shutdown(mut self) {
+        self.stop.take().unwrap().send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut self.server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+}
+
+impl Drop for ControlledServer {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+#[tokio::test]
+async fn readiness_requires_both_passes_and_tracks_independent_failure_and_recovery() {
+    let mut server = ControlledServer::start().await;
+    let reclaim = server.call("reclaim").await;
+    assert_eq!(server.probe("/livez").await, 200);
+    assert_eq!(server.probe("/readyz").await, 503);
+    complete(reclaim, Action::Succeed);
+    let rollover = server.call("budget-rollover").await;
+    assert_eq!(
+        server.probe("/readyz").await,
+        503,
+        "startup requires both passes"
+    );
+    complete(rollover, Action::Succeed);
+    let reclaim = server.call("reclaim").await;
+    assert_eq!(server.probe("/readyz").await, 200);
+    server.store.ping_healthy.store(false, Ordering::Release);
+    assert_eq!(
+        server.probe("/readyz").await,
+        503,
+        "maintenance cannot replace store health"
+    );
+    server.store.ping_healthy.store(true, Ordering::Release);
+    assert_eq!(server.probe("/readyz").await, 200);
+
+    complete(reclaim, Action::Fail);
+    let rollover = server.call("budget-rollover").await;
+    assert_eq!(
+        server.probe("/readyz").await,
+        503,
+        "report reclaim failure before rollover can suspend"
+    );
+    assert_eq!(server.probe("/livez").await, 200);
+    complete(rollover, Action::Succeed);
+    let reclaim = server.call("reclaim").await;
+    assert_eq!(
+        server.probe("/readyz").await,
+        503,
+        "rollover cannot repair reclaim health"
+    );
+    complete(reclaim, Action::Succeed);
+    let rollover = server.call("budget-rollover").await;
+    assert_eq!(server.probe("/readyz").await, 200);
+    complete(rollover, Action::Fail);
+    let reclaim = server.call("reclaim").await;
+    assert_eq!(server.probe("/readyz").await, 503);
+    complete(reclaim, Action::Succeed);
+    let rollover = server.call("budget-rollover").await;
+    assert_eq!(
+        server.probe("/readyz").await,
+        503,
+        "reclaim cannot repair rollover health"
+    );
+    complete(rollover, Action::Succeed);
+    let _pending = server.call("reclaim").await;
+    assert_eq!(server.probe("/readyz").await, 200);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn persistent_failures_escalate_and_recovery_resets_each_operation() {
+    for operation in ["reclaim", "budget-rollover"] {
+        let (captor, _guard) = capture();
+        let mut server = ControlledServer::start().await;
+        let mut reclaim = server.call("reclaim").await;
+        for action in [
+            Action::Fail,
+            Action::Fail,
+            Action::Fail,
+            Action::Fail,
+            Action::Succeed,
+            Action::Fail,
+        ] {
+            complete(
+                reclaim,
+                if operation == "reclaim" {
+                    action
+                } else {
+                    Action::Succeed
+                },
+            );
+            let rollover = server.call("budget-rollover").await;
+            complete(
+                rollover,
+                if operation == "budget-rollover" {
+                    action
+                } else {
+                    Action::Succeed
+                },
+            );
+            reclaim = server.call("reclaim").await;
+            assert_eq!(
+                server.probe("/readyz").await,
+                if matches!(action, Action::Succeed) {
+                    200
+                } else {
+                    503
+                }
+            );
+        }
+        server.shutdown().await;
+        let events = captor.0.lock().unwrap();
+        let for_operation = |event: &&Captured| {
+            event
+                .fields
+                .contains(&("operation".into(), format!("{operation:?}")))
+        };
+        let failures: Vec<_> = events
+            .iter()
+            .filter(for_operation)
+            .filter_map(|event| {
+                event
+                    .fields
+                    .iter()
+                    .find(|(field, _)| field == "consecutive_failures")
+                    .map(|(_, count)| (event.level, count.clone()))
+            })
+            .collect();
+        assert_eq!(
+            failures,
+            vec![
+                (Level::WARN, "1".into()),
+                (Level::WARN, "2".into()),
+                (Level::ERROR, "3".into()),
+                (Level::ERROR, "4".into()),
+                (Level::WARN, "1".into())
+            ]
+        );
+        let recoveries: Vec<_> = events
+            .iter()
+            .filter(for_operation)
+            .filter_map(|event| {
+                event
+                    .fields
+                    .iter()
+                    .find(|(field, _)| field == "after_failures")
+                    .map(|(_, count)| (event.level, count.clone()))
+            })
+            .collect();
+        assert_eq!(recoveries, vec![(Level::INFO, "4".into())]);
+        assert!(!format!("{events:?}").contains("private-fixture-maintenance-71"));
+    }
+}
+
+#[tokio::test]
+async fn a_panicked_maintenance_call_stops_the_server_with_a_safe_error() {
+    for operation in ["reclaim", "budget-rollover"] {
+        let (captor, _guard) = capture();
+        let mut server = ControlledServer::start().await;
+        let mut call = server.call("reclaim").await;
+        if operation == "budget-rollover" {
+            complete(call, Action::Succeed);
+            call = server.call(operation).await;
+        }
+        complete(call, Action::Panic);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), &mut server.server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            error.to_string(),
+            "server maintenance task stopped unexpectedly"
+        );
+        assert!(server.stop.as_ref().unwrap().is_closed());
+        let events = captor.0.lock().unwrap();
+        assert!(events.iter().any(|event| {
+            event.level == Level::ERROR
+                && event
+                    .fields
+                    .contains(&("operation".into(), "\"maintenance\"".into()))
+                && event
+                    .fields
+                    .contains(&("reason".into(), "\"panic\"".into()))
+        }));
+        assert!(!format!("{events:?}").contains("public test panic fixture"));
+    }
+}
+
+#[tokio::test]
+async fn graceful_shutdown_cancels_pending_maintenance_without_failure_events() {
+    let (captor, _guard) = capture();
+    let mut server = ControlledServer::start().await;
+    let _pending = server.call("reclaim").await;
+    server.shutdown().await;
+    assert!(
+        !captor
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.level == Level::ERROR)
+    );
+}
+
+#[tokio::test]
+async fn cancelling_the_server_drops_its_shutdown_future() {
+    let mut server = ControlledServer::start().await;
+    let _pending = server.call("reclaim").await;
+    assert_eq!(server.probe("/livez").await, 200);
+    server.server.abort();
+    assert!((&mut server.server).await.unwrap_err().is_cancelled());
+    assert!(
+        server.stop.as_ref().unwrap().is_closed(),
+        "the shutdown future belongs to serve, not a detached signal watcher"
+    );
+}
+
+#[tokio::test]
+async fn invalid_maintenance_intervals_are_rejected_without_starting_tasks() {
+    for interval in [std::time::Duration::ZERO, std::time::Duration::MAX] {
+        let store = store_with_expired_lease();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let error = serve(
+            listener,
+            ServerState {
+                store: Arc::clone(&store),
+                clock: Arc::new(SystemClock),
+                security: common::security(),
+            },
+            interval,
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(Arc::strong_count(&store), 1);
+    }
+}
 
 fn t(secs: i64) -> Timestamp {
     Timestamp::from_second(secs).unwrap()
@@ -45,8 +408,13 @@ struct FlakyReclaimStore {
     inner: Arc<MemoryStore>,
     failures_left: AtomicU32,
     fail_on_call: Option<u32>,
-    fail_rollover: bool,
+    fail_rollover: AtomicBool,
     calls: AtomicU32,
+    called: tokio::sync::Notify,
+    cycles: AtomicU32,
+    next_cycle: AtomicBool,
+    control: Option<Control>,
+    ping_healthy: AtomicBool,
 }
 
 #[async_trait]
@@ -103,6 +471,13 @@ impl LeaseAllocator for FlakyReclaimStore {
         limit: NonZeroUsize,
     ) -> Result<ReclaimBatch, StoreError> {
         let call = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
+        if self.next_cycle.swap(false, Ordering::AcqRel) {
+            self.cycles.fetch_add(1, Ordering::AcqRel);
+            self.called.notify_one();
+        }
+        if let Some(control) = &self.control {
+            control.call("reclaim").await?;
+        }
         if self.fail_on_call == Some(call) {
             return Err(StoreError(
                 "backend failure: password=fixture-maintenance-sensitive-70".into(),
@@ -124,8 +499,12 @@ impl LeaseAllocator for FlakyReclaimStore {
 #[async_trait]
 impl StoreHealth for FlakyReclaimStore {
     async fn ping(&self) -> Result<(), StoreError> {
-        // Deliberately healthy: readiness cannot see the sweep failing.
-        Ok(())
+        // A successful ping is deliberately independent of maintenance health.
+        if self.ping_healthy.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(StoreError("private-fixture-ping-71".into()))
+        }
     }
 }
 
@@ -206,12 +585,27 @@ impl AdminStore for FlakyReclaimStore {
         now: Timestamp,
         limit: std::num::NonZeroUsize,
     ) -> Result<tollgate_store::RolloverBatch, StoreError> {
-        if self.fail_rollover {
-            return Err(StoreError(
-                "backend failure: password=fixture-maintenance-sensitive-70".into(),
-            ));
+        let result = async {
+            if let Some(control) = &self.control {
+                control.call("budget-rollover").await?;
+            }
+            if self.fail_rollover.load(Ordering::Acquire) {
+                return Err(StoreError(
+                    "backend failure: password=fixture-maintenance-sensitive-70".into(),
+                ));
+            }
+            AdminStore::roll_due_periods(&*self.inner, now, limit).await
         }
-        AdminStore::roll_due_periods(&*self.inner, now, limit).await
+        .await;
+        // A terminal rollover outcome ends the cycle. Saturated batches are
+        // additional calls inside one cycle, never evidence of a later tick.
+        if match &result {
+            Ok(batch) => !batch.is_saturated(),
+            Err(_) => true,
+        } {
+            self.next_cycle.store(true, Ordering::Release);
+        }
+        result
     }
 
     async fn publish_snapshot(
@@ -322,6 +716,20 @@ impl Drop for CaptureGuard {
     }
 }
 
+async fn wait_for_cycles(store: &FlakyReclaimStore, minimum: u32) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let called = store.called.notified();
+            if store.cycles.load(Ordering::Acquire) >= minimum {
+                return;
+            }
+            called.await;
+        }
+    })
+    .await
+    .expect("maintenance must reach the observed cycle");
+}
+
 fn store_with_expired_lease() -> Arc<MemoryStore> {
     let store = MemoryStore::new(GrantPolicy {
         shrink_divisor: 1,
@@ -370,12 +778,19 @@ async fn spawn_server(
     (server, stop_tx)
 }
 
-/// Run `serve` against the given store for long enough to sweep, then stop.
+/// Observe completed cycles, then stop. Entering the next reclaim call proves
+/// that the prior cycle, including its rollover and outcome logs, finished.
+/// The timeout detects a broken driver; elapsed time is never success evidence.
 async fn serve_briefly(store: Arc<FlakyReclaimStore>, clock: Arc<dyn tollgate_store::Clock>) {
-    let (server, stop_tx) = spawn_server(store, clock, std::time::Duration::from_millis(10)).await;
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let (server, stop_tx) = spawn_server(
+        Arc::clone(&store),
+        clock,
+        std::time::Duration::from_millis(10),
+    )
+    .await;
+    wait_for_cycles(&store, 5).await;
     let _ = stop_tx.send(());
-    let _ = server.await;
+    server.await.unwrap().unwrap();
 }
 
 /// The server actually runs the sweep: an expired lease's units come back
@@ -393,8 +808,13 @@ async fn the_server_reclaims_expired_leases_on_its_interval() {
         inner: Arc::clone(&inner),
         failures_left: AtomicU32::new(0),
         fail_on_call: None,
-        fail_rollover: false,
+        fail_rollover: AtomicBool::new(false),
         calls: AtomicU32::new(0),
+        called: tokio::sync::Notify::new(),
+        cycles: AtomicU32::new(0),
+        next_cycle: AtomicBool::new(true),
+        control: None,
+        ping_healthy: AtomicBool::new(true),
     });
     let (captor, guard) = capture();
     // A clock past the lease's expiry, so the sweep has something to reclaim.
@@ -470,8 +890,13 @@ async fn one_scheduled_sweep_drains_every_saturated_batch() {
         inner: Arc::clone(&inner),
         failures_left: AtomicU32::new(0),
         fail_on_call: None,
-        fail_rollover: false,
+        fail_rollover: AtomicBool::new(false),
         calls: AtomicU32::new(0),
+        called: tokio::sync::Notify::new(),
+        cycles: AtomicU32::new(0),
+        next_cycle: AtomicBool::new(true),
+        control: None,
+        ping_healthy: AtomicBool::new(true),
     });
     let (server, stop_tx) = spawn_server(
         Arc::clone(&store),
@@ -488,10 +913,15 @@ async fn one_scheduled_sweep_drains_every_saturated_batch() {
     .await
     .expect("the first sweep cycle must drain both batches");
     assert_eq!(store.calls.load(Ordering::Acquire), 2);
+    assert_eq!(
+        store.cycles.load(Ordering::Acquire),
+        1,
+        "saturated batches do not count as additional cycles"
+    );
     assert_eq!(inner.balance(ACCOUNT), CostUnits(1_000));
 
     let _ = stop_tx.send(());
-    let _ = server.await;
+    server.await.unwrap().unwrap();
 }
 
 /// A later batch can fail after earlier transactions committed. That partial
@@ -511,8 +941,13 @@ async fn a_failed_later_batch_reports_already_committed_progress() {
         inner,
         failures_left: AtomicU32::new(0),
         fail_on_call: Some(2),
-        fail_rollover: false,
+        fail_rollover: AtomicBool::new(false),
         calls: AtomicU32::new(0),
+        called: tokio::sync::Notify::new(),
+        cycles: AtomicU32::new(0),
+        next_cycle: AtomicBool::new(true),
+        control: None,
+        ping_healthy: AtomicBool::new(true),
     });
     let (captor, guard) = capture();
     let (server, stop_tx) = spawn_server(
@@ -568,7 +1003,7 @@ async fn a_failed_later_batch_reports_already_committed_progress() {
     }
 
     let _ = stop_tx.send(());
-    let _ = server.await;
+    server.await.unwrap().unwrap();
 }
 
 /// Recovery is its own signal: an operator watching a failing sweep needs to
@@ -579,8 +1014,13 @@ async fn a_recovering_sweep_reports_how_many_failures_it_took() {
         inner: store_with_expired_lease(),
         failures_left: AtomicU32::new(2),
         fail_on_call: None,
-        fail_rollover: false,
+        fail_rollover: AtomicBool::new(false),
         calls: AtomicU32::new(0),
+        called: tokio::sync::Notify::new(),
+        cycles: AtomicU32::new(0),
+        next_cycle: AtomicBool::new(true),
+        control: None,
+        ping_healthy: AtomicBool::new(true),
     });
     let (captor, guard) = capture();
     serve_briefly(Arc::clone(&store), Arc::new(SystemClock)).await;
@@ -607,7 +1047,7 @@ async fn a_recovering_sweep_reports_how_many_failures_it_took() {
 }
 
 /// A sweep that fails every tick reports each failure with a rising count —
-/// the only signal there is, since `/readyz` still answers OK.
+/// readiness also falls and persistent failures escalate to error.
 #[tokio::test]
 async fn a_failing_sweep_reports_consecutive_failures() {
     let (captor, guard) = capture();
@@ -616,8 +1056,13 @@ async fn a_failing_sweep_reports_consecutive_failures() {
         inner: store_with_expired_lease(),
         failures_left: AtomicU32::new(u32::MAX),
         fail_on_call: None,
-        fail_rollover: false,
+        fail_rollover: AtomicBool::new(false),
         calls: AtomicU32::new(0),
+        called: tokio::sync::Notify::new(),
+        cycles: AtomicU32::new(0),
+        next_cycle: AtomicBool::new(true),
+        control: None,
+        ping_healthy: AtomicBool::new(true),
     });
     serve_briefly(Arc::clone(&store), Arc::new(SystemClock)).await;
     drop(guard);
@@ -635,7 +1080,7 @@ async fn a_failing_sweep_reports_consecutive_failures() {
         .lock()
         .unwrap()
         .iter()
-        .filter(|event| event.level == Level::WARN)
+        .filter(|event| event.level == Level::WARN || event.level == Level::ERROR)
         .filter_map(|event| {
             event
                 .fields
@@ -662,8 +1107,13 @@ async fn failed_rollover_retains_safe_progress_without_backend_text() {
         inner: store_with_expired_lease(),
         failures_left: AtomicU32::new(0),
         fail_on_call: None,
-        fail_rollover: true,
+        fail_rollover: AtomicBool::new(true),
         calls: AtomicU32::new(0),
+        called: tokio::sync::Notify::new(),
+        cycles: AtomicU32::new(0),
+        next_cycle: AtomicBool::new(true),
+        control: None,
+        ping_healthy: AtomicBool::new(true),
     });
     let (captor, guard) = capture();
     let (server, stop) = spawn_server(
@@ -738,8 +1188,13 @@ async fn the_server_rolls_due_budget_periods_on_its_interval() {
         inner: Arc::clone(&inner),
         failures_left: AtomicU32::new(0),
         fail_on_call: None,
-        fail_rollover: false,
+        fail_rollover: AtomicBool::new(false),
         calls: AtomicU32::new(0),
+        called: tokio::sync::Notify::new(),
+        cycles: AtomicU32::new(0),
+        next_cycle: AtomicBool::new(true),
+        control: None,
+        ping_healthy: AtomicBool::new(true),
     });
     let (captor, guard) = capture();
     // 2026-02-14, past the boundary the epoch-stamped account still sits
@@ -795,8 +1250,13 @@ async fn a_tick_that_rolls_nothing_says_nothing() {
         inner: Arc::clone(&inner),
         failures_left: AtomicU32::new(0),
         fail_on_call: None,
-        fail_rollover: false,
+        fail_rollover: AtomicBool::new(false),
         calls: AtomicU32::new(0),
+        called: tokio::sync::Notify::new(),
+        cycles: AtomicU32::new(0),
+        next_cycle: AtomicBool::new(true),
+        control: None,
+        ping_healthy: AtomicBool::new(true),
     });
     let (captor, guard) = capture();
     serve_briefly(
@@ -824,8 +1284,13 @@ async fn cancelling_the_server_releases_its_owned_maintenance_task() {
         inner: store_with_expired_lease(),
         failures_left: AtomicU32::new(0),
         fail_on_call: None,
-        fail_rollover: false,
+        fail_rollover: AtomicBool::new(false),
         calls: AtomicU32::new(0),
+        called: tokio::sync::Notify::new(),
+        cycles: AtomicU32::new(0),
+        next_cycle: AtomicBool::new(true),
+        control: None,
+        ping_healthy: AtomicBool::new(true),
     });
     let (server, _stop) = spawn_server(
         Arc::clone(&store),

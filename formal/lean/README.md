@@ -57,6 +57,11 @@ This Lean package contains exact models for critical contracts:
   replacement, and inert duplicate joins.
 - `PeriodRoller` models bounded independent maintenance: one pending call,
   a fixed cutoff per pass, and terminal stopping.
+- `ServerMaintenance` models independent reclaim/rollover outcomes and terminal
+  owner stop or task exit. It proves that the other operation cannot conceal a
+  failure and that later successes cannot restore readiness after stop/exit.
+  Watch-channel closure, task cancellation, HTTP delivery and finite counters
+  remain separate implementation obligations.
 - `ControlPlane` models disjoint role evidence and serialized administrative
   receipt composition. It assumes credential authenticity and atomic policy
   selection; it does not prove cryptography or database serialization.

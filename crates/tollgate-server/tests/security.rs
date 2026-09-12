@@ -104,14 +104,17 @@ async fn every_control_plane_route_requires_its_own_role_before_decoding() {
             }
         }
     }
-    for path in ["/livez", "/readyz"] {
+    for (path, expected) in [
+        ("/livez", StatusCode::OK),
+        ("/readyz", StatusCode::SERVICE_UNAVAILABLE),
+    ] {
         assert_eq!(
             app.clone()
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::OK
+            expected
         );
     }
 }

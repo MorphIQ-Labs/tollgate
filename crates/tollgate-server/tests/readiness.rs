@@ -223,8 +223,12 @@ async fn readyz_is_503_when_the_store_cannot_answer() {
     assert!(!format!("{events:?}").contains("fixture-readiness-sensitive-70"));
 }
 
-/// And the converse, so "always 503" would fail too: a healthy store is ready.
+/// Bare routers have no maintenance owner and cannot advertise readiness.
+/// The running-server tests pin the healthy 200 converse.
 #[tokio::test]
-async fn readyz_is_200_when_the_store_answers() {
-    assert_eq!(readyz_status(true).await, axum::http::StatusCode::OK);
+async fn a_router_without_maintenance_cannot_advertise_readiness() {
+    assert_eq!(
+        readyz_status(true).await,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
 }

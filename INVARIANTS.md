@@ -505,6 +505,28 @@ until it has one.
    `expired_backlog_is_reclaimed_in_bounded_batches` (store suites), plus
    `one_scheduled_sweep_drains_every_saturated_batch` (server suite).
 
+   The server owns and observes its maintenance task. Each reclaim and rollover
+   outcome is published independently; readiness requires both to have completed
+   successfully and the publisher to remain alive. A first failure withdraws
+   readiness before the next operation can suspend. Failure of one pass does
+   not prevent the other from running. Unexpected task completion, cancellation
+   or unwinding panic stops the listener with an operational error. Graceful
+   shutdown and owner cancellation withdraw readiness before aborting the task;
+   a late success cannot restore it. These are observed-outcome/liveness claims,
+   not a new deadline on a pending backend call or proof that another replica
+   holds no skipped rows.
+   Enforcement: `maintenance::Publisher`, `Monitor`, `Task` and `serve`.
+   *Tests:* `readiness_requires_both_passes_and_tracks_independent_failure_and_recovery`,
+   `a_panicked_maintenance_call_stops_the_server_with_a_safe_error`,
+   `graceful_shutdown_cancels_pending_maintenance_without_failure_events`,
+   `cancelling_the_server_drops_its_shutdown_future`,
+   `owner_drop_withdraws_readiness_before_abort_is_polled`,
+   `closed_publication_cannot_preserve_a_healthy_last_value`, and
+   `cancellation_without_a_stop_request_closes_maintenance_health`.
+   `Tollgate.ServerMaintenance` proves independent failure, recovery, and terminal
+   stop/exit properties over atomic observations. Rust tests witness the watch,
+   task, HTTP and finite-counter implementation boundaries separately.
+
 10. **Ready means currently admissible.** An instance reports ready only while
     its snapshot resolutions meet the bar below, it can still fund work, and
     its snapshot and refill/accounting tasks are alive. Readiness falls again
@@ -841,6 +863,24 @@ until it has one.
     `healthy_refill_emits_no_warning` (the converse: a healthy plane stays
     quiet, or the signal is worthless), `ping_surfaces_a_closed_pool`, and
     `usage_sink_outage_and_recovery_are_reported`.
+
+    Server reclaim and rollover failures each carry an independent checked
+    consecutive-failure count: the first two are `warn`, the third and later
+    are `error`. Recovery emits one `info` with the preceding count and resets
+    the streak. Three attempts is an alerting policy, not a derived TTL bound;
+    readiness falls on the first failure. Counter exhaustion stops maintenance
+    and is explicit, never wrapping or silently saturating. Task-exit events
+    contain only a static reason, never a backend or panic payload (37).
+    *Tests:* `persistent_failures_escalate_and_recovery_resets_each_operation`,
+    `failure_counter_exhaustion_withdraws_health_without_wrapping`, and
+    `readiness_matches_both_operation_outcomes_for_every_short_trace`.
+
+    The separately owned security reloader reports unexpected task exit at its
+    drop boundary, without exposing panic text. Its owner marks deliberate stop
+    before abort, including before the task's first poll. This does not change
+    the validity of the previously installed security configuration or signing
+    keys. *Tests:* `a_dead_security_reloader_reports_a_safe_error` and
+    `dropping_an_unpolled_reloader_is_an_expected_stop`.
 
 20. **Every admission outcome is counted, exactly once, under its own reason.**
     The request path may not log (5), so its tallies are the only account it
