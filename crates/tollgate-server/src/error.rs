@@ -5,9 +5,10 @@
 //! correctness suite fails.
 
 use axum::extract::rejection::{JsonRejection, PathRejection};
-use axum::extract::{FromRequest, FromRequestParts, Json, Path, Request};
+use axum::extract::{FromRequest, FromRequestParts, Json, MatchedPath, Path, Request};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
 
@@ -192,7 +193,7 @@ impl From<PathRejection> for ApiError {
 
 impl From<AllocateError> for ApiError {
     fn from(e: AllocateError) -> Self {
-        let (status, code) = match &e {
+        let (status, code) = match e {
             AllocateError::UnknownAccount => (StatusCode::NOT_FOUND, "unknown-account"),
             AllocateError::AccountInactive => (StatusCode::CONFLICT, "account-inactive"),
             AllocateError::InsufficientBalance => (StatusCode::CONFLICT, "insufficient-balance"),
@@ -201,7 +202,7 @@ impl From<AllocateError> for ApiError {
             AllocateError::Fenced => (StatusCode::CONFLICT, "fenced"),
             AllocateError::LeaseNotActive => (StatusCode::CONFLICT, "lease-not-active"),
             AllocateError::InvalidRelease => (StatusCode::UNPROCESSABLE_ENTITY, "invalid-release"),
-            AllocateError::Storage(_) => (StatusCode::SERVICE_UNAVAILABLE, "storage"),
+            AllocateError::Storage(inner) => return ApiError::from(inner),
         };
         ApiError {
             status,
@@ -280,11 +281,13 @@ impl From<PublishSnapshotError> for ApiError {
 }
 
 impl From<StoreError> for ApiError {
-    fn from(e: StoreError) -> Self {
+    fn from(_: StoreError) -> Self {
         ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: "storage",
-            title: e.to_string(),
+            // A backend owns arbitrary text, which may include credentials or
+            // private row values. Never format it into a public diagnostic.
+            title: "backend unavailable".into(),
             generation: None,
         }
     }
@@ -302,10 +305,10 @@ impl From<IngestError> for ApiError {
             // refusal it must not repeat from an outage it should wait out —
             // which is the distinction #61 is about, made at both ends of the
             // wire rather than only at the transport.
-            IngestError::Refused(e) => ApiError {
+            IngestError::Refused(_) => ApiError {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: "usage-refused",
-                title: e.to_string(),
+                title: "usage batch refused".into(),
                 generation: None,
             },
         }
@@ -325,14 +328,57 @@ impl From<SnapshotValidationError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        self.render(|| diagnostic_id(getrandom::fill))
+    }
+}
+
+/// Only generated identifiers and static machine codes cross into diagnostics.
+/// The middleware receives this marker, never a backend error or response text.
+#[derive(Clone)]
+struct HttpFailure {
+    code: &'static str,
+    error_id: Option<String>,
+}
+
+fn diagnostic_id(fill: impl FnOnce(&mut [u8]) -> Result<(), getrandom::Error>) -> Option<String> {
+    let mut bytes = [0u8; 16];
+    fill(&mut bytes).ok()?;
+    Some(tollgate_core::RequestId(u128::from_be_bytes(bytes)).to_string())
+}
+
+impl ApiError {
+    fn render(self, new_id: impl FnOnce() -> Option<String>) -> Response {
         let unauthorized = self.status == StatusCode::UNAUTHORIZED;
+        let failure =
+            (self.status.is_server_error() || self.code == "usage-refused").then(|| HttpFailure {
+                code: self.code,
+                error_id: new_id(),
+            });
         let problem = Problem {
             status: self.status.as_u16(),
             code: self.code.to_string(),
             title: self.title,
             generation: self.generation,
         };
-        let mut response = (self.status, Json(problem)).into_response();
+        // Keep the public Problem Rust shape intact. This optional JSON
+        // extension is ignored by existing clients and carries no authority.
+        #[derive(serde::Serialize)]
+        struct DiagnosticProblem {
+            #[serde(flatten)]
+            problem: Problem,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            error_id: Option<String>,
+        }
+        let body = DiagnosticProblem {
+            problem,
+            error_id: failure
+                .as_ref()
+                .and_then(|failure| failure.error_id.clone()),
+        };
+        let mut response = (self.status, Json(body)).into_response();
+        if let Some(failure) = failure {
+            response.extensions_mut().insert(failure);
+        }
         response.headers_mut().insert(
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("application/problem+json"),
@@ -344,5 +390,53 @@ impl IntoResponse for ApiError {
             );
         }
         response
+    }
+}
+
+/// The router owns failure reporting, including static route context. Raw
+/// paths, queries, headers, request bodies and backend text are never logged.
+pub(crate) async fn report_http_failure(request: Request, next: Next) -> Response {
+    let route = request.extensions().get::<MatchedPath>().cloned();
+    let response = next.run(request).await;
+    if let Some(failure) = response.extensions().get::<HttpFailure>() {
+        tracing::warn!(
+            target: "tollgate::diagnostics",
+            route = route.as_ref().map(MatchedPath::as_str).unwrap_or("unmatched"),
+            code = failure.code,
+            status = response.status().as_u16(),
+            error_id = failure.error_id.as_deref(),
+            error_id_unavailable = failure.error_id.is_none(),
+            "control-plane operation failed; consult backend health and retained operational records"
+        );
+    }
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_identifiers_use_all_entropy_and_surface_entropy_failure() {
+        let id = diagnostic_id(|bytes| {
+            bytes.copy_from_slice(&0x00112233445566778899aabbccddeeff_u128.to_be_bytes());
+            Ok(())
+        });
+        assert_eq!(id.as_deref(), Some("00112233445566778899aabbccddeeff"));
+        assert!(diagnostic_id(|_| Err(getrandom::Error::UNSUPPORTED)).is_none());
+    }
+
+    #[tokio::test]
+    async fn entropy_failure_preserves_the_error_without_inventing_an_identifier() {
+        use http_body_util::BodyExt;
+        let response = ApiError::from(StoreError("fixture-secret-70".into())).render(|| None);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let failure = response.extensions().get::<HttpFailure>().unwrap();
+        assert_eq!(failure.code, "storage");
+        assert!(failure.error_id.is_none());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["title"], "backend unavailable");
+        assert!(json.get("error_id").is_none());
     }
 }

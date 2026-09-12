@@ -41,6 +41,44 @@ pub fn http(base: impl Into<String>) -> Arc<HttpStore> {
     .unwrap()
 }
 
+#[derive(Clone, Debug)]
+pub struct CapturedEvent {
+    pub target: String,
+    pub level: tracing::Level,
+    pub fields: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Clone, Default)]
+pub struct EventCapture(Arc<std::sync::Mutex<Vec<CapturedEvent>>>);
+
+impl EventCapture {
+    pub fn events(&self) -> Vec<CapturedEvent> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        #[derive(Default)]
+        struct Fields(std::collections::BTreeMap<String, String>);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().into(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().into(), value.into());
+            }
+        }
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        self.0.lock().unwrap().push(CapturedEvent {
+            target: event.metadata().target().into(),
+            level: *event.metadata().level(),
+            fields: fields.0,
+        });
+    }
+}
+
 pub struct Certificates {
     pub ca: String,
     pub server: String,

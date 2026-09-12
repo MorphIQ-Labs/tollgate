@@ -47,7 +47,9 @@ impl StoreHealth for PingOnlyStore {
         if self.healthy {
             Ok(())
         } else {
-            Err(StoreError("store unreachable".into()))
+            Err(StoreError(
+                "store unreachable: password=fixture-readiness-sensitive-70".into(),
+            ))
         }
     }
 }
@@ -206,10 +208,19 @@ async fn readyz_status(healthy: bool) -> axum::http::StatusCode {
 /// Fail-closed correctness must not masquerade as availability.
 #[tokio::test]
 async fn readyz_is_503_when_the_store_cannot_answer() {
-    assert_eq!(
-        readyz_status(false).await,
-        axum::http::StatusCode::SERVICE_UNAVAILABLE
-    );
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+    let capture = common::EventCapture::default();
+    let status = readyz_status(false)
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let events = capture.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].level, tracing::Level::WARN);
+    assert_eq!(events[0].fields["operation"], "readiness");
+    assert_eq!(events[0].fields["code"], "storage");
+    assert!(!format!("{events:?}").contains("fixture-readiness-sensitive-70"));
 }
 
 /// And the converse, so "always 503" would fail too: a healthy store is ready.

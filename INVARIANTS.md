@@ -1804,3 +1804,31 @@ exists to detect corrupt state and must not be able to launder it.
     `a_partial_run_cannot_record_using_previous_complete_samples`,
     `divergent_copies_and_invalid_sample_values_preserve_the_destination`, and
     `calibration_medians_reject_invalid_means_and_avoid_intermediate_overflow`.
+
+37. **Backend error text is private across the HTTP and diagnostic boundaries.**
+    The server converts opaque `StoreError` payloads to fixed public titles,
+    retaining the existing status/code and retry classification. This covers
+    allocation, account creation/status, publication and both ingest outcomes.
+    Server-owned readiness, maintenance and PostgreSQL startup failure logs
+    retain operation and progress context without formatting backend text or
+    connection strings. Authentication does not make a backend payload public.
+
+    The router reports HTTP problem responses with 5xx or `usage-refused` using a private
+    response marker containing only a static code and a generated 128-bit ID.
+    Its warning records status and the route template, never raw path values,
+    queries, headers or bodies. The optional JSON `error_id` matches that warning
+    and carries no authority. Entropy failure preserves the original refusal,
+    omits the ID and reports `error_id_unavailable`; it cannot invent an ID or
+    turn a failed operation into success. Delivery requires a tracing subscriber
+    retaining `tollgate::diagnostics` warnings and is not a durable audit outbox.
+
+    Enforcement: `ApiError` conversions, its response marker and the router's
+    diagnostic middleware; fixed fields at the background/startup log sites.
+    *Tests:* `every_backend_error_conversion_keeps_opaque_details_out_of_responses_and_debug`,
+    `router_correlates_backend_failures_without_logging_request_or_error_payloads`,
+    `diagnostic_identifiers_use_all_entropy_and_surface_entropy_failure`,
+    `entropy_failure_preserves_the_error_without_inventing_an_identifier`,
+    `readyz_is_503_when_the_store_cannot_answer`,
+    `a_failing_sweep_reports_consecutive_failures`,
+    `failed_rollover_retains_safe_progress_without_backend_text`, and
+    `backend_startup_failure_never_discloses_connection_strings_or_driver_text`.

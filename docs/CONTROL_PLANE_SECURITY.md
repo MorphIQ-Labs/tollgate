@@ -183,6 +183,44 @@ billing delivery but must not turn a valid usage batch into a terminal refusal.
 Existing writer buffering, backpressure and shutdown bounds still apply; a long
 credential outage eventually denies admissions rather than losing usage silently.
 
+## Backend failures and diagnostics
+
+Backend errors carry arbitrary text. The server does not expose that text in
+HTTP bodies, `ApiError` debug output or its backend-failure logs. Public storage
+failures use `503 / storage / backend unavailable`; permanent usage refusals use
+`422 / usage-refused / usage batch refused`. Existing domain codes, generation
+responses and retry decisions are preserved. Credential-page failures retain
+their existing `credential-source-unavailable` code and title.
+
+HTTP problem responses with 5xx or `usage-refused` add an optional `error_id` containing 32
+lowercase hexadecimal digits. Find the matching warning on `tollgate::diagnostics`
+to identify the route template, status and code. The server generates this ID;
+request headers cannot choose it. It is diagnostic context, not authorization
+evidence. If system entropy is unavailable, the failure keeps its original
+status, omits the ID and logs `error_id_unavailable=true`.
+
+Retain this target at `warn` or above, for example with
+`RUST_LOG=info,tollgate::diagnostics=warn`. Library embedders own subscriber
+installation and log delivery. Correlation is limited by that delivery; it is
+not a durable record across process death. `Problem`'s public Rust shape is
+unchanged, and existing clients ignore the additive JSON field. HTTP consumers
+that need the correlation ID can read `error_id` from the response object.
+
+Readiness retains its empty 200/503 response and logs failures by operation.
+Maintenance logs retain static operation codes and completed
+progress counters; PostgreSQL startup logs identify initialization failure and
+the configuration to check. Neither connection strings nor driver text are
+logged. Inspect connectivity, backend health, migration status and appropriately
+protected backend operational records using the incident's time and operation.
+An error does not prove rollback: administrative audit receipts remain the
+authority for confirmed writes, and ambiguous failures need reconciliation.
+
+This change requires no schema or configuration migration and preserves the
+public Rust error types. Deploying the server updates the public titles and adds
+the optional field. Consumers must classify errors by status/code, not by parsing
+the old backend-specific title. A rollback to an older server restores the
+disclosure defect.
+
 ## Administrative audit
 
 Every HTTP administrative operation reaching the store emits structured

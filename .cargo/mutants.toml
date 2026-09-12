@@ -45,12 +45,10 @@ exclude_re = [
   # path off an O(shards) scan — and cost is what the performance gates
   # measure, not what a mutation test can observe.
   "replace && with \\|\\| in ConcurrencyGauge::release_shard",
-  # A binary's `main` is process wiring — env parsing, subscriber install,
-  # and a call into library code that has its own tests. Nothing running
-  # in-process can observe its body being replaced, so a mutant there is
-  # unkillable rather than untested: the harness never runs `main`. Logic
-  # worth pinning is therefore extracted out of it and tested directly
-  # (`is_loopback`, `redact_dsn`, `init_tracing` in tollgate-server).
+  # Whole entry-point replacement is outside this gate's generated mutations.
+  # Operational logic lives in tested helpers; binary integration tests
+  # separately witness startup, feature selection and diagnostic failures.
+  # This exclusion does not establish mutation coverage for those entry points.
   "replace main -> ",
   # `PostgresStore::roll_due_periods` runs one statement per `Period` variant
   # and keeps the batch within `limit` across them:

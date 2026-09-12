@@ -45,6 +45,7 @@ struct FlakyReclaimStore {
     inner: Arc<MemoryStore>,
     failures_left: AtomicU32,
     fail_on_call: Option<u32>,
+    fail_rollover: bool,
     calls: AtomicU32,
 }
 
@@ -103,14 +104,18 @@ impl LeaseAllocator for FlakyReclaimStore {
     ) -> Result<ReclaimBatch, StoreError> {
         let call = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
         if self.fail_on_call == Some(call) {
-            return Err(StoreError("sweep backend unavailable".into()));
+            return Err(StoreError(
+                "backend failure: password=fixture-maintenance-sensitive-70".into(),
+            ));
         }
         if self
             .failures_left
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
             .is_ok()
         {
-            return Err(StoreError("sweep backend unavailable".into()));
+            return Err(StoreError(
+                "backend failure: password=fixture-maintenance-sensitive-70".into(),
+            ));
         }
         self.inner.reclaim_expired_batch(now, limit).await
     }
@@ -201,6 +206,11 @@ impl AdminStore for FlakyReclaimStore {
         now: Timestamp,
         limit: std::num::NonZeroUsize,
     ) -> Result<tollgate_store::RolloverBatch, StoreError> {
+        if self.fail_rollover {
+            return Err(StoreError(
+                "backend failure: password=fixture-maintenance-sensitive-70".into(),
+            ));
+        }
         AdminStore::roll_due_periods(&*self.inner, now, limit).await
     }
 
@@ -383,6 +393,7 @@ async fn the_server_reclaims_expired_leases_on_its_interval() {
         inner: Arc::clone(&inner),
         failures_left: AtomicU32::new(0),
         fail_on_call: None,
+        fail_rollover: false,
         calls: AtomicU32::new(0),
     });
     let (captor, guard) = capture();
@@ -459,6 +470,7 @@ async fn one_scheduled_sweep_drains_every_saturated_batch() {
         inner: Arc::clone(&inner),
         failures_left: AtomicU32::new(0),
         fail_on_call: None,
+        fail_rollover: false,
         calls: AtomicU32::new(0),
     });
     let (server, stop_tx) = spawn_server(
@@ -499,6 +511,7 @@ async fn a_failed_later_batch_reports_already_committed_progress() {
         inner,
         failures_left: AtomicU32::new(0),
         fail_on_call: Some(2),
+        fail_rollover: false,
         calls: AtomicU32::new(0),
     });
     let (captor, guard) = capture();
@@ -566,6 +579,7 @@ async fn a_recovering_sweep_reports_how_many_failures_it_took() {
         inner: store_with_expired_lease(),
         failures_left: AtomicU32::new(2),
         fail_on_call: None,
+        fail_rollover: false,
         calls: AtomicU32::new(0),
     });
     let (captor, guard) = capture();
@@ -602,10 +616,19 @@ async fn a_failing_sweep_reports_consecutive_failures() {
         inner: store_with_expired_lease(),
         failures_left: AtomicU32::new(u32::MAX),
         fail_on_call: None,
+        fail_rollover: false,
         calls: AtomicU32::new(0),
     });
     serve_briefly(Arc::clone(&store), Arc::new(SystemClock)).await;
     drop(guard);
+
+    let events = captor.0.lock().unwrap().clone();
+    assert!(!format!("{events:?}").contains("fixture-maintenance-sensitive-70"));
+    assert!(events.iter().any(|event| {
+        event
+            .fields
+            .contains(&("operation".into(), "\"reclaim\"".into()))
+    }));
 
     let counts: Vec<u64> = captor
         .0
@@ -633,6 +656,68 @@ async fn a_failing_sweep_reports_consecutive_failures() {
     );
 }
 
+#[tokio::test]
+async fn failed_rollover_retains_safe_progress_without_backend_text() {
+    let store = Arc::new(FlakyReclaimStore {
+        inner: store_with_expired_lease(),
+        failures_left: AtomicU32::new(0),
+        fail_on_call: None,
+        fail_rollover: true,
+        calls: AtomicU32::new(0),
+    });
+    let (captor, guard) = capture();
+    let (server, stop) = spawn_server(
+        store,
+        Arc::new(SystemClock),
+        std::time::Duration::from_secs(3600),
+    )
+    .await;
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let found = captor.0.lock().unwrap().iter().any(|event| {
+                event
+                    .fields
+                    .contains(&("operation".into(), "\"budget-rollover\"".into()))
+            });
+            if found {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let _ = stop.send(());
+    server.await.unwrap().unwrap();
+    drop(guard);
+    observed.expect("the failing rollover must report its outcome");
+    let events = captor.0.lock().unwrap();
+    let event = events
+        .iter()
+        .find(|event| {
+            event
+                .fields
+                .contains(&("operation".into(), "\"budget-rollover\"".into()))
+        })
+        .unwrap();
+    assert_eq!(event.level, Level::WARN);
+    assert!(
+        event
+            .fields
+            .contains(&("code".into(), "\"storage\"".into()))
+    );
+    assert!(
+        event
+            .fields
+            .contains(&("rolled_accounts".into(), "0".into()))
+    );
+    assert!(
+        event
+            .fields
+            .contains(&("completed_batches".into(), "0".into()))
+    );
+    assert!(!format!("{events:?}").contains("fixture-maintenance-sensitive-70"));
+}
+
 /// The rollover pass shares this tick, and it is the *only* trigger: without
 /// it a budget schedule is a stored intention nothing ever acts on. The
 /// account below has one and has never been rolled, so a served interval must
@@ -653,6 +738,7 @@ async fn the_server_rolls_due_budget_periods_on_its_interval() {
         inner: Arc::clone(&inner),
         failures_left: AtomicU32::new(0),
         fail_on_call: None,
+        fail_rollover: false,
         calls: AtomicU32::new(0),
     });
     let (captor, guard) = capture();
@@ -709,6 +795,7 @@ async fn a_tick_that_rolls_nothing_says_nothing() {
         inner: Arc::clone(&inner),
         failures_left: AtomicU32::new(0),
         fail_on_call: None,
+        fail_rollover: false,
         calls: AtomicU32::new(0),
     });
     let (captor, guard) = capture();
@@ -737,6 +824,7 @@ async fn cancelling_the_server_releases_its_owned_maintenance_task() {
         inner: store_with_expired_lease(),
         failures_left: AtomicU32::new(0),
         fail_on_call: None,
+        fail_rollover: false,
         calls: AtomicU32::new(0),
     });
     let (server, _stop) = spawn_server(

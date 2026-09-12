@@ -9,8 +9,15 @@
 
 use std::process::{Command, Output};
 
+// Keep diagnostic assertions independent of the invoking terminal's color policy.
+fn server_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tollgate-server"));
+    command.env("NO_COLOR", "1");
+    command
+}
+
 fn run_with_backend(backend: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tollgate-server"))
+    server_command()
         .env("TOLLGATE_BIND", "127.0.0.1:0")
         .env("TOLLGATE_RECLAIM_INTERVAL_SECS", "5")
         .env("TOLLGATE_STORE", backend)
@@ -74,7 +81,7 @@ fn postgres_backend_fails_closed_when_not_compiled() {
 #[test]
 fn help_and_version_precede_configuration_and_respect_the_end_marker() {
     for argument in ["--help", "-h", "--version", "-V"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_tollgate-server"))
+        let output = server_command()
             .args(["unknown", argument])
             .env("TOLLGATE_STORE", "invalid")
             .env_remove("TOLLGATE_SECURITY_CONFIG")
@@ -83,7 +90,7 @@ fn help_and_version_precede_configuration_and_respect_the_end_marker() {
         assert!(output.status.success());
         assert!(diagnostics(&output).contains(env!("CARGO_PKG_VERSION")));
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_tollgate-server"))
+    let output = server_command()
         .args(["--", "--help"])
         .env("RUST_LOG", "error")
         .output()
@@ -98,7 +105,7 @@ fn credentials_are_required_even_for_loopback_and_invalid_intervals_are_rejected
     assert_eq!(output.status.code(), Some(2));
     assert!(diagnostics(&output).contains("TOLLGATE_SECURITY_CONFIG is required"));
     for interval in ["invalid", "0"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_tollgate-server"))
+        let output = server_command()
             .env("TOLLGATE_RECLAIM_INTERVAL_SECS", interval)
             .env("RUST_LOG", "error")
             .output()
@@ -115,7 +122,7 @@ fn normal_log_verbosity_cannot_silence_the_binarys_audit_target() {
     let directory = tempfile::tempdir().unwrap();
     let manifest = directory.path().join("security.json");
     std::fs::write(&manifest, "{}").unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tollgate-server"))
+    let mut child = server_command()
         .env("TOLLGATE_STORE", "memory")
         .env("TOLLGATE_BIND", "127.0.0.1:0")
         .env("TOLLGATE_RECLAIM_INTERVAL_SECS", "5")
@@ -158,7 +165,7 @@ fn the_binary_refuses_an_exposed_plaintext_listener_before_opening_the_backend()
         .into_iter()
         .filter(|backend| *backend == "memory" || cfg!(feature = "postgres"))
     {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_tollgate-server"))
+        let mut child = server_command()
             .env("TOLLGATE_STORE", backend)
             .env("TOLLGATE_PG_URL", "invalid-fixture-url")
             .env("TOLLGATE_BIND", "0.0.0.0:0")
@@ -184,5 +191,34 @@ fn the_binary_refuses_an_exposed_plaintext_listener_before_opening_the_backend()
         let output = child.wait_with_output().unwrap();
         assert!(!output.status.success());
         assert!(diagnostics(&output).contains("non-loopback listeners require TLS"));
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn backend_startup_failure_never_discloses_connection_strings_or_driver_text() {
+    let directory = tempfile::tempdir().unwrap();
+    let manifest = directory.path().join("security.json");
+    std::fs::write(&manifest, "{}").unwrap();
+    // Public fixtures. An invalid port or URL fails before any connection.
+    for url in [
+        "postgres://user:fixture-startup-sensitive-70@localhost:invalid/db?password=fixture-startup-sensitive-70",
+        "host=localhost port=invalid password=fixture-startup-sensitive-70",
+        "malformed-fixture-startup-sensitive-70",
+    ] {
+        let output = server_command()
+            .env("TOLLGATE_STORE", "postgres")
+            .env("TOLLGATE_PG_URL", url)
+            .env("TOLLGATE_BIND", "127.0.0.1:0")
+            .env("TOLLGATE_RECLAIM_INTERVAL_SECS", "5")
+            .env("TOLLGATE_SECURITY_CONFIG", &manifest)
+            .env("RUST_LOG", "error")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let diagnostic = diagnostics(&output);
+        assert!(diagnostic.contains("cannot initialize postgres"));
+        assert!(diagnostic.contains("operation=\"connect\""));
+        assert!(!diagnostic.contains("fixture-startup-sensitive-70"));
     }
 }
