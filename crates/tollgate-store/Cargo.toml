@@ -24,8 +24,8 @@ serde_json = { workspace = true }
 # Event-capture tests only, matching tollgate-client: a library emits, and only
 # a test or an application installs a subscriber to observe it.
 tracing-subscriber = { workspace = true }
-# Account-status transitions only (#51): the two records must agree after every
-# sequence of transitions, not just the ones a scenario happened to write.
+# State/representation contract properties: account-status agreement after
+# arbitrary transitions (#51) and exact positive wire TTL round trips (#76).
 proptest = { workspace = true }
 
 [features]

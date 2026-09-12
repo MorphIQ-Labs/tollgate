@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use jiff::SignedDuration;
 use serde::{Deserialize, Serialize};
 
 use tollgate_core::{
@@ -102,11 +103,66 @@ pub const MAX_KEY_RECORD_BYTES: usize = 216;
 /// The maximal envelope is 134 bytes; the first record needs no comma.
 pub const MAX_KEYS_BODY_BYTES: usize = crate::MAX_KEY_PAGE_LIMIT * (MAX_KEY_RECORD_BYTES + 1) + 133;
 
+/// The TTL fields shared by both lease-creating requests.
+///
+/// Positive whole seconds through `u32::MAX` retain the original
+/// `ttl_seconds` spelling. Every other positive duration carries Jiff's exact
+/// duration string in `ttl`, with `ttl_seconds: 0`: a legacy server rejects
+/// that sentinel instead of silently allocating a differently timed lease.
+/// Upgrade servers before enabling these durations on HTTP clients.
+///
+/// Deserialized fields are untrusted; [`Self::duration`] validates them before
+/// a handler invokes its allocator. [`Self::try_from`] refuses nonpositive caller
+/// input before an HTTP request is built. Neither operation applies policy's
+/// maximum TTL: that remains the allocator's decision.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct LeaseTtl {
+    ttl_seconds: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ttl: Option<SignedDuration>,
+}
+
+impl TryFrom<SignedDuration> for LeaseTtl {
+    type Error = crate::AllocateError;
+
+    fn try_from(ttl: SignedDuration) -> Result<Self, Self::Error> {
+        if ttl <= SignedDuration::ZERO {
+            return Err(crate::AllocateError::InvalidTtl);
+        }
+        Ok(match (u32::try_from(ttl.as_secs()), ttl.subsec_nanos()) {
+            (Ok(ttl_seconds), 0) => Self {
+                ttl_seconds,
+                ttl: None,
+            },
+            _ => Self {
+                ttl_seconds: 0,
+                ttl: Some(ttl),
+            },
+        })
+    }
+}
+
+impl LeaseTtl {
+    pub fn duration(self) -> Result<SignedDuration, crate::AllocateError> {
+        let ttl = match (self.ttl_seconds, self.ttl) {
+            (0, Some(ttl)) => ttl,
+            (seconds, None) => SignedDuration::from_secs(i64::from(seconds)),
+            // Two nonzero declarations have no implicit precedence.
+            _ => return Err(crate::AllocateError::InvalidTtl),
+        };
+        if ttl <= SignedDuration::ZERO {
+            return Err(crate::AllocateError::InvalidTtl);
+        }
+        Ok(ttl)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AcquireRequest {
     pub account_id: AccountId,
     pub requested: CostUnits,
-    pub ttl_seconds: u32,
+    #[serde(flatten)]
+    pub ttl: LeaseTtl,
 }
 
 pub type AcquireResponse = LeaseGrant;
@@ -129,7 +185,8 @@ pub struct ConsolidateRequest {
     pub fencing_token: FencingToken,
     pub unspent: CostUnits,
     pub requested: CostUnits,
-    pub ttl_seconds: u32,
+    #[serde(flatten)]
+    pub ttl: LeaseTtl,
 }
 
 pub type ConsolidateResponse = LeaseGrant;

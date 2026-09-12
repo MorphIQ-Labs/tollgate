@@ -361,6 +361,12 @@ async fn usability_window_rollover_returns_unspent_capacity() {
 
 #[test]
 fn invalid_lease_manager_durations_are_rejected() {
+    for ttl in [SignedDuration::ZERO, SignedDuration::from_nanos(-1)] {
+        let mut config = manager_config();
+        config.lease_ttl = ttl;
+        config.expiry_safety_margin = SignedDuration::ZERO;
+        assert!(config.validate().is_err());
+    }
     let mut config = manager_config();
     config.expiry_safety_margin = SignedDuration::from_secs(-1);
     assert!(config.validate().is_err());
@@ -368,6 +374,22 @@ fn invalid_lease_manager_durations_are_rejected() {
     let mut config = manager_config();
     config.poll_interval = std::time::Duration::ZERO;
     assert!(config.validate().is_err());
+}
+
+#[test]
+fn fractional_and_wide_lease_ttls_remain_valid_configuration() {
+    for ttl in [
+        SignedDuration::from_nanos(1),
+        SignedDuration::from_millis(500),
+        SignedDuration::from_millis(1_500),
+        SignedDuration::from_secs(i64::from(u32::MAX) + 1),
+        SignedDuration::MAX,
+    ] {
+        let mut config = manager_config();
+        config.lease_ttl = ttl;
+        config.expiry_safety_margin = SignedDuration::ZERO;
+        assert_eq!(config.validate(), Ok(()), "TTL {ttl}");
+    }
 }
 
 #[tokio::test(start_paused = true)]
