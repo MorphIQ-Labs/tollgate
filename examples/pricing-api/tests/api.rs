@@ -126,6 +126,29 @@ async fn wait_ready(router: &axum::Router) {
     panic!("service never became ready");
 }
 
+/// Elastic readiness may be satisfied entirely by overage headroom. Tests
+/// whose next request must use a lease observe that separate prerequisite.
+/// No requests have spent this first grant, so its refill signal is unarmed.
+async fn wait_for_first_grant(router: &axum::Router, units: u64) {
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if metrics(router).await["total_lease_remaining"]
+                .as_u64()
+                .is_some_and(|remaining| remaining >= units)
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        observed.is_ok(),
+        "the first grant never funded {units} units: {}",
+        metrics(router).await
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authorized_request_prices_and_charges() {
     let (router, runtime) = build_test_app(100_000, true).await;
@@ -358,8 +381,8 @@ async fn exhausted_quota_returns_429_and_never_overspends() {
 /// The elastic twin of `exhausted_quota_returns_429_and_never_overspends`,
 /// end to end over HTTP. The same tiny deposit, and the same requests — but
 /// the account keeps serving past what it paid for, every unfunded unit is
-/// recorded, and the refusal when the cap runs out is a 402 that says so
-/// rather than a 429 inviting a retry that cannot help.
+/// recorded. Cap exhaustion returns a retryable 503 because a subsequent
+/// lease can fund the same request without changing the local overage cap.
 ///
 /// This is also the test that pins the wiring reading the mode: a
 /// `enforcement_mode()` that ignored the published snapshot would report no
@@ -379,6 +402,7 @@ async fn an_elastic_account_serves_past_its_deposit_and_bills_the_overage() {
     )
     .await;
     wait_ready(&router).await;
+    wait_for_first_grant(&router, 51).await;
 
     assert_eq!(
         metrics(&router).await["total_overage_cap"],
@@ -400,10 +424,8 @@ async fn an_elastic_account_serves_past_its_deposit_and_bills_the_overage() {
         }
     }
 
-    // Strict would have stopped when the lease ran out. 200 units funds only
-    // a handful of 51-unit requests — and fewer than three, because the grant
-    // policy shrinks near exhaustion — so anything past that was served on
-    // credit.
+    // Strict would have stopped when the lease ran out. 200 units funds at
+    // most three 51-unit requests, so anything past that was served on credit.
     assert!(ok > 3, "elastic must serve past the deposit, admitted {ok}");
     assert!(
         capacity_unavailable > 0,
@@ -420,30 +442,98 @@ async fn an_elastic_account_serves_past_its_deposit_and_bills_the_overage() {
         "the lease funded the first requests, so `admitted` is the total and \
          `admitted_overage` a qualifier inside it — never a sibling to add"
     );
-    assert!(after["total_overage_spent"].as_u64().unwrap() <= CAP);
-    assert_eq!(
-        after["denials"]["overage_cap_exhausted"],
-        json!(capacity_unavailable)
-    );
-
+    assert_elastic_totals(&after, ok, on_credit, capacity_unavailable);
+    assert!(on_credit * 51 <= CAP);
     let store = runtime.store.clone();
     runtime.shutdown().await;
 
     // The point of the whole design: spend beyond the deposit is *recorded*,
     // and the ledger still balances because overage funds what it bills.
-    let conservation = store.conservation(DEMO_ACCOUNT).unwrap();
-    assert!(
-        conservation.overage_recorded > CostUnits::ZERO,
-        "unfunded spend must be recorded, not forgiven"
-    );
+    assert_elastic_bill(&store, 200, ok, on_credit);
     assert!(
         store.usage_recorded(DEMO_ACCOUNT).get() > 200,
         "the account was billed past its deposit"
     );
-    assert!(
-        conservation.holds(),
-        "conservation violated: {conservation:?}"
-    );
+}
+
+fn assert_elastic_totals(after: &Value, admitted: u64, on_credit: u64, denied: u64) {
+    assert_eq!(after["admitted"], admitted);
+    assert_eq!(after["units_admitted"], admitted * 51);
+    assert_eq!(after["admitted_overage"], on_credit);
+    assert_eq!(after["units_admitted_overage"], on_credit * 51);
+    assert_eq!(after["total_overage_spent"], on_credit * 51);
+    assert_eq!(after["committed_at_overage"], 0);
+    assert_eq!(after["units_committed_at_overage"], 0);
+    assert_eq!(after["execution_started"], admitted);
+    assert_eq!(after["denied"], denied);
+    assert_eq!(after["denials"]["overage_cap_exhausted"], denied);
+}
+
+fn assert_elastic_bill(
+    store: &tollgate_store::MemoryStore,
+    deposited: u64,
+    admitted: u64,
+    on_credit: u64,
+) {
+    let ledger = store.conservation(DEMO_ACCOUNT).unwrap();
+    assert_eq!(ledger.deposited, CostUnits(deposited));
+    assert_eq!(ledger.settled_usage, CostUnits(admitted * 51));
+    assert_eq!(store.usage_recorded(DEMO_ACCOUNT), CostUnits(admitted * 51));
+    assert_eq!(ledger.overage_recorded, CostUnits(on_credit * 51));
+    assert_eq!(ledger.settlement_loss, CostUnits::ZERO);
+    assert_eq!(ledger.expired, CostUnits::ZERO);
+    assert!(ledger.holds(), "conservation violated: {ledger:?}");
+}
+
+/// Hold funding at zero until after the HTTP assertions: no scheduler can
+/// deliver the first grant early. Then publish the deposit and observe the
+/// first installed grant before requiring a lease-funded admission.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn elastic_readiness_serves_before_the_first_grant_and_recovers_after_funding() {
+    const CAP: u64 = 1_074;
+    let (router, runtime) = build_test_app_with_mode(
+        0,
+        true,
+        EnforcementMode::Elastic {
+            overage_cap: CostUnits(CAP),
+        },
+    )
+    .await;
+    wait_ready(&router).await;
+    let before = metrics(&router).await;
+    assert_eq!(before.get("total_lease_remaining"), Some(&Value::Null));
+    assert_eq!(before["total_overage_cap"], CAP);
+
+    // 21 x 51 = 1,071 fits; the remaining three units cannot fund request 22.
+    // Readiness therefore never established the old `admitted > on_credit`
+    // premise: all of these successful requests are legitimate overage.
+    for request in 0..40 {
+        let (status, body) = call(&router, Some(DEMO_API_KEY), price_body(1)).await;
+        if request < 21 {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["metadata"]["units_charged"], 51);
+        } else {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert_eq!(body["code"], "overage-cap-exhausted");
+            assert_eq!(body["units_charged"], 0);
+        }
+    }
+    let unfunded = metrics(&router).await;
+    assert_eq!(unfunded.get("total_lease_remaining"), Some(&Value::Null));
+    assert_elastic_totals(&unfunded, 21, 21, 19);
+
+    runtime.store.deposit(DEMO_ACCOUNT, CostUnits(200)).unwrap();
+    wait_for_first_grant(&router, 51).await;
+    let (status, body) = call(&router, Some(DEMO_API_KEY), price_body(1)).await;
+    assert_eq!(status, StatusCode::OK, "the lease funds the retry: {body}");
+    assert_eq!(body["metadata"]["units_charged"], 51);
+    let funded = metrics(&router).await;
+    assert_elastic_totals(&funded, 22, 21, 19);
+    assert_eq!(funded["total_overage_cap"], CAP);
+
+    let store = runtime.store.clone();
+    runtime.shutdown().await;
+    assert_elastic_bill(&store, 200, 22, 21);
 }
 
 /// Issue #37: an instance that is refusing everything must not look like one
