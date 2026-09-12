@@ -35,7 +35,7 @@ pub enum AllocateError {
     /// should keep polling, because usage settlement or a top-up can restore
     /// balance.
     InsufficientBalance,
-    /// A lease must have a strictly positive lifetime.
+    /// A lease must specify one unambiguous, strictly positive lifetime.
     InvalidTtl,
     UnknownLease,
     /// The fencing token does not match the lease record named by `lease_id`.
@@ -107,7 +107,9 @@ impl std::fmt::Display for AllocateError {
             AllocateError::UnknownAccount => f.write_str("unknown account"),
             AllocateError::AccountInactive => f.write_str("account inactive"),
             AllocateError::InsufficientBalance => f.write_str("insufficient balance"),
-            AllocateError::InvalidTtl => f.write_str("lease TTL must be positive"),
+            AllocateError::InvalidTtl => {
+                f.write_str("lease TTL must specify one positive duration")
+            }
             AllocateError::UnknownLease => f.write_str("unknown lease"),
             AllocateError::Fenced => f.write_str("fencing token mismatch"),
             AllocateError::LeaseNotActive => f.write_str("lease not active"),

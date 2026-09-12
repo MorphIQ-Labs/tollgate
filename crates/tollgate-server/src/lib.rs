@@ -39,7 +39,6 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use jiff::SignedDuration;
 use tracing::Instrument as _;
 
 use tollgate_core::{AccountId, CapacityClass, CostUnits, Principal, PublishableSnapshot};
@@ -519,7 +518,7 @@ async fn acquire<S: Backend>(
         .acquire(
             request.account_id,
             request.requested,
-            SignedDuration::from_secs(i64::from(request.ttl_seconds)),
+            request.ttl.duration()?,
             state.clock.now(),
         )
         .await?;
@@ -562,7 +561,7 @@ async fn consolidate<S: Backend>(
             request.fencing_token,
             request.unspent,
             request.requested,
-            SignedDuration::from_secs(i64::from(request.ttl_seconds)),
+            request.ttl.duration()?,
             state.clock.now(),
         )
         .await?;

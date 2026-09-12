@@ -512,6 +512,12 @@ until it has one.
    `expired_backlog_is_reclaimed_in_bounded_batches` (store suites), plus
    `one_scheduled_sweep_drains_every_saturated_batch` (server suite).
 
+   Known implementation gap: PostgreSQL stores lease expiry and reclaim grace
+   in microseconds but can return a finer expiry. The durable boundary can
+   precede that returned expiry plus grace; #117 tracks the storage precision
+   and rollout correction. Exact HTTP TTL round trips do not establish that
+   separate durable timing property.
+
    The server owns and observes its maintenance task. Each reclaim and rollover
    outcome is published independently; readiness requires both to have completed
    successfully and the publisher to remain alive. A first failure withdraws
@@ -773,6 +779,26 @@ until it has one.
     and `legacy_invalid_snapshot_is_rejected_on_read`. *Proof:*
     `formal/lean/Tollgate/SnapshotLimits.lean`. Values are never silently
     repaired: coercing a declared capacity would change its contract.
+
+    Lease TTLs cross HTTP without truncation or saturation. `LeaseTtl::try_from`
+    rejects nonpositive caller input before a request is built; its wire
+    representation retains positive whole `u32` seconds or carries the exact
+    `SignedDuration` with a zero legacy sentinel. `LeaseTtl::duration` refuses
+    nonpositive or conflicting declarations before either acquire or
+    consolidation invokes a backend. The allocator alone applies its policy
+    ceiling. Fractional and wide positive TTLs remain valid configuration.
+    *Tests:* `whole_second_ttls_keep_the_legacy_wire_contract`,
+    `precise_ttls_carry_an_exact_string_and_a_refusing_legacy_sentinel`,
+    `every_positive_duration_round_trips_in_both_lease_requests`,
+    `nonpositive_and_ambiguous_ttls_are_rejected`,
+    `malformed_or_partial_ttl_fields_are_not_repaired`,
+    `duplicated_ttl_fields_are_rejected_inside_both_request_envelopes`,
+    `http_acquire_preserves_positive_ttl`,
+    `http_consolidation_preserves_positive_ttl`,
+    `postgres_and_http_preserve_ttl_across_acquire_and_consolidation`,
+    `invalid_wire_ttls_never_debit_or_settle_a_lease`,
+    `legacy_servers_reject_precise_ttls_and_invalid_input_never_reaches_http`,
+    and `fractional_and_wide_lease_ttls_remain_valid_configuration`.
 
 17. **Negative caching is bounded and self-healing.** The ArcSwap map retains
     at most its configured count of request-visible negatives, removes

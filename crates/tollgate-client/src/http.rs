@@ -23,8 +23,8 @@ use tollgate_core::{
     PublishableSnapshot, UsageEvent,
 };
 use tollgate_store::wire::{
-    API_PREFIX, AcquireRequest, ConsolidateRequest, IngestRequestRef, PrincipalsResponse, Problem,
-    ReleaseRequest,
+    API_PREFIX, AcquireRequest, ConsolidateRequest, IngestRequestRef, LeaseTtl, PrincipalsResponse,
+    Problem, ReleaseRequest,
 };
 use tollgate_store::{
     AllocateError, IngestError, IngestReport, LeaseAllocator, ReclaimBatch, SnapshotPush,
@@ -195,13 +195,13 @@ impl LeaseAllocator for HttpStore {
         _now: Timestamp,
     ) -> Result<LeaseGrant, AllocateError> {
         // The server stamps its own clock; `now` stays local-only.
-        let ttl_seconds = u32::try_from(ttl.as_secs().max(0)).unwrap_or(u32::MAX);
+        let ttl = LeaseTtl::try_from(ttl)?;
         let response = self
             .request(reqwest::Method::POST, "/leases/acquire")
             .json(&AcquireRequest {
                 account_id: account,
                 requested,
-                ttl_seconds,
+                ttl,
             })
             .send()
             .await?;
@@ -249,7 +249,7 @@ impl LeaseAllocator for HttpStore {
         // this transport would reintroduce exactly the gap the operation
         // exists to close. The server stamps its own clock, as it does for
         // acquire and release.
-        let ttl_seconds = u32::try_from(ttl.as_secs().max(0)).unwrap_or(u32::MAX);
+        let ttl = LeaseTtl::try_from(ttl)?;
         let response = self
             .request(reqwest::Method::POST, "/leases/consolidate")
             .json(&ConsolidateRequest {
@@ -257,7 +257,7 @@ impl LeaseAllocator for HttpStore {
                 fencing_token,
                 unspent,
                 requested,
-                ttl_seconds,
+                ttl,
             })
             .send()
             .await?;

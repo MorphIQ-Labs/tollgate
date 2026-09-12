@@ -12,8 +12,9 @@ postgres = { max-threads = 1 }
 # `scripts/check_mutations.sh` also restricts cargo-mutants to one worker when
 # PostgreSQL is enabled because separate nextest processes cannot share this
 # group semaphore and the suite intentionally truncates one shared database.
+# The HTTP TTL parity test uses that same database and must share the group.
 [[profile.mutants.overrides]]
-filter = 'package(tollgate-store-postgres)'
+filter = 'package(tollgate-store-postgres) | (package(tollgate-server) & binary(lease_ttl) & test(postgres))'
 test-group = 'postgres'
 # The 10s cap above is a *hang* detector, and it was set (#14, 2026-08-22)
 # before this suite's slowest legitimate test existed (#12, 2026-08-23).

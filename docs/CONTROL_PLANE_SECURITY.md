@@ -20,6 +20,36 @@ their existing authority. Deliberately dropping the owner is not a failure alert
 
 ## Server configuration
 
+### Lease TTL compatibility
+
+Both `/v1/leases/acquire` and `/v1/leases/consolidate` accept positive whole
+seconds as before (`"ttl_seconds": 60`). A fractional or wider duration uses
+an exact Jiff duration string with a zero compatibility sentinel, for example
+`"ttl_seconds": 0, "ttl": "PT0.5S"`. A non-null `ttl` requires the sentinel
+to be zero; two nonzero declarations are refused with 422 `invalid-ttl`, even
+when they express the same duration. Malformed fields return `invalid-json`.
+The server's allocator continues to apply its configured maximum TTL and
+supplies the authoritative expiry in its response.
+
+Upgrade every control-plane server before enabling fractional or greater-than-
+`u32::MAX`-second TTLs in HTTP clients. Whole-second clients remain compatible
+throughout the rollout. An older server ignores `ttl` and rejects the zero
+sentinel with `invalid-ttl`, so a mixed deployment cannot silently grant a
+different lifetime. Before rolling servers back, stop clients from issuing
+the precise form; otherwise those lease operations refuse until compatible
+servers return. Existing grant responses and the database schema are unchanged.
+PostgreSQL's separate durable microsecond precision gap is tracked in #117;
+wire precision does not certify its reclaim boundary at finer precision.
+
+Rust callers constructing `AcquireRequest` or `ConsolidateRequest` must replace
+the `ttl_seconds` member with `ttl: LeaseTtl::try_from(duration)?`. This is a Rust
+DTO source break. `HttpStore`'s public allocator signatures and valid runtime
+configuration remain unchanged; nonpositive durations return `InvalidTtl`
+before HTTP I/O. The `invalid-ttl` code remains stable; its title says that a
+TTL must specify one positive duration.
+
+### Security manifest
+
 Set `TOLLGATE_SECURITY_CONFIG` to a JSON manifest. There is no default credential,
 including on loopback. Relative paths resolve against the manifest's directory.
 Unknown fields, duplicate credential mappings, malformed credentials, and invalid
