@@ -97,6 +97,44 @@ fn publishable(snapshot: Arc<AccountSnapshot>) -> PublishableSnapshot {
     PublishableSnapshot::try_new(snapshot).expect("test snapshot limits are valid")
 }
 
+fn runtime_config(principal: Principal) -> tollgate_client::InstanceRuntimeConfig {
+    tollgate_client::InstanceRuntimeConfig {
+        snapshots: SnapshotManagerConfig {
+            principals: TrackedPrincipals::All {
+                seed: vec![principal],
+            },
+            refresh_interval: std::time::Duration::from_millis(20),
+            unknown_ttl: SignedDuration::from_secs(1),
+            revoked_ttl: SignedDuration::from_secs(1),
+            retry_backoff: std::time::Duration::from_millis(10),
+            max_concurrent_fetches: 4,
+            fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(5),
+        },
+        leases: tollgate_client::AccountLeaseConfig {
+            target_grant: CostUnits(2_000),
+            low_water: CostUnits(500),
+            lease_ttl: SignedDuration::from_secs(3_600),
+            expiry_safety_margin: SignedDuration::from_secs(2),
+            poll_interval: std::time::Duration::from_millis(10),
+            store_call_timeout: std::time::Duration::from_secs(5),
+            shutdown_release_deadline: std::time::Duration::from_secs(10),
+        },
+        usage: UsageWriterConfig {
+            queue_capacity: 64,
+            max_batch: 16,
+            flush_interval: std::time::Duration::from_millis(10),
+            retry_backoff: std::time::Duration::from_millis(10),
+            shutdown_drain_deadline: std::time::Duration::from_secs(60),
+            ingest_timeout: std::time::Duration::from_secs(5),
+        },
+        sharding: tollgate_core::LocalSharding::SINGLE,
+        idle_account_linger: std::time::Duration::from_millis(30),
+        manager_restart_backoff: std::time::Duration::from_millis(10),
+        shutdown_deadline: std::time::Duration::from_secs(70),
+    }
+}
+
 #[tokio::test]
 async fn http_store_rejects_invalid_snapshot_from_legacy_server() {
     use axum::Json;
@@ -359,6 +397,379 @@ async fn full_stack_over_mtls() {
     full_stack(common::TransportMode::Mtls).await;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GrantOperation {
+    Acquire,
+    Consolidate,
+}
+
+struct HeldGrant {
+    grant: LeaseGrant,
+    deliver: tokio::sync::oneshot::Sender<()>,
+}
+
+/// Real HTTP operations, with a controlled handoff of one committed grant to
+/// the manager. Cancelling this handoff models losing the allocation result;
+/// it does not simulate a TCP stack or assert that cancellation rolls back I/O.
+struct HeldGrantAllocator {
+    http: Arc<tollgate_client::HttpStore>,
+    operation: GrantOperation,
+    acquired: std::sync::atomic::AtomicU64,
+    held: tokio::sync::mpsc::UnboundedSender<HeldGrant>,
+}
+
+impl HeldGrantAllocator {
+    async fn hold(&self, grant: LeaseGrant) -> LeaseGrant {
+        let (deliver, received) = tokio::sync::oneshot::channel();
+        self.held.send(HeldGrant { grant, deliver }).unwrap();
+        received
+            .await
+            .expect("the test retains the delivery handle");
+        grant
+    }
+}
+
+#[async_trait::async_trait]
+impl tollgate_store::LeaseAllocator for HeldGrantAllocator {
+    async fn acquire(
+        &self,
+        account: AccountId,
+        requested: CostUnits,
+        ttl: SignedDuration,
+        now: Timestamp,
+    ) -> Result<LeaseGrant, AllocateError> {
+        let grant = self.http.acquire(account, requested, ttl, now).await?;
+        let previous = self
+            .acquired
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(
+            if self.operation == GrantOperation::Acquire && previous == 1 {
+                self.hold(grant).await
+            } else {
+                grant
+            },
+        )
+    }
+
+    async fn consolidate(
+        &self,
+        lease: LeaseId,
+        fence: FencingToken,
+        unspent: CostUnits,
+        requested: CostUnits,
+        ttl: SignedDuration,
+        now: Timestamp,
+    ) -> Result<LeaseGrant, AllocateError> {
+        let grant = self
+            .http
+            .consolidate(lease, fence, unspent, requested, ttl, now)
+            .await?;
+        Ok(if self.operation == GrantOperation::Consolidate {
+            self.hold(grant).await
+        } else {
+            grant
+        })
+    }
+
+    async fn release(
+        &self,
+        lease: LeaseId,
+        fence: FencingToken,
+        unspent: CostUnits,
+        now: Timestamp,
+    ) -> Result<(), AllocateError> {
+        self.http.release(lease, fence, unspent, now).await
+    }
+
+    async fn reclaim_expired_batch(
+        &self,
+        now: Timestamp,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<tollgate_store::ReclaimBatch, tollgate_store::StoreError> {
+        self.http.reclaim_expired_batch(now, limit).await
+    }
+}
+
+async fn wait_for_observation(
+    mut observed: impl FnMut() -> bool,
+) -> Result<(), tokio::time::error::Elapsed> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !observed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+}
+
+/// Shutdown returns every confirmed, quiesced grant. A cancelled acquisition
+/// may have committed an unknown capability, which must remain reported and
+/// conserved until expiry. Observe both stages instead of assuming liquidity.
+async fn assert_shutdown_accounting(
+    store: &MemoryStore,
+    handle: &tollgate_client::RuntimeHandle,
+    stopped: &tollgate_client::RuntimeShutdownReport,
+    deposited: CostUnits,
+    committed: CostUnits,
+    reclaim_at: Timestamp,
+) -> Vec<tollgate_store::ReclaimedLease> {
+    assert!(
+        !stopped.background_failed && !stopped.deadline_expired,
+        "{stopped:?}"
+    );
+    assert!(stopped.unfinished_accounts.is_empty(), "{stopped:?}");
+    assert!(!stopped.snapshots.as_ref().unwrap().task_died);
+    assert_eq!(stopped.accounts.len(), 1);
+    let account = &stopped.accounts[&ACCOUNT];
+    assert!(!account.task_died, "{account:?}");
+    assert_eq!(account.abandoned, 0, "no request still holds a known grant");
+    let usage = stopped.usage.as_ref().unwrap();
+    assert_eq!(usage.lost, 0);
+    assert_eq!(usage.rejected, 0);
+    assert_eq!(usage.unresolved, 0);
+    assert!(!usage.counter_overflow);
+
+    let report = handle.report();
+    assert!(!report.counter_overflow, "{report:?}");
+    assert_eq!(report.unrecovered_grants, 0, "{report:?}");
+    assert_eq!(report.accounting.unaccounted, 0);
+    let refill = report.refill.unwrap();
+    assert_eq!(
+        refill.acquired, refill.released,
+        "every confirmed grant settled"
+    );
+    assert_eq!(refill.abandoned, 0);
+    let accounts = handle.account_reports(reclaim_at);
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].account, ACCOUNT);
+    assert_eq!(accounts[0].uncertain_acquires, report.uncertain_acquires);
+
+    let before = store.conservation(ACCOUNT).unwrap();
+    assert!(before.holds(), "ledger: {before:?}; runtime: {report:?}");
+    assert_eq!(before.deposited, deposited);
+    assert_eq!(before.overage_recorded, CostUnits::ZERO);
+    assert_eq!(store.usage_recorded(ACCOUNT), committed);
+    assert_eq!(before.settled_usage, committed);
+    assert_eq!(before.settlement_loss, CostUnits::ZERO);
+    assert_eq!(before.expired, CostUnits::ZERO);
+    if report.uncertain_acquires == 0 {
+        assert_eq!(before.active_lease_grants, CostUnits::ZERO, "{report:?}");
+    }
+
+    // No server task remains. Advance only the store's explicit time input;
+    // there is no sleep or extra measurement in this expiry observation.
+    let reclaimed = store.reclaim_expired(reclaim_at).await.unwrap();
+    assert!(
+        u64::try_from(reclaimed.len()).unwrap() <= report.uncertain_acquires,
+        "only reported unanswered acquisitions may remain: {reclaimed:?}; {report:?}"
+    );
+    let returned = reclaimed.iter().fold(CostUnits::ZERO, |sum, lease| {
+        assert_eq!(lease.account_id, ACCOUNT);
+        sum.checked_add(lease.reclaimed).unwrap()
+    });
+    assert_eq!(
+        returned, before.active_lease_grants,
+        "unanswered grants funded no usage"
+    );
+    let after = store.conservation(ACCOUNT).unwrap();
+    assert!(after.holds(), "{after:?}");
+    assert_eq!(after.active_lease_grants, CostUnits::ZERO);
+    assert_eq!(after.balance, deposited.checked_sub(committed).unwrap());
+    assert_eq!(store.usage_recorded(ACCOUNT), committed);
+    assert_eq!(after.settled_usage, committed);
+    assert_eq!(after.settlement_loss, CostUnits::ZERO);
+    assert_eq!(after.expired, CostUnits::ZERO);
+    reclaimed
+}
+
+#[tokio::test]
+async fn shutdown_accounts_for_unanswered_grants_over_http() {
+    controlled_shutdown(common::TransportMode::LoopbackBearer).await;
+}
+
+#[tokio::test]
+async fn shutdown_accounts_for_unanswered_grants_over_tls() {
+    controlled_shutdown(common::TransportMode::TlsBearer).await;
+}
+
+#[tokio::test]
+async fn shutdown_accounts_for_unanswered_grants_over_mtls() {
+    controlled_shutdown(common::TransportMode::Mtls).await;
+}
+
+async fn controlled_shutdown(mode: common::TransportMode) {
+    for operation in [GrantOperation::Acquire, GrantOperation::Consolidate] {
+        for deliver_result in [false, true] {
+            // Freeze business time inside the generated TLS certificate's
+            // validity window; expiry checks below advance only this input.
+            let now = Timestamp::now();
+            let clock = Arc::new(tollgate_client::ManualClock::new(now));
+            let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+            store.create_account(AccountConfig {
+                account_id: ACCOUNT,
+                initial_balance: CostUnits(104),
+                status: AccountStatus::Active,
+                capacity_class: CapacityClass::Assured,
+            });
+            store
+                .publish_snapshot(PRINCIPAL, publishable(snapshot()))
+                .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (security, http) = common::transport(mode, listener.local_addr().unwrap());
+            let (stop, stopping) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(serve(
+                listener,
+                ServerState {
+                    security,
+                    store: store.clone(),
+                    clock: clock.clone(),
+                },
+                std::time::Duration::from_millis(200),
+                async move {
+                    let _ = stopping.await;
+                },
+            ));
+            let (held, mut pending) = tokio::sync::mpsc::unbounded_channel();
+            let allocator = Arc::new(HeldGrantAllocator {
+                http: http.clone(),
+                operation,
+                acquired: std::sync::atomic::AtomicU64::new(0),
+                held,
+            });
+            assert!(matches!(
+                http.snapshot(PRINCIPAL).await.unwrap(),
+                SnapshotResolution::Present(_)
+            ));
+            let mut config = runtime_config(PRINCIPAL);
+            // 104 deposited -> 52 granted -> 51 billed, leaving 53 unspent.
+            // A crossing acquires 26 beside the old lease; a refusal folds
+            // its one-unit tail into a 26-unit replacement. Both can leave
+            // exactly the reported 27-versus-53 balance if the reply is lost.
+            config.leases.low_water = match operation {
+                GrantOperation::Acquire => CostUnits(51),
+                GrantOperation::Consolidate => CostUnits::ZERO,
+            };
+            let (runtime, handle) = tollgate_client::InstanceRuntime::spawn(
+                http.clone(),
+                allocator,
+                http,
+                clock,
+                config,
+            )
+            .unwrap();
+            wait_for_observation(|| handle.readiness(now).is_ready())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "readiness: {:?}; runtime: {:?}; accounts: {:?}",
+                        handle.readiness(now),
+                        handle.report(),
+                        handle.account_reports(now)
+                    )
+                });
+            let admitted = handle
+                .begin(PRINCIPAL, PermissionBits::bit(0), now)
+                .unwrap()
+                .admit(
+                    &[(PriceOp, 1)],
+                    handle.recorder().try_reserve().unwrap(),
+                    now,
+                )
+                .unwrap();
+            let committed = admitted
+                .acquire_capacity(&NoGate)
+                .unwrap()
+                .commit(RequestId(1), now)
+                .unwrap();
+            assert_eq!(committed.units(), CostUnits(51));
+            drop(committed);
+            if operation == GrantOperation::Consolidate {
+                let context = handle
+                    .begin(PRINCIPAL, PermissionBits::bit(0), now)
+                    .unwrap();
+                assert!(matches!(
+                    context.admit(
+                        &[(PriceOp, 1)],
+                        handle.recorder().try_reserve().unwrap(),
+                        now,
+                    ),
+                    Err(DenyReason::LeaseExhausted { .. })
+                ));
+            }
+            let held = tokio::time::timeout(std::time::Duration::from_secs(5), pending.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(held.grant.units, CostUnits(26));
+            let mut deliver = Some(held.deliver);
+            if deliver_result {
+                deliver.take().unwrap().send(()).unwrap();
+                wait_for_observation(|| handle.report().refill.unwrap().acquired == 2)
+                    .await
+                    .unwrap();
+            }
+            let stopped = runtime.shutdown().await.unwrap();
+            if let Some(deliver) = deliver {
+                assert!(deliver.is_closed(), "shutdown cancelled the pending result");
+            }
+            stop.send(()).unwrap();
+            server.await.unwrap().unwrap();
+            let report = handle.report();
+            let ledger = store.conservation(ACCOUNT).unwrap();
+            assert!(ledger.holds(), "{ledger:?}");
+            assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(51));
+            assert_eq!(report.uncertain_acquires, u64::from(!deliver_result));
+            assert_eq!(
+                handle.account_reports(now)[0].uncertain_acquires,
+                report.uncertain_acquires
+            );
+            assert!(stopped.unfinished_accounts.is_empty());
+            assert_eq!(
+                ledger.balance,
+                CostUnits(if deliver_result { 53 } else { 27 })
+            );
+            assert_eq!(
+                ledger.active_lease_grants,
+                CostUnits(if deliver_result { 0 } else { 26 })
+            );
+            // Expiry alone is not enough: the allocator also promises grace.
+            assert!(
+                store
+                    .reclaim_expired(held.grant.expires_at)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(store.conservation(ACCOUNT).unwrap(), ledger);
+            let reclaim_at = held
+                .grant
+                .expires_at
+                .checked_add(GrantPolicy::default().reclaim_grace)
+                .unwrap()
+                .checked_add(SignedDuration::from_nanos(1))
+                .unwrap();
+            let reclaimed = assert_shutdown_accounting(
+                &store,
+                &handle,
+                &stopped,
+                CostUnits(104),
+                CostUnits(51),
+                reclaim_at,
+            )
+            .await;
+            assert_eq!(reclaimed.len(), usize::from(!deliver_result));
+            if !deliver_result {
+                assert_eq!(reclaimed[0].lease_id, held.grant.lease_id);
+                assert_eq!(reclaimed[0].reclaimed, CostUnits(26));
+            }
+            assert_eq!(
+                handle.report().uncertain_acquires,
+                report.uncertain_acquires,
+                "expiry does not rewrite the runtime's historical observation"
+            );
+        }
+    }
+}
+
 async fn full_stack(mode: common::TransportMode) {
     // Server side: memory backend, system clock, real listener on an
     // ephemeral port.
@@ -461,41 +872,7 @@ async fn full_stack(mode: common::TransportMode) {
         http.clone(),
         http.clone(),
         clock,
-        tollgate_client::InstanceRuntimeConfig {
-            snapshots: SnapshotManagerConfig {
-                principals: TrackedPrincipals::All {
-                    seed: vec![principal],
-                },
-                refresh_interval: std::time::Duration::from_millis(20),
-                unknown_ttl: SignedDuration::from_secs(1),
-                revoked_ttl: SignedDuration::from_secs(1),
-                retry_backoff: std::time::Duration::from_millis(10),
-                max_concurrent_fetches: 4,
-                fetch_timeout: std::time::Duration::from_secs(5),
-                enumeration_timeout: std::time::Duration::from_secs(5),
-            },
-            leases: tollgate_client::AccountLeaseConfig {
-                target_grant: CostUnits(2_000),
-                low_water: CostUnits(500),
-                lease_ttl: SignedDuration::from_secs(3_600),
-                expiry_safety_margin: SignedDuration::from_secs(2),
-                poll_interval: std::time::Duration::from_millis(10),
-                store_call_timeout: std::time::Duration::from_secs(5),
-                shutdown_release_deadline: std::time::Duration::from_secs(10),
-            },
-            usage: UsageWriterConfig {
-                queue_capacity: 64,
-                max_batch: 16,
-                flush_interval: std::time::Duration::from_millis(10),
-                retry_backoff: std::time::Duration::from_millis(10),
-                shutdown_drain_deadline: std::time::Duration::from_secs(60),
-                ingest_timeout: std::time::Duration::from_secs(5),
-            },
-            sharding: tollgate_core::LocalSharding::SINGLE,
-            idle_account_linger: std::time::Duration::from_millis(30),
-            manager_restart_backoff: std::time::Duration::from_millis(10),
-            shutdown_deadline: std::time::Duration::from_secs(70),
-        },
+        runtime_config(principal),
     )
     .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -574,10 +951,7 @@ async fn full_stack(mode: common::TransportMode) {
     // Orderly shutdown: flush billing, then release leases, then stop the
     // server.
     let report = runtime.shutdown().await.unwrap();
-    assert!(report.unfinished_accounts.is_empty());
-    let stats = report.usage.unwrap();
-    assert_eq!(stats.lost, 0);
-    assert_eq!(stats.rejected, 0);
+    let stats = report.usage.as_ref().unwrap();
     assert_eq!(stats.unattributed, 0);
     assert_eq!(stats.attribution_unreported_batches, 0);
     let activity = tollgate_store::KeyDirectory::credential_activity(&*store, &[minted.key_id])
@@ -592,13 +966,21 @@ async fn full_stack(mode: common::TransportMode) {
     let _ = stop_tx.send(());
     server.await.unwrap().unwrap();
 
-    // Zero drift between admission's committed units and the billing ledger,
-    // through a real network transport.
-    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(committed_units));
-    assert_eq!(store.balance(ACCOUNT), CostUnits(DEPOSIT - committed_units));
-    let conservation = store.conservation(ACCOUNT).unwrap();
-    assert!(conservation.holds(), "conservation: {conservation:?}");
-    assert_eq!(conservation.settlement_loss, CostUnits::ZERO);
+    let policy = GrantPolicy::default();
+    let reclaim_at = Timestamp::now()
+        .checked_add(policy.max_ttl)
+        .unwrap()
+        .checked_add(policy.reclaim_grace)
+        .unwrap();
+    assert_shutdown_accounting(
+        &store,
+        &engine,
+        &report,
+        CostUnits(DEPOSIT),
+        CostUnits(committed_units),
+        reclaim_at,
+    )
+    .await;
 }
 
 /// #48 over the transport that needs it most. `HttpStore::subscribe` is a

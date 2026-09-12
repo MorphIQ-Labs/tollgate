@@ -366,6 +366,13 @@ until it has one.
    `only_ambiguous_acquire_outcomes_increase_uncertainty`, with
    `AccountLifecycle.consolidation_preserves_parked_inventory` proving the
    exact-model inventory transition.
+   The HTTP boundary also witnesses both delivered and cancelled acquisition
+   results: `shutdown_accounts_for_unanswered_grants_over_http`,
+   `shutdown_accounts_for_unanswered_grants_over_tls`, and
+   `shutdown_accounts_for_unanswered_grants_over_mtls`. They reconcile billing
+   and active grants at shutdown, preserve the reclaim grace period, and verify
+   the exact unspent balance returns when the reported unanswered grant expires.
+   Uncertainty counts possible grants, not units or confirmed transactions.
 
    Publishing a lease to N locality views is N swaps, so mutators are serialized: a
    reader straddles one publication exactly as it straddled the single-view
