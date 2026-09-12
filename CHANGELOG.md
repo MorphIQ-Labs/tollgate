@@ -7,6 +7,15 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.19.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.18.2...v0.19.0) - 2026-09-12
+
+### Fixed
+
+- *(http)* [**breaking**] preserve exact lease TTLs across transports
+- *(test)* observe funding before requiring elastic lease admissions
+- *(test)* reconcile unanswered grants after shutdown
+- *(server)* supervise maintenance and withdraw unhealthy readiness
+
 ## [0.18.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.18.1...v0.18.2) - 2026-09-12
 
 ### Fixed
