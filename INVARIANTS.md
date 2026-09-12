@@ -550,6 +550,13 @@ until it has one.
     direction. Readiness reads the mode from the snapshot the request path
     reads, never a copy, so the two cannot disagree after a republish.
 
+    Elastic readiness does not establish that the first lease has arrived.
+    A workload that requires lease-funded requests must observe installed
+    funding separately; a ready instance with only overage headroom may bill
+    every admission as overage. *HTTP tests:*
+    `an_elastic_account_serves_past_its_deposit_and_bills_the_overage` and
+    `elastic_readiness_serves_before_the_first_grant_and_recovers_after_funding`.
+
     The snapshot bar depends on how the tracked set is chosen, because the
     same rule means opposite things at the two scales (#48). For a
     `Fixed` set — hand-configured, small — ready requires **every** tracked
@@ -949,7 +956,8 @@ until it has one.
     that reads as "never happens". An admission that no lease funded is counted
     under `admitted` *and* under `admitted_overage`, a qualifier rather than a
     sibling, so a reader of `admitted` never has to add two numbers to get the
-    total. *Tests:*
+    total. The qualifier may equal the total when every admission is unfunded;
+    a strict inequality requires at least one lease-funded admission. *Tests:*
     `indices_cover_every_slot_exactly_once`,
     `shipped_slots_and_labels_never_move`,
     `labels_are_distinct_and_payload_free`, `payload_does_not_affect_the_slot`,
@@ -959,6 +967,8 @@ until it has one.
     `engines_sharing_a_map_export_one_counter_identity`,
     `moka_engine_and_installed_context_share_one_counter_identity`,
     `metrics_separate_admissions_from_each_kind_of_refusal`,
+    `an_elastic_account_serves_past_its_deposit_and_bills_the_overage`,
+    `elastic_readiness_serves_before_the_first_grant_and_recovers_after_funding`,
     `an_overage_admission_is_counted_twice_over_and_a_refusal_once`,
     `every_admitted_request_reaches_exactly_one_terminal_counter`,
     `an_abandoned_context_is_counted_and_denies_nothing`,
