@@ -146,6 +146,7 @@ pub fn router<S: Backend>(state: ServerState<S>) -> Router {
         .route("/readyz", get(readyz::<S>))
         .nest(API_PREFIX, instance.nest("/admin", operator))
         .with_state(state)
+        .layer(axum::middleware::from_fn(error::report_http_failure))
 }
 
 /// Serve until `shutdown` resolves, running the maintenance sweep every
@@ -305,10 +306,11 @@ async fn maintenance_sweep<S: Backend>(
                     );
                 }
             }
-            Err(error) => {
+            Err(_) => {
                 consecutive_failures += 1;
                 tracing::warn!(
-                    %error,
+                    operation = "reclaim",
+                    code = "storage",
                     consecutive_failures,
                     reclaimed_leases = %progress.leases,
                     reclaimed_units = %progress.units,
@@ -365,9 +367,10 @@ async fn roll_due_periods<S: Backend>(store: &S, now: jiff::Timestamp) {
                 // yields; let request handlers run between chunks.
                 tokio::task::yield_now().await;
             }
-            Err(error) => {
+            Err(_) => {
                 tracing::warn!(
-                    %error,
+                    operation = "budget-rollover",
+                    code = "storage",
                     rolled_accounts = accounts,
                     completed_batches = batches,
                     "budget rollover failed; accounts past their boundary keep last period's allowance until it recovers"
@@ -386,10 +389,12 @@ async fn roll_due_periods<S: Backend>(store: &S, now: jiff::Timestamp) {
 async fn readyz<S: Backend>(State(state): State<ServerState<S>>) -> StatusCode {
     match state.store.ping().await {
         Ok(()) => StatusCode::OK,
-        Err(error) => {
-            // The 503 says "not ready"; only the event says why, and "why"
-            // is the difference between a restart and a page.
-            tracing::warn!(%error, "readiness probe failed: the store did not answer");
+        Err(_) => {
+            tracing::warn!(
+                operation = "readiness",
+                code = "storage",
+                "readiness probe failed: the store did not answer"
+            );
             StatusCode::SERVICE_UNAVAILABLE
         }
     }
@@ -539,17 +544,11 @@ async fn active_keys<S: Backend>(
             page.validate_request(query.after, limit)?;
             Ok(page)
         })
-        .map_err(|_| {
-            tracing::warn!(
-                operation = "credential-page",
-                "credential source read failed"
-            );
-            ApiError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                code: "credential-source-unavailable",
-                title: "credential source is unavailable".into(),
-                generation: None,
-            }
+        .map_err(|_| ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "credential-source-unavailable",
+            title: "credential source is unavailable".into(),
+            generation: None,
         })?;
     let body = tollgate_store::wire::KeysResponse {
         revision: page.revision(),

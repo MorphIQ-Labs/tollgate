@@ -41,19 +41,6 @@ fn init_tracing() {
         .init();
 }
 
-/// A connection string with its userinfo removed: enough to identify which
-/// database was unreachable, never enough to authenticate to it.
-#[cfg(feature = "postgres")]
-fn redact_dsn(url: &str) -> String {
-    match url.split_once("://") {
-        Some((scheme, rest)) => match rest.split_once('@') {
-            Some((_, host)) => format!("{scheme}://<redacted>@{host}"),
-            None => url.to_owned(),
-        },
-        None => url.to_owned(),
-    }
-}
-
 /// The sweep cadence, or `None` if the configured value cannot run a sweep.
 /// A zero interval would spin the reclaim loop without ever waiting, so it is
 /// refused at startup rather than accepted into a busy loop (INVARIANTS #16).
@@ -187,17 +174,14 @@ async fn main() -> std::io::Result<()> {
             });
             let store = PostgresStore::connect(&url, GrantPolicy::default())
                 .await
-                .unwrap_or_else(|e| {
-                    // A DSN carries a password, and a driver error may quote
-                    // the DSN back at us — so the target is reported with its
-                    // userinfo stripped, and the error text has any verbatim
-                    // copy of the DSN removed (AGENTS.md: never log
-                    // credential-bearing database URLs).
-                    let target = redact_dsn(&url);
+                .unwrap_or_else(|_| {
+                    // Both the URL and arbitrary driver text may carry secrets
+                    // outside userinfo, including query or keyword parameters.
                     tracing::error!(
-                        %target,
-                        error = e.to_string().replace(&url, &target),
-                        "cannot connect to postgres"
+                        backend = "postgres",
+                        operation = "connect",
+                        code = "storage",
+                        "cannot initialize postgres; verify connectivity, TOLLGATE_PG_URL credentials and schema migrations"
                     );
                     std::process::exit(2);
                 });
@@ -238,23 +222,5 @@ mod tests {
             reclaim_interval(3_600),
             Some(std::time::Duration::from_secs(3_600))
         );
-    }
-
-    /// Credential redaction is security behavior, not formatting: a DSN in a
-    /// log line is a leaked password (AGENTS.md).
-    #[cfg(feature = "postgres")]
-    #[test]
-    fn redact_dsn_strips_userinfo() {
-        assert_eq!(
-            redact_dsn("postgres://user:hunter2@db.internal:5432/tollgate"),
-            "postgres://<redacted>@db.internal:5432/tollgate"
-        );
-        assert!(!redact_dsn("postgres://user:hunter2@db/tollgate").contains("hunter2"));
-        // Nothing to strip: pass through rather than mangle.
-        assert_eq!(
-            redact_dsn("postgres://db.internal/tollgate"),
-            "postgres://db.internal/tollgate"
-        );
-        assert_eq!(redact_dsn("not-a-url"), "not-a-url");
     }
 }
