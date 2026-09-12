@@ -12,7 +12,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-tollgate-core = { path = "../tollgate-core", version = "=0.18.1" }
+tollgate-core = { path = "../tollgate-core", version = "=0.18.2" }
 arc-swap = { workspace = true }
 jiff = { workspace = true }
 zeroize = { workspace = true }

@@ -7,6 +7,13 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.18.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.18.1...v0.18.2) - 2026-09-12
+
+### Fixed
+
+- *(server)* keep backend details out of public diagnostics
+- *(store)* isolate invalid usage and enforce accounting domains
+
 ## [0.18.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.18.0...v0.18.1) - 2026-09-11
 
 ### Fixed
