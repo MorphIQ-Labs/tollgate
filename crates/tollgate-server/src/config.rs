@@ -257,7 +257,27 @@ fn record_digest(digest: &mut Sha256, bytes: &[u8]) {
 
 /// Owned periodic reload; dropping it stops file reads and signing-key refresh.
 #[must_use]
-pub struct SecurityReloader(tokio::task::JoinHandle<()>);
+pub struct SecurityReloader {
+    task: tokio::task::JoinHandle<()>,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The reloader is owned independently of `serve`. Its exit is reported at
+/// the task boundary even during unwinding; no panic payload crosses the log
+/// boundary. The owner's terminal bit distinguishes deliberate cancellation.
+struct ReloadExit(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for ReloadExit {
+    fn drop(&mut self) {
+        if !self.0.load(std::sync::atomic::Ordering::Acquire) {
+            tracing::error!(
+                operation = "security-reload",
+                reason = "unexpected-exit",
+                "security reload task stopped; configuration will not refresh"
+            );
+        }
+    }
+}
 
 impl SecurityReloader {
     pub fn spawn(
@@ -265,7 +285,10 @@ impl SecurityReloader {
         security: Arc<ServerSecurity>,
         clock: Arc<dyn tollgate_store::Clock>,
     ) -> Self {
-        Self(tokio::spawn(async move {
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exit = ReloadExit(Arc::clone(&stopping));
+        let task = tokio::spawn(async move {
+            let _exit = exit;
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 match loader.load(clock.now()).await {
@@ -281,13 +304,16 @@ impl SecurityReloader {
                     }
                 }
             }
-        }))
+        });
+        Self { task, stopping }
     }
 }
 
 impl Drop for SecurityReloader {
     fn drop(&mut self) {
-        self.0.abort();
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.task.abort();
     }
 }
 

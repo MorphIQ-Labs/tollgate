@@ -10,8 +10,13 @@ reporting. There is no additional activity HTTP endpoint.
 
 `tollgate-server` authenticates every lease, snapshot, credential, usage, and administrative
 route. `/livez` and `/readyz` accept unauthenticated probes. Readiness checks
-storage reachability; it does not certify that every configured identity is
-usable. Monitor security reload warnings separately.
+storage reachability and the server-owned maintenance task's latest reclaim and
+rollover outcomes. It does not certify that every configured identity is usable.
+Monitor security reload warnings separately.
+The independently owned reloader reports unexpected task exit at `error` with
+`operation=security-reload` and `reason=unexpected-exit`; restart its owner to
+restore refresh. The last valid configuration and signing-key expiry retain
+their existing authority. Deliberately dropping the owner is not a failure alert.
 
 ## Server configuration
 
@@ -83,7 +88,8 @@ TLS uses rustls with safe protocol defaults. `TOLLGATE_BIND` defaults to
 without it. Network restriction alone does not permit remote plaintext. The
 library `serve` function enforces the same rule. Embedders must use this listener
 entry point; the standalone `router` is useful for in-process tests and cannot
-validate an external listener it does not own.
+validate an external listener it does not own. Its `/readyz` returns 503 because
+it has no maintenance owner; `/livez` and authenticated API handlers still work.
 
 An optional client CA requests and verifies client certificates while allowing
 bearer-only callers and probes. A trusted certificate also needs an exact leaf
@@ -98,6 +104,51 @@ set these bounds with `TlsConfig::with_handshake_limits`; the binary uses the
 defaults. Dropping the listener aborts pending handshakes. SIGTERM and Ctrl-C
 start graceful HTTP shutdown; cancelling the server also aborts its maintenance
 task. This does not introduce a total deadline for all server HTTP requests.
+The caller's shutdown future remains owned by `serve`. Cancellation or task
+failure also releases its internal signal waiter and tells existing connections
+to shut down.
+
+## Maintenance readiness and recovery
+
+`serve` starts maintenance immediately. `/readyz` stays 503 until both the reclaim
+and budget-rollover passes reach a partial batch successfully, and returns 200
+only while their latest outcomes are successful, the task is alive and the store
+answers `ping`. A failed pass withdraws readiness immediately, even if the other
+pass succeeds. Successful recovery of the failed operation restores its own
+health; `/livez` remains 200 while the service can run. The handlers continue to
+return their normal domain results while maintenance retries on its existing
+cadence. No partial batch or failed call is treated as proof of rollback.
+
+Each operation logs its first two consecutive failures at `warn`, the third and
+subsequent failures at `error`. Monitor `operation` (`reclaim` or `budget-rollover`)
+and `consecutive_failures`; one `info` event reports `after_failures` on recovery.
+The three-attempt threshold is an alerting policy, not proof that a particular
+lease TTL has expired. Inspect backend permissions, connectivity and transaction
+health; successful ping alone does not prove that maintenance writes can run.
+Completed progress fields survive a later failed batch. No backend details are
+formatted into these events.
+
+An unexpected maintenance return, cancellation or unwinding panic emits an
+`error` with `operation=maintenance` and a static `reason`, then `serve` returns
+an I/O error and stops listening. Process supervision should restart it. A build
+using `panic=abort` terminates the process immediately on panic; it cannot emit
+the unwind supervisor's event. Graceful shutdown withdraws readiness before
+cancelling maintenance, and expected cancellation is not a task-failure alert.
+Pending store calls may have committed effects even when cancelled; reconcile
+with backend records rather than inferring rollback from shutdown.
+
+This health policy observes completed outcomes and task liveness. It adds no
+timeout or cancellation deadline to a backend call that remains pending, and it
+does not certify that `SKIP LOCKED` left no rows with another replica. Backend
+futures must yield to the executor for task supervision and cancellation to run.
+
+There are no Rust signature, database or wire-schema changes. Readiness is
+intentionally stricter: deployments should allow initial maintenance to complete
+before routing traffic. Embedders using the bare router for a listener must move
+to `serve`; their probe now stays 503 instead of claiming health without an
+owned worker. Existing `TOLLGATE_RECLAIM_INTERVAL_SECS` retains its scheduling
+meaning. Zero or a duration that cannot fit the monotonic clock is rejected
+before starting tasks. Rolling back restores the old false-ready behavior.
 
 ## Instance clients and Cloud Run
 

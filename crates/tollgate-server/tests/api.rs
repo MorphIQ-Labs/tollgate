@@ -210,7 +210,7 @@ async fn admin_snapshot_roundtrip_and_probes() {
     let (status, _) = call(&router, "GET", "/livez", None).await;
     assert_eq!(status, StatusCode::OK);
     let (status, _) = call(&router, "GET", "/readyz", None).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
     let (status, _) = call(
         &router,
