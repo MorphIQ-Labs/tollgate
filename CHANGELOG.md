@@ -7,6 +7,13 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.20.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.19.0...v0.20.0) - 2026-09-13
+
+### Fixed
+
+- *(store)* [**breaking**] preserve credential expiry through projections
+- *(store)* [**breaking**] preserve durable lease expiry and reclaim precision
+
 ## [0.19.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.18.2...v0.19.0) - 2026-09-12
 
 ### Fixed
