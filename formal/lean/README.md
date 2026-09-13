@@ -2,6 +2,12 @@
 
 This Lean package contains exact models for critical contracts:
 
+- `LeaseTiming` proves exact integer-pair encoding and ordering, equivalence
+  of the reclaim cutoff to expiry plus full grace, safe underflow/overflow
+  behavior, and conservative bounds for migrated legacy timestamps. Rust
+  property tests and PostgreSQL migration tests separately witness the finite
+  timestamp domain, driver representation and database compatibility fence.
+
 - `LeaseShards` models the aggregate of cache-isolated lease counters and
   exact-total debit/refund receipts. It proves conservation through reserve, cancel,
   and commit, proves committed spend stays within the grant, and proves that

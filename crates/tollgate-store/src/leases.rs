@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use jiff::{SignedDuration, Timestamp};
+use jiff::Timestamp;
 
 use tollgate_core::{AccountId, CostUnits, FencingToken, LeaseId};
 
@@ -170,22 +170,13 @@ impl Leases {
     ///
     /// The index is ordered by expiry and `reclaim_grace` is a constant, so
     /// the due-ness predicate is monotone along it and the walk can stop at
-    /// the first lease that is not due. Testing the predicate rather than
-    /// computing `now - grace` keeps the existing saturating `checked_add` and
-    /// leaves no subtraction to underflow.
-    pub(crate) fn reclaimable(
-        &self,
-        now: Timestamp,
-        grace: SignedDuration,
-        limit: usize,
-    ) -> Vec<LeaseId> {
+    /// the first lease that is not due. The policy's checked cutoff leaves
+    /// an underflow as no due leases.
+    pub(crate) fn reclaimable(&self, cutoff: Option<Timestamp>, limit: usize) -> Vec<LeaseId> {
         self.active_by_expiry
             .iter()
             .inspect(|_| self.mark_examined())
-            .take_while(|(expires_at, _)| {
-                let reclaim_at = expires_at.checked_add(grace).unwrap_or(Timestamp::MAX);
-                now >= reclaim_at
-            })
+            .take_while(|(expires_at, _)| cutoff.is_some_and(|cutoff| *expires_at <= cutoff))
             .take(limit)
             .map(|(_, lease_id)| *lease_id)
             .collect()
@@ -235,7 +226,6 @@ mod tests {
     use super::*;
 
     const ACCOUNT: AccountId = AccountId(1);
-    const GRACE: SignedDuration = SignedDuration::from_secs(30);
 
     fn t(secs: i64) -> Timestamp {
         Timestamp::from_second(secs).unwrap()
@@ -258,12 +248,12 @@ mod tests {
         let mut leases = Leases::default();
         let lease_id = open_at(&mut leases, 1, 60);
         assert_eq!(leases.active_len(), 1);
-        assert_eq!(leases.reclaimable(t(90), GRACE, 10), vec![lease_id]);
+        assert_eq!(leases.reclaimable(Some(t(60)), 10), vec![lease_id]);
 
         assert!(leases.settle(lease_id, Settled::Released, CostUnits(40)));
         assert_eq!(leases.active_len(), 0);
         assert!(
-            leases.reclaimable(t(90), GRACE, 10).is_empty(),
+            leases.reclaimable(Some(t(60)), 10).is_empty(),
             "a released lease must never be reclaimed as well"
         );
         assert_eq!(
@@ -306,19 +296,19 @@ mod tests {
         let late = open_at(&mut leases, 3, 500);
 
         assert_eq!(
-            leases.reclaimable(t(55), GRACE, 10),
+            leases.reclaimable(Some(t(25)), 10),
             vec![early, middle],
             "due at expiry + grace, and `late` is not"
         );
         assert_eq!(
-            leases.reclaimable(t(55), GRACE, 1),
+            leases.reclaimable(Some(t(25)), 1),
             vec![early],
             "the limit truncates from the oldest end"
         );
-        assert!(leases.reclaimable(t(39), GRACE, 10).is_empty());
+        assert!(leases.reclaimable(Some(t(9)), 10).is_empty());
 
         let before = leases.examined();
-        assert!(leases.reclaimable(t(0), GRACE, 10).is_empty());
+        assert!(leases.reclaimable(None, 10).is_empty());
         assert_eq!(
             leases.examined() - before,
             1,

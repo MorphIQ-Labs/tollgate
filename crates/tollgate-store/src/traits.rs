@@ -273,6 +273,14 @@ impl Default for GrantPolicy {
 }
 
 impl GrantPolicy {
+    /// Greatest expiry whose full grace window has elapsed at `now`.
+    /// A validated policy has nonnegative grace; subtraction underflow means
+    /// no representable expiry is due. In particular, a deadline beyond
+    /// Timestamp::MAX is never shortened to that last representable instant.
+    pub fn reclaim_cutoff(&self, now: Timestamp) -> Option<Timestamp> {
+        now.checked_sub(self.reclaim_grace).ok()
+    }
+
     pub fn validate(&self) -> Result<(), GrantPolicyError> {
         if self.shrink_divisor == 0 {
             return Err(GrantPolicyError("shrink_divisor must be positive"));

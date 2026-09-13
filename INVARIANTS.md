@@ -512,11 +512,26 @@ until it has one.
    `expired_backlog_is_reclaimed_in_bounded_batches` (store suites), plus
    `one_scheduled_sweep_drains_every_saturated_batch` (server suite).
 
-   Known implementation gap: PostgreSQL stores lease expiry and reclaim grace
-   in microseconds but can return a finer expiry. The durable boundary can
-   precede that returned expiry plus grace; #117 tracks the storage precision
-   and rollout correction. Exact HTTP TTL round trips do not establish that
-   separate durable timing property.
+   Both backends retain exact nanosecond expiry and grace. PostgreSQL stores
+   a canonical integer pair and compares it to `GrantPolicy::reclaim_cutoff`;
+   MemoryStore uses the same checked cutoff. An underflow has no due expiry,
+   and a deadline beyond Timestamp::MAX is never shortened to that instant.
+   Migration 0017 retains an explicit conservative upper bound for legacy
+   rows with lost precision and fences old lease SQL through a column rename.
+   *Tests:* `nanosecond_lease_boundaries_preserve_release_reclaim_and_consolidation`,
+   `a_grace_deadline_beyond_timestamp_max_never_reclaims_early`,
+   `an_unrepresentable_replacement_expiry_leaves_the_original_grant_untouched`
+   (both stores),
+   `reclaim_cutoff_matches_an_independent_nanosecond_oracle`,
+   `reclaim_cutoff_preserves_single_nanosecond_boundaries`,
+   `durable_pairs_round_trip_and_preserve_order`,
+   `lease_instants_preserve_epoch_edges_and_the_full_timestamp_domain`,
+   `expiry_upgrade_preserves_accounting_and_fences_old_lease_queries`,
+   `legacy_expiry_bounds_cover_both_sides_of_the_epoch`, and
+   `invalid_legacy_expiry_rolls_back_upgrade_and_exact_rows_enforce_the_domain`.
+   *Proof:* `formal/lean/Tollgate/LeaseTiming.lean`; finite representation and
+   database behavior are separate test evidence. See `docs/LEASE_TIMING.md`
+   for migration bounds, deployment and recovery.
 
    The server owns and observes its maintenance task. Each reclaim and rollover
    outcome is published independently; readiness requires both to have completed
