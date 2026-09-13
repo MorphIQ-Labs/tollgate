@@ -190,7 +190,7 @@ async fn invalid_history_blocks_validation_but_leaves_write_guards_and_can_be_re
             .fetch_one(&mut connection)
             .await
             .unwrap();
-        assert_eq!(applied, 17);
+        assert_eq!(applied, 18);
         cleanup(connection, &schema).await;
     }
 }

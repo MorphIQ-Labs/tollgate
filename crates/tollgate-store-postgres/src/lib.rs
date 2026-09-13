@@ -16,8 +16,9 @@
 //!   (a balance beyond i64::MAX is refused, not wrapped; a negative stored
 //!   value is refused, not clamped) and schema-level CHECK constraints
 //!   keeping every unit column non-negative;
-//! - lease expiry as floor `BIGINT` microseconds plus a `SMALLINT` nanosecond
-//!   remainder; other timestamps as `BIGINT` microseconds since the Unix epoch;
+//! - lease and credential expiry as floor `BIGINT` microseconds plus a
+//!   `SMALLINT` nanosecond remainder; informational timestamps as `BIGINT`
+//!   microseconds since the Unix epoch;
 //! - snapshots as storage-local `JSONB`: ids in the legacy u64 range remain
 //!   numeric for rollback, larger ids use canonical text, and the public
 //!   HTTP/Serde contract always uses text.
@@ -26,9 +27,9 @@
 //! (LISTEN/NOTIFY or the server's future SSE) is a documented seam in
 //! `docs/DESIGN.md`.
 
-mod lease_time;
+mod instant;
 
-use lease_time::LeaseInstant;
+use instant::StoredInstant;
 use std::num::{NonZeroI64, NonZeroUsize};
 use std::sync::Arc;
 
@@ -171,21 +172,24 @@ impl KeyDirectory for PostgresStore {
     }
 
     async fn insert_key(&self, record: KeyRecord) -> Result<(), KeyError> {
+        let expiry = record.not_after.map(StoredInstant::from);
         // The account reference is checked by the foreign key rather than by a
         // prior SELECT: a check-then-insert would admit a credential against
         // an account deleted between the two, and this backend refuses to
         // hold a credential no account owns.
         let result = sqlx::query(
             "INSERT INTO tollgate_credential_keys
-             (key_id, account_id, principal, digest, not_after_us, revoked_at_us)
-             VALUES ($1, $2, $3, $4, $5, NULL)
+             (key_id, account_id, principal, digest, not_after_floor_us,
+              not_after_submicro_ns, not_after_is_lower_bound, revoked_at_us)
+             VALUES ($1, $2, $3, $4, $5, $6, FALSE, NULL)
              ON CONFLICT (key_id) DO NOTHING",
         )
         .bind(id_bytes(record.key_id.0))
         .bind(id_bytes(record.account_id.0))
         .bind(id_bytes(record.principal.0))
         .bind(record.digest.to_vec())
-        .bind(record.not_after.map(ts_micros))
+        .bind(expiry.map(|expiry| expiry.micros))
+        .bind(expiry.map(|expiry| expiry.submicro_nanos))
         .execute(&self.pool)
         .await;
         match result {
@@ -237,19 +241,22 @@ impl KeyDirectory for PostgresStore {
     }
 
     async fn active_keys(&self, now: Timestamp) -> Result<Vec<KeyRecord>, StoreError> {
+        let cutoff = StoredInstant::from(now);
         // Expiry is applied here, beside revocation, so this backend answers
         // "active" exactly as `MemoryStore` does and a projection built from
         // either sees the same live set. Ordering is explicit for the same
         // reason: two instances must not build tables that differ by row
         // order alone.
         let rows = sqlx::query(
-            "SELECT key_id, account_id, principal, digest, not_after_us
+            "SELECT key_id, account_id, principal, digest, not_after_floor_us, not_after_submicro_ns, not_after_is_lower_bound
              FROM tollgate_credential_keys
              WHERE revoked_at_us IS NULL
-               AND (not_after_us IS NULL OR not_after_us > $1)
+               AND (not_after_floor_us IS NULL OR not_after_submicro_ns IS NULL
+                    OR (not_after_floor_us, not_after_submicro_ns) > ($1, $2))
              ORDER BY key_id",
         )
-        .bind(ts_micros(now))
+        .bind(cutoff.micros)
+        .bind(cutoff.submicro_nanos)
         .fetch_all(&self.pool)
         .await
         .map_err(storage)?;
@@ -268,15 +275,23 @@ fn credential_from_row(row: sqlx::postgres::PgRow) -> Result<KeyRecord, StoreErr
         Ok(u128::from_be_bytes(fixed))
     };
     let key_id = KeyId(id(0)?);
+    let not_after = match (row.get::<Option<i64>, _>(4), row.get::<Option<i16>, _>(5)) {
+        (None, None) if !row.get::<bool, _>(6) => None,
+        (Some(micros), Some(submicro_nanos)) => Some(
+            StoredInstant {
+                micros,
+                submicro_nanos,
+            }
+            .timestamp()?,
+        ),
+        _ => return Err(StoreError("incomplete stored credential expiry".into())),
+    };
     Ok(KeyRecord {
         key_id,
         account_id: AccountId(id(1)?),
         principal: Principal(id(2)?),
         digest: digest_from(row.get::<Vec<u8>, _>(3).as_slice(), key_id)?,
-        not_after: row
-            .get::<Option<i64>, _>(4)
-            .map(|us| micros_ts(us, "credential expiry"))
-            .transpose()?,
+        not_after,
     })
 }
 
@@ -289,6 +304,7 @@ impl tollgate_store::KeySource for PostgresStore {
         limit: NonZeroUsize,
     ) -> Result<tollgate_store::KeyPage, StoreError> {
         tollgate_store::validate_key_page_limit(limit)?;
+        let cutoff = StoredInstant::from(now);
         // One short snapshot per page, never a transaction held across HTTP
         // requests. Revision and records therefore cannot describe two commits.
         let mut tx = self.pool.begin().await.map_err(storage)?;
@@ -305,18 +321,21 @@ impl tollgate_store::KeySource for PostgresStore {
             .map_err(|_| StoreError("credential revision is negative".into()))?;
         // Separate SQL shapes preserve an indexable range in prepared plans.
         let sql = if after.is_some() {
-            "SELECT key_id, account_id, principal, digest, not_after_us
+            "SELECT key_id, account_id, principal, digest, not_after_floor_us, not_after_submicro_ns, not_after_is_lower_bound
              FROM tollgate_credential_keys WHERE revoked_at_us IS NULL
-             AND (not_after_us IS NULL OR not_after_us > $1) AND key_id > $2
-             ORDER BY key_id LIMIT $3"
+             AND (not_after_floor_us IS NULL OR not_after_submicro_ns IS NULL
+                  OR (not_after_floor_us, not_after_submicro_ns) > ($1, $2)) AND key_id > $3
+             ORDER BY key_id LIMIT $4"
         } else {
-            "SELECT key_id, account_id, principal, digest, not_after_us
+            "SELECT key_id, account_id, principal, digest, not_after_floor_us, not_after_submicro_ns, not_after_is_lower_bound
              FROM tollgate_credential_keys WHERE revoked_at_us IS NULL
-             AND (not_after_us IS NULL OR not_after_us > $1) AND key_id >= $2
-             ORDER BY key_id LIMIT $3"
+             AND (not_after_floor_us IS NULL OR not_after_submicro_ns IS NULL
+                  OR (not_after_floor_us, not_after_submicro_ns) > ($1, $2)) AND key_id >= $3
+             ORDER BY key_id LIMIT $4"
         };
         let rows = sqlx::query(sql)
-            .bind(ts_micros(now))
+            .bind(cutoff.micros)
+            .bind(cutoff.submicro_nanos)
             .bind(id_bytes(after.unwrap_or(KeyId(0)).0))
             .bind((limit.get() + 1) as i64)
             .fetch_all(&mut *tx)
@@ -836,7 +855,7 @@ struct LockedLeaseRow {
     granted: i64,
     used: i64,
     credited: i64,
-    expires_at: LeaseInstant,
+    expires_at: StoredInstant,
     state: i16,
     /// The half of `granted` drawn from the account's periodic allowance, and
     /// the period that funded it. Settlement needs both: the split says which
@@ -942,7 +961,7 @@ async fn lock_lease(
         granted: row.get(2),
         used: row.get(3),
         credited: row.get(4),
-        expires_at: LeaseInstant {
+        expires_at: StoredInstant {
             micros: row.get(5),
             submicro_nanos: row.get(9),
         },
@@ -1033,10 +1052,10 @@ impl PostgresStore {
         .bind(id_bytes(account.0))
         .bind(fence)
         .bind(granted_i)
-        .bind(LeaseInstant::from(expires_at).micros)
+        .bind(StoredInstant::from(expires_at).micros)
         .bind(from_allowance)
         .bind(period_start_us)
-        .bind(LeaseInstant::from(expires_at).submicro_nanos)
+        .bind(StoredInstant::from(expires_at).submicro_nanos)
         .execute(&mut **tx)
         .await
         .map_err(alloc_storage)?;
@@ -1251,7 +1270,7 @@ impl LeaseAllocator for PostgresStore {
         let Some(cutoff) = self.policy.reclaim_cutoff(now) else {
             return ReclaimBatch::try_new(Vec::new(), limit);
         };
-        let cutoff = LeaseInstant::from(cutoff);
+        let cutoff = StoredInstant::from(cutoff);
         let mut tx = self.pool.begin().await.map_err(storage)?;
         let result = async {
             // Reclaim only once the grace window past expiry has fully lapsed:

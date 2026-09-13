@@ -77,7 +77,10 @@ This Lean package contains exact models for critical contracts:
   The bounded fixed-catalogue drain has no omissions or duplicates; mixed
   revisions preserve the predecessor. Cached evidence retains its original
   bound. Ordered cursor refinement, coherent source reads, atomic
-  publication, verified input and accurate clocks are assumptions; Rust tests
+  publication, verified input and accurate clocks are assumptions. Its legacy
+  expiry model proves that migration's earliest compatible timestamp cannot
+  extend source authority, including the zero bucket and domain minimum;
+  a reset session inherits that bound. Rust tests
   separately exercise timestamp overflow, transport and session behavior.
 
 Run from the repository root:

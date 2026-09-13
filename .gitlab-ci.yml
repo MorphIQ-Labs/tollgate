@@ -262,6 +262,7 @@ test-postgres:
     - test -n "$TOLLGATE_PG_URL" || { echo "TOLLGATE_PG_URL is unset; this gate must not pass without a database" >&2; exit 1; }
     - cargo test --locked -p tollgate-store-postgres
     - cargo test --locked -p tollgate-server --all-features --test lease_ttl
+    - cargo test --locked -p tollgate-server --all-features --test credential_expiry
 
 bench-compile:
   dependencies: []

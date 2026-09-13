@@ -148,4 +148,41 @@ theorem mixed_revisions_preserve_the_predecessor (previous candidate : Table)
     coherentRefresh previous first last candidate = previous := by
   simp [coherentRefresh, different]
 
+-- #118: legacy microseconds discarded precision toward zero. Credential
+-- authority uses the earliest compatible instant, intersected with the
+-- timestamp domain. SQL migration and finite Rust decoding are separate
+-- implementation witnesses; these are exact integer nanoseconds.
+def legacyExpiryLower (minimum micros : Int) : Int :=
+  max minimum (if 0 < micros then 1000 * micros else 1000 * micros - 999)
+
+theorem positive_legacy_expiry_is_never_extended (minimum micros expiry : Int)
+    (positive : 0 < micros) (domain : minimum ≤ expiry)
+    (low : 1000 * micros ≤ expiry) (high : expiry ≤ 1000 * micros + 999) :
+    legacyExpiryLower minimum micros ≤ expiry ∧
+      expiry - legacyExpiryLower minimum micros ≤ 999 := by
+  simp [legacyExpiryLower, positive]
+  omega
+
+theorem negative_legacy_expiry_is_never_extended (minimum micros expiry : Int)
+    (negative : micros < 0) (domain : minimum ≤ expiry)
+    (low : 1000 * micros - 999 ≤ expiry) (high : expiry ≤ 1000 * micros) :
+    legacyExpiryLower minimum micros ≤ expiry ∧
+      expiry - legacyExpiryLower minimum micros ≤ 999 := by
+  have nonpositive : ¬ 0 < micros := by omega
+  simp [legacyExpiryLower, nonpositive]
+  omega
+
+theorem zero_legacy_expiry_is_never_extended (minimum expiry : Int)
+    (domain : minimum ≤ expiry) (low : -999 ≤ expiry) (high : expiry ≤ 999) :
+    legacyExpiryLower minimum 0 ≤ expiry ∧
+      expiry - legacyExpiryLower minimum 0 ≤ 1998 := by
+  simp [legacyExpiryLower]
+  omega
+
+theorem a_reset_session_cannot_outlive_conservative_source_expiry
+    (started maxAge lower original now : Int) (conservative : lower ≤ original)
+    (accepted : now < deadline started maxAge (some lower)) : now < original := by
+  have := source_expiry_is_never_extended started maxAge lower
+  omega
+
 end Tollgate.CredentialProjection

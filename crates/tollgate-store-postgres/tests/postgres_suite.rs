@@ -5676,7 +5676,7 @@ async fn credential_pages_order_bound_skip_retired_and_expose_every_mutation() {
 }
 
 #[tokio::test]
-async fn credential_revision_covers_legacy_writes_rollback_and_overflow() {
+async fn credential_revision_covers_direct_writes_rollback_and_overflow() {
     let _guard = DB_LOCK.lock().await;
     let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
         return;
@@ -5688,8 +5688,8 @@ async fn credential_revision_covers_legacy_writes_rollback_and_overflow() {
     let id = 1u128.to_be_bytes();
     let mut digest = [0; 32];
     digest[..16].copy_from_slice(&id);
-    // SQL used by pre-0013 writers: they know nothing about the revision.
-    sqlx::query("INSERT INTO tollgate_credential_keys (key_id, account_id, principal, digest) VALUES ($1,$2,$1,$3)")
+    // Direct writers declare exact expiry but need not manage the revision.
+    sqlx::query("INSERT INTO tollgate_credential_keys (key_id, account_id, principal, digest, not_after_is_lower_bound) VALUES ($1,$2,$1,$3,FALSE)")
         .bind(id.as_slice()).bind(ACCOUNT.0.to_be_bytes().as_slice()).bind(digest.as_slice())
         .execute(&pool).await.unwrap();
     let inserted = revision().await.unwrap();
@@ -5978,4 +5978,15 @@ async fn an_unrepresentable_replacement_expiry_leaves_the_original_grant_untouch
     assert!(c.holds());
     assert_eq!(c.balance, CostUnits(100));
     assert_eq!(c.active_lease_grants, CostUnits::ZERO);
+}
+#[path = "../../tollgate-store/tests/support/credential_expiry.rs"]
+mod credential_expiry;
+
+#[tokio::test]
+async fn credential_expiry_is_exact_in_directory_and_every_page() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    credential_expiry::exact_expiry(&*store, ACCOUNT).await;
 }
