@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.21.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.20.0...v0.21.0) - 2026-09-13
+
+### Fixed
+
+- *(client)* [**breaking**] report snapshot refusals and clear exited task health
+
 ## [0.20.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.19.0...v0.20.0) - 2026-09-13
 
 ### Fixed
