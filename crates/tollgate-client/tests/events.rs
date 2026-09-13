@@ -27,6 +27,203 @@ use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 
+#[path = "support/snapshot_source.rs"]
+mod snapshot_source;
+use snapshot_source::DrivenPushSource;
+
+const PRINCIPAL: tollgate_core::Principal = tollgate_core::Principal(77);
+
+fn positive(generation: u64) -> tollgate_store::SnapshotResolution {
+    use tollgate_core::{
+        AccountSnapshot, CostTable, Generation, PermissionBits, PublishableSnapshot, ResolvedLimits,
+    };
+    tollgate_store::SnapshotResolution::Present(
+        PublishableSnapshot::try_new(Arc::new(
+            AccountSnapshot::builder(
+                ACCOUNT,
+                Generation(generation),
+                AccountStatus::Active,
+                t(1_000),
+                PermissionBits::NONE,
+                ResolvedLimits::new(1),
+                Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+            )
+            .build(),
+        ))
+        .unwrap(),
+    )
+}
+
+fn snapshots(
+    source: Arc<DrivenPushSource>,
+    clock: Arc<ManualClock>,
+) -> (
+    tollgate_client::SnapshotManager,
+    Arc<tollgate_admission::ArcSwapSnapshotMap>,
+) {
+    let map = Arc::new(tollgate_admission::ArcSwapSnapshotMap::new());
+    let manager = tollgate_client::SnapshotManager::spawn(
+        source,
+        map.clone(),
+        tollgate_client::SlotRegistry::new(),
+        clock,
+        tollgate_client::SnapshotManagerConfig {
+            principals: tollgate_client::TrackedPrincipals::Fixed(vec![PRINCIPAL]),
+            refresh_interval: std::time::Duration::from_secs(1),
+            unknown_ttl: SignedDuration::from_secs(1),
+            revoked_ttl: SignedDuration::from_secs(1),
+            retry_backoff: std::time::Duration::from_secs(1),
+            max_concurrent_fetches: 1,
+            fetch_timeout: std::time::Duration::from_secs(1),
+            enumeration_timeout: std::time::Duration::from_secs(1),
+        },
+    )
+    .unwrap();
+    (manager, map)
+}
+
+async fn wait_for(mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !condition() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("observable update must arrive");
+}
+
+#[tokio::test(start_paused = true)]
+async fn snapshot_refusals_are_reported_and_counted_for_pushes_and_refreshes() {
+    use tollgate_admission::{MapEntry, SnapshotMap};
+    use tollgate_core::Generation;
+    use tollgate_store::SnapshotResolution;
+    for push in [true, false] {
+        let (captor, _guard) = capture();
+        let source = DrivenPushSource::new(positive(5));
+        let clock = Arc::new(ManualClock::new(t(0)));
+        let (manager, map) = snapshots(source.clone(), clock.clone());
+        let counters = manager.counters();
+        wait_for(|| *manager.ready().borrow()).await;
+        let offer = |resolution: SnapshotResolution| {
+            source.set_pull(resolution.clone());
+            if push {
+                source.send(PRINCIPAL, resolution);
+            } else {
+                // Expire a prior tombstone's refetch deadline; policy time
+                // remains independent of Tokio's paused scheduling clock.
+                clock.advance(SignedDuration::from_secs(2));
+            }
+        };
+        offer(positive(4));
+        wait_for(|| counters.snapshot().refused_updates == 1).await;
+        offer(SnapshotResolution::Revoked {
+            generation: Generation(4),
+        });
+        wait_for(|| counters.snapshot().refused_updates == 2).await;
+        let Some(MapEntry::Present(state)) = map.get(&PRINCIPAL) else {
+            panic!("refusals must preserve the live snapshot")
+        };
+        assert_eq!(state.snapshot.generation, Generation(5));
+        assert!(*manager.ready().borrow());
+
+        // A legitimate withdrawal is accepted, but its own generation
+        // cannot return as positive authority.
+        offer(SnapshotResolution::Revoked {
+            generation: Generation(5),
+        });
+        wait_for(|| !matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(_)))).await;
+        assert_eq!(counters.snapshot().refused_updates, 2);
+        offer(positive(5));
+        wait_for(|| counters.snapshot().refused_updates == 3).await;
+        assert!(!matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(_))));
+        offer(positive(6));
+        wait_for(|| matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(state)) if state.snapshot.generation == Generation(6))).await;
+        assert_eq!(counters.snapshot().refused_updates, 3);
+        assert_eq!(counters.snapshot().refresh_failures, 0);
+        manager.shutdown().await;
+        let warnings = captor.at_least(Level::WARN, "tollgate_client::snapshot_manager");
+        assert_eq!(
+            warnings.len(),
+            3,
+            "exactly one event per refused update: {warnings:?}"
+        );
+        for (event, (kind, offered)) in
+            warnings
+                .iter()
+                .zip([("positive", "4"), ("revoked", "4"), ("positive", "5")])
+        {
+            assert_eq!(event.level, Level::WARN);
+            assert_eq!(
+                event.field("origin"),
+                Some(if push { "push" } else { "refresh" })
+            );
+            assert_eq!(event.field("kind"), Some(kind));
+            assert_eq!(event.field("offered"), Some(offered));
+            assert!(event.field("principal").is_some());
+            assert!(event.field("retained").is_some());
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unchanged_snapshots_and_accepted_updates_do_not_report_refusals() {
+    use tollgate_admission::{MapEntry, SnapshotMap};
+    use tollgate_core::Generation;
+    let (captor, _guard) = capture();
+    let source = DrivenPushSource::new(positive(5));
+    let (manager, map) = snapshots(source.clone(), Arc::new(ManualClock::new(t(0))));
+    let counters = manager.counters();
+    wait_for(|| counters.snapshot().refresh_attempts >= 2).await;
+    source.send(PRINCIPAL, positive(5));
+    // The next accepted push is a FIFO barrier proving the duplicate was
+    // processed; no absence assertion can pass just because a task was idle.
+    source.set_pull(positive(6));
+    source.send(PRINCIPAL, positive(6));
+    wait_for(|| matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(state)) if state.snapshot.generation == Generation(6))).await;
+    assert_eq!(counters.snapshot().refused_updates, 0);
+    manager.shutdown().await;
+    assert!(
+        captor
+            .at_least(Level::WARN, "tollgate_client::snapshot_manager")
+            .is_empty()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn lease_health_is_false_after_an_unpolled_abort_or_panic() {
+    struct PanicClock;
+    impl tollgate_store::Clock for PanicClock {
+        fn now(&self) -> Timestamp {
+            panic!("fixture clock panic")
+        }
+    }
+    for abort in [true, false] {
+        let (_captor, _guard) = capture();
+        let manager = LeaseManager::spawn(
+            store(10_000),
+            LeaseSlot::for_account(ACCOUNT),
+            Arc::new(PanicClock),
+            manager_config(),
+        )
+        .unwrap();
+        let mut health = manager.health();
+        assert!(*health.borrow());
+        if abort {
+            // No await before Drop: the spawned task has never been polled.
+            drop(manager);
+        } else {
+            wait_for(|| health.has_changed().is_err()).await;
+            manager.shutdown().await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while health.changed().await.is_ok() {}
+        })
+        .await
+        .unwrap();
+        assert!(!*health.borrow());
+    }
+}
+
 const ACCOUNT: AccountId = AccountId(1);
 
 fn t(secs: i64) -> Timestamp {
@@ -547,12 +744,13 @@ async fn attribution_coverage_reports_transitions_without_repeating_incidents() 
 }
 
 /// An allocator that grants normally and rejects every release capability.
-struct FencedReleaseAllocator {
+struct RefusingReleaseAllocator {
     inner: Arc<MemoryStore>,
+    invalid: bool,
 }
 
 #[async_trait]
-impl LeaseAllocator for FencedReleaseAllocator {
+impl LeaseAllocator for RefusingReleaseAllocator {
     async fn acquire(
         &self,
         account: AccountId,
@@ -570,7 +768,11 @@ impl LeaseAllocator for FencedReleaseAllocator {
         _unspent: CostUnits,
         _now: Timestamp,
     ) -> Result<(), AllocateError> {
-        Err(AllocateError::Fenced)
+        Err(if self.invalid {
+            AllocateError::InvalidRelease
+        } else {
+            AllocateError::Fenced
+        })
     }
 
     async fn consolidate(
@@ -594,43 +796,42 @@ impl LeaseAllocator for FencedReleaseAllocator {
     }
 }
 
-/// `LeaseManagerReport` counts a refused release as released — the store is
-/// no longer holding it — so *which* refusal happened has no channel but the
-/// event. A `Fenced` at shutdown means the store rejected the capability the
-/// manager copied from its grant.
+/// A fenced capability is obsolete; invalid counts are an integrity fault
+/// and unconfirmed release. They must differ in both the report and event.
 #[tokio::test(start_paused = true)]
 async fn refused_release_at_shutdown_is_reported() {
-    let (captor, _guard) = capture();
-    let manager = LeaseManager::spawn(
-        Arc::new(FencedReleaseAllocator {
-            inner: store(10_000),
-        }) as Arc<dyn LeaseAllocator>,
-        LeaseSlot::for_account(ACCOUNT),
-        Arc::new(ManualClock::new(t(0))),
-        manager_config(),
-    )
-    .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    for invalid in [false, true] {
+        let (captor, _guard) = capture();
+        let manager = LeaseManager::spawn(
+            Arc::new(RefusingReleaseAllocator {
+                inner: store(10_000),
+                invalid,
+            }) as Arc<dyn LeaseAllocator>,
+            LeaseSlot::for_account(ACCOUNT),
+            Arc::new(ManualClock::new(t(0))),
+            manager_config(),
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let report = manager.shutdown().await;
-    assert_eq!(report.released, 1, "the store is not holding it open");
-    assert_eq!(report.abandoned, 0);
+        let counters = manager.counters();
+        let report = manager.shutdown().await;
+        assert_eq!(report.released, u64::from(!invalid));
+        assert_eq!(report.abandoned, u64::from(invalid));
+        assert_eq!(counters.snapshot().abandoned, u64::from(invalid));
 
-    let refusals: Vec<_> = captor
-        .at_least(Level::WARN, "tollgate_client::lease_manager")
-        .into_iter()
-        .filter(|event| event.field("lease").is_some())
-        .collect();
-    assert!(
-        !refusals.is_empty(),
-        "a refused release at shutdown must be reported, not counted as clean"
-    );
-    assert!(
-        refusals
-            .iter()
-            .any(|event| event.field("error").is_some_and(|e| e.contains("fenc"))),
-        "the event must name the refusal: {refusals:?}"
-    );
+        let refusals: Vec<_> = captor
+            .at_least(Level::WARN, "tollgate_client::lease_manager")
+            .into_iter()
+            .filter(|event| event.field("lease").is_some())
+            .collect();
+        assert_eq!(refusals.len(), 1);
+        assert_eq!(
+            refusals[0].level,
+            if invalid { Level::ERROR } else { Level::WARN }
+        );
+        assert!(refusals[0].field("error").is_some());
+    }
 }
 
 struct RefusingKeys(std::sync::atomic::AtomicBool);

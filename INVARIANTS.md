@@ -561,6 +561,19 @@ until it has one.
     on exhaustion, expiry, or task exit; fail-closed correctness must not
     masquerade as availability.
 
+    Snapshot and lease tasks own the sole health publisher through
+    `TaskHealth`. Its destructor stores false before closing the channel on
+    normal return, unwind or cancellation, including cancellation before the
+    first poll. Retained watch receivers cannot preserve a true value after
+    the task exits. Aborting a task requests cancellation; this guarantee
+    applies when its future is destroyed, not before the executor processes
+    the abort. Whole-process abort has no surviving in-process observer.
+    *Tests:* `snapshot_readiness_is_false_after_shutdown_or_owner_drop`,
+    `a_snapshot_task_panic_withdraws_the_retained_readiness_value`,
+    `lease_health_is_false_after_an_unpolled_abort_or_panic`,
+    `shutdown_releases_unspent_units`, and
+    `cancelling_lease_shutdown_aborts_the_owned_release_task`.
+
     "Can still fund work" is the same question admission asks, and it is
     mode-dependent for the same reason (1). Under `Strict` it is a lease inside
     the local usability window with units left. Under `Elastic` an empty or
@@ -607,9 +620,9 @@ until it has one.
     Readiness is a single bit either way, so it says *that* an instance is
     unready and never *how much* is unresolved; the count of principals
     without a valid resolution is exported alongside it and is derived from
-    the same pass that decides the bit, so the two cannot disagree — a
-    separate predicate would be free to drift, leaving readiness false with
-    nothing to explain it. Enumeration failures are counted apart from fetch
+    the same pass that decides the resolution part of readiness. Task liveness
+    is separate: an exited task can be unready with a last unresolved count
+    of zero. Enumeration failures are counted apart from fetch
     failures, since they freeze the tracked set rather than staling it and are
     otherwise invisible. *Tests:*
     `initial_load_gates_readiness_and_installs`,
@@ -918,6 +931,25 @@ until it has one.
     `healthy_refill_emits_no_warning` (the converse: a healthy plane stays
     quiet, or the signal is worthless), `ping_surfaces_a_closed_pool`, and
     `usage_sink_outage_and_recovery_are_reported`.
+
+    Snapshot generation decisions own their refusal evidence: both push and
+    refresh paths emit one structured warning per refused positive or
+    revocation and increment `SnapshotStats::refused_updates` once. Events
+    identify the origin, principal, offered kind/generation and retained
+    watermark. An unchanged visible positive at its current generation is
+    an idempotent no-op, not a refusal to report. Accepted absences and
+    revocations are not counted. Acceptance, retained deadlines, publication
+    and retry backoff retain the shared generation model's semantics (15).
+    *Tests:* `snapshot_refusals_are_reported_and_counted_for_pushes_and_refreshes`,
+    `unchanged_snapshots_and_accepted_updates_do_not_report_refusals`,
+    `a_push_reinstates_an_absent_principal_at_its_own_generation`, and
+    `a_refused_answer_is_retried_with_backoff_not_at_source_latency`.
+
+    Release refusal severity and ownership remain consistent at shutdown:
+    invalid counts are an error and abandoned release, never a clean
+    settlement. The shared classification already enforces this in refill
+    and shutdown. *Tests:* `refused_release_at_shutdown_is_reported` and
+    `shutdown_distinguishes_settled_leases_from_unconfirmed_or_invalid_releases`.
 
     Server reclaim and rollover failures each carry an independent checked
     consecutive-failure count: the first two are `warn`, the third and later

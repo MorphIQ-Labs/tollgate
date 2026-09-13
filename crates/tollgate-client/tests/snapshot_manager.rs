@@ -24,6 +24,10 @@ use tollgate_store::{
     StoreError,
 };
 
+#[path = "support/snapshot_source.rs"]
+mod snapshot_source;
+use snapshot_source::DrivenPushSource;
+
 const ACCOUNT: AccountId = AccountId(1);
 const PRINCIPAL: Principal = Principal(7);
 
@@ -158,6 +162,71 @@ async fn initial_load_gates_readiness_and_installs() {
     .expect("manager must become ready");
     assert_eq!(admit(&fixture), Ok(()));
     fixture.manager.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn snapshot_readiness_is_false_after_shutdown_or_owner_drop() {
+    for stop in 0..3 {
+        let fixture = fixture(base_store());
+        let mut ready = fixture.manager.ready();
+        while !*ready.borrow_and_update() {
+            ready.changed().await.unwrap();
+        }
+        match stop {
+            0 => assert!(!fixture.manager.shutdown().await.task_died),
+            1 => drop(fixture.manager),
+            _ => drop(fixture.manager.shutdown()),
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while ready.changed().await.is_ok() {}
+        })
+        .await
+        .expect("task must release its readiness publisher");
+        assert!(!*ready.borrow(), "closed readiness must retain false");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_task_panic_withdraws_the_retained_readiness_value() {
+    struct PanicClock(AtomicBool);
+    impl tollgate_store::Clock for PanicClock {
+        fn now(&self) -> Timestamp {
+            assert!(!self.0.load(Ordering::Relaxed), "fixture clock panic");
+            t(0)
+        }
+    }
+    let clock = Arc::new(PanicClock(AtomicBool::new(false)));
+    let source = DrivenPushSource::new(SnapshotResolution::Unknown);
+    let manager = SnapshotManager::spawn(
+        source.clone(),
+        Arc::new(ArcSwapSnapshotMap::new()),
+        SlotRegistry::new(),
+        clock.clone(),
+        SnapshotManagerConfig {
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
+            refresh_interval: std::time::Duration::from_secs(60),
+            unknown_ttl: SignedDuration::from_secs(30),
+            revoked_ttl: SignedDuration::from_secs(3_600),
+            retry_backoff: std::time::Duration::from_secs(1),
+            max_concurrent_fetches: 1,
+            fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(30),
+        },
+    )
+    .unwrap();
+    let mut ready = manager.ready();
+    while !*ready.borrow_and_update() {
+        ready.changed().await.unwrap();
+    }
+    clock.0.store(true, Ordering::Relaxed);
+    source.send(PRINCIPAL, SnapshotResolution::Unknown);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while ready.changed().await.is_ok() {}
+    })
+    .await
+    .expect("panicked task must release its readiness publisher");
+    assert!(!*ready.borrow());
+    assert!(manager.shutdown().await.task_died);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1848,53 +1917,6 @@ async fn a_stale_positive_cannot_drop_readiness() {
     manager.shutdown().await;
 }
 
-/// A source whose pulls are fixed and whose pushes the test drives directly.
-///
-/// The #53 regression tests all use `MutableNoPushSource`, so they exercise the
-/// *sweep*. Pushes are the primary propagation path for an in-process store,
-/// with the sweep as fallback — and the manager applies the same generation
-/// rule at both. This source is what lets the push half be pinned.
-struct DrivenPushSource {
-    pull: Mutex<SnapshotResolution>,
-    push: tokio::sync::broadcast::Sender<SnapshotPush>,
-}
-
-impl DrivenPushSource {
-    fn new(pull: SnapshotResolution) -> Arc<Self> {
-        let (push, _) = tokio::sync::broadcast::channel(8);
-        Arc::new(Self {
-            pull: Mutex::new(pull),
-            push,
-        })
-    }
-
-    fn send(&self, principal: Principal, resolution: SnapshotResolution) {
-        // Zero receivers is not a failure here either -- the manager may not
-        // have subscribed yet -- but the count is the difference between a
-        // push landing and the test silently retesting the sweep, so it is
-        // asserted rather than discarded.
-        let delivered = self
-            .push
-            .send(SnapshotPush {
-                principal,
-                resolution,
-            })
-            .expect("the manager must be subscribed");
-        assert_eq!(delivered, 1, "exactly one subscriber must receive the push");
-    }
-}
-
-#[async_trait]
-impl SnapshotSource for DrivenPushSource {
-    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
-        Ok(self.pull.lock().expect("pull mode poisoned").clone())
-    }
-
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-        self.push.subscribe()
-    }
-}
-
 /// #53 on the **push** path: a principal that goes absent and is then
 /// reinstated by a push at its original generation must come back.
 ///
@@ -1947,6 +1969,7 @@ async fn a_push_reinstates_an_absent_principal_at_its_own_generation() {
     .expect("the absence must reach the map");
 
     // And comes back, unchanged, at the generation it always had.
+    source.set_pull(live.clone());
     source.send(PRINCIPAL, live);
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         while !matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(_))) {
@@ -1956,6 +1979,7 @@ async fn a_push_reinstates_an_absent_principal_at_its_own_generation() {
     .await
     .expect("a push must reinstate an absent principal at its own generation");
 
+    assert_eq!(manager.counters().snapshot().refused_updates, 0);
     manager.shutdown().await;
 }
 

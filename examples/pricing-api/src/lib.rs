@@ -899,15 +899,20 @@ pub struct Snapshots {
     pub refresh_attempts: u64,
     /// Fetches the source could not answer.
     pub refresh_failures: u64,
+    /// Fetches abandoned at the configured timeout, distinct from a source
+    /// returning a failure.
+    pub refresh_timeouts: u64,
     /// Enumerations the source could not answer (#48). Its own counter
     /// because its consequence is different: fetch failures make known
     /// principals stale, which `unresolved` shows, while enumeration failures
     /// mean *new* principals never appear — invisible in every other number,
     /// since everything already tracked keeps working.
     pub discovery_failures: u64,
-    /// Principals with no currently valid resolution — the gauge that makes
-    /// readiness false, and the disambiguator for an `unknown_principal`
-    /// spike: nonzero means distribution, zero means credentials.
+    /// Stale or revoked updates refused across pushes and refreshes; excludes
+    /// an unchanged positive at the already installed generation.
+    pub refused_updates: u64,
+    /// Principals unresolved at the last pass. Readiness also applies the
+    /// configured Fixed/All rule and requires the background task to be alive.
     pub unresolved: u64,
 }
 
@@ -1040,7 +1045,9 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Json<Metrics> {
             Snapshots {
                 refresh_attempts: stats.refresh_attempts,
                 refresh_failures: stats.refresh_failures,
+                refresh_timeouts: stats.refresh_timeouts,
                 discovery_failures: stats.discovery_failures,
+                refused_updates: stats.refused_updates,
                 unresolved: stats.unresolved,
             }
         }),
