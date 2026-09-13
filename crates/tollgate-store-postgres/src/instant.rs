@@ -1,14 +1,14 @@
-//! Exact lease instants as an indexable PostgreSQL integer pair.
+//! Exact durable instants as an indexable PostgreSQL integer pair.
 use jiff::Timestamp;
 use tollgate_store::StoreError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct LeaseInstant {
+pub(crate) struct StoredInstant {
     pub micros: i64,
     pub submicro_nanos: i16,
 }
 
-impl From<Timestamp> for LeaseInstant {
+impl From<Timestamp> for StoredInstant {
     fn from(timestamp: Timestamp) -> Self {
         let nanos = timestamp.as_nanosecond();
         Self {
@@ -20,11 +20,11 @@ impl From<Timestamp> for LeaseInstant {
     }
 }
 
-impl LeaseInstant {
+impl StoredInstant {
     pub fn timestamp(self) -> Result<Timestamp, StoreError> {
         if !(0..1_000).contains(&self.submicro_nanos) {
             return Err(StoreError(
-                "invalid stored lease nanosecond remainder".into(),
+                "invalid stored timestamp nanosecond remainder".into(),
             ));
         }
         // The seconds constructor includes Timestamp::MAX's final fraction.
@@ -32,7 +32,7 @@ impl LeaseInstant {
             self.micros.div_euclid(1_000_000),
             (self.micros.rem_euclid(1_000_000) * 1_000 + i64::from(self.submicro_nanos)) as i32,
         )
-        .map_err(|_| StoreError("stored lease expiry exceeds the timestamp domain".into()))
+        .map_err(|_| StoreError("stored instant exceeds the timestamp domain".into()))
     }
 }
 
@@ -52,24 +52,24 @@ mod tests {
             Timestamp::new(-1, -999_999_999).unwrap(),
         ] {
             assert_eq!(
-                LeaseInstant::from(timestamp).timestamp().unwrap(),
+                StoredInstant::from(timestamp).timestamp().unwrap(),
                 timestamp
             );
         }
         for invalid in [
-            LeaseInstant {
+            StoredInstant {
                 micros: 0,
                 submicro_nanos: -1,
             },
-            LeaseInstant {
+            StoredInstant {
                 micros: 0,
                 submicro_nanos: 1_000,
             },
-            LeaseInstant {
+            StoredInstant {
                 micros: i64::MIN,
                 submicro_nanos: 0,
             },
-            LeaseInstant {
+            StoredInstant {
                 micros: i64::MAX,
                 submicro_nanos: 999,
             },
@@ -86,8 +86,8 @@ mod tests {
         ) {
             let timestamp = |n: i128| Timestamp::new((n / 1_000_000_000) as i64,
                 (n % 1_000_000_000) as i32).unwrap();
-            let a_pair = LeaseInstant::from(timestamp(a));
-            let b_pair = LeaseInstant::from(timestamp(b));
+            let a_pair = StoredInstant::from(timestamp(a));
+            let b_pair = StoredInstant::from(timestamp(b));
             prop_assert_eq!(a_pair.timestamp().unwrap().as_nanosecond(), a);
             prop_assert_eq!(b_pair.timestamp().unwrap().as_nanosecond(), b);
             prop_assert_eq!(a_pair.cmp(&b_pair), a.cmp(&b));

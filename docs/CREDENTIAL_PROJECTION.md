@@ -42,25 +42,100 @@ after the final page's read is subject to the refresh window: this protocol
 provides a coherent committed revision, not a transaction extending through
 publication on the instance.
 
-Apply migration **0013** before enabling the route. PostgreSQL embedders must
-also follow the [startup and rollback constraints](CREDENTIAL_ACTIVITY.md#persistence-and-rollout):
-old migration catalogues reject newer applied versions on restart even when
-the schema changes are additive. Migration 0013 adds a revision table,
-a transactional trigger covering old and new writers, and a partial `key_id`
-index. Installation is transactional and may briefly block credential writes
-while the index builds; schedule accordingly for a large existing table. Old
-binaries continue reading and writing credentials, with the trigger maintaining
-revisions. Roll back binaries while retaining these additive objects. Removing
-the trigger or resetting the revision while paged readers run is unsupported.
-Revision overflow rejects a mutation atomically, never wraps it.
+The PostgreSQL schema includes a revision table, a transactional mutation
+trigger and a partial `key_id` index. Direct writers do not manage revisions;
+the trigger advances them atomically, including rollback and overflow checks.
+Removing the trigger or resetting the revision while readers run is unsupported.
+Migration **0018** preserves exact credential expiry and requires the coordinated
+upgrade below. Old expiry readers and issuers are incompatible with that schema.
 
-Deploy servers before clients. A 404 from an older server leaves a new manager
-unready. `KeyDirectory` intentionally gains the `KeySource` supertrait, and
-`Backend` gains the read bound; custom backends implement the paged contract.
-`KeyDirectory::active_keys` remains an unbounded operator read with its existing
-semantics. These are intentional Rust API breaks in unpublished crates. The
-route, page DTO and new error codes are additive; existing wire formats remain
-unchanged. Pin server/client consumers to the same tested Git tag.
+`KeyDirectory` has the `KeySource` supertrait, and `Backend` requires its read
+bound; custom backends implement the paged contract. `KeyDirectory::active_keys`
+remains an unbounded operator read. Allocator/authentication APIs, HTTP page
+fields and error codes retain their contracts in this precision correction.
+Pin server/client consumers to the same tested Git tag.
+
+## Expiry precision and upgrade
+
+New credentials retain the complete nanosecond `not_after` timestamp through
+insertion, directory reads, every page, HTTP decoding and verifier/session
+evidence. The expiry is exclusive: an unchanged credential works one nanosecond
+before it and refuses at the instant itself. `None` continues to mean no
+individual expiry; managed projections still impose their freshness bound.
+All representable timestamps, including pre-epoch values and both domain
+endpoints, remain valid. Revocation's timestamp is informational: its presence
+retires the credential immediately, independently of the supplied read time.
+Credential activity remains a separate microsecond reporting contract.
+
+PostgreSQL stores finite expiry as `not_after_floor_us` plus
+`not_after_submicro_ns` (0–999). Both fields must be present or both absent.
+Their integer pair preserves exact timestamp ordering. The existing key-ID
+indexes and page bounds remain; there is no request-path change. Constraints
+refuse partial or out-of-domain rows, and readers report incomplete evidence
+rather than interpret it as indefinite validity.
+
+Migration 0018 cannot reconstruct fractions discarded by legacy writers. It
+uses the earliest possible expiry consistent with truncation toward zero:
+positive microseconds start at their stored instant; negative and zero values
+start 999 ns before it, bounded by Timestamp::MIN. This can end authority up
+to 999 ns early, or 1,998 ns for the zero bucket, but cannot extend it. Finite
+legacy rows carry `not_after_is_lower_bound = true`; indefinite rows remain
+exact nulls, and every new insertion declares exact evidence. This marker is
+durable operator evidence and is not added to the wire DTO.
+
+This upgrade requires a maintenance window across credential sources and
+consuming instances, not only the database:
+
+1. Preserve a recoverable backup and the running configuration. Stop ingress,
+   drain admitted work and usage, and stop old issuers, credential servers,
+   projection managers and direct-store consumers. Follow the lease shutdown
+   order for instances that also hold quota.
+2. Clear all old registry projections and `SessionCredential` proofs. Restarting
+   every process that owns them provides this boundary. A refresh alone is
+   insufficient: an existing session retains its originally issued deadline
+   even after a corrected table replaces it. An embedder doing an in-process
+   upgrade must demonstrably clear every such session before resuming ingress.
+3. Start a backend with migration 0018. The transaction locks the credential
+   table, renames the old expiry column, backfills bounds and validates all
+   rows. The existing trigger advances revision once if finite rows change;
+   revision overflow or invalid history rolls back schema and data together.
+   Allow for table-size-dependent backfill and lock acquisition.
+4. Start compatible issuers/readers, then fresh instance projections and
+   sessions. Require key-manager and runtime readiness before resuming ingress.
+   Inspect the uncertainty counts below; rotate affected credentials through
+   the normal durable issuance/revocation lifecycle when exact replacement
+   evidence is needed. Do not clear a marker or extend a bound by guessing.
+
+```sql
+SELECT revoked_at_us IS NOT NULL AS revoked,
+       not_after_is_lower_bound, count(*)
+FROM tollgate_credential_keys
+GROUP BY revoked, not_after_is_lower_bound;
+```
+
+The renamed column makes old expiry reads/writes fail, including on connections
+opened before migration. Old insertion shapes that omit the new evidence
+declaration also fail. Old revocation-only statements remain valid because
+they only remove authority. Old startup refuses the unknown migration version.
+These database fences cannot retroactively invalidate a proof already cached
+in another process; the session reset above is required. The migration does
+not alter key IDs, accounts, principals, digests, retirement or billing history.
+
+There is no automatic downgrade to the old expiry schema. Recovery after
+commit uses a compatible corrected binary or a separately reconciled restore;
+dropping nanoseconds would reintroduce the defect. A failed migration retains
+the old schema and history. Repair invalid timestamps only from authoritative
+evidence; revision exhaustion requires a deliberate source-generation recovery
+plan, never lowering the revision under live readers. Finite legacy uncertainty
+remains on retired history; normal rotation replaces active credentials with
+new exact records without erasing that history.
+
+The Lean projection model proves that conservative source bounds cannot extend
+authority and that reset sessions inherit them. Integer-pair order uses the
+existing exact timing model. Shared backend scenarios, migration/rollback tests
+and real memory/PostgreSQL HTTP-to-session tests are separate finite arithmetic,
+driver, transaction and rollout witnesses; these do not prove cryptography or
+fleet-wide operator execution.
 
 ## Instance lifecycle
 

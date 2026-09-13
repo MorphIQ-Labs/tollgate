@@ -4207,3 +4207,11 @@ async fn an_unrepresentable_replacement_expiry_leaves_the_original_grant_untouch
     assert_eq!(c.balance, CostUnits(100));
     assert_eq!(c.active_lease_grants, CostUnits::ZERO);
 }
+#[path = "support/credential_expiry.rs"]
+mod credential_expiry;
+
+#[tokio::test]
+async fn credential_expiry_is_exact_in_directory_and_every_page() {
+    let store = store_with_balance(full_grant_policy(), 100);
+    credential_expiry::exact_expiry(&*store, ACCOUNT).await;
+}

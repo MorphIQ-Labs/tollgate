@@ -1385,6 +1385,26 @@ exists to detect corrupt state and must not be able to launder it.
     projection may cross the instance-only secured control-plane link (32);
     it cannot invent liveness absent from the selected ledger revision.
 
+    New credential expiry is preserved at nanosecond precision through every
+    backend read and projection. PostgreSQL's `StoredInstant` representation
+    and schema constraints own the exact pair; a missing component is a storage
+    error, never an indefinite credential. Migration 0018 marks legacy finite
+    rows with the earliest compatible expiry and fences old readers/issuers.
+    It cannot extend source authority. Existing cached proofs must be cleared
+    during the coordinated upgrade described in `docs/CREDENTIAL_PROJECTION.md`.
+    *Tests:* `credential_expiry_is_exact_in_directory_and_every_page` (both
+    stores), `credential_expiry_preserves_the_final_fractional_second`,
+    `credential_expiry_upgrade_bounds_legacy_authority_and_fences_old_queries`,
+    `invalid_credential_history_or_revision_overflow_preserves_the_old_schema`,
+    `credential_expiry_constraints_and_readers_refuse_incomplete_evidence`,
+    `an_indefinite_catalogue_migrates_without_inventing_expiry_or_revision`,
+    `memory_expiry_reaches_http_projection_and_session_exactly`,
+    `postgres_expiry_reaches_http_projection_and_session_exactly`, and
+    `repairing_source_expiry_requires_resetting_preupgrade_cached_proofs`.
+    *Proof:* the legacy lower-bound and reset-session theorems in
+    `formal/lean/Tollgate/CredentialProjection.lean`; actual schema and session
+    behavior are separate implementation witnesses.
+
     Per-credential withdrawal reaches the request path by the mechanism that
     already exists: a `Principal` *is* the credential's digest fingerprint, so
     revoking one is `install_revoked` for that principal, and admission
@@ -1808,7 +1828,7 @@ exists to detect corrupt state and must not be able to launder it.
     `the_instance_clock_narrows_the_server_set_at_publication`,
     `credential_refresh_failure_is_structured_without_exposing_the_source_body`,
     `credential_pages_order_bound_skip_retired_and_expose_every_mutation` (both stores),
-    `credential_revision_covers_legacy_writes_rollback_and_overflow` (PostgreSQL),
+    `credential_revision_covers_direct_writes_rollback_and_overflow` (PostgreSQL),
     `maximal_key_pages_fit_the_derived_envelope_and_digests_are_canonical`,
     `cached_projected_credentials_remain_allocation_free_through_expiry`,
     `only_instances_receive_active_keys_at_the_server_clock_without_caching`,

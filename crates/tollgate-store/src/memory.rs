@@ -1755,6 +1755,8 @@ impl KeyDirectory for MemoryStore {
             // Expiry is decided here rather than by each reader, so every
             // backend answers "active" the same way and a projection cannot
             // disagree with the ledger about which credentials are live.
+            // Compare the full Timestamp: truncating either side can change
+            // an exclusive expiry boundary or the proof sent to a verifier.
             .filter(|stored| {
                 stored
                     .record

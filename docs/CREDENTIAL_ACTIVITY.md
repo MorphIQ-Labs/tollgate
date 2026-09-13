@@ -65,6 +65,11 @@ storage failures still roll back the complete ingest transaction and retry.
 
 ## Persistence and rollout
 
+The activity-only compatibility discussion below applies to migration 0014.
+Deployments including credential expiry migration 0018 must follow the
+[coordinated source and session upgrade](CREDENTIAL_PROJECTION.md#expiry-precision-and-upgrade);
+its expiry-column fence supersedes the earlier additive-schema rollout.
+
 Migration 0014 adds a nullable `key_id` to usage rows and a separate
 `tollgate_credential_activity` table. The usage column deliberately has no key FK:
 an unknown attribution must not lose a bill. The aggregate references retained

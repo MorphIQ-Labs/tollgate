@@ -663,3 +663,65 @@ async fn a_page_for_another_request_never_publishes() {
     assert_eq!(r.projected_keys, 0);
     manager.shutdown().await;
 }
+#[tokio::test(start_paused = true)]
+async fn repairing_source_expiry_requires_resetting_preupgrade_cached_proofs() {
+    // A legacy zero-microsecond row may have advertised zero for an actual
+    // expiry at -1 ns. Migration's earliest safe bound is -999 ns.
+    let (token, old) = minted(118, Some(t(0)));
+    let corrected = CredentialRecord {
+        not_after: Some(t(0) - SignedDuration::from_nanos(999)),
+        ..old
+    };
+    let source = Source::new(vec![old]);
+    let clock = Arc::new(ManualClock::new(t(-1)));
+    let manager = KeyManager::spawn(source.clone(), SECRET, clock, config()).unwrap();
+    let verifier = manager.verifier();
+    let mut monitor = manager.monitor();
+    wait_for(&mut monitor, t(-1), |r| r.ready).await;
+    let session = SessionCredential::new();
+    assert_eq!(
+        session.authenticate(Some(&token), &verifier, t(-1)),
+        Some(old.principal)
+    );
+    source.set(Reply::Keys(
+        CredentialSet::try_new(vec![corrected]).unwrap(),
+    ));
+    tokio::time::advance(Duration::from_secs(5)).await;
+    wait_for(&mut monitor, t(-1), |r| r.stats.refreshes == 2).await;
+    assert_eq!(
+        verifier.verify(&token).unwrap().reusable_until,
+        corrected.not_after
+    );
+    let actual_expiry = t(0) - SignedDuration::from_nanos(1);
+    // Refresh does not retroactively rewrite issued session evidence. This
+    // pins the need to clear it during the coordinated upgrade, not an
+    // assertion that a database migration alone repairs warm sessions.
+    assert_eq!(
+        session.authenticate(Some(&token), &verifier, actual_expiry),
+        Some(old.principal)
+    );
+    assert!(
+        session
+            .authenticate(None, &verifier, actual_expiry)
+            .is_none()
+    );
+    assert!(
+        session
+            .authenticate(Some(&token), &verifier, actual_expiry)
+            .is_none()
+    );
+    assert!(
+        SessionCredential::new()
+            .authenticate(Some(&token), &verifier, actual_expiry)
+            .is_none()
+    );
+    assert_eq!(
+        SessionCredential::new().authenticate(
+            Some(&token),
+            &verifier,
+            corrected.not_after.unwrap() - SignedDuration::from_nanos(1)
+        ),
+        Some(old.principal)
+    );
+    manager.shutdown().await;
+}

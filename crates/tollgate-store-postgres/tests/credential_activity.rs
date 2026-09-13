@@ -99,10 +99,7 @@ async fn credential_expiry_preserves_the_final_fractional_second() {
         .unwrap()
         .not_after
         .unwrap();
-    assert_eq!(
-        until.as_microsecond(),
-        jiff::Timestamp::MAX.as_microsecond()
-    );
+    assert_eq!(until, jiff::Timestamp::MAX);
 }
 
 #[tokio::test]
