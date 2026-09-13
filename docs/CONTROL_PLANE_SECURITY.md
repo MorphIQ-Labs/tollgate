@@ -37,9 +37,10 @@ throughout the rollout. An older server ignores `ttl` and rejects the zero
 sentinel with `invalid-ttl`, so a mixed deployment cannot silently grant a
 different lifetime. Before rolling servers back, stop clients from issuing
 the precise form; otherwise those lease operations refuse until compatible
-servers return. Existing grant responses and the database schema are unchanged.
-PostgreSQL's separate durable microsecond precision gap is tracked in #117;
-wire precision does not certify its reclaim boundary at finer precision.
+servers return. Existing grant responses are unchanged. PostgreSQL's durable
+nanosecond timing requires the coordinated migration 0017 upgrade described in
+[Lease timing](LEASE_TIMING.md); that storage upgrade has its own compatibility
+fence and must precede resuming lease operations on the new backend.
 
 Rust callers constructing `AcquireRequest` or `ConsolidateRequest` must replace
 the `ttl_seconds` member with `ttl: LeaseTtl::try_from(duration)?`. This is a Rust

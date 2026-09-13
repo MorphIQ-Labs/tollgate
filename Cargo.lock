@@ -2967,6 +2967,7 @@ dependencies = [
  "async-trait",
  "criterion",
  "jiff",
+ "proptest",
  "serde",
  "serde_json",
  "sqlx",

@@ -16,7 +16,8 @@
 //!   (a balance beyond i64::MAX is refused, not wrapped; a negative stored
 //!   value is refused, not clamped) and schema-level CHECK constraints
 //!   keeping every unit column non-negative;
-//! - timestamps as `BIGINT` microseconds since the Unix epoch;
+//! - lease expiry as floor `BIGINT` microseconds plus a `SMALLINT` nanosecond
+//!   remainder; other timestamps as `BIGINT` microseconds since the Unix epoch;
 //! - snapshots as storage-local `JSONB`: ids in the legacy u64 range remain
 //!   numeric for rollback, larger ids use canonical text, and the public
 //!   HTTP/Serde contract always uses text.
@@ -25,6 +26,9 @@
 //! (LISTEN/NOTIFY or the server's future SSE) is a documented seam in
 //! `docs/DESIGN.md`.
 
+mod lease_time;
+
+use lease_time::LeaseInstant;
 use std::num::{NonZeroI64, NonZeroUsize};
 use std::sync::Arc;
 
@@ -597,7 +601,6 @@ where
 pub struct PostgresStore {
     pool: PgPool,
     policy: GrantPolicy,
-    reclaim_grace_us: i64,
     push: broadcast::Sender<SnapshotPush>,
 }
 
@@ -657,8 +660,6 @@ impl PostgresStore {
             .validate()
             .map_err(|e| StoreError(format!("invalid grant policy: {e}")))?;
         pool_config.validate()?;
-        let reclaim_grace_us = i64::try_from(policy.reclaim_grace.as_micros())
-            .map_err(|_| StoreError("reclaim_grace exceeds PostgreSQL timestamp range".into()))?;
         let pool = PgPoolOptions::new()
             .max_connections(pool_config.max_connections)
             .acquire_timeout(pool_config.acquire_timeout)
@@ -670,12 +671,7 @@ impl PostgresStore {
             .await
             .map_err(|e| StoreError(format!("migrate: {e}")))?;
         let (push, _) = broadcast::channel(PUSH_CHANNEL_CAPACITY);
-        Ok(Arc::new(PostgresStore {
-            pool,
-            policy,
-            reclaim_grace_us,
-            push,
-        }))
+        Ok(Arc::new(PostgresStore { pool, policy, push }))
     }
 
     /// Test/reset helper: drop all quota rows (not the schema).
@@ -840,7 +836,7 @@ struct LockedLeaseRow {
     granted: i64,
     used: i64,
     credited: i64,
-    expires_at_us: i64,
+    expires_at: LeaseInstant,
     state: i16,
     /// The half of `granted` drawn from the account's periodic allowance, and
     /// the period that funded it. Settlement needs both: the split says which
@@ -933,8 +929,8 @@ async fn lock_lease(
     lease_id: LeaseId,
 ) -> Result<Option<LockedLeaseRow>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT account_id, fencing_token, granted, used, credited, expires_at_us, state,
-                from_allowance, period_start_us
+        "SELECT account_id, fencing_token, granted, used, credited, expires_at_floor_us, state,
+                from_allowance, period_start_us, expires_at_submicro_ns
          FROM tollgate_leases WHERE lease_id = $1 FOR UPDATE",
     )
     .bind(id_bytes(lease_id.0))
@@ -946,7 +942,10 @@ async fn lock_lease(
         granted: row.get(2),
         used: row.get(3),
         credited: row.get(4),
-        expires_at_us: row.get(5),
+        expires_at: LeaseInstant {
+            micros: row.get(5),
+            submicro_nanos: row.get(9),
+        },
         state: row.get(6),
         from_allowance: row.get(7),
         period_start_us: row.get(8),
@@ -1026,17 +1025,18 @@ impl PostgresStore {
         .map_err(alloc_storage)?;
         sqlx::query(
             "INSERT INTO tollgate_leases
-             (lease_id, account_id, fencing_token, granted, used, credited, expires_at_us,
-              state, from_allowance, period_start_us)
-             VALUES ($1, $2, $3, $4, 0, 0, $5, 0, $6, $7)",
+             (lease_id, account_id, fencing_token, granted, used, credited, expires_at_floor_us,
+              state, from_allowance, period_start_us, expires_at_submicro_ns, expiry_is_upper_bound)
+             VALUES ($1, $2, $3, $4, 0, 0, $5, 0, $6, $7, $8, FALSE)",
         )
         .bind(id_bytes(lease_id.0))
         .bind(id_bytes(account.0))
         .bind(fence)
         .bind(granted_i)
-        .bind(ts_micros(expires_at))
+        .bind(LeaseInstant::from(expires_at).micros)
         .bind(from_allowance)
         .bind(period_start_us)
+        .bind(LeaseInstant::from(expires_at).submicro_nanos)
         .execute(&mut **tx)
         .await
         .map_err(alloc_storage)?;
@@ -1066,7 +1066,7 @@ impl PostgresStore {
             granted,
             used,
             credited: _credited,
-            expires_at_us,
+            expires_at,
             state,
             from_allowance,
             period_start_us,
@@ -1080,8 +1080,13 @@ impl PostgresStore {
         }
         // Releases are accepted through the grace window (see GrantPolicy::
         // reclaim_grace) — only a settled or grace-exhausted lease refuses.
-        let release_deadline_us = expires_at_us.saturating_add(self.reclaim_grace_us);
-        if state != STATE_ACTIVE || ts_micros(now) >= release_deadline_us {
+        let expires_at = expires_at.timestamp().map_err(AllocateError::Storage)?;
+        if state != STATE_ACTIVE
+            || self
+                .policy
+                .reclaim_cutoff(now)
+                .is_some_and(|cutoff| expires_at <= cutoff)
+        {
             return Err(AllocateError::LeaseNotActive);
         }
         // Decoded before the byte form is consumed by the credit below, and
@@ -1243,20 +1248,25 @@ impl LeaseAllocator for PostgresStore {
     ) -> Result<ReclaimBatch, StoreError> {
         let limit_i = i64::try_from(limit.get())
             .map_err(|_| StoreError(format!("reclaim batch limit exceeds i64 range: {limit}")))?;
+        let Some(cutoff) = self.policy.reclaim_cutoff(now) else {
+            return ReclaimBatch::try_new(Vec::new(), limit);
+        };
+        let cutoff = LeaseInstant::from(cutoff);
         let mut tx = self.pool.begin().await.map_err(storage)?;
         let result = async {
             // Reclaim only once the grace window past expiry has fully lapsed:
-            // expires_at + grace <= now  ⟺  expires_at_us <= now_us - grace_us.
-            let threshold_us = ts_micros(now).saturating_sub(self.reclaim_grace_us);
+            // expires_at + grace <= now  iff  expires_at <= now - grace.
+            // Both tuple components preserve the exact timestamp ordering.
             // SKIP LOCKED lets concurrent sweepers cooperate; the limit keeps
             // both the lease locks and the transaction's row work bounded.
             let rows = sqlx::query(
                 "SELECT lease_id, account_id, granted, used, from_allowance, period_start_us
                  FROM tollgate_leases
-                 WHERE state = 0 AND expires_at_us <= $1
-                 ORDER BY account_id, lease_id LIMIT $2 FOR UPDATE SKIP LOCKED",
+                 WHERE state = 0 AND (expires_at_floor_us, expires_at_submicro_ns) <= ($1, $2)
+                 ORDER BY account_id, lease_id LIMIT $3 FOR UPDATE SKIP LOCKED",
             )
-            .bind(threshold_us)
+            .bind(cutoff.micros)
+            .bind(cutoff.submicro_nanos)
             .bind(limit_i)
             .fetch_all(&mut *tx)
             .await
@@ -2846,7 +2856,6 @@ mod tests {
         let store = PostgresStore {
             pool,
             policy: GrantPolicy::default(),
-            reclaim_grace_us: 0,
             push,
         };
 

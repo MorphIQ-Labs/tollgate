@@ -721,11 +721,11 @@ fn plan_release(
     // Releases are accepted through the grace window: a holder shutting down
     // slowly may reach here after `expires_at` but before the sweep settles
     // the lease. Only a settled (or grace-exhausted) lease refuses.
-    let release_deadline = lease
-        .expires_at
-        .checked_add(policy.reclaim_grace)
-        .unwrap_or(Timestamp::MAX);
-    if !lease.is_active() || now >= release_deadline {
+    if !lease.is_active()
+        || policy
+            .reclaim_cutoff(now)
+            .is_some_and(|cutoff| lease.expires_at <= cutoff)
+    {
         return Err(AllocateError::LeaseNotActive);
     }
     // granted = used + unspent + loss; a claim that doesn't fit is a client
@@ -926,7 +926,7 @@ impl LeaseAllocator for MemoryStore {
         // not what the process has ever leased (#23).
         let expired = inner
             .leases
-            .reclaimable(now, self.policy.reclaim_grace, limit.get());
+            .reclaimable(self.policy.reclaim_cutoff(now), limit.get());
         // Planned, validated, then applied. `ReclaimBatch::try_new` is the
         // last fallible step, and running it after a loop that had already
         // settled leases and credited balances would return `Err` over a

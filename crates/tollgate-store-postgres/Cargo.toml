@@ -25,6 +25,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 criterion = { workspace = true }
+proptest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 # Control-plane database latency, reported but not gated: the absolute result

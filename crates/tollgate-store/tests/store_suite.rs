@@ -4044,3 +4044,166 @@ async fn usage_accepts_zero_and_the_backends_unit_ceiling() {
         assert_conserved(&store);
     }
 }
+#[tokio::test]
+async fn nanosecond_lease_boundaries_preserve_release_reclaim_and_consolidation() {
+    let ns = SignedDuration::from_nanos;
+    for (now, ttl, grace, max_ttl) in [
+        (t(100), ns(1), SignedDuration::from_secs(30), TTL),
+        (t(100) + ns(1), ns(999), ns(1), TTL),
+        (t(-100) - ns(2), ns(1), ns(1), TTL),
+        (t(0) - ns(2), ns(1), ns(0), TTL),
+        (t(0), ns(2_001), ns(999), ns(1_001)),
+        (Timestamp::MIN, ns(1), ns(1), TTL),
+        (Timestamp::MAX - ns(1), ns(1), ns(0), TTL),
+        (Timestamp::MAX - ns(1_001), ns(1), ns(999), TTL),
+    ] {
+        let policy = GrantPolicy {
+            max_ttl,
+            reclaim_grace: grace,
+            ..full_grant_policy()
+        };
+        let store = store_with_balance(policy, 100);
+        let lease = store
+            .acquire(ACCOUNT, CostUnits(10), ttl, now)
+            .await
+            .unwrap();
+        let expiry = now.checked_add(ttl.min(max_ttl)).unwrap();
+        assert_eq!(lease.expires_at, expiry);
+        let lease = store
+            .consolidate(
+                lease.lease_id,
+                lease.fencing_token,
+                CostUnits(10),
+                CostUnits(10),
+                ttl,
+                now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(lease.expires_at, expiry);
+        let released = store
+            .acquire(ACCOUNT, CostUnits(10), ttl, now)
+            .await
+            .unwrap();
+        let deadline = expiry.checked_add(grace).unwrap();
+        let before = deadline - ns(1);
+        assert!(
+            store.reclaim_expired(before).await.unwrap().is_empty(),
+            "early reclaim: {now}, {ttl}, {grace}"
+        );
+        store
+            .release(
+                released.lease_id,
+                released.fencing_token,
+                CostUnits(10),
+                before,
+            )
+            .await
+            .expect("release remains valid until the exact deadline");
+        let c = store.conservation(ACCOUNT).unwrap();
+        assert!(c.holds());
+        assert_eq!(c.balance, CostUnits(90));
+        assert_eq!(c.active_lease_grants, CostUnits(10));
+        assert_eq!(
+            store
+                .release(lease.lease_id, lease.fencing_token, CostUnits(10), deadline)
+                .await
+                .unwrap_err(),
+            AllocateError::LeaseNotActive
+        );
+        let reclaimed = store.reclaim_expired(deadline).await.unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].lease_id, lease.lease_id);
+        assert_eq!(reclaimed[0].reclaimed, CostUnits(10));
+        assert!(store.reclaim_expired(deadline).await.unwrap().is_empty());
+        let c = store.conservation(ACCOUNT).unwrap();
+        assert!(c.holds());
+        assert_eq!(c.balance, CostUnits(100));
+        assert_eq!(c.active_lease_grants, CostUnits::ZERO);
+        assert_eq!(c.settlement_loss, CostUnits::ZERO);
+    }
+}
+
+#[tokio::test]
+async fn a_grace_deadline_beyond_timestamp_max_never_reclaims_early() {
+    for grace in [SignedDuration::from_nanos(2), SignedDuration::MAX] {
+        let policy = GrantPolicy {
+            reclaim_grace: grace,
+            ..full_grant_policy()
+        };
+        let store = store_with_balance(policy, 100);
+        let now = Timestamp::MAX - SignedDuration::from_nanos(2);
+        let lease = store
+            .acquire(ACCOUNT, CostUnits(10), SignedDuration::from_nanos(1), now)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reclaim_expired(Timestamp::MIN)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .reclaim_expired(Timestamp::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .release(
+                lease.lease_id,
+                lease.fencing_token,
+                CostUnits(10),
+                Timestamp::MAX,
+            )
+            .await
+            .expect("a deadline beyond the timestamp domain has not elapsed");
+        let c = store.conservation(ACCOUNT).unwrap();
+        assert!(c.holds());
+        assert_eq!(c.balance, CostUnits(100));
+        assert_eq!(c.active_lease_grants, CostUnits::ZERO);
+    }
+}
+#[tokio::test]
+async fn an_unrepresentable_replacement_expiry_leaves_the_original_grant_untouched() {
+    let store = store_with_balance(full_grant_policy(), 100);
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(10), TTL, t(0))
+        .await
+        .unwrap();
+    for ttl in [SignedDuration::from_nanos(1), SignedDuration::MAX] {
+        assert!(matches!(
+            store
+                .acquire(ACCOUNT, CostUnits(10), ttl, Timestamp::MAX)
+                .await,
+            Err(AllocateError::Storage(_))
+        ));
+        assert!(matches!(
+            store
+                .consolidate(
+                    lease.lease_id,
+                    lease.fencing_token,
+                    CostUnits(10),
+                    CostUnits(10),
+                    ttl,
+                    Timestamp::MAX
+                )
+                .await,
+            Err(AllocateError::Storage(_))
+        ));
+        let c = store.conservation(ACCOUNT).unwrap();
+        assert!(c.holds());
+        assert_eq!(c.balance, CostUnits(90));
+        assert_eq!(c.active_lease_grants, CostUnits(10));
+    }
+    store
+        .release(lease.lease_id, lease.fencing_token, CostUnits(10), t(1))
+        .await
+        .unwrap();
+    let c = store.conservation(ACCOUNT).unwrap();
+    assert!(c.holds());
+    assert_eq!(c.balance, CostUnits(100));
+    assert_eq!(c.active_lease_grants, CostUnits::ZERO);
+}
