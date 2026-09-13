@@ -2301,6 +2301,7 @@ async fn cancelling_lease_shutdown_aborts_the_owned_release_task() {
         health.has_changed().is_err(),
         "cancelled shutdown must not detach its manager"
     );
+    assert!(!*health.borrow(), "cancelled refill task must retain false");
 }
 
 /// Issue #109: near the end of an allowance the allocator shrinks the grant,

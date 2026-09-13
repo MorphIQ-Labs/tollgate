@@ -215,13 +215,14 @@ pub struct SnapshotManagerReport {
 
 /// What the snapshot task has done, readable at any time.
 ///
-/// [`ready`](SnapshotManager::ready) answers one bit — every principal
-/// resolved, or not. That is the right shape for a readiness probe and the
+/// [`ready`](SnapshotManager::ready) answers one bit under the configured
+/// Fixed/All rule. That is the right shape for a readiness probe and the
 /// wrong shape for diagnosis: it cannot say whether one principal is
 /// unresolved or a thousand, nor whether the source has been failing all
 /// morning (#4). These counters are the scrapeable half, and the
-/// `unresolved` gauge is computed from the same pass that decides readiness,
-/// so the two cannot disagree.
+/// `unresolved` gauge is computed from the same resolutions used by readiness.
+/// Task liveness is independent: a stopped manager is unready even if its
+/// last resolution pass had no unresolved principals.
 ///
 /// Written only by the snapshot task; `Relaxed` throughout.
 #[derive(Debug)]
@@ -230,6 +231,7 @@ pub struct SnapshotCounters {
     refresh_failures: AtomicU64,
     refresh_timeouts: AtomicU64,
     discovery_failures: AtomicU64,
+    refused_updates: AtomicU64,
     unresolved: AtomicU64,
 }
 
@@ -241,6 +243,7 @@ impl SnapshotCounters {
             refresh_failures: AtomicU64::new(0),
             refresh_timeouts: AtomicU64::new(0),
             discovery_failures: AtomicU64::new(0),
+            refused_updates: AtomicU64::new(0),
             unresolved: AtomicU64::new(0),
         }
     }
@@ -292,6 +295,7 @@ impl SnapshotCounters {
             refresh_failures: self.refresh_failures.load(Ordering::Relaxed),
             refresh_timeouts: self.refresh_timeouts.load(Ordering::Relaxed),
             discovery_failures: self.discovery_failures.load(Ordering::Relaxed),
+            refused_updates: self.refused_updates.load(Ordering::Relaxed),
             unresolved: self.unresolved.load(Ordering::Relaxed),
         }
     }
@@ -318,9 +322,14 @@ pub struct SnapshotStats {
     /// tracked set is frozen: everything already known keeps being refreshed,
     /// and nothing new is ever discovered.
     pub discovery_failures: u64,
+    /// Pushes or fetched updates refused by generation ordering. Excludes
+    /// an already installed positive at the same generation: that is an
+    /// ordinary unchanged catalogue, not a stale or revoked update.
+    pub refused_updates: u64,
     /// Principals with no currently valid resolution — a gauge, not a total.
-    /// Nonzero is exactly the condition that makes `ready` false, and the
-    /// count says how much of the tracked set is affected.
+    /// Reports the last resolution pass, not task liveness. Fixed mode needs
+    /// zero unresolved; All mode needs some resolved (or an empty catalogue).
+    /// Both additionally require a live task.
     pub unresolved: u64,
 }
 
@@ -347,7 +356,7 @@ impl SnapshotManager {
             ));
         }
         let (shutdown, shutdown_rx) = watch::channel(false);
-        let (ready_tx, ready) = watch::channel(false);
+        let (ready_tx, ready) = crate::task_health::TaskHealth::channel(false);
         let principals = config.principals.initial().len();
         let counters = Arc::new(SnapshotCounters::new());
         let task_counters = Arc::clone(&counters);
@@ -383,9 +392,10 @@ impl SnapshotManager {
         Arc::clone(&self.counters)
     }
 
-    /// True while every tracked principal has a currently valid positive or
-    /// negative resolution. The sender closes if the manager task exits, so
-    /// callers can include task health in their readiness probe.
+    /// True while the task is alive and its current resolutions meet the
+    /// configured Fixed/All readiness rule. The task stores false before the
+    /// channel closes on normal return, panic or cancellation; a retained
+    /// receiver's value alone cannot keep advertising an exited task as ready.
     #[must_use]
     pub fn ready(&self) -> watch::Receiver<bool> {
         self.ready.clone()
@@ -440,6 +450,21 @@ enum Resolution {
         /// the positive this negative replaced. That conflation is #53.
         watermark: Option<Watermark>,
     },
+}
+
+#[derive(Clone, Copy)]
+enum UpdateOrigin {
+    Push,
+    Refresh,
+}
+
+impl UpdateOrigin {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Push => "push",
+            Self::Refresh => "refresh",
+        }
+    }
 }
 
 impl Resolution {
@@ -668,14 +693,62 @@ impl Resolutions {
     /// already denying live principals on the request path, and one that no
     /// pre-#53 version repaired either, since the equal generation was refused
     /// outright.
-    fn accepts_positive(&self, principal: Principal, generation: Generation) -> bool {
+    fn accepts_positive(
+        &self,
+        principal: Principal,
+        generation: Generation,
+        origin: UpdateOrigin,
+        counters: &SnapshotCounters,
+    ) -> bool {
         let current = self.by_principal.get(&principal).copied();
         let (_, accepted) = accept_positive(
             current.and_then(Resolution::watermark),
             generation,
             current.is_some_and(|resolution| matches!(resolution, Resolution::Present { .. })),
         );
+        // The shared admission rule also returns false for a visible equal
+        // generation. Classify that idempotent no-op without changing its
+        // acceptance or retry behavior, and keep a healthy refresh quiet.
+        let unchanged = matches!(current, Some(Resolution::Present { generation: held, .. })
+            if held == generation);
+        if !accepted && !unchanged {
+            self.record_refusal(principal, generation, "positive", origin, counters);
+        }
         accepted
+    }
+
+    fn revocation(
+        &self,
+        principal: Principal,
+        generation: Generation,
+        origin: UpdateOrigin,
+        counters: &SnapshotCounters,
+    ) -> (Option<Watermark>, bool) {
+        let decision = accept_revoked(self.watermark_of(principal), generation);
+        if !decision.1 {
+            self.record_refusal(principal, generation, "revoked", origin, counters);
+        }
+        decision
+    }
+
+    /// Both ingress paths obtain their decision and its evidence together.
+    fn record_refusal(
+        &self,
+        principal: Principal,
+        generation: Generation,
+        kind: &'static str,
+        origin: UpdateOrigin,
+        counters: &SnapshotCounters,
+    ) {
+        counters.refused_updates.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            %principal,
+            offered = generation.0,
+            retained = ?self.watermark_of(principal),
+            origin = origin.name(),
+            kind,
+            "snapshot update refused; previous resolution retained"
+        );
     }
 
     /// Record a resolution, replacing whatever this principal held.
@@ -1064,28 +1137,14 @@ async fn refresh_all_cancellable(
         };
         match result {
             Ok(SnapshotResolution::Present(snapshot)) => {
-                if !resolutions.accepts_positive(principal, snapshot.generation) {
-                    // Refused, and deliberately left out of `completed` so it
-                    // lands in the returned set that drives `back_off`.
-                    //
-                    // An earlier cut marked it completed instead, reasoning
-                    // that a refusal is not a failed fetch. It is not — but
-                    // that set is what re-arms `next_refetch`, and without it
-                    // a negative's deadline stays in the past, so the control
-                    // wakeup re-fires at zero delay and refetches at source
-                    // latency: 410 fetches in 600 ms against a replica serving
-                    // a stale generation, where the back-off gives three. #53's
-                    // severity came from the refusal being *permanent*, not
-                    // from the throttle; removing the throttle made it worse.
-                    //
-                    // What that cut was right about is visibility, so the
-                    // refusal is now said out loud rather than absorbed.
-                    tracing::warn!(
-                        %principal,
-                        offered = snapshot.generation.0,
-                        "source offered a snapshot this instance already refuses; \
-                         retrying with backoff"
-                    );
+                if !resolutions.accepts_positive(
+                    principal,
+                    snapshot.generation,
+                    UpdateOrigin::Refresh,
+                    counters,
+                ) {
+                    // Keep refusals/no-ops out of completed: it rearms a
+                    // negative's retry backoff, never its validity deadline.
                     continue;
                 }
                 completed.insert(principal);
@@ -1108,16 +1167,9 @@ async fn refresh_all_cancellable(
             }) => {
                 let now = clock.now();
                 let (watermark, accepted) =
-                    accept_revoked(resolutions.watermark_of(principal), incoming);
+                    resolutions.revocation(principal, incoming, UpdateOrigin::Refresh, counters);
                 if !accepted {
-                    // Refused, and left out of `completed` for the reason the
-                    // positive arm above spells out: that set is the throttle.
-                    tracing::warn!(
-                        %principal,
-                        offered = incoming.0,
-                        "source offered a revocation older than this instance holds; \
-                         retrying with backoff"
-                    );
+                    // Refused answers still drive the bounded retry schedule.
                     continue;
                 }
                 let until = negative_deadline(now, config, NegativeKind::Revoked);
@@ -1257,9 +1309,10 @@ async fn run(
     clock: Arc<dyn Clock>,
     config: SnapshotManagerConfig,
     mut shutdown: watch::Receiver<bool>,
-    ready: watch::Sender<bool>,
+    readiness: crate::task_health::TaskHealth,
     counters: Arc<SnapshotCounters>,
 ) {
+    let ready = readiness.sender();
     let mut updates = source.subscribe();
     let mut resolutions = Resolutions::publishing(
         config.principals.initial().iter().copied(),
@@ -1295,7 +1348,7 @@ async fn run(
             &pending,
             &mut resolutions,
             &mut shutdown,
-            &ready,
+            ready,
             &counters,
         )
         .await
@@ -1304,7 +1357,7 @@ async fn run(
         };
         pending = failed;
         update_ready(
-            &ready,
+            ready,
             &mut resolutions,
             &clock,
             &counters,
@@ -1322,7 +1375,7 @@ async fn run(
         }
     }
     update_ready(
-        &ready,
+        ready,
         &mut resolutions,
         &clock,
         &counters,
@@ -1353,7 +1406,7 @@ async fn run(
                         match push.resolution {
                             SnapshotResolution::Present(snapshot) => {
                                 if !resolutions
-                                    .accepts_positive(push.principal, snapshot.generation)
+                                    .accepts_positive(push.principal, snapshot.generation, UpdateOrigin::Push, &counters)
                                 {
                                     continue;
                                 }
@@ -1380,7 +1433,7 @@ async fn run(
                                 let (watermark, accepted, kind, update) = match resolution {
                                     SnapshotResolution::Revoked { generation } => {
                                         let (watermark, accepted) =
-                                            accept_revoked(current, generation);
+                                            resolutions.revocation(push.principal, generation, UpdateOrigin::Push, &counters);
                                         (watermark, accepted, NegativeKind::Revoked, Some(generation))
                                     }
                                     SnapshotResolution::Unknown => {
@@ -1416,7 +1469,7 @@ async fn run(
                                 resolutions.publish(vec![update], now);
                             }
                         }
-                        update_ready(&ready, &mut resolutions, &clock, &counters, &config.principals);
+                        update_ready(ready, &mut resolutions, &clock, &counters, &config.principals);
                     }
                 }
                 // Lagged: missed pushes — refetch everything rather than
@@ -1427,12 +1480,12 @@ async fn run(
                     if refresh_all_cancellable(
                         &source, &slots, &clock, &config, &resolutions.all_tracked(),
                         &mut resolutions, &mut shutdown,
-                        &ready,
+                        ready,
                         &counters,
                     ).await.is_none() {
                         return;
                     }
-                    update_ready(&ready, &mut resolutions, &clock, &counters, &config.principals);
+                    update_ready(ready, &mut resolutions, &clock, &counters, &config.principals);
                 }
                 // Push stream gone (e.g. HTTP transport): periodic refresh
                 // remains the freshness path.
@@ -1455,21 +1508,21 @@ async fn run(
                 if refresh_all_cancellable(
                     &source, &slots, &clock, &config, &resolutions.due_for_sweep(),
                     &mut resolutions, &mut shutdown,
-                    &ready,
+                    ready,
                     &counters,
                 ).await.is_none() {
                     return;
                 }
-                update_ready(&ready, &mut resolutions, &clock, &counters, &config.principals);
+                update_ready(ready, &mut resolutions, &clock, &counters, &config.principals);
             }
             _ = &mut control_wakeup => {
                 let now = clock.now();
-                update_ready(&ready, &mut resolutions, &clock, &counters, &config.principals);
+                update_ready(ready, &mut resolutions, &clock, &counters, &config.principals);
                 let due = resolutions.due_for_refetch(now, config.max_concurrent_fetches);
                 if !due.is_empty() {
                     let Some(failed) = refresh_all_cancellable(
                         &source, &slots, &clock, &config, &due,
-                        &mut resolutions, &mut shutdown, &ready, &counters,
+                        &mut resolutions, &mut shutdown, ready, &counters,
                     ).await else {
                         return;
                     };
@@ -1477,7 +1530,7 @@ async fn run(
                     for principal in failed {
                         resolutions.back_off(principal, retry_at);
                     }
-                    update_ready(&ready, &mut resolutions, &clock, &counters, &config.principals);
+                    update_ready(ready, &mut resolutions, &clock, &counters, &config.principals);
                 }
             }
             changed = shutdown.changed() => {

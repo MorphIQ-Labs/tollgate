@@ -42,6 +42,8 @@ readiness, revocation windows and rollout.
 
 See [usage accounting](docs/USAGE_ACCOUNTING.md) for batch rejection semantics,
 PostgreSQL numeric limits, and database-guard migration and recovery.
+See [snapshot operations](docs/SNAPSHOT_OPERATIONS.md) for generation-refusal
+diagnostics and retained readiness after task exit.
 
 ## Quickstart
 

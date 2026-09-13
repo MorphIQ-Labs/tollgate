@@ -51,6 +51,7 @@ pub mod period_roller;
 mod registry;
 pub mod runtime;
 pub mod snapshot_manager;
+mod task_health;
 pub mod usage_writer;
 
 #[cfg(feature = "http")]

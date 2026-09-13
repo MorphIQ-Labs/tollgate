@@ -474,7 +474,7 @@ impl LeaseManager {
     ) -> Result<Self, LeaseManagerConfigError> {
         config.validate()?;
         let (shutdown, shutdown_rx) = watch::channel(false);
-        let (health_tx, health) = watch::channel(true);
+        let (health_tx, health) = crate::task_health::TaskHealth::channel(true);
         let account = config.account;
         let counters = Arc::new(LeaseCounters::new());
         let task_counters = Arc::clone(&counters);
@@ -484,20 +484,18 @@ impl LeaseManager {
         let task_paused = Arc::clone(&paused);
         let handle = tokio::spawn(
             async move {
-                let report = run(
+                run(
                     allocator,
                     slot,
                     clock,
                     config,
                     shutdown_rx,
-                    &health_tx,
+                    health_tx.sender(),
                     &task_counters,
                     &task_deadline,
                     &task_paused,
                 )
-                .await;
-                crate::signal(&health_tx, false, "lease-manager health");
-                report
+                .await
             }
             .instrument(tracing::info_span!("lease_manager", %account)),
         );
@@ -523,9 +521,9 @@ impl LeaseManager {
     }
 
     /// True while the refill task is alive *and* its accounting still agrees
-    /// with the store. Channel closure also means the task exited (including
-    /// panic/abort), so readiness probes should check both the current value
-    /// and `Receiver::has_changed().is_ok()`.
+    /// with the store. The task owns a publisher that stores false before
+    /// closing on normal return, panic or cancellation. Channel closure also
+    /// remains available to observers that distinguish exit from a live fault.
     #[must_use]
     pub fn health(&self) -> watch::Receiver<bool> {
         self.health.clone()
