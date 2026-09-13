@@ -9,7 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-tollgate-core = { path = "../tollgate-core", version = "=0.20.0" }
+tollgate-core = { path = "../tollgate-core", version = "=0.21.0" }
 async-trait = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true, optional = true }
