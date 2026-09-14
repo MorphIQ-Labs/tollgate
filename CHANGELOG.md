@@ -7,6 +7,13 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.21.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.21.0...v0.21.1) - 2026-09-14
+
+### Fixed
+
+- *(load-gate)* report execution failures without panicking
+- *(ci)* validate invariant witness references
+
 ## [0.21.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.20.0...v0.21.0) - 2026-09-13
 
 ### Fixed
