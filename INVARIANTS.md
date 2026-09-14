@@ -704,15 +704,16 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     equation pass over the corruption it exists to detect. The Postgres
     schema additionally CHECK-constrains unit columns non-negative, including
     billing-event units, and every persisted fence strictly positive.
-    *Tests:* `tollgate-core` proptests;
+    *Tests:* `tollgate-core` proptests; all seven of
     `negative_account_column_fails_conservation_read`,
     `negative_account_column_fails_balance_and_usage_reads`,
     `negative_lease_sum_fails_conservation_read`,
     `acquire_surfaces_negative_stored_balance`,
     `reclaim_refuses_negative_credit`,
     `straggler_exceeding_recorded_loss_fails_ingest`, and
-    `checked_ledger_columns_reject_negative_writes` (Postgres suite; the
-    memory backend makes negative state unrepresentable via `u64`);
+    `checked_ledger_columns_reject_negative_writes` (Postgres suite only; the
+    memory backend makes negative state unrepresentable via `u64`, so it has
+    no counterpart to any of them);
     `usage_guard_upgrade_preserves_legacy_rows_and_refuses_an_old_catalogue` and
     `invalid_history_blocks_validation_but_leaves_write_guards_and_can_be_repaired`
     (Postgres migration suite).

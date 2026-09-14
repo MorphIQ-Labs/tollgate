@@ -1,6 +1,9 @@
 //! Declaration resolution for current invariant documentation. This is not a
 //! coverage check, a Rust name resolver, or a substitute for executing proofs.
 
+pub mod cli;
+pub mod parity;
+
 use proc_macro2::{TokenStream, TokenTree};
 use std::{
     collections::{BTreeMap, BTreeSet},

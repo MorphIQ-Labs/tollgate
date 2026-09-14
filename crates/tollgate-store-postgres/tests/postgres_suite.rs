@@ -146,6 +146,20 @@ async fn nonpositive_lease_ttl_is_rejected_without_debiting() {
         AllocateError::InvalidTtl
     );
     assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(100));
+
+    // The memory suite's second half, mirrored (#85). `now.checked_add(ttl)`
+    // runs after the `FOR UPDATE` read but before the balance `UPDATE`, so a
+    // reordering of those two statements would debit an account for a lease
+    // whose expiry cannot be represented. Without this the PostgreSQL side
+    // asserted only the non-positive TTL, and that reordering would have gone
+    // unnoticed here while the memory suite caught it.
+    assert!(
+        store
+            .acquire(ACCOUNT, CostUnits(10), TTL, Timestamp::MAX)
+            .await
+            .is_err()
+    );
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(100));
 }
 
 fn usage(lease: &tollgate_core::LeaseGrant, request: u128, units: u64, at: i64) -> UsageEvent {

@@ -146,6 +146,10 @@ repository-hygiene:
     # already decided whether that stage exists (#106).
     - ./scripts/check_ci_rules.sh
     - ./scripts/check_invariant_witnesses.sh
+    # The two backend suites must drive the same contract under one test name.
+    # `MemoryStore` has inherent helpers shadowing its `AdminStore` methods and
+    # `PostgresStore` has none, so the drift is silent and recurring (#43, #85).
+    - ./scripts/check_backend_parity.sh
 
 fmt:
   dependencies: []
