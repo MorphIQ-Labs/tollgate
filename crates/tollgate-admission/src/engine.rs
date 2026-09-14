@@ -897,7 +897,9 @@ fn reserve_from_lease(
         .lease
         .load_at(locality)
         .ok_or(DenyReason::LeaseUnavailable)?;
-    Reservation::reserve_at_locality(&lease, units, now, locality)
+    // Moved, not borrowed: `load_at` already owns this handle, and the
+    // reservation is where it lives from here (#79).
+    Reservation::reserve_at_locality(lease, units, now, locality)
 }
 
 /// The elastic half: extend unfunded credit, or return the lease's own

@@ -215,25 +215,34 @@ impl Reservation {
         units: CostUnits,
         now: Timestamp,
     ) -> Result<Reservation, DenyReason> {
-        Self::reserve_at_locality(lease, units, now, Locality::current())
+        Self::reserve_at_locality(Arc::clone(lease), units, now, Locality::current())
     }
 
     /// Reserve using locality already resolved by the enclosing admission
     /// pipeline, avoiding repeated thread-local lookups between stages.
+    ///
+    /// Takes the handle **by value** because its caller already owns one:
+    /// `LeaseSlot::load_at` hands back an owned `Arc`, and borrowing it here
+    /// only to clone it again would put two refcount operations on the shared
+    /// lease back onto every admission — in the shipped `LocalSharding::SINGLE`
+    /// layout, on the one cache line every thread serving the account touches
+    /// (#79). This is the owned half of the same split `request_entry_from`
+    /// and `request_entry_at` draw one layer down, in the snapshot map.
+    ///
+    /// [`reserve`](Reservation::reserve) keeps the borrowing signature, and
+    /// pays the clone at its own call site rather than inside this one, so the
+    /// count is unchanged for every caller that holds only a borrow.
     #[doc(hidden)]
     #[inline]
     pub fn reserve_at_locality(
-        lease: &Arc<LocalLease>,
+        lease: Arc<LocalLease>,
         units: CostUnits,
         now: Timestamp,
         locality: Locality,
     ) -> Result<Reservation, DenyReason> {
         let debit = lease.try_reserve_at(units, now, locality)?;
         Ok(Reservation {
-            source: ChargeSource::Lease {
-                lease: Arc::clone(lease),
-                debit,
-            },
+            source: ChargeSource::Lease { lease, debit },
             units,
             phase: AtomicU8::new(PENDING_LEASE),
         })
