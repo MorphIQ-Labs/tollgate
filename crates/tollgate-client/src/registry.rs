@@ -92,6 +92,12 @@ impl SlotRegistry {
         if self.observes() {
             let mut inner = self.inner.lock().expect("slot registry poisoned");
             inner.tracked.clone_from(principals);
+            // The predicate is pure and total -- every untracked resolution
+            // goes, whatever order they are visited in.
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "pure, total predicate: the visit order cannot change which entries survive"
+            )]
             inner
                 .resolutions
                 .retain(|principal, _| principals.contains(principal));
@@ -100,6 +106,10 @@ impl SlotRegistry {
 
     pub(crate) fn resolution_counts(&self, now: Timestamp) -> (usize, usize) {
         let inner = self.inner.lock().expect("slot registry poisoned");
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "counts unresolved principals; a count does not depend on the order they are counted in"
+        )]
         let unresolved = inner
             .tracked
             .iter()
@@ -116,6 +126,10 @@ impl SlotRegistry {
     pub(crate) fn funding(&self, now: Timestamp) -> RuntimeFundingReport {
         let inner = self.inner.lock().expect("slot registry poisoned");
         let mut report = RuntimeFundingReport::default();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "sums overage across slots with checked addition; the total does not depend on the order the addends arrive in"
+        )]
         for slot in inner.slots.values() {
             report.total_overage_spent = report
                 .total_overage_spent
@@ -130,6 +144,10 @@ impl SlotRegistry {
                 report.total_lease_remaining = Some(sum);
             }
         }
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "reduces each account's members to `any(..)` and `max(..)`; neither depends on the order they are visited in"
+        )]
         for (account, members) in &inner.members {
             if members
                 .values()
@@ -288,6 +306,12 @@ impl SlotRegistry {
             .map(|(at, _)| *at)
     }
 
+    /// Both callers are order-independent: `readiness` counts eligible and
+    /// unfundable accounts, and `account_reports` re-keys into a `BTreeMap`.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "callers count or re-key into a BTreeMap; the key order never reaches an output"
+    )]
     pub(crate) fn bindings(&self) -> Vec<AccountBinding> {
         let inner = self.inner.lock().expect("slot registry poisoned");
         inner
@@ -307,6 +331,12 @@ impl SlotRegistry {
 }
 
 impl Registry {
+    /// The snapshot list is only ever reduced with `any(..)`, by
+    /// `AccountBinding::eligible` and `fundable`, so its order is not an output.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the snapshots are only reduced with any(..); their order never reaches an output"
+    )]
     fn binding(&self, account: AccountId) -> AccountBinding {
         AccountBinding {
             account,
@@ -336,6 +366,11 @@ fn quota_usable(slot: &LeaseSlot, mode: EnforcementMode, now: Timestamp) -> bool
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::disallowed_methods,
+        reason = "unit tests that build an arbitrary `now` the assertions are relative to; \
+                  no assertion here depends on what the clock actually said"
+    )]
     use super::*;
     use jiff::SignedDuration;
     use tollgate_core::{

@@ -1,6 +1,12 @@
 //! Contract tests for the example service: the embedding is where the
 //! product's guarantees become user-visible HTTP behavior.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "the example service reads the clock at its HTTP edge, so a test of that surface \
+              observes the same instants it does"
+)]
+
 use std::num::NonZeroU32;
 
 use axum::body::Body;

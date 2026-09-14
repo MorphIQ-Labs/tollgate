@@ -22,6 +22,16 @@
 //! loopback test in tollgate-server). Readiness reports 503 until the account's
 //! lease slot is stocked (INVARIANTS.md #10).
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "the embedder is where business time legitimately enters the system (#100). \
+              The library takes a `Timestamp` at every boundary precisely so that an \
+              application reads the clock once, at its own edge, and passes the instant \
+              down -- which is what makes admission replayable from its inputs. Reading \
+              it here is that design working, not an escape from it; a service wanting \
+              a controllable clock substitutes `tollgate_store::Clock` at these sites."
+)]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

@@ -2,6 +2,12 @@
 //! readiness, pushes propagate, refresh recovers, and revocation reaches
 //! running instances.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "builds an arbitrary `now` the assertions are relative to; no assertion depends on \
+              what the clock actually said"
+)]
+
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

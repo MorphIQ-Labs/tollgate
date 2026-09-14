@@ -1,5 +1,11 @@
 //! Complete measurements and execution failures share one atomic publisher.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "stamps when a load-gate report was produced; metadata about the run, not an \
+              input to the gate's verdict"
+)]
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

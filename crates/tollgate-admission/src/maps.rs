@@ -699,6 +699,10 @@ impl ArcSwapSnapshotMap {
         let current = self.map.load_full();
         let mut next = PrincipalMap::clone(&current);
         if let Some(now) = now {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "the predicate is pure and total -- every expired negative entry goes, whatever order they are visited in"
+            )]
             next.retain(
                 |_, entry| !matches!(entry, StoredEntry::NegativeUntil { until } if *until <= now),
             );
@@ -719,6 +723,10 @@ impl Default for ArcSwapSnapshotMap {
 }
 
 fn trim_negatives(map: &mut PrincipalMap, max_negative_entries: usize) {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "sorted below before any entry is removed, so which negatives are trimmed is decided by deadline, not by hash order"
+    )]
     let mut negatives: Vec<_> = map
         .iter()
         .filter_map(|(principal, entry)| match entry {

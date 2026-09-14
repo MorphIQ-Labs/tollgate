@@ -29,6 +29,10 @@ pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now(&self) -> Timestamp {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "this is the one production read of the business clock; every other caller takes a Timestamp from a Clock, which is what makes the rest of the system replayable"
+        )]
         Timestamp::now()
     }
 }
