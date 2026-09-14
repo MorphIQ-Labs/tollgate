@@ -6,6 +6,7 @@
 //! chosen for that asymmetry.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -16,11 +17,12 @@ use tollgate_core::{
 };
 
 use crate::counters::AdmissionCounters;
-use crate::generation_model::{Watermark, accept_positive, accept_revoked};
+use crate::history::GenerationHistory;
 use crate::state::{
     AccountAdmissionState, AdmissionStateRegistry, LeaseSlot, MapEntry, Principal,
     PublishableSnapshotUpdate, ResolvedAdmissionState, SnapshotMap, SnapshotUpdate,
 };
+use crate::{PublicationError, RefreshBatch, Refreshed};
 
 /// The hasher every `Principal`-keyed map in this crate uses.
 ///
@@ -102,44 +104,6 @@ fn request_entry_at(entry: &StoredEntry, sharding: LocalSharding, locality: Loca
             MapEntry::Present(Arc::clone(&states[locality.index(sharding)]))
         }
         StoredEntry::NegativeUntil { until } => MapEntry::NegativeUntil { until: *until },
-    }
-}
-
-#[derive(Default)]
-struct GenerationWatermarks {
-    /// Control-plane only, and on the alias for consistency rather than for
-    /// speed: two `Principal`-keyed maps in one file disagreeing about their
-    /// hasher would read as a decision nobody made.
-    by_principal: HashMap<Principal, Watermark, PrincipalHasher>,
-}
-
-impl GenerationWatermarks {
-    /// `visible` is whether the principal currently has a request-visible
-    /// positive entry, which is what keeps a duplicate publish of a live
-    /// snapshot an idempotent no-op (#53).
-    fn accept_positive(
-        &mut self,
-        principal: Principal,
-        incoming: Generation,
-        visible: bool,
-    ) -> bool {
-        let (next, accepted) = accept_positive(
-            self.by_principal.get(&principal).copied(),
-            incoming,
-            visible,
-        );
-        if let Some(next) = next {
-            self.by_principal.insert(principal, next);
-        }
-        accepted
-    }
-
-    fn accept_revoked(&mut self, principal: Principal, incoming: Generation) -> bool {
-        let (next, accepted) = accept_revoked(self.by_principal.get(&principal).copied(), incoming);
-        if let Some(next) = next {
-            self.by_principal.insert(principal, next);
-        }
-        accepted
     }
 }
 
@@ -226,7 +190,7 @@ fn apply_prepared(
 /// policy authorities either.
 fn accept_updates(
     map: &PrincipalMap,
-    watermarks: &mut GenerationWatermarks,
+    watermarks: &mut GenerationHistory,
     updates: impl IntoIterator<Item = InstallUpdate>,
 ) -> Vec<InstallUpdate> {
     let mut visible = HashMap::with_hasher(PrincipalHasher::default());
@@ -269,6 +233,261 @@ fn accept_updates(
     accepted.into_iter().flatten().collect()
 }
 
+fn raw_updates(updates: Vec<SnapshotUpdate>) -> Vec<InstallUpdate> {
+    updates
+        .into_iter()
+        .map(|update| match update {
+            SnapshotUpdate::Present {
+                principal,
+                snapshot,
+                lease,
+            } => InstallUpdate::Present {
+                principal,
+                snapshot,
+                maximum_quote: None,
+                lease,
+            },
+            SnapshotUpdate::Revoked {
+                principal,
+                until,
+                generation,
+            } => InstallUpdate::Revoked {
+                principal,
+                until,
+                generation,
+            },
+            SnapshotUpdate::Unknown { principal, until } => {
+                InstallUpdate::Unknown { principal, until }
+            }
+        })
+        .collect()
+}
+fn raw_publishable_updates(updates: Vec<PublishableSnapshotUpdate>) -> Vec<InstallUpdate> {
+    updates
+        .into_iter()
+        .map(|update| match update {
+            PublishableSnapshotUpdate::Present {
+                principal,
+                snapshot,
+                lease,
+            } => InstallUpdate::Present {
+                principal,
+                maximum_quote: snapshot.maximum_quote(),
+                snapshot: snapshot.into_inner(),
+                lease,
+            },
+            PublishableSnapshotUpdate::Revoked {
+                principal,
+                until,
+                generation,
+            } => InstallUpdate::Revoked {
+                principal,
+                until,
+                generation,
+            },
+            PublishableSnapshotUpdate::Unknown { principal, until } => {
+                InstallUpdate::Unknown { principal, until }
+            }
+        })
+        .collect()
+}
+
+/// Resolve only accepted, request-visible positives as one registry batch.
+/// Generation rejection has already happened while the watermark lock is
+/// held, so no rejected snapshot can mutate account policy.
+fn prepare_accepted(
+    states: &AdmissionStateRegistry,
+    updates: impl IntoIterator<Item = InstallUpdate>,
+) -> Vec<PreparedUpdate> {
+    // Negatives need no limiter, so they skip the registry entirely and
+    // keep their place by index rather than by being carried through it.
+    let updates = updates.into_iter();
+    let mut prepared: Vec<Option<PreparedUpdate>> = Vec::with_capacity(updates.size_hint().0);
+    let mut positives = Vec::new();
+    for update in updates {
+        match update {
+            InstallUpdate::Present {
+                principal,
+                snapshot,
+                maximum_quote,
+                lease,
+            } => {
+                prepared.push(None);
+                positives.push((
+                    prepared.len() - 1,
+                    principal,
+                    snapshot,
+                    maximum_quote,
+                    lease,
+                ));
+            }
+            InstallUpdate::Revoked {
+                principal,
+                until,
+                generation: _,
+            } => prepared.push(Some(PreparedUpdate::Revoked { principal, until })),
+            InstallUpdate::Unknown { principal, until } => {
+                prepared.push(Some(PreparedUpdate::Unknown { principal, until }));
+            }
+        }
+    }
+
+    let resolved = states.states_for(
+        positives,
+        |(_, principal, snapshot, _, _)| (*principal, snapshot.account_id, snapshot.generation),
+        |(_, _, snapshot, _, _)| snapshot.limits,
+        |(_, _, _, maximum_quote, _)| *maximum_quote,
+    );
+    for ((slot, principal, snapshot, _, lease), runtime) in resolved {
+        prepared[slot] = Some(PreparedUpdate::Present {
+            principal,
+            snapshot,
+            lease,
+            runtime,
+        });
+    }
+
+    prepared
+        .into_iter()
+        .map(|update| update.expect("every slot is filled by exactly one branch above"))
+        .collect()
+}
+
+enum InstallBatch {
+    Push(Vec<InstallUpdate>),
+    Refreshed(Vec<Refreshed<PublishableSnapshotUpdate>>),
+}
+
+impl InstallBatch {
+    fn prepare(
+        self,
+        history: &mut GenerationHistory,
+    ) -> Result<Vec<InstallUpdate>, PublicationError> {
+        match self {
+            Self::Push(updates) => {
+                history.check_pushes(updates.iter().filter_map(|update| match update {
+                    InstallUpdate::Present { principal, .. }
+                    | InstallUpdate::Revoked { principal, .. } => Some(*principal),
+                    InstallUpdate::Unknown { .. } => None,
+                }))?;
+                Ok(updates)
+            }
+            Self::Refreshed(updates) => {
+                for update in &updates {
+                    history.check_refresh(update, update.value().principal())?;
+                }
+                for update in &updates {
+                    history.complete_refresh(
+                        update.principal(),
+                        !matches!(update.value(), PublishableSnapshotUpdate::Unknown { .. }),
+                    );
+                }
+                Ok(raw_publishable_updates(
+                    updates.into_iter().map(Refreshed::into_value).collect(),
+                ))
+            }
+        }
+    }
+}
+
+// Both map backends route every publication variant through the same guarded
+// batch boundary; adding an overload cannot accidentally bypass the fence.
+macro_rules! publication_methods {
+    () => {
+        fn history_stats(&self) -> Option<crate::SnapshotHistoryStats> {
+            Some(self.watermarks.lock().expect("watermarks poisoned").stats())
+        }
+        fn generation_capacity(&self) -> std::num::NonZeroUsize {
+            self.watermarks
+                .lock()
+                .expect("watermarks poisoned")
+                .capacity()
+        }
+        fn needs_refresh(&self, principal: Principal) -> bool {
+            self.watermarks
+                .lock()
+                .expect("watermarks poisoned")
+                .needs_refresh(principal)
+        }
+        fn install(
+            &self,
+            principal: Principal,
+            snapshot: Arc<AccountSnapshot>,
+            lease: Arc<LeaseSlot>,
+        ) -> Result<(), PublicationError> {
+            self.apply_many(vec![SnapshotUpdate::Present {
+                principal,
+                snapshot,
+                lease,
+            }])
+        }
+        fn install_publishable(
+            &self,
+            principal: Principal,
+            snapshot: PublishableSnapshot,
+            lease: Arc<LeaseSlot>,
+        ) -> Result<(), PublicationError> {
+            self.apply_publishable_many(vec![PublishableSnapshotUpdate::Present {
+                principal,
+                snapshot,
+                lease,
+            }])
+        }
+        fn install_revoked(
+            &self,
+            principal: Principal,
+            until: Timestamp,
+            generation: Generation,
+        ) -> Result<(), PublicationError> {
+            self.apply_many(vec![SnapshotUpdate::Revoked {
+                principal,
+                until,
+                generation,
+            }])
+        }
+        fn install_unknown(
+            &self,
+            principal: Principal,
+            until: Timestamp,
+        ) -> Result<(), PublicationError> {
+            self.apply_many(vec![SnapshotUpdate::Unknown { principal, until }])
+        }
+        fn apply_many(&self, updates: Vec<SnapshotUpdate>) -> Result<(), PublicationError> {
+            self.write(InstallBatch::Push(raw_updates(updates)), None)
+        }
+        fn apply_many_at(
+            &self,
+            updates: Vec<SnapshotUpdate>,
+            now: Timestamp,
+        ) -> Result<(), PublicationError> {
+            self.write(InstallBatch::Push(raw_updates(updates)), Some(now))
+        }
+        fn apply_publishable_many(
+            &self,
+            updates: Vec<PublishableSnapshotUpdate>,
+        ) -> Result<(), PublicationError> {
+            self.write(InstallBatch::Push(raw_publishable_updates(updates)), None)
+        }
+        fn apply_publishable_many_at(
+            &self,
+            updates: Vec<PublishableSnapshotUpdate>,
+            now: Timestamp,
+        ) -> Result<(), PublicationError> {
+            self.write(
+                InstallBatch::Push(raw_publishable_updates(updates)),
+                Some(now),
+            )
+        }
+        fn apply_refreshed_many_at(
+            &self,
+            updates: Vec<Refreshed<PublishableSnapshotUpdate>>,
+            now: Timestamp,
+        ) -> Result<(), PublicationError> {
+            self.write(InstallBatch::Refreshed(updates), Some(now))
+        }
+    };
+}
+
 /// `moka`-backed bounded cache. Values are `Arc`-cheap by construction (the
 /// review's caution about moka cloning values on retrieval) — and moka clones
 /// on its *write* path too, so a stored value must not resolve anything
@@ -276,7 +495,7 @@ fn accept_updates(
 /// thread before any request saw it. Locality is applied in `get_at`.
 pub struct MokaSnapshotMap {
     cache: moka::sync::Cache<Principal, StoredEntry, PrincipalHasher>,
-    watermarks: Mutex<GenerationWatermarks>,
+    watermarks: Mutex<GenerationHistory>,
     states: AdmissionStateRegistry,
     sharding: LocalSharding,
     counters: Arc<AdmissionCounters>,
@@ -290,6 +509,18 @@ impl MokaSnapshotMap {
 
     #[must_use]
     pub fn with_sharding(max_capacity: u64, sharding: LocalSharding) -> Self {
+        let history = NonZeroUsize::new(usize::try_from(max_capacity).unwrap_or(usize::MAX).max(1))
+            .expect("capacity is positive");
+        Self::with_capacities(max_capacity, sharding, history)
+    }
+
+    /// Configure visible and retained-history capacities independently.
+    #[must_use]
+    pub fn with_capacities(
+        max_capacity: u64,
+        sharding: LocalSharding,
+        history: NonZeroUsize,
+    ) -> Self {
         MokaSnapshotMap {
             // Same hasher as the arc-swap map, and for the same reason. It
             // also keeps the two `snapshot_lookup` benches comparing like with
@@ -299,15 +530,43 @@ impl MokaSnapshotMap {
             cache: moka::sync::Cache::builder()
                 .max_capacity(max_capacity)
                 .build_with_hasher(PrincipalHasher::default()),
-            watermarks: Mutex::new(GenerationWatermarks::default()),
+            watermarks: Mutex::new(GenerationHistory::new(history)),
             states: AdmissionStateRegistry::new(sharding),
             sharding,
             counters: Arc::new(AdmissionCounters::with_sharding(sharding)),
         }
     }
+    fn write(&self, batch: InstallBatch, _now: Option<Timestamp>) -> Result<(), PublicationError> {
+        let mut history = self.watermarks.lock().expect("watermarks poisoned");
+        let updates = batch.prepare(&mut history)?;
+        let mut visible = PrincipalMap::default();
+        for update in &updates {
+            let principal = match update {
+                InstallUpdate::Present { principal, .. }
+                | InstallUpdate::Revoked { principal, .. }
+                | InstallUpdate::Unknown { principal, .. } => *principal,
+            };
+            if let Some(entry) = self.cache.get(&principal) {
+                visible.insert(principal, entry);
+            }
+        }
+        let accepted = accept_updates(&visible, &mut history, updates);
+        let prepared = prepare_accepted(&self.states, accepted);
+        // Only final accepted mutations are inserted; a refused update must
+        // neither refresh cache frequency nor become account policy authority.
+        let mut changed = PrincipalMap::default();
+        apply_prepared(&mut changed, &prepared, self.sharding, &self.counters);
+        for (principal, entry) in changed {
+            self.cache.insert(principal, entry);
+        }
+        Ok(())
+    }
 }
 
 impl SnapshotMap for MokaSnapshotMap {
+    fn contains_cached(&self, principal: &Principal) -> bool {
+        self.cache.contains_key(principal)
+    }
     fn get(&self, principal: &Principal) -> Option<MapEntry> {
         self.get_at(principal, Locality::current())
     }
@@ -326,71 +585,18 @@ impl SnapshotMap for MokaSnapshotMap {
         &self.counters
     }
 
-    fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>) {
-        let mut watermarks = self.watermarks.lock().expect("watermarks poisoned");
-        let visible = matches!(
-            self.cache.get(&principal),
-            Some(StoredEntry::Present(_) | StoredEntry::ShardedPresent(_))
-        );
-        if watermarks.accept_positive(principal, snapshot.generation, visible) {
-            let runtime = self.states.state_for(
-                principal,
-                snapshot.account_id,
-                snapshot.generation,
-                &snapshot.limits,
-                None,
-            );
-            self.cache.insert(
-                principal,
-                present_state(snapshot, &self.counters, lease, runtime, self.sharding),
-            );
-        }
-    }
+    publication_methods!();
 
-    fn install_publishable(
+    fn prepare_refreshes(
         &self,
-        principal: Principal,
-        snapshot: PublishableSnapshot,
-        lease: Arc<LeaseSlot>,
-    ) {
-        let maximum_quote = snapshot.maximum_quote();
-        let snapshot = snapshot.into_inner();
-        let mut watermarks = self.watermarks.lock().expect("watermarks poisoned");
-        let visible = matches!(
-            self.cache.get(&principal),
-            Some(StoredEntry::Present(_) | StoredEntry::ShardedPresent(_))
-        );
-        if watermarks.accept_positive(principal, snapshot.generation, visible) {
-            let runtime = self.states.state_for(
-                principal,
-                snapshot.account_id,
-                snapshot.generation,
-                &snapshot.limits,
-                maximum_quote,
-            );
-            self.cache.insert(
-                principal,
-                present_state(snapshot, &self.counters, lease, runtime, self.sharding),
-            );
+        principals: &[Principal],
+    ) -> Result<RefreshBatch, PublicationError> {
+        let mut history = self.watermarks.lock().expect("watermarks poisoned");
+        let batch = history.prepare(principals)?;
+        for principal in &batch.evicted {
+            self.cache.invalidate(principal);
         }
-    }
-
-    fn install_revoked(&self, principal: Principal, until: Timestamp, generation: Generation) {
-        let mut watermarks = self.watermarks.lock().expect("watermarks poisoned");
-        if watermarks.accept_revoked(principal, generation) {
-            self.cache
-                .insert(principal, StoredEntry::NegativeUntil { until });
-        }
-    }
-
-    fn install_unknown(&self, principal: Principal, until: Timestamp) {
-        // The lock is still taken, and deliberately: it serializes this write
-        // against a concurrent positive install the way `remove` does. What it
-        // does *not* do is consult the watermark, because an absence says
-        // nothing about any generation.
-        let _watermarks = self.watermarks.lock().expect("watermarks poisoned");
-        self.cache
-            .insert(principal, StoredEntry::NegativeUntil { until });
+        Ok(batch)
     }
 
     fn remove(&self, principal: &Principal) {
@@ -404,7 +610,7 @@ impl SnapshotMap for MokaSnapshotMap {
 /// happen at control-plane frequency, not request frequency.
 pub struct ArcSwapSnapshotMap {
     map: ArcSwap<PrincipalMap>,
-    watermarks: Mutex<GenerationWatermarks>,
+    watermarks: Mutex<GenerationHistory>,
     states: AdmissionStateRegistry,
     max_negative_entries: usize,
     sharding: LocalSharding,
@@ -413,6 +619,9 @@ pub struct ArcSwapSnapshotMap {
 
 impl ArcSwapSnapshotMap {
     pub const DEFAULT_MAX_NEGATIVE_ENTRIES: usize = 4_096;
+    /// Covers the configured simultaneously served set, including refreshes.
+    pub const DEFAULT_GENERATION_CAPACITY: NonZeroUsize =
+        NonZeroUsize::new(65_536).expect("positive constant");
 
     #[must_use]
     pub fn new() -> Self {
@@ -434,9 +643,22 @@ impl ArcSwapSnapshotMap {
         sharding: LocalSharding,
         max_negative_entries: usize,
     ) -> Self {
+        Self::with_capacities(
+            sharding,
+            max_negative_entries,
+            Self::DEFAULT_GENERATION_CAPACITY,
+        )
+    }
+
+    #[must_use]
+    pub fn with_capacities(
+        sharding: LocalSharding,
+        max_negative_entries: usize,
+        history: NonZeroUsize,
+    ) -> Self {
         ArcSwapSnapshotMap {
             map: ArcSwap::default(),
-            watermarks: Mutex::new(GenerationWatermarks::default()),
+            watermarks: Mutex::new(GenerationHistory::new(history)),
             states: AdmissionStateRegistry::new(sharding),
             max_negative_entries,
             sharding,
@@ -444,131 +666,11 @@ impl ArcSwapSnapshotMap {
         }
     }
 
-    fn raw_updates(updates: Vec<SnapshotUpdate>) -> Vec<InstallUpdate> {
-        updates
-            .into_iter()
-            .map(|update| match update {
-                SnapshotUpdate::Present {
-                    principal,
-                    snapshot,
-                    lease,
-                } => InstallUpdate::Present {
-                    principal,
-                    snapshot,
-                    maximum_quote: None,
-                    lease,
-                },
-                SnapshotUpdate::Revoked {
-                    principal,
-                    until,
-                    generation,
-                } => InstallUpdate::Revoked {
-                    principal,
-                    until,
-                    generation,
-                },
-                SnapshotUpdate::Unknown { principal, until } => {
-                    InstallUpdate::Unknown { principal, until }
-                }
-            })
-            .collect()
-    }
-
-    fn raw_publishable_updates(updates: Vec<PublishableSnapshotUpdate>) -> Vec<InstallUpdate> {
-        updates
-            .into_iter()
-            .map(|update| match update {
-                PublishableSnapshotUpdate::Present {
-                    principal,
-                    snapshot,
-                    lease,
-                } => InstallUpdate::Present {
-                    principal,
-                    maximum_quote: snapshot.maximum_quote(),
-                    snapshot: snapshot.into_inner(),
-                    lease,
-                },
-                PublishableSnapshotUpdate::Revoked {
-                    principal,
-                    until,
-                    generation,
-                } => InstallUpdate::Revoked {
-                    principal,
-                    until,
-                    generation,
-                },
-                PublishableSnapshotUpdate::Unknown { principal, until } => {
-                    InstallUpdate::Unknown { principal, until }
-                }
-            })
-            .collect()
-    }
-
-    /// Resolve only accepted, request-visible positives as one registry batch.
-    /// Generation rejection has already happened while the watermark lock is
-    /// held, so no rejected snapshot can mutate account policy.
-    fn prepare_accepted(
-        &self,
-        updates: impl IntoIterator<Item = InstallUpdate>,
-    ) -> Vec<PreparedUpdate> {
-        // Negatives need no limiter, so they skip the registry entirely and
-        // keep their place by index rather than by being carried through it.
-        let updates = updates.into_iter();
-        let mut prepared: Vec<Option<PreparedUpdate>> = Vec::with_capacity(updates.size_hint().0);
-        let mut positives = Vec::new();
-        for update in updates {
-            match update {
-                InstallUpdate::Present {
-                    principal,
-                    snapshot,
-                    maximum_quote,
-                    lease,
-                } => {
-                    prepared.push(None);
-                    positives.push((
-                        prepared.len() - 1,
-                        principal,
-                        snapshot,
-                        maximum_quote,
-                        lease,
-                    ));
-                }
-                InstallUpdate::Revoked {
-                    principal,
-                    until,
-                    generation: _,
-                } => prepared.push(Some(PreparedUpdate::Revoked { principal, until })),
-                InstallUpdate::Unknown { principal, until } => {
-                    prepared.push(Some(PreparedUpdate::Unknown { principal, until }));
-                }
-            }
-        }
-
-        let resolved = self.states.states_for(
-            positives,
-            |(_, principal, snapshot, _, _)| (*principal, snapshot.account_id, snapshot.generation),
-            |(_, _, snapshot, _, _)| snapshot.limits,
-            |(_, _, _, maximum_quote, _)| *maximum_quote,
-        );
-        for ((slot, principal, snapshot, _, lease), runtime) in resolved {
-            prepared[slot] = Some(PreparedUpdate::Present {
-                principal,
-                snapshot,
-                lease,
-                runtime,
-            });
-        }
-
-        prepared
-            .into_iter()
-            .map(|update| update.expect("every slot is filled by exactly one branch above"))
-            .collect()
-    }
-
     /// Writers serialize only against other control-plane writers. Request
     /// reads remain one ArcSwap load and one hash lookup.
-    fn write(&self, updates: Vec<InstallUpdate>, now: Option<Timestamp>) {
+    fn write(&self, batch: InstallBatch, now: Option<Timestamp>) -> Result<(), PublicationError> {
         let mut watermarks = self.watermarks.lock().expect("watermarks poisoned");
+        let updates = batch.prepare(&mut watermarks)?;
         let current = self.map.load_full();
         let mut next = PrincipalMap::clone(&current);
         if let Some(now) = now {
@@ -577,10 +679,11 @@ impl ArcSwapSnapshotMap {
             );
         }
         let accepted = accept_updates(&next, &mut watermarks, updates);
-        let prepared = self.prepare_accepted(accepted);
+        let prepared = prepare_accepted(&self.states, accepted);
         apply_prepared(&mut next, &prepared, self.sharding, &self.counters);
         trim_negatives(&mut next, self.max_negative_entries);
         self.map.store(Arc::new(next));
+        Ok(())
     }
 }
 
@@ -609,6 +712,9 @@ fn trim_negatives(map: &mut PrincipalMap, max_negative_entries: usize) {
 }
 
 impl SnapshotMap for ArcSwapSnapshotMap {
+    fn contains_cached(&self, principal: &Principal) -> bool {
+        self.map.load().contains_key(principal)
+    }
     fn get(&self, principal: &Principal) -> Option<MapEntry> {
         self.get_at(principal, Locality::current())
     }
@@ -628,41 +734,22 @@ impl SnapshotMap for ArcSwapSnapshotMap {
         &self.counters
     }
 
-    fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>) {
-        let updates = Self::raw_updates(vec![SnapshotUpdate::Present {
-            principal,
-            snapshot,
-            lease,
-        }]);
-        self.write(updates, None);
-    }
+    publication_methods!();
 
-    fn install_publishable(
+    fn prepare_refreshes(
         &self,
-        principal: Principal,
-        snapshot: PublishableSnapshot,
-        lease: Arc<LeaseSlot>,
-    ) {
-        let updates = Self::raw_publishable_updates(vec![PublishableSnapshotUpdate::Present {
-            principal,
-            snapshot,
-            lease,
-        }]);
-        self.write(updates, None);
-    }
-
-    fn install_revoked(&self, principal: Principal, until: Timestamp, generation: Generation) {
-        let updates = Self::raw_updates(vec![SnapshotUpdate::Revoked {
-            principal,
-            until,
-            generation,
-        }]);
-        self.write(updates, None);
-    }
-
-    fn install_unknown(&self, principal: Principal, until: Timestamp) {
-        let updates = Self::raw_updates(vec![SnapshotUpdate::Unknown { principal, until }]);
-        self.write(updates, None);
+        principals: &[Principal],
+    ) -> Result<RefreshBatch, PublicationError> {
+        let mut history = self.watermarks.lock().expect("watermarks poisoned");
+        let batch = history.prepare(principals)?;
+        if !batch.evicted.is_empty() {
+            let mut next = PrincipalMap::clone(&self.map.load_full());
+            for principal in &batch.evicted {
+                next.remove(principal);
+            }
+            self.map.store(Arc::new(next));
+        }
+        Ok(batch)
     }
 
     fn remove(&self, principal: &Principal) {
@@ -680,37 +767,6 @@ impl SnapshotMap for ArcSwapSnapshotMap {
             next.remove(principal);
         }
         self.map.store(Arc::new(next));
-    }
-
-    /// One map clone for the whole batch — the point of the override: bulk
-    /// loading N principals costs O(N), not O(N²).
-    fn install_many(&self, entries: Vec<(Principal, Arc<AccountSnapshot>, Arc<LeaseSlot>)>) {
-        self.apply_many(
-            entries
-                .into_iter()
-                .map(|(principal, snapshot, lease)| SnapshotUpdate::Present {
-                    principal,
-                    snapshot,
-                    lease,
-                })
-                .collect(),
-        );
-    }
-
-    fn apply_many(&self, updates: Vec<SnapshotUpdate>) {
-        self.write(Self::raw_updates(updates), None);
-    }
-
-    fn apply_many_at(&self, updates: Vec<SnapshotUpdate>, now: Timestamp) {
-        self.write(Self::raw_updates(updates), Some(now));
-    }
-
-    fn apply_publishable_many(&self, updates: Vec<PublishableSnapshotUpdate>) {
-        self.write(Self::raw_publishable_updates(updates), None);
-    }
-
-    fn apply_publishable_many_at(&self, updates: Vec<PublishableSnapshotUpdate>, now: Timestamp) {
-        self.write(Self::raw_publishable_updates(updates), Some(now));
     }
 }
 
@@ -880,9 +936,10 @@ mod tests {
             _principal: Principal,
             _snapshot: Arc<AccountSnapshot>,
             _lease: Arc<LeaseSlot>,
-        ) {
+        ) -> Result<(), PublicationError> {
             self.installs
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
         }
 
         fn install_revoked(
@@ -890,14 +947,20 @@ mod tests {
             _principal: Principal,
             _until: Timestamp,
             _generation: Generation,
-        ) {
+        ) -> Result<(), PublicationError> {
             self.negatives
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
         }
 
-        fn install_unknown(&self, _principal: Principal, _until: Timestamp) {
+        fn install_unknown(
+            &self,
+            _principal: Principal,
+            _until: Timestamp,
+        ) -> Result<(), PublicationError> {
             self.negatives
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
         }
 
         fn remove(&self, _principal: &Principal) {}
@@ -917,7 +980,8 @@ mod tests {
             Principal(1),
             publishable.clone(),
             LeaseSlot::for_account(AccountId(1)),
-        );
+        )
+        .unwrap();
         map.apply_publishable_many(vec![
             PublishableSnapshotUpdate::Present {
                 principal: Principal(2),
@@ -928,7 +992,8 @@ mod tests {
                 principal: Principal(3),
                 until: t(2),
             },
-        ]);
+        ])
+        .unwrap();
         map.apply_publishable_many_at(
             vec![PublishableSnapshotUpdate::Present {
                 principal: Principal(4),
@@ -936,7 +1001,8 @@ mod tests {
                 lease: LeaseSlot::for_account(AccountId(1)),
             }],
             t(3),
-        );
+        )
+        .unwrap();
         assert_eq!(map.installs.load(std::sync::atomic::Ordering::Relaxed), 3);
         assert_eq!(map.negatives.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
@@ -953,9 +1019,11 @@ mod tests {
         assert!(map.get(&p).is_none());
 
         // Install, then attempt a rollback to an older generation: no-op.
-        map.install(p, snapshot(5), LeaseSlot::for_account(AccountId(1)));
+        map.install(p, snapshot(5), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
         assert_eq!(generation_of(&map, &p), Some(5));
-        map.install(p, snapshot(3), LeaseSlot::for_account(AccountId(1)));
+        map.install(p, snapshot(3), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
         assert_eq!(generation_of(&map, &p), Some(5));
         // Same generation is also a no-op (idempotent replay) -- and it must
         // be observed as *the same entry*, not merely the same generation.
@@ -967,7 +1035,8 @@ mod tests {
             Some(MapEntry::Present(state)) => state,
             other => panic!("expected a present entry, got {other:?}"),
         };
-        map.install(p, snapshot(5), LeaseSlot::for_account(AccountId(1)));
+        map.install(p, snapshot(5), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
         assert_eq!(generation_of(&map, &p), Some(5));
         let after = match map.get(&p) {
             Some(MapEntry::Present(state)) => state,
@@ -996,7 +1065,8 @@ mod tests {
         );
 
         // Newer generation replaces.
-        map.install(p, snapshot(6), LeaseSlot::for_account(AccountId(1)));
+        map.install(p, snapshot(6), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
         assert_eq!(generation_of(&map, &p), Some(6));
 
         // An absent row denies, and a *delayed older* push still cannot roll
@@ -1008,29 +1078,33 @@ mod tests {
         // being treated as a tombstone, which is exactly the conflation #53
         // removed. Ordering is the real property here; revocation is asserted
         // below, against an actual revocation.
-        map.install_unknown(p, t(100));
+        map.install_unknown(p, t(100)).unwrap();
         assert!(matches!(map.get(&p), Some(MapEntry::NegativeUntil { .. })));
-        map.install(p, snapshot(1), LeaseSlot::for_account(AccountId(1)));
+        map.install(p, snapshot(1), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
         assert!(matches!(map.get(&p), Some(MapEntry::NegativeUntil { .. })));
 
         // And the principal returns at the generation it already had: an
         // absence is not a statement that generation 6 is dead (#53).
-        map.install(p, snapshot(6), LeaseSlot::for_account(AccountId(1)));
+        map.install(p, snapshot(6), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
         assert_eq!(generation_of(&map, &p), Some(6));
 
-        map.install(p, snapshot(7), LeaseSlot::for_account(AccountId(1)));
+        map.install(p, snapshot(7), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
         assert_eq!(generation_of(&map, &p), Some(7));
 
         // The symmetric reorder is safe too: an old revocation cannot revoke a
         // snapshot that has already advanced beyond it.
-        map.install_revoked(p, t(200), Generation(6));
+        map.install_revoked(p, t(200), Generation(6)).unwrap();
         assert_eq!(generation_of(&map, &p), Some(7));
-        map.install_revoked(p, t(200), Generation(7));
+        map.install_revoked(p, t(200), Generation(7)).unwrap();
         assert!(matches!(map.get(&p), Some(MapEntry::NegativeUntil { .. })));
 
         // A real revocation *does* refuse its own generation back -- the half
         // that must not loosen (INVARIANTS.md #15).
-        map.install(p, snapshot(7), LeaseSlot::for_account(AccountId(1)));
+        map.install(p, snapshot(7), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
         assert!(
             matches!(map.get(&p), Some(MapEntry::NegativeUntil { .. })),
             "a replay at the tombstone's generation stays dead"
@@ -1041,9 +1115,11 @@ mod tests {
         // The watermark here is a *revocation* at 7, so 7 stays refused.
         map.remove(&p);
         assert!(map.get(&p).is_none());
-        map.install(p, snapshot(7), LeaseSlot::for_account(AccountId(1)));
+        map.install(p, snapshot(7), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
         assert!(map.get(&p).is_none());
-        map.install(p, snapshot(8), LeaseSlot::for_account(AccountId(1)));
+        map.install(p, snapshot(8), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
         assert_eq!(generation_of(&map, &p), Some(8));
 
         // The other half of `remove`, which nothing pinned before #53 and
@@ -1054,14 +1130,16 @@ mod tests {
         // until someone publishes a higher generation.
         map.remove(&p);
         assert!(map.get(&p).is_none());
-        map.install(p, snapshot(8), LeaseSlot::for_account(AccountId(1)));
+        map.install(p, snapshot(8), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
         assert_eq!(
             generation_of(&map, &p),
             Some(8),
             "an evicted entry is repaired by re-fetching the generation it had"
         );
         // Ordering still holds across the eviction: older is still refused.
-        map.install(p, snapshot(7), LeaseSlot::for_account(AccountId(1)));
+        map.install(p, snapshot(7), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
         assert_eq!(generation_of(&map, &p), Some(8));
     }
 
@@ -1072,7 +1150,8 @@ mod tests {
             Principal(1),
             snapshot(5),
             LeaseSlot::for_account(AccountId(1)),
-        );
+        )
+        .unwrap();
         map.install_many(vec![
             (
                 Principal(1),
@@ -1089,7 +1168,8 @@ mod tests {
                 snapshot(1),
                 LeaseSlot::for_account(AccountId(1)),
             ),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(generation_of(&map, &Principal(1)), Some(5));
         assert_eq!(generation_of(&map, &Principal(2)), Some(1));
         assert_eq!(generation_of(&map, &Principal(3)), Some(1));
@@ -1108,7 +1188,8 @@ mod tests {
             Principal(1),
             PublishableSnapshot::try_new(snapshot(1)).unwrap(),
             LeaseSlot::with_sharding(AccountId(1), sharding),
-        );
+        )
+        .unwrap();
 
         assert_eq!(map.local_sharding(), sharding);
         assert!(matches!(map.get(&Principal(1)), Some(MapEntry::Present(_))));
@@ -1128,7 +1209,8 @@ mod tests {
             Principal(1),
             PublishableSnapshot::try_new(snapshot(1)).unwrap(),
             LeaseSlot::with_sharding(AccountId(1), sharding),
-        );
+        )
+        .unwrap();
 
         let seen: Vec<_> = (0..8)
             .map(|_| {
@@ -1205,7 +1287,8 @@ mod tests {
             Principal(1),
             publishable.clone(),
             LeaseSlot::with_sharding(AccountId(1), sharding),
-        );
+        )
+        .unwrap();
 
         match map.map.load().get(&Principal(1)).unwrap() {
             StoredEntry::ShardedPresent(states) => {
@@ -1238,7 +1321,8 @@ mod tests {
             principal: Principal(2),
             snapshot: publishable.clone(),
             lease: LeaseSlot::with_sharding(AccountId(1), sharding),
-        }]);
+        }])
+        .unwrap();
         map.apply_publishable_many_at(
             vec![PublishableSnapshotUpdate::Present {
                 principal: Principal(3),
@@ -1246,9 +1330,33 @@ mod tests {
                 lease: LeaseSlot::with_sharding(AccountId(1), sharding),
             }],
             t(1),
-        );
+        )
+        .unwrap();
         assert_eq!(generation_of(&map, &Principal(2)), Some(1));
         assert_eq!(generation_of(&map, &Principal(3)), Some(1));
+    }
+
+    /// The control plane asks whether an entry is still *visible*, which is not
+    /// the same question `get` answers for a request: a probe must not count as
+    /// a request for cache-frequency purposes, and both maps therefore answer
+    /// it from their own key index rather than through a lookup.
+    #[test]
+    fn the_visibility_probe_tracks_installation_and_eviction_in_every_map() {
+        let moka: Arc<dyn SnapshotMap> = Arc::new(MokaSnapshotMap::new(8));
+        let arc_swap: Arc<dyn SnapshotMap> = Arc::new(ArcSwapSnapshotMap::new());
+        for map in [moka, arc_swap] {
+            assert!(!map.contains_cached(&Principal(1)));
+            map.install(
+                Principal(1),
+                snapshot(1),
+                LeaseSlot::for_account(AccountId(1)),
+            )
+            .unwrap();
+            assert!(map.contains_cached(&Principal(1)));
+            assert!(!map.contains_cached(&Principal(2)));
+            map.remove(&Principal(1));
+            assert!(!map.contains_cached(&Principal(1)));
+        }
     }
 
     #[test]
@@ -1263,7 +1371,8 @@ mod tests {
                 lease: LeaseSlot::for_account(AccountId(1)),
             }],
             t(10),
-        );
+        )
+        .unwrap();
         assert_eq!(generation_of(&map, &Principal(1)), Some(1));
     }
 
@@ -1284,7 +1393,8 @@ mod tests {
             Principal(0),
             PublishableSnapshot::try_new(snapshot(1)).unwrap(),
             LeaseSlot::with_sharding(AccountId(1), sharding),
-        );
+        )
+        .unwrap();
         assert_eq!(map.local_sharding(), sharding);
         assert!(matches!(
             map.get_at(&Principal(0), Locality::current()),
@@ -1302,7 +1412,8 @@ mod tests {
                 snapshot(1),
                 LeaseSlot::for_account(AccountId(1)),
             ),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(generation_of(&map, &Principal(1)), Some(1));
         assert_eq!(generation_of(&map, &Principal(2)), Some(1));
 
@@ -1317,7 +1428,8 @@ mod tests {
                 until: t(100),
                 generation: Generation(2),
             },
-        ]);
+        ])
+        .unwrap();
         assert_eq!(generation_of(&map, &Principal(1)), Some(2));
         assert!(matches!(
             map.get(&Principal(2)),
@@ -1328,7 +1440,8 @@ mod tests {
             principal: Principal(3),
             snapshot: PublishableSnapshot::try_new(snapshot(1)).unwrap(),
             lease: LeaseSlot::for_account(AccountId(1)),
-        }]);
+        }])
+        .unwrap();
         assert_eq!(generation_of(&map, &Principal(3)), Some(1));
         map.apply_publishable_many_at(
             vec![PublishableSnapshotUpdate::Present {
@@ -1337,7 +1450,8 @@ mod tests {
                 lease: LeaseSlot::for_account(AccountId(1)),
             }],
             t(10),
-        );
+        )
+        .unwrap();
         assert_eq!(generation_of(&map, &Principal(3)), Some(2));
 
         map.remove(&Principal(1));
@@ -1356,9 +1470,11 @@ mod tests {
                 Principal(id),
                 snapshot(1),
                 LeaseSlot::for_account(AccountId(1)),
-            );
+            )
+            .unwrap();
         }
-        map.install_revoked(Principal(2), t(100), Generation(2));
+        map.install_revoked(Principal(2), t(100), Generation(2))
+            .unwrap();
         map.remove_many(&[Principal(1), Principal(2), Principal(999)]);
         assert!(map.get(&Principal(1)).is_none());
         assert!(map.get(&Principal(2)).is_none());
@@ -1367,7 +1483,8 @@ mod tests {
             Principal(2),
             snapshot(2),
             LeaseSlot::for_account(AccountId(1)),
-        );
+        )
+        .unwrap();
         assert!(
             map.get(&Principal(2)).is_none(),
             "removal must preserve the tombstone watermark"
@@ -1376,7 +1493,8 @@ mod tests {
             Principal(2),
             snapshot(3),
             LeaseSlot::for_account(AccountId(1)),
-        );
+        )
+        .unwrap();
         assert_eq!(generation_of(&map, &Principal(2)), Some(3));
         map.remove_many(&[]);
         assert_eq!(generation_of(&map, &Principal(3)), Some(1));
@@ -1389,10 +1507,11 @@ mod tests {
             Principal(1),
             snapshot(1),
             LeaseSlot::for_account(AccountId(1)),
-        );
-        map.install_unknown(Principal(2), t(30));
-        map.install_unknown(Principal(3), t(10));
-        map.install_unknown(Principal(4), t(20));
+        )
+        .unwrap();
+        map.install_unknown(Principal(2), t(30)).unwrap();
+        map.install_unknown(Principal(3), t(10)).unwrap();
+        map.install_unknown(Principal(4), t(20)).unwrap();
 
         assert_eq!(generation_of(&map, &Principal(1)), Some(1));
         assert!(map.get(&Principal(3)).is_none());
@@ -1409,10 +1528,10 @@ mod tests {
     #[test]
     fn arc_swap_control_write_drops_expired_negatives() {
         let map = ArcSwapSnapshotMap::with_max_negative_entries(10);
-        map.install_unknown(Principal(1), t(10));
-        map.install_unknown(Principal(2), t(20));
+        map.install_unknown(Principal(1), t(10)).unwrap();
+        map.install_unknown(Principal(2), t(20)).unwrap();
 
-        map.apply_many_at(Vec::new(), t(10));
+        map.apply_many_at(Vec::new(), t(10)).unwrap();
 
         assert!(map.get(&Principal(1)).is_none());
         assert!(matches!(
@@ -1425,17 +1544,22 @@ mod tests {
     fn negative_eviction_preserves_generation_monotonicity() {
         let map = ArcSwapSnapshotMap::with_max_negative_entries(0);
         let principal = Principal(1);
-        map.install(principal, snapshot(5), LeaseSlot::for_account(AccountId(1)));
-        map.install_revoked(principal, t(10), Generation(5));
+        map.install(principal, snapshot(5), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
+        map.install_revoked(principal, t(10), Generation(5))
+            .unwrap();
         assert!(map.get(&principal).is_none(), "zero-cap cache must evict");
 
-        map.install(principal, snapshot(4), LeaseSlot::for_account(AccountId(1)));
-        map.install(principal, snapshot(5), LeaseSlot::for_account(AccountId(1)));
+        map.install(principal, snapshot(4), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
+        map.install(principal, snapshot(5), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
         assert!(
             map.get(&principal).is_none(),
             "eviction must not admit a stale or replayed snapshot"
         );
-        map.install(principal, snapshot(6), LeaseSlot::for_account(AccountId(1)));
+        map.install(principal, snapshot(6), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
         assert_eq!(generation_of(&map, &principal), Some(6));
     }
 
@@ -1444,7 +1568,8 @@ mod tests {
         const CAP: usize = 17;
         let map = ArcSwapSnapshotMap::with_max_negative_entries(CAP);
         for raw in 0..1_000 {
-            map.install_unknown(Principal(raw), t(i64::try_from(raw).unwrap() + 1));
+            map.install_unknown(Principal(raw), t(i64::try_from(raw).unwrap() + 1))
+                .unwrap();
         }
         let visible = (0..1_000)
             .filter(|raw| map.get(&Principal(*raw)).is_some())
@@ -1479,7 +1604,8 @@ mod tests {
                 principal,
                 snapshot_for(account, 1),
                 LeaseSlot::for_account(AccountId(1)),
-            );
+            )
+            .unwrap();
             map.remove(&principal);
         }
 
@@ -1509,7 +1635,8 @@ mod tests {
                 Principal(account),
                 snapshot_for(account, 1),
                 LeaseSlot::for_account(AccountId(1)),
-            );
+            )
+            .unwrap();
         }
 
         let walked = map.states.swept_entries();
@@ -1535,7 +1662,8 @@ mod tests {
             Principal(0),
             snapshot_for(7, 1),
             LeaseSlot::for_account(AccountId(1)),
-        );
+        )
+        .unwrap();
         let before = match map.get(&Principal(0)).unwrap() {
             MapEntry::Present(state) => state.limiter.clone(),
             MapEntry::NegativeUntil { .. } => unreachable!(),
@@ -1548,7 +1676,8 @@ mod tests {
                 principal,
                 snapshot_for(account, 1),
                 LeaseSlot::for_account(AccountId(1)),
-            );
+            )
+            .unwrap();
             map.remove(&principal);
         }
 
@@ -1556,7 +1685,8 @@ mod tests {
             Principal(1),
             snapshot_for(7, 1),
             LeaseSlot::for_account(AccountId(1)),
-        );
+        )
+        .unwrap();
         let after = match map.get(&Principal(1)).unwrap() {
             MapEntry::Present(state) => state.limiter.clone(),
             MapEntry::NegativeUntil { .. } => unreachable!(),
@@ -1595,7 +1725,7 @@ mod tests {
             if reversed {
                 updates.reverse();
             }
-            map.apply_many(updates);
+            map.apply_many(updates).unwrap();
 
             let state = match map.get(&Principal(1)).unwrap() {
                 MapEntry::Present(state) => state,
@@ -1641,12 +1771,14 @@ mod tests {
             Principal(1),
             snapshot(1),
             LeaseSlot::for_account(AccountId(1)),
-        );
+        )
+        .unwrap();
         map.install(
             Principal(2),
             snapshot(1),
             LeaseSlot::for_account(AccountId(1)),
-        );
+        )
+        .unwrap();
         let (a, b) = match (
             map.get(&Principal(1)).unwrap(),
             map.get(&Principal(2)).unwrap(),
@@ -1667,12 +1799,14 @@ mod tests {
     fn limiter_survives_same_limit_reinstall() {
         let map = ArcSwapSnapshotMap::new();
         let p = Principal(1);
-        map.install(p, snapshot(1), LeaseSlot::for_account(AccountId(1)));
+        map.install(p, snapshot(1), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
         let first = match map.get(&p).unwrap() {
             MapEntry::Present(s) => s,
             _ => unreachable!(),
         };
-        map.install(p, snapshot(2), LeaseSlot::for_account(AccountId(1)));
+        map.install(p, snapshot(2), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
         let second = match map.get(&p).unwrap() {
             MapEntry::Present(s) => s,
             _ => unreachable!(),
@@ -1682,7 +1816,8 @@ mod tests {
 
         let mut changed = (*snapshot(3)).clone();
         changed.limits = ResolvedLimits::new(100).with_weighted_rate(2_000, 5_000);
-        map.install(p, Arc::new(changed), LeaseSlot::for_account(AccountId(1)));
+        map.install(p, Arc::new(changed), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
         let third = match map.get(&p).unwrap() {
             MapEntry::Present(s) => s,
             _ => unreachable!(),
@@ -1698,12 +1833,14 @@ mod tests {
             Principal(1),
             snapshot(1),
             LeaseSlot::for_account(AccountId(1)),
-        );
+        )
+        .unwrap();
         map.install(
             Principal(2),
             snapshot(1),
             LeaseSlot::for_account(AccountId(1)),
-        );
+        )
+        .unwrap();
         let before = match map.get(&Principal(2)).unwrap() {
             MapEntry::Present(state) => state.limiter.current(),
             _ => unreachable!(),
@@ -1715,7 +1852,8 @@ mod tests {
             Principal(1),
             Arc::new(changed),
             LeaseSlot::for_account(AccountId(1)),
-        );
+        )
+        .unwrap();
 
         let (a, b) = match (
             map.get(&Principal(1)).unwrap(),
@@ -1746,7 +1884,8 @@ mod tests {
             principal,
             Arc::new(first),
             LeaseSlot::for_account(AccountId(1)),
-        );
+        )
+        .unwrap();
         let first = match map.get(&principal).unwrap() {
             MapEntry::Present(state) => state,
             MapEntry::NegativeUntil { .. } => unreachable!(),
@@ -1766,7 +1905,8 @@ mod tests {
             principal,
             Arc::new(replacement),
             LeaseSlot::for_account(AccountId(1)),
-        );
+        )
+        .unwrap();
         let replacement = match map.get(&principal).unwrap() {
             MapEntry::Present(state) => state,
             MapEntry::NegativeUntil { .. } => unreachable!(),
@@ -1807,7 +1947,8 @@ mod tests {
             Principal(1),
             Arc::new(current),
             LeaseSlot::for_account(AccountId(1)),
-        );
+        )
+        .unwrap();
         let installed = match map.get(&Principal(1)).unwrap() {
             MapEntry::Present(state) => state.limiter.current(),
             _ => unreachable!(),
@@ -1817,7 +1958,8 @@ mod tests {
             Principal(1),
             snapshot(3),
             LeaseSlot::for_account(AccountId(1)),
-        );
+        )
+        .unwrap();
         let after_stale = match map.get(&Principal(1)).unwrap() {
             MapEntry::Present(state) => state.limiter.current(),
             _ => unreachable!(),
@@ -1828,13 +1970,15 @@ mod tests {
     fn rejected_positive_cannot_change_account_policy(map: impl SnapshotMap) {
         let sibling = Principal(2);
         let revoked = Principal(1);
-        map.install(sibling, snapshot(5), LeaseSlot::for_account(AccountId(1)));
+        map.install(sibling, snapshot(5), LeaseSlot::for_account(AccountId(1)))
+            .unwrap();
         let before = match map.get(&sibling).unwrap() {
             MapEntry::Present(state) => state.limiter.current(),
             MapEntry::NegativeUntil { .. } => unreachable!(),
         };
 
-        map.install_revoked(revoked, t(100), Generation(10));
+        map.install_revoked(revoked, t(100), Generation(10))
+            .unwrap();
         let mut replay = (*snapshot(9)).clone();
         replay.limits = ResolvedLimits::new(100)
             .with_weighted_rate_compatibility_fallback(7, 11)
@@ -1843,7 +1987,8 @@ mod tests {
             revoked,
             Arc::new(replay),
             LeaseSlot::for_account(AccountId(1)),
-        );
+        )
+        .unwrap();
 
         assert!(matches!(
             map.get(&revoked),
@@ -1876,7 +2021,8 @@ mod tests {
             Principal(2),
             snapshot(5),
             LeaseSlot::for_account(AccountId(1)),
-        );
+        )
+        .unwrap();
         let before = match map.get(&Principal(2)).unwrap() {
             MapEntry::Present(state) => state.limiter.current(),
             MapEntry::NegativeUntil { .. } => unreachable!(),
@@ -1897,7 +2043,8 @@ mod tests {
                 until: t(100),
                 generation: Generation(10),
             },
-        ]);
+        ])
+        .unwrap();
 
         assert!(matches!(
             map.get(&Principal(1)),
@@ -1908,5 +2055,306 @@ mod tests {
             MapEntry::NegativeUntil { .. } => unreachable!(),
         };
         assert!(Arc::ptr_eq(&before, &after));
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use tollgate_core::{AccountId, AccountStatus, CostTable, PermissionBits, ResolvedLimits};
+
+    fn t(seconds: i64) -> Timestamp {
+        Timestamp::from_second(seconds).unwrap()
+    }
+    fn snapshot(generation: u64) -> Arc<AccountSnapshot> {
+        Arc::new(
+            AccountSnapshot::builder(
+                AccountId(1),
+                Generation(generation),
+                AccountStatus::Active,
+                Timestamp::MAX,
+                PermissionBits::ALL,
+                ResolvedLimits::new(100),
+                Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+            )
+            .build(),
+        )
+    }
+    fn positive(principal: Principal, generation: u64) -> PublishableSnapshotUpdate {
+        PublishableSnapshotUpdate::Present {
+            principal,
+            snapshot: PublishableSnapshot::try_new(snapshot(generation)).unwrap(),
+            lease: LeaseSlot::for_account(AccountId(1)),
+        }
+    }
+    fn maps(capacity: usize) -> [Arc<dyn SnapshotMap>; 2] {
+        let capacity = NonZeroUsize::new(capacity).unwrap();
+        [
+            Arc::new(ArcSwapSnapshotMap::with_capacities(
+                LocalSharding::SINGLE,
+                2,
+                capacity,
+            )),
+            Arc::new(MokaSnapshotMap::with_capacities(
+                128,
+                LocalSharding::SINGLE,
+                capacity,
+            )),
+        ]
+    }
+    fn fresh(map: &dyn SnapshotMap, update: PublishableSnapshotUpdate) {
+        let read = map
+            .prepare_refreshes(&[update.principal()])
+            .unwrap()
+            .reads
+            .pop()
+            .unwrap();
+        map.apply_refreshed_many_at(vec![read.read(|| update)], t(0))
+            .unwrap();
+    }
+    fn present(map: &dyn SnapshotMap, principal: Principal) -> u64 {
+        match map.get(&principal) {
+            Some(MapEntry::Present(state)) => state.snapshot.generation.0,
+            other => panic!("expected a positive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generation_churn_is_bounded_in_both_maps() {
+        for map in maps(7) {
+            for n in 0..1000 {
+                let principal = Principal(n);
+                let update = if n % 2 == 0 {
+                    positive(principal, 1)
+                } else {
+                    PublishableSnapshotUpdate::Revoked {
+                        principal,
+                        generation: Generation(2),
+                        until: t(1),
+                    }
+                };
+                fresh(&*map, update);
+                let stats = map.history_stats().unwrap();
+                assert_eq!(stats.capacity, 7);
+                assert_eq!(stats.retained, ((n + 1) as usize).min(7));
+                if n >= 7 {
+                    assert!(map.get(&Principal(n - 7)).is_none());
+                }
+            }
+            assert!(map.needs_refresh(Principal(0)));
+            assert_eq!(
+                map.install(
+                    Principal(0),
+                    snapshot(1),
+                    LeaseSlot::for_account(AccountId(1))
+                ),
+                Err(PublicationError::RefreshRequired(Principal(0)))
+            );
+        }
+    }
+
+    #[test]
+    fn reclaimed_history_requires_a_fresh_authority_before_replay() {
+        for map in maps(1) {
+            map.install_revoked(Principal(1), t(1), Generation(9))
+                .unwrap();
+            // The replay stays valid forever, so no tombstone TTL can make it safe.
+            fresh(&*map, positive(Principal(2), 1));
+            assert!(map.get(&Principal(1)).is_none());
+            assert_eq!(
+                map.install(
+                    Principal(1),
+                    snapshot(9),
+                    LeaseSlot::for_account(AccountId(1))
+                ),
+                Err(PublicationError::RefreshRequired(Principal(1)))
+            );
+            fresh(
+                &*map,
+                PublishableSnapshotUpdate::Revoked {
+                    principal: Principal(1),
+                    until: t(10),
+                    generation: Generation(9),
+                },
+            );
+            map.remove(&Principal(1));
+            map.install(
+                Principal(1),
+                snapshot(9),
+                LeaseSlot::for_account(AccountId(1)),
+            )
+            .unwrap();
+            assert!(map.get(&Principal(1)).is_none());
+            fresh(&*map, positive(Principal(1), 10));
+            assert_eq!(present(&*map, Principal(1)), 10);
+            map.install_revoked(Principal(1), t(20), Generation(9))
+                .unwrap();
+            assert_eq!(present(&*map, Principal(1)), 10);
+        }
+    }
+
+    #[test]
+    fn a_recreated_principal_rejects_the_old_in_flight_response() {
+        for map in maps(1) {
+            let old = map
+                .prepare_refreshes(&[Principal(1)])
+                .unwrap()
+                .reads
+                .pop()
+                .unwrap()
+                .read(|| positive(Principal(1), 1));
+            fresh(&*map, positive(Principal(2), 1));
+            fresh(
+                &*map,
+                PublishableSnapshotUpdate::Revoked {
+                    principal: Principal(1),
+                    until: t(10),
+                    generation: Generation(9),
+                },
+            );
+            assert_eq!(
+                map.apply_refreshed_many_at(vec![old], t(0)),
+                Err(PublicationError::Superseded(Principal(1)))
+            );
+            assert!(matches!(
+                map.get(&Principal(1)),
+                Some(MapEntry::NegativeUntil { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn an_unknown_revalidation_cannot_reopen_forgotten_history() {
+        for map in maps(1) {
+            map.install_revoked(Principal(1), t(1), Generation(9))
+                .unwrap();
+            fresh(&*map, positive(Principal(2), 1));
+            fresh(
+                &*map,
+                PublishableSnapshotUpdate::Unknown {
+                    principal: Principal(1),
+                    until: t(10),
+                },
+            );
+            assert!(map.needs_refresh(Principal(1)));
+            assert_eq!(
+                map.install(
+                    Principal(1),
+                    snapshot(9),
+                    LeaseSlot::for_account(AccountId(1))
+                ),
+                Err(PublicationError::RefreshRequired(Principal(1)))
+            );
+            fresh(&*map, positive(Principal(1), 10));
+            assert_eq!(present(&*map, Principal(1)), 10);
+        }
+    }
+
+    #[test]
+    fn refresh_fences_are_bound_to_the_map_principal_and_whole_batch() {
+        for map in maps(2) {
+            fresh(&*map, positive(Principal(1), 9));
+            let foreign = ArcSwapSnapshotMap::new()
+                .prepare_refreshes(&[Principal(1)])
+                .unwrap()
+                .reads
+                .pop()
+                .unwrap()
+                .read(|| positive(Principal(1), 10));
+            assert_eq!(
+                map.apply_refreshed_many_at(vec![foreign], t(0)),
+                Err(PublicationError::Superseded(Principal(1)))
+            );
+            let swapped = map
+                .prepare_refreshes(&[Principal(1)])
+                .unwrap()
+                .reads
+                .pop()
+                .unwrap()
+                .read(|| positive(Principal(2), 10));
+            assert_eq!(
+                map.apply_refreshed_many_at(vec![swapped], t(0)),
+                Err(PublicationError::Superseded(Principal(2)))
+            );
+            let mut reads = map
+                .prepare_refreshes(&[Principal(1), Principal(2)])
+                .unwrap()
+                .reads
+                .into_iter();
+            let valid = reads.next().unwrap().read(|| positive(Principal(1), 10));
+            let invalid = reads.next().unwrap().read(|| positive(Principal(2), 10));
+            // Reclaim principal 2 while explicitly protecting principal 1.
+            map.prepare_refreshes(&[Principal(1), Principal(3)])
+                .unwrap();
+            assert_eq!(
+                map.apply_refreshed_many_at(vec![valid, invalid], t(0)),
+                Err(PublicationError::Superseded(Principal(2)))
+            );
+            assert_eq!(present(&*map, Principal(1)), 9);
+            assert!(map.get(&Principal(2)).is_none());
+            assert!(matches!(
+                map.prepare_refreshes(&[Principal(1), Principal(2), Principal(3)]),
+                Err(PublicationError::BatchExceedsCapacity {
+                    requested: 3,
+                    capacity: 2
+                })
+            ));
+            assert_eq!(present(&*map, Principal(1)), 9);
+        }
+    }
+
+    #[test]
+    fn a_source_read_cannot_overwrite_a_concurrent_revocation() {
+        for map in maps(1) {
+            fresh(&*map, positive(Principal(1), 1));
+            let read = map
+                .prepare_refreshes(&[Principal(1)])
+                .unwrap()
+                .reads
+                .pop()
+                .unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let writer = Arc::clone(&map);
+            let task = std::thread::spawn(move || {
+                let response = read.read(|| {
+                    let response = positive(Principal(1), 1);
+                    started_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                    response
+                });
+                writer.apply_refreshed_many_at(vec![response], t(0))
+            });
+            started_rx.recv().unwrap();
+            map.install_revoked(Principal(1), t(10), Generation(9))
+                .unwrap();
+            resume_tx.send(()).unwrap();
+            task.join().unwrap().unwrap();
+            assert!(matches!(
+                map.get(&Principal(1)),
+                Some(MapEntry::NegativeUntil { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_full_push_batch_preserves_existing_entries_and_account_policy() {
+        for map in maps(1) {
+            map.install(
+                Principal(1),
+                snapshot(9),
+                LeaseSlot::for_account(AccountId(1)),
+            )
+            .unwrap();
+            assert_eq!(
+                map.apply_publishable_many(vec![
+                    positive(Principal(1), 10),
+                    positive(Principal(2), 20)
+                ]),
+                Err(PublicationError::RefreshRequired(Principal(2)))
+            );
+            assert_eq!(present(&*map, Principal(1)), 9);
+            assert!(map.get(&Principal(2)).is_none());
+        }
     }
 }

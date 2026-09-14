@@ -69,6 +69,8 @@ fn spawn_instance(store: &Arc<MemoryStore>, clock: &Arc<ManualClock>) -> Instanc
         store.clone(),
         clock.clone(),
         InstanceRuntimeConfig {
+            snapshot_history_capacity:
+                tollgate_admission::ArcSwapSnapshotMap::DEFAULT_GENERATION_CAPACITY,
             snapshots: SnapshotManagerConfig {
                 principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
                 refresh_interval: std::time::Duration::from_secs(30),

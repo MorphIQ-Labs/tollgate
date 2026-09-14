@@ -70,7 +70,7 @@ pub enum CommitError {
     /// lapsing between reserve and commit: past that point the allocator may
     /// reclaim and re-grant the capacity, so committing would perform work
     /// that can never be billed. Under
-    /// [`EnforcementMode::Elastic`](crate::snapshot::EnforcementMode::Elastic)
+    /// [`EnforcementMode::Elastic`]
     /// the same lapse first attempts the overage fallback, and any of
     /// `OverageCapExhausted`, `OverageCapTemporarilyExhausted`, or
     /// `OverageCommitInProgress` may be reported instead. Each carries its own
@@ -104,10 +104,10 @@ pub enum CommitError {
 /// generation admission itself read.
 #[derive(Debug, Clone, Copy)]
 pub enum CommitFunding<'a> {
-    /// [`EnforcementMode::Strict`](crate::snapshot::EnforcementMode::Strict):
+    /// [`EnforcementMode::Strict`]:
     /// a lapsed lease releases for zero and the kernel must not run.
     LeaseOnly,
-    /// [`EnforcementMode::Elastic`](crate::snapshot::EnforcementMode::Elastic):
+    /// [`EnforcementMode::Elastic`]:
     /// a lapsed lease may settle against overage instead, bounded by `cap`.
     OverageFallback {
         overage: &'a AccountOverage,

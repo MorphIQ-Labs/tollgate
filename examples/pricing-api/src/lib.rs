@@ -659,6 +659,8 @@ async fn build_app_with(
             store.clone(),
             clock,
             tollgate_client::InstanceRuntimeConfig {
+                snapshot_history_capacity:
+                    tollgate_admission::ArcSwapSnapshotMap::DEFAULT_GENERATION_CAPACITY,
                 snapshots: SnapshotManagerConfig {
                     // Stateless: any instance may serve any customer, so this
                     // one tracks everything the store knows rather than a list
@@ -911,6 +913,10 @@ pub struct Snapshots {
     /// Stale or revoked updates refused across pushes and refreshes; excludes
     /// an unchanged positive at the already installed generation.
     pub refused_updates: u64,
+    /// History reclaimed under snapshot capacity pressure.
+    pub history_evictions: u64,
+    /// Publications refused by history retention or a superseded source read.
+    pub publication_failures: u64,
     /// Principals unresolved at the last pass. Readiness also applies the
     /// configured Fixed/All rule and requires the background task to be alive.
     pub unresolved: u64,
@@ -1048,6 +1054,8 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Json<Metrics> {
                 refresh_timeouts: stats.refresh_timeouts,
                 discovery_failures: stats.discovery_failures,
                 refused_updates: stats.refused_updates,
+                history_evictions: stats.history_evictions,
+                publication_failures: stats.publication_failures,
                 unresolved: stats.unresolved,
             }
         }),

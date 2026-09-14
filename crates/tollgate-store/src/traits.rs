@@ -570,6 +570,12 @@ pub trait SnapshotSource: Send + Sync {
     /// Fetch the authoritative state for a principal. Revocation is distinct
     /// from never-known so pull, lag recovery, and restart preserve the
     /// generation watermark required for anti-resurrection semantics.
+    /// Reads used to reconstruct reclaimed local history must be linearizable
+    /// against durable publications/tombstones. Start a new source operation;
+    /// an earlier cached response or lagging replica cannot establish that
+    /// principal's forgotten generation floor. Return an error if this
+    /// authority is unavailable. MemoryStore and primary PostgresStore reads
+    /// supply this ordering; HTTP deployments must preserve it end to end.
     async fn snapshot(&self, principal: Principal) -> Result<SnapshotResolution, StoreError>;
 
     /// Subscribe to pushes. A lagging receiver may miss updates; the

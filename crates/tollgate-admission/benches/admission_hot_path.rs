@@ -80,11 +80,14 @@ fn bench_commit_usage(c: &mut Criterion) {
                         CostUnits::ZERO,
                     ))));
                 }
-                engine.map().install_publishable(
-                    Principal(1),
-                    PublishableSnapshot::try_new(Arc::new(snapshot)).unwrap(),
-                    slot,
-                );
+                engine
+                    .map()
+                    .install_publishable(
+                        Principal(1),
+                        PublishableSnapshot::try_new(Arc::new(snapshot)).unwrap(),
+                        slot,
+                    )
+                    .unwrap();
                 let commit_at = if source == "fallback" {
                     now.checked_add(jiff::SignedDuration::from_secs(1)).unwrap()
                 } else {
@@ -222,7 +225,8 @@ fn populate(map: &impl SnapshotMap) {
             Principal(i),
             PublishableSnapshot::try_new(snapshot()).unwrap(),
             slot,
-        );
+        )
+        .unwrap();
     }
 }
 
@@ -235,7 +239,8 @@ fn populate_contention(map: &impl SnapshotMap) {
             Principal(i),
             PublishableSnapshot::try_new(contention_snapshot()).unwrap(),
             slot,
-        );
+        )
+        .unwrap();
     }
 }
 
@@ -247,7 +252,8 @@ fn populate_with_limits(map: &impl SnapshotMap, limits: ResolvedLimits) {
     for i in 0..512u128 {
         let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
         drop(slot.replace(big_lease(sharding)));
-        map.install_publishable(Principal(i), configured.clone(), slot);
+        map.install_publishable(Principal(i), configured.clone(), slot)
+            .unwrap();
     }
 }
 
@@ -261,7 +267,8 @@ fn populate_distinct(map: &impl SnapshotMap) {
             Principal(i),
             PublishableSnapshot::try_new(snapshot_for_account(account_id.0)).unwrap(),
             slot,
-        );
+        )
+        .unwrap();
     }
 }
 
@@ -706,7 +713,8 @@ fn exhausted_engine(mode: EnforcementMode) -> AdmissionEngine<ArcSwapSnapshotMap
         drop(slot.replace(empty_lease()));
         engine
             .map()
-            .install(Principal(i), Arc::clone(&snapshot), slot);
+            .install(Principal(i), Arc::clone(&snapshot), slot)
+            .unwrap();
     }
     engine
 }
@@ -733,7 +741,7 @@ fn bench_bulk_install(c: &mut Criterion) {
             || (ArcSwapSnapshotMap::new(), entries()),
             |(map, entries)| {
                 for (principal, snapshot, lease) in entries {
-                    map.install(principal, snapshot, lease);
+                    map.install(principal, snapshot, lease).unwrap();
                 }
                 map
             },
@@ -744,7 +752,7 @@ fn bench_bulk_install(c: &mut Criterion) {
         b.iter_batched(
             || (ArcSwapSnapshotMap::new(), entries()),
             |(map, entries)| {
-                map.install_many(entries);
+                map.install_many(entries).unwrap();
                 map
             },
             BatchSize::SmallInput,
@@ -773,7 +781,7 @@ fn bench_bulk_install(c: &mut Criterion) {
             b.iter_batched(
                 || (ArcSwapSnapshotMap::new(), distinct()),
                 |(map, entries)| {
-                    map.install_many(entries);
+                    map.install_many(entries).unwrap();
                     map
                 },
                 BatchSize::SmallInput,
@@ -796,7 +804,7 @@ fn bench_bulk_install(c: &mut Criterion) {
             || (ArcSwapSnapshotMap::new(), distinct()),
             |(map, entries)| {
                 for (principal, snapshot, lease) in entries {
-                    map.install(principal, snapshot, lease);
+                    map.install(principal, snapshot, lease).unwrap();
                 }
                 map
             },

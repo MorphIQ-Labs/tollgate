@@ -265,14 +265,22 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    account rate and burst; publication's already-validated maximum quote
    limits the shard count so every shard can admit the largest legitimate
    request. That limit is account-wide, because the bucket is: it is the
-   tightest ceiling any principal sharing the account has presented, tightened
-   by every install irrespective of generation ordering and never widened, so
-   a key with a heavier cost table is never wedged by a split its sibling
-   sized. Raw snapshot installs retain one defensive bucket because they do
-   not carry that proof. A shard that cannot hold a request is not the
-   account's answer: siblings are tried, the soonest retry any of them offers
-   is what `RateLimited` reports, and `UnpriceableUnderLimits` is returned only
-   when no bucket can take the request now or later.
+   tightest ceiling accepted publications from principals sharing the account
+   have presented. An accepted principal snapshot can tighten it even when its
+   account-policy generation is older; a rejected replay cannot affect it. The
+   ceiling never widens, so a key with a heavier cost table is never wedged by
+   a split its sibling sized. Raw snapshot installs retain one defensive bucket
+   because they do not carry that proof. A shard that cannot hold a request is
+   not the account's answer: siblings are tried. If none admits now but at least
+   one can hold the weight, the weighted refusal is `RateLimited`;
+   `UnpriceableUnderLimits` applies only when no bucket can hold it.
+   Both `RateLimited` and `RequestRateLimited` classify as `Retry::Transient`.
+   Neither carries a retry instant or delay, and neither promises admission at
+   an earliest retry time. Enforcement: payload-free denial variants and
+   `DenyReason::retry` own the public contract; admission consumes the governor
+   refusal without exposing its timing. *Tests:*
+   `every_reason_has_the_expected_retry_class` (core deny tests),
+   `rate_limiter_weights_by_cost`, and `request_rate_limiter_counts_requests_not_cost`.
    *Additional tests:* `rate_shards_partition_one_account_burst_without_multiplying_it`,
    `maximum_quote_limits_shards_to_buckets_that_can_admit_it`,
    `publication_accepts_a_worst_case_quote_equal_to_the_burst`,
@@ -777,6 +785,14 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     delayed older tombstone cannot revoke a newer positive snapshot. The
     source stores tombstones durably so the rule survives instance restarts;
     evicting a request-visible entry does not evict its revocation watermark.
+    Reclaiming bounded local history is a separate control-plane transition:
+    it removes visible state and invalidates that incarnation's outstanding
+    reads. Reopening requires a new authoritative read, linearizable against
+    durable source publications and tombstones. A private map/principal/read
+    fence enforces this boundary before account-policy resolution. Pending
+    reconstruction refuses pushes; an unknown response cannot authorize them.
+    Source-read freshness remains an explicit source contract, not something
+    the cache can infer from a generation number or timestamp.
     The rule is about **tombstones**, and the implementation now says so: only
     a generation the source published a revocation at may refuse that same
     generation back. A generation this instance merely observed orders
@@ -803,7 +819,18 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     with `a_revoked_principal_stays_tracked_and_cannot_be_resurrected` — the
     pair that separates an absence from a revocation at *equality*, which is
     the only generation where the two rules differ. *Proof:*
-    `formal/lean/Tollgate/SnapshotCache.lean`.
+    `formal/lean/Tollgate/SnapshotCache.lean` and
+    `formal/lean/Tollgate/SnapshotHistory.lean`. Retention witnesses:
+    `reclaimed_history_requires_a_fresh_authority_before_replay`,
+    `a_recreated_principal_rejects_the_old_in_flight_response`,
+    `refresh_fences_are_bound_to_the_map_principal_and_whole_batch`,
+    `a_refused_push_invalidates_an_older_reconstruction`,
+    `an_unknown_revalidation_cannot_reopen_forgotten_history`,
+    `a_source_read_cannot_overwrite_a_concurrent_revocation`,
+    `reclaimed_principals_refetch_authority_instead_of_replaying_a_push`,
+    `an_unseen_principal_needs_authority_once_history_is_full_or_has_reclaimed`,
+    `a_push_batch_may_not_exceed_the_room_history_has_left`, and
+    `a_push_for_an_unresolved_principal_is_discovery_not_authority`.
 
 16. **Unsafe configuration never becomes authoritative.** Nonpositive lease
     TTLs, polling/refresh/reclaim intervals, negative safety margins or
@@ -893,6 +920,30 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     skipping them in the sweep: a live principal is always swept, so
     withdrawing one still propagates within `refresh_interval`; what the
     longer TTL bounds is the Negative → Present direction only.
+    Both maps also bound retained generation histories and their eviction
+    index, including pending reconstructions. The client removes reclaimed
+    resolution/deadline entries before source I/O, batches reads within that
+    budget, and rejects fixed sets exceeding it before tasks start. Visible
+    eviction alone is repaired by an equal-generation refresh without making
+    a background probe count as a request-frequency hit. Reclamation cannot
+    reset account lease slots or irreversible spend. This local-history bound
+    does not bound the authoritative catalogue or account spend history.
+    *Retention tests:* `generation_churn_is_bounded_in_both_maps`,
+    `churn_bounds_both_history_and_its_index`,
+    `history_reclamation_bounds_resolution_and_deadline_indexes`,
+    `a_superseded_publication_cannot_claim_a_resolved_deadline`,
+    `a_discovered_catalogue_larger_than_history_is_refreshed_in_bounded_batches`,
+    `a_fixed_set_larger_than_history_is_rejected_before_tasks_start`,
+    `same_generation_refresh_repairs_a_visible_cache_eviction`,
+    `a_refresh_pass_reserves_at_the_retention_budget_not_per_principal`, and
+    `the_visibility_probe_tracks_installation_and_eviction_in_every_map`.
+    An embedder's own map inherits the unbounded compatibility defaults
+    instead, which both maps here override and therefore never execute:
+    `a_map_without_reclamation_never_demands_a_refresh_and_retains_everything`,
+    `the_default_visibility_probe_answers_from_the_request_lookup`,
+    `the_default_batch_writes_dispatch_every_update_variant`,
+    `the_default_install_many_publishes_the_whole_batch`, and
+    `an_unfenced_reservation_round_trip_publishes_its_reads`.
     *Tests:* `arc_swap_negative_cache_is_bounded_and_evicts_oldest_deadline_first`,
     `arc_swap_control_write_drops_expired_negatives`,
     `many_unknowns_leave_only_the_configured_number_visible`,

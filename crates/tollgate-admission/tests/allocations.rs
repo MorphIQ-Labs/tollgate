@@ -82,11 +82,14 @@ fn engine_with_limits(limits: ResolvedLimits) -> AdmissionEngine<ArcSwapSnapshot
         CostUnits(u64::MAX / 2),
         LocalSharding::SINGLE,
     )));
-    engine.map().install(
-        Principal(1),
-        snapshot_with_limits(AccountId(1), EnforcementMode::Strict, limits),
-        slot,
-    );
+    engine
+        .map()
+        .install(
+            Principal(1),
+            snapshot_with_limits(AccountId(1), EnforcementMode::Strict, limits),
+            slot,
+        )
+        .unwrap();
     engine
 }
 
@@ -115,7 +118,8 @@ fn install(
     let sharding = map.local_sharding();
     let slot = LeaseSlot::with_sharding(account, sharding);
     drop(slot.replace(lease(account, units, sharding)));
-    map.install(principal, snapshot(account, mode), slot);
+    map.install(principal, snapshot(account, mode), slot)
+        .unwrap();
 }
 
 fn engine(
@@ -486,6 +490,12 @@ impl<M> CountingMap<M> {
 }
 
 impl<M: SnapshotMap> SnapshotMap for CountingMap<M> {
+    fn contains_cached(&self, principal: &Principal) -> bool {
+        self.inner.contains_cached(principal)
+    }
+    fn history_stats(&self) -> Option<tollgate_admission::SnapshotHistoryStats> {
+        self.inner.history_stats()
+    }
     fn get(&self, principal: &Principal) -> Option<MapEntry> {
         self.get.fetch_add(1, Ordering::Relaxed);
         self.inner.get(principal)
@@ -504,8 +514,13 @@ impl<M: SnapshotMap> SnapshotMap for CountingMap<M> {
         self.inner.counters()
     }
 
-    fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>) {
-        self.inner.install(principal, snapshot, lease);
+    fn install(
+        &self,
+        principal: Principal,
+        snapshot: Arc<AccountSnapshot>,
+        lease: Arc<LeaseSlot>,
+    ) -> Result<(), tollgate_admission::PublicationError> {
+        self.inner.install(principal, snapshot, lease)
     }
 
     fn install_publishable(
@@ -513,40 +528,85 @@ impl<M: SnapshotMap> SnapshotMap for CountingMap<M> {
         principal: Principal,
         snapshot: tollgate_core::PublishableSnapshot,
         lease: Arc<LeaseSlot>,
-    ) {
-        self.inner.install_publishable(principal, snapshot, lease);
+    ) -> Result<(), tollgate_admission::PublicationError> {
+        self.inner.install_publishable(principal, snapshot, lease)
     }
 
-    fn install_revoked(&self, principal: Principal, until: Timestamp, generation: Generation) {
-        self.inner.install_revoked(principal, until, generation);
+    fn install_revoked(
+        &self,
+        principal: Principal,
+        until: Timestamp,
+        generation: Generation,
+    ) -> Result<(), tollgate_admission::PublicationError> {
+        self.inner.install_revoked(principal, until, generation)
     }
 
-    fn install_unknown(&self, principal: Principal, until: Timestamp) {
-        self.inner.install_unknown(principal, until);
+    fn install_unknown(
+        &self,
+        principal: Principal,
+        until: Timestamp,
+    ) -> Result<(), tollgate_admission::PublicationError> {
+        self.inner.install_unknown(principal, until)
     }
 
     fn remove(&self, principal: &Principal) {
         self.inner.remove(principal);
     }
 
-    fn install_many(&self, entries: Vec<(Principal, Arc<AccountSnapshot>, Arc<LeaseSlot>)>) {
-        self.inner.install_many(entries);
+    fn install_many(
+        &self,
+        entries: Vec<(Principal, Arc<AccountSnapshot>, Arc<LeaseSlot>)>,
+    ) -> Result<(), tollgate_admission::PublicationError> {
+        self.inner.install_many(entries)
     }
 
-    fn apply_many(&self, updates: Vec<SnapshotUpdate>) {
-        self.inner.apply_many(updates);
+    fn apply_many(
+        &self,
+        updates: Vec<SnapshotUpdate>,
+    ) -> Result<(), tollgate_admission::PublicationError> {
+        self.inner.apply_many(updates)
     }
 
-    fn apply_many_at(&self, updates: Vec<SnapshotUpdate>, now: Timestamp) {
-        self.inner.apply_many_at(updates, now);
+    fn apply_many_at(
+        &self,
+        updates: Vec<SnapshotUpdate>,
+        now: Timestamp,
+    ) -> Result<(), tollgate_admission::PublicationError> {
+        self.inner.apply_many_at(updates, now)
     }
 
-    fn apply_publishable_many(&self, updates: Vec<PublishableSnapshotUpdate>) {
-        self.inner.apply_publishable_many(updates);
+    fn apply_publishable_many(
+        &self,
+        updates: Vec<PublishableSnapshotUpdate>,
+    ) -> Result<(), tollgate_admission::PublicationError> {
+        self.inner.apply_publishable_many(updates)
     }
 
-    fn apply_publishable_many_at(&self, updates: Vec<PublishableSnapshotUpdate>, now: Timestamp) {
-        self.inner.apply_publishable_many_at(updates, now);
+    fn apply_publishable_many_at(
+        &self,
+        updates: Vec<PublishableSnapshotUpdate>,
+        now: Timestamp,
+    ) -> Result<(), tollgate_admission::PublicationError> {
+        self.inner.apply_publishable_many_at(updates, now)
+    }
+    fn generation_capacity(&self) -> std::num::NonZeroUsize {
+        self.inner.generation_capacity()
+    }
+    fn needs_refresh(&self, principal: Principal) -> bool {
+        self.inner.needs_refresh(principal)
+    }
+    fn prepare_refreshes(
+        &self,
+        principals: &[Principal],
+    ) -> Result<tollgate_admission::RefreshBatch, tollgate_admission::PublicationError> {
+        self.inner.prepare_refreshes(principals)
+    }
+    fn apply_refreshed_many_at(
+        &self,
+        updates: Vec<tollgate_admission::Refreshed<PublishableSnapshotUpdate>>,
+        now: Timestamp,
+    ) -> Result<(), tollgate_admission::PublicationError> {
+        self.inner.apply_refreshed_many_at(updates, now)
     }
 }
 

@@ -99,6 +99,8 @@ fn publishable(snapshot: Arc<AccountSnapshot>) -> PublishableSnapshot {
 
 fn runtime_config(principal: Principal) -> tollgate_client::InstanceRuntimeConfig {
     tollgate_client::InstanceRuntimeConfig {
+        snapshot_history_capacity:
+            tollgate_admission::ArcSwapSnapshotMap::DEFAULT_GENERATION_CAPACITY,
         snapshots: SnapshotManagerConfig {
             principals: TrackedPrincipals::All {
                 seed: vec![principal],

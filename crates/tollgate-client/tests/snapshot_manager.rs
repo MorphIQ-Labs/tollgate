@@ -2045,3 +2045,320 @@ async fn a_refused_answer_is_retried_with_backoff_not_at_source_latency() {
 
     manager.shutdown().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn reclaimed_principals_refetch_authority_instead_of_replaying_a_push() {
+    for map in [
+        Arc::new(ArcSwapSnapshotMap::with_capacities(
+            LocalSharding::SINGLE,
+            1,
+            NonZeroUsize::new(1).unwrap(),
+        )) as Arc<dyn SnapshotMap>,
+        Arc::new(tollgate_admission::MokaSnapshotMap::with_capacities(
+            8,
+            LocalSharding::SINGLE,
+            NonZeroUsize::new(1).unwrap(),
+        )),
+    ] {
+        let source = DrivenPushSource::new(SnapshotResolution::Revoked {
+            generation: Generation(9),
+        });
+        let slots = SlotRegistry::new();
+        let original_slot = slots.slot(ACCOUNT);
+        let mut config = discovering_config(3_600_000);
+        config.max_concurrent_fetches = 8;
+        let manager = SnapshotManager::spawn(
+            source.clone(),
+            map.clone(),
+            slots.clone(),
+            Arc::new(ManualClock::new(t(0))),
+            config,
+        )
+        .unwrap();
+        settle().await;
+        assert!(matches!(
+            map.get(&PRINCIPAL),
+            Some(MapEntry::NegativeUntil { .. })
+        ));
+
+        let later = Principal(8);
+        let live = SnapshotResolution::Present(publishable(snapshot(1, PermissionBits::bit(0))));
+        source.set_pull(live.clone());
+        source.send(later, live);
+        settle().await;
+        assert!(
+            map.get(&PRINCIPAL).is_none(),
+            "history reclamation removes its visible tombstone"
+        );
+        assert!(matches!(map.get(&later), Some(MapEntry::Present(_))));
+        assert_eq!(manager.counters().snapshot().unresolved, 1);
+        assert_eq!(manager.counters().snapshot().history_evictions, 1);
+
+        source.set_pull(SnapshotResolution::Revoked {
+            generation: Generation(9),
+        });
+        // This message is still valid at the caller's time, but the source has
+        // revoked it. The forgotten principal's push can only request a pull.
+        source.send(
+            PRINCIPAL,
+            SnapshotResolution::Present(publishable(snapshot(9, PermissionBits::ALL))),
+        );
+        settle().await;
+        assert!(matches!(
+            map.get(&PRINCIPAL),
+            Some(MapEntry::NegativeUntil { .. })
+        ));
+        assert!(map.get(&later).is_none());
+        assert_eq!(map.history_stats().unwrap().retained, 1);
+        assert_eq!(manager.counters().snapshot().history_evictions, 2);
+        assert_eq!(manager.counters().snapshot().unresolved, 1);
+        assert!(
+            Arc::ptr_eq(&original_slot, &slots.slot(ACCOUNT)),
+            "history eviction must preserve irreversible account spend state"
+        );
+        manager.shutdown().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_discovered_catalogue_larger_than_history_is_refreshed_in_bounded_batches() {
+    let source = CountingSource::new();
+    let map = Arc::new(ArcSwapSnapshotMap::with_capacities(
+        LocalSharding::SINGLE,
+        1,
+        NonZeroUsize::new(1).unwrap(),
+    ));
+    let mut config = churn_config(SignedDuration::from_secs(3_600));
+    config.refresh_interval = std::time::Duration::from_secs(3_600);
+    let manager = SnapshotManager::spawn(
+        source,
+        map.clone(),
+        SlotRegistry::new(),
+        Arc::new(ManualClock::new(t(0))),
+        config,
+    )
+    .unwrap();
+    settle().await;
+    assert_eq!(map.history_stats().unwrap().retained, 1);
+    assert_eq!(manager.counters().snapshot().history_evictions, 1);
+    assert_eq!(manager.counters().snapshot().publication_failures, 0);
+    assert_eq!(manager.counters().snapshot().refresh_attempts, 2);
+    assert_eq!(manager.counters().snapshot().unresolved, 1);
+    assert!(*manager.ready().borrow());
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_fixed_set_larger_than_history_is_rejected_before_tasks_start() {
+    let source = DrivenPushSource::new(SnapshotResolution::Unknown);
+    let map = Arc::new(ArcSwapSnapshotMap::with_capacities(
+        LocalSharding::SINGLE,
+        1,
+        NonZeroUsize::new(1).unwrap(),
+    ));
+    let mut config = discovering_config(1000);
+    config.principals = TrackedPrincipals::Fixed(vec![Principal(1), Principal(2)]);
+    let error = SnapshotManager::spawn(
+        source,
+        map.clone(),
+        SlotRegistry::new(),
+        Arc::new(ManualClock::new(t(0))),
+        config,
+    )
+    .err()
+    .expect("oversized fixed set must be rejected");
+    assert_eq!(
+        error.0,
+        "fixed principals exceed snapshot generation capacity"
+    );
+    assert_eq!(map.history_stats().unwrap().retained, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn same_generation_refresh_repairs_a_visible_cache_eviction() {
+    for map in [
+        Arc::new(ArcSwapSnapshotMap::new()) as Arc<dyn SnapshotMap>,
+        Arc::new(tollgate_admission::MokaSnapshotMap::new(8)),
+    ] {
+        let source = MutableNoPushSource::new();
+        source.set(MutableMode::Present(snapshot(5, PermissionBits::bit(0))));
+        let mut config = discovering_config(1000);
+        config.principals = TrackedPrincipals::Fixed(vec![PRINCIPAL]);
+        let manager = SnapshotManager::spawn(
+            source,
+            map.clone(),
+            SlotRegistry::new(),
+            Arc::new(ManualClock::new(t(0))),
+            config,
+        )
+        .unwrap();
+        settle().await;
+        assert!(matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(_))));
+        map.remove(&PRINCIPAL);
+        assert!(!map.contains_cached(&PRINCIPAL));
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        settle().await;
+        let Some(MapEntry::Present(state)) = map.get(&PRINCIPAL) else {
+            panic!("equal-generation refresh must repair a visible eviction")
+        };
+        assert_eq!(state.snapshot.generation, Generation(5));
+        assert_eq!(manager.counters().snapshot().refused_updates, 0);
+        manager.shutdown().await;
+    }
+}
+
+/// Records the size of every reservation a refresh pass makes. The pass must
+/// reserve at the retention budget: reserving one principal at a time would
+/// still resolve the catalogue, but it would pay a reservation, a publication
+/// and a concurrency window per principal instead of per budget-sized chunk.
+struct ReservationSizes {
+    inner: ArcSwapSnapshotMap,
+    sizes: Mutex<Vec<usize>>,
+}
+
+impl ReservationSizes {
+    fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner: ArcSwapSnapshotMap::with_capacities(
+                LocalSharding::SINGLE,
+                capacity,
+                NonZeroUsize::new(capacity).unwrap(),
+            ),
+            sizes: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn recorded(&self) -> Vec<usize> {
+        self.sizes
+            .lock()
+            .expect("reservation sizes poisoned")
+            .clone()
+    }
+}
+
+impl SnapshotMap for ReservationSizes {
+    fn prepare_refreshes(
+        &self,
+        principals: &[Principal],
+    ) -> Result<tollgate_admission::RefreshBatch, tollgate_admission::PublicationError> {
+        self.sizes
+            .lock()
+            .expect("reservation sizes poisoned")
+            .push(principals.len());
+        self.inner.prepare_refreshes(principals)
+    }
+    fn apply_refreshed_many_at(
+        &self,
+        updates: Vec<tollgate_admission::Refreshed<tollgate_admission::PublishableSnapshotUpdate>>,
+        now: Timestamp,
+    ) -> Result<(), tollgate_admission::PublicationError> {
+        self.inner.apply_refreshed_many_at(updates, now)
+    }
+    fn generation_capacity(&self) -> NonZeroUsize {
+        self.inner.generation_capacity()
+    }
+    fn needs_refresh(&self, principal: Principal) -> bool {
+        self.inner.needs_refresh(principal)
+    }
+    fn contains_cached(&self, principal: &Principal) -> bool {
+        self.inner.contains_cached(principal)
+    }
+    fn history_stats(&self) -> Option<tollgate_admission::SnapshotHistoryStats> {
+        self.inner.history_stats()
+    }
+    fn local_sharding(&self) -> LocalSharding {
+        self.inner.local_sharding()
+    }
+    fn get(&self, principal: &Principal) -> Option<MapEntry> {
+        self.inner.get(principal)
+    }
+    fn get_at(&self, principal: &Principal, locality: tollgate_core::Locality) -> Option<MapEntry> {
+        self.inner.get_at(principal, locality)
+    }
+    fn counters(&self) -> &Arc<tollgate_admission::AdmissionCounters> {
+        self.inner.counters()
+    }
+    fn install(
+        &self,
+        principal: Principal,
+        snapshot: Arc<AccountSnapshot>,
+        lease: Arc<tollgate_admission::LeaseSlot>,
+    ) -> Result<(), tollgate_admission::PublicationError> {
+        self.inner.install(principal, snapshot, lease)
+    }
+    fn install_revoked(
+        &self,
+        principal: Principal,
+        until: Timestamp,
+        generation: Generation,
+    ) -> Result<(), tollgate_admission::PublicationError> {
+        self.inner.install_revoked(principal, until, generation)
+    }
+    fn install_unknown(
+        &self,
+        principal: Principal,
+        until: Timestamp,
+    ) -> Result<(), tollgate_admission::PublicationError> {
+        self.inner.install_unknown(principal, until)
+    }
+    fn remove(&self, principal: &Principal) {
+        self.inner.remove(principal);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refresh_pass_reserves_at_the_retention_budget_not_per_principal() {
+    let source = MutableNoPushSource::new();
+    source.set(MutableMode::Present(snapshot(1, PermissionBits::bit(0))));
+    let map = ReservationSizes::new(3);
+    let mut config = discovering_config(3_600_000);
+    config.principals = TrackedPrincipals::Fixed(vec![Principal(1), Principal(2), Principal(3)]);
+    let manager = SnapshotManager::spawn(
+        source,
+        map.clone(),
+        SlotRegistry::new(),
+        Arc::new(ManualClock::new(t(0))),
+        config,
+    )
+    .unwrap();
+    settle().await;
+    assert_eq!(
+        map.recorded(),
+        vec![3],
+        "the whole budget-sized set belongs to one reservation"
+    );
+    assert_eq!(map.history_stats().unwrap().retained, 3);
+    manager.shutdown().await;
+}
+
+/// A push *names* a principal this instance has never resolved; it does not
+/// carry authority for one. Discovery therefore fetches, and the source's
+/// answer is what lands -- so a push that has been superseded, replayed, or
+/// simply raced by a revocation cannot install a snapshot the source no longer
+/// publishes. Only a principal this instance already holds may be advanced by
+/// the push's own payload.
+#[tokio::test(start_paused = true)]
+async fn a_push_for_an_unresolved_principal_is_discovery_not_authority() {
+    let source = DrivenPushSource::new(SnapshotResolution::Revoked {
+        generation: Generation(9),
+    });
+    let fixture = spawn_with(source.clone(), discovering_config(600_000));
+    stock_slot(&fixture);
+    settle().await;
+    assert_eq!(
+        admit_as(&fixture, LATER_PRINCIPAL),
+        Err(DenyReason::UnknownPrincipal)
+    );
+
+    source.send(
+        LATER_PRINCIPAL,
+        SnapshotResolution::Present(publishable(snapshot(5, PermissionBits::bit(0)))),
+    );
+    settle().await;
+
+    assert_eq!(
+        admit_as(&fixture, LATER_PRINCIPAL),
+        Err(DenyReason::UnknownPrincipal),
+        "the authoritative read decides a newly discovered principal, not the push that named it"
+    );
+}

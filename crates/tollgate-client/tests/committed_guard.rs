@@ -88,7 +88,7 @@ fn engine() -> AdmissionEngine<ArcSwapSnapshotMap> {
     ));
     let slot = LeaseSlot::for_account(ACCOUNT);
     drop(slot.replace(lease));
-    engine.map().install(PRINCIPAL, snapshot, slot);
+    engine.map().install(PRINCIPAL, snapshot, slot).unwrap();
     engine
 }
 
