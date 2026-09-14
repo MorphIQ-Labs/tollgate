@@ -27,7 +27,7 @@
 //! (LISTEN/NOTIFY or the server's future SSE) is a documented seam in
 //! `docs/DESIGN.md`.
 
-mod instant;
+pub(crate) mod instant;
 
 #[cfg(feature = "test-support")]
 pub mod test_support;
@@ -529,6 +529,62 @@ const ACTIVE_LEASE_SUM_SQL: &str =
     "SELECT COALESCE(SUM(granted), 0)::BIGINT, COALESCE(SUM(used), 0)::BIGINT
      FROM tollgate_leases WHERE account_id = $1 AND state = 0";
 
+/// The expiry sweep's selection, named for the same reason as the sum above:
+/// `reclaim_expired_batch` runs it and `explain_reclaim_due_leases` asks the
+/// planner what it does with it. A test that copied the text would keep
+/// reporting an index-ordered walk after the real `ORDER BY` had drifted away
+/// from `tollgate_leases_expiry` — which is exactly the drift #65 found.
+///
+/// The `ORDER BY` is the index's own column order, and that is the whole
+/// point. It was `(account_id, lease_id)`, which no index answers, so the
+/// `LIMIT` could not stop an index walk: every batch read and sorted the
+/// entire remaining backlog to return 256 rows, making a drain quadratic in
+/// the backlog it exists to clear (#65). Ordering by the expiry pair makes
+/// the `LIMIT` a range stop, and settles oldest-due-first like the reference
+/// backend does.
+const RECLAIM_DUE_LEASES_SQL: &str =
+    "SELECT lease_id, account_id, granted, used, from_allowance, period_start_us
+     FROM tollgate_leases
+     WHERE state = 0 AND (expires_at_floor_us, expires_at_submicro_ns) <= ($1, $2)
+     ORDER BY expires_at_floor_us, expires_at_submicro_ns
+     LIMIT $3 FOR UPDATE SKIP LOCKED";
+
+/// The rollover sweep's selection, hoisted and fixed for the same reason
+/// (#65's sibling) — but it needed two changes, not one.
+///
+/// `ORDER BY account_id` sorted every due account to return one bounded page,
+/// and served the lowest ids rather than the most overdue boundaries.
+/// `budget_period = $1` is an equality, so within that prefix of
+/// `tollgate_accounts_due_rollover (budget_period, period_start_us)` the scan
+/// is already ordered by `period_start_us`: ordering by it is index-native and
+/// crosses the oldest boundary first.
+///
+/// That alone changed nothing, because the index is *partial* on
+/// `budget_allowance IS NOT NULL` and this query never said so — the planner
+/// cannot apply a partial index it cannot prove applies, so the sweep had
+/// never once used the index added for it. Restating the predicate is free and
+/// selects exactly the same rows: `tollgate_accounts_budget_all_or_nothing` already
+/// requires the allowance, period and rollover columns to be all null or all
+/// non-null, and `budget_period = $1` has ruled out all-null. Measured on 400
+/// accounts with five due: seq scan and sort at cost 25.02, versus an index
+/// scan with no sort at 5.92.
+const DUE_PERIODS_SQL: &str = "WITH due AS (
+         SELECT account_id, allowance_balance AS prior, budget_allowance AS allowance
+         FROM tollgate_accounts
+         WHERE budget_allowance IS NOT NULL
+           AND budget_period = $1 AND period_start_us < $2
+         ORDER BY period_start_us LIMIT $3 FOR UPDATE SKIP LOCKED
+     )
+     UPDATE tollgate_accounts AS account SET
+         deposited = account.deposited + due.allowance,
+         expired = account.expired + due.prior,
+         balance = account.balance - due.prior + due.allowance,
+         allowance_balance = due.allowance,
+         period_start_us = $2
+     FROM due
+     WHERE account.account_id = due.account_id
+     RETURNING due.account_id, due.allowance, due.prior";
+
 fn id_bytes(id: u128) -> Vec<u8> {
     id.to_be_bytes().to_vec()
 }
@@ -638,6 +694,22 @@ where
 /// # use tollgate_core::AccountId;
 /// fn explain(store: &PostgresStore) {
 ///     let _ = store.explain_active_lease_sum(AccountId(1));
+/// }
+/// ```
+///
+/// The same holds for the two sweep plans (#65):
+///
+/// ```compile_fail,E0599
+/// # use tollgate_store_postgres::PostgresStore;
+/// fn explain_sweep(store: &PostgresStore) {
+///     let _ = store.explain_reclaim_due_leases(jiff::Timestamp::UNIX_EPOCH, 256);
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// # use tollgate_store_postgres::PostgresStore;
+/// fn explain_rollover(store: &PostgresStore) {
+///     let _ = store.explain_due_periods("daily", 0, 256);
 /// }
 /// ```
 pub struct PostgresStore {
@@ -1260,18 +1332,13 @@ impl LeaseAllocator for PostgresStore {
             // Both tuple components preserve the exact timestamp ordering.
             // SKIP LOCKED lets concurrent sweepers cooperate; the limit keeps
             // both the lease locks and the transaction's row work bounded.
-            let rows = sqlx::query(
-                "SELECT lease_id, account_id, granted, used, from_allowance, period_start_us
-                 FROM tollgate_leases
-                 WHERE state = 0 AND (expires_at_floor_us, expires_at_submicro_ns) <= ($1, $2)
-                 ORDER BY account_id, lease_id LIMIT $3 FOR UPDATE SKIP LOCKED",
-            )
-            .bind(cutoff.micros)
-            .bind(cutoff.submicro_nanos)
-            .bind(limit_i)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(storage)?;
+            let rows = sqlx::query(RECLAIM_DUE_LEASES_SQL)
+                .bind(cutoff.micros)
+                .bind(cutoff.submicro_nanos)
+                .bind(limit_i)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(storage)?;
 
             let mut reclaimed = Vec::with_capacity(rows.len());
             let mut lease_ids = Vec::with_capacity(rows.len());
@@ -1490,9 +1557,14 @@ impl UsageSink for PostgresStore {
 
         let mut tx = self.pool.begin().await.map_err(storage)?;
         let result: Result<_, IngestError> = async {
-            // Lock every referenced lease in the same global account/lease
-            // order as reclaim. Release touches one lease, so every
-            // lease-writing transaction now agrees on this order.
+            // Lock every referenced lease in one global account/lease order.
+            // A cycle needs two waiters, and this is the path that waits:
+            // release touches a single lease, and reclaim takes its leases
+            // with SKIP LOCKED, so it abandons a contended row instead of
+            // queueing behind it. Concurrent ingests are therefore what this
+            // order is for -- reclaim selects in expiry order (#65) and is
+            // still safe, because the lease-then-account phase order below is
+            // what keeps the two from crossing.
             let lease_ids: Vec<Vec<u8>> = prepared
                 .iter()
                 .filter_map(|event| event.lease_id.clone())
@@ -2442,29 +2514,13 @@ impl AdminStore for PostgresStore {
             // The prior `allowance_balance` is read in the CTE because the
             // UPDATE cannot return it: PostgreSQL's RETURNING sees the new row
             // only, and `expired` has to be reported as the delta it is.
-            let rows = sqlx::query(
-                "WITH due AS (
-                     SELECT account_id, allowance_balance AS prior, budget_allowance AS allowance
-                     FROM tollgate_accounts
-                     WHERE budget_period = $1 AND period_start_us < $2
-                     ORDER BY account_id LIMIT $3 FOR UPDATE SKIP LOCKED
-                 )
-                 UPDATE tollgate_accounts AS account SET
-                     deposited = account.deposited + due.allowance,
-                     expired = account.expired + due.prior,
-                     balance = account.balance - due.prior + due.allowance,
-                     allowance_balance = due.allowance,
-                     period_start_us = $2
-                 FROM due
-                 WHERE account.account_id = due.account_id
-                 RETURNING due.account_id, due.allowance, due.prior",
-            )
-            .bind(period.as_str())
-            .bind(boundary_us)
-            .bind(remaining)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(storage)?;
+            let rows = sqlx::query(DUE_PERIODS_SQL)
+                .bind(period.as_str())
+                .bind(boundary_us)
+                .bind(remaining)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(storage)?;
 
             for row in rows {
                 rolled.push(RolledAccount {

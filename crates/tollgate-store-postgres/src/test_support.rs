@@ -9,7 +9,10 @@ use sqlx::Row;
 use tollgate_core::AccountId;
 use tollgate_store::StoreError;
 
-use crate::{ACTIVE_LEASE_SUM_SQL, PostgresStore, id_bytes, storage};
+use crate::{
+    ACTIVE_LEASE_SUM_SQL, DUE_PERIODS_SQL, PostgresStore, RECLAIM_DUE_LEASES_SQL, id_bytes,
+    instant::StoredInstant, storage,
+};
 
 /// The plan PostgreSQL chooses for the active-lease sum inside
 /// [`PostgresStore::conservation`] — the query migration 0005's partial index
@@ -41,6 +44,69 @@ pub async fn explain_active_lease_sum(
         .map(|row| row.get::<String, _>(0))
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+/// The plan PostgreSQL chooses for the expiry sweep's selection inside
+/// `reclaim_expired_batch` (#65).
+///
+/// The property worth pinning is not "an index is used" — the predicate always
+/// matched `tollgate_leases_expiry`. It is that the `LIMIT` can *stop* the
+/// walk: under an `ORDER BY` the index cannot answer, the planner reads every
+/// expired row and sorts it before taking a page, so each bounded batch costs
+/// the whole backlog. A `Sort` node above the scan is that defect, which is
+/// why the caller asserts on its absence.
+///
+/// Statistics are refreshed first, for the reason
+/// [`explain_active_lease_sum`] gives.
+pub async fn explain_reclaim_due_leases(
+    store: &PostgresStore,
+    cutoff: jiff::Timestamp,
+    limit: i64,
+) -> Result<String, StoreError> {
+    let cutoff = StoredInstant::from(cutoff);
+    sqlx::raw_sql("ANALYZE tollgate_leases")
+        .execute(&store.pool)
+        .await
+        .map_err(storage)?;
+    let rows = sqlx::query(&format!("EXPLAIN {RECLAIM_DUE_LEASES_SQL}"))
+        .bind(cutoff.micros)
+        .bind(cutoff.submicro_nanos)
+        .bind(limit)
+        .fetch_all(&store.pool)
+        .await
+        .map_err(storage)?;
+    Ok(plan_text(&rows))
+}
+
+/// The plan PostgreSQL chooses for the rollover sweep's selection inside
+/// `roll_due_periods` — #65's sibling, and the same property: the bounded page
+/// must be an index-range stop rather than a sort of every account whose
+/// boundary has passed.
+pub async fn explain_due_periods(
+    store: &PostgresStore,
+    period: &str,
+    boundary_us: i64,
+    limit: i64,
+) -> Result<String, StoreError> {
+    sqlx::raw_sql("ANALYZE tollgate_accounts")
+        .execute(&store.pool)
+        .await
+        .map_err(storage)?;
+    let rows = sqlx::query(&format!("EXPLAIN {DUE_PERIODS_SQL}"))
+        .bind(period)
+        .bind(boundary_us)
+        .bind(limit)
+        .fetch_all(&store.pool)
+        .await
+        .map_err(storage)?;
+    Ok(plan_text(&rows))
+}
+
+fn plan_text(rows: &[sqlx::postgres::PgRow]) -> String {
+    rows.iter()
+        .map(|row| row.get::<String, _>(0))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Delete all account, lease, snapshot, credential and usage rows, including
