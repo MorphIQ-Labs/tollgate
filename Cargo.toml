@@ -46,10 +46,21 @@ criterion = "0.5"
 proptest = "1.7"
 tempfile = "3"
 tollgate-alloc-count = { path = "crates/tollgate-alloc-count", version = "=0.21.3" }
+# Axum/tower test scaffolding: `oneshot` against a built router, and the body
+# collector that reads its response. Dev-only in every member that takes them.
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
 
 # Later members (admission/store/server/client) — declared centrally so every
 # crate resolves the same versions.
 arc-swap = "1"
+# `v4` only, deliberately. `examples/pricing-api` adds `fast-rng` for its own
+# reasons, stated there; the members that mint lease ids do not ask for it, so
+# a standalone build of them keeps the getrandom-backed generator. Cargo
+# unifies features across a `--workspace` build, so they do link `fast-rng`
+# there — that is a property of the build graph, not a per-crate choice, and
+# naming the split here is what keeps it from being made by accident.
+uuid = { version = "1", features = ["v4"] }
 # Wipes cached credential bytes on drop. Hand-rolled zeroing is what this
 # crate exists to replace: a plain loop is dead-store-eliminable.
 zeroize = "1"
@@ -108,6 +119,10 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 let_underscore_must_use = "deny"
+# #19's enforcement says an `#[allow]` is acceptable "unless" it states why.
+# That was a convention a reviewer had to notice; this makes it mechanical, the
+# way the deny above already makes discarding a fallible call mechanical (#82).
+allow_attributes_without_reason = "deny"
 
 # Deployment profile for load-gate runs and production builds; kept separate so
 # Criterion benches retain the default calibrated release codegen policy.

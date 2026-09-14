@@ -45,8 +45,8 @@ rcgen = { workspace = true }
 async-trait = { workspace = true }
 tollgate-admission = { path = "../tollgate-admission", version = "=0.21.3" }
 tollgate-client = { path = "../tollgate-client", version = "=0.21.3", features = ["http"] }
-http-body-util = "0.1"
-tower = { version = "0.5", features = ["util"] }
+http-body-util = { workspace = true }
+tower = { workspace = true }
 
 [lints]
 workspace = true

@@ -780,7 +780,14 @@ impl Drop for SupervisorLiveness {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+// A background task owns its collaborators for the process's life rather than
+// borrowing them per call, and grouping them into a struct would name a thing
+// that exists only to satisfy the lint: every field is already reachable from
+// `Shared`, and the split is which handles this loop must keep alive.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "supervisor entry point: every argument is a handle it must keep alive for the process"
+)]
 async fn supervise(
     shared: Arc<Shared>,
     allocator: Arc<dyn LeaseAllocator>,

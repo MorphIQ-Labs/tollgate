@@ -1,4 +1,7 @@
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared fixture module; each test binary uses a subset"
+)]
 // Public test fixtures only. These credentials are never deployment defaults.
 use std::sync::Arc;
 use tollgate_auth::{CredentialVerifier, HmacRegistry};
