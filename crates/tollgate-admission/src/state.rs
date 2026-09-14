@@ -1464,6 +1464,35 @@ impl PublishableSnapshotUpdate {
 /// Generation monotonicity is part of the contract: installing a snapshot
 /// older than the one present must be a no-op, so replayed or reordered
 /// control-plane pushes can never roll an account back.
+///
+/// # Adding a defaulted method
+///
+/// Fifteen of these twenty-one methods carry a default body, and a *wrapper*
+/// around another map inherits every one it does not override — silently, with
+/// no compile error. Whether that is correct depends entirely on what the body
+/// is written over, and the two answers are opposite:
+///
+/// - **Written over other `Self` methods** — `contains_cached`, `get_at`,
+///   `install_publishable`, `remove_many`, `install_many`, `apply_many`,
+///   `apply_many_at`, `apply_publishable_many`, `apply_publishable_many_at`,
+///   `apply_refreshed_many_at`. A wrapper must **inherit** these. Forwarding
+///   one to the inner map rebinds `self` and discards the wrapper's own
+///   overrides — a counting wrapper would stop counting installs that arrive
+///   through `apply_many`.
+/// - **A constant or sentinel** — `local_sharding` (`SINGLE`),
+///   `generation_capacity` (`MAX`), `needs_refresh` (`false`), `history_stats`
+///   (`None`), `prepare_refreshes` (unfenced reads for everything). A wrapper
+///   must **forward** these. Inheriting one makes the wrapper lie about the map
+///   behind it: a sharded map reported as `SINGLE`, a bounded one as unbounded,
+///   a real fenced refresh plan replaced by unfenced reads.
+///
+/// A new default belongs in one of those two lists, decided by reading the body
+/// rather than the name. `the_arc_delegation_forwards_every_bulk_write` in
+/// `maps.rs` witnesses the constant case for the blanket `Arc<T>` delegation —
+/// the one the request path actually dispatches through — and
+/// `tests/map_defaults.rs` pins what each default does when it *is* inherited.
+/// This is the same rule `tollgate-store`'s `drain_reclaim_expired` records for
+/// `LeaseAllocator::reclaim_expired` (#83, #120).
 pub trait SnapshotMap: Send + Sync {
     /// Control-plane visibility probe. Cache implementations should avoid
     /// changing request-frequency bookkeeping for a background refresh.
