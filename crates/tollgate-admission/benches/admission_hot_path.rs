@@ -69,7 +69,7 @@ fn bench_commit_usage(c: &mut Criterion) {
                     } else {
                         far_future()
                     };
-                    slot.install(Arc::new(LocalLease::new(
+                    drop(slot.replace(Arc::new(LocalLease::new(
                         LeaseGrant {
                             lease_id: LeaseId(7),
                             account_id: AccountId(1),
@@ -78,7 +78,7 @@ fn bench_commit_usage(c: &mut Criterion) {
                             expires_at,
                         },
                         CostUnits::ZERO,
-                    )));
+                    ))));
                 }
                 engine.map().install_publishable(
                     Principal(1),
@@ -217,7 +217,7 @@ fn populate(map: &impl SnapshotMap) {
     let sharding = map.local_sharding();
     for i in 0..512u128 {
         let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
-        slot.install(big_lease(sharding));
+        drop(slot.replace(big_lease(sharding)));
         map.install_publishable(
             Principal(i),
             PublishableSnapshot::try_new(snapshot()).unwrap(),
@@ -230,7 +230,7 @@ fn populate_contention(map: &impl SnapshotMap) {
     let sharding = map.local_sharding();
     for i in 0..512u128 {
         let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
-        slot.install(big_lease(sharding));
+        drop(slot.replace(big_lease(sharding)));
         map.install_publishable(
             Principal(i),
             PublishableSnapshot::try_new(contention_snapshot()).unwrap(),
@@ -246,7 +246,7 @@ fn populate_with_limits(map: &impl SnapshotMap, limits: ResolvedLimits) {
     let configured = PublishableSnapshot::try_new(Arc::new(configured)).unwrap();
     for i in 0..512u128 {
         let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
-        slot.install(big_lease(sharding));
+        drop(slot.replace(big_lease(sharding)));
         map.install_publishable(Principal(i), configured.clone(), slot);
     }
 }
@@ -256,7 +256,7 @@ fn populate_distinct(map: &impl SnapshotMap) {
     for i in 0..512u128 {
         let account_id = AccountId(i + 1);
         let slot = LeaseSlot::with_sharding(account_id, sharding);
-        slot.install(big_lease_for(account_id, sharding));
+        drop(slot.replace(big_lease_for(account_id, sharding)));
         map.install_publishable(
             Principal(i),
             PublishableSnapshot::try_new(snapshot_for_account(account_id.0)).unwrap(),
@@ -703,7 +703,7 @@ fn exhausted_engine(mode: EnforcementMode) -> AdmissionEngine<ArcSwapSnapshotMap
     let snapshot = Arc::new(snapshot);
     for i in 0..512u128 {
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(empty_lease());
+        drop(slot.replace(empty_lease()));
         engine
             .map()
             .install(Principal(i), Arc::clone(&snapshot), slot);

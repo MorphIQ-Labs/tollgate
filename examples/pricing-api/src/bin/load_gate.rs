@@ -12,13 +12,9 @@
 //! throughput gate on the controlled host; each admitted-vs-baseline ratio is
 //! meaningful only when the configured connection count is held constant.
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -28,8 +24,24 @@ use pricing_api::{
 use tollgate_admission::ExecutionCapacityMode;
 use tollgate_core::{CapacityClass, LocalSharding};
 
+#[path = "load_gate/client.rs"]
+mod client;
+#[path = "load_gate/report.rs"]
+mod report;
+#[cfg(test)]
+use client::throughput_for_window;
+use client::{ClientWork, MeasuredSamples, drive_clients};
+use report::{RunContext, report_failure, write_report};
+
+#[cfg(test)]
+#[path = "../../tests/fixtures/load_failures.rs"]
+mod load_failures;
+
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Thresholds {
+    #[serde(default)]
+    _comment: serde::de::IgnoredAny,
     warmup_requests: usize,
     measured_requests: usize,
     /// Persistent clients driven concurrently against the same account.
@@ -292,34 +304,6 @@ struct MixedReport {
     verdict: MixedVerdict,
 }
 
-/// What the machine looked like while measuring.
-///
-/// This gate takes one measurement and has no history to compare it against,
-/// so unlike the perf gate it cannot judge its own trustworthiness (#49) — the
-/// ratio's *denominator* is as exposed to a busy host as its numerator, which
-/// is how a ×1.241 was once reported against three re-runs at ×1.096–×1.120.
-/// Recording the context at least makes a suspect result diagnosable after the
-/// fact instead of only reproducible.
-#[derive(Serialize)]
-struct RunContext {
-    recorded_at_unix: u64,
-    available_parallelism: Option<usize>,
-    load_average: Option<String>,
-}
-
-impl RunContext {
-    fn capture() -> Self {
-        RunContext {
-            recorded_at_unix: std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or_default(),
-            available_parallelism: std::thread::available_parallelism().ok().map(Into::into),
-            load_average: std::env::var("TOLLGATE_GATE_LOAD").ok(),
-        }
-    }
-}
-
 /// The single-contract body every pre-#99 scenario sent, kept as the fixture
 /// `body(1)` is pinned against.
 ///
@@ -464,34 +448,6 @@ fn distribute_requests(total: usize, connections: NonZeroUsize) -> Vec<usize> {
     (0..connections)
         .map(|index| per_connection + usize::from(index < remainder))
         .collect()
-}
-
-#[derive(Clone)]
-struct MeasurementGate {
-    state: Arc<(Mutex<Option<bool>>, Condvar)>,
-}
-
-impl MeasurementGate {
-    fn new() -> Self {
-        Self {
-            state: Arc::new((Mutex::new(None), Condvar::new())),
-        }
-    }
-
-    fn wait(&self) -> bool {
-        let (lock, wake) = &*self.state;
-        let mut state = lock.lock().expect("measurement gate poisoned");
-        while state.is_none() {
-            state = wake.wait(state).expect("measurement gate poisoned");
-        }
-        state.expect("measurement gate must have a decision")
-    }
-
-    fn release(&self, run: bool) {
-        let (lock, wake) = &*self.state;
-        *lock.lock().expect("measurement gate poisoned") = Some(run);
-        wake.notify_all();
-    }
 }
 
 fn percentile(sorted: &[u64], q: f64) -> f64 {
@@ -818,35 +774,17 @@ async fn measure(
     let samples = async {
         if admission {
             // Wait for readiness: the lease slot must be stocked (#10).
-            wait_ready(address).await?;
+            client::wait_ready(address, std::time::Duration::from_secs(5)).await?;
         }
         run_clients(address, admission, connections, warmup, measured, workload).await
     }
     .await;
 
-    runtime.shutdown_server(server, stop_tx).await?;
-
-    samples
-}
-
-struct MeasuredSamples {
-    /// One entry per connection, in connection order, so a caller can
-    /// attribute results to the tenant that connection spoke as. The original
-    /// scenarios flatten it immediately; the mixed one does not, which is the
-    /// whole reason it is kept split.
-    outcomes: Vec<ClientOutcome>,
-    throughput_requests_per_second: f64,
-}
-
-/// What one connection saw.
-#[derive(Default)]
-struct ClientOutcome {
-    /// Latencies of requests the service *served*. A refusal is not a
-    /// latency sample: including one would let an instance improve its
-    /// percentiles by refusing more work.
-    samples: Vec<u64>,
-    /// Requests refused for want of execution capacity (503).
-    shed: usize,
+    match (samples, runtime.shutdown_server(server, stop_tx).await) {
+        (Ok(samples), Ok(())) => Ok(samples),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(shutdown)) => Err(format!("{error}; shutdown: {shutdown}")),
+    }
 }
 
 async fn run_clients(
@@ -858,192 +796,21 @@ async fn run_clients(
     workload: &Workload,
 ) -> Result<MeasuredSamples, String> {
     let request_body = body(workload.contracts);
-    let warmup_work = distribute_requests(warmup, connections);
-    let measured_work = distribute_requests(measured, connections);
-    let gate = MeasurementGate::new();
-    let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut clients = Vec::with_capacity(connections.get());
-
-    for (index, (warmup, measured)) in warmup_work.into_iter().zip(measured_work).enumerate() {
-        let gate = gate.clone();
-        let ready_tx = ready_tx.clone();
-        let request = http_request(
-            address,
-            admission.then(|| workload.tenant(index).api_key.as_str()),
-            &request_body,
-        );
-        clients.push(tokio::task::spawn_blocking(move || {
-            run_client(address, &request, warmup, measured, ready_tx, gate)
-        }));
-    }
-    drop(ready_tx);
-
-    let mut ready = 0;
-    for _ in 0..connections.get() {
-        if ready_rx.recv().await.is_none() {
-            break;
-        }
-        ready += 1;
-    }
-    let all_ready = ready == connections.get();
-    let measured_started = Instant::now();
-    gate.release(all_ready);
-
-    let mut outcomes = Vec::with_capacity(connections.get());
-    let mut client_errors = Vec::new();
-    for client in clients {
-        match client.await {
-            Ok(outcome) => outcomes.push(outcome),
-            Err(error) => client_errors.push(format!("load-gate client task failed: {error}")),
-        }
-    }
-    let measured_elapsed = measured_started.elapsed();
-
-    let client_error = client_errors.into_iter().next();
-    if !all_ready {
-        return Err(client_error.unwrap_or_else(|| {
-            format!(
-                "only {ready} of {} load-gate clients completed warmup",
-                connections.get()
-            )
-        }));
-    }
-    if let Some(error) = client_error {
-        return Err(error);
-    }
-    // Served requests only: refused ones cost the instance almost nothing, so
-    // counting them would let a saturated service report its best throughput
-    // exactly when it is doing the least work.
-    let served: usize = outcomes.iter().map(|o| o.samples.len()).sum();
-    let throughput_requests_per_second = throughput_for_window(
-        served,
-        measured_elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
-    );
-    Ok(MeasuredSamples {
-        outcomes,
-        throughput_requests_per_second,
-    })
-}
-
-fn throughput_for_window(requests: usize, elapsed_seconds: f64) -> f64 {
-    (requests as f64) / elapsed_seconds
-}
-
-fn run_client(
-    address: std::net::SocketAddr,
-    request: &str,
-    warmup: usize,
-    measured: usize,
-    ready_tx: tokio::sync::mpsc::UnboundedSender<()>,
-    gate: MeasurementGate,
-) -> ClientOutcome {
-    let mut stream = TcpStream::connect(address).expect("connect");
-    stream.set_nodelay(true).expect("set TCP_NODELAY");
-    let mut buf = vec![0u8; 16 * 1024];
-    for _ in 0..warmup {
-        stream.write_all(request.as_bytes()).expect("write warmup");
-        read_response(&mut stream, &mut buf);
-    }
-    ready_tx.send(()).expect("load-gate coordinator stopped");
-    drop(ready_tx);
-    if !gate.wait() {
-        return ClientOutcome::default();
-    }
-
-    let mut outcome = ClientOutcome {
-        samples: Vec::with_capacity(measured),
-        shed: 0,
-    };
-    for _ in 0..measured {
-        let start = Instant::now();
-        stream
-            .write_all(request.as_bytes())
-            .expect("write measured");
-        match read_response(&mut stream, &mut buf) {
-            Served => outcome
-                .samples
-                .push(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)),
-            Shed => outcome.shed += 1,
-        }
-    }
-    outcome
-}
-
-/// What the service did with one request. A capacity refusal is an outcome the
-/// mixed scenario is measuring, not an error — every other status still is.
-#[derive(Clone, Copy, PartialEq)]
-enum Outcome {
-    Served,
-    Shed,
-}
-use Outcome::{Served, Shed};
-
-/// Read one HTTP/1.1 response (headers + content-length body). The gate's
-/// requests are always small and never chunked.
-fn read_response(stream: &mut TcpStream, buf: &mut [u8]) -> Outcome {
-    let mut filled = 0;
-    loop {
-        let n = stream.read(&mut buf[filled..]).expect("read");
-        assert!(n > 0, "server closed connection");
-        filled += n;
-        let head = &buf[..filled];
-        if let Some(header_end) = find_header_end(head) {
-            let headers = std::str::from_utf8(&head[..header_end]).expect("ascii headers");
-            // 503 is the execution-capacity refusal (#99), and the mixed
-            // scenario exists to produce it. Every other status is still a
-            // panic: a gate that quietly accepted 500s would report an
-            // instance that answers nothing as one with excellent latency.
-            let outcome = if headers.starts_with("HTTP/1.1 200") {
-                Served
-            } else if headers.starts_with("HTTP/1.1 503") {
-                Shed
-            } else {
-                panic!(
-                    "unexpected response: {}",
-                    headers.lines().next().unwrap_or("")
-                )
-            };
-            let content_length: usize = headers
-                .lines()
-                .find_map(|l| {
-                    l.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(str::trim)
-                        .map(String::from)
-                })
-                .and_then(|v| v.parse().ok())
-                .expect("content-length");
-            let total = header_end + 4 + content_length;
-            while filled < total {
-                let n = stream.read(&mut buf[filled..]).expect("read body");
-                assert!(n > 0, "server closed mid-body");
-                filled += n;
-            }
-            return outcome;
-        }
-    }
-}
-
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
-}
-
-async fn wait_ready(address: std::net::SocketAddr) -> Result<(), String> {
-    for _ in 0..500 {
-        if let Ok(mut stream) = TcpStream::connect(address) {
-            let request =
-                format!("GET /readyz HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
-            if stream.write_all(request.as_bytes()).is_ok() {
-                let mut response = String::new();
-                let _ = stream.read_to_string(&mut response);
-                if response.starts_with("HTTP/1.1 200") {
-                    return Ok(());
-                }
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    Err("service never became ready".to_owned())
+    let work = distribute_requests(warmup, connections)
+        .into_iter()
+        .zip(distribute_requests(measured, connections))
+        .enumerate()
+        .map(|(index, (warmup, measured))| ClientWork {
+            request: http_request(
+                address,
+                admission.then(|| workload.tenant(index).api_key.as_str()),
+                &request_body,
+            ),
+            warmup,
+            measured,
+        })
+        .collect();
+    drive_clients(address, work).await
 }
 
 fn p50_overhead_ratio(baseline: Percentiles, admitted: Percentiles) -> f64 {
@@ -1190,10 +957,31 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    run(thresholds_path, report_path, verdict_mode)
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    // Tokio's implicit environment parsing and runtime construction panic on
+    // invalid configuration/build failure. This executable owns that boundary
+    // so those failures can use the same report path as client failures.
+    if let Some(workers) = std::env::var_os("TOKIO_WORKER_THREADS") {
+        let Some(workers) = workers
+            .to_str()
+            .and_then(|value| value.parse::<NonZeroUsize>().ok())
+        else {
+            return report_failure(
+                &report_path,
+                "runtime configuration",
+                "TOKIO_WORKER_THREADS must be a positive integer",
+            );
+        };
+        builder.worker_threads(workers.get());
+    }
+    let runtime = match builder.build() {
+        Ok(runtime) => runtime,
+        Err(error) => return report_failure(&report_path, "runtime startup", &error.to_string()),
+    };
+    runtime.block_on(run(thresholds_path, report_path, verdict_mode))
 }
 
-#[tokio::main]
 async fn run(
     thresholds_path: PathBuf,
     report_path: PathBuf,
@@ -1202,22 +990,19 @@ async fn run(
     let thresholds_json = match std::fs::read_to_string(&thresholds_path) {
         Ok(contents) => contents,
         Err(error) => {
-            eprintln!("read {}: {error}", thresholds_path.display());
-            return ExitCode::FAILURE;
+            return report_failure(&report_path, "read thresholds", &error.to_string());
         }
     };
     let thresholds: Thresholds = match serde_json::from_str(&thresholds_json) {
         Ok(thresholds) => thresholds,
         Err(error) => {
-            eprintln!("parse {}: {error}", thresholds_path.display());
-            return ExitCode::FAILURE;
+            return report_failure(&report_path, "parse thresholds", &error.to_string());
         }
     };
     let concurrent_connections = match thresholds.validate() {
         Ok(connections) => connections,
         Err(error) => {
-            eprintln!("invalid {}: {error}", thresholds_path.display());
-            return ExitCode::FAILURE;
+            return report_failure(&report_path, "validate thresholds", &error);
         }
     };
     let sequential_connection = NonZeroUsize::new(1).expect("one is nonzero");
@@ -1234,8 +1019,7 @@ async fn run(
     let baseline = match baseline {
         Ok(result) => result,
         Err(error) => {
-            eprintln!("sequential baseline failed: {error}");
-            return ExitCode::FAILURE;
+            return report_failure(&report_path, "sequential baseline", &error);
         }
     };
     let admitted = run_scenario(
@@ -1249,8 +1033,7 @@ async fn run(
     let admitted = match admitted {
         Ok(result) => result,
         Err(error) => {
-            eprintln!("sequential admitted scenario failed: {error}");
-            return ExitCode::FAILURE;
+            return report_failure(&report_path, "sequential admitted scenario", &error);
         }
     };
     let concurrent_baseline = run_scenario(
@@ -1264,8 +1047,7 @@ async fn run(
     let concurrent_baseline = match concurrent_baseline {
         Ok(result) => result,
         Err(error) => {
-            eprintln!("concurrent baseline failed: {error}");
-            return ExitCode::FAILURE;
+            return report_failure(&report_path, "concurrent baseline", &error);
         }
     };
     let concurrent_admitted = run_scenario(
@@ -1279,8 +1061,7 @@ async fn run(
     let concurrent_admitted = match concurrent_admitted {
         Ok(result) => result,
         Err(error) => {
-            eprintln!("concurrent admitted scenario failed: {error}");
-            return ExitCode::FAILURE;
+            return report_failure(&report_path, "concurrent admitted scenario", &error);
         }
     };
 
@@ -1299,8 +1080,7 @@ async fn run(
     {
         Ok(result) => result,
         Err(error) => {
-            eprintln!("distinct-account baseline failed: {error}");
-            return ExitCode::FAILURE;
+            return report_failure(&report_path, "distinct-account baseline", &error);
         }
     };
     let distinct_admitted = match run_scenario(
@@ -1314,8 +1094,7 @@ async fn run(
     {
         Ok(result) => result,
         Err(error) => {
-            eprintln!("distinct-account admitted scenario failed: {error}");
-            return ExitCode::FAILURE;
+            return report_failure(&report_path, "distinct-account admitted scenario", &error);
         }
     };
 
@@ -1333,15 +1112,13 @@ async fn run(
     {
         Ok(result) => result,
         Err(error) => {
-            eprintln!("ungated mixed scenario failed: {error}");
-            return ExitCode::FAILURE;
+            return report_failure(&report_path, "ungated mixed scenario", &error);
         }
     };
     let pool = match reserved_mode(concurrent_connections) {
         Ok(pool) => pool,
         Err(error) => {
-            eprintln!("mixed scenario configuration failed: {error}");
-            return ExitCode::FAILURE;
+            return report_failure(&report_path, "mixed scenario configuration", &error);
         }
     };
     let mixed_uniform = match run_mixed_scenario(
@@ -1356,8 +1133,7 @@ async fn run(
     {
         Ok(result) => result,
         Err(error) => {
-            eprintln!("uniform mixed control failed: {error}");
-            return ExitCode::FAILURE;
+            return report_failure(&report_path, "uniform mixed control", &error);
         }
     };
 
@@ -1371,8 +1147,7 @@ async fn run(
     {
         Ok(result) => result,
         Err(error) => {
-            eprintln!("mixed saturation scenario failed: {error}");
-            return ExitCode::FAILURE;
+            return report_failure(&report_path, "mixed saturation scenario", &error);
         }
     };
 
@@ -1550,18 +1325,8 @@ async fn run(
             .max_mixed_assured_p50_overhead_ratio
             .map_or_else(|| "disabled".to_owned(), |max| format!("x{max:.3}")),
     );
-    if let Some(parent) = report_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let report_json = match serde_json::to_string_pretty(&report) {
-        Ok(json) => json,
-        Err(error) => {
-            eprintln!("serialize load-gate report: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    if let Err(error) = std::fs::write(&report_path, report_json) {
-        eprintln!("write {}: {error}", report_path.display());
+    if let Err(error) = write_report(&report_path, &report) {
+        eprintln!("load-gate: FAIL — report unavailable: {error}");
         return ExitCode::FAILURE;
     }
 
@@ -1583,12 +1348,19 @@ async fn run(
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_clients_publish_diagnostics_without_measurements() {
+        let directory = tempfile::tempdir().unwrap();
+        load_failures::exercise(directory.path()).await;
+    }
+
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
     fn valid_thresholds() -> Thresholds {
         Thresholds {
+            _comment: serde::de::IgnoredAny,
             warmup_requests: 8,
             measured_requests: 16,
             concurrent_connections: 4,
@@ -1851,40 +1623,12 @@ mod tests {
         assert!(local.validate().is_ok());
         assert!(ci.validate().is_ok());
 
-        let missing_p50 = ci_json.replace("  \"max_p50_ns\": null,\n", "");
-        let missing_p99 = ci_json.replace("  \"max_p99_ns\": null,\n", "");
-        let missing_throughput =
-            ci_json.replace("  \"min_throughput_requests_per_second\": null,\n", "");
-        let missing_concurrent_throughput = ci_json.replace(
-            "  \"min_concurrent_throughput_requests_per_second\": null,\n",
-            "",
-        );
-        assert!(serde_json::from_str::<Thresholds>(&missing_p50).is_err());
-        assert!(serde_json::from_str::<Thresholds>(&missing_p99).is_err());
-        assert!(serde_json::from_str::<Thresholds>(&missing_throughput).is_err());
-        assert!(serde_json::from_str::<Thresholds>(&missing_concurrent_throughput).is_err());
-
-        // #99's ceilings obey the same rule. A `null` says "deliberately
-        // disabled" and reports as such; an *absent* key would default to the
-        // same `None` and silently read as a measurement nobody took, which is
-        // the distinction `deserialize_required_option` exists to keep.
         assert!(ci.max_distinct_account_p50_overhead_ratio.is_none());
         assert!(ci.max_mixed_assured_p50_overhead_ratio.is_none());
-        for key in [
-            "  \"max_distinct_account_p50_overhead_ratio\": null,\n",
-            "  \"max_mixed_assured_p50_overhead_ratio\": null,\n",
-        ] {
-            let without = ci_json.replace(key, "");
-            assert_ne!(without, ci_json, "the manifest must contain {key}");
-            assert!(
-                serde_json::from_str::<Thresholds>(&without).is_err(),
-                "omitting {key} must be invalid, not silently disabled"
-            );
-        }
 
         // The two shed fractions are not host-dependent, so both manifests
-        // carry the same values: assured work is never shed, and a run that
-        // sheds no best-effort work has not saturated.
+        // carry the same values: assured work has a measured shed advantage,
+        // and a run that sheds no best-effort work has not saturated.
         assert_eq!(
             local.min_assured_shed_advantage,
             ci.min_assured_shed_advantage
@@ -1902,13 +1646,64 @@ mod tests {
     }
 
     #[test]
-    fn measurement_gate_publishes_run_and_abort_decisions() {
-        for decision in [true, false] {
-            let gate = MeasurementGate::new();
-            let waiter = gate.clone();
-            let thread = std::thread::spawn(move || waiter.wait());
-            gate.release(decision);
-            assert_eq!(thread.join().unwrap(), decision);
+    fn every_load_setting_is_required_independent_of_json_layout() {
+        for source in [
+            include_str!("../../../../testing/load_thresholds.json"),
+            include_str!("../../../../testing/load_thresholds_ci.json"),
+        ] {
+            let value: std::collections::BTreeMap<String, serde_json::Value> =
+                serde_json::from_str(source).unwrap();
+            // Compact and pretty serialization also reorder the original
+            // object by key. Neither layout changes the configuration contract.
+            for json in [
+                serde_json::to_string(&value).unwrap(),
+                serde_json::to_string_pretty(&value).unwrap(),
+            ] {
+                let input: serde_json::Value = serde_json::from_str(&json).unwrap();
+                let complete: Thresholds = serde_json::from_str(&json).unwrap();
+                assert!(complete.validate().is_ok());
+                for key in input
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .filter(|key| key.as_str() != "_comment")
+                {
+                    let mut missing = input.clone();
+                    assert!(missing.as_object_mut().unwrap().remove(key).is_some());
+                    let error = serde_json::from_value::<Thresholds>(missing)
+                        .err()
+                        .expect("absent settings cannot silently disable a bound");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(&format!("missing field `{key}`")),
+                        "{key}: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn load_settings_accept_documented_comments_and_reject_unknown_keys() {
+        let input: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../testing/load_thresholds_ci.json"))
+                .unwrap();
+        assert!(serde_json::from_value::<Thresholds>(input.clone()).is_ok());
+        let mut without_comment = input.clone();
+        without_comment.as_object_mut().unwrap().remove("_comment");
+        assert!(serde_json::from_value::<Thresholds>(without_comment).is_ok());
+        for key in ["max_p50_ns_typo", "_unrecognized_setting"] {
+            let mut invalid = input.clone();
+            invalid[key] = 10.into();
+            let error = serde_json::from_value::<Thresholds>(invalid)
+                .err()
+                .expect("unknown load key must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown field `{key}`"))
+            );
         }
     }
 
@@ -2556,6 +2351,9 @@ mod tests {
         )
         .await
         .expect("client failure must not deadlock");
-        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.starts_with("client 0: connect:"), "{error}");
+        assert!(error.contains("client 1: connect:"), "{error}");
+        assert!(!error.contains("task did not complete"), "{error}");
     }
 }

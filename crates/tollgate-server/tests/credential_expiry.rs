@@ -155,6 +155,8 @@ async fn postgres_expiry_reaches_http_projection_and_session_exactly() {
     let store = tollgate_store_postgres::PostgresStore::connect(&url, GrantPolicy::default())
         .await
         .unwrap();
-    store.truncate_all().await.unwrap();
+    tollgate_store_postgres::test_support::truncate_all(&store)
+        .await
+        .unwrap();
     exact_projection(store).await;
 }

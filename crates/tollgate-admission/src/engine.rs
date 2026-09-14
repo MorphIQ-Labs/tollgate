@@ -947,7 +947,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(10000));
+        drop(slot.replace(lease(10000)));
         let mut original = (*snapshot(AccountStatus::Active)).clone();
         original.key_id = Some(tollgate_core::KeyId(1));
         engine
@@ -1080,7 +1080,7 @@ mod tests {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
         if let Some(units) = lease_units {
-            slot.install(lease(units));
+            drop(slot.replace(lease(units)));
         }
         engine.map().install(Principal(1), snapshot(status), slot);
         engine
@@ -1096,7 +1096,7 @@ mod tests {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
         if let Some(units) = lease_units {
-            slot.install(lease(units));
+            drop(slot.replace(lease(units)));
         }
         let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
         snapshot.enforcement_mode = EnforcementMode::Elastic {
@@ -1143,7 +1143,7 @@ mod tests {
     fn elastic_admits_past_an_expired_lease() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease_until(1_000, t(5)));
+        drop(slot.replace(lease_until(1_000, t(5))));
         let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
         snapshot.enforcement_mode = EnforcementMode::Elastic {
             overage_cap: CostUnits(1_000),
@@ -1261,7 +1261,7 @@ mod tests {
             let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
             let slot = LeaseSlot::for_account(AccountId(1));
             if let Some(initial_lease) = initial_lease {
-                slot.install(initial_lease);
+                drop(slot.replace(initial_lease));
             }
             let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
             snapshot.enforcement_mode = EnforcementMode::Elastic {
@@ -1286,7 +1286,7 @@ mod tests {
             );
             assert_eq!(denied.retry(), Retry::Transient, "lease was {name}");
 
-            slot.install(lease(51));
+            drop(slot.replace(lease(51)));
             let admitted = engine
                 .admit_one(request(1), now)
                 .unwrap_or_else(|denied| panic!("a refill must recover {name}: {denied}"));
@@ -1314,7 +1314,7 @@ mod tests {
         let sharding = LocalSharding::new(std::num::NonZeroUsize::new(THREADS).unwrap());
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::with_sharding(sharding));
         let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
-        slot.install(lease(0));
+        drop(slot.replace(lease(0)));
         let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
         snapshot.enforcement_mode = EnforcementMode::Elastic {
             overage_cap: CostUnits(102),
@@ -1386,7 +1386,7 @@ mod tests {
         let sharding = LocalSharding::new(std::num::NonZeroUsize::new(8).unwrap());
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::with_sharding(sharding));
         let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
-        slot.install(lease(1_000));
+        drop(slot.replace(lease(1_000)));
         let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
         snapshot.enforcement_mode = EnforcementMode::Elastic {
             overage_cap: CostUnits(1_000),
@@ -1491,7 +1491,7 @@ mod tests {
     fn every_principal_of_an_account_shares_one_cap() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(0));
+        drop(slot.replace(lease(0)));
         let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
         snapshot.enforcement_mode = EnforcementMode::Elastic {
             overage_cap: CostUnits(51),
@@ -1536,7 +1536,7 @@ mod tests {
     fn divergent_caps_bound_an_account_by_the_largest_not_the_sum() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(0));
+        drop(slot.replace(lease(0)));
         for (principal, cap) in [(Principal(1), 51u64), (Principal(2), 102)] {
             let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
             snapshot.enforcement_mode = EnforcementMode::Elastic {
@@ -1679,7 +1679,7 @@ mod tests {
 
     fn install_budget(engine: &AdmissionEngine<ArcSwapSnapshotMap>, balance: u64, generation: u64) {
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(1_000_000));
+        drop(slot.replace(lease(1_000_000)));
         let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
         snapshot.generation = Generation(generation);
         snapshot.budget = Some(BudgetView {
@@ -1865,7 +1865,7 @@ mod tests {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
         let installed = lease(10_000);
-        slot.install(Arc::clone(&installed));
+        drop(slot.replace(Arc::clone(&installed)));
         engine
             .map()
             .install(Principal(1), snapshot(AccountStatus::Active), slot);
@@ -2014,7 +2014,7 @@ mod tests {
     fn a_commit_time_funding_refusal_is_counted_under_its_own_reason() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease_until(10_000, t(100)));
+        drop(slot.replace(lease_until(10_000, t(100))));
         engine
             .map()
             .install(Principal(1), snapshot(AccountStatus::Active), slot);
@@ -2060,7 +2060,7 @@ mod tests {
     fn a_commit_time_fallback_is_counted_under_its_own_qualifier() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease_until(10_000, t(100)));
+        drop(slot.replace(lease_until(10_000, t(100))));
         let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
         snapshot.enforcement_mode = EnforcementMode::Elastic {
             overage_cap: CostUnits(10_000),
@@ -2122,7 +2122,7 @@ mod tests {
         let revision = PolicyRevision([0x11; 32]);
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(10_000));
+        drop(slot.replace(lease(10_000)));
         engine
             .map()
             .install(Principal(1), snapshot_with_revision(revision), slot);
@@ -2174,7 +2174,7 @@ mod tests {
         let second = PolicyRevision([0x02; 32]);
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(10_000));
+        drop(slot.replace(lease(10_000)));
         engine.map().install(
             Principal(1),
             snapshot_with_revision(first),
@@ -2259,7 +2259,7 @@ mod tests {
         for now in [t(9), t(10)] {
             let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
             let slot = LeaseSlot::for_account(AccountId(1));
-            slot.install(lease(10_000));
+            drop(slot.replace(lease(10_000)));
             let mut original = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
             original.valid_until = t(10);
             engine
@@ -2292,7 +2292,7 @@ mod tests {
         fn check(map: impl SnapshotMap) {
             let map = Arc::new(map);
             let slot = LeaseSlot::for_account(AccountId(1));
-            slot.install(lease(10_000));
+            drop(slot.replace(lease(10_000)));
             map.install(Principal(1), snapshot(AccountStatus::Active), slot);
             let first = AdmissionEngine::new(Arc::clone(&map));
             let second = AdmissionEngine::new(Arc::clone(&map));
@@ -2408,7 +2408,7 @@ mod tests {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
         let installed = lease(10_000);
-        slot.install(Arc::clone(&installed));
+        drop(slot.replace(Arc::clone(&installed)));
         engine
             .map()
             .install(Principal(1), snapshot(AccountStatus::Active), slot);
@@ -2464,7 +2464,7 @@ mod tests {
     fn a_strict_expiry_at_execution_start_produces_no_committed_guard() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease_until(10_000, t(100)));
+        drop(slot.replace(lease_until(10_000, t(100))));
         engine
             .map()
             .install(Principal(1), snapshot(AccountStatus::Active), slot);
@@ -2492,7 +2492,7 @@ mod tests {
     fn an_elastic_expiry_at_execution_start_produces_a_guard_billed_as_overage() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease_until(10_000, t(100)));
+        drop(slot.replace(lease_until(10_000, t(100))));
         let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
         snapshot.enforcement_mode = EnforcementMode::Elastic {
             overage_cap: CostUnits(10_000),
@@ -2526,7 +2526,7 @@ mod tests {
     fn a_commit_time_fallback_beyond_the_cap_reports_the_overage_refusal() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease_until(10_000, t(100)));
+        drop(slot.replace(lease_until(10_000, t(100))));
         let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
         // A cap far below any quote this request can produce.
         snapshot.enforcement_mode = EnforcementMode::Elastic {
@@ -2642,7 +2642,7 @@ mod tests {
         let snapshot = Arc::new(snapshot);
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(1_000_000));
+        drop(slot.replace(lease(1_000_000)));
         engine.map().install(Principal(1), snapshot, slot);
 
         let req = request(50); // 50 + 50 fixed = 100 units
@@ -2691,7 +2691,7 @@ mod tests {
     fn changing_disabled_weighted_fallback_does_not_refill_request_rate() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(1_000_000));
+        drop(slot.replace(lease(1_000_000)));
 
         let mut original = (*snapshot(AccountStatus::Active)).clone();
         original.limits = ResolvedLimits::new(64)
@@ -2729,7 +2729,7 @@ mod tests {
     fn enabling_request_rate_does_not_refill_weighted_rate() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(1_000_000));
+        drop(slot.replace(lease(1_000_000)));
 
         let mut weighted_only = (*snapshot(AccountStatus::Active)).clone();
         weighted_only.limits = ResolvedLimits::new(64).with_weighted_rate(1, 51);
@@ -2773,7 +2773,7 @@ mod tests {
     fn divergent_enabled_snapshot_cannot_outlive_a_disabled_account_bucket() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(1_000_000));
+        drop(slot.replace(lease(1_000_000)));
 
         let mut disabled = (*snapshot(AccountStatus::Active)).clone();
         disabled.limits = ResolvedLimits::new(64)
@@ -2817,7 +2817,7 @@ mod tests {
     fn divergent_disabled_snapshot_cannot_bypass_an_enabled_account_bucket() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(1_000_000));
+        drop(slot.replace(lease(1_000_000)));
 
         let mut enabled = (*snapshot(AccountStatus::Active)).clone();
         enabled.limits = ResolvedLimits::new(64).with_weighted_rate(1, 51);
@@ -2854,7 +2854,7 @@ mod tests {
         let sharding = LocalSharding::new(std::num::NonZeroUsize::new(8).unwrap());
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::with_sharding(sharding));
         let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
-        slot.install(lease(1_000_000));
+        drop(slot.replace(lease(1_000_000)));
 
         let priced = |quote: u64| {
             let snapshot = Arc::new(
@@ -2919,7 +2919,7 @@ mod tests {
     fn every_principal_observes_the_canonical_account_concurrency_ceiling() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(1_000_000));
+        drop(slot.replace(lease(1_000_000)));
 
         let mut bounded = (*snapshot(AccountStatus::Active)).clone();
         bounded.limits = ResolvedLimits::new(64)
@@ -2969,7 +2969,7 @@ mod tests {
     fn newer_account_concurrency_policy_reaches_existing_principals() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(1_000_000));
+        drop(slot.replace(lease(1_000_000)));
 
         let mut original = (*snapshot(AccountStatus::Active)).clone();
         original.limits = ResolvedLimits::new(64)
@@ -3007,7 +3007,7 @@ mod tests {
     fn enabling_account_concurrency_counts_already_in_flight_work() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(1_000_000));
+        drop(slot.replace(lease(1_000_000)));
 
         let held = {
             let mut unlimited = (*snapshot(AccountStatus::Active)).clone();
@@ -3041,7 +3041,7 @@ mod tests {
     fn enabling_principal_concurrency_counts_already_in_flight_work() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(1_000_000));
+        drop(slot.replace(lease(1_000_000)));
 
         let mut account_only = (*snapshot(AccountStatus::Active)).clone();
         account_only.limits = ResolvedLimits::new(64)
@@ -3076,7 +3076,7 @@ mod tests {
     fn reenabled_account_concurrency_counts_work_admitted_while_disabled() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(1_000_000));
+        drop(slot.replace(lease(1_000_000)));
 
         let mut initially_limited = (*snapshot(AccountStatus::Active)).clone();
         initially_limited.limits = ResolvedLimits::new(64)
@@ -3120,7 +3120,7 @@ mod tests {
     fn a_principal_ceiling_narrows_without_bypassing_the_account_ceiling() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(1_000_000));
+        drop(slot.replace(lease(1_000_000)));
         let limits = ResolvedLimits::new(64)
             .with_weighted_rate(1_000_000, 1_000_000)
             .with_concurrency(
@@ -3199,7 +3199,7 @@ mod tests {
         let snapshot = Arc::new(snapshot);
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(1_000_000));
+        drop(slot.replace(lease(1_000_000)));
         engine.map().install(Principal(1), snapshot, slot);
         engine
     }
@@ -3334,7 +3334,7 @@ mod tests {
         let heavy = PublishableSnapshot::try_new(Arc::new(heavy)).unwrap();
 
         let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
-        slot.install(lease(1_000_000));
+        drop(slot.replace(lease(1_000_000)));
         engine
             .map()
             .install_publishable(Principal(1), light, Arc::clone(&slot));
@@ -3437,7 +3437,7 @@ mod tests {
         // and this slot would never be reached.
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease_until(10_000, t(100)));
+        drop(slot.replace(lease_until(10_000, t(100))));
         engine
             .map()
             .install(Principal(1), snapshot(AccountStatus::Active), slot);
@@ -3461,7 +3461,7 @@ mod tests {
         let overflowing = Arc::new(overflowing);
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(u64::MAX));
+        drop(slot.replace(lease(u64::MAX)));
         engine.map().install(Principal(1), overflowing, slot);
         assert_eq!(
             engine.admit_one(request(4), t(0)).unwrap_err(),
@@ -3525,7 +3525,7 @@ mod tests {
             engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::LeaseUnavailable
         );
-        slot.install(lease(10_000));
+        drop(slot.replace(lease(10_000)));
         engine.admit_one(request(1), t(0)).unwrap();
     }
 
@@ -3538,7 +3538,7 @@ mod tests {
     fn a_workload_requiring_ungranted_bits_is_denied_at_stage_two() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(1_000));
+        drop(slot.replace(lease(1_000)));
         engine
             .map()
             .install(Principal(1), snapshot_without_work_permission(), slot);
@@ -3559,7 +3559,7 @@ mod tests {
     fn a_workload_within_granted_bits_admits() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        slot.install(lease(1_000));
+        drop(slot.replace(lease(1_000)));
         let snapshot = Arc::new(
             AccountSnapshot::builder(
                 AccountId(1),

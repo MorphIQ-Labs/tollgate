@@ -18,7 +18,7 @@ axum = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # fast-rng: v4 ids from a userspace CSPRNG seeded once — a getrandom
@@ -38,6 +38,11 @@ path = "src/main.rs"
 [[bin]]
 name = "load_gate"
 path = "src/bin/load_gate.rs"
+
+[[example]]
+name = "load_gate_failure_probe"
+path = "tests/fixtures/load_gate_failure_probe.rs"
+test = false
 
 [lints.rust]
 unsafe_code = "forbid"

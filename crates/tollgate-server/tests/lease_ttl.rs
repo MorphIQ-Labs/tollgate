@@ -102,7 +102,9 @@ async fn postgres_and_http_preserve_ttl_across_acquire_and_consolidation() {
         return;
     };
     let store = PostgresStore::connect(&url, policy()).await.unwrap();
-    store.truncate_all().await.unwrap();
+    tollgate_store_postgres::test_support::truncate_all(&store)
+        .await
+        .unwrap();
     AdminStore::create_account(
         &*store,
         AccountConfig {

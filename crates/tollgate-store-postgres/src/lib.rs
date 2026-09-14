@@ -29,6 +29,9 @@
 
 mod instant;
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 use instant::StoredInstant;
 use std::num::{NonZeroI64, NonZeroUsize};
 use std::sync::Arc;
@@ -617,6 +620,26 @@ where
     }
 }
 
+/// Fixture reset is available only in the opt-in `test_support` module,
+/// never as a method on a normal store handle.
+///
+/// ```compile_fail,E0599
+/// # use tollgate_store_postgres::PostgresStore;
+/// fn reset(store: &PostgresStore) {
+///     let _ = store.truncate_all();
+/// }
+/// ```
+///
+/// Query-plan inspection, which refreshes database statistics, is likewise
+/// absent from the operational handle:
+///
+/// ```compile_fail,E0599
+/// # use tollgate_store_postgres::PostgresStore;
+/// # use tollgate_core::AccountId;
+/// fn explain(store: &PostgresStore) {
+///     let _ = store.explain_active_lease_sum(AccountId(1));
+/// }
+/// ```
 pub struct PostgresStore {
     pool: PgPool,
     policy: GrantPolicy,
@@ -693,7 +716,6 @@ impl PostgresStore {
         Ok(Arc::new(PostgresStore { pool, policy, push }))
     }
 
-    /// Test/reset helper: drop all quota rows (not the schema).
     /// Broadcast a control-plane change to in-process subscribers. No
     /// receivers is not a failure — a pull still observes the change — but
     /// how many instances the push reached is the difference between
@@ -707,46 +729,6 @@ impl PostgresStore {
             subscribers,
             "snapshot pushed to subscribers"
         );
-    }
-
-    /// The plan PostgreSQL chooses for the active-lease sum inside
-    /// [`Self::conservation`] — the query migration 0005's partial index
-    /// exists to serve (#12).
-    ///
-    /// Whether an index is *used* is a claim only the planner can settle, and
-    /// this explains the same query string `conservation` runs rather than one
-    /// a test wrote: a hand-copied query would keep reporting an index scan
-    /// long after the real predicate had drifted away from the index.
-    ///
-    /// Statistics are refreshed first. `TRUNCATE` resets `reltuples` to zero
-    /// and autoanalyze runs on its own schedule, so a plan chosen immediately
-    /// after a load would describe an empty table rather than a real one.
-    pub async fn explain_active_lease_sum(&self, account: AccountId) -> Result<String, StoreError> {
-        sqlx::raw_sql("ANALYZE tollgate_leases")
-            .execute(&self.pool)
-            .await
-            .map_err(storage)?;
-        let rows = sqlx::query(&format!("EXPLAIN {ACTIVE_LEASE_SUM_SQL}"))
-            .bind(id_bytes(account.0))
-            .fetch_all(&self.pool)
-            .await
-            .map_err(storage)?;
-        Ok(rows
-            .iter()
-            .map(|row| row.get::<String, _>(0))
-            .collect::<Vec<_>>()
-            .join("\n"))
-    }
-
-    pub async fn truncate_all(&self) -> Result<(), StoreError> {
-        sqlx::raw_sql(
-            "TRUNCATE tollgate_credential_keys, tollgate_usage_events, tollgate_leases, \
-             tollgate_snapshots, tollgate_accounts CASCADE",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(storage)?;
-        Ok(())
     }
 
     // ---- reconciliation / test surface (mirrors MemoryStore) ---------

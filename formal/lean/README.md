@@ -32,13 +32,14 @@ This Lean package contains exact models for critical contracts:
   proves that transfer retains occupancy and that only finishing either the
   pending or execution owner releases it; Rust's private fields, behavior
   witness, and compile-fail witness connect that model to the API.
-- `Conservation` models the per-account ledger equation
-  `deposited + overage = balance + activeGrants + settledUsage + loss` and
+- [`Conservation`](Tollgate/Conservation.lean) models the per-account ledger equation
+  `deposited + overage = balance + activeGrants + settledUsage + loss + expired`,
+  where `balance = allowanceBalance + topupBalance`, and
   proves each transition preserves it: deposit, acquire, release, reclaim, a
-  straggler on a settled lease, and the overage ingest issue #1 adds. It also
-  proves the negative that earns the funding column — billing overage without
-  funding it *always* breaks the equation, by exactly the overage — and that an
-  accepted debit never carries the counter past its cap.
+  straggler on a settled lease, overage ingest, and budget rollover. It also
+  proves that billing overage without funding it, or discarding an allowance
+  without recording its expiry, breaks the equation by exactly the omitted
+  units. An accepted overage debit never carries the counter past its cap.
 - `OveragePublication` models the observer-visible split between pending and
   committed overage and the publication marker around the reservation phase
   CAS. It proves an in-flight commit is never reported as refundable, stable

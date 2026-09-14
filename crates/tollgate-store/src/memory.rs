@@ -5,9 +5,8 @@
 //! auditable. A real backend (Postgres) must reproduce exactly these rules —
 //! the shared correctness suite in `tests/` runs against both.
 //!
-//! Conservation ledger (checked by `MemoryStore::conservation`): for every
-//! account,
-//! `initial deposits == balance + Σ active-lease grants + Σ settled usage + Σ settlement losses`.
+//! [`MemoryStore::conservation`] returns the per-account ledger checked by
+//! [`Conservation::holds`], including overage funding and expired allowances.
 //! Usage recorded against a still-active lease lives *inside* that lease's
 //! grant (the grant was debited whole at acquire), so it only stands alone in
 //! the equation once the lease settles. A settlement loss is billing a
@@ -32,7 +31,7 @@
 //!   bounded by the number of principals rather than by traffic.
 //!
 //! The *sweep* cost does not follow that growth. Active leases are indexed
-//! (see [`crate::leases`]), so reclaim and [`MemoryStore::conservation`] walk
+//! in the private `leases` module, so reclaim and [`MemoryStore::conservation`] walk
 //! the live population, not the historical one (#23). Memory still does grow,
 //! so this backend suits development and demos but not soak or load testing;
 //! [`MemoryStore::stored_records`] reports the numbers, and the server logs

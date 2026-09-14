@@ -261,7 +261,9 @@ async fn activity_and_source_identity_survive_restart_and_reset_together() {
         activity[1].state,
         tollgate_store::CredentialActivityState::Unobserved
     );
-    reopened.truncate_all().await.unwrap();
+    tollgate_store_postgres::test_support::truncate_all(&reopened)
+        .await
+        .unwrap();
     let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tollgate_credential_activity")
         .fetch_one(&pool)
         .await
@@ -321,7 +323,9 @@ async fn store() -> Option<std::sync::Arc<PostgresStore>> {
     let store = PostgresStore::connect(&url, GrantPolicy::default())
         .await
         .expect("isolated PostgreSQL fixture connects");
-    store.truncate_all().await.unwrap();
+    tollgate_store_postgres::test_support::truncate_all(&store)
+        .await
+        .unwrap();
     Some(store)
 }
 

@@ -44,6 +44,8 @@ See [usage accounting](docs/USAGE_ACCOUNTING.md) for batch rejection semantics,
 PostgreSQL numeric limits, and database-guard migration and recovery.
 See [snapshot operations](docs/SNAPSHOT_OPERATIONS.md) for generation-refusal
 diagnostics and retained readiness after task exit.
+See [lease ownership and test support](docs/LEASE_OWNERSHIP.md) for explicit
+grant retirement and PostgreSQL fixture API migration.
 
 ## Quickstart
 
@@ -135,8 +137,10 @@ thresholds require deliberate calibration evidence.
 - Readiness is continuous, covering snapshot freshness/task health, lease
   usability, and accounting-writer health rather than only initial loading.
 - Leases bound spend; usage events are the billing truth; per-account
-  conservation (`deposited == balance + active grants + settled usage +
-  loss`) is asserted exactly in every backend's suite.
+  conservation (`deposited + overage_recorded == balance + active grants +
+  settled usage + settlement loss + expired`) is asserted exactly in every
+  backend's suite. The [ledger contract](INVARIANTS.md) explains overage
+  funding and expired allowances.
 - Backends are honest trait implementations: the memory store is the
   executable spec, and Postgres passes the same scenario suite by name.
 - Every failure here is silent and recoverable by design, so the signals are

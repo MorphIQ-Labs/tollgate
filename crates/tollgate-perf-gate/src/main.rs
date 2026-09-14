@@ -90,7 +90,14 @@ enum Command {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Manifest {
+    // Documentation is explicitly inert. It must not make misspelled policy
+    // keys disappear into serde's general unknown-field fallback.
+    #[serde(default)]
+    _comment: serde::de::IgnoredAny,
+    #[serde(default)]
+    _reserved_ids: serde::de::IgnoredAny,
     benchmarks: Vec<Entry>,
     #[serde(default)]
     ratios: Vec<RatioBound>,
@@ -99,20 +106,27 @@ struct Manifest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RatioBound {
+    #[serde(default)]
+    _comment: serde::de::IgnoredAny,
     numerator: String,
     denominator: String,
     max_ratio: f64,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Entry {
+    #[serde(default)]
+    _comment: serde::de::IgnoredAny,
     id: String,
     target_ns: f64,
     threshold_ns: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct BaselineHost {
     id: String,
     architecture: String,
@@ -122,6 +136,7 @@ struct BaselineHost {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Baseline {
     host: BaselineHost,
     recorded_at: String,
@@ -137,6 +152,7 @@ struct Baseline {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct BaselineEntry {
     id: String,
     mean_ns: f64,
@@ -180,6 +196,7 @@ const BASELINE_PROFILE: &str = "criterion release";
 
 /// When to stop believing a run.
 #[derive(Deserialize, Serialize, Clone, Copy, Debug)]
+#[serde(deny_unknown_fields)]
 struct TrustPolicy {
     /// Relative change against the previous run at which a benchmark counts
     /// as having moved.
@@ -2216,9 +2233,12 @@ mod tests {
 
     fn recording_manifest(ids: &[&str]) -> Manifest {
         Manifest {
+            _comment: serde::de::IgnoredAny,
+            _reserved_ids: serde::de::IgnoredAny,
             benchmarks: ids
                 .iter()
                 .map(|id| Entry {
+                    _comment: serde::de::IgnoredAny,
                     id: (*id).to_owned(),
                     target_ns: 10.0,
                     threshold_ns: 100.0,
@@ -3149,6 +3169,146 @@ mod tests {
         assert_eq!(manifest.trust.moved_shift, default_shift());
         assert_eq!(manifest.trust.moved_fraction, default_fraction());
         assert_eq!(manifest.trust.max_ci_width, default_ci_width());
+        assert_eq!(
+            manifest.trust.unstable_fraction,
+            default_unstable_fraction()
+        );
+    }
+
+    #[test]
+    fn misspelled_gate_settings_never_become_defaults() {
+        let minimal = serde_json::json!({
+            "benchmarks": [{"id": "a", "target_ns": 1.0, "threshold_ns": 2.0}]
+        });
+        for key in ["trust", "ratios"] {
+            let mut input = minimal.clone();
+            input[format!("{key}_typo")] = serde_json::json!({});
+            let error = serde_json::from_value::<Manifest>(input)
+                .err()
+                .expect("unknown key must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown field `{key}_typo`"))
+            );
+        }
+        for key in [
+            "moved_shift",
+            "moved_fraction",
+            "max_ci_width",
+            "unstable_fraction",
+        ] {
+            let mut input = minimal.clone();
+            input["trust"] = serde_json::json!({format!("{key}_typo"): 0.2});
+            let error = serde_json::from_value::<Manifest>(input)
+                .err()
+                .expect("unknown trust key must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown field `{key}_typo`"))
+            );
+        }
+    }
+
+    #[test]
+    fn partial_trust_settings_preserve_explicit_values_and_omitted_defaults() {
+        for (field, value) in [
+            ("moved_shift", 0.2),
+            ("moved_fraction", 0.25),
+            ("max_ci_width", 0.05),
+            ("unstable_fraction", 0.15),
+        ] {
+            let input = serde_json::json!({"benchmarks": [], "trust": {field: value}});
+            let parsed: Manifest = serde_json::from_value(input).unwrap();
+            let mut expected = serde_json::json!({
+                "moved_shift": 0.40, "moved_fraction": 0.34,
+                "max_ci_width": 0.10, "unstable_fraction": 0.10,
+            });
+            expected[field] = value.into();
+            assert_eq!(serde_json::to_value(parsed.trust).unwrap(), expected);
+        }
+        let empty: TrustPolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            serde_json::to_value(empty).unwrap(),
+            serde_json::json!({
+                "moved_shift": 0.40, "moved_fraction": 0.34,
+                "max_ci_width": 0.10, "unstable_fraction": 0.10,
+            })
+        );
+    }
+
+    #[test]
+    fn gate_metadata_is_explicit_and_does_not_hide_unknown_settings() {
+        let fixture = serde_json::json!({
+            "_comment": "operator documentation",
+            "_reserved_ids": {"planned": ["b"]},
+            "benchmarks": [{"_comment": "row", "id": "a", "target_ns": 1.0, "threshold_ns": 2.0}],
+            "ratios": [{"_comment": "ratio", "numerator": "a", "denominator": "b", "max_ratio": 1.2}],
+            "trust": {},
+        });
+        let manifest: Manifest = serde_json::from_value(fixture.clone()).unwrap();
+        assert_eq!(manifest.benchmarks[0].id, "a");
+        assert_eq!(manifest.ratios[0].max_ratio, 1.2);
+        for pointer in ["", "/benchmarks/0", "/ratios/0", "/trust"] {
+            let mut input = fixture.clone();
+            input.pointer_mut(pointer).unwrap()["_unrecognized_setting"] = 0.1.into();
+            let error = serde_json::from_value::<Manifest>(input)
+                .err()
+                .expect("unknown key must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unknown field `_unrecognized_setting`")
+            );
+        }
+        let mut input = fixture;
+        input["trust"]["_comment"] = "not a supported trust setting".into();
+        assert!(serde_json::from_value::<Manifest>(input).is_err());
+    }
+
+    #[test]
+    fn baseline_setting_typos_are_rejected_without_changing_legacy_defaults() {
+        let recorded = recorded_baseline(
+            &recording_context(),
+            None,
+            &recording_manifest(&["a"]),
+            &vec![means(&[("a", 100.0)]); 3],
+            "now".to_owned(),
+        )
+        .unwrap();
+        let mut input = serde_json::to_value(recorded).unwrap();
+        input["benchmarks"][0]["max_regression"] = 0.15.into();
+        let parsed: Baseline = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(parsed.benchmarks[0].max_regression, 0.15);
+        for (pointer, key) in [("", "samples"), ("/benchmarks/0", "max_regression")] {
+            let mut invalid = input.clone();
+            let object = invalid
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            let value = object.remove(key).unwrap();
+            object.insert(format!("{key}_typo"), value);
+            let error = serde_json::from_value::<Baseline>(invalid)
+                .expect_err("unknown baseline key must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown field `{key}_typo`"))
+            );
+        }
+        let mut invalid = input.clone();
+        invalid["host"]["os_typo"] = "wrong setting".into();
+        assert!(serde_json::from_value::<Baseline>(invalid).is_err());
+        input.as_object_mut().unwrap().remove("samples");
+        input["benchmarks"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("max_regression");
+        let legacy: Baseline = serde_json::from_value(input).unwrap();
+        assert_eq!(legacy.samples, 1);
+        assert_eq!(legacy.benchmarks[0].max_regression, 0.05);
     }
 
     /// Both tolerances are exclusive: landing exactly on the line is inside
@@ -3384,6 +3544,7 @@ mod tests {
     #[test]
     fn a_same_run_ratio_enforces_the_portable_contention_budget() {
         let bound = RatioBound {
+            _comment: serde::de::IgnoredAny,
             numerator: "contended".to_string(),
             denominator: "uncontended".to_string(),
             max_ratio: 3.0,
@@ -3413,6 +3574,7 @@ mod tests {
         let zero_measurement = means(&[("contended", 0.0), ("uncontended", 100.0)]);
         for max_ratio in [0.0, -1.0] {
             let invalid = RatioBound {
+                _comment: serde::de::IgnoredAny,
                 numerator: bound.numerator.clone(),
                 denominator: bound.denominator.clone(),
                 max_ratio,
@@ -3438,6 +3600,7 @@ mod tests {
     #[test]
     fn an_unstable_side_makes_a_ratio_inconclusive_rather_than_a_verdict() {
         let bound = RatioBound {
+            _comment: serde::de::IgnoredAny,
             numerator: "contended".to_string(),
             denominator: "uncontended".to_string(),
             max_ratio: 3.0,
@@ -3582,6 +3745,7 @@ mod tests {
 
     fn entry() -> Entry {
         Entry {
+            _comment: serde::de::IgnoredAny,
             id: "admission/full_check".to_string(),
             target_ns: 110.0,
             threshold_ns: 250.0,

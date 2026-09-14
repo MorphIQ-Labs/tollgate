@@ -63,7 +63,7 @@ fn ready_from_grant(
         .build(),
     );
     let slot = LeaseSlot::for_account(ACCOUNT);
-    slot.install(Arc::new(LocalLease::new(grant, CostUnits::ZERO)));
+    drop(slot.replace(Arc::new(LocalLease::new(grant, CostUnits::ZERO))));
     engine.map().install(PRINCIPAL, snapshot, slot);
     engine
         .begin(PRINCIPAL, PermissionBits::bit(0), t(0))

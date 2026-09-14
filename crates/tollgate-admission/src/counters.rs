@@ -441,7 +441,7 @@ impl AdmissionCounters {
     /// Record a refusal against its reason's slot.
     ///
     /// Public because not every refusal originates in
-    /// [`AdmissionEngine::admit`](crate::AdmissionEngine::admit):
+    /// [`RequestContext::admit`](crate::RequestContext::admit):
     /// `AccountingBackpressure` is decided by the embedder *before* admission
     /// (INVARIANTS.md #8 sheds on a full usage queue), so a service that
     /// sheds there records it here. A slot that could only ever read zero

@@ -114,19 +114,21 @@ fn base_store() -> Arc<MemoryStore> {
 /// Fund the account's slot directly so admission outcomes isolate snapshot
 /// behavior.
 fn stock_slot(fixture: &Fixture) {
-    fixture
-        .slots
-        .slot(ACCOUNT)
-        .install(Arc::new(LocalLease::new(
-            LeaseGrant {
-                lease_id: LeaseId(1),
-                account_id: ACCOUNT,
-                fencing_token: FencingToken(1),
-                units: CostUnits(1_000_000),
-                expires_at: t(100_000),
-            },
-            CostUnits::ZERO,
-        )));
+    drop(
+        fixture
+            .slots
+            .slot(ACCOUNT)
+            .replace(Arc::new(LocalLease::new(
+                LeaseGrant {
+                    lease_id: LeaseId(1),
+                    account_id: ACCOUNT,
+                    fencing_token: FencingToken(1),
+                    units: CostUnits(1_000_000),
+                    expires_at: t(100_000),
+                },
+                CostUnits::ZERO,
+            ))),
+    );
 }
 
 fn admit(fixture: &Fixture) -> Result<(), DenyReason> {

@@ -418,7 +418,7 @@ mod tests {
         );
 
         let lease = lease_expiring_at(now, 100);
-        slot.install(Arc::clone(&lease));
+        drop(slot.replace(Arc::clone(&lease)));
         assert!(
             lease.try_debit(CostUnits(1), now).is_err(),
             "the request path denies at the boundary",
@@ -428,16 +428,16 @@ mod tests {
             "so readiness must not still be advertising at it",
         );
 
-        slot.install(lease_expiring_at(
+        drop(slot.replace(lease_expiring_at(
             now.checked_add(SignedDuration::from_secs(60)).unwrap(),
             100,
-        ));
+        )));
         assert!(quota_usable(&slot, EnforcementMode::Strict, now));
 
-        slot.install(lease_expiring_at(
+        drop(slot.replace(lease_expiring_at(
             now.checked_add(SignedDuration::from_secs(60)).unwrap(),
             0,
-        ));
+        )));
         assert!(
             !quota_usable(&slot, EnforcementMode::Strict, now),
             "a live lease with nothing left funds nothing either",
@@ -461,10 +461,10 @@ mod tests {
         assert!(!quota_usable(&slot, EnforcementMode::Strict, now));
         assert!(quota_usable(&slot, elastic, now));
 
-        slot.install(lease_expiring_at(
+        drop(slot.replace(lease_expiring_at(
             now.checked_add(SignedDuration::from_secs(60)).unwrap(),
             0,
-        ));
+        )));
         assert!(!quota_usable(&slot, EnforcementMode::Strict, now));
         assert!(quota_usable(&slot, elastic, now));
 

@@ -114,7 +114,9 @@ async fn store_with_balance(policy: GrantPolicy, balance: u64) -> Option<Arc<Pos
     let store = PostgresStore::connect(&url, policy)
         .await
         .unwrap_or_else(|e| panic!("postgres unreachable at {}: {e}", redact_url(&url)));
-    store.truncate_all().await.unwrap();
+    tollgate_store_postgres::test_support::truncate_all(&store)
+        .await
+        .unwrap();
     AdminStore::create_account(
         &*store,
         AccountConfig {
@@ -1655,7 +1657,9 @@ async fn the_account_filter_is_answered_by_an_index_not_by_discarding_rows() {
         "the measured account holds its own live leases and no one else's"
     );
 
-    let plan = store.explain_active_lease_sum(ACCOUNT).await.unwrap();
+    let plan = tollgate_store_postgres::test_support::explain_active_lease_sum(&store, ACCOUNT)
+        .await
+        .unwrap();
     assert!(
         plan.contains("tollgate_leases_account_active"),
         "the reconciliation query must reach its index; plan was:\n{plan}"
