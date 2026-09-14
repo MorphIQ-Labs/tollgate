@@ -182,3 +182,27 @@ pub fn transport(
         HttpStore::with_config(format!("https://{address}"), config).unwrap(),
     )
 }
+
+/// Send a request to an in-process router and decode its JSON reply.
+///
+/// The `oneshot` / status / collect / `from_slice` tail this replaces is
+/// written out thirteen times across this crate's test binaries. An empty body
+/// decodes as `Value::Null` rather than a parse error, because several routes
+/// answer 204.
+pub async fn send(
+    router: &axum::Router,
+    request: axum::http::Request<axum::body::Body>,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, value)
+}

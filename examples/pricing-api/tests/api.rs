@@ -16,7 +16,7 @@ use pricing_api::{
 };
 use tollgate_admission::{CommitRefusal, ExecutionCapacityMode};
 use tollgate_core::{CostUnits, DenyReason, EnforcementMode, LocalSharding, RequestId};
-use tollgate_store::SnapshotSource;
+use tollgate_store::{AllocateError, SnapshotSource};
 
 /// Every test router needs a connection to authenticate against, because the
 /// price route takes `ConnectInfo<PricingConnection>` — that requirement is
@@ -49,25 +49,18 @@ fn price_body(contracts: usize) -> Value {
     json!({ "contracts": vec![contract; contracts] })
 }
 
-async fn call(router: &axum::Router, auth: Option<&str>, body: Value) -> (StatusCode, Value) {
-    let mut builder = Request::builder()
-        .method("POST")
-        .uri("/v1/price")
-        .header(header::CONTENT_TYPE, "application/json");
-    if let Some(key) = auth {
-        builder = builder.header(header::AUTHORIZATION, format!("Bearer {key}"));
-    }
-    let response = router
-        .clone()
-        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
-        .await
-        .unwrap();
+/// Send a request and decode its JSON reply.
+///
+/// The `oneshot` / status / collect / `from_slice` tail below was written out
+/// five times in this file. Every helper here is now a wrapper around it.
+async fn send(router: &axum::Router, request: Request<Body>) -> (StatusCode, Value) {
+    let response = router.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
-async fn call_raw(router: &axum::Router, auth: Option<&str>, body: &str) -> (StatusCode, Value) {
+fn price_request(auth: Option<&str>, body: Body) -> Request<Body> {
     let mut builder = Request::builder()
         .method("POST")
         .uri("/v1/price")
@@ -75,30 +68,29 @@ async fn call_raw(router: &axum::Router, auth: Option<&str>, body: &str) -> (Sta
     if let Some(key) = auth {
         builder = builder.header(header::AUTHORIZATION, format!("Bearer {key}"));
     }
-    let response = router
-        .clone()
-        .oneshot(builder.body(Body::from(body.to_owned())).unwrap())
-        .await
-        .unwrap();
-    let status = response.status();
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    (status, serde_json::from_slice(&bytes).unwrap())
+    builder.body(body).unwrap()
+}
+
+async fn call(router: &axum::Router, auth: Option<&str>, body: Value) -> (StatusCode, Value) {
+    send(router, price_request(auth, Body::from(body.to_string()))).await
+}
+
+/// The same request with an unparsed body, for the malformed-input cases.
+async fn call_raw(router: &axum::Router, auth: Option<&str>, body: &str) -> (StatusCode, Value) {
+    send(router, price_request(auth, Body::from(body.to_owned()))).await
 }
 
 async fn metrics(router: &axum::Router) -> Value {
-    let response = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/metrics")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    serde_json::from_slice(&bytes).unwrap()
+    send(
+        router,
+        Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .1
 }
 
 async fn ready(router: &axum::Router) -> StatusCode {
@@ -700,7 +692,7 @@ async fn metrics_report_refill_and_snapshot_health() {
     assert_eq!(refill["abandoned"], 0);
     assert_eq!(
         refill["refusals"].as_object().unwrap().len(),
-        9,
+        AllocateError::COUNT,
         "every refusal reason is exported, including the ones at zero"
     );
 

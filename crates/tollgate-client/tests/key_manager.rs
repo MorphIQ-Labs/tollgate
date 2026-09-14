@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -8,6 +7,10 @@ use tollgate_client::{
     KeyManager, KeyManagerConfig, KeyManagerHealth, KeyManagerMonitor, KeyManagerReport,
 };
 use tollgate_core::KeyId;
+#[path = "../../tollgate-store/tests/support/delegating.rs"]
+mod delegating;
+use delegating::{DelegatingStore, RejectingStore, rejecting};
+
 use tollgate_store::{Clock, CredentialRecord, CredentialSet, KeySource, ManualClock, StoreError};
 
 const SECRET: &[u8] = b"fixture-key-manager-hmac-secret-108";
@@ -33,55 +36,64 @@ enum Reply {
     Hung,
     Panic,
 }
+/// The scripted reply and what the test observes about in-flight calls.
 struct Source {
     reply: Mutex<Reply>,
     active: AtomicUsize,
     cancelled: AtomicUsize,
 }
+
 impl Source {
-    fn new(keys: Vec<CredentialRecord>) -> Arc<Self> {
-        Arc::new(Self {
+    /// The handle and the source to hand [`KeyManager::spawn`].
+    fn new(keys: Vec<CredentialRecord>) -> (Arc<Self>, Arc<DelegatingStore<RejectingStore>>) {
+        let source = Arc::new(Self {
             reply: Mutex::new(Reply::Keys(CredentialSet::try_new(keys).unwrap())),
             active: AtomicUsize::new(0),
             cancelled: AtomicUsize::new(0),
-        })
+        });
+        (Arc::clone(&source), scripted_source(&source))
     }
+
     fn set(&self, reply: Reply) {
         *self.reply.lock().unwrap() = reply;
     }
 }
-#[async_trait]
-impl KeySource for Source {
-    async fn active_keys_page(
-        &self,
-        now: Timestamp,
-        after: Option<KeyId>,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<tollgate_store::KeyPage, StoreError> {
-        let reply = self.reply.lock().unwrap().clone();
-        match reply {
-            Reply::Keys(keys) => page(keys, now, after, limit),
-            Reply::AdvanceClock(keys, clock, now) => {
-                clock.set(now);
-                page(keys, now, after, limit)
-            }
-            Reply::Error => Err(StoreError("fixture outage".into())),
-            Reply::Panic => panic!("fixture task death"),
-            Reply::Hung => {
-                struct Pending<'a>(&'a Source);
-                impl Drop for Pending<'_> {
-                    fn drop(&mut self) {
-                        self.0.active.fetch_sub(1, Ordering::SeqCst);
-                        self.0.cancelled.fetch_add(1, Ordering::SeqCst);
+
+fn scripted_source(source: &Arc<Source>) -> Arc<DelegatingStore<RejectingStore>> {
+    let source = Arc::clone(source);
+    Arc::new(
+        rejecting("a key-source fixture answers pages and nothing else").on_active_keys_page(
+            move |_, now, after, limit| {
+                let source = Arc::clone(&source);
+                async move {
+                    let reply = source.reply.lock().unwrap().clone();
+                    match reply {
+                        Reply::Keys(keys) => page(keys, now, after, limit),
+                        Reply::AdvanceClock(keys, clock, now) => {
+                            clock.set(now);
+                            page(keys, now, after, limit)
+                        }
+                        Reply::Error => Err(StoreError("fixture outage".into())),
+                        Reply::Panic => panic!("fixture task death"),
+                        Reply::Hung => {
+                            struct Pending(Arc<Source>);
+                            impl Drop for Pending {
+                                fn drop(&mut self) {
+                                    self.0.active.fetch_sub(1, Ordering::SeqCst);
+                                    self.0.cancelled.fetch_add(1, Ordering::SeqCst);
+                                }
+                            }
+                            source.active.fetch_add(1, Ordering::SeqCst);
+                            let _pending = Pending(Arc::clone(&source));
+                            std::future::pending().await
+                        }
                     }
                 }
-                self.active.fetch_add(1, Ordering::SeqCst);
-                let _pending = Pending(self);
-                std::future::pending().await
-            }
-        }
-    }
+            },
+        ),
+    )
 }
+
 fn page(
     keys: CredentialSet,
     now: Timestamp,
@@ -140,9 +152,9 @@ async fn wait_for(
 async fn complete_refresh_replaces_keys_and_cached_proofs_keep_their_original_deadline() {
     let (first, a) = minted(1, None);
     let (second, b) = minted(2, Some(t(113)));
-    let source = Source::new(vec![a]);
+    let (source, pages) = Source::new(vec![a]);
     let clock = Arc::new(ManualClock::new(t(100)));
-    let manager = KeyManager::spawn(source.clone(), SECRET, clock.clone(), config()).unwrap();
+    let manager = KeyManager::spawn(pages.clone(), SECRET, clock.clone(), config()).unwrap();
     let verifier = manager.verifier();
     let mut monitor = manager.monitor();
     assert!(!monitor.report(t(100)).ready);
@@ -197,9 +209,9 @@ async fn complete_refresh_replaces_keys_and_cached_proofs_keep_their_original_de
 #[tokio::test(start_paused = true)]
 async fn an_outage_never_extends_projection_validity_and_recovery_replaces_it() {
     let (token, key) = minted(1, None);
-    let source = Source::new(vec![key]);
+    let (source, pages) = Source::new(vec![key]);
     let clock = Arc::new(ManualClock::new(t(100)));
-    let manager = KeyManager::spawn(source.clone(), SECRET, clock.clone(), config()).unwrap();
+    let manager = KeyManager::spawn(pages.clone(), SECRET, clock.clone(), config()).unwrap();
     let verifier = manager.verifier();
     let mut monitor = manager.monitor();
     wait_for(&mut monitor, t(100), |r| r.ready).await;
@@ -238,10 +250,10 @@ async fn an_outage_never_extends_projection_validity_and_recovery_replaces_it() 
 
 #[tokio::test(start_paused = true)]
 async fn hung_fetches_timeout_retry_and_shutdown_interrupts_the_pending_read() {
-    let source = Source::new(vec![]);
+    let (source, pages) = Source::new(vec![]);
     source.set(Reply::Hung);
     let clock = Arc::new(ManualClock::new(t(100)));
-    let manager = KeyManager::spawn(source.clone(), SECRET, clock, config()).unwrap();
+    let manager = KeyManager::spawn(pages.clone(), SECRET, clock, config()).unwrap();
     let mut monitor = manager.monitor();
     tokio::task::yield_now().await;
     assert_eq!(source.active.load(Ordering::SeqCst), 1);
@@ -265,10 +277,10 @@ async fn hung_fetches_timeout_retry_and_shutdown_interrupts_the_pending_read() {
 
 #[tokio::test(start_paused = true)]
 async fn dropping_an_unpolled_shutdown_future_aborts_the_owned_refresh() {
-    let source = Source::new(vec![]);
+    let (source, pages) = Source::new(vec![]);
     source.set(Reply::Hung);
     let manager = KeyManager::spawn(
-        source.clone(),
+        pages.clone(),
         SECRET,
         Arc::new(ManualClock::new(t(100))),
         config(),
@@ -286,9 +298,9 @@ async fn dropping_an_unpolled_shutdown_future_aborts_the_owned_refresh() {
 #[tokio::test(start_paused = true)]
 async fn task_death_withdraws_new_verification_and_is_visible_to_the_monitor() {
     let (token, key) = minted(1, None);
-    let source = Source::new(vec![key]);
+    let (source, pages) = Source::new(vec![key]);
     let manager = KeyManager::spawn(
-        source.clone(),
+        pages.clone(),
         SECRET,
         Arc::new(ManualClock::new(t(100))),
         config(),
@@ -351,7 +363,7 @@ async fn a_large_legitimate_projection_is_installed_without_truncation() {
         })
         .collect();
     let manager = KeyManager::spawn(
-        Source::new(records),
+        Source::new(records).1,
         SECRET,
         Arc::new(ManualClock::new(t(100))),
         config(),
@@ -373,13 +385,13 @@ async fn fetch_time_consumes_freshness_and_expired_responses_cannot_replace_the_
     for completed in [119, 120, 121] {
         let (token, key) = minted(1, None);
         let clock = Arc::new(ManualClock::new(t(100)));
-        let source = Source::new(vec![]);
+        let (source, pages) = Source::new(vec![]);
         source.set(Reply::AdvanceClock(
             CredentialSet::try_new(vec![key]).unwrap(),
             clock.clone(),
             t(completed),
         ));
-        let manager = KeyManager::spawn(source, SECRET, clock, config()).unwrap();
+        let manager = KeyManager::spawn(pages, SECRET, clock, config()).unwrap();
         let mut monitor = manager.monitor();
         let report = wait_for(&mut monitor, t(completed), |r| {
             r.stats.refreshes + r.stats.failures == 1
@@ -404,18 +416,18 @@ async fn fetch_time_consumes_freshness_and_expired_responses_cannot_replace_the_
 async fn timestamp_overflow_cannot_renew_a_previously_valid_projection() {
     let (token, key) = minted(1, None);
     let clock = Arc::new(ManualClock::new(t(100)));
-    let source = Source::new(vec![key]);
-    assert!(KeyManager::spawn(source.clone(), b"short", clock.clone(), config()).is_err());
+    let (_source, pages) = Source::new(vec![key]);
+    assert!(KeyManager::spawn(pages.clone(), b"short", clock.clone(), config()).is_err());
     assert!(
         KeyManager::spawn(
-            source.clone(),
+            pages.clone(),
             SECRET,
             Arc::new(ManualClock::new(Timestamp::MAX)),
             config()
         )
         .is_err()
     );
-    let manager = KeyManager::spawn(source, SECRET, clock.clone(), config()).unwrap();
+    let manager = KeyManager::spawn(pages, SECRET, clock.clone(), config()).unwrap();
     let mut monitor = manager.monitor();
     wait_for(&mut monitor, t(100), |r| r.ready).await;
     clock.set(Timestamp::MAX);
@@ -430,32 +442,42 @@ async fn timestamp_overflow_cannot_renew_a_previously_valid_projection() {
     assert!(!manager.shutdown().await.task_failed);
 }
 
+/// A queue of replies and the cursors the manager asked for.
 struct Scripted {
     replies: Mutex<std::collections::VecDeque<Result<tollgate_store::KeyPage, StoreError>>>,
     cursors: Mutex<Vec<Option<KeyId>>>,
 }
-#[async_trait]
-impl KeySource for Scripted {
-    async fn active_keys_page(
-        &self,
-        _: Timestamp,
-        after: Option<KeyId>,
-        _: std::num::NonZeroUsize,
-    ) -> Result<tollgate_store::KeyPage, StoreError> {
-        self.cursors.lock().unwrap().push(after);
-        self.replies
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or_else(|| Err(StoreError("script exhausted".into())))
-    }
-}
-fn scripted(replies: Vec<tollgate_store::KeyPage>) -> Arc<Scripted> {
-    Arc::new(Scripted {
+
+fn scripted(
+    replies: Vec<tollgate_store::KeyPage>,
+) -> (Arc<Scripted>, Arc<DelegatingStore<RejectingStore>>) {
+    let script = Arc::new(Scripted {
         replies: Mutex::new(replies.into_iter().map(Ok).collect()),
         cursors: Mutex::new(vec![]),
-    })
+    });
+    (Arc::clone(&script), scripted_pages(&script))
 }
+
+fn scripted_pages(script: &Arc<Scripted>) -> Arc<DelegatingStore<RejectingStore>> {
+    let script = Arc::clone(script);
+    Arc::new(
+        rejecting("a scripted-page fixture answers pages and nothing else").on_active_keys_page(
+            move |_, _now, after, _limit| {
+                let script = Arc::clone(&script);
+                async move {
+                    script.cursors.lock().unwrap().push(after);
+                    script
+                        .replies
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or_else(|| Err(StoreError("script exhausted".into())))
+                }
+            },
+        ),
+    )
+}
+
 fn one_page(
     revision: u64,
     after: Option<KeyId>,
@@ -486,7 +508,7 @@ async fn revision_change_restarts_from_the_beginning_instead_of_omitting_a_new_k
     let (retired, b) = minted(2, None);
     let (last, c) = minted(3, None);
     // Between pages: revoke 2, insert 1 behind the cursor. Never publish 2+3.
-    let source = scripted(vec![
+    let (script, source) = scripted(vec![
         one_page(1, None, b, true),
         one_page(2, Some(b.key_id), c, false),
         one_page(2, None, a, true),
@@ -513,7 +535,7 @@ async fn revision_change_restarts_from_the_beginning_instead_of_omitting_a_new_k
     assert!(verifier.verify(&retired).is_none());
     assert!(verifier.verify(&early).is_some() && verifier.verify(&last).is_some());
     assert_eq!(
-        *source.cursors.lock().unwrap(),
+        *script.cursors.lock().unwrap(),
         vec![None, Some(KeyId(2)), None, Some(KeyId(1))]
     );
     manager.shutdown().await;
@@ -523,7 +545,7 @@ async fn revision_change_restarts_from_the_beginning_instead_of_omitting_a_new_k
 async fn page_budget_and_revision_regression_preserve_the_previous_table_and_deadline() {
     let (old, a) = minted(1, None);
     let (new, b) = minted(2, None);
-    let source = scripted(vec![
+    let (_script, source) = scripted(vec![
         one_page(3, None, a, false),
         one_page(4, None, a, true),
         one_page(5, Some(a.key_id), b, false),
@@ -555,7 +577,7 @@ async fn page_budget_and_revision_regression_preserve_the_previous_table_and_dea
 async fn page_budget_cannot_publish_an_incomplete_first_table() {
     let (_, a) = minted(1, None);
     let manager = KeyManager::spawn(
-        scripted(vec![one_page(1, None, a, true)]),
+        scripted(vec![one_page(1, None, a, true)]).1,
         SECRET,
         Arc::new(ManualClock::new(t(100))),
         paged_config(1),
@@ -572,7 +594,7 @@ async fn page_budget_cannot_publish_an_incomplete_first_table() {
 async fn the_instance_clock_narrows_the_server_set_at_publication() {
     let (secret, a) = minted(1, Some(t(105)));
     let manager = KeyManager::spawn(
-        scripted(vec![one_page(1, None, a, false)]),
+        scripted(vec![one_page(1, None, a, false)]).1,
         SECRET,
         Arc::new(ManualClock::new(t(105))),
         paged_config(1),
@@ -584,27 +606,31 @@ async fn the_instance_clock_narrows_the_server_set_at_publication() {
     manager.shutdown().await;
 }
 
-struct SlowPages(Arc<Scripted>);
-#[async_trait]
-impl KeySource for SlowPages {
-    async fn active_keys_page(
-        &self,
-        now: Timestamp,
-        after: Option<KeyId>,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<tollgate_store::KeyPage, StoreError> {
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        self.0.active_keys_page(now, after, limit).await
-    }
+/// The same scripted pages, each delayed past the pass deadline.
+fn slow_pages(script: &Arc<Scripted>) -> Arc<DelegatingStore<RejectingStore>> {
+    let inner = scripted_pages(script);
+    Arc::new(
+        rejecting("a slow-page fixture answers pages and nothing else").on_active_keys_page(
+            move |_, now, after, limit| {
+                let inner = Arc::clone(&inner);
+                async move {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    KeySource::active_keys_page(&*inner, now, after, limit).await
+                }
+            },
+        ),
+    )
 }
+
 #[tokio::test(start_paused = true)]
 async fn per_call_progress_does_not_reset_the_pass_deadline() {
     let (_, a) = minted(1, None);
     let (_, b) = minted(2, None);
-    let source = Arc::new(SlowPages(scripted(vec![
+    let (script, _) = scripted(vec![
         one_page(1, None, a, true),
         one_page(1, Some(a.key_id), b, false),
-    ])));
+    ]);
+    let source = slow_pages(&script);
     let manager = KeyManager::spawn(
         source,
         SECRET,
@@ -636,17 +662,17 @@ async fn per_call_progress_does_not_reset_the_pass_deadline() {
 
 #[tokio::test]
 async fn a_32_byte_hmac_secret_is_accepted_and_31_bytes_are_refused() {
-    let source = Source::new(vec![]);
+    let (_source, pages) = Source::new(vec![]);
     let clock = Arc::new(ManualClock::new(t(100)));
-    assert!(KeyManager::spawn(source.clone(), &[1; 31], clock.clone(), config()).is_err());
-    let manager = KeyManager::spawn(source, &[1; 32], clock, config()).unwrap();
+    assert!(KeyManager::spawn(pages.clone(), &[1; 31], clock.clone(), config()).is_err());
+    let manager = KeyManager::spawn(pages, &[1; 32], clock, config()).unwrap();
     manager.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_page_for_another_request_never_publishes() {
     let (_, a) = minted(1, None);
-    let source = scripted(vec![one_page(1, Some(KeyId(0)), a, false)]);
+    let (_script, source) = scripted(vec![one_page(1, Some(KeyId(0)), a, false)]);
     let manager = KeyManager::spawn(
         source,
         SECRET,
@@ -672,9 +698,9 @@ async fn repairing_source_expiry_requires_resetting_preupgrade_cached_proofs() {
         not_after: Some(t(0) - SignedDuration::from_nanos(999)),
         ..old
     };
-    let source = Source::new(vec![old]);
+    let (source, pages) = Source::new(vec![old]);
     let clock = Arc::new(ManualClock::new(t(-1)));
-    let manager = KeyManager::spawn(source.clone(), SECRET, clock, config()).unwrap();
+    let manager = KeyManager::spawn(pages.clone(), SECRET, clock, config()).unwrap();
     let verifier = manager.verifier();
     let mut monitor = manager.monitor();
     wait_for(&mut monitor, t(-1), |r| r.ready).await;

@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
 use std::sync::{
     Arc,
@@ -15,9 +14,11 @@ use tollgate_core::{
     EnforcementMode, Generation, OpIndex, PermissionBits, Principal, PublishableSnapshot,
     RequestId,
 };
-use tollgate_store::{
-    AccountConfig, AllocateError, GrantPolicy, LeaseAllocator, MemoryStore, ReclaimBatch,
-};
+#[path = "../../tollgate-store/tests/support/delegating.rs"]
+mod delegating;
+use delegating::{DelegatingStore, RejectingStore, rejecting};
+
+use tollgate_store::{AccountConfig, AllocateError, GrantPolicy, LeaseAllocator, MemoryStore};
 
 #[derive(Clone, Copy)]
 struct Op;
@@ -339,82 +340,100 @@ struct ReleaseBlock {
     resume: tokio::sync::Notify,
 }
 
-struct ScriptedAllocator {
-    store: Arc<MemoryStore>,
+/// The injections the allocator fixtures vary, shared with the test.
+#[derive(Default)]
+struct Scripted {
     panic: AtomicBool,
     invalid_release: bool,
     release_block: Option<Arc<ReleaseBlock>>,
 }
-#[async_trait]
-impl LeaseAllocator for ScriptedAllocator {
-    async fn acquire(
-        &self,
-        account: AccountId,
-        units: CostUnits,
-        ttl: SignedDuration,
-        now: Timestamp,
-    ) -> Result<tollgate_core::LeaseGrant, AllocateError> {
-        assert!(
-            !self.panic.swap(false, Ordering::SeqCst),
-            "injected allocator panic"
-        );
-        self.store.acquire(account, units, ttl, now).await
-    }
-    async fn release(
-        &self,
-        lease: tollgate_core::LeaseId,
-        fence: tollgate_core::FencingToken,
-        remaining: CostUnits,
-        now: Timestamp,
-    ) -> Result<(), AllocateError> {
-        if let Some(block) = &self.release_block {
-            block.started.store(true, Ordering::Release);
-            block.resume.notified().await;
-        }
-        if self.invalid_release {
-            return Err(AllocateError::InvalidRelease);
-        }
-        self.store.release(lease, fence, remaining, now).await
-    }
-    /// Delegated, and subject to the same injected `invalid_release`: a
-    /// consolidation is a release and an acquire, so a fixture that refuses
-    /// one half must refuse it here too.
-    async fn consolidate(
-        &self,
-        lease: tollgate_core::LeaseId,
-        fence: tollgate_core::FencingToken,
-        unspent: CostUnits,
-        requested: CostUnits,
-        ttl: SignedDuration,
-        now: Timestamp,
-    ) -> Result<tollgate_core::LeaseGrant, AllocateError> {
-        if self.invalid_release {
-            return Err(AllocateError::InvalidRelease);
-        }
-        self.store
-            .consolidate(lease, fence, unspent, requested, ttl, now)
-            .await
+
+impl Scripted {
+    /// The handle and the store to hand [`InstanceRuntime::spawn`].
+    fn spawn(self, store: &Arc<MemoryStore>) -> (Arc<Self>, Arc<DelegatingStore<MemoryStore>>) {
+        let scripted = Arc::new(self);
+        (Arc::clone(&scripted), scripted_allocator(store, &scripted))
     }
 
-    async fn reclaim_expired_batch(
-        &self,
-        now: Timestamp,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<ReclaimBatch, tollgate_store::StoreError> {
-        self.store.reclaim_expired_batch(now, limit).await
+    fn panicking() -> Self {
+        Self {
+            panic: AtomicBool::new(true),
+            ..Self::default()
+        }
+    }
+
+    fn refusing_release() -> Self {
+        Self {
+            invalid_release: true,
+            ..Self::default()
+        }
+    }
+
+    fn blocking(release_block: Option<Arc<ReleaseBlock>>) -> Self {
+        Self {
+            release_block,
+            ..Self::default()
+        }
     }
 }
+
+fn scripted_allocator(
+    store: &Arc<MemoryStore>,
+    scripted: &Arc<Scripted>,
+) -> Arc<DelegatingStore<MemoryStore>> {
+    let (acquire, release, consolidate) = (
+        Arc::clone(scripted),
+        Arc::clone(scripted),
+        Arc::clone(scripted),
+    );
+    Arc::new(
+        DelegatingStore::wrapping(Arc::clone(store))
+            .on_acquire(move |inner, account, units, ttl, now| {
+                let scripted = Arc::clone(&acquire);
+                async move {
+                    assert!(
+                        !scripted.panic.swap(false, Ordering::SeqCst),
+                        "injected allocator panic"
+                    );
+                    inner.acquire(account, units, ttl, now).await
+                }
+            })
+            .on_release(move |inner, lease, fence, remaining, now| {
+                let scripted = Arc::clone(&release);
+                async move {
+                    if let Some(block) = &scripted.release_block {
+                        block.started.store(true, Ordering::Release);
+                        block.resume.notified().await;
+                    }
+                    if scripted.invalid_release {
+                        return Err(AllocateError::InvalidRelease);
+                    }
+                    inner.release(lease, fence, remaining, now).await
+                }
+            })
+            // Subject to the same injected `invalid_release`: a consolidation
+            // is a release and an acquire, so a fixture that refuses one half
+            // must refuse it here too.
+            .on_consolidate(move |inner, lease, fence, unspent, requested, ttl, now| {
+                let scripted = Arc::clone(&consolidate);
+                async move {
+                    if scripted.invalid_release {
+                        return Err(AllocateError::InvalidRelease);
+                    }
+                    inner
+                        .consolidate(lease, fence, unspent, requested, ttl, now)
+                        .await
+                }
+            }),
+    )
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_dead_manager_is_joined_then_restarted_with_backoff() {
     let store = store();
     account(&store, 1, 1_000);
     publish(&store, 11, 1, 1, EnforcementMode::Strict);
-    let allocator = Arc::new(ScriptedAllocator {
-        store: store.clone(),
-        panic: AtomicBool::new(true),
-        invalid_release: false,
-        release_block: None,
-    });
+    let (_scripted, allocator) = Scripted::panicking().spawn(&store);
     let (runtime, handle) = InstanceRuntime::spawn(
         store.clone(),
         allocator,
@@ -527,27 +546,25 @@ async fn readiness_checks_freshness_at_the_callers_time_before_a_background_wake
     }
 }
 
-struct FailingSnapshots {
-    store: Arc<MemoryStore>,
-    fail: AtomicBool,
-}
-#[async_trait]
-impl tollgate_store::SnapshotSource for FailingSnapshots {
-    async fn snapshot(
-        &self,
-        principal: Principal,
-    ) -> Result<tollgate_store::SnapshotResolution, tollgate_store::StoreError> {
-        if self.fail.load(Ordering::Acquire) {
-            return Err(tollgate_store::StoreError("test outage".into()));
-        }
-        tollgate_store::SnapshotSource::snapshot(&*self.store, principal).await
-    }
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<tollgate_store::SnapshotPush> {
-        tollgate_store::SnapshotSource::subscribe(&*self.store)
-    }
-    async fn principals(&self) -> Result<Option<Vec<Principal>>, tollgate_store::StoreError> {
-        tollgate_store::SnapshotSource::principals(&*self.store).await
-    }
+/// A source whose pulls can be made to fail. `subscribe` and `principals`
+/// need no mention: delegation supplies both, and `principals` in particular
+/// must not fall back to the trait default (#83).
+fn failing_snapshots(
+    store: &Arc<MemoryStore>,
+    fail: &Arc<AtomicBool>,
+) -> Arc<DelegatingStore<MemoryStore>> {
+    let fail = Arc::clone(fail);
+    Arc::new(
+        DelegatingStore::wrapping(Arc::clone(store)).on_snapshot(move |inner, principal| {
+            let fail = Arc::clone(&fail);
+            async move {
+                if fail.load(Ordering::Acquire) {
+                    return Err(tollgate_store::StoreError("test outage".into()));
+                }
+                tollgate_store::SnapshotSource::snapshot(&*inner, principal).await
+            }
+        }),
+    )
 }
 
 #[tokio::test(start_paused = true)]
@@ -555,10 +572,8 @@ async fn a_refresh_outage_preserves_a_fresh_accounts_manager() {
     let store = store();
     account(&store, 1, 1_000);
     publish(&store, 11, 1, 1, EnforcementMode::Strict);
-    let source = Arc::new(FailingSnapshots {
-        store: store.clone(),
-        fail: AtomicBool::new(false),
-    });
+    let fail = Arc::new(AtomicBool::new(false));
+    let source = failing_snapshots(&store, &fail);
     let (runtime, handle) = InstanceRuntime::spawn(
         source.clone(),
         store.clone(),
@@ -568,7 +583,7 @@ async fn a_refresh_outage_preserves_a_fresh_accounts_manager() {
     )
     .unwrap();
     wait(|| handle.readiness(t(100)).is_ready()).await;
-    source.fail.store(true, Ordering::Release);
+    fail.store(true, Ordering::Release);
     wait(|| handle.report().snapshots.refresh_failures > 0).await;
     assert!(handle.readiness(t(100)).is_ready());
     assert_eq!(handle.report().managed_accounts, 1);
@@ -577,29 +592,31 @@ async fn a_refresh_outage_preserves_a_fresh_accounts_manager() {
     assert_eq!(runtime.shutdown().await.unwrap().usage.unwrap().accepted, 1);
 }
 
-struct CatalogueSource {
-    store: Arc<MemoryStore>,
-    visible: AtomicBool,
-}
-#[async_trait]
-impl tollgate_store::SnapshotSource for CatalogueSource {
-    async fn snapshot(
-        &self,
-        principal: Principal,
-    ) -> Result<tollgate_store::SnapshotResolution, tollgate_store::StoreError> {
-        tollgate_store::SnapshotSource::snapshot(&*self.store, principal).await
-    }
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<tollgate_store::SnapshotPush> {
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        rx
-    }
-    async fn principals(&self) -> Result<Option<Vec<Principal>>, tollgate_store::StoreError> {
-        Ok(Some(if self.visible.load(Ordering::Acquire) {
-            vec![Principal(11)]
-        } else {
-            vec![]
-        }))
-    }
+/// A source with a controllable catalogue and, deliberately, no pushes: the
+/// dead receiver is what isolates the enumeration path this test measures, so
+/// `subscribe` is overridden rather than delegated.
+fn catalogue_source(
+    store: &Arc<MemoryStore>,
+    visible: &Arc<AtomicBool>,
+) -> Arc<DelegatingStore<MemoryStore>> {
+    let visible = Arc::clone(visible);
+    Arc::new(
+        DelegatingStore::wrapping(Arc::clone(store))
+            .on_subscribe(|_| {
+                let (_, rx) = tokio::sync::broadcast::channel(1);
+                rx
+            })
+            .on_principals(move |_| {
+                let visible = Arc::clone(&visible);
+                async move {
+                    Ok(Some(if visible.load(Ordering::Acquire) {
+                        vec![Principal(11)]
+                    } else {
+                        vec![]
+                    }))
+                }
+            }),
+    )
 }
 
 #[tokio::test(start_paused = true)]
@@ -607,10 +624,8 @@ async fn catalogue_removal_withdraws_a_still_fresh_map_entry_and_can_restore_it(
     let store = store();
     account(&store, 1, 1_000);
     publish(&store, 11, 1, 1, EnforcementMode::Strict);
-    let source = Arc::new(CatalogueSource {
-        store: store.clone(),
-        visible: AtomicBool::new(true),
-    });
+    let visible = Arc::new(AtomicBool::new(true));
+    let source = catalogue_source(&store, &visible);
     let (runtime, handle) = InstanceRuntime::spawn(
         source.clone(),
         store.clone(),
@@ -620,7 +635,7 @@ async fn catalogue_removal_withdraws_a_still_fresh_map_entry_and_can_restore_it(
     )
     .unwrap();
     wait(|| handle.readiness(t(100)).is_ready() && handle.report().managed_accounts == 1).await;
-    source.visible.store(false, Ordering::Release);
+    visible.store(false, Ordering::Release);
     wait(|| handle.account_reports(t(100))[0].phase == AccountPhase::Dormant).await;
     assert!(
         handle
@@ -628,7 +643,7 @@ async fn catalogue_removal_withdraws_a_still_fresh_map_entry_and_can_restore_it(
             .is_err()
     );
     assert_eq!(store.balance(AccountId(1)), CostUnits(1_000));
-    source.visible.store(true, Ordering::Release);
+    visible.store(true, Ordering::Release);
     wait(|| handle.report().managed_accounts == 1 && handle.readiness(t(100)).is_ready()).await;
     charge(&handle, 11, 1, 3);
     assert_eq!(runtime.shutdown().await.unwrap().usage.unwrap().accepted, 1);
@@ -738,12 +753,7 @@ async fn an_accounting_integrity_fault_stops_the_instance_without_restart() {
     let store = store();
     account(&store, 1, 1_000);
     publish(&store, 11, 1, 1, EnforcementMode::Strict);
-    let allocator = Arc::new(ScriptedAllocator {
-        store: store.clone(),
-        panic: AtomicBool::new(false),
-        invalid_release: true,
-        release_block: None,
-    });
+    let (_scripted, allocator) = Scripted::refusing_release().spawn(&store);
     let (runtime, handle) = InstanceRuntime::spawn(
         store.clone(),
         allocator,
@@ -870,12 +880,7 @@ async fn an_in_flight_release_cannot_start_a_refill_after_shutdown_pauses_it() {
         started: AtomicBool::new(false),
         resume: tokio::sync::Notify::new(),
     });
-    let allocator = Arc::new(ScriptedAllocator {
-        store: store.clone(),
-        panic: AtomicBool::new(false),
-        invalid_release: false,
-        release_block: Some(block.clone()),
-    });
+    let (_scripted, allocator) = Scripted::blocking(Some(block.clone())).spawn(&store);
     let clock = Arc::new(ManualClock::new(t(100)));
     let mut cfg = config();
     cfg.leases.store_call_timeout = Duration::from_secs(5);
@@ -897,25 +902,21 @@ async fn an_in_flight_release_cannot_start_a_refill_after_shutdown_pauses_it() {
     assert_eq!(store.balance(AccountId(1)), CostUnits(1_000));
 }
 
-struct PushOnlySource(Arc<MemoryStore>);
-#[async_trait]
-impl tollgate_store::SnapshotSource for PushOnlySource {
-    async fn snapshot(
-        &self,
-        principal: Principal,
-    ) -> Result<tollgate_store::SnapshotResolution, tollgate_store::StoreError> {
-        tollgate_store::SnapshotSource::snapshot(&*self.0, principal).await
-    }
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<tollgate_store::SnapshotPush> {
-        tollgate_store::SnapshotSource::subscribe(&*self.0)
-    }
+/// A source that pushes but cannot enumerate.
+///
+/// The `Ok(None)` is stated rather than inherited. This double previously got
+/// it by *omitting* `principals`, which is the same silence that made other
+/// wrappers lie about a catalogue they did have — here it happened to be the
+/// intent. Saying it out loud is the difference between the two (#83).
+fn push_only_source(store: &Arc<MemoryStore>) -> Arc<DelegatingStore<MemoryStore>> {
+    Arc::new(DelegatingStore::wrapping(Arc::clone(store)).on_principals(|_| async { Ok(None) }))
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_push_only_source_reports_unresolved_principals_without_enumeration() {
     let store = store();
     let (runtime, handle) = InstanceRuntime::spawn(
-        Arc::new(PushOnlySource(store.clone())),
+        push_only_source(&store),
         store.clone(),
         store.clone(),
         Arc::new(ManualClock::new(t(100))),
@@ -1041,29 +1042,28 @@ async fn readiness_withdraws_at_queue_capacity_and_recovers_when_a_permit_return
     assert!(!handle.readiness(t(100)).accounting_healthy);
 }
 
-struct RejectingSink {
-    permanent: bool,
-}
-#[async_trait]
-impl tollgate_store::UsageSink for RejectingSink {
-    async fn ingest(
-        &self,
-        events: &[tollgate_core::UsageEvent],
-        _now: Timestamp,
-    ) -> Result<tollgate_store::IngestReport, tollgate_store::IngestError> {
-        if self.permanent {
-            Err(tollgate_store::IngestError::Refused(
-                tollgate_store::StoreError("injected refusal".into()),
-            ))
-        } else {
-            Ok(tollgate_store::IngestReport {
-                unattributed: None,
-                accepted: 0,
-                duplicate: 0,
-                rejected: events.len() as u64,
-            })
-        }
-    }
+/// A sink that refuses, permanently or by rejecting every event. It has no
+/// inner store, so it rejects everything it is not given rather than
+/// delegating — there is nothing behind it to delegate to.
+fn rejecting_sink(permanent: bool) -> Arc<DelegatingStore<RejectingStore>> {
+    Arc::new(
+        rejecting("a usage-sink fixture answers ingest and nothing else").on_ingest(
+            move |_, events, _now| async move {
+                if permanent {
+                    Err(tollgate_store::IngestError::Refused(
+                        tollgate_store::StoreError("injected refusal".into()),
+                    ))
+                } else {
+                    Ok(tollgate_store::IngestReport {
+                        unattributed: None,
+                        accepted: 0,
+                        duplicate: 0,
+                        rejected: events.len() as u64,
+                    })
+                }
+            },
+        ),
+    )
 }
 
 #[tokio::test(start_paused = true)]
@@ -1075,7 +1075,7 @@ async fn rejected_and_permanently_lost_usage_withdraw_accounting_readiness() {
         let (runtime, handle) = InstanceRuntime::spawn(
             store.clone(),
             store.clone(),
-            Arc::new(RejectingSink { permanent }),
+            rejecting_sink(permanent),
             Arc::new(ManualClock::new(t(100))),
             config(),
         )
@@ -1100,12 +1100,7 @@ async fn a_second_crash_reports_parked_grants_after_releasing_an_inherited_capab
     let store = store();
     account(&store, 1, 1_000);
     publish(&store, 11, 1, 1, EnforcementMode::Strict);
-    let allocator = Arc::new(ScriptedAllocator {
-        store: store.clone(),
-        panic: AtomicBool::new(false),
-        invalid_release: false,
-        release_block: None,
-    });
+    let (scripted, allocator) = Scripted::default().spawn(&store);
     let mut cfg = config();
     cfg.leases.target_grant = CostUnits(100);
     let (runtime, handle) = InstanceRuntime::spawn(
@@ -1128,7 +1123,7 @@ async fn a_second_crash_reports_parked_grants_after_releasing_an_inherited_capab
             )
             .unwrap()
     };
-    allocator.panic.store(true, Ordering::Release);
+    scripted.panic.store(true, Ordering::Release);
     let inherited = hold();
     wait(|| handle.report().restarting_accounts == 1).await;
     assert_eq!(handle.report().unrecovered_grants, 0);
@@ -1137,7 +1132,7 @@ async fn a_second_crash_reports_parked_grants_after_releasing_an_inherited_capab
     wait(|| handle.report().refill.unwrap().released == 1).await;
     let parked = hold();
     wait(|| handle.report().refill.unwrap().acquired == 3).await;
-    allocator.panic.store(true, Ordering::Release);
+    scripted.panic.store(true, Ordering::Release);
     let current = hold();
     wait(|| handle.report().restarting_accounts == 1).await;
     assert_eq!(handle.report().unrecovered_grants, 1);
@@ -1244,12 +1239,7 @@ async fn removing_the_last_principal_cancels_a_pending_manager_restart() {
     let store = store();
     account(&store, 1, 1_000);
     publish(&store, 11, 1, 1, EnforcementMode::Strict);
-    let allocator = Arc::new(ScriptedAllocator {
-        store: store.clone(),
-        panic: AtomicBool::new(true),
-        invalid_release: false,
-        release_block: None,
-    });
+    let (_scripted, allocator) = Scripted::panicking().spawn(&store);
     let mut cfg = config();
     cfg.manager_restart_backoff = Duration::from_secs(1);
     let (runtime, handle) = InstanceRuntime::spawn(
@@ -1284,12 +1274,12 @@ async fn integrity_faults_in_idle_and_final_release_are_reported_as_terminal() {
                 resume: tokio::sync::Notify::new(),
             })
         });
-        let allocator = Arc::new(ScriptedAllocator {
-            store: store.clone(),
-            panic: AtomicBool::new(false),
+        let (_scripted, allocator) = Scripted {
             invalid_release: true,
             release_block: block.clone(),
-        });
+            ..Scripted::default()
+        }
+        .spawn(&store);
         let (runtime, handle) = InstanceRuntime::spawn(
             store.clone(),
             allocator,
@@ -1332,12 +1322,7 @@ async fn a_consolidated_predecessor_is_not_reported_as_crash_exposure() {
     .unwrap();
     account(&store, 1, 160);
     publish(&store, 11, 1, 1, EnforcementMode::Strict);
-    let allocator = Arc::new(ScriptedAllocator {
-        store: store.clone(),
-        panic: AtomicBool::new(false),
-        invalid_release: false,
-        release_block: None,
-    });
+    let (scripted, allocator) = Scripted::default().spawn(&store);
     let mut cfg = config();
     cfg.leases.target_grant = CostUnits(100);
     cfg.leases.low_water = CostUnits(50);
@@ -1366,7 +1351,7 @@ async fn a_consolidated_predecessor_is_not_reported_as_crash_exposure() {
         Err(tollgate_core::DenyReason::LeaseExhausted { .. })
     ));
     wait(|| handle.report().refill.unwrap().consolidated == 1).await;
-    allocator.panic.store(true, Ordering::SeqCst);
+    scripted.panic.store(true, Ordering::SeqCst);
     charge(&handle, 11, 3, 51);
     wait(|| handle.report().restarting_accounts == 1).await;
     assert_eq!(handle.report().unrecovered_grants, 0);
@@ -1380,71 +1365,39 @@ async fn a_consolidated_predecessor_is_not_reported_as_crash_exposure() {
 }
 
 /// Commits the exchange and then loses its reply, as a transport can.
-struct UnansweredConsolidation {
-    store: Arc<MemoryStore>,
-    committed: AtomicBool,
+fn unanswered_consolidator(
+    store: &Arc<MemoryStore>,
+    committed: &Arc<AtomicBool>,
     reply_error: bool,
+) -> Arc<DelegatingStore<MemoryStore>> {
+    let committed = Arc::clone(committed);
+    Arc::new(DelegatingStore::wrapping(Arc::clone(store)).on_consolidate(
+        move |inner, lease, fence, unspent, requested, ttl, now| {
+            let committed = Arc::clone(&committed);
+            async move {
+                let _fresh = inner
+                    .consolidate(lease, fence, unspent, requested, ttl, now)
+                    .await?;
+                committed.store(true, Ordering::SeqCst);
+                if reply_error {
+                    return Err(AllocateError::Storage(tollgate_store::StoreError(
+                        "reply lost after commit".into(),
+                    )));
+                }
+                std::future::pending().await
+            }
+        },
+    ))
 }
-#[async_trait]
-impl LeaseAllocator for UnansweredConsolidation {
-    async fn acquire(
-        &self,
-        account: AccountId,
-        requested: CostUnits,
-        ttl: SignedDuration,
-        now: Timestamp,
-    ) -> Result<tollgate_core::LeaseGrant, AllocateError> {
-        self.store.acquire(account, requested, ttl, now).await
-    }
-    async fn release(
-        &self,
-        lease: tollgate_core::LeaseId,
-        fence: tollgate_core::FencingToken,
-        unspent: CostUnits,
-        now: Timestamp,
-    ) -> Result<(), AllocateError> {
-        self.store.release(lease, fence, unspent, now).await
-    }
-    async fn consolidate(
-        &self,
-        lease: tollgate_core::LeaseId,
-        fence: tollgate_core::FencingToken,
-        unspent: CostUnits,
-        requested: CostUnits,
-        ttl: SignedDuration,
-        now: Timestamp,
-    ) -> Result<tollgate_core::LeaseGrant, AllocateError> {
-        let _fresh = self
-            .store
-            .consolidate(lease, fence, unspent, requested, ttl, now)
-            .await?;
-        self.committed.store(true, Ordering::SeqCst);
-        if self.reply_error {
-            return Err(AllocateError::Storage(tollgate_store::StoreError(
-                "reply lost after commit".into(),
-            )));
-        }
-        std::future::pending().await
-    }
-    async fn reclaim_expired_batch(
-        &self,
-        now: Timestamp,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<ReclaimBatch, tollgate_store::StoreError> {
-        self.store.reclaim_expired_batch(now, limit).await
-    }
-}
+
 async fn unanswered_consolidation(
     reply_error: bool,
 ) -> (InstanceRuntime, RuntimeHandle, Arc<MemoryStore>) {
     let store = store();
     account(&store, 1, 100);
     publish(&store, 11, 1, 1, EnforcementMode::Strict);
-    let allocator = Arc::new(UnansweredConsolidation {
-        store: store.clone(),
-        committed: AtomicBool::new(false),
-        reply_error,
-    });
+    let committed = Arc::new(AtomicBool::new(false));
+    let allocator = unanswered_consolidator(&store, &committed, reply_error);
     let (runtime, handle) = InstanceRuntime::spawn(
         store.clone(),
         allocator.clone(),
@@ -1466,7 +1419,7 @@ async fn unanswered_consolidation(
             )
             .is_err()
     );
-    wait(|| allocator.committed.load(Ordering::SeqCst)).await;
+    wait(|| committed.load(Ordering::SeqCst)).await;
     (runtime, handle, store)
 }
 

@@ -5,183 +5,36 @@
 
 mod common;
 
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use jiff::{SignedDuration, Timestamp};
-
-use tollgate_core::{
-    AccountId, AccountStatus, CapacityClass, CostUnits, Principal, PublishableSnapshot,
-};
-use tollgate_store::{
-    AccountConfig, AdminStore, AllocateError, CreateAccountError, IngestError, IngestReport,
-    LeaseAllocator, PublishSnapshotError, ReclaimBatch, SetStatusError, SnapshotPush,
-    SnapshotResolution, SnapshotSource, StatusChange, StoreError, StoreHealth, SystemClock,
-    UsageSink,
-};
+use tollgate_store::{StoreError, SystemClock};
 
 use tollgate_server::{ServerState, router};
 
+#[path = "../../tollgate-store/tests/support/delegating.rs"]
+mod delegating;
+use delegating::{DelegatingStore, RejectingStore, rejecting};
+
 /// A backend that answers only `ping`, and answers it however the test says.
-/// Everything else is unreachable: a readiness probe must not depend on it.
-struct PingOnlyStore {
-    healthy: bool,
-}
-
-#[async_trait]
-impl tollgate_store::KeySource for PingOnlyStore {
-    async fn active_keys_page(
-        &self,
-        now: Timestamp,
-        after: Option<tollgate_core::KeyId>,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<tollgate_store::KeyPage, StoreError> {
-        tollgate_store::KeyPage::try_new(0, now, after, limit, vec![], None)
-    }
-}
-
-#[async_trait]
-impl StoreHealth for PingOnlyStore {
-    async fn ping(&self) -> Result<(), StoreError> {
-        if self.healthy {
-            Ok(())
-        } else {
-            Err(StoreError(
-                "store unreachable: password=fixture-readiness-sensitive-70".into(),
-            ))
-        }
-    }
-}
-
-#[async_trait]
-impl LeaseAllocator for PingOnlyStore {
-    async fn acquire(
-        &self,
-        _account: AccountId,
-        _requested: CostUnits,
-        _ttl: SignedDuration,
-        _now: Timestamp,
-    ) -> Result<tollgate_core::LeaseGrant, AllocateError> {
-        unreachable!("readiness never acquires")
-    }
-
-    async fn release(
-        &self,
-        _lease_id: tollgate_core::LeaseId,
-        _fencing_token: tollgate_core::FencingToken,
-        _unspent: CostUnits,
-        _now: Timestamp,
-    ) -> Result<(), AllocateError> {
-        unreachable!("readiness never releases")
-    }
-
-    async fn consolidate(
-        &self,
-        _lease_id: tollgate_core::LeaseId,
-        _fencing_token: tollgate_core::FencingToken,
-        _unspent: tollgate_core::CostUnits,
-        _requested: tollgate_core::CostUnits,
-        _ttl: jiff::SignedDuration,
-        _now: jiff::Timestamp,
-    ) -> Result<tollgate_core::LeaseGrant, tollgate_store::AllocateError> {
-        unreachable!("readiness never consolidates")
-    }
-
-    async fn reclaim_expired_batch(
-        &self,
-        _now: Timestamp,
-        _limit: NonZeroUsize,
-    ) -> Result<ReclaimBatch, StoreError> {
-        unreachable!("readiness never reclaims")
-    }
-}
-
-#[async_trait]
-impl SnapshotSource for PingOnlyStore {
-    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
-        unreachable!("readiness never fetches snapshots")
-    }
-
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-        unreachable!("readiness never subscribes")
-    }
-}
-
-#[async_trait]
-impl UsageSink for PingOnlyStore {
-    async fn ingest(
-        &self,
-        _events: &[tollgate_core::UsageEvent],
-        _now: Timestamp,
-    ) -> Result<IngestReport, IngestError> {
-        unreachable!("readiness never ingests")
-    }
-}
-
-#[async_trait]
-impl AdminStore for PingOnlyStore {
-    async fn create_account(
-        &self,
-        _config: AccountConfig,
-    ) -> Result<tollgate_store::AdminReceipt<()>, CreateAccountError> {
-        unreachable!("readiness never administers")
-    }
-
-    async fn deposit(
-        &self,
-        _account: AccountId,
-        _units: CostUnits,
-    ) -> Result<tollgate_store::AdminReceipt<()>, AllocateError> {
-        unreachable!("readiness never administers")
-    }
-
-    async fn set_account_status(
-        &self,
-        _account: AccountId,
-        _status: AccountStatus,
-    ) -> Result<tollgate_store::AdminReceipt<StatusChange>, SetStatusError> {
-        unreachable!("readiness never administers")
-    }
-
-    async fn set_capacity_class(
-        &self,
-        _account: AccountId,
-        _class: CapacityClass,
-    ) -> Result<tollgate_store::AdminReceipt<StatusChange>, SetStatusError> {
-        unreachable!("readiness never administers")
-    }
-
-    async fn set_budget_schedule(
-        &self,
-        _account: AccountId,
-        _schedule: Option<tollgate_core::BudgetSchedule>,
-    ) -> Result<(), tollgate_store::BudgetError> {
-        unreachable!("readiness never administers")
-    }
-
-    async fn roll_due_periods(
-        &self,
-        _now: Timestamp,
-        _limit: std::num::NonZeroUsize,
-    ) -> Result<tollgate_store::RolloverBatch, StoreError> {
-        unreachable!("readiness never administers")
-    }
-
-    async fn publish_snapshot(
-        &self,
-        _principal: Principal,
-        _snapshot: PublishableSnapshot,
-    ) -> Result<tollgate_store::AdminReceipt<()>, PublishSnapshotError> {
-        unreachable!("readiness never administers")
-    }
-
-    async fn remove_snapshot(
-        &self,
-        _principal: Principal,
-    ) -> Result<tollgate_store::AdminReceipt<()>, StoreError> {
-        unreachable!("readiness never administers")
-    }
+/// Everything else rejects: a readiness probe must not depend on it, and the
+/// panic is that assertion. Delegating the rest to a real store would delete
+/// the claim this file exists to make.
+fn ping_only(healthy: bool) -> DelegatingStore<RejectingStore> {
+    rejecting("a readiness probe must not touch the store")
+        // The probe does reach the credential projection, and must find it
+        // empty rather than unreachable.
+        .on_active_keys_page(|_, now, after, limit| async move {
+            tollgate_store::KeyPage::try_new(0, now, after, limit, vec![], None)
+        })
+        .on_ping(move |_| async move {
+            if healthy {
+                Ok(())
+            } else {
+                Err(StoreError(
+                    "store unreachable: password=fixture-readiness-sensitive-70".into(),
+                ))
+            }
+        })
 }
 
 async fn readyz_status(healthy: bool) -> axum::http::StatusCode {
@@ -189,7 +42,7 @@ async fn readyz_status(healthy: bool) -> axum::http::StatusCode {
 
     let app = router(ServerState {
         security: common::security(),
-        store: Arc::new(PingOnlyStore { healthy }),
+        store: Arc::new(ping_only(healthy)),
         clock: Arc::new(SystemClock),
     });
     let response = app

@@ -31,6 +31,10 @@ use tollgate_core::{
     PermissionBits, PolicyRevision, Principal, PublishableSnapshot, RequestId, ResolvedLimits,
     UsageEvent, UsageSource,
 };
+#[path = "../../tollgate-store/tests/support/delegating.rs"]
+mod delegating;
+use delegating::DelegatingStore;
+
 use tollgate_store::wire::{API_PREFIX, MAX_INGEST_BODY_BYTES};
 use tollgate_store::{
     AccountConfig, AllocateError, GrantPolicy, LeaseAllocator as _, MemoryStore,
@@ -418,83 +422,59 @@ struct HeldGrant {
 /// Real HTTP operations, with a controlled handoff of one committed grant to
 /// the manager. Cancelling this handoff models losing the allocation result;
 /// it does not simulate a TCP stack or assert that cancellation rolls back I/O.
-struct HeldGrantAllocator {
-    http: Arc<tollgate_client::HttpStore>,
+///
+/// `HttpStore` implements four of the seven store traits and has no
+/// `AdminStore` or `StoreHealth` anywhere in the client crate. The wrapper
+/// still works because `DelegatingStore<S>` is generic in `S` with each trait
+/// impl bounded on `S`, so it implements exactly the traits its inner store
+/// does — no more, and nothing invented to fill the gap.
+fn held_grant_allocator(
+    http: &Arc<tollgate_client::HttpStore>,
     operation: GrantOperation,
-    acquired: std::sync::atomic::AtomicU64,
     held: tokio::sync::mpsc::UnboundedSender<HeldGrant>,
-}
-
-impl HeldGrantAllocator {
-    async fn hold(&self, grant: LeaseGrant) -> LeaseGrant {
+) -> Arc<DelegatingStore<tollgate_client::HttpStore>> {
+    async fn hold(
+        held: &tokio::sync::mpsc::UnboundedSender<HeldGrant>,
+        grant: LeaseGrant,
+    ) -> LeaseGrant {
         let (deliver, received) = tokio::sync::oneshot::channel();
-        self.held.send(HeldGrant { grant, deliver }).unwrap();
+        held.send(HeldGrant { grant, deliver }).unwrap();
         received
             .await
             .expect("the test retains the delivery handle");
         grant
     }
-}
 
-#[async_trait::async_trait]
-impl tollgate_store::LeaseAllocator for HeldGrantAllocator {
-    async fn acquire(
-        &self,
-        account: AccountId,
-        requested: CostUnits,
-        ttl: SignedDuration,
-        now: Timestamp,
-    ) -> Result<LeaseGrant, AllocateError> {
-        let grant = self.http.acquire(account, requested, ttl, now).await?;
-        let previous = self
-            .acquired
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(
-            if self.operation == GrantOperation::Acquire && previous == 1 {
-                self.hold(grant).await
-            } else {
-                grant
-            },
-        )
-    }
-
-    async fn consolidate(
-        &self,
-        lease: LeaseId,
-        fence: FencingToken,
-        unspent: CostUnits,
-        requested: CostUnits,
-        ttl: SignedDuration,
-        now: Timestamp,
-    ) -> Result<LeaseGrant, AllocateError> {
-        let grant = self
-            .http
-            .consolidate(lease, fence, unspent, requested, ttl, now)
-            .await?;
-        Ok(if self.operation == GrantOperation::Consolidate {
-            self.hold(grant).await
-        } else {
-            grant
-        })
-    }
-
-    async fn release(
-        &self,
-        lease: LeaseId,
-        fence: FencingToken,
-        unspent: CostUnits,
-        now: Timestamp,
-    ) -> Result<(), AllocateError> {
-        self.http.release(lease, fence, unspent, now).await
-    }
-
-    async fn reclaim_expired_batch(
-        &self,
-        now: Timestamp,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<tollgate_store::ReclaimBatch, tollgate_store::StoreError> {
-        self.http.reclaim_expired_batch(now, limit).await
-    }
+    let acquired = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (on_acquire, on_consolidate) = (held.clone(), held);
+    Arc::new(
+        DelegatingStore::wrapping(Arc::clone(http))
+            .on_acquire(move |http, account, requested, ttl, now| {
+                let (held, acquired) = (on_acquire.clone(), Arc::clone(&acquired));
+                async move {
+                    let grant = http.acquire(account, requested, ttl, now).await?;
+                    let previous = acquired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(if operation == GrantOperation::Acquire && previous == 1 {
+                        hold(&held, grant).await
+                    } else {
+                        grant
+                    })
+                }
+            })
+            .on_consolidate(move |http, lease, fence, unspent, requested, ttl, now| {
+                let held = on_consolidate.clone();
+                async move {
+                    let grant = http
+                        .consolidate(lease, fence, unspent, requested, ttl, now)
+                        .await?;
+                    Ok(if operation == GrantOperation::Consolidate {
+                        hold(&held, grant).await
+                    } else {
+                        grant
+                    })
+                }
+            }),
+    )
 }
 
 async fn wait_for_observation(
@@ -636,12 +616,7 @@ async fn controlled_shutdown(mode: common::TransportMode) {
                 },
             ));
             let (held, mut pending) = tokio::sync::mpsc::unbounded_channel();
-            let allocator = Arc::new(HeldGrantAllocator {
-                http: http.clone(),
-                operation,
-                acquired: std::sync::atomic::AtomicU64::new(0),
-                held,
-            });
+            let allocator = held_grant_allocator(&http, operation, held);
             assert!(matches!(
                 http.snapshot(PRINCIPAL).await.unwrap(),
                 SnapshotResolution::Present(_)

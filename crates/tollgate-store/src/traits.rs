@@ -490,32 +490,59 @@ pub trait LeaseAllocator: Send + Sync {
     /// explicitly reports that partial progress rather than presenting the
     /// operation as all-or-nothing.
     async fn reclaim_expired(&self, now: Timestamp) -> Result<Vec<ReclaimedLease>, StoreError> {
-        let mut reclaimed: Vec<ReclaimedLease> = Vec::new();
-        loop {
-            let batch = match self
-                .reclaim_expired_batch(now, DEFAULT_RECLAIM_BATCH_LIMIT)
-                .await
-            {
-                Ok(batch) => batch,
-                Err(error) if reclaimed.is_empty() => return Err(error),
-                Err(error) => {
-                    let units: u128 = reclaimed
-                        .iter()
-                        .map(|lease| u128::from(lease.reclaimed.get()))
-                        .sum();
-                    return Err(StoreError(format!(
-                        "reclaim drain failed after {} leases totaling {units} units were committed: {error}",
-                        reclaimed.len()
-                    )));
-                }
-            };
-            let saturated = batch.is_saturated();
-            reclaimed.extend(batch.into_reclaimed());
-            if !saturated {
-                return Ok(reclaimed);
+        drain_reclaim_expired(self, now).await
+    }
+}
+
+/// The drain loop [`LeaseAllocator::reclaim_expired`] performs, as a free
+/// function so that an override can reuse it instead of re-deriving it.
+///
+/// Rust has no `super` for a trait default, so a wrapper that overrides
+/// `reclaim_expired` cannot call the body it overrides. Without this it must
+/// choose between forwarding to an inner allocator — which silently discards
+/// the wrapper's own `reclaim_expired_batch` override, and so discards any
+/// failure that override injects — and copying this loop, which is how two
+/// copies drift apart. Calling this keeps one body and re-dispatches every
+/// batch through `allocator`, whatever `allocator` is (#83).
+///
+/// `#[doc(hidden)]` marks it cross-crate-visible for that purpose rather than
+/// part of the documented surface, as [`Reservation::reserve_at_locality`] is
+/// in `tollgate-core`.
+///
+/// [`Reservation::reserve_at_locality`]: https://docs.rs/tollgate-core
+#[doc(hidden)]
+pub async fn drain_reclaim_expired<A>(
+    allocator: &A,
+    now: Timestamp,
+) -> Result<Vec<ReclaimedLease>, StoreError>
+where
+    A: LeaseAllocator + ?Sized,
+{
+    let mut reclaimed: Vec<ReclaimedLease> = Vec::new();
+    loop {
+        let batch = match allocator
+            .reclaim_expired_batch(now, DEFAULT_RECLAIM_BATCH_LIMIT)
+            .await
+        {
+            Ok(batch) => batch,
+            Err(error) if reclaimed.is_empty() => return Err(error),
+            Err(error) => {
+                let units: u128 = reclaimed
+                    .iter()
+                    .map(|lease| u128::from(lease.reclaimed.get()))
+                    .sum();
+                return Err(StoreError(format!(
+                    "reclaim drain failed after {} leases totaling {units} units were committed: {error}",
+                    reclaimed.len()
+                )));
             }
-            tokio::task::yield_now().await;
+        };
+        let saturated = batch.is_saturated();
+        reclaimed.extend(batch.into_reclaimed());
+        if !saturated {
+            return Ok(reclaimed);
         }
+        tokio::task::yield_now().await;
     }
 }
 

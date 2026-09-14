@@ -17,18 +17,20 @@
 mod common;
 
 use std::cell::RefCell;
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Once};
 
-use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
 
 use tollgate_core::{AccountId, AccountStatus, CapacityClass, CostUnits};
 use tollgate_store::{
     AccountConfig, AdminStore, DEFAULT_RECLAIM_BATCH_LIMIT, GrantPolicy, LeaseAllocator,
-    MemoryStore, ReclaimBatch, StoreError, StoreHealth, SystemClock,
+    MemoryStore, StoreError, SystemClock,
 };
+#[path = "../../tollgate-store/tests/support/delegating.rs"]
+mod delegating;
+use delegating::DelegatingStore;
+
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
@@ -87,7 +89,7 @@ const ACCOUNT: AccountId = AccountId(1);
 /// Each observed call stays pending until the test supplies its outcome.
 /// This pins ordering across awaits without making a scheduler-speed claim.
 struct ControlledServer {
-    store: Arc<FlakyReclaimStore>,
+    state: Arc<SweepState>,
     calls: tokio::sync::mpsc::UnboundedReceiver<Call>,
     server: tokio::task::JoinHandle<std::io::Result<()>>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -99,18 +101,8 @@ impl ControlledServer {
     async fn start() -> Self {
         install_subscriber();
         let (calls_tx, calls) = tokio::sync::mpsc::unbounded_channel();
-        let store = Arc::new(FlakyReclaimStore {
-            inner: store_with_expired_lease(),
-            failures_left: AtomicU32::new(0),
-            fail_on_call: None,
-            fail_rollover: AtomicBool::new(false),
-            calls: AtomicU32::new(0),
-            called: tokio::sync::Notify::new(),
-            cycles: AtomicU32::new(0),
-            next_cycle: AtomicBool::new(true),
-            control: Some(Control(calls_tx)),
-            ping_healthy: AtomicBool::new(true),
-        });
+        let state = Arc::new(SweepState::default().controlled(Control(calls_tx)));
+        let store = flaky(store_with_expired_lease(), &state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let (stop, stopping) = tokio::sync::oneshot::channel();
@@ -127,7 +119,7 @@ impl ControlledServer {
             },
         ));
         Self {
-            store,
+            state,
             calls,
             server,
             stop: Some(stop),
@@ -186,13 +178,13 @@ async fn readiness_requires_both_passes_and_tracks_independent_failure_and_recov
     complete(rollover, Action::Succeed);
     let reclaim = server.call("reclaim").await;
     assert_eq!(server.probe("/readyz").await, 200);
-    server.store.ping_healthy.store(false, Ordering::Release);
+    server.state.ping_healthy.store(false, Ordering::Release);
     assert_eq!(
         server.probe("/readyz").await,
         503,
         "maintenance cannot replace store health"
     );
-    server.store.ping_healthy.store(true, Ordering::Release);
+    server.state.ping_healthy.store(true, Ordering::Release);
     assert_eq!(server.probe("/readyz").await, 200);
 
     complete(reclaim, Action::Fail);
@@ -405,10 +397,11 @@ fn t(secs: i64) -> Timestamp {
     Timestamp::from_second(secs).unwrap()
 }
 
-/// Wraps a real store, failing `reclaim_expired` a fixed number of times and
-/// counting how often it was called.
-struct FlakyReclaimStore {
-    inner: Arc<MemoryStore>,
+/// The state the sweep fixture's hooks share and the tests observe.
+///
+/// These were the double's own fields. Only five of the nine are ever varied,
+/// so the rest come from `Default` rather than being respelled at ten sites.
+struct SweepState {
     failures_left: AtomicU32,
     fail_on_call: Option<u32>,
     fail_rollover: AtomicBool,
@@ -420,211 +413,138 @@ struct FlakyReclaimStore {
     ping_healthy: AtomicBool,
 }
 
-#[async_trait]
-impl tollgate_store::KeySource for FlakyReclaimStore {
-    async fn active_keys_page(
-        &self,
-        now: Timestamp,
-        after: Option<tollgate_core::KeyId>,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<tollgate_store::KeyPage, StoreError> {
-        tollgate_store::KeySource::active_keys_page(&*self.inner, now, after, limit).await
-    }
-}
-
-#[async_trait]
-impl LeaseAllocator for FlakyReclaimStore {
-    async fn acquire(
-        &self,
-        account: AccountId,
-        requested: CostUnits,
-        ttl: SignedDuration,
-        now: Timestamp,
-    ) -> Result<tollgate_core::LeaseGrant, tollgate_store::AllocateError> {
-        self.inner.acquire(account, requested, ttl, now).await
-    }
-
-    async fn release(
-        &self,
-        lease_id: tollgate_core::LeaseId,
-        fencing_token: tollgate_core::FencingToken,
-        unspent: CostUnits,
-        now: Timestamp,
-    ) -> Result<(), tollgate_store::AllocateError> {
-        self.inner
-            .release(lease_id, fencing_token, unspent, now)
-            .await
-    }
-
-    async fn consolidate(
-        &self,
-        _lease_id: tollgate_core::LeaseId,
-        _fencing_token: tollgate_core::FencingToken,
-        _unspent: tollgate_core::CostUnits,
-        _requested: tollgate_core::CostUnits,
-        _ttl: jiff::SignedDuration,
-        _now: jiff::Timestamp,
-    ) -> Result<tollgate_core::LeaseGrant, tollgate_store::AllocateError> {
-        unreachable!("the sweep never consolidates")
-    }
-
-    async fn reclaim_expired_batch(
-        &self,
-        now: Timestamp,
-        limit: NonZeroUsize,
-    ) -> Result<ReclaimBatch, StoreError> {
-        let call = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
-        if self.next_cycle.swap(false, Ordering::AcqRel) {
-            self.cycles.fetch_add(1, Ordering::AcqRel);
-            self.called.notify_one();
-        }
-        if let Some(control) = &self.control {
-            control.call("reclaim").await?;
-        }
-        if self.fail_on_call == Some(call) {
-            return Err(StoreError(
-                "backend failure: password=fixture-maintenance-sensitive-70".into(),
-            ));
-        }
-        if self
-            .failures_left
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-            .is_ok()
-        {
-            return Err(StoreError(
-                "backend failure: password=fixture-maintenance-sensitive-70".into(),
-            ));
-        }
-        self.inner.reclaim_expired_batch(now, limit).await
-    }
-}
-
-#[async_trait]
-impl StoreHealth for FlakyReclaimStore {
-    async fn ping(&self) -> Result<(), StoreError> {
-        // A successful ping is deliberately independent of maintenance health.
-        if self.ping_healthy.load(Ordering::Acquire) {
-            Ok(())
-        } else {
-            Err(StoreError("private-fixture-ping-71".into()))
+impl Default for SweepState {
+    fn default() -> Self {
+        Self {
+            failures_left: AtomicU32::new(0),
+            fail_on_call: None,
+            fail_rollover: AtomicBool::new(false),
+            calls: AtomicU32::new(0),
+            called: tokio::sync::Notify::new(),
+            cycles: AtomicU32::new(0),
+            next_cycle: AtomicBool::new(true),
+            control: None,
+            ping_healthy: AtomicBool::new(true),
         }
     }
 }
 
-#[async_trait]
-impl tollgate_store::SnapshotSource for FlakyReclaimStore {
-    async fn snapshot(
-        &self,
-        principal: tollgate_core::Principal,
-    ) -> Result<tollgate_store::SnapshotResolution, StoreError> {
-        self.inner.snapshot(principal).await
+impl SweepState {
+    fn failing(self, batches: u32) -> Self {
+        Self {
+            failures_left: AtomicU32::new(batches),
+            ..self
+        }
     }
 
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<tollgate_store::SnapshotPush> {
-        tollgate_store::SnapshotSource::subscribe(&*self.inner)
+    fn failing_on_call(self, call: u32) -> Self {
+        Self {
+            fail_on_call: Some(call),
+            ..self
+        }
+    }
+
+    fn failing_rollover(self) -> Self {
+        Self {
+            fail_rollover: AtomicBool::new(true),
+            ..self
+        }
+    }
+
+    fn controlled(self, control: Control) -> Self {
+        Self {
+            control: Some(control),
+            ..self
+        }
     }
 }
 
-#[async_trait]
-impl tollgate_store::UsageSink for FlakyReclaimStore {
-    async fn ingest(
-        &self,
-        events: &[tollgate_core::UsageEvent],
-        now: Timestamp,
-    ) -> Result<tollgate_store::IngestReport, tollgate_store::IngestError> {
-        self.inner.ingest(events, now).await
-    }
-}
+type SweepStore = DelegatingStore<MemoryStore>;
 
-#[async_trait]
-impl AdminStore for FlakyReclaimStore {
-    async fn create_account(
-        &self,
-        config: AccountConfig,
-    ) -> Result<tollgate_store::AdminReceipt<()>, tollgate_store::CreateAccountError> {
-        AdminStore::create_account(&*self.inner, config).await
-    }
-
-    async fn deposit(
-        &self,
-        account: AccountId,
-        units: CostUnits,
-    ) -> Result<tollgate_store::AdminReceipt<()>, tollgate_store::AllocateError> {
-        AdminStore::deposit(&*self.inner, account, units).await
-    }
-
-    async fn set_account_status(
-        &self,
-        account: AccountId,
-        status: AccountStatus,
-    ) -> Result<
-        tollgate_store::AdminReceipt<tollgate_store::StatusChange>,
-        tollgate_store::SetStatusError,
-    > {
-        AdminStore::set_account_status(&*self.inner, account, status).await
-    }
-
-    async fn set_capacity_class(
-        &self,
-        account: AccountId,
-        class: CapacityClass,
-    ) -> Result<
-        tollgate_store::AdminReceipt<tollgate_store::StatusChange>,
-        tollgate_store::SetStatusError,
-    > {
-        AdminStore::set_capacity_class(&*self.inner, account, class).await
-    }
-
-    async fn set_budget_schedule(
-        &self,
-        account: AccountId,
-        schedule: Option<tollgate_core::BudgetSchedule>,
-    ) -> Result<(), tollgate_store::BudgetError> {
-        AdminStore::set_budget_schedule(&*self.inner, account, schedule).await
-    }
-
-    async fn roll_due_periods(
-        &self,
-        now: Timestamp,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<tollgate_store::RolloverBatch, StoreError> {
-        let result = async {
-            if let Some(control) = &self.control {
-                control.call("budget-rollover").await?;
-            }
-            if self.fail_rollover.load(Ordering::Acquire) {
-                return Err(StoreError(
-                    "backend failure: password=fixture-maintenance-sensitive-70".into(),
-                ));
-            }
-            AdminStore::roll_due_periods(&*self.inner, now, limit).await
-        }
-        .await;
-        // A terminal rollover outcome ends the cycle. Saturated batches are
-        // additional calls inside one cycle, never evidence of a later tick.
-        if match &result {
-            Ok(batch) => !batch.is_saturated(),
-            Err(_) => true,
-        } {
-            self.next_cycle.store(true, Ordering::Release);
-        }
-        result
-    }
-
-    async fn publish_snapshot(
-        &self,
-        principal: tollgate_core::Principal,
-        snapshot: tollgate_core::PublishableSnapshot,
-    ) -> Result<tollgate_store::AdminReceipt<()>, tollgate_store::PublishSnapshotError> {
-        AdminStore::publish_snapshot(&*self.inner, principal, snapshot).await
-    }
-
-    async fn remove_snapshot(
-        &self,
-        principal: tollgate_core::Principal,
-    ) -> Result<tollgate_store::AdminReceipt<()>, StoreError> {
-        AdminStore::remove_snapshot(&*self.inner, principal).await
-    }
+/// Wraps a real store, failing reclaim batches on a script and counting how
+/// often the sweep ran.
+///
+/// `reclaim_expired` is deliberately left un-hooked. Its trait default is
+/// written over `reclaim_expired_batch`, so the wrapper inherits it and the
+/// drain re-enters the hook below — which is what carries an injected failure
+/// out to the `/reclaim` route. A hand-written delegation would naturally
+/// forward `reclaim_expired` to the inner store instead, and the failure would
+/// vanish with no compile error (#83).
+fn flaky(inner: Arc<MemoryStore>, state: &Arc<SweepState>) -> Arc<SweepStore> {
+    let (batch, rollover, ping) = (Arc::clone(state), Arc::clone(state), Arc::clone(state));
+    Arc::new(
+        DelegatingStore::wrapping(inner)
+            .on_reclaim_expired_batch(move |inner, now, limit| {
+                let state = Arc::clone(&batch);
+                async move {
+                    let call = state.calls.fetch_add(1, Ordering::AcqRel) + 1;
+                    if state.next_cycle.swap(false, Ordering::AcqRel) {
+                        state.cycles.fetch_add(1, Ordering::AcqRel);
+                        state.called.notify_one();
+                    }
+                    if let Some(control) = &state.control {
+                        control.call("reclaim").await?;
+                    }
+                    if state.fail_on_call == Some(call) {
+                        return Err(StoreError(
+                            "backend failure: password=fixture-maintenance-sensitive-70".into(),
+                        ));
+                    }
+                    if state
+                        .failures_left
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                        .is_ok()
+                    {
+                        return Err(StoreError(
+                            "backend failure: password=fixture-maintenance-sensitive-70".into(),
+                        ));
+                    }
+                    inner.reclaim_expired_batch(now, limit).await
+                }
+            })
+            .on_roll_due_periods(move |inner, now, limit| {
+                let state = Arc::clone(&rollover);
+                async move {
+                    let result = async {
+                        if let Some(control) = &state.control {
+                            control.call("budget-rollover").await?;
+                        }
+                        if state.fail_rollover.load(Ordering::Acquire) {
+                            return Err(StoreError(
+                                "backend failure: password=fixture-maintenance-sensitive-70".into(),
+                            ));
+                        }
+                        AdminStore::roll_due_periods(&*inner, now, limit).await
+                    }
+                    .await;
+                    // A terminal rollover outcome ends the cycle. Saturated
+                    // batches are additional calls inside one cycle, never
+                    // evidence of a later tick.
+                    if match &result {
+                        Ok(batch) => !batch.is_saturated(),
+                        Err(_) => true,
+                    } {
+                        state.next_cycle.store(true, Ordering::Release);
+                    }
+                    result
+                }
+            })
+            .on_ping(move |_| {
+                let state = Arc::clone(&ping);
+                async move {
+                    // A successful ping is deliberately independent of
+                    // maintenance health.
+                    if state.ping_healthy.load(Ordering::Acquire) {
+                        Ok(())
+                    } else {
+                        Err(StoreError("private-fixture-ping-71".into()))
+                    }
+                }
+            })
+            .on_consolidate(|_, _, _, _, _, _, _| async {
+                unreachable!("the sweep never consolidates")
+            }),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -719,11 +639,11 @@ impl Drop for CaptureGuard {
     }
 }
 
-async fn wait_for_cycles(store: &FlakyReclaimStore, minimum: u32) {
+async fn wait_for_cycles(state: &SweepState, minimum: u32) {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            let called = store.called.notified();
-            if store.cycles.load(Ordering::Acquire) >= minimum {
+            let called = state.called.notified();
+            if state.cycles.load(Ordering::Acquire) >= minimum {
                 return;
             }
             called.await;
@@ -756,7 +676,7 @@ fn store_with_expired_lease() -> Arc<MemoryStore> {
 /// that captures nothing still cannot be the first to register a callsite
 /// against an absent dispatcher, because there is never an absent dispatcher.
 async fn spawn_server(
-    store: Arc<FlakyReclaimStore>,
+    store: Arc<SweepStore>,
     clock: Arc<dyn tollgate_store::Clock>,
     reclaim_interval: std::time::Duration,
 ) -> (
@@ -784,14 +704,18 @@ async fn spawn_server(
 /// Observe completed cycles, then stop. Entering the next reclaim call proves
 /// that the prior cycle, including its rollover and outcome logs, finished.
 /// The timeout detects a broken driver; elapsed time is never success evidence.
-async fn serve_briefly(store: Arc<FlakyReclaimStore>, clock: Arc<dyn tollgate_store::Clock>) {
+async fn serve_briefly(
+    store: Arc<SweepStore>,
+    state: Arc<SweepState>,
+    clock: Arc<dyn tollgate_store::Clock>,
+) {
     let (server, stop_tx) = spawn_server(
         Arc::clone(&store),
         clock,
         std::time::Duration::from_millis(10),
     )
     .await;
-    wait_for_cycles(&store, 5).await;
+    wait_for_cycles(&state, 5).await;
     let _ = stop_tx.send(());
     server.await.unwrap().unwrap();
 }
@@ -807,28 +731,19 @@ async fn the_server_reclaims_expired_leases_on_its_interval() {
         .unwrap();
     assert_eq!(inner.balance(ACCOUNT), CostUnits(600));
 
-    let store = Arc::new(FlakyReclaimStore {
-        inner: Arc::clone(&inner),
-        failures_left: AtomicU32::new(0),
-        fail_on_call: None,
-        fail_rollover: AtomicBool::new(false),
-        calls: AtomicU32::new(0),
-        called: tokio::sync::Notify::new(),
-        cycles: AtomicU32::new(0),
-        next_cycle: AtomicBool::new(true),
-        control: None,
-        ping_healthy: AtomicBool::new(true),
-    });
+    let state = Arc::new(SweepState::default());
+    let store = flaky(Arc::clone(&inner), &state);
     let (captor, guard) = capture();
     // A clock past the lease's expiry, so the sweep has something to reclaim.
     serve_briefly(
         Arc::clone(&store),
+        Arc::clone(&state),
         Arc::new(tollgate_store::ManualClock::new(t(120))),
     )
     .await;
     drop(guard);
 
-    assert!(store.calls.load(Ordering::Acquire) > 0, "the sweep ran");
+    assert!(state.calls.load(Ordering::Acquire) > 0, "the sweep ran");
     assert_eq!(
         inner.balance(ACCOUNT),
         CostUnits(1_000),
@@ -889,18 +804,8 @@ async fn one_scheduled_sweep_drains_every_saturated_batch() {
         CostUnits(1_000 - u64::try_from(lease_count).unwrap())
     );
 
-    let store = Arc::new(FlakyReclaimStore {
-        inner: Arc::clone(&inner),
-        failures_left: AtomicU32::new(0),
-        fail_on_call: None,
-        fail_rollover: AtomicBool::new(false),
-        calls: AtomicU32::new(0),
-        called: tokio::sync::Notify::new(),
-        cycles: AtomicU32::new(0),
-        next_cycle: AtomicBool::new(true),
-        control: None,
-        ping_healthy: AtomicBool::new(true),
-    });
+    let state = Arc::new(SweepState::default());
+    let store = flaky(Arc::clone(&inner), &state);
     let (server, stop_tx) = spawn_server(
         Arc::clone(&store),
         Arc::new(tollgate_store::ManualClock::new(t(120))),
@@ -909,15 +814,15 @@ async fn one_scheduled_sweep_drains_every_saturated_batch() {
     .await;
 
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while store.calls.load(Ordering::Acquire) < 2 {
+        while state.calls.load(Ordering::Acquire) < 2 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("the first sweep cycle must drain both batches");
-    assert_eq!(store.calls.load(Ordering::Acquire), 2);
+    assert_eq!(state.calls.load(Ordering::Acquire), 2);
     assert_eq!(
-        store.cycles.load(Ordering::Acquire),
+        state.cycles.load(Ordering::Acquire),
         1,
         "saturated batches do not count as additional cycles"
     );
@@ -940,18 +845,8 @@ async fn a_failed_later_batch_reports_already_committed_progress() {
             .await
             .unwrap();
     }
-    let store = Arc::new(FlakyReclaimStore {
-        inner,
-        failures_left: AtomicU32::new(0),
-        fail_on_call: Some(2),
-        fail_rollover: AtomicBool::new(false),
-        calls: AtomicU32::new(0),
-        called: tokio::sync::Notify::new(),
-        cycles: AtomicU32::new(0),
-        next_cycle: AtomicBool::new(true),
-        control: None,
-        ping_healthy: AtomicBool::new(true),
-    });
+    let state = Arc::new(SweepState::default().failing_on_call(2));
+    let store = flaky(inner, &state);
     let (captor, guard) = capture();
     let (server, stop_tx) = spawn_server(
         Arc::clone(&store),
@@ -1013,20 +908,15 @@ async fn a_failed_later_batch_reports_already_committed_progress() {
 /// learn it came back, and how long it was down for.
 #[tokio::test]
 async fn a_recovering_sweep_reports_how_many_failures_it_took() {
-    let store = Arc::new(FlakyReclaimStore {
-        inner: store_with_expired_lease(),
-        failures_left: AtomicU32::new(2),
-        fail_on_call: None,
-        fail_rollover: AtomicBool::new(false),
-        calls: AtomicU32::new(0),
-        called: tokio::sync::Notify::new(),
-        cycles: AtomicU32::new(0),
-        next_cycle: AtomicBool::new(true),
-        control: None,
-        ping_healthy: AtomicBool::new(true),
-    });
+    let state = Arc::new(SweepState::default().failing(2));
+    let store = flaky(store_with_expired_lease(), &state);
     let (captor, guard) = capture();
-    serve_briefly(Arc::clone(&store), Arc::new(SystemClock)).await;
+    serve_briefly(
+        Arc::clone(&store),
+        Arc::clone(&state),
+        Arc::new(SystemClock),
+    )
+    .await;
     drop(guard);
 
     let recoveries: Vec<_> = captor
@@ -1055,19 +945,14 @@ async fn a_recovering_sweep_reports_how_many_failures_it_took() {
 async fn a_failing_sweep_reports_consecutive_failures() {
     let (captor, guard) = capture();
 
-    let store = Arc::new(FlakyReclaimStore {
-        inner: store_with_expired_lease(),
-        failures_left: AtomicU32::new(u32::MAX),
-        fail_on_call: None,
-        fail_rollover: AtomicBool::new(false),
-        calls: AtomicU32::new(0),
-        called: tokio::sync::Notify::new(),
-        cycles: AtomicU32::new(0),
-        next_cycle: AtomicBool::new(true),
-        control: None,
-        ping_healthy: AtomicBool::new(true),
-    });
-    serve_briefly(Arc::clone(&store), Arc::new(SystemClock)).await;
+    let state = Arc::new(SweepState::default().failing(u32::MAX));
+    let store = flaky(store_with_expired_lease(), &state);
+    serve_briefly(
+        Arc::clone(&store),
+        Arc::clone(&state),
+        Arc::new(SystemClock),
+    )
+    .await;
     drop(guard);
 
     let events = captor.0.lock().unwrap().clone();
@@ -1106,18 +991,8 @@ async fn a_failing_sweep_reports_consecutive_failures() {
 
 #[tokio::test]
 async fn failed_rollover_retains_safe_progress_without_backend_text() {
-    let store = Arc::new(FlakyReclaimStore {
-        inner: store_with_expired_lease(),
-        failures_left: AtomicU32::new(0),
-        fail_on_call: None,
-        fail_rollover: AtomicBool::new(true),
-        calls: AtomicU32::new(0),
-        called: tokio::sync::Notify::new(),
-        cycles: AtomicU32::new(0),
-        next_cycle: AtomicBool::new(true),
-        control: None,
-        ping_healthy: AtomicBool::new(true),
-    });
+    let state = Arc::new(SweepState::default().failing_rollover());
+    let store = flaky(store_with_expired_lease(), &state);
     let (captor, guard) = capture();
     let (server, stop) = spawn_server(
         store,
@@ -1187,23 +1062,14 @@ async fn the_server_rolls_due_budget_periods_on_its_interval() {
     .unwrap();
     assert_eq!(inner.balance(ACCOUNT), CostUnits(1_000), "no allowance yet");
 
-    let store = Arc::new(FlakyReclaimStore {
-        inner: Arc::clone(&inner),
-        failures_left: AtomicU32::new(0),
-        fail_on_call: None,
-        fail_rollover: AtomicBool::new(false),
-        calls: AtomicU32::new(0),
-        called: tokio::sync::Notify::new(),
-        cycles: AtomicU32::new(0),
-        next_cycle: AtomicBool::new(true),
-        control: None,
-        ping_healthy: AtomicBool::new(true),
-    });
+    let state = Arc::new(SweepState::default());
+    let store = flaky(Arc::clone(&inner), &state);
     let (captor, guard) = capture();
     // 2026-02-14, past the boundary the epoch-stamped account still sits
     // behind.
     serve_briefly(
         Arc::clone(&store),
+        Arc::clone(&state),
         Arc::new(tollgate_store::ManualClock::new(t(1_771_027_200))),
     )
     .await;
@@ -1249,21 +1115,12 @@ async fn the_server_rolls_due_budget_periods_on_its_interval() {
 #[tokio::test]
 async fn a_tick_that_rolls_nothing_says_nothing() {
     let inner = store_with_expired_lease();
-    let store = Arc::new(FlakyReclaimStore {
-        inner: Arc::clone(&inner),
-        failures_left: AtomicU32::new(0),
-        fail_on_call: None,
-        fail_rollover: AtomicBool::new(false),
-        calls: AtomicU32::new(0),
-        called: tokio::sync::Notify::new(),
-        cycles: AtomicU32::new(0),
-        next_cycle: AtomicBool::new(true),
-        control: None,
-        ping_healthy: AtomicBool::new(true),
-    });
+    let state = Arc::new(SweepState::default());
+    let store = flaky(Arc::clone(&inner), &state);
     let (captor, guard) = capture();
     serve_briefly(
         Arc::clone(&store),
+        Arc::clone(&state),
         Arc::new(tollgate_store::ManualClock::new(t(1_771_027_200))),
     )
     .await;
@@ -1283,18 +1140,8 @@ async fn a_tick_that_rolls_nothing_says_nothing() {
 
 #[tokio::test]
 async fn cancelling_the_server_releases_its_owned_maintenance_task() {
-    let store = Arc::new(FlakyReclaimStore {
-        inner: store_with_expired_lease(),
-        failures_left: AtomicU32::new(0),
-        fail_on_call: None,
-        fail_rollover: AtomicBool::new(false),
-        calls: AtomicU32::new(0),
-        called: tokio::sync::Notify::new(),
-        cycles: AtomicU32::new(0),
-        next_cycle: AtomicBool::new(true),
-        control: None,
-        ping_healthy: AtomicBool::new(true),
-    });
+    let state = Arc::new(SweepState::default());
+    let store = flaky(store_with_expired_lease(), &state);
     let (server, _stop) = spawn_server(
         Arc::clone(&store),
         Arc::new(SystemClock),
@@ -1302,7 +1149,7 @@ async fn cancelling_the_server_releases_its_owned_maintenance_task() {
     )
     .await;
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while store.calls.load(Ordering::Acquire) == 0 {
+        while state.calls.load(Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
         }
     })
