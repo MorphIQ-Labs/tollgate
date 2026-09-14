@@ -255,10 +255,18 @@ impl GenerationHistory {
                 capacity: self.capacity.get(),
             });
         }
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "counts matches; a count does not depend on the order they are counted in"
+        )]
         let added = wanted
             .iter()
             .filter(|principal| !self.by_principal.contains_key(principal))
             .count();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "counts matches; a count does not depend on the order they are counted in"
+        )]
         let invalidated = wanted
             .iter()
             .filter(|principal| {

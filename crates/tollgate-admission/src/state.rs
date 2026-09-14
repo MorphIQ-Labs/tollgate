@@ -1161,6 +1161,10 @@ impl<K: Eq + Hash, V> WeakRegistry<K, V> {
         {
             self.swept_entries += self.entries.len();
         }
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the predicate is pure and total -- every dead entry goes, whatever order they are visited in"
+        )]
         self.entries.retain(|_, value| value.strong_count() > 0);
         self.swept_at = self.entries.len();
     }

@@ -966,6 +966,10 @@ impl Resolutions {
     ///
     /// Ordered, so a sweep visits principals the same way twice running.
     fn due_for_sweep(&self) -> Vec<Principal> {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "sorted below before it is returned, so the hash order never reaches the caller"
+        )]
         let mut principals: Vec<Principal> = self
             .tracked
             .iter()
@@ -989,6 +993,10 @@ impl Resolutions {
     /// out. Lag means local resolutions are untrustworthy; filtering by them
     /// would be assuming the answer (#52).
     fn all_tracked(&self) -> Vec<Principal> {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "sorted on the next line before it is returned, so the hash order never reaches the caller"
+        )]
         let mut principals: Vec<Principal> = self.tracked.iter().copied().collect();
         principals.sort_unstable();
         principals
@@ -1497,6 +1505,10 @@ async fn run(
     // Initial load: retry until every tracked principal is resolved, then
     // report ready. The map denies (fail closed) for anything unresolved in
     // the meantime.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a work queue drained to empty, not an output: every tracked principal is fetched, and the pass reports the same result whichever order they were fetched in"
+    )]
     let mut pending: Vec<Principal> = resolutions.tracked.iter().copied().collect();
     while !pending.is_empty() {
         if *shutdown.borrow() {
@@ -1900,6 +1912,10 @@ mod tests {
             resolutions: &HashMap<Principal, Resolution>,
             now: jiff::Timestamp,
         ) -> std::time::Duration {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "reduces deadlines to a minimum; a minimum does not depend on the order it is taken in"
+            )]
             resolutions
                 .values()
                 .map(|resolution| resolution.deadline())
@@ -1915,6 +1931,10 @@ mod tests {
             resolutions: &HashMap<Principal, Resolution>,
             now: jiff::Timestamp,
         ) -> std::time::Duration {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "reduces deadlines to a minimum; a minimum does not depend on the order it is taken in"
+            )]
             resolutions
                 .values()
                 .filter_map(|resolution| match resolution {
@@ -1941,6 +1961,10 @@ mod tests {
             now: jiff::Timestamp,
             limit: usize,
         ) -> Vec<Principal> {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "sorted below before the limit is applied, so which principals a bounded refetch takes is decided by deadline"
+            )]
             let mut due: Vec<_> = resolutions
                 .iter()
                 .filter_map(|(principal, resolution)| match resolution {

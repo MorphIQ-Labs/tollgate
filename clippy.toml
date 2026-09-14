@@ -1,0 +1,67 @@
+# Nondeterministic APIs this codebase must not reach for (#100, G14.determinism).
+#
+# Derived from this architecture, not copied: the request path "reads no
+# wall/business clock for policy decisions" and "callers pass `jiff` timestamps
+# explicitly" (AGENTS.md), so the business clock is the denial that matters
+# here. Two deliberate omissions are recorded at the bottom, because a denial
+# list is also a claim about what is *allowed*.
+#
+# Every entry carries a reason: a denial without one is a rule nobody can apply
+# at the call site it fires on.
+#
+# `disallowed_methods` only accepts paths that resolve in this dependency graph
+# — an unreachable path is itself a warning, and `-D warnings` makes it fatal —
+# so this list cannot pre-emptively deny APIs from crates the workspace does not
+# depend on.
+
+disallowed-methods = [
+  # --- Ambient business/wall time -------------------------------------------
+  # Policy decisions take an explicit `Timestamp` argument. The one production
+  # source is `tollgate_store::Clock`; tests use `ManualClock` or a literal, so
+  # a scenario's outcome depends on its inputs and not on when it ran.
+  { path = "jiff::Timestamp::now", reason = "take the instant as an argument; production reads it once through tollgate_store::Clock, tests through ManualClock" },
+  { path = "jiff::Zoned::now", reason = "same as Timestamp::now, and a zone makes the result depend on host configuration as well as on the clock" },
+  { path = "std::time::SystemTime::now", reason = "the wall clock is not monotonic and is not the business clock; use tollgate_store::Clock for business time and Instant for elapsed time" },
+
+  # --- Unordered iteration reaching an output --------------------------------
+  # A `HashMap`/`HashSet` iterates in an order derived from a per-process random
+  # seed, so anything that collects, folds, or emits in that order produces a
+  # result that differs run to run. Order-independent uses are fine and say so
+  # in an `#[allow]` at the site — which is the point: the annotation records
+  # that the author checked, rather than leaving the reader to.
+  #
+  # This is not theoretical here. `MemoryStore::principals` returned
+  # `snapshots.keys()` straight to its caller while `PostgresStore` answered
+  # `ORDER BY principal`, and the suite's assertion sorted before comparing, so
+  # the two backends disagreed invisibly (#100).
+  { path = "std::collections::HashMap::iter", reason = "iteration order comes from the hash seed; collect into a BTreeMap, or sort, when the order reaches an output" },
+  { path = "std::collections::HashMap::iter_mut", reason = "same as HashMap::iter when the traversal order affects what is written" },
+  { path = "std::collections::HashMap::keys", reason = "iteration order comes from the hash seed; sort before returning a key set to a caller" },
+  { path = "std::collections::HashMap::values", reason = "iteration order comes from the hash seed; sort by key when the order reaches an output" },
+  { path = "std::collections::HashMap::values_mut", reason = "same as HashMap::values when the traversal order affects what is written" },
+  { path = "std::collections::HashMap::drain", reason = "drains in hash order; collect and sort when the drained order reaches an output" },
+  { path = "std::collections::HashMap::retain", reason = "visits in hash order, so a predicate with side effects observes a different sequence each run" },
+  { path = "std::collections::HashSet::iter", reason = "iteration order comes from the hash seed; sort before the order reaches an output" },
+  { path = "std::collections::HashSet::drain", reason = "drains in hash order; collect and sort when the drained order reaches an output" },
+  { path = "std::collections::HashSet::retain", reason = "visits in hash order, so a predicate with side effects observes a different sequence each run" },
+]
+
+# --- Deliberately not denied -------------------------------------------------
+#
+# `std::time::Instant::now` and `tokio::time::Instant::now`. AGENTS.md makes
+# monotonic reads an explicit, measured allowance rather than an oversight:
+# "Moka maintenance and governor's bucket arithmetic read their own monotonic
+# clocks; those are measured mechanism costs, never sources of snapshot or lease
+# truth." The control plane's timeouts, deadlines and backoff are that same
+# mechanism. Denying it would need roughly thirty allows asserting the design
+# the architecture already states, and would blur the distinction the rules rest
+# on: elapsed time is a mechanism, business time is truth.
+#
+# `getrandom::fill` and `uuid::Uuid::new_v4`. These are randomness the codebase
+# *must* reach for — unguessable lease identifiers, HMAC secrets, diagnostic
+# ids. A determinism gate denies APIs that make a result depend on something
+# other than its inputs by accident; these are unpredictability on purpose, and
+# a denial here would be thirteen allows saying "yes, this one is meant to be
+# random". The seeded/thread-local PRNGs that *would* belong (`rand::random`,
+# `rand::thread_rng`) are not in the dependency graph, and naming them would
+# fail the build for an unresolvable path.

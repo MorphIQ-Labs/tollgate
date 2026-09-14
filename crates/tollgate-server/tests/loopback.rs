@@ -10,6 +10,11 @@
 //! are what fail if shutdown misbehaves, and a receiver that has already gone
 //! away is the normal end of a test.
 #![allow(
+    clippy::disallowed_methods,
+    reason = "an end-to-end test over real loopback TCP against a live server: wall-clock time is \
+              what the server itself runs on, so the harness must speak the same instants"
+)]
+#![allow(
     clippy::let_underscore_must_use,
     reason = "test teardown discards results the assertions have already read"
 )]

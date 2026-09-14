@@ -276,6 +276,11 @@ impl CredentialVerifier for HmacRegistry {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::disallowed_methods,
+        reason = "unit tests that build an arbitrary `now` the assertions are relative to; \
+                  no assertion here depends on what the clock actually said"
+    )]
     #[test]
     fn credential_diagnostics_never_disclose_issuer_or_customer_secrets() {
         let secret = b"fixture-debug-redaction-hmac-secret-108";

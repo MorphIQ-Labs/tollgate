@@ -1207,10 +1207,44 @@ impl AdminStore for MemoryStore {
     ) -> Result<RolloverBatch, StoreError> {
         let mut inner = self.lock();
         let mut rolled = Vec::new();
-        for (account_id, record) in inner.accounts.iter_mut() {
-            if rolled.len() == limit.get() {
-                break;
-            }
+        // Choose *which* accounts this bounded batch rolls before rolling any,
+        // oldest period first, exactly as `DUE_PERIODS_SQL` does with
+        // `ORDER BY period_start_us LIMIT $3`.
+        //
+        // Iterating `accounts` directly and breaking at `limit` selected by
+        // hash order, so with more accounts due than one batch can take, two
+        // runs over identical state rolled different accounts — and a different
+        // set again from the backend this one is the reference for (#100). The
+        // drain loop means every due account is rolled eventually, so this was
+        // not a ledger defect; it was an unbounded-in-principle wait for any
+        // particular account, and a divergence no test could see.
+        //
+        // The account id breaks ties so the order is total. PostgreSQL leaves
+        // equal `period_start_us` rows in an arbitrary order; being stricter
+        // than the contract is safe, and being unpredictable is what this
+        // avoids.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "sorted below before the limit is applied, so the batch's membership is a function of the stored state"
+        )]
+        let mut due: Vec<(Timestamp, AccountId)> = inner
+            .accounts
+            .iter()
+            .filter_map(|(account_id, record)| {
+                let schedule = record.schedule?;
+                (schedule.period.start_of(now) > record.period_start)
+                    .then_some((record.period_start, *account_id))
+            })
+            .collect();
+        due.sort_unstable();
+        due.truncate(limit.get());
+
+        for (_, account_id) in due {
+            let account_id = &account_id;
+            let record = inner
+                .accounts
+                .get_mut(account_id)
+                .expect("the due set was taken from this map under the same lock");
             let Some(schedule) = record.schedule else {
                 continue;
             };
@@ -1444,7 +1478,20 @@ impl SnapshotSource for MemoryStore {
     /// the catalogue would make it indistinguishable from a principal that
     /// never existed, which is the resurrection INVARIANTS.md #15 forbids.
     async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
-        Ok(Some(self.lock().snapshots.keys().copied().collect()))
+        // Sorted, because the catalogue is an output and `snapshots` is a
+        // `HashMap`: returning its iteration order would make this call's
+        // result depend on the hash seed rather than on the stored state, and
+        // differ run to run. `PostgresStore` already answers
+        // `ORDER BY principal`, so the reference backend was the one diverging
+        // (#100). The suite's assertion sorted before comparing, which is how
+        // it stayed invisible.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "sorted on the next line before it leaves the function, so the hash order never reaches the caller"
+        )]
+        let mut principals: Vec<Principal> = self.lock().snapshots.keys().copied().collect();
+        principals.sort_unstable_by_key(|principal| principal.0);
+        Ok(Some(principals))
     }
 }
 

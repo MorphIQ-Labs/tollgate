@@ -3072,6 +3072,60 @@ async fn clearing_a_schedule_leaves_the_balance_alone() {
 
 /// Every scheduled account comes due at the same instant — that is what a
 /// calendar boundary is — so the pass is bounded and its caller drains it.
+/// Which accounts a bounded pass rolls is decided, not left to the map (#100).
+///
+/// The reference backend used to iterate `accounts` and break at the limit, so
+/// with more accounts due than one batch takes, two runs over identical state
+/// rolled different accounts — `HashMap` order comes from a per-process seed.
+/// `PostgresStore` has always answered `ORDER BY period_start_us LIMIT $3`, so
+/// the backend the other one mirrors was the unpredictable one.
+///
+/// Every due account still rolls, because the caller drains saturated batches;
+/// what this pins is that the *selection* is a function of the stored state.
+/// Equal period starts tie-break on the account id, which is stricter than
+/// PostgreSQL's arbitrary order among equals — being stricter is safe, and
+/// being unpredictable is the thing worth forbidding.
+#[tokio::test]
+async fn a_bounded_rollover_pass_takes_the_oldest_periods_not_an_arbitrary_set() {
+    let first_batch = || async {
+        let store = MemoryStore::new(full_grant_policy()).unwrap();
+        for id in 1..=5u128 {
+            store.create_account(AccountConfig {
+                account_id: AccountId(id),
+                initial_balance: CostUnits::ZERO,
+                status: AccountStatus::Active,
+                capacity_class: CapacityClass::Assured,
+            });
+            store
+                .set_budget_schedule(AccountId(id), Some(monthly(100)))
+                .await
+                .unwrap();
+        }
+        let batch = store
+            .roll_due_periods(t(FEB), NonZeroUsize::new(2).unwrap())
+            .await
+            .unwrap();
+        batch
+            .rolled()
+            .iter()
+            .map(|rolled| rolled.account_id)
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        first_batch().await,
+        vec![AccountId(1), AccountId(2)],
+        "the two oldest-and-lowest due accounts, in order"
+    );
+    // A fresh store built the same way must choose the same two. Under hash
+    // order this held only by luck, and a differently seeded process broke it.
+    assert_eq!(
+        first_batch().await,
+        first_batch().await,
+        "the selection is a function of the stored state, not of the run"
+    );
+}
+
 /// A batch that quietly rolled everything would make the first pass after
 /// midnight on the 1st as large as the account table.
 #[tokio::test]

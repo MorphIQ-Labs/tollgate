@@ -34,6 +34,12 @@
 //! benchmark was read as a real threshold breach, and how a baseline captured
 //! on a loaded machine made a later change look 16% faster than it was.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a reporting tool: these reads stamp when a report was produced, which is \
+              metadata about the run rather than an input to any decision the workspace makes"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
