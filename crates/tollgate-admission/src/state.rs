@@ -1455,6 +1455,11 @@ impl PublishableSnapshotUpdate {
 
 /// The pluggable snapshot map. Implementations must make `get` lock-free (or
 /// as close as their backing store allows) and safe for concurrent `install`.
+/// "As close as allows" is a real allowance, not a formality: a bounded cache
+/// has to do its bookkeeping somewhere, and [`crate::MokaSnapshotMap`] pays
+/// it inline under a non-blocking `try_lock` on roughly every sixty-fourth
+/// lookup. What an implementation may never do is *block* a request behind
+/// another thread's maintenance, or make a request wait on the control plane.
 ///
 /// Generation monotonicity is part of the contract: installing a snapshot
 /// older than the one present must be a no-op, so replayed or reordered

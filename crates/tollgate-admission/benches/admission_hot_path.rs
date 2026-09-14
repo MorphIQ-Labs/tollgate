@@ -22,7 +22,8 @@ use jiff::Timestamp;
 
 use tollgate_admission::{
     AdmissionEngine, ArcSwapSnapshotMap, CapacityGate, ExecutionCapacityGate,
-    ExecutionCapacityMode, LeaseSlot, MokaSnapshotMap, NoGate, Pending, Principal, SnapshotMap,
+    ExecutionCapacityMode, LeaseSlot, MokaSnapshotMap, NoGate, Pending, Principal,
+    PublishableSnapshotUpdate, SnapshotMap,
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, FencingToken,
@@ -272,6 +273,82 @@ fn populate_distinct(map: &impl SnapshotMap) {
     }
 }
 
+/// Moka's configured bound in `bench_lookup`, and the size of the at-capacity
+/// working set below: exactly `max_capacity` principals resident, because that
+/// is the largest legitimate population for a cache built with it. A power of
+/// two, so rotating through it costs a mask rather than a division.
+const AT_CAPACITY: usize = 4_096;
+const AT_CAPACITY_MASK: usize = AT_CAPACITY - 1;
+
+/// A fixed permutation of `0..AT_CAPACITY`, shared by both maps so the two
+/// at-capacity rows differ in their map and in nothing else.
+///
+/// The stride is odd, so `i -> i * STRIDE mod 2^12` is a bijection: every
+/// principal is visited exactly once per rotation, in an order no hardware
+/// prefetcher walks ahead of, and without a random number generator whose seed
+/// would be one more thing the two rows could disagree about.
+fn at_capacity_working_set() -> Vec<Principal> {
+    const STRIDE: usize = 2_654_435_761;
+    let order: Vec<Principal> = (0..AT_CAPACITY)
+        .map(|i| Principal((i.wrapping_mul(STRIDE) & AT_CAPACITY_MASK) as u128))
+        .collect();
+    let mut seen = vec![false; AT_CAPACITY];
+    for principal in &order {
+        let index = principal.0 as usize;
+        assert!(!seen[index], "the stride must permute the working set");
+        seen[index] = true;
+    }
+    order
+}
+
+/// `populate`'s sibling rather than a parameter on it: five other fixtures are
+/// baselined at 512 principals and must not move.
+///
+/// One batch instead of a loop of installs, because the copy-on-write map
+/// clones the whole map per install — 4,096 individual installs is the O(N^2)
+/// shape `install_many` exists to avoid. One shared `LeaseSlot`, because these
+/// principals share `AccountId(1)` and a slot is per account; the lookup path
+/// never reads it.
+fn populate_working_set(map: &impl SnapshotMap, working_set: &[Principal]) {
+    let sharding = map.local_sharding();
+    let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
+    drop(slot.replace(big_lease(sharding)));
+    let snapshot = PublishableSnapshot::try_new(snapshot()).unwrap();
+    map.apply_publishable_many(
+        working_set
+            .iter()
+            .map(|principal| PublishableSnapshotUpdate::Present {
+                principal: *principal,
+                snapshot: snapshot.clone(),
+                lease: Arc::clone(&slot),
+            })
+            .collect(),
+    )
+    .unwrap();
+}
+
+/// Read the whole working set `rounds` times and report the hits.
+///
+/// Outside every timed loop, and it does two jobs. It warms: one rotation is
+/// sixty-four times moka's read-log flush point, so the first housekeeper
+/// drain, the frequency sketch's enablement and crossbeam-epoch's lazy init
+/// are all behind us before a sample is taken. And it probes: the timed loops
+/// take no branch on a miss, so this is what makes a fixture that silently
+/// lost entries fail loudly instead of being measured — a moka miss is
+/// *cheaper* than a hit, so a broken fixture would otherwise report a faster
+/// moka rather than a broken benchmark.
+fn sweep(map: &impl SnapshotMap, working_set: &[Principal], rounds: usize) -> usize {
+    let mut hits = 0;
+    for _ in 0..rounds {
+        for principal in working_set {
+            if black_box(map.get(black_box(principal))).is_some() {
+                hits += 1;
+            }
+        }
+    }
+    hits
+}
+
 fn bench_lookup(c: &mut Criterion) {
     let mut group = c.benchmark_group("admission");
     let principal = Principal(97);
@@ -287,6 +364,68 @@ fn bench_lookup(c: &mut Criterion) {
     group.bench_function("snapshot_lookup_moka", |b| {
         b.iter(|| moka.get(black_box(&principal)).unwrap())
     });
+
+    // The pair above reads one principal out of 512 in a cache sized 4,096: a
+    // permanently resident key in a cache one-eighth full, where moka evicts
+    // nothing and — below half of `max_capacity` — does not enable its
+    // frequency sketch at all. The pair below holds exactly `max_capacity`
+    // principals and rotates across all of them, which is the configuration a
+    // bounded cache exists for. Both walk the same permutation of the same
+    // working set, so the ratio between them is a statement about the two maps
+    // and nothing else.
+    //
+    // It is a full-cache *read* measurement, not an eviction measurement:
+    // `get` never inserts, so nothing in the timed loop can push the cache
+    // over capacity. What it prices over the pair above is the enabled sketch,
+    // full access-order deques, and a working set past L1.
+    let working_set = at_capacity_working_set();
+
+    let arc_swap_full = ArcSwapSnapshotMap::new();
+    populate_working_set(&arc_swap_full, &working_set);
+    let moka_full = MokaSnapshotMap::new(AT_CAPACITY as u64);
+    populate_working_set(&moka_full, &working_set);
+
+    assert_eq!(
+        sweep(&arc_swap_full, &working_set, 4),
+        4 * AT_CAPACITY,
+        "the arc-swap fixture must hold the whole working set"
+    );
+    assert_eq!(
+        sweep(&moka_full, &working_set, 4),
+        4 * AT_CAPACITY,
+        "moka must hold all {AT_CAPACITY} principals before it is timed"
+    );
+
+    group.bench_function("snapshot_lookup_arc_swap_at_capacity", |b| {
+        let mut cursor = 0usize;
+        b.iter(|| {
+            let hit = black_box(arc_swap_full.get(black_box(&working_set[cursor]))).is_some();
+            // A true data dependency on the result, without perturbing the
+            // order: `hit` is 1 on every iteration, so the walk is exactly the
+            // permutation, but the address of the next load cannot be computed
+            // until this one has landed. That keeps this a latency measurement
+            // like the pair above rather than letting the core overlap
+            // independent lookups, and it is also why the rotation cannot be
+            // hoisted out of the loop.
+            cursor = (cursor + usize::from(hit)) & AT_CAPACITY_MASK;
+        });
+    });
+    group.bench_function("snapshot_lookup_moka_at_capacity", |b| {
+        let mut cursor = 0usize;
+        b.iter(|| {
+            let hit = black_box(moka_full.get(black_box(&working_set[cursor]))).is_some();
+            cursor = (cursor + usize::from(hit)) & AT_CAPACITY_MASK;
+        });
+    });
+
+    // Afterwards as well as before: nothing in the timed loop writes, so
+    // nothing should have evicted, and this is what says so rather than
+    // assuming it.
+    assert_eq!(
+        sweep(&moka_full, &working_set, 1),
+        AT_CAPACITY,
+        "moka evicted during a read-only benchmark"
+    );
 
     group.finish();
 }

@@ -468,9 +468,10 @@ impl AdmissionCounters {
     ///
     /// Lock-free, so the result is not a single instant: counters read later
     /// may include increments that landed after the earlier ones were read.
-    /// The alternative is a lock on the request path, which INVARIANTS.md #5
-    /// forbids outright — and skew between counters read microseconds apart
-    /// does not survive the scrape interval that consumes them.
+    /// The alternative is a blocking lock held across the request path, which
+    /// the crate's hot-path budget rules out — and skew between counters read
+    /// microseconds apart does not survive the scrape interval that consumes
+    /// them.
     #[must_use]
     /// Units quoted by every admitted request on this instance, including the
     /// overage ones (`record_admit_overage` counts through `record_admit`).
