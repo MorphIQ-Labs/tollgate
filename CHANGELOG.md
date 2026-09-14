@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.21.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.21.2...v0.21.3) - 2026-09-14
+
+### Fixed
+
+- *(admission)* state the request path's real lock budget, and measure the cache full
+
 ## [0.21.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.21.1...v0.21.2) - 2026-09-14
 
 ### Fixed
