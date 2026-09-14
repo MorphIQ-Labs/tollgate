@@ -113,8 +113,8 @@ impl CostTable {
     /// workload and needs the permission bits only the fold returns, so it
     /// keeps [`CostTable::quote_workload`] and is unaffected either way.
     ///
-    /// The arithmetic stays shared — [`CostTable::weight_at`] and
-    /// [`CostTable::quote_weight`] are the same two steps the fold takes — and
+    /// The arithmetic stays shared — `CostTable::weight_at` and
+    /// `CostTable::quote_weight` are the same two steps the fold takes — and
     /// `quote_agrees_with_the_one_entry_workload` holds the two paths to the
     /// same answer rather than trusting that argument.
     #[inline]

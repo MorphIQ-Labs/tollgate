@@ -34,8 +34,8 @@ use tokio::task::JoinSet;
 use tracing::Instrument as _;
 
 use tollgate_admission::{
-    PublishableSnapshotUpdate, SnapshotMap, Watermark, accept_positive, accept_revoked,
-    accept_unknown,
+    PublicationError, PublishableSnapshotUpdate, RefreshBatch, Refreshed, SnapshotMap, Watermark,
+    accept_positive, accept_revoked, accept_unknown,
 };
 use tollgate_core::{Generation, Principal};
 use tollgate_store::{Clock, SnapshotResolution, SnapshotSource, StoreError};
@@ -232,6 +232,8 @@ pub struct SnapshotCounters {
     refresh_timeouts: AtomicU64,
     discovery_failures: AtomicU64,
     refused_updates: AtomicU64,
+    history_evictions: AtomicU64,
+    publication_failures: AtomicU64,
     unresolved: AtomicU64,
 }
 
@@ -244,6 +246,8 @@ impl SnapshotCounters {
             refresh_timeouts: AtomicU64::new(0),
             discovery_failures: AtomicU64::new(0),
             refused_updates: AtomicU64::new(0),
+            history_evictions: AtomicU64::new(0),
+            publication_failures: AtomicU64::new(0),
             unresolved: AtomicU64::new(0),
         }
     }
@@ -296,6 +300,8 @@ impl SnapshotCounters {
             refresh_timeouts: self.refresh_timeouts.load(Ordering::Relaxed),
             discovery_failures: self.discovery_failures.load(Ordering::Relaxed),
             refused_updates: self.refused_updates.load(Ordering::Relaxed),
+            history_evictions: self.history_evictions.load(Ordering::Relaxed),
+            publication_failures: self.publication_failures.load(Ordering::Relaxed),
             unresolved: self.unresolved.load(Ordering::Relaxed),
         }
     }
@@ -326,6 +332,12 @@ pub struct SnapshotStats {
     /// an already installed positive at the same generation: that is an
     /// ordinary unchanged catalogue, not a stale or revoked update.
     pub refused_updates: u64,
+    /// Histories reclaimed under capacity pressure. Each removal also removes
+    /// visible state and requires a fresh authoritative read to recover.
+    pub history_evictions: u64,
+    /// Reservations or publications refused by the retention/fence boundary.
+    /// Distinct from source failures and ordinary generation rejection.
+    pub publication_failures: u64,
     /// Principals with no currently valid resolution — a gauge, not a total.
     /// Reports the last resolution pass, not task liveness. Fixed mode needs
     /// zero unresolved; All mode needs some resolved (or an empty catalogue).
@@ -350,6 +362,12 @@ impl SnapshotManager {
         config: SnapshotManagerConfig,
     ) -> Result<Self, SnapshotManagerConfigError> {
         config.validate()?;
+        if matches!(&config.principals, TrackedPrincipals::Fixed(principals) if principals.len() > map.generation_capacity().get())
+        {
+            return Err(SnapshotManagerConfigError(
+                "fixed principals exceed snapshot generation capacity",
+            ));
+        }
         if map.local_sharding() != slots.sharding() {
             return Err(SnapshotManagerConfigError(
                 "snapshot map and lease slots must use the same local sharding",
@@ -498,6 +516,23 @@ impl Resolution {
 /// When nothing is scheduled: re-examine in an hour rather than never.
 const IDLE_WAKEUP: std::time::Duration = std::time::Duration::from_secs(3_600);
 
+enum Publications {
+    Push(Vec<PublishableSnapshotUpdate>),
+    Refreshed(Vec<Refreshed<PublishableSnapshotUpdate>>),
+}
+
+impl Publications {
+    fn principals(&self) -> Vec<Principal> {
+        match self {
+            Self::Push(updates) => updates
+                .iter()
+                .map(PublishableSnapshotUpdate::principal)
+                .collect(),
+            Self::Refreshed(updates) => updates.iter().map(Refreshed::principal).collect(),
+        }
+    }
+}
+
 /// The running manager's sole publication boundary. Runtime membership is
 /// observed only after the map has applied its generation acceptance rule.
 struct Publication {
@@ -512,25 +547,22 @@ impl std::fmt::Debug for Publication {
 }
 
 impl Publication {
-    fn apply(&self, updates: Vec<PublishableSnapshotUpdate>, now: jiff::Timestamp) {
-        let principals: Vec<_> = if self.slots.observes() {
-            updates
-                .iter()
-                .map(|update| match update {
-                    PublishableSnapshotUpdate::Present { principal, .. }
-                    | PublishableSnapshotUpdate::Revoked { principal, .. }
-                    | PublishableSnapshotUpdate::Unknown { principal, .. } => *principal,
-                })
-                .collect()
+    fn apply(&self, updates: Publications, now: jiff::Timestamp) -> Result<(), PublicationError> {
+        let principals = if self.slots.observes() {
+            updates.principals()
         } else {
             Vec::new()
         };
-        self.map.apply_publishable_many_at(updates, now);
+        match updates {
+            Publications::Push(updates) => self.map.apply_publishable_many_at(updates, now)?,
+            Publications::Refreshed(updates) => self.map.apply_refreshed_many_at(updates, now)?,
+        }
         self.slots.observe_many(
             principals
                 .into_iter()
                 .map(|principal| (principal, self.map.get(&principal))),
         );
+        Ok(())
     }
 }
 
@@ -562,10 +594,9 @@ struct Resolutions {
     /// and a count alone cannot answer "is this one still ours?" when a push
     /// arrives or an enumeration drops someone.
     tracked: HashSet<Principal>,
-    /// Authoritative per-principal state. Never shrinks: an expired
-    /// resolution keeps its generation watermark, which must outlive it or a
-    /// replayed older generation could resurrect a revoked principal
-    /// (INVARIANTS.md #15).
+    /// Resolution and deadline state for retained histories. Expiry keeps the
+    /// watermark; a reported history reclamation removes the whole resolution
+    /// before reconstruction starts. Source-catalogue membership is separate.
     by_principal: HashMap<Principal, Resolution>,
     /// Live `Present` deadlines, drained as they pass.
     present: BTreeSet<(jiff::Timestamp, Principal)>,
@@ -582,7 +613,7 @@ impl Resolutions {
         let tracked: HashSet<Principal> = tracked.into_iter().collect();
         Resolutions {
             publication: None,
-            by_principal: HashMap::with_capacity(tracked.len()),
+            by_principal: HashMap::new(),
             tracked,
             present: BTreeSet::new(),
             negative: BTreeSet::new(),
@@ -601,11 +632,86 @@ impl Resolutions {
         resolutions
     }
 
-    fn publish(&self, updates: Vec<PublishableSnapshotUpdate>, now: jiff::Timestamp) {
-        self.publication
+    fn publish(
+        &mut self,
+        updates: Publications,
+        now: jiff::Timestamp,
+        counters: &SnapshotCounters,
+    ) -> bool {
+        let principals = updates.principals();
+        let result = self
+            .publication
             .as_ref()
             .expect("a running manager owns publication")
             .apply(updates, now);
+        if let Err(error) = result {
+            counters
+                .publication_failures
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(%error, "snapshot publication refused; affected principals remain unresolved and retry");
+            for principal in principals {
+                self.discard(principal);
+            }
+            false
+        } else {
+            true
+        }
+    }
+
+    fn discard(&mut self, principal: Principal) {
+        if let Some(previous) = self.by_principal.remove(&principal) {
+            self.forget(principal, previous);
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.publication
+            .as_ref()
+            .expect("a running manager owns publication")
+            .map
+            .generation_capacity()
+            .get()
+    }
+
+    fn needs_refresh(&self, principal: Principal) -> bool {
+        !self.by_principal.contains_key(&principal)
+            || self
+                .publication
+                .as_ref()
+                .expect("a running manager owns publication")
+                .map
+                .needs_refresh(principal)
+    }
+
+    fn prepare_refreshes(
+        &mut self,
+        principals: &[Principal],
+        counters: &SnapshotCounters,
+    ) -> Result<RefreshBatch, PublicationError> {
+        let publication = self
+            .publication
+            .as_ref()
+            .expect("a running manager owns publication");
+        let batch = publication.map.prepare_refreshes(principals)?;
+        if !batch.evicted.is_empty() {
+            counters
+                .history_evictions
+                .fetch_add(batch.evicted.len() as u64, Ordering::Relaxed);
+            if publication.slots.observes() {
+                publication
+                    .slots
+                    .observe_many(batch.evicted.iter().map(|&principal| (principal, None)));
+            }
+            tracing::warn!(
+                evicted = batch.evicted.len(),
+                capacity = publication.map.generation_capacity().get(),
+                "snapshot history reclaimed; evicted principals require authoritative refresh"
+            );
+            for &principal in &batch.evicted {
+                self.discard(principal);
+            }
+        }
+        Ok(batch)
     }
 
     fn is_tracked(&self, principal: Principal) -> bool {
@@ -670,29 +776,11 @@ impl Resolutions {
     /// called, so a second copy of the rule here would decide the outcome on
     /// its own — which is how #53 survived a fix to the map alone.
     ///
-    /// Whether an incoming positive at `generation` may replace what this
-    /// principal holds — the admission layer's rule, called rather than
-    /// restated, since the manager gates before the map is ever reached.
-    ///
-    /// Visibility comes from this resolution, and the two alternatives were
-    /// both tried and are both worse:
-    ///
-    /// - Asking the map makes every sweep record a synthetic read against
-    ///   every tracked principal. On a `moka` cache that feeds the frequency
-    ///   sketch and biases eviction toward whatever the sweep touched.
-    /// - Passing `false` accepts an equal generation, so an *unchanged*
-    ///   catalogue yields an update per principal per sweep: a slot lookup and
-    ///   a limiter resolution each, and on the copy-on-write map a clone of the
-    ///   whole map — a batch that previously did not exist at all.
-    ///
-    /// The cost of using this resolution is that a map which evicts a
-    /// *present* entry behind the manager's back will not be repaired by a
-    /// same-generation refetch. `ArcSwapSnapshotMap` never does: it evicts only
-    /// negatives, by expiry or by the negative cap. `MokaSnapshotMap` can, when
-    /// `max_capacity` is below the tracked set — a configuration that is
-    /// already denying live principals on the request path, and one that no
-    /// pre-#53 version repaired either, since the equal generation was refused
-    /// outright.
+    /// History reclamation discards this resolution before refetching. A
+    /// separate visible eviction leaves history intact; probe cache membership
+    /// without recording a request-frequency hit so an equal-generation pull
+    /// repairs that miss. The manager owns publication, so its resolution
+    /// determines whether a retained visible entry is positive or negative.
     fn accepts_positive(
         &self,
         principal: Principal,
@@ -704,7 +792,11 @@ impl Resolutions {
         let (_, accepted) = accept_positive(
             current.and_then(Resolution::watermark),
             generation,
-            current.is_some_and(|resolution| matches!(resolution, Resolution::Present { .. })),
+            current.is_some_and(|resolution| matches!(resolution, Resolution::Present { .. }))
+                && self
+                    .publication
+                    .as_ref()
+                    .is_none_or(|publication| publication.map.contains_cached(&principal)),
         );
         // The shared admission rule also returns false for a visible equal
         // generation. Classify that idempotent no-op without changing its
@@ -1050,24 +1142,66 @@ async fn refresh_all_cancellable(
     ready: &watch::Sender<bool>,
     counters: &SnapshotCounters,
 ) -> Option<Vec<Principal>> {
-    let mut pending = principals.iter().copied();
+    let mut pending = Vec::new();
+    for principals in principals.chunks(resolutions.capacity()) {
+        pending.extend(
+            refresh_chunk_cancellable(
+                source,
+                slots,
+                clock,
+                config,
+                principals,
+                resolutions,
+                shutdown,
+                ready,
+                counters,
+            )
+            .await?,
+        );
+    }
+    Some(pending)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn refresh_chunk_cancellable(
+    source: &Arc<dyn SnapshotSource>,
+    slots: &Arc<SlotRegistry>,
+    clock: &Arc<dyn Clock>,
+    config: &SnapshotManagerConfig,
+    principals: &[Principal],
+    resolutions: &mut Resolutions,
+    shutdown: &mut watch::Receiver<bool>,
+    ready: &watch::Sender<bool>,
+    counters: &SnapshotCounters,
+) -> Option<Vec<Principal>> {
+    let mut pending = match resolutions.prepare_refreshes(principals, counters) {
+        Ok(batch) => batch.reads.into_iter(),
+        Err(error) => {
+            counters
+                .publication_failures
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(%error, "snapshot refresh reservation failed; principals retry with backoff");
+            return Some(principals.to_vec());
+        }
+    };
+    // Eviction changes readiness before source I/O, even if the source hangs.
+    update_ready(ready, resolutions, clock, counters, &config.principals);
     // The inner result is the source's answer; the outer one says whether it
     // arrived at all. Abandoning the fetch — rather than the task holding a
     // future that never resolves — is what lets `tasks` empty and the sweep
     // return (#103).
     type Fetched = Result<Result<SnapshotResolution, StoreError>, tokio::time::error::Elapsed>;
-    let mut tasks = JoinSet::<(Principal, Fetched)>::new();
+    let mut tasks = JoinSet::<Refreshed<Fetched>>::new();
     for _ in 0..config.max_concurrent_fetches {
-        let Some(principal) = pending.next() else {
+        let Some(read) = pending.next() else {
             break;
         };
         let source = Arc::clone(source);
         let bound = config.fetch_timeout;
+        let principal = read.principal();
         tasks.spawn(async move {
-            (
-                principal,
-                tokio::time::timeout(bound, source.snapshot(principal)).await,
-            )
+            read.fetch(|| tokio::time::timeout(bound, source.snapshot(principal)))
+                .await
         });
     }
 
@@ -1090,14 +1224,12 @@ async fn refresh_all_cancellable(
                     }
                     None => {}
                 }
-                if let Some(principal) = pending.next() {
+                if let Some(read) = pending.next() {
                     let source = Arc::clone(source);
                     let bound = config.fetch_timeout;
+                    let principal = read.principal();
                     tasks.spawn(async move {
-                        (
-                            principal,
-                            tokio::time::timeout(bound, source.snapshot(principal)).await,
-                        )
+                        read.fetch(|| tokio::time::timeout(bound, source.snapshot(principal))).await
                     });
                 }
             }
@@ -1115,113 +1247,129 @@ async fn refresh_all_cancellable(
 
     let mut updates = Vec::with_capacity(results.len());
     let mut completed = HashSet::with_capacity(results.len());
-    for (principal, result) in results {
-        // One attempt per principal per pass, counted whatever the outcome:
-        // an attempt rate that has gone to zero is itself the signal that the
-        // refresh loop has stopped.
-        counters.record_attempt();
-        // Unwrap the bound before the source's own answer, so every arm below
-        // reads exactly as it did when a fetch could only succeed or fail.
-        // Left out of `completed` like a refusal, which is what re-arms
-        // `next_refetch` and puts this principal behind the backoff rather
-        // than into a zero-delay refetch loop against a slow source.
-        let Ok(result) = result else {
-            counters.record_timeout();
-            tracing::warn!(
-                %principal,
-                timeout_ms = config.fetch_timeout.as_millis(),
-                "snapshot fetch abandoned at its bound; principal keeps its \
-                 previous resolution and retries with backoff"
-            );
-            continue;
-        };
-        match result {
-            Ok(SnapshotResolution::Present(snapshot)) => {
-                if !resolutions.accepts_positive(
-                    principal,
-                    snapshot.generation,
-                    UpdateOrigin::Refresh,
-                    counters,
-                ) {
-                    // Keep refusals/no-ops out of completed: it rearms a
-                    // negative's retry backoff, never its validity deadline.
-                    continue;
-                }
-                completed.insert(principal);
-                let slot = slots.slot(snapshot.account_id);
-                resolutions.insert(
-                    principal,
-                    Resolution::Present {
-                        deadline: snapshot.valid_until,
-                        generation: snapshot.generation,
-                    },
-                );
-                updates.push(PublishableSnapshotUpdate::Present {
-                    principal,
-                    snapshot,
-                    lease: slot,
-                });
-            }
-            Ok(SnapshotResolution::Revoked {
-                generation: incoming,
-            }) => {
-                let now = clock.now();
-                let (watermark, accepted) =
-                    resolutions.revocation(principal, incoming, UpdateOrigin::Refresh, counters);
-                if !accepted {
-                    // Refused answers still drive the bounded retry schedule.
-                    continue;
-                }
-                let until = negative_deadline(now, config, NegativeKind::Revoked);
-                completed.insert(principal);
-                resolutions.insert(
-                    principal,
-                    Resolution::Negative {
-                        deadline: until,
-                        next_refetch: until,
-                        watermark,
-                    },
-                );
-                updates.push(PublishableSnapshotUpdate::Revoked {
-                    principal,
-                    until,
-                    generation: incoming,
-                });
-            }
-            Ok(SnapshotResolution::Unknown) => {
-                completed.insert(principal);
-                let now = clock.now();
-                // The watermark passes through untouched. The source said
-                // nothing about any generation, so there is nothing here to
-                // raise or re-tag -- and re-tagging it as a revocation is what
-                // stranded the principal at its own generation (#53).
-                let (watermark, _) = accept_unknown(resolutions.watermark_of(principal));
-                let until = negative_deadline(now, config, NegativeKind::Unknown);
-                resolutions.insert(
-                    principal,
-                    Resolution::Negative {
-                        deadline: until,
-                        next_refetch: until,
-                        watermark,
-                    },
-                );
-                updates.push(PublishableSnapshotUpdate::Unknown { principal, until });
-            }
-            // The principal keeps whatever resolution it already had and
-            // stays pending for the next sweep. Without this event a source
-            // that is down looks exactly like one with nothing to say.
-            Err(error) => {
-                counters.record_failure();
+    for read in results {
+        let principal = read.principal();
+        let update = read.filter_map(|result| {
+            // One attempt per principal per pass, counted whatever the outcome:
+            // an attempt rate that has gone to zero is itself the signal that the
+            // refresh loop has stopped.
+            counters.record_attempt();
+            // Unwrap the bound before the source's own answer, so every arm below
+            // reads exactly as it did when a fetch could only succeed or fail.
+            // Left out of `completed` like a refusal, which is what re-arms
+            // `next_refetch` and puts this principal behind the backoff rather
+            // than into a zero-delay refetch loop against a slow source.
+            let Ok(result) = result else {
+                counters.record_timeout();
                 tracing::warn!(
                     %principal,
-                    %error,
-                    "snapshot fetch failed; principal keeps its previous resolution"
+                    timeout_ms = config.fetch_timeout.as_millis(),
+                    "snapshot fetch abandoned at its bound; principal keeps its \
+                     previous resolution and retries with backoff"
                 );
+                return None;
+            };
+            match result {
+                Ok(SnapshotResolution::Present(snapshot)) => {
+                    if !resolutions.accepts_positive(
+                        principal,
+                        snapshot.generation,
+                        UpdateOrigin::Refresh,
+                        counters,
+                    ) {
+                        // Keep refusals/no-ops out of completed: it rearms a
+                        // negative's retry backoff, never its validity deadline.
+                        return None;
+                    }
+                    completed.insert(principal);
+                    let slot = slots.slot(snapshot.account_id);
+                    resolutions.insert(
+                        principal,
+                        Resolution::Present {
+                            deadline: snapshot.valid_until,
+                            generation: snapshot.generation,
+                        },
+                    );
+                    Some(PublishableSnapshotUpdate::Present {
+                        principal,
+                        snapshot,
+                        lease: slot,
+                    })
+                }
+                Ok(SnapshotResolution::Revoked {
+                    generation: incoming,
+                }) => {
+                    let now = clock.now();
+                    let (watermark, accepted) = resolutions.revocation(
+                        principal,
+                        incoming,
+                        UpdateOrigin::Refresh,
+                        counters,
+                    );
+                    if !accepted {
+                        // Refused answers still drive the bounded retry schedule.
+                        return None;
+                    }
+                    let until = negative_deadline(now, config, NegativeKind::Revoked);
+                    completed.insert(principal);
+                    resolutions.insert(
+                        principal,
+                        Resolution::Negative {
+                            deadline: until,
+                            next_refetch: until,
+                            watermark,
+                        },
+                    );
+                    Some(PublishableSnapshotUpdate::Revoked {
+                        principal,
+                        until,
+                        generation: incoming,
+                    })
+                }
+                Ok(SnapshotResolution::Unknown) => {
+                    completed.insert(principal);
+                    let now = clock.now();
+                    // The watermark passes through untouched. The source said
+                    // nothing about any generation, so there is nothing here to
+                    // raise or re-tag -- and re-tagging it as a revocation is what
+                    // stranded the principal at its own generation (#53).
+                    let (watermark, _) = accept_unknown(resolutions.watermark_of(principal));
+                    let until = negative_deadline(now, config, NegativeKind::Unknown);
+                    resolutions.insert(
+                        principal,
+                        Resolution::Negative {
+                            deadline: until,
+                            next_refetch: until,
+                            watermark,
+                        },
+                    );
+                    Some(PublishableSnapshotUpdate::Unknown { principal, until })
+                }
+                // The principal keeps whatever resolution it already had and
+                // stays pending for the next sweep. Without this event a source
+                // that is down looks exactly like one with nothing to say.
+                Err(error) => {
+                    counters.record_failure();
+                    tracing::warn!(
+                        %principal,
+                        %error,
+                        "snapshot fetch failed; principal keeps its previous resolution"
+                    );
+                    None
+                }
             }
+        });
+        if let Some(update) = update {
+            updates.push(update);
         }
     }
     if !updates.is_empty() {
-        resolutions.publish(updates, clock.now());
+        let published = updates.iter().map(Refreshed::principal).collect::<Vec<_>>();
+        if !resolutions.publish(Publications::Refreshed(updates), clock.now(), counters) {
+            for principal in published {
+                completed.remove(&principal);
+            }
+        }
     }
     Some(
         principals
@@ -1403,6 +1551,13 @@ async fn run(
                         resolutions.track(push.principal);
                     }
                     if resolutions.is_tracked(push.principal) {
+                        if resolutions.needs_refresh(push.principal) {
+                            if refresh_all_cancellable(&source, &slots, &clock, &config, &[push.principal],
+                                &mut resolutions, &mut shutdown, ready, &counters).await.is_none() { return; }
+                            update_ready(ready, &mut resolutions, &clock, &counters, &config.principals);
+                            continue;
+                        }
+
                         match push.resolution {
                             SnapshotResolution::Present(snapshot) => {
                                 if !resolutions
@@ -1419,12 +1574,13 @@ async fn run(
                                     },
                                 );
                                 resolutions.publish(
-                                    vec![PublishableSnapshotUpdate::Present {
+                                    Publications::Push(vec![PublishableSnapshotUpdate::Present {
                                         principal: push.principal,
                                         snapshot,
                                         lease: slot,
-                                    }],
+                                    }]),
                                     clock.now(),
+                                    &counters,
                                 );
                             }
                             resolution @ (SnapshotResolution::Revoked { .. }
@@ -1466,7 +1622,7 @@ async fn run(
                                         until,
                                     },
                                 };
-                                resolutions.publish(vec![update], now);
+                                resolutions.publish(Publications::Push(vec![update]), now, &counters);
                             }
                         }
                         update_ready(ready, &mut resolutions, &clock, &counters, &config.principals);
@@ -1550,6 +1706,105 @@ mod tests {
 
     fn t(seconds: i64) -> jiff::Timestamp {
         jiff::Timestamp::from_second(seconds).unwrap()
+    }
+
+    #[test]
+    fn history_reclamation_bounds_resolution_and_deadline_indexes() {
+        use std::num::NonZeroUsize;
+        use tollgate_admission::ArcSwapSnapshotMap;
+        use tollgate_core::LocalSharding;
+        let map = Arc::new(ArcSwapSnapshotMap::with_capacities(
+            LocalSharding::SINGLE,
+            7,
+            NonZeroUsize::new(7).unwrap(),
+        ));
+        let mut resolutions =
+            Resolutions::publishing((0..1000).map(Principal), map.clone(), SlotRegistry::new());
+        let counters = SnapshotCounters::new();
+        for principal in (0..1000).map(Principal) {
+            let read = resolutions
+                .prepare_refreshes(&[principal], &counters)
+                .unwrap()
+                .reads
+                .pop()
+                .unwrap();
+            resolutions.insert(
+                principal,
+                Resolution::Negative {
+                    deadline: t(10),
+                    next_refetch: t(10),
+                    watermark: None,
+                },
+            );
+            assert!(resolutions.publish(
+                Publications::Refreshed(vec![read.read(|| PublishableSnapshotUpdate::Unknown {
+                    principal,
+                    until: t(10)
+                })]),
+                t(0),
+                &counters
+            ));
+            let retained = ((principal.0 + 1) as usize).min(7);
+            assert_eq!(resolutions.by_principal.len(), retained);
+            assert_eq!(resolutions.negative.len(), retained);
+            assert_eq!(resolutions.refetch.len(), retained);
+            assert!(resolutions.present.is_empty());
+            assert_eq!(map.history_stats().unwrap().retained, retained);
+        }
+        assert_eq!(resolutions.unresolved(t(0)), 993);
+        assert_eq!(counters.snapshot().history_evictions, 993);
+        assert_eq!(counters.snapshot().publication_failures, 0);
+    }
+
+    #[test]
+    fn a_superseded_publication_cannot_claim_a_resolved_deadline() {
+        use std::num::NonZeroUsize;
+        use tollgate_admission::ArcSwapSnapshotMap;
+        use tollgate_core::LocalSharding;
+        let map = Arc::new(ArcSwapSnapshotMap::with_capacities(
+            LocalSharding::SINGLE,
+            1,
+            NonZeroUsize::new(1).unwrap(),
+        ));
+        let mut resolutions = Resolutions::publishing(
+            [Principal(1), Principal(2)],
+            map.clone(),
+            SlotRegistry::new(),
+        );
+        let counters = SnapshotCounters::new();
+        let stale = resolutions
+            .prepare_refreshes(&[Principal(1)], &counters)
+            .unwrap()
+            .reads
+            .pop()
+            .unwrap();
+        // Another control-plane reservation overtakes this source response.
+        resolutions
+            .prepare_refreshes(&[Principal(2)], &counters)
+            .unwrap();
+        resolutions.insert(
+            Principal(1),
+            Resolution::Negative {
+                deadline: t(10),
+                next_refetch: t(10),
+                watermark: None,
+            },
+        );
+        assert!(!resolutions.publish(
+            Publications::Refreshed(vec![stale.read(|| PublishableSnapshotUpdate::Unknown {
+                principal: Principal(1),
+                until: t(10)
+            })]),
+            t(0),
+            &counters
+        ));
+        assert_eq!(resolutions.unresolved(t(0)), 2);
+        assert!(resolutions.by_principal.is_empty());
+        assert!(resolutions.negative.is_empty());
+        assert!(resolutions.refetch.is_empty());
+        assert_eq!(counters.snapshot().publication_failures, 1);
+        assert_eq!(counters.snapshot().refresh_failures, 0);
+        assert!(map.get(&Principal(1)).is_none());
     }
 
     #[test]

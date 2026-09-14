@@ -53,12 +53,26 @@ impl SnapshotMap for NullMap {
         _principal: Principal,
         _snapshot: Arc<AccountSnapshot>,
         _lease: Arc<tollgate_admission::LeaseSlot>,
-    ) {
+    ) -> Result<(), tollgate_admission::PublicationError> {
+        Ok(())
     }
 
-    fn install_revoked(&self, _principal: Principal, _until: Timestamp, _generation: Generation) {}
+    fn install_revoked(
+        &self,
+        _principal: Principal,
+        _until: Timestamp,
+        _generation: Generation,
+    ) -> Result<(), tollgate_admission::PublicationError> {
+        Ok(())
+    }
 
-    fn install_unknown(&self, _principal: Principal, _until: Timestamp) {}
+    fn install_unknown(
+        &self,
+        _principal: Principal,
+        _until: Timestamp,
+    ) -> Result<(), tollgate_admission::PublicationError> {
+        Ok(())
+    }
 
     fn remove(&self, _principal: &Principal) {}
 }

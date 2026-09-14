@@ -952,13 +952,17 @@ mod tests {
         original.key_id = Some(tollgate_core::KeyId(1));
         engine
             .map()
-            .install(Principal(1), Arc::new(original.clone()), slot.clone());
+            .install(Principal(1), Arc::new(original.clone()), slot.clone())
+            .unwrap();
         let context = engine
             .begin(Principal(1), PermissionBits::bit(0), t(0))
             .unwrap();
         original.generation = Generation(2);
         original.key_id = Some(tollgate_core::KeyId(2));
-        engine.map().install(Principal(1), Arc::new(original), slot);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(original), slot)
+            .unwrap();
         let committed = context
             .admit(&[(Op::Price, 1)], Capture(tx.clone()), t(0))
             .unwrap()
@@ -1082,7 +1086,10 @@ mod tests {
         if let Some(units) = lease_units {
             drop(slot.replace(lease(units)));
         }
-        engine.map().install(Principal(1), snapshot(status), slot);
+        engine
+            .map()
+            .install(Principal(1), snapshot(status), slot)
+            .unwrap();
         engine
     }
 
@@ -1102,7 +1109,10 @@ mod tests {
         snapshot.enforcement_mode = EnforcementMode::Elastic {
             overage_cap: CostUnits(overage_cap),
         };
-        engine.map().install(Principal(1), Arc::new(snapshot), slot);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(snapshot), slot)
+            .unwrap();
         engine
     }
 
@@ -1148,7 +1158,10 @@ mod tests {
         snapshot.enforcement_mode = EnforcementMode::Elastic {
             overage_cap: CostUnits(1_000),
         };
-        engine.map().install(Principal(1), Arc::new(snapshot), slot);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(snapshot), slot)
+            .unwrap();
 
         let admitted = engine.admit_one(request(1), t(10)).expect("elastic admits");
         assert!(admitted.funding.reservation().admitted_as_overage());
@@ -1174,7 +1187,10 @@ mod tests {
             snapshot.enforcement_mode = EnforcementMode::Elastic {
                 overage_cap: CostUnits(1_000),
             };
-            engine.map().install(Principal(1), Arc::new(snapshot), slot);
+            engine
+                .map()
+                .install(Principal(1), Arc::new(snapshot), slot)
+                .unwrap();
             assert!(engine.admit_one(request(1), t(0)).is_err(), "{status:?}");
             assert_eq!(overage_spent(&engine), CostUnits::ZERO);
         }
@@ -1269,7 +1285,8 @@ mod tests {
             };
             engine
                 .map()
-                .install(Principal(1), Arc::new(snapshot), Arc::clone(&slot));
+                .install(Principal(1), Arc::new(snapshot), Arc::clone(&slot))
+                .unwrap();
 
             engine
                 .admit_one(request(1), now)
@@ -1319,7 +1336,10 @@ mod tests {
         snapshot.enforcement_mode = EnforcementMode::Elastic {
             overage_cap: CostUnits(102),
         };
-        engine.map().install(Principal(1), Arc::new(snapshot), slot);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(snapshot), slot)
+            .unwrap();
         let engine = Arc::new(engine);
 
         // Two quotes of 51 fit in a cap of 102. Eight threads ask; the answer
@@ -1391,7 +1411,10 @@ mod tests {
         snapshot.enforcement_mode = EnforcementMode::Elastic {
             overage_cap: CostUnits(1_000),
         };
-        engine.map().install(Principal(1), Arc::new(snapshot), slot);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(snapshot), slot)
+            .unwrap();
 
         let admitted = engine
             .admit_one(request(1), t(0))
@@ -1500,7 +1523,8 @@ mod tests {
         for principal in [Principal(1), Principal(2)] {
             engine
                 .map()
-                .install(principal, Arc::clone(&snapshot), Arc::clone(&slot));
+                .install(principal, Arc::clone(&snapshot), Arc::clone(&slot))
+                .unwrap();
         }
 
         let _held = engine
@@ -1544,7 +1568,8 @@ mod tests {
             };
             engine
                 .map()
-                .install(principal, Arc::new(snapshot), Arc::clone(&slot));
+                .install(principal, Arc::new(snapshot), Arc::clone(&slot))
+                .unwrap();
         }
 
         let held: Vec<_> = (0..2)
@@ -1599,7 +1624,10 @@ mod tests {
         next.enforcement_mode = EnforcementMode::Elastic {
             overage_cap: CostUnits(51),
         };
-        engine.map().install(Principal(1), Arc::new(next), slot);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(next), slot)
+            .unwrap();
 
         assert_eq!(
             engine.admit_one(request(1), t(0)).unwrap_err(),
@@ -1628,7 +1656,10 @@ mod tests {
         next.enforcement_mode = EnforcementMode::Elastic {
             overage_cap: CostUnits(102),
         };
-        engine.map().install(Principal(1), Arc::new(next), slot);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(next), slot)
+            .unwrap();
 
         engine
             .admit_one(request(1), t(0))
@@ -1686,7 +1717,10 @@ mod tests {
             balance_at_publish: CostUnits(balance),
             period_end: None,
         });
-        engine.map().install(Principal(1), Arc::new(snapshot), slot);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(snapshot), slot)
+            .unwrap();
     }
 
     fn estimate(engine: &AdmissionEngine<ArcSwapSnapshotMap>) -> Option<CostUnits> {
@@ -1868,7 +1902,8 @@ mod tests {
         drop(slot.replace(Arc::clone(&installed)));
         engine
             .map()
-            .install(Principal(1), snapshot(AccountStatus::Active), slot);
+            .install(Principal(1), snapshot(AccountStatus::Active), slot)
+            .unwrap();
         let before = installed.remaining();
 
         let (gate, _held) = saturated_gate();
@@ -2017,7 +2052,8 @@ mod tests {
         drop(slot.replace(lease_until(10_000, t(100))));
         engine
             .map()
-            .install(Principal(1), snapshot(AccountStatus::Active), slot);
+            .install(Principal(1), snapshot(AccountStatus::Active), slot)
+            .unwrap();
 
         engine
             .admit_one(request(1), t(99))
@@ -2065,7 +2101,10 @@ mod tests {
         snapshot.enforcement_mode = EnforcementMode::Elastic {
             overage_cap: CostUnits(10_000),
         };
-        engine.map().install(Principal(1), Arc::new(snapshot), slot);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(snapshot), slot)
+            .unwrap();
 
         let committed = engine
             .admit_one(request(1), t(99))
@@ -2125,7 +2164,8 @@ mod tests {
         drop(slot.replace(lease(10_000)));
         engine
             .map()
-            .install(Principal(1), snapshot_with_revision(revision), slot);
+            .install(Principal(1), snapshot_with_revision(revision), slot)
+            .unwrap();
 
         let context = engine
             .begin(Principal(1), PermissionBits::bit(0), t(0))
@@ -2175,11 +2215,14 @@ mod tests {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
         drop(slot.replace(lease(10_000)));
-        engine.map().install(
-            Principal(1),
-            snapshot_with_revision(first),
-            Arc::clone(&slot),
-        );
+        engine
+            .map()
+            .install(
+                Principal(1),
+                snapshot_with_revision(first),
+                Arc::clone(&slot),
+            )
+            .unwrap();
 
         // Pinned before the republication.
         let context = engine
@@ -2188,7 +2231,10 @@ mod tests {
 
         let mut next = AccountSnapshot::clone(&snapshot_with_revision(second));
         next.generation = Generation(2);
-        engine.map().install(Principal(1), Arc::new(next), slot);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(next), slot)
+            .unwrap();
 
         assert_eq!(
             context.policy_revision(),
@@ -2229,11 +2275,14 @@ mod tests {
         let mut replacement = AccountSnapshot::clone(&snapshot(AccountStatus::Suspended));
         replacement.generation = Generation(2);
         replacement.limits = ResolvedLimits::new(1).with_weighted_rate(1_000_000, 1_000_000);
-        engine.map().install(
-            Principal(1),
-            Arc::new(replacement),
-            LeaseSlot::for_account(AccountId(1)),
-        );
+        engine
+            .map()
+            .install(
+                Principal(1),
+                Arc::new(replacement),
+                LeaseSlot::for_account(AccountId(1)),
+            )
+            .unwrap();
         assert!(
             engine
                 .begin(Principal(1), PermissionBits::bit(0), t(0))
@@ -2264,7 +2313,8 @@ mod tests {
             original.valid_until = t(10);
             engine
                 .map()
-                .install(Principal(1), Arc::new(original), Arc::clone(&slot));
+                .install(Principal(1), Arc::new(original), Arc::clone(&slot))
+                .unwrap();
             let context = engine
                 .begin(Principal(1), PermissionBits::bit(0), t(0))
                 .unwrap();
@@ -2272,7 +2322,8 @@ mod tests {
             replacement.generation = Generation(2);
             engine
                 .map()
-                .install(Principal(1), Arc::new(replacement), slot);
+                .install(Principal(1), Arc::new(replacement), slot)
+                .unwrap();
             let result = context.admit(&[(&Op::Price, 1)], DiscardedUsage::new().slot(), now);
             if now == t(9) {
                 result
@@ -2293,7 +2344,8 @@ mod tests {
             let map = Arc::new(map);
             let slot = LeaseSlot::for_account(AccountId(1));
             drop(slot.replace(lease(10_000)));
-            map.install(Principal(1), snapshot(AccountStatus::Active), slot);
+            map.install(Principal(1), snapshot(AccountStatus::Active), slot)
+                .unwrap();
             let first = AdmissionEngine::new(Arc::clone(&map));
             let second = AdmissionEngine::new(Arc::clone(&map));
             let context = first
@@ -2327,11 +2379,14 @@ mod tests {
         let mut replacement = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
         replacement.generation = Generation(2);
         replacement.limits = ResolvedLimits::new(1).with_weighted_rate(1_000_000, 51);
-        engine.map().install(
-            Principal(1),
-            Arc::new(replacement),
-            LeaseSlot::for_account(AccountId(1)),
-        );
+        engine
+            .map()
+            .install(
+                Principal(1),
+                Arc::new(replacement),
+                LeaseSlot::for_account(AccountId(1)),
+            )
+            .unwrap();
         // The old principal permits two items, quoted at 52. Account rate is
         // current, so its new 51-unit burst refuses before any lease debit.
         let result = context.admit(&[(&Op::Price, 2)], DiscardedUsage::new().slot(), t(0));
@@ -2411,7 +2466,8 @@ mod tests {
         drop(slot.replace(Arc::clone(&installed)));
         engine
             .map()
-            .install(Principal(1), snapshot(AccountStatus::Active), slot);
+            .install(Principal(1), snapshot(AccountStatus::Active), slot)
+            .unwrap();
         let before = installed.remaining();
 
         let (ready, handle) = engine
@@ -2467,7 +2523,8 @@ mod tests {
         drop(slot.replace(lease_until(10_000, t(100))));
         engine
             .map()
-            .install(Principal(1), snapshot(AccountStatus::Active), slot);
+            .install(Principal(1), snapshot(AccountStatus::Active), slot)
+            .unwrap();
 
         let ready = engine
             .admit_one(request(1), t(99))
@@ -2498,7 +2555,10 @@ mod tests {
             overage_cap: CostUnits(10_000),
         };
         let overage = Arc::clone(slot.overage());
-        engine.map().install(Principal(1), Arc::new(snapshot), slot);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(snapshot), slot)
+            .unwrap();
 
         let pending = engine
             .admit_one(request(1), t(99))
@@ -2532,7 +2592,10 @@ mod tests {
         snapshot.enforcement_mode = EnforcementMode::Elastic {
             overage_cap: CostUnits(1),
         };
-        engine.map().install(Principal(1), Arc::new(snapshot), slot);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(snapshot), slot)
+            .unwrap();
 
         let (error, _released) = engine
             .admit_one(request(1), t(99))
@@ -2563,7 +2626,7 @@ mod tests {
     #[test]
     fn negative_cache_denies() {
         let engine = AdmissionEngine::new(MokaSnapshotMap::new(10));
-        engine.map().install_unknown(Principal(1), t(100));
+        engine.map().install_unknown(Principal(1), t(100)).unwrap();
         assert_eq!(
             engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::UnknownPrincipal
@@ -2643,7 +2706,7 @@ mod tests {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
         drop(slot.replace(lease(1_000_000)));
-        engine.map().install(Principal(1), snapshot, slot);
+        engine.map().install(Principal(1), snapshot, slot).unwrap();
 
         let req = request(50); // 50 + 50 fixed = 100 units
         for _ in 0..10 {
@@ -2699,7 +2762,8 @@ mod tests {
             .with_request_rate(NonZeroU32::MIN, NonZeroU32::MIN);
         engine
             .map()
-            .install(Principal(1), Arc::new(original), Arc::clone(&slot));
+            .install(Principal(1), Arc::new(original), Arc::clone(&slot))
+            .unwrap();
 
         drop(engine.admit_one(request(1), t(0)).unwrap());
         assert_eq!(
@@ -2712,11 +2776,14 @@ mod tests {
         compatibility_only.limits = ResolvedLimits::new(64)
             .with_weighted_rate_compatibility_fallback(2, 2)
             .with_request_rate(NonZeroU32::MIN, NonZeroU32::MIN);
-        engine.map().install(
-            Principal(1),
-            Arc::new(compatibility_only),
-            Arc::clone(&slot),
-        );
+        engine
+            .map()
+            .install(
+                Principal(1),
+                Arc::new(compatibility_only),
+                Arc::clone(&slot),
+            )
+            .unwrap();
 
         assert_eq!(
             engine.admit_one(request(1), t(0)).unwrap_err(),
@@ -2735,7 +2802,8 @@ mod tests {
         weighted_only.limits = ResolvedLimits::new(64).with_weighted_rate(1, 51);
         engine
             .map()
-            .install(Principal(1), Arc::new(weighted_only), Arc::clone(&slot));
+            .install(Principal(1), Arc::new(weighted_only), Arc::clone(&slot))
+            .unwrap();
 
         drop(engine.admit_one(request(1), t(0)).unwrap());
         assert_eq!(
@@ -2751,11 +2819,14 @@ mod tests {
                 NonZeroU32::new(1_000_000).unwrap(),
                 NonZeroU32::new(1_000_000).unwrap(),
             );
-        engine.map().install(
-            Principal(1),
-            Arc::new(request_rate_added),
-            Arc::clone(&slot),
-        );
+        engine
+            .map()
+            .install(
+                Principal(1),
+                Arc::new(request_rate_added),
+                Arc::clone(&slot),
+            )
+            .unwrap();
 
         assert_eq!(
             engine.admit_one(request(1), t(0)).unwrap_err(),
@@ -2781,7 +2852,8 @@ mod tests {
             .with_request_rate(NonZeroU32::MIN, NonZeroU32::MIN);
         engine
             .map()
-            .install(Principal(1), Arc::new(disabled), Arc::clone(&slot));
+            .install(Principal(1), Arc::new(disabled), Arc::clone(&slot))
+            .unwrap();
 
         let mut enabled = (*snapshot(AccountStatus::Active)).clone();
         enabled.limits = ResolvedLimits::new(64)
@@ -2789,7 +2861,8 @@ mod tests {
             .with_request_rate(NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
         engine
             .map()
-            .install(Principal(2), Arc::new(enabled), Arc::clone(&slot));
+            .install(Principal(2), Arc::new(enabled), Arc::clone(&slot))
+            .unwrap();
 
         let admitted = engine
             .admit_one(request_for(Principal(2), 1), t(0))
@@ -2823,14 +2896,16 @@ mod tests {
         enabled.limits = ResolvedLimits::new(64).with_weighted_rate(1, 51);
         engine
             .map()
-            .install(Principal(1), Arc::new(enabled), Arc::clone(&slot));
+            .install(Principal(1), Arc::new(enabled), Arc::clone(&slot))
+            .unwrap();
 
         let mut disabled = (*snapshot(AccountStatus::Active)).clone();
         disabled.limits =
             ResolvedLimits::new(64).with_weighted_rate_compatibility_fallback(1_000_000, 1_000_000);
         engine
             .map()
-            .install(Principal(2), Arc::new(disabled), Arc::clone(&slot));
+            .install(Principal(2), Arc::new(disabled), Arc::clone(&slot))
+            .unwrap();
 
         drop(
             engine
@@ -2877,10 +2952,12 @@ mod tests {
         };
         engine
             .map()
-            .install_publishable(Principal(1), priced(100), Arc::clone(&slot));
+            .install_publishable(Principal(1), priced(100), Arc::clone(&slot))
+            .unwrap();
         engine
             .map()
-            .install_publishable(Principal(2), priced(500), Arc::clone(&slot));
+            .install_publishable(Principal(2), priced(500), Arc::clone(&slot))
+            .unwrap();
 
         for _ in 0..8 {
             drop(
@@ -2928,13 +3005,15 @@ mod tests {
             .unwrap();
         engine
             .map()
-            .install(Principal(1), Arc::new(bounded), Arc::clone(&slot));
+            .install(Principal(1), Arc::new(bounded), Arc::clone(&slot))
+            .unwrap();
 
         let mut unbounded = (*snapshot(AccountStatus::Active)).clone();
         unbounded.limits = ResolvedLimits::new(64).with_weighted_rate(1_000_000, 1_000_000);
         engine
             .map()
-            .install(Principal(2), Arc::new(unbounded), Arc::clone(&slot));
+            .install(Principal(2), Arc::new(unbounded), Arc::clone(&slot))
+            .unwrap();
 
         let mut wider = (*snapshot(AccountStatus::Active)).clone();
         wider.limits = ResolvedLimits::new(64)
@@ -2943,7 +3022,8 @@ mod tests {
             .unwrap();
         engine
             .map()
-            .install(Principal(3), Arc::new(wider), Arc::clone(&slot));
+            .install(Principal(3), Arc::new(wider), Arc::clone(&slot))
+            .unwrap();
 
         let held = engine
             .admit_one(request_for(Principal(2), 1), t(0))
@@ -2978,7 +3058,8 @@ mod tests {
             .unwrap();
         engine
             .map()
-            .install(Principal(1), Arc::new(original), Arc::clone(&slot));
+            .install(Principal(1), Arc::new(original), Arc::clone(&slot))
+            .unwrap();
 
         let mut narrower = (*snapshot(AccountStatus::Active)).clone();
         narrower.generation = Generation(2);
@@ -2988,7 +3069,8 @@ mod tests {
             .unwrap();
         engine
             .map()
-            .install(Principal(2), Arc::new(narrower), Arc::clone(&slot));
+            .install(Principal(2), Arc::new(narrower), Arc::clone(&slot))
+            .unwrap();
 
         let held = engine
             .admit_one(request_for(Principal(1), 1), t(0))
@@ -3014,7 +3096,8 @@ mod tests {
             unlimited.limits = ResolvedLimits::new(64).with_weighted_rate(1_000_000, 1_000_000);
             engine
                 .map()
-                .install(Principal(1), Arc::new(unlimited), Arc::clone(&slot));
+                .install(Principal(1), Arc::new(unlimited), Arc::clone(&slot))
+                .unwrap();
             engine.admit_one(request(1), t(0)).unwrap()
         };
 
@@ -3026,7 +3109,8 @@ mod tests {
             .unwrap();
         engine
             .map()
-            .install(Principal(1), Arc::new(limited), Arc::clone(&slot));
+            .install(Principal(1), Arc::new(limited), Arc::clone(&slot))
+            .unwrap();
 
         assert_eq!(
             engine.admit_one(request(1), t(0)).unwrap_err(),
@@ -3050,7 +3134,8 @@ mod tests {
             .unwrap();
         engine
             .map()
-            .install(Principal(1), Arc::new(account_only), Arc::clone(&slot));
+            .install(Principal(1), Arc::new(account_only), Arc::clone(&slot))
+            .unwrap();
         let held = engine.admit_one(request(1), t(0)).unwrap();
 
         let mut principal_limited = (*snapshot(AccountStatus::Active)).clone();
@@ -3061,7 +3146,8 @@ mod tests {
             .unwrap();
         engine
             .map()
-            .install(Principal(1), Arc::new(principal_limited), Arc::clone(&slot));
+            .install(Principal(1), Arc::new(principal_limited), Arc::clone(&slot))
+            .unwrap();
 
         assert_eq!(
             engine.admit_one(request(1), t(0)).unwrap_err(),
@@ -3085,7 +3171,8 @@ mod tests {
             .unwrap();
         engine
             .map()
-            .install(Principal(1), Arc::new(initially_limited), Arc::clone(&slot));
+            .install(Principal(1), Arc::new(initially_limited), Arc::clone(&slot))
+            .unwrap();
         let before_disable = engine.admit_one(request(1), t(0)).unwrap();
 
         let mut disabled = (*snapshot(AccountStatus::Active)).clone();
@@ -3093,7 +3180,8 @@ mod tests {
         disabled.limits = ResolvedLimits::new(64).with_weighted_rate(1_000_000, 1_000_000);
         engine
             .map()
-            .install(Principal(1), Arc::new(disabled), Arc::clone(&slot));
+            .install(Principal(1), Arc::new(disabled), Arc::clone(&slot))
+            .unwrap();
         let while_disabled = engine.admit_one(request(1), t(0)).unwrap();
 
         let mut reenabled = (*snapshot(AccountStatus::Active)).clone();
@@ -3104,7 +3192,8 @@ mod tests {
             .unwrap();
         engine
             .map()
-            .install(Principal(1), Arc::new(reenabled), Arc::clone(&slot));
+            .install(Principal(1), Arc::new(reenabled), Arc::clone(&slot))
+            .unwrap();
 
         assert_eq!(
             engine.admit_one(request(1), t(0)).unwrap_err(),
@@ -3133,7 +3222,8 @@ mod tests {
             account.limits = limits;
             engine
                 .map()
-                .install(principal, Arc::new(account), Arc::clone(&slot));
+                .install(principal, Arc::new(account), Arc::clone(&slot))
+                .unwrap();
         }
 
         let first = engine
@@ -3170,11 +3260,14 @@ mod tests {
         let mut account = (*snapshot(AccountStatus::Active)).clone();
         account.limits = limits;
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
-        engine.map().install(
-            Principal(1),
-            Arc::new(account),
-            LeaseSlot::for_account(AccountId(1)),
-        );
+        engine
+            .map()
+            .install(
+                Principal(1),
+                Arc::new(account),
+                LeaseSlot::for_account(AccountId(1)),
+            )
+            .unwrap();
 
         assert_eq!(
             engine.admit_one(request(1), t(0)).unwrap_err(),
@@ -3200,7 +3293,7 @@ mod tests {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
         drop(slot.replace(lease(1_000_000)));
-        engine.map().install(Principal(1), snapshot, slot);
+        engine.map().install(Principal(1), snapshot, slot).unwrap();
         engine
     }
 
@@ -3337,8 +3430,12 @@ mod tests {
         drop(slot.replace(lease(1_000_000)));
         engine
             .map()
-            .install_publishable(Principal(1), light, Arc::clone(&slot));
-        engine.map().install_publishable(Principal(2), heavy, slot);
+            .install_publishable(Principal(1), light, Arc::clone(&slot))
+            .unwrap();
+        engine
+            .map()
+            .install_publishable(Principal(2), heavy, slot)
+            .unwrap();
 
         let admitted = engine
             .admit_one(
@@ -3440,7 +3537,8 @@ mod tests {
         drop(slot.replace(lease_until(10_000, t(100))));
         engine
             .map()
-            .install(Principal(1), snapshot(AccountStatus::Active), slot);
+            .install(Principal(1), snapshot(AccountStatus::Active), slot)
+            .unwrap();
         assert_eq!(
             engine.admit_one(request(1), t(200)).unwrap_err(),
             DenyReason::LeaseExpired
@@ -3462,7 +3560,10 @@ mod tests {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
         drop(slot.replace(lease(u64::MAX)));
-        engine.map().install(Principal(1), overflowing, slot);
+        engine
+            .map()
+            .install(Principal(1), overflowing, slot)
+            .unwrap();
         assert_eq!(
             engine.admit_one(request(4), t(0)).unwrap_err(),
             DenyReason::CostOverflow
@@ -3516,11 +3617,14 @@ mod tests {
     fn refill_after_cold_start_recovers() {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
         let slot = LeaseSlot::for_account(AccountId(1));
-        engine.map().install(
-            Principal(1),
-            snapshot(AccountStatus::Active),
-            Arc::clone(&slot),
-        );
+        engine
+            .map()
+            .install(
+                Principal(1),
+                snapshot(AccountStatus::Active),
+                Arc::clone(&slot),
+            )
+            .unwrap();
         assert_eq!(
             engine.admit_one(request(1), t(0)).unwrap_err(),
             DenyReason::LeaseUnavailable
@@ -3541,7 +3645,8 @@ mod tests {
         drop(slot.replace(lease(1_000)));
         engine
             .map()
-            .install(Principal(1), snapshot_without_work_permission(), slot);
+            .install(Principal(1), snapshot_without_work_permission(), slot)
+            .unwrap();
 
         // Stage one succeeds: the route permission is granted.
         let context = engine
@@ -3576,7 +3681,7 @@ mod tests {
             )
             .build(),
         );
-        engine.map().install(Principal(1), snapshot, slot);
+        engine.map().install(Principal(1), snapshot, slot).unwrap();
 
         let context = engine
             .begin(Principal(1), PermissionBits::bit(0), t(0))

@@ -29,6 +29,10 @@ pub struct InstanceRuntimeConfig {
     pub leases: AccountLeaseConfig,
     pub usage: UsageWriterConfig,
     pub sharding: LocalSharding,
+    /// Retained snapshot histories, including in-flight authoritative reads.
+    /// Cover the simultaneously served principal set; exceeding it evicts
+    /// principals until a fresh source read can reconstruct their history.
+    pub snapshot_history_capacity: std::num::NonZeroUsize,
     /// Time with no fresh active principal before returning routine grants.
     /// Zero requests immediate retirement; this is not a traffic-idle timer.
     pub idle_account_linger: Duration,
@@ -52,6 +56,13 @@ impl InstanceRuntimeConfig {
         self.snapshots
             .validate()
             .map_err(|e| error(e.to_string()))?;
+        if matches!(&self.snapshots.principals, TrackedPrincipals::Fixed(principals)
+            if principals.len() > self.snapshot_history_capacity.get())
+        {
+            return Err(error(
+                "fixed principals exceed snapshot_history_capacity".into(),
+            ));
+        }
         self.leases.validate().map_err(|e| error(e.to_string()))?;
         self.usage.validate().map_err(|e| error(e.to_string()))?;
         let phases = self
@@ -453,7 +464,11 @@ impl InstanceRuntime {
         config: InstanceRuntimeConfig,
     ) -> Result<(Self, RuntimeHandle), InstanceRuntimeConfigError> {
         config.validate()?;
-        let map = Arc::new(ArcSwapSnapshotMap::with_sharding(config.sharding));
+        let map = Arc::new(ArcSwapSnapshotMap::with_capacities(
+            config.sharding,
+            ArcSwapSnapshotMap::DEFAULT_MAX_NEGATIVE_ENTRIES,
+            config.snapshot_history_capacity,
+        ));
         let (slots, changes) = SlotRegistry::observed(config.sharding);
         let (recorder, writer) = UsageWriter::spawn(sink, Arc::clone(&clock), config.usage)
             .map_err(|e| InstanceRuntimeConfigError(e.to_string()))?;

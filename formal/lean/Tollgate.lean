@@ -7,6 +7,7 @@ import Tollgate.LeaseTiming
 import Tollgate.OveragePublication
 import Tollgate.RatePublication
 import Tollgate.SnapshotCache
+import Tollgate.SnapshotHistory
 import Tollgate.SnapshotLimits
 import Tollgate.AccountLifecycle
 import Tollgate.PeriodRoller

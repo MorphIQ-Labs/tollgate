@@ -184,6 +184,8 @@ async fn install_admission(principal: Principal) -> (InstanceRuntime, RuntimeHan
         store,
         Arc::new(ManualClock::new(now())),
         InstanceRuntimeConfig {
+            snapshot_history_capacity:
+                tollgate_admission::ArcSwapSnapshotMap::DEFAULT_GENERATION_CAPACITY,
             snapshots: SnapshotManagerConfig {
                 principals: TrackedPrincipals::Fixed(vec![principal]),
                 refresh_interval: Duration::from_secs(30),

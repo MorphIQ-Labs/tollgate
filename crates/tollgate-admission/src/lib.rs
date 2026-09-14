@@ -32,6 +32,7 @@ pub mod capacity;
 pub mod counters;
 pub mod engine;
 pub mod generation_model;
+mod history;
 pub mod maps;
 pub mod state;
 
@@ -42,6 +43,9 @@ pub use capacity::{
 pub use counters::{AdmissionCounters, CommitRefusal, CountersSnapshot};
 pub use engine::{AdmissionEngine, Committed, Pending, ReadyToStart, Released, RequestContext};
 pub use generation_model::{Watermark, accept_positive, accept_revoked, accept_unknown};
+pub use history::{
+    PublicationError, RefreshBatch, Refreshed, SnapshotHistoryStats, SnapshotRefresh,
+};
 pub use maps::{ArcSwapSnapshotMap, MokaSnapshotMap};
 pub use state::{
     AccountAdmissionState, LeaseSlot, MapEntry, Principal, PublishableSnapshotUpdate, SnapshotMap,

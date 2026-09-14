@@ -31,6 +31,8 @@ fn t(n: i64) -> Timestamp {
 }
 fn config() -> InstanceRuntimeConfig {
     InstanceRuntimeConfig {
+        snapshot_history_capacity:
+            tollgate_admission::ArcSwapSnapshotMap::DEFAULT_GENERATION_CAPACITY,
         snapshots: SnapshotManagerConfig {
             principals: TrackedPrincipals::All { seed: vec![] },
             refresh_interval: Duration::from_millis(20),

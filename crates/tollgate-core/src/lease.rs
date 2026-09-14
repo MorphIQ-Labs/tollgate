@@ -625,7 +625,7 @@ impl LocalLease {
     /// and deliberately so: a shard-by-shard walk is not one atomic instant,
     /// and a failed fragmented reservation returns its whole aggregate to one
     /// shard rather than to the shards it drew from (see
-    /// [`Self::try_reserve_at`]). A refund landing on an already-visited
+    /// `Self::try_reserve_at`). A refund landing on an already-visited
     /// shard is counted twice; one landing on a shard the walk has passed is
     /// missed. Hence the clamp: the sum can exceed the grant, so it is
     /// saturated and bounded rather than asserted, and no reader of a live
@@ -663,7 +663,7 @@ impl LocalLease {
     /// crossing exists to avoid, already happened: there is nothing left to
     /// preserve, and acquiring alongside a grant that could not fund the work
     /// would install a *smaller* one beside it (see
-    /// [`Self::signal_refusal`]).
+    /// `Self::signal_refusal`).
     ///
     /// Re-arming: for the crossing case the second aggregate read closes the
     /// race with a debit that observed a still-set flag just before this

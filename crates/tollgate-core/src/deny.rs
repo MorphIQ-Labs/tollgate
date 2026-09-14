@@ -59,9 +59,11 @@ pub enum DenyReason {
     /// cannot be charged, so it cannot be admitted.
     UnpricedOperation,
     /// The account's local rate limiter has no capacity for this request's
-    /// weight *right now*. Transient: the bucket refills.
+    /// weight *right now*. Classifies as [`Retry::Transient`] because the
+    /// bucket refills; it carries no retry instant or delay.
     RateLimited,
     /// The account's request-count bucket has no token available right now.
+    /// Classifies as [`Retry::Transient`] and carries no retry instant or delay.
     RequestRateLimited,
     /// An account or principal in-flight request ceiling is saturated.
     ConcurrencyLimited,

@@ -9,6 +9,7 @@ OUTPUT="$ROOT/reports/mutations"
 # can serialize PostgreSQL tests within one process, but not across workers;
 # parallel workers would therefore truncate the same database underneath one
 # another and could turn unrelated failures into false "caught" mutants.
+PARALLEL=${MUTANTS_JOBS:-4}
 if [ -n "${TOLLGATE_PG_URL:-}" ]; then
   if [ "${MUTANTS_JOBS:-1}" != "1" ]; then
     echo "mutation gate: MUTANTS_JOBS must be 1 when TOLLGATE_PG_URL is set; PostgreSQL tests share one database" >&2
@@ -16,7 +17,7 @@ if [ -n "${TOLLGATE_PG_URL:-}" ]; then
   fi
   JOBS=1
 else
-  JOBS=${MUTANTS_JOBS:-4}
+  JOBS=$PARALLEL
 fi
 # `set -u` is on, so the verdict below needs this defined even when the run
 # never reaches cargo-mutants.
@@ -53,10 +54,28 @@ case "${1:-}" in
       echo "mutation gate: no Rust changes against $base"
       exit 0
     fi
-    if grep -q 'crates/tollgate-store-postgres/' "$diff" \
-      && [ -z "${TOLLGATE_PG_URL:-}" ]; then
-      echo "mutation gate: Postgres changed; set TOLLGATE_PG_URL so backend mutants are exercised" >&2
-      exit 1
+    if grep -q 'crates/tollgate-store-postgres/' "$diff"; then
+      if [ -z "${TOLLGATE_PG_URL:-}" ]; then
+        echo "mutation gate: Postgres changed; set TOLLGATE_PG_URL so backend mutants are exercised" >&2
+        exit 1
+      fi
+    elif [ -n "${TOLLGATE_PG_URL:-}" ] && [ -z "${MUTANTS_JOBS:-}" ]; then
+      # The shared database is the only reason a diff run is serial, and a diff
+      # that cannot change backend behaviour does not need it. Dropping it lets
+      # the backend suite skip instead of race, and the gate use every worker.
+      #
+      # This trades away the backend suite's ability to kill a mutant in
+      # another crate. That direction is safe: a mutant that only a PostgreSQL
+      # test would have caught is now reported MISSED, which fails the gate and
+      # is read by a person -- it never turns a missed mutant into a pass. It
+      # also keeps cargo-mutants' timeout meaningful, because the suite each
+      # mutant runs no longer takes longer than the gate's own floor.
+      #
+      # #67 is why this exists: 159 mutants at one worker ran past the job's
+      # 90-minute limit, and a gate that cannot finish reports nothing at all.
+      echo "mutation gate: no PostgreSQL change in this diff; the backend suite skips and the run uses $PARALLEL workers"
+      unset TOLLGATE_PG_URL
+      JOBS=$PARALLEL
     fi
     cargo mutants --workspace -j "$JOBS" --line-col true --in-diff "$diff" --output "$OUTPUT" \
       || status=$?

@@ -1197,6 +1197,7 @@ mod tests {
     /// rather than to a decode error, which is the whole reader-first half of
     /// the rollout.
     #[test]
+    #[cfg(feature = "serde")]
     fn a_snapshot_without_a_revision_key_decodes_as_unstated() {
         let snapshot = AccountSnapshot::builder(
             AccountId(1),

@@ -390,7 +390,8 @@ mod tests {
             )
             .build(),
         );
-        map.install(principal, snapshot, registry.slot(AccountId(1)));
+        map.install(principal, snapshot, registry.slot(AccountId(1)))
+            .unwrap();
         registry.observe_many([(principal, map.get(&principal))]);
         assert!(changed.has_changed().unwrap());
         changed.borrow_and_update();

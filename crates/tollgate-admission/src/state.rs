@@ -286,13 +286,11 @@ impl Buckets {
                     let index = (first + offset) % shards.len();
                     match shards[index].0.check_n(n) {
                         Ok(Ok(())) => return Ok(Ok(())),
-                        // The caller's own shard's denial, kept by
-                        // construction: it is the bucket a retry from this
-                        // locality will meet. `DenyReason::RateLimited`
-                        // carries no retry hint today, so which denial
-                        // travels is not observable — which is exactly why
-                        // the choice should be the defensible one now rather
-                        // than whichever shard happened to be scanned last.
+                        // Keep the first refillable denial in the
+                        // locality-first scan. If the local shard cannot
+                        // hold n, a sibling supplies it instead. Admission
+                        // exposes only the rate-limit category and discards
+                        // governor's timing; no earliest retry is promised.
                         Ok(Err(denial)) => {
                             denied.get_or_insert(denial);
                         }
@@ -694,9 +692,10 @@ struct LimiterConfig {
     /// installed last would leave a principal with a heavier table unable to
     /// spend its largest quote in any shard — a permanent
     /// `UnpriceableUnderLimits` for a request the account's burst can hold.
-    /// Tightening therefore ignores generation ordering: an older snapshot's
-    /// evidence is still evidence about a principal that is admitting
-    /// requests now.
+    /// Maps accept the principal generation before resolving this state.
+    /// Among accepted snapshots, an older account-policy generation can
+    /// still supply quote evidence for another admitting principal and tighten
+    /// the split. A rejected replay never reaches this update.
     ///
     /// It never widens again. Doing so would need per-principal evidence with
     /// its own eviction story for churned credentials, and the whole cost of
@@ -1231,28 +1230,6 @@ impl AdmissionStateRegistry {
         }
     }
 
-    /// Resolve stable account/principal state for one accepted snapshot.
-    /// Called at control-plane frequency only.
-    pub(crate) fn state_for(
-        &self,
-        principal: Principal,
-        account: AccountId,
-        generation: Generation,
-        limits: &ResolvedLimits,
-        maximum_quote: Option<CostUnits>,
-    ) -> ResolvedAdmissionState {
-        let mut inner = self.inner.lock().expect("admission registry poisoned");
-        inner.sweep_if_overgrown();
-        inner.resolve(
-            principal,
-            account,
-            generation,
-            limits,
-            maximum_quote,
-            self.sharding,
-        )
-    }
-
     /// Resolve a whole batch under one lock.
     ///
     /// The bulk paths used to take and release the registry mutex once per
@@ -1465,6 +1442,17 @@ pub enum PublishableSnapshotUpdate {
     },
 }
 
+impl PublishableSnapshotUpdate {
+    #[must_use]
+    pub fn principal(&self) -> Principal {
+        match self {
+            Self::Present { principal, .. }
+            | Self::Revoked { principal, .. }
+            | Self::Unknown { principal, .. } => *principal,
+        }
+    }
+}
+
 /// The pluggable snapshot map. Implementations must make `get` lock-free (or
 /// as close as their backing store allows) and safe for concurrent `install`.
 ///
@@ -1472,6 +1460,58 @@ pub enum PublishableSnapshotUpdate {
 /// older than the one present must be a no-op, so replayed or reordered
 /// control-plane pushes can never roll an account back.
 pub trait SnapshotMap: Send + Sync {
+    /// Control-plane visibility probe. Cache implementations should avoid
+    /// changing request-frequency bookkeeping for a background refresh.
+    fn contains_cached(&self, principal: &Principal) -> bool {
+        self.get(principal).is_some()
+    }
+    /// Control-plane occupancy; custom maps may not expose retention statistics.
+    fn history_stats(&self) -> Option<crate::SnapshotHistoryStats> {
+        None
+    }
+    /// Maximum retained generation entries, including pending source reads.
+    /// Custom maps without reclamation retain the compatibility default.
+    fn generation_capacity(&self) -> std::num::NonZeroUsize {
+        std::num::NonZeroUsize::MAX
+    }
+
+    /// Whether a push must be replaced by a new authoritative source read.
+    fn needs_refresh(&self, _principal: Principal) -> bool {
+        false
+    }
+
+    /// Reserve a batch before invoking the authoritative source. Reclaimed
+    /// principals are already absent from request-visible state on return.
+    fn prepare_refreshes(
+        &self,
+        principals: &[Principal],
+    ) -> Result<crate::RefreshBatch, crate::PublicationError> {
+        Ok(crate::RefreshBatch {
+            reads: principals
+                .iter()
+                .map(|&principal| crate::SnapshotRefresh::unfenced(principal))
+                .collect(),
+            evicted: Vec::new(),
+        })
+    }
+
+    /// Publish authoritative responses only while their retained incarnations
+    /// still match. Implementations reclaiming history must validate every fence
+    /// before any batch member can change account policy or visible state.
+    fn apply_refreshed_many_at(
+        &self,
+        updates: Vec<crate::Refreshed<PublishableSnapshotUpdate>>,
+        now: Timestamp,
+    ) -> Result<(), crate::PublicationError> {
+        self.apply_publishable_many_at(
+            updates
+                .into_iter()
+                .map(crate::Refreshed::into_value)
+                .collect(),
+            now,
+        )
+    }
+
     fn get(&self, principal: &Principal) -> Option<MapEntry>;
 
     /// Lookup using locality already resolved by the admission engine, so a
@@ -1500,7 +1540,12 @@ pub trait SnapshotMap: Send + Sync {
     /// Install (or refresh) the state for a principal, respecting generation
     /// monotonicity. `lease` is the account's slot, shared across the
     /// account's principals by the caller.
-    fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>);
+    fn install(
+        &self,
+        principal: Principal,
+        snapshot: Arc<AccountSnapshot>,
+        lease: Arc<LeaseSlot>,
+    ) -> Result<(), crate::PublicationError>;
 
     /// Install a publication-validated snapshot without discarding its
     /// maximum-quote proof. Implementations that shard the rate limiter
@@ -1510,8 +1555,8 @@ pub trait SnapshotMap: Send + Sync {
         principal: Principal,
         snapshot: PublishableSnapshot,
         lease: Arc<LeaseSlot>,
-    ) {
-        self.install(principal, snapshot.into_inner(), lease);
+    ) -> Result<(), crate::PublicationError> {
+        self.install(principal, snapshot.into_inner(), lease)
     }
 
     /// Record a revocation the source published at `generation`, denying until
@@ -1519,7 +1564,12 @@ pub trait SnapshotMap: Send + Sync {
     ///
     /// The generation is not optional: a revocation always carries one, and it
     /// is what refuses a replayed snapshot at or below it (INVARIANTS.md #15).
-    fn install_revoked(&self, principal: Principal, until: Timestamp, generation: Generation);
+    fn install_revoked(
+        &self,
+        principal: Principal,
+        until: Timestamp,
+        generation: Generation,
+    ) -> Result<(), crate::PublicationError>;
 
     /// Record that the source has no row for this principal, denying until
     /// `until`.
@@ -1528,7 +1578,11 @@ pub trait SnapshotMap: Send + Sync {
     /// the 404 path cannot supply one, and inventing one from what this
     /// instance last saw is #53. It therefore leaves any existing watermark
     /// exactly as it was rather than raising or re-tagging it.
-    fn install_unknown(&self, principal: Principal, until: Timestamp);
+    fn install_unknown(
+        &self,
+        principal: Principal,
+        until: Timestamp,
+    ) -> Result<(), crate::PublicationError>;
 
     /// Evict a principal outright. Revocations must use
     /// [`SnapshotMap::install_revoked`] so their generation watermark survives
@@ -1556,7 +1610,10 @@ pub trait SnapshotMap: Send + Sync {
     /// override it to pay their clone cost once per batch instead of once
     /// per entry (review finding #9 — loading N principals individually is
     /// O(N²) on a whole-map-clone structure).
-    fn install_many(&self, entries: Vec<(Principal, Arc<AccountSnapshot>, Arc<LeaseSlot>)>) {
+    fn install_many(
+        &self,
+        entries: Vec<(Principal, Arc<AccountSnapshot>, Arc<LeaseSlot>)>,
+    ) -> Result<(), crate::PublicationError> {
         self.apply_many(
             entries
                 .into_iter()
@@ -1566,64 +1623,103 @@ pub trait SnapshotMap: Send + Sync {
                     lease,
                 })
                 .collect(),
-        );
+        )
     }
 
-    fn apply_many(&self, updates: Vec<SnapshotUpdate>) {
+    fn apply_many(&self, updates: Vec<SnapshotUpdate>) -> Result<(), crate::PublicationError> {
         for update in updates {
             match update {
                 SnapshotUpdate::Present {
                     principal,
                     snapshot,
                     lease,
-                } => self.install(principal, snapshot, lease),
+                } => self.install(principal, snapshot, lease)?,
                 SnapshotUpdate::Revoked {
                     principal,
                     until,
                     generation,
-                } => self.install_revoked(principal, until, generation),
+                } => self.install_revoked(principal, until, generation)?,
                 SnapshotUpdate::Unknown { principal, until } => {
-                    self.install_unknown(principal, until);
+                    self.install_unknown(principal, until)?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Apply a control-plane batch at an explicit time. Implementations with
     /// expiry maintenance can combine the sweep and batch in one write;
     /// implementations without time-based maintenance use the default.
-    fn apply_many_at(&self, updates: Vec<SnapshotUpdate>, _now: Timestamp) {
-        self.apply_many(updates);
+    fn apply_many_at(
+        &self,
+        updates: Vec<SnapshotUpdate>,
+        _now: Timestamp,
+    ) -> Result<(), crate::PublicationError> {
+        self.apply_many(updates)
     }
 
-    fn apply_publishable_many(&self, updates: Vec<PublishableSnapshotUpdate>) {
+    fn apply_publishable_many(
+        &self,
+        updates: Vec<PublishableSnapshotUpdate>,
+    ) -> Result<(), crate::PublicationError> {
         for update in updates {
             match update {
                 PublishableSnapshotUpdate::Present {
                     principal,
                     snapshot,
                     lease,
-                } => self.install_publishable(principal, snapshot, lease),
+                } => self.install_publishable(principal, snapshot, lease)?,
                 PublishableSnapshotUpdate::Revoked {
                     principal,
                     until,
                     generation,
-                } => self.install_revoked(principal, until, generation),
+                } => self.install_revoked(principal, until, generation)?,
                 PublishableSnapshotUpdate::Unknown { principal, until } => {
-                    self.install_unknown(principal, until)
+                    self.install_unknown(principal, until)?
                 }
             }
         }
+        Ok(())
     }
 
-    fn apply_publishable_many_at(&self, updates: Vec<PublishableSnapshotUpdate>, _now: Timestamp) {
-        self.apply_publishable_many(updates);
+    fn apply_publishable_many_at(
+        &self,
+        updates: Vec<PublishableSnapshotUpdate>,
+        _now: Timestamp,
+    ) -> Result<(), crate::PublicationError> {
+        self.apply_publishable_many(updates)
     }
 }
 
 // A shared map is still a map: lets an `AdmissionEngine<Arc<M>>` and a
 // background snapshot manager hold the same map instance.
 impl<T: SnapshotMap + ?Sized> SnapshotMap for Arc<T> {
+    fn contains_cached(&self, principal: &Principal) -> bool {
+        (**self).contains_cached(principal)
+    }
+    fn history_stats(&self) -> Option<crate::SnapshotHistoryStats> {
+        (**self).history_stats()
+    }
+    fn generation_capacity(&self) -> std::num::NonZeroUsize {
+        (**self).generation_capacity()
+    }
+    fn needs_refresh(&self, principal: Principal) -> bool {
+        (**self).needs_refresh(principal)
+    }
+    fn prepare_refreshes(
+        &self,
+        principals: &[Principal],
+    ) -> Result<crate::RefreshBatch, crate::PublicationError> {
+        (**self).prepare_refreshes(principals)
+    }
+    fn apply_refreshed_many_at(
+        &self,
+        updates: Vec<crate::Refreshed<PublishableSnapshotUpdate>>,
+        now: Timestamp,
+    ) -> Result<(), crate::PublicationError> {
+        (**self).apply_refreshed_many_at(updates, now)
+    }
+
     fn remove_many(&self, principals: &[Principal]) {
         (**self).remove_many(principals);
     }
@@ -1643,8 +1739,13 @@ impl<T: SnapshotMap + ?Sized> SnapshotMap for Arc<T> {
         (**self).counters()
     }
 
-    fn install(&self, principal: Principal, snapshot: Arc<AccountSnapshot>, lease: Arc<LeaseSlot>) {
-        (**self).install(principal, snapshot, lease);
+    fn install(
+        &self,
+        principal: Principal,
+        snapshot: Arc<AccountSnapshot>,
+        lease: Arc<LeaseSlot>,
+    ) -> Result<(), crate::PublicationError> {
+        (**self).install(principal, snapshot, lease)
     }
 
     fn install_publishable(
@@ -1652,40 +1753,63 @@ impl<T: SnapshotMap + ?Sized> SnapshotMap for Arc<T> {
         principal: Principal,
         snapshot: PublishableSnapshot,
         lease: Arc<LeaseSlot>,
-    ) {
-        (**self).install_publishable(principal, snapshot, lease);
+    ) -> Result<(), crate::PublicationError> {
+        (**self).install_publishable(principal, snapshot, lease)
     }
 
-    fn install_revoked(&self, principal: Principal, until: Timestamp, generation: Generation) {
-        (**self).install_revoked(principal, until, generation);
+    fn install_revoked(
+        &self,
+        principal: Principal,
+        until: Timestamp,
+        generation: Generation,
+    ) -> Result<(), crate::PublicationError> {
+        (**self).install_revoked(principal, until, generation)
     }
 
-    fn install_unknown(&self, principal: Principal, until: Timestamp) {
-        (**self).install_unknown(principal, until);
+    fn install_unknown(
+        &self,
+        principal: Principal,
+        until: Timestamp,
+    ) -> Result<(), crate::PublicationError> {
+        (**self).install_unknown(principal, until)
     }
 
     fn remove(&self, principal: &Principal) {
         (**self).remove(principal);
     }
 
-    fn install_many(&self, entries: Vec<(Principal, Arc<AccountSnapshot>, Arc<LeaseSlot>)>) {
-        (**self).install_many(entries);
+    fn install_many(
+        &self,
+        entries: Vec<(Principal, Arc<AccountSnapshot>, Arc<LeaseSlot>)>,
+    ) -> Result<(), crate::PublicationError> {
+        (**self).install_many(entries)
     }
 
-    fn apply_many(&self, updates: Vec<SnapshotUpdate>) {
-        (**self).apply_many(updates);
+    fn apply_many(&self, updates: Vec<SnapshotUpdate>) -> Result<(), crate::PublicationError> {
+        (**self).apply_many(updates)
     }
 
-    fn apply_many_at(&self, updates: Vec<SnapshotUpdate>, now: Timestamp) {
-        (**self).apply_many_at(updates, now);
+    fn apply_many_at(
+        &self,
+        updates: Vec<SnapshotUpdate>,
+        now: Timestamp,
+    ) -> Result<(), crate::PublicationError> {
+        (**self).apply_many_at(updates, now)
     }
 
-    fn apply_publishable_many(&self, updates: Vec<PublishableSnapshotUpdate>) {
-        (**self).apply_publishable_many(updates);
+    fn apply_publishable_many(
+        &self,
+        updates: Vec<PublishableSnapshotUpdate>,
+    ) -> Result<(), crate::PublicationError> {
+        (**self).apply_publishable_many(updates)
     }
 
-    fn apply_publishable_many_at(&self, updates: Vec<PublishableSnapshotUpdate>, now: Timestamp) {
-        (**self).apply_publishable_many_at(updates, now);
+    fn apply_publishable_many_at(
+        &self,
+        updates: Vec<PublishableSnapshotUpdate>,
+        now: Timestamp,
+    ) -> Result<(), crate::PublicationError> {
+        (**self).apply_publishable_many_at(updates, now)
     }
 }
 

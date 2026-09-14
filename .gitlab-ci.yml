@@ -166,6 +166,7 @@ clippy:
   script:
     - rustc --version
     - cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+    - RUSTDOCFLAGS="-D warnings" cargo doc --locked -p tollgate-core -p tollgate-admission --all-features --no-deps
 
 # Cargo.lock makes this a reproducible whole-tree scan. Run it on both merge
 # requests and the default branch so a newly published advisory blocks the next
@@ -247,6 +248,9 @@ test-no-default-features:
         printf 'tollgate-server without default features must not depend on Postgres or sqlx\n' >&2
         exit 1
       fi
+    # Workspace feature unification can enable core's optional serde support;
+    # check the standalone crate before the combined workspace suite.
+    - cargo test --locked -p tollgate-core --no-default-features
     - cargo test --locked --workspace --no-default-features
 
 # First-class Postgres coverage: the env-gated suite that silently skips on
