@@ -67,20 +67,25 @@ fn invalid_grant_policy_is_rejected() {
     );
 }
 
-fn store_with_balance(policy: GrantPolicy, balance: u64) -> Arc<MemoryStore> {
+async fn store_with_balance(policy: GrantPolicy, balance: u64) -> Arc<MemoryStore> {
     let store = MemoryStore::new(policy).unwrap();
-    store.create_account(AccountConfig {
-        account_id: ACCOUNT,
-        initial_balance: CostUnits(balance),
-        status: AccountStatus::Active,
-        capacity_class: CapacityClass::Assured,
-    });
+    AdminStore::create_account(
+        &*store,
+        AccountConfig {
+            account_id: ACCOUNT,
+            initial_balance: CostUnits(balance),
+            status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
+        },
+    )
+    .await
+    .unwrap();
     store
 }
 
 #[tokio::test]
 async fn nonpositive_lease_ttl_is_rejected_without_debiting() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     assert_eq!(
         store
             .acquire(ACCOUNT, CostUnits(10), SignedDuration::ZERO, t(0))
@@ -137,7 +142,7 @@ fn assert_conserved(store: &MemoryStore) {
 
 #[tokio::test]
 async fn adaptive_grant_shrinks_near_exhaustion() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
 
     // Deep balance: capped at balance/2.
     let grant = store
@@ -170,7 +175,7 @@ async fn adaptive_grant_shrinks_near_exhaustion() {
 /// the deposited balance once drained.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn no_double_spend_across_instances() {
-    let store = store_with_balance(GrantPolicy::default(), 100_000);
+    let store = store_with_balance(GrantPolicy::default(), 100_000).await;
     let mut tasks = Vec::new();
     for _ in 0..16 {
         let store = Arc::clone(&store);
@@ -198,7 +203,7 @@ async fn no_double_spend_across_instances() {
 /// Both simultaneously active leases retain their own capabilities.
 #[tokio::test]
 async fn newer_lease_does_not_invalidate_older_active_capability() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let older = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
         .await
@@ -239,7 +244,7 @@ async fn newer_lease_does_not_invalidate_older_active_capability() {
 /// returns; the PostgreSQL mirror protects the awaited-rollback regression.
 #[tokio::test]
 async fn wrong_token_release_leaves_lease_reclaimable() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let lease = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
         .await
@@ -265,7 +270,7 @@ async fn wrong_token_release_leaves_lease_reclaimable() {
 #[tokio::test]
 async fn usage_rejects_mismatched_lease_capability() {
     const OTHER: AccountId = AccountId(2);
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     AdminStore::create_account(
         &*store,
         AccountConfig {
@@ -310,7 +315,7 @@ async fn usage_rejects_mismatched_lease_capability() {
 /// INVARIANTS.md #9: a crashed holder's unspent units return at TTL.
 #[tokio::test]
 async fn expired_lease_units_reclaimed() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
@@ -347,7 +352,7 @@ async fn expired_lease_units_reclaimed() {
 #[tokio::test]
 async fn expired_backlog_is_reclaimed_in_bounded_batches() {
     const OTHER: AccountId = AccountId(2);
-    let store = store_with_balance(full_grant_policy(), 200);
+    let store = store_with_balance(full_grant_policy(), 200).await;
     AdminStore::create_account(
         &*store,
         AccountConfig {
@@ -424,7 +429,7 @@ async fn expired_backlog_is_reclaimed_in_bounded_batches() {
 /// backend (#65).
 #[tokio::test]
 async fn a_bounded_reclaim_page_settles_the_oldest_due_leases_first() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     for id in 2..=4u128 {
         AdminStore::create_account(
             &*store,
@@ -510,7 +515,7 @@ fn reclaim_batch_rejects_backend_results_over_the_limit() {
 /// INVARIANTS.md #7: replaying a batch never double-bills.
 #[tokio::test]
 async fn usage_replay_is_idempotent() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
@@ -536,7 +541,7 @@ async fn usage_replay_is_idempotent() {
 #[tokio::test]
 async fn mixed_usage_batch_preserves_partial_acceptance() {
     const OTHER: AccountId = AccountId(2);
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     AdminStore::create_account(
         &*store,
         AccountConfig {
@@ -631,7 +636,7 @@ async fn mixed_usage_batch_preserves_partial_acceptance() {
 
 #[tokio::test]
 async fn graceful_release_returns_unspent() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
@@ -678,7 +683,7 @@ async fn graceful_release_returns_unspent() {
 /// balance test.
 #[tokio::test]
 async fn consolidation_never_grants_less_than_it_folded_in() {
-    let store = store_with_balance(GrantPolicy::default(), 58);
+    let store = store_with_balance(GrantPolicy::default(), 58).await;
     let first = store
         .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
         .await
@@ -723,7 +728,7 @@ async fn consolidation_never_grants_less_than_it_folded_in() {
 /// the account can still fund, rather than two fragments neither of which can.
 #[tokio::test]
 async fn consolidation_folds_the_tail_grant_and_the_ledger_into_one_lease() {
-    let store = store_with_balance(full_grant_policy(), 58);
+    let store = store_with_balance(full_grant_policy(), 58).await;
     // The stranded state exactly: 49 held by this instance, 9 left in the
     // ledger, and a 51-unit quote that neither can fund alone.
     let tail = store
@@ -759,7 +764,7 @@ async fn consolidation_folds_the_tail_grant_and_the_ledger_into_one_lease() {
 /// exactly this to put it back in the slot.
 #[tokio::test]
 async fn a_refused_consolidation_leaves_the_original_lease_spendable() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     let lease = store
         .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
         .await
@@ -796,7 +801,7 @@ async fn a_refused_consolidation_leaves_the_original_lease_spendable() {
 /// strength of a token the ledger does not recognise.
 #[tokio::test]
 async fn consolidating_without_the_lease_capability_moves_no_units() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let lease = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
         .await
@@ -855,7 +860,7 @@ async fn consolidating_without_the_lease_capability_moves_no_units() {
 /// stops a consolidation from settling a lease it then cannot replace.
 #[tokio::test]
 async fn a_consolidation_with_an_invalid_ttl_settles_nothing() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let lease = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
         .await
@@ -896,7 +901,8 @@ async fn reclaim_waits_for_grace_and_release_works_within_it() {
             reclaim_grace: SignedDuration::from_secs(30),
         },
         1_000,
-    );
+    )
+    .await;
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
@@ -937,7 +943,7 @@ async fn reclaim_waits_for_grace_and_release_works_within_it() {
 /// tolerance the client's quiescence-gated release relies on.
 #[tokio::test]
 async fn straggler_usage_after_release_is_billed() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
@@ -975,7 +981,7 @@ async fn straggler_usage_after_release_is_billed() {
 /// balance, ledger totals, and the fencing sequence survive intact.
 #[tokio::test]
 async fn recreate_account_is_refused_and_nondestructive() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let lease = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
         .await
@@ -1013,7 +1019,7 @@ async fn a_non_active_account_refuses_leases() {
     // Both non-Active statuses refuse, under one deny reason: no client acts
     // on the distinction (#51).
     for status in [AccountStatus::Suspended, AccountStatus::Closed] {
-        let store = store_with_balance(GrantPolicy::default(), 1_000);
+        let store = store_with_balance(GrantPolicy::default(), 1_000).await;
         // Through `AdminStore`, matching the PostgreSQL mirror. The two had
         // drifted: this side called the inherent method, so the trait
         // implementation could be replaced by `Ok(())` — suspending an account
@@ -1034,7 +1040,7 @@ async fn a_non_active_account_refuses_leases() {
 
 #[tokio::test]
 async fn unknown_account_status_update_is_refused() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let unknown = AccountId(999);
 
     for status in [
@@ -1060,14 +1066,17 @@ async fn unknown_account_status_update_is_refused() {
 #[tokio::test]
 async fn creating_a_suspended_account_denies_from_birth() {
     let store = MemoryStore::new(GrantPolicy::default()).unwrap();
-    store
-        .try_create_account(AccountConfig {
+    AdminStore::create_account(
+        &*store,
+        AccountConfig {
             account_id: ACCOUNT,
             initial_balance: CostUnits(1_000),
             status: AccountStatus::Suspended,
             capacity_class: CapacityClass::Assured,
-        })
-        .expect("creation succeeds");
+        },
+    )
+    .await
+    .expect("creation succeeds");
 
     assert_eq!(
         store
@@ -1086,7 +1095,7 @@ async fn creating_a_suspended_account_denies_from_birth() {
 /// that never existed, which is the resurrection INVARIANTS.md #15 forbids.
 #[tokio::test]
 async fn enumerating_principals_includes_revoked_ones() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     assert_eq!(
         store.principals().await.unwrap(),
         Some(Vec::new()),
@@ -1109,13 +1118,13 @@ async fn enumerating_principals_includes_revoked_ones() {
     };
     let live = Principal(1);
     let revoked = Principal(2);
-    store
-        .publish_snapshot(live, snapshot())
+    AdminStore::publish_snapshot(&*store, live, snapshot())
+        .await
         .expect("snapshot fixture matches its account and credential");
-    store
-        .publish_snapshot(revoked, snapshot())
+    AdminStore::publish_snapshot(&*store, revoked, snapshot())
+        .await
         .expect("snapshot fixture matches its account and credential");
-    store.remove_snapshot(revoked);
+    AdminStore::remove_snapshot(&*store, revoked).await.unwrap();
 
     let mut listed = store.principals().await.unwrap().expect("enumerable");
     listed.sort_by_key(|principal| principal.0);
@@ -1128,7 +1137,7 @@ async fn enumerating_principals_includes_revoked_ones() {
 /// against a five-minute policy could have been honoured in full.
 #[tokio::test]
 async fn a_ttl_beyond_the_policy_maximum_is_clamped() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let lease = store
         .acquire(
             ACCOUNT,
@@ -1170,7 +1179,7 @@ async fn a_ttl_beyond_the_policy_maximum_is_clamped() {
 async fn depositing_funds_the_account_and_the_ledger_agrees() {
     // Full grants, so the acquire below reflects the deposited balance
     // rather than the default policy's halving.
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     assert_eq!(store.balance(ACCOUNT), CostUnits(100));
 
     AdminStore::deposit(&*store, ACCOUNT, CostUnits(400))
@@ -1203,7 +1212,7 @@ async fn depositing_funds_the_account_and_the_ledger_agrees() {
 
 #[tokio::test]
 async fn snapshot_publish_fetch_and_push() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let principal = Principal(42);
     let snapshot = Arc::new(
         AccountSnapshot::builder(
@@ -1223,8 +1232,8 @@ async fn snapshot_publish_fetch_and_push() {
         store.snapshot(principal).await.unwrap(),
         SnapshotResolution::Unknown
     ));
-    store
-        .publish_snapshot(principal, publishable(Arc::clone(&snapshot)))
+    AdminStore::publish_snapshot(&*store, principal, publishable(Arc::clone(&snapshot)))
+        .await
         .expect("snapshot fixture matches its account and credential");
 
     let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
@@ -1243,8 +1252,8 @@ async fn snapshot_publish_fetch_and_push() {
     // pushes an update.
     let mut older = (*snapshot).clone();
     older.generation = Generation(2);
-    store
-        .publish_snapshot(principal, publishable(Arc::new(older)))
+    AdminStore::publish_snapshot(&*store, principal, publishable(Arc::new(older)))
+        .await
         .expect("snapshot fixture matches its account and credential");
     let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
         panic!("newest snapshot must remain present");
@@ -1257,7 +1266,9 @@ async fn snapshot_publish_fetch_and_push() {
 
     // Revocation retains generation 3 as a tombstone. A delayed generation-2
     // publication cannot recreate the principal; generation 4 can.
-    store.remove_snapshot(principal);
+    AdminStore::remove_snapshot(&*store, principal)
+        .await
+        .unwrap();
     let removed = updates.recv().await.unwrap();
     assert!(matches!(
         removed.resolution,
@@ -1267,8 +1278,8 @@ async fn snapshot_publish_fetch_and_push() {
     ));
     let mut replayed = (*snapshot).clone();
     replayed.generation = Generation(2);
-    store
-        .publish_snapshot(principal, publishable(Arc::new(replayed)))
+    AdminStore::publish_snapshot(&*store, principal, publishable(Arc::new(replayed)))
+        .await
         .expect("snapshot fixture matches its account and credential");
     assert!(matches!(
         store.snapshot(principal).await.unwrap(),
@@ -1280,8 +1291,8 @@ async fn snapshot_publish_fetch_and_push() {
 
     let mut newer = (*snapshot).clone();
     newer.generation = Generation(4);
-    store
-        .publish_snapshot(principal, publishable(Arc::new(newer)))
+    AdminStore::publish_snapshot(&*store, principal, publishable(Arc::new(newer)))
+        .await
         .expect("snapshot fixture matches its account and credential");
     let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
         panic!("newer snapshot must supersede revocation");
@@ -1291,7 +1302,7 @@ async fn snapshot_publish_fetch_and_push() {
 
 #[tokio::test]
 async fn staged_limits_round_trip_through_the_memory_store() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let principal = Principal(43);
     let limits = ResolvedLimits::new(64)
         .with_weighted_rate_compatibility_fallback(1_000, 2_000)
@@ -1311,8 +1322,8 @@ async fn staged_limits_round_trip_through_the_memory_store() {
         Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
     )
     .build();
-    store
-        .publish_snapshot(principal, publishable(Arc::new(snapshot)))
+    AdminStore::publish_snapshot(&*store, principal, publishable(Arc::new(snapshot)))
+        .await
         .expect("snapshot fixture matches its account and credential");
 
     let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
@@ -1374,7 +1385,7 @@ async fn status_of(store: &MemoryStore, principal: Principal) -> (AccountStatus,
 /// deactivated an account watched it keep serving.
 #[tokio::test]
 async fn suspending_an_account_stops_leases_and_republishes_its_snapshots() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let first = Principal(10);
     let second = Principal(11);
     for principal in [first, second] {
@@ -1422,14 +1433,19 @@ async fn suspending_an_account_stops_leases_and_republishes_its_snapshots() {
 /// generations.
 #[tokio::test]
 async fn suspension_republishes_only_the_suspended_accounts_snapshots() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let other_account = AccountId(2);
-    store.create_account(AccountConfig {
-        account_id: other_account,
-        initial_balance: CostUnits(1_000),
-        status: AccountStatus::Active,
-        capacity_class: CapacityClass::Assured,
-    });
+    AdminStore::create_account(
+        &*store,
+        AccountConfig {
+            account_id: other_account,
+            initial_balance: CostUnits(1_000),
+            status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
+        },
+    )
+    .await
+    .unwrap();
     let mine = Principal(10);
     let theirs = Principal(20);
     AdminStore::publish_snapshot(
@@ -1480,7 +1496,7 @@ async fn suspension_republishes_only_the_suspended_accounts_snapshots() {
 /// would shadow a later legitimate republish.
 #[tokio::test]
 async fn suspending_an_account_does_not_resurrect_revoked_principals() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let live = Principal(10);
     let revoked = Principal(11);
     for principal in [live, revoked] {
@@ -1521,7 +1537,7 @@ async fn suspending_an_account_does_not_resurrect_revoked_principals() {
 /// `Suspended`: reactivation restores admission and bumps again.
 #[tokio::test]
 async fn reactivating_an_account_restores_admission_and_bumps_generations() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let principal = Principal(10);
     AdminStore::publish_snapshot(
         &*store,
@@ -1558,7 +1574,7 @@ async fn reactivating_an_account_restores_admission_and_bumps_generations() {
 /// the divergence this whole mechanism exists to abolish.
 #[tokio::test]
 async fn a_closed_account_cannot_be_reactivated() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let principal = Principal(10);
     AdminStore::publish_snapshot(
         &*store,
@@ -1614,7 +1630,7 @@ async fn a_closed_account_cannot_be_reactivated() {
 /// depending on which credential it arrived with.
 #[tokio::test]
 async fn a_capacity_class_change_republishes_every_live_snapshot() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let first = Principal(10);
     let second = Principal(11);
     for principal in [first, second] {
@@ -1658,7 +1674,7 @@ async fn a_capacity_class_change_republishes_every_live_snapshot() {
 /// pinned snapshot for nothing.
 #[tokio::test]
 async fn repeating_a_capacity_class_change_publishes_nothing_new() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let principal = Principal(10);
     AdminStore::publish_snapshot(
         &*store,
@@ -1698,7 +1714,7 @@ async fn repeating_a_capacity_class_change_publishes_nothing_new() {
 /// records rather than filtering by account alone.
 #[tokio::test]
 async fn a_capacity_class_change_does_not_resurrect_revoked_principals() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let live = Principal(10);
     let revoked = Principal(11);
     for principal in [live, revoked] {
@@ -1735,7 +1751,7 @@ async fn a_capacity_class_change_does_not_resurrect_revoked_principals() {
 /// exists to abolish.
 #[tokio::test]
 async fn a_publish_contradicting_the_ledger_class_is_refused() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let principal = Principal(10);
 
     let mut snapshot = account_snapshot(ACCOUNT, 3, AccountStatus::Active);
@@ -1776,7 +1792,7 @@ async fn a_publish_contradicting_the_ledger_class_is_refused() {
 /// every class test still green.
 #[tokio::test]
 async fn a_publish_matching_a_reclassified_ledger_is_accepted() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let principal = Principal(10);
     AdminStore::set_capacity_class(&*store, ACCOUNT, CapacityClass::BestEffort)
         .await
@@ -1818,14 +1834,19 @@ async fn a_publish_matching_a_reclassified_ledger_is_accepted() {
 /// This is the class sibling of `creating_a_suspended_account_denies_from_birth`.
 #[tokio::test]
 async fn an_account_can_be_born_best_effort() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let born = AccountId(77);
-    store.create_account(AccountConfig {
-        account_id: born,
-        initial_balance: CostUnits(1_000),
-        status: AccountStatus::Active,
-        capacity_class: CapacityClass::BestEffort,
-    });
+    AdminStore::create_account(
+        &*store,
+        AccountConfig {
+            account_id: born,
+            initial_balance: CostUnits(1_000),
+            status: AccountStatus::Active,
+            capacity_class: CapacityClass::BestEffort,
+        },
+    )
+    .await
+    .unwrap();
 
     let mut snapshot = account_snapshot(born, 3, AccountStatus::Active);
     snapshot.capacity_class = CapacityClass::BestEffort;
@@ -1859,7 +1880,7 @@ async fn an_account_can_be_born_best_effort() {
 /// reached from inside the mechanism that exists to prevent it.
 #[tokio::test]
 async fn a_capacity_class_change_that_cannot_republish_moves_neither_record() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let principal = Principal(10);
     AdminStore::publish_snapshot(
         &*store,
@@ -1910,7 +1931,7 @@ async fn a_capacity_class_change_that_cannot_republish_moves_neither_record() {
 /// is why they share `SetStatusError`.
 #[tokio::test]
 async fn reclassifying_an_unknown_or_closed_account_is_refused() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     assert!(matches!(
         AdminStore::set_capacity_class(&*store, AccountId(u128::MAX), CapacityClass::BestEffort)
             .await,
@@ -1928,7 +1949,7 @@ async fn reclassifying_an_unknown_or_closed_account_is_refused() {
 
 #[tokio::test]
 async fn repeating_a_status_change_publishes_nothing_new() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let principal = Principal(10);
     AdminStore::publish_snapshot(
         &*store,
@@ -1969,7 +1990,7 @@ async fn repeating_a_status_change_publishes_nothing_new() {
 /// milliseconds rather than at the refresh interval.
 #[tokio::test]
 async fn a_status_change_pushes_every_republished_principal() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let first = Principal(10);
     let second = Principal(11);
     let revoked = Principal(12);
@@ -2017,7 +2038,7 @@ async fn a_status_change_pushes_every_republished_principal() {
 /// disagreement one principal at a time.
 #[tokio::test]
 async fn publishing_a_snapshot_that_contradicts_the_ledger_is_refused() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let principal = Principal(10);
     AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
         .await
@@ -2085,7 +2106,7 @@ async fn publishing_a_snapshot_that_contradicts_the_ledger_is_refused() {
 /// any.
 #[tokio::test]
 async fn a_status_change_that_cannot_republish_moves_neither_record() {
-    let store = store_with_balance(GrantPolicy::default(), 1_000);
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
     let principal = Principal(10);
     AdminStore::publish_snapshot(
         &*store,
@@ -2123,7 +2144,7 @@ async fn a_status_change_that_cannot_republish_moves_neither_record() {
 /// the point of the test rather than decoration.
 #[tokio::test]
 async fn overage_usage_is_billed_and_funds_itself() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let before = store.conservation(ACCOUNT).unwrap();
     assert_eq!(before.overage_recorded, CostUnits::ZERO);
 
@@ -2158,7 +2179,7 @@ async fn overage_usage_is_billed_and_funds_itself() {
 /// exist is the only way it can be wrong.
 #[tokio::test]
 async fn overage_usage_for_an_unknown_account_is_rejected() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let report = store
         .ingest(&[overage_usage(AccountId(u128::MAX), 1, 40, 1)], t(1))
         .await
@@ -2175,7 +2196,7 @@ async fn overage_usage_for_an_unknown_account_is_rejected() {
 /// event unchanged.
 #[tokio::test]
 async fn an_overage_replay_is_idempotent() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let event = overage_usage(ACCOUNT, 1, 40, 1);
     assert_eq!(store.ingest(&[event], t(1)).await.unwrap().accepted, 1);
     let report = store.ingest(&[event, event], t(2)).await.unwrap();
@@ -2199,7 +2220,7 @@ async fn an_overage_replay_is_idempotent() {
 /// suite, which reaches the same verdict through its own arithmetic.
 #[tokio::test]
 async fn overage_accounting_overflow_is_surfaced() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     // Fill the funding term to the top of its domain, which an accepted event
     // is allowed to do.
     assert_eq!(
@@ -2248,7 +2269,7 @@ async fn overage_accounting_overflow_is_surfaced() {
 /// against a settled lease, silently losing the charge for work that ran.
 #[tokio::test]
 async fn a_commit_time_fallback_is_ingested_as_overage_after_its_lease_is_reclaimed() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
@@ -2294,7 +2315,7 @@ async fn a_commit_time_fallback_is_ingested_as_overage_after_its_lease_is_reclai
 /// account that has spent overage.
 #[tokio::test]
 async fn settlement_is_unaffected_by_an_account_carrying_overage() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let released = store
         .acquire(ACCOUNT, CostUnits(300), TTL, t(0))
         .await
@@ -2369,7 +2390,7 @@ fn key(id: u128, principal: u128, digest_byte: u8, not_after: Option<Timestamp>)
 
 #[tokio::test]
 async fn a_recorded_credential_is_active_until_it_is_revoked() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     store.insert_key(key(1, 11, 0xa1, None)).await.unwrap();
 
     let active = store.active_keys(t(0)).await.unwrap();
@@ -2390,7 +2411,7 @@ async fn a_recorded_credential_is_active_until_it_is_revoked() {
 
 #[tokio::test]
 async fn revoking_reports_whether_anything_was_retired() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     store.insert_key(key(1, 11, 0xa1, None)).await.unwrap();
 
     assert_eq!(
@@ -2411,7 +2432,7 @@ async fn revoking_reports_whether_anything_was_retired() {
 
 #[tokio::test]
 async fn a_credential_expires_out_of_the_active_set_without_being_revoked() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     store
         .insert_key(key(1, 11, 0xa1, Some(t(100))))
         .await
@@ -2431,7 +2452,7 @@ async fn a_credential_expires_out_of_the_active_set_without_being_revoked() {
 
 #[tokio::test]
 async fn issuance_is_never_destructive() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     store.insert_key(key(1, 11, 0xa1, None)).await.unwrap();
 
     assert_eq!(
@@ -2449,7 +2470,7 @@ async fn issuance_is_never_destructive() {
 
 #[tokio::test]
 async fn a_credential_cannot_belong_to_an_account_that_does_not_exist() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     let orphan = KeyRecord {
         account_id: AccountId(404),
         ..key(1, 11, 0xa1, None)
@@ -2464,7 +2485,7 @@ async fn a_credential_cannot_belong_to_an_account_that_does_not_exist() {
 
 #[tokio::test]
 async fn the_active_set_is_ordered_so_two_instances_project_alike() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     for id in [3u128, 1, 2] {
         store
             .insert_key(key(id, 100 + id, id as u8, None))
@@ -2486,7 +2507,7 @@ async fn the_active_set_is_ordered_so_two_instances_project_alike() {
 /// withdraw another's credential.
 #[tokio::test]
 async fn two_credentials_cannot_share_a_principal() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     store.insert_key(key(1, 11, 0xa1, None)).await.unwrap();
     assert_eq!(
         store.insert_key(key(2, 11, 0xb2, None)).await,
@@ -2512,12 +2533,17 @@ async fn two_credentials_cannot_share_a_principal() {
 #[tokio::test]
 async fn a_refused_deposit_moves_neither_column() {
     let store = MemoryStore::new(full_grant_policy()).unwrap();
-    store.create_account(AccountConfig {
-        account_id: ACCOUNT,
-        initial_balance: CostUnits(u64::MAX),
-        status: AccountStatus::Active,
-        capacity_class: CapacityClass::Assured,
-    });
+    AdminStore::create_account(
+        &*store,
+        AccountConfig {
+            account_id: ACCOUNT,
+            initial_balance: CostUnits(u64::MAX),
+            status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
+        },
+    )
+    .await
+    .unwrap();
     // Spend some balance so `balance < deposited`, which is the ordering that
     // makes `deposited` overflow while `balance` still has room.
     store
@@ -2551,7 +2577,7 @@ async fn a_refused_deposit_moves_neither_column() {
 #[tokio::test]
 async fn a_failed_ingest_batch_leaves_the_ledger_untouched() {
     for overage_first in [false, true] {
-        let store = store_with_balance(full_grant_policy(), 10_000);
+        let store = store_with_balance(full_grant_policy(), 10_000).await;
         let lease = store
             .acquire(ACCOUNT, CostUnits(1_000), TTL, t(0))
             .await
@@ -2635,7 +2661,7 @@ async fn a_failed_ingest_batch_leaves_the_ledger_untouched() {
 async fn a_publish_racing_a_suspension_never_leaves_the_records_disagreeing() {
     const ROUNDS: u128 = 32;
     for round in 0..ROUNDS {
-        let store = store_with_balance(GrantPolicy::default(), 1_000);
+        let store = store_with_balance(GrantPolicy::default(), 1_000).await;
         let principal = Principal(round + 100);
 
         let publisher = tokio::spawn({
@@ -2740,7 +2766,7 @@ async fn roll(store: &MemoryStore, now: i64) -> Option<RolledAccount> {
 /// today.
 #[tokio::test]
 async fn setting_a_schedule_deposits_nothing() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     store
         .set_budget_schedule(ACCOUNT, Some(monthly(500)))
         .await
@@ -2754,7 +2780,7 @@ async fn setting_a_schedule_deposits_nothing() {
 /// it now rather than at a boundary that never funds anything.
 #[tokio::test]
 async fn setting_a_schedule_on_an_unknown_account_is_refused() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     assert_eq!(
         store
             .set_budget_schedule(AccountId(999), Some(monthly(500)))
@@ -2768,7 +2794,7 @@ async fn setting_a_schedule_on_an_unknown_account_is_refused() {
 /// loser must be able to tell that it lost from what it is returned.
 #[tokio::test]
 async fn racing_passes_cross_a_boundary_exactly_once() {
-    let store = store_with_balance(full_grant_policy(), 0);
+    let store = store_with_balance(full_grant_policy(), 0).await;
     store
         .set_budget_schedule(ACCOUNT, Some(monthly(500)))
         .await
@@ -2801,7 +2827,7 @@ async fn racing_passes_cross_a_boundary_exactly_once() {
 /// any cadence without checking the calendar itself.
 #[tokio::test]
 async fn a_pass_inside_the_current_period_changes_nothing() {
-    let store = store_with_balance(full_grant_policy(), 0);
+    let store = store_with_balance(full_grant_policy(), 0).await;
     store
         .set_budget_schedule(ACCOUNT, Some(monthly(500)))
         .await
@@ -2817,7 +2843,7 @@ async fn a_pass_inside_the_current_period_changes_nothing() {
 /// not being set, and `AlreadyCurrent` could not say so.
 #[tokio::test]
 async fn an_account_without_a_schedule_is_untouched() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     assert_eq!(roll(&store, FEB).await, None);
     assert_eq!(store.balance(ACCOUNT), CostUnits(100));
     assert_conserved(&store);
@@ -2827,13 +2853,15 @@ async fn an_account_without_a_schedule_is_untouched() {
 /// allowance resets, manual credits do not.
 #[tokio::test]
 async fn a_top_up_survives_rollover_but_the_allowance_does_not() {
-    let store = store_with_balance(full_grant_policy(), 0);
+    let store = store_with_balance(full_grant_policy(), 0).await;
     store
         .set_budget_schedule(ACCOUNT, Some(monthly(500)))
         .await
         .unwrap();
     roll(&store, JAN + 1).await;
-    store.deposit(ACCOUNT, CostUnits(70)).unwrap();
+    AdminStore::deposit(&*store, ACCOUNT, CostUnits(70))
+        .await
+        .unwrap();
     assert_eq!(store.balance(ACCOUNT), CostUnits(570));
 
     let rolled = roll(&store, FEB).await;
@@ -2860,7 +2888,7 @@ async fn a_top_up_survives_rollover_but_the_allowance_does_not() {
 /// would turn an operational outage into a billing event.
 #[tokio::test]
 async fn a_missed_period_does_not_accrue_a_backlog() {
-    let store = store_with_balance(full_grant_policy(), 0);
+    let store = store_with_balance(full_grant_policy(), 0).await;
     store
         .set_budget_schedule(ACCOUNT, Some(monthly(500)))
         .await
@@ -2887,7 +2915,7 @@ async fn a_missed_period_does_not_accrue_a_backlog() {
 /// rather than returned to a balance the schedule says should be fresh.
 #[tokio::test]
 async fn a_lease_from_the_closed_period_expires_its_unspent_allowance() {
-    let store = store_with_balance(full_grant_policy(), 0);
+    let store = store_with_balance(full_grant_policy(), 0).await;
     store
         .set_budget_schedule(ACCOUNT, Some(monthly(500)))
         .await
@@ -2940,7 +2968,7 @@ async fn a_lease_from_the_closed_period_expires_its_unspent_allowance() {
 /// the timestamp alone would consume credits that never had an expiry date.
 #[tokio::test]
 async fn a_lease_funded_by_a_top_up_is_unaffected_by_a_boundary() {
-    let store = store_with_balance(full_grant_policy(), 300);
+    let store = store_with_balance(full_grant_policy(), 300).await;
     store
         .set_budget_schedule(ACCOUNT, Some(monthly(500)))
         .await
@@ -2979,7 +3007,7 @@ async fn a_lease_funded_by_a_top_up_is_unaffected_by_a_boundary() {
 /// moving durable credits into the bucket that expires next month.
 #[tokio::test]
 async fn a_split_funded_lease_charges_the_allowance_half_first() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     store
         .set_budget_schedule(ACCOUNT, Some(monthly(60)))
         .await
@@ -3025,7 +3053,7 @@ async fn a_split_funded_lease_charges_the_allowance_half_first() {
 /// through the sweep.
 #[tokio::test]
 async fn reclaim_expires_a_closed_period_lease_it_sweeps() {
-    let store = store_with_balance(full_grant_policy(), 0);
+    let store = store_with_balance(full_grant_policy(), 0).await;
     store
         .set_budget_schedule(ACCOUNT, Some(monthly(500)))
         .await
@@ -3057,7 +3085,7 @@ async fn reclaim_expires_a_closed_period_lease_it_sweeps() {
 /// expiry it started: the allowance simply becomes an ordinary balance.
 #[tokio::test]
 async fn clearing_a_schedule_leaves_the_balance_alone() {
-    let store = store_with_balance(full_grant_policy(), 0);
+    let store = store_with_balance(full_grant_policy(), 0).await;
     store
         .set_budget_schedule(ACCOUNT, Some(monthly(500)))
         .await
@@ -3132,12 +3160,17 @@ async fn a_bounded_rollover_pass_takes_the_oldest_periods_not_an_arbitrary_set()
 async fn the_rollover_pass_is_bounded_and_saturation_says_there_is_more() {
     let store = MemoryStore::new(full_grant_policy()).unwrap();
     for id in 1..=5u128 {
-        store.create_account(AccountConfig {
-            account_id: AccountId(id),
-            initial_balance: CostUnits::ZERO,
-            status: AccountStatus::Active,
-            capacity_class: CapacityClass::Assured,
-        });
+        AdminStore::create_account(
+            &*store,
+            AccountConfig {
+                account_id: AccountId(id),
+                initial_balance: CostUnits::ZERO,
+                status: AccountStatus::Active,
+                capacity_class: CapacityClass::Assured,
+            },
+        )
+        .await
+        .unwrap();
         store
             .set_budget_schedule(AccountId(id), Some(monthly(100)))
             .await
@@ -3175,12 +3208,17 @@ async fn the_rollover_pass_is_bounded_and_saturation_says_there_is_more() {
 async fn an_unscheduled_account_is_never_selected() {
     let store = MemoryStore::new(full_grant_policy()).unwrap();
     for id in 1..=3u128 {
-        store.create_account(AccountConfig {
-            account_id: AccountId(id),
-            initial_balance: CostUnits(10),
-            status: AccountStatus::Active,
-            capacity_class: CapacityClass::Assured,
-        });
+        AdminStore::create_account(
+            &*store,
+            AccountConfig {
+                account_id: AccountId(id),
+                initial_balance: CostUnits(10),
+                status: AccountStatus::Active,
+                capacity_class: CapacityClass::Assured,
+            },
+        )
+        .await
+        .unwrap();
     }
     store
         .set_budget_schedule(AccountId(2), Some(monthly(100)))
@@ -3205,7 +3243,7 @@ async fn an_unscheduled_account_is_never_selected() {
 /// allowance that was about to reset.
 #[tokio::test]
 async fn a_grant_spends_the_expiring_allowance_before_a_top_up() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     store
         .set_budget_schedule(ACCOUNT, Some(monthly(60)))
         .await
@@ -3257,7 +3295,7 @@ async fn a_grant_spends_the_expiring_allowance_before_a_top_up() {
 /// account's fresh allowance every time a request cancelled.
 #[tokio::test]
 async fn a_lease_released_inside_its_own_period_expires_nothing() {
-    let store = store_with_balance(full_grant_policy(), 0);
+    let store = store_with_balance(full_grant_policy(), 0).await;
     store
         .set_budget_schedule(ACCOUNT, Some(monthly(500)))
         .await
@@ -3297,7 +3335,7 @@ async fn a_lease_released_inside_its_own_period_expires_nothing() {
 /// the allowance of every consolidation, which is every one #109 performs.
 #[tokio::test]
 async fn consolidating_inside_a_lease_own_period_expires_nothing() {
-    let store = store_with_balance(full_grant_policy(), 0);
+    let store = store_with_balance(full_grant_policy(), 0).await;
     store
         .set_budget_schedule(ACCOUNT, Some(monthly(500)))
         .await
@@ -3351,14 +3389,17 @@ async fn consolidating_across_a_boundary_regrants_only_what_the_credit_restores(
             ..full_grant_policy()
         },
         0,
-    );
+    )
+    .await;
     store
         .set_budget_schedule(ACCOUNT, Some(monthly(500)))
         .await
         .unwrap();
     roll(&store, JAN + 1).await;
     // Half allowance, half a top-up that never expires.
-    store.deposit(ACCOUNT, CostUnits(100)).unwrap();
+    AdminStore::deposit(&*store, ACCOUNT, CostUnits(100))
+        .await
+        .unwrap();
 
     let january = store
         .acquire(ACCOUNT, CostUnits(600), LONG, t(JAN + 2))
@@ -3406,7 +3447,7 @@ async fn consolidation_after_a_budget_reduction_uses_only_restored_credit_as_flo
         max_ttl: LONG,
         ..full_grant_policy()
     };
-    let store = store_with_balance(policy, 0);
+    let store = store_with_balance(policy, 0).await;
     AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(500)))
         .await
         .unwrap();
@@ -3444,7 +3485,7 @@ async fn consolidation_after_a_budget_reduction_uses_only_restored_credit_as_flo
 /// reclaimed to the balance rather than written off.
 #[tokio::test]
 async fn a_lease_reclaimed_inside_its_own_period_expires_nothing() {
-    let store = store_with_balance(full_grant_policy(), 0);
+    let store = store_with_balance(full_grant_policy(), 0).await;
     store
         .set_budget_schedule(ACCOUNT, Some(monthly(500)))
         .await
@@ -3477,7 +3518,7 @@ async fn a_lease_reclaimed_inside_its_own_period_expires_nothing() {
 /// at all.
 #[tokio::test]
 async fn a_snapshot_revision_round_trips_through_the_store() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let principal = Principal(0x94);
     let revision = PolicyRevision([0x7e; 32]);
 
@@ -3506,7 +3547,7 @@ async fn a_snapshot_revision_round_trips_through_the_store() {
 /// comes back as such — not as an error, and not as a value the store made up.
 #[tokio::test]
 async fn a_snapshot_without_a_revision_publishes_as_unstated() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let principal = Principal(0x95);
 
     let submitted = account_snapshot(ACCOUNT, 1, AccountStatus::Active);
@@ -3526,7 +3567,7 @@ async fn a_snapshot_without_a_revision_publishes_as_unstated() {
 /// conservation term may notice it.
 #[tokio::test]
 async fn a_usage_event_is_ingested_with_its_revision_and_conserves() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
@@ -3570,7 +3611,7 @@ async fn a_usage_event_is_ingested_with_its_revision_and_conserves() {
 /// built without one and comes back carrying the ledger's numbers.
 #[tokio::test]
 async fn a_published_snapshot_carries_the_ledgers_budget() {
-    let store = store_with_balance(full_grant_policy(), 0);
+    let store = store_with_balance(full_grant_policy(), 0).await;
     store
         .set_budget_schedule(ACCOUNT, Some(monthly(500)))
         .await
@@ -3604,7 +3645,7 @@ async fn a_published_snapshot_carries_the_ledgers_budget() {
 /// took a lease, and would then *rise* again when that lease settled.
 #[tokio::test]
 async fn the_budget_view_counts_units_out_on_lease() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let principal = Principal(0x52);
     let lease = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
@@ -3648,7 +3689,7 @@ async fn the_budget_view_counts_units_out_on_lease() {
 /// it does not hold — so a supplied value can never survive.
 #[tokio::test]
 async fn a_supplied_budget_never_survives_publication() {
-    let store = store_with_balance(full_grant_policy(), 700);
+    let store = store_with_balance(full_grant_policy(), 700).await;
     let fabricated = BudgetView {
         balance_at_publish: CostUnits(999_999),
         period_end: Some(t(MAR)),
@@ -3698,7 +3739,7 @@ async fn a_supplied_budget_never_survives_publication() {
 /// this month's quota — the one number the whole feature exists to get right.
 #[tokio::test]
 async fn the_budget_view_does_not_report_expired_units_as_spendable() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     store
         .set_budget_schedule(ACCOUNT, Some(monthly(500)))
         .await
@@ -3737,7 +3778,7 @@ async fn the_budget_view_does_not_report_expired_units_as_spendable() {
 /// spend again.
 #[tokio::test]
 async fn the_budget_view_writes_off_settlement_loss() {
-    let store = store_with_balance(full_grant_policy(), 1_000);
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
     let principal = Principal(0x56);
     let lease = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
@@ -3779,12 +3820,17 @@ async fn the_budget_view_writes_off_settlement_loss() {
 #[tokio::test]
 async fn admin_receipts_identify_the_state_each_operation_replaced() {
     let store = MemoryStore::new(full_grant_policy()).unwrap();
-    store.create_account(AccountConfig {
-        account_id: ACCOUNT,
-        initial_balance: CostUnits(100),
-        status: AccountStatus::Active,
-        capacity_class: CapacityClass::Assured,
-    });
+    AdminStore::create_account(
+        &*store,
+        AccountConfig {
+            account_id: ACCOUNT,
+            initial_balance: CostUnits(100),
+            status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
+        },
+    )
+    .await
+    .unwrap();
     use tollgate_store::AdminState;
     let created = AdminStore::create_account(
         &*store,
@@ -3867,12 +3913,17 @@ async fn admin_receipts_identify_the_state_each_operation_replaced() {
 #[tokio::test]
 async fn concurrent_deposit_receipts_form_one_exact_funding_history() {
     let store = MemoryStore::new(full_grant_policy()).unwrap();
-    store.create_account(AccountConfig {
-        account_id: ACCOUNT,
-        initial_balance: CostUnits(100),
-        status: AccountStatus::Active,
-        capacity_class: CapacityClass::Assured,
-    });
+    AdminStore::create_account(
+        &*store,
+        AccountConfig {
+            account_id: ACCOUNT,
+            initial_balance: CostUnits(100),
+            status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
+        },
+    )
+    .await
+    .unwrap();
     use tollgate_store::AdminState;
     let mut tasks = tokio::task::JoinSet::new();
     for _ in 0..32 {
@@ -3913,12 +3964,17 @@ async fn concurrent_deposit_receipts_form_one_exact_funding_history() {
 #[tokio::test]
 async fn racing_publication_and_revocation_receipts_name_the_actual_predecessor() {
     let store = MemoryStore::new(full_grant_policy()).unwrap();
-    store.create_account(AccountConfig {
-        account_id: ACCOUNT,
-        initial_balance: CostUnits(100),
-        status: AccountStatus::Active,
-        capacity_class: CapacityClass::Assured,
-    });
+    AdminStore::create_account(
+        &*store,
+        AccountConfig {
+            account_id: ACCOUNT,
+            initial_balance: CostUnits(100),
+            status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
+        },
+    )
+    .await
+    .unwrap();
     use tollgate_store::AdminState;
     let mut tasks = tokio::task::JoinSet::new();
     for generation in 1..=24 {
@@ -3990,7 +4046,7 @@ async fn racing_publication_and_revocation_receipts_name_the_actual_predecessor(
 
 #[tokio::test]
 async fn credential_projection_preserves_lifecycle_truth_and_refuses_corrupt_identity() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     use tollgate_store::KeySource;
     for (id, expiry) in [(1u128, None), (2, Some(t(100))), (3, None)] {
         let mut digest = [0u8; 32];
@@ -4050,7 +4106,7 @@ async fn credential_projection_preserves_lifecycle_truth_and_refuses_corrupt_ide
 
 #[tokio::test]
 async fn credential_pages_order_bound_skip_retired_and_expose_every_mutation() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     use tollgate_store::KeySource;
     let limit = NonZeroUsize::new(2).unwrap();
     let initial = store.active_keys_page(t(100), None, limit).await.unwrap();
@@ -4147,7 +4203,7 @@ async fn credential_pages_order_bound_skip_retired_and_expose_every_mutation() {
 async fn usage_accepts_zero_and_the_backends_unit_ceiling() {
     for leased in [false, true] {
         let ceiling = u64::MAX;
-        let store = store_with_balance(full_grant_policy(), if leased { ceiling } else { 0 });
+        let store = store_with_balance(full_grant_policy(), if leased { ceiling } else { 0 }).await;
         let lease = if leased {
             Some(
                 store
@@ -4199,7 +4255,7 @@ async fn nanosecond_lease_boundaries_preserve_release_reclaim_and_consolidation(
             reclaim_grace: grace,
             ..full_grant_policy()
         };
-        let store = store_with_balance(policy, 100);
+        let store = store_with_balance(policy, 100).await;
         let lease = store
             .acquire(ACCOUNT, CostUnits(10), ttl, now)
             .await
@@ -4268,7 +4324,7 @@ async fn a_grace_deadline_beyond_timestamp_max_never_reclaims_early() {
             reclaim_grace: grace,
             ..full_grant_policy()
         };
-        let store = store_with_balance(policy, 100);
+        let store = store_with_balance(policy, 100).await;
         let now = Timestamp::MAX - SignedDuration::from_nanos(2);
         let lease = store
             .acquire(ACCOUNT, CostUnits(10), SignedDuration::from_nanos(1), now)
@@ -4305,7 +4361,7 @@ async fn a_grace_deadline_beyond_timestamp_max_never_reclaims_early() {
 }
 #[tokio::test]
 async fn an_unrepresentable_replacement_expiry_leaves_the_original_grant_untouched() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     let lease = store
         .acquire(ACCOUNT, CostUnits(10), TTL, t(0))
         .await
@@ -4349,6 +4405,6 @@ mod credential_expiry;
 
 #[tokio::test]
 async fn credential_expiry_is_exact_in_directory_and_every_page() {
-    let store = store_with_balance(full_grant_policy(), 100);
+    let store = store_with_balance(full_grant_policy(), 100).await;
     credential_expiry::exact_expiry(&*store, ACCOUNT).await;
 }

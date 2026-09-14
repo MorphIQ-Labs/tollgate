@@ -38,6 +38,7 @@ TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
 ./scripts/check_allocations.sh
 ./scripts/check_ci_rules.sh
 ./scripts/check_invariant_witnesses.sh
+./scripts/check_backend_parity.sh
 cargo run --locked --profile production -p pricing-api --example load_gate_failure_probe
 cargo run -p pricing-api --bin pricing-api
 cargo run -p tollgate-server
@@ -98,7 +99,7 @@ Invariants live in `INVARIANTS.md`, the testable contract, with rationale in `do
 
 ## Coding Style and Testing
 
-Use rustfmt defaults and idiomatic Rust naming: `snake_case` for modules, functions, and tests; `UpperCamelCase` for types; `SCREAMING_SNAKE_CASE` for constants. Use standard and Tokio tests, `proptest` for properties, and Criterion for hot-path benchmarks. Name tests for observable behavior. A backend behavior change must update both memory and PostgreSQL implementations and their mirrored scenario tests.
+Use rustfmt defaults and idiomatic Rust naming: `snake_case` for modules, functions, and tests; `UpperCamelCase` for types; `SCREAMING_SNAKE_CASE` for constants. Use standard and Tokio tests, `proptest` for properties, and Criterion for hot-path benchmarks. Name tests for observable behavior. A backend behavior change must update both memory and PostgreSQL implementations and their mirrored scenario tests, and those mirrors must drive the same contract: `MemoryStore` carries inherent helpers that shadow its `AdminStore` methods while `PostgresStore` has none, so a mirrored test calling the helper on one side and the trait on the other runs two different contracts under one name. `./scripts/check_backend_parity.sh` enforces that mechanically, because it drifted twice (#43, #85) and neither a compiler nor a passing suite says anything about it.
 
 ## Merge Requests and Releases
 

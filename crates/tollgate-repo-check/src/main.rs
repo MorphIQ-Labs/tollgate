@@ -1,39 +1,17 @@
-use std::{env, path::PathBuf, process::ExitCode};
+use std::{env, process::ExitCode};
+
+use tollgate_repo_check::cli::{Invocation, parse};
+
+const USAGE: &str = "Usage: check_invariant_witnesses [--] [REPOSITORY]\n\nChecks INVARIANTS.md against Rust and Lean declarations. Defaults to the current directory.";
 
 fn run() -> Result<(), String> {
-    let args: Vec<_> = env::args_os().skip(1).collect();
-    for arg in args.iter().take_while(|arg| *arg != "--") {
-        match arg.to_str() {
-            Some("--help" | "-h") => {
-                println!(
-                    "Usage: check_invariant_witnesses [--] [REPOSITORY]\n\nChecks INVARIANTS.md against Rust and Lean declarations. Defaults to the current directory."
-                );
-                return Ok(());
-            }
-            Some("--version" | "-V") => {
-                println!("check_invariant_witnesses {}", env!("CARGO_PKG_VERSION"));
-                return Ok(());
-            }
-            _ => {}
+    let root = match parse(env::args_os().skip(1), "check_invariant_witnesses", USAGE)? {
+        Invocation::Print(text) => {
+            println!("{text}");
+            return Ok(());
         }
-    }
-    let mut positional = Vec::new();
-    let mut terminated = false;
-    for arg in args {
-        if !terminated && arg == "--" {
-            terminated = true;
-        } else if !terminated && arg.to_string_lossy().starts_with('-') {
-            return Err(format!("unknown option: {}", arg.to_string_lossy()));
-        } else {
-            positional.push(arg);
-        }
-    }
-    if positional.len() > 1 {
-        return Err("expected at most one repository path".into());
-    }
-    let root = positional
-        .first()
-        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+        Invocation::Check(root) => root,
+    };
     let report = tollgate_repo_check::check(&root)?;
     println!(
         "invariant references: OK ({} resolved, {} external; declarations only, not test execution or proof checking)",
@@ -45,8 +23,8 @@ fn run() -> Result<(), String> {
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("invariant references: {error}");
+        Err(message) => {
+            eprintln!("invariant references: {message}");
             ExitCode::FAILURE
         }
     }
