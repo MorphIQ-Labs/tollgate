@@ -65,9 +65,10 @@ TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate ./scripts/c
 ./scripts/check_mutations.sh --package tollgate-core
 
 # Run the example service:
-cargo run -p pricing-api
+cargo run -p pricing-api --bin pricing-api -- --help
+cargo run -p pricing-api --bin pricing-api
 # Opt in only after profiling sustained same-account cross-core contention:
-TOLLGATE_LOCAL_SHARDS=8 cargo run -p pricing-api
+TOLLGATE_LOCAL_SHARDS=8 cargo run -p pricing-api --bin pricing-api
 curl -s -H 'Authorization: Bearer demo-key-1' -H 'Content-Type: application/json' \
      -d '{"contracts":[{"spot":100,"strike":105,"rate":0.05,"vol":0.2,"tte_years":0.25}]}' \
      http://127.0.0.1:8081/v1/price
@@ -83,6 +84,14 @@ The [control-plane security runbook](docs/CONTROL_PLANE_SECURITY.md) covers TLS,
 Cloud Run service identity, credential rotation, audit collection, and the Rust
 API/configuration rollout. Remote plaintext and anonymous control-plane calls
 are refused.
+
+Every binary accepts `--help`/`-h` and `--version`/`-V` before validating other
+arguments or application configuration. The first information flag before `--`
+wins; everything after that marker is positional. `pricing-api` and
+`tollgate-server` take no positional arguments: no arguments or a bare `--`
+starts the service, and other arguments exit with status 2. Information commands
+exit successfully without starting the application, binding its listener or
+running measurements. The gate tools retain their documented positional inputs.
 
 ## Supported Rust toolchains
 

@@ -610,17 +610,26 @@ fn evaluate(
     }
 }
 
-fn parse_args(args: &[String]) -> Result<Command, String> {
-    let separator = args.iter().position(|arg| arg == "--");
+fn parse_args<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Result<Command, String> {
+    let separator = args.iter().position(|arg| arg.as_ref() == "--");
     let option_end = separator.unwrap_or(args.len());
     for arg in &args[..option_end] {
-        match arg.as_str() {
-            "-h" | "--help" => return Ok(Command::Help),
-            "-V" | "--version" => return Ok(Command::Version),
+        match arg.as_ref().to_str() {
+            Some("-h" | "--help") => return Ok(Command::Help),
+            Some("-V" | "--version") => return Ok(Command::Version),
             _ => {}
         }
     }
 
+    let args: Vec<String> = args
+        .iter()
+        .map(|arg| {
+            arg.as_ref()
+                .to_str()
+                .map(str::to_owned)
+                .ok_or("arguments must be valid UTF-8")
+        })
+        .collect::<Result<_, _>>()?;
     let mut mode = GateMode::Full;
     let mut baseline_path = None;
     let mut record_path = None;
@@ -1435,7 +1444,7 @@ fn fail(msg: &str) -> ExitCode {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
     let (
         manifest_path,
         criterion_root,
@@ -1974,7 +1983,7 @@ mod tests {
             parse_args(&strings(&["--wat"])),
             Err("unknown option: --wat".to_owned())
         );
-        assert_eq!(parse_args(&[]), Err(USAGE.to_owned()));
+        assert_eq!(parse_args(&strings(&[])), Err(USAGE.to_owned()));
         for once in ["--record", "--samples", "--history"] {
             assert_eq!(
                 parse_args(&strings(&[once])),

@@ -404,17 +404,26 @@ impl MeasurementVerdict {
     }
 }
 
-fn parse_args(args: &[String]) -> Result<Command, String> {
-    let separator = args.iter().position(|arg| arg == "--");
+fn parse_args<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Result<Command, String> {
+    let separator = args.iter().position(|arg| arg.as_ref() == "--");
     let option_end = separator.unwrap_or(args.len());
     for arg in &args[..option_end] {
-        match arg.as_str() {
-            "-h" | "--help" => return Ok(Command::Help),
-            "-V" | "--version" => return Ok(Command::Version),
+        match arg.as_ref().to_str() {
+            Some("-h" | "--help") => return Ok(Command::Help),
+            Some("-V" | "--version") => return Ok(Command::Version),
             _ => {}
         }
     }
 
+    let args: Vec<String> = args
+        .iter()
+        .map(|arg| {
+            arg.as_ref()
+                .to_str()
+                .map(str::to_owned)
+                .ok_or("arguments must be valid UTF-8")
+        })
+        .collect::<Result<_, _>>()?;
     let mut verdict_mode = VerdictMode::Gate;
     let mut positional = Vec::with_capacity(args.len());
     for arg in &args[..option_end] {
@@ -1160,9 +1169,8 @@ fn all_scenarios_passed(
     sequential && concurrent && distinct_accounts.unwrap_or(true) && mixed.passed()
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+fn main() -> ExitCode {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
     let (thresholds_path, report_path, verdict_mode) = match parse_args(&args) {
         Ok(Command::Run {
             thresholds_path,
@@ -1182,6 +1190,15 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    run(thresholds_path, report_path, verdict_mode)
+}
+
+#[tokio::main]
+async fn run(
+    thresholds_path: PathBuf,
+    report_path: PathBuf,
+    verdict_mode: VerdictMode,
+) -> ExitCode {
     let thresholds_json = match std::fs::read_to_string(&thresholds_path) {
         Ok(contents) => contents,
         Err(error) => {
@@ -1674,7 +1691,7 @@ mod tests {
             parse_args(&strings(&["--wat"])),
             Err("unknown option: --wat".to_owned())
         );
-        assert_eq!(parse_args(&[]), Err(USAGE.to_owned()));
+        assert_eq!(parse_args(&strings(&[])), Err(USAGE.to_owned()));
         assert_eq!(
             parse_args(&strings(&["thresholds.json", "report.json"])),
             Ok(Command::Run {

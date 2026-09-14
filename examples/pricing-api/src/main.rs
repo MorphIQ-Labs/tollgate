@@ -11,13 +11,62 @@
 //!      http://127.0.0.1:8081/v1/price
 //! ```
 
-use std::num::NonZeroUsize;
+use std::{ffi::OsString, num::NonZeroUsize, process::ExitCode};
 
 use pricing_api::{PricingConnection, build_app_with_sharding};
 use tollgate_core::LocalSharding;
 
+enum Startup {
+    Help,
+    Version,
+    Serve,
+}
+
+fn parse_startup(args: &[OsString]) -> Result<Startup, &'static str> {
+    for arg in args.iter().take_while(|arg| *arg != "--") {
+        match arg.to_str() {
+            Some("--help" | "-h") => return Ok(Startup::Help),
+            Some("--version" | "-V") => return Ok(Startup::Version),
+            _ => {}
+        }
+    }
+    if args.is_empty() || (args.len() == 1 && args[0] == "--") {
+        Ok(Startup::Serve)
+    } else {
+        Err("unexpected argument; use --help")
+    }
+}
+
+fn main() -> ExitCode {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    match parse_startup(&args) {
+        Ok(Startup::Help) => {
+            println!(
+                "pricing-api {}\nUsage: pricing-api [--help | --version] [--]\n\nConfiguration (environment variables):\n  PRICING_BIND          Listener address (default 127.0.0.1:8081)\n  PRICING_DEPOSIT       Demo account deposit in units (default 1000000)\n  TOLLGATE_LOCAL_SHARDS Positive local shard count (default 1)\n  RUST_LOG              Log filter (default info)\n\nThis example uses the demo credential documented in README.md.",
+                env!("CARGO_PKG_VERSION")
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Startup::Version) => {
+            println!("pricing-api {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        Ok(Startup::Serve) => match serve() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("pricing-api: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("pricing-api: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
+async fn serve() -> std::io::Result<()> {
     let bind = std::env::var("PRICING_BIND").unwrap_or_else(|_| "127.0.0.1:8081".to_string());
     let deposit: u64 = std::env::var("PRICING_DEPOSIT")
         .ok()
