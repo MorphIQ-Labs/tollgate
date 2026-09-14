@@ -737,9 +737,11 @@ async fn run(
                 counters.record_acquired(grant.units);
                 // Rotation: install the fresh lease and park the superseded
                 // one until it quiesces (module docs).
-                if let Some(old) = slot.replace(install_lease(grant, &config, &slot, &refill)) {
-                    parked.push(old);
-                }
+                publish_and_park(
+                    &slot,
+                    install_lease(grant, &config, &slot, &refill),
+                    &mut parked,
+                );
             }
             // Denied, backend down, or too slow: nothing to install. The slot
             // keeps whatever live lease it still has (spend continues until
@@ -1021,7 +1023,7 @@ async fn consolidate_live_lease(
     };
     if Arc::strong_count(&live) > 1 || !live.is_only_local_view() {
         counters.record_consolidation_deferred();
-        slot.install(live);
+        publish_and_park(slot, live, parked);
         return Consolidation::KeptServing;
     }
     // Exact: the predicate above establishes that no request can debit or
@@ -1071,7 +1073,7 @@ async fn consolidate_live_lease(
             // this grant, so it must not be parked: releasing it again would
             // claim units the ledger has already credited back.
             drop(live);
-            slot.install(install_lease(fresh, config, slot, refill));
+            publish_and_park(slot, install_lease(fresh, config, slot, refill), parked);
             return Consolidation::Installed;
         }
         Ok(Err(error)) => error,
@@ -1092,7 +1094,7 @@ async fn consolidate_live_lease(
                 lease = %grant.lease_id, %error,
                 "consolidation refused; the grant is untouched and keeps serving"
             );
-            slot.install(live);
+            publish_and_park(slot, live, parked);
             Consolidation::KeptServing
         }
         ConsolidationFailure::Integrity => {
@@ -1101,7 +1103,7 @@ async fn consolidate_live_lease(
                 lease = %grant.lease_id, units = unspent.get(), %error,
                 "consolidation violated the allocator contract; readiness withdrawn"
             );
-            slot.install(live);
+            publish_and_park(slot, live, parked);
             Consolidation::KeptServing
         }
         ConsolidationFailure::Settled => {
@@ -1121,6 +1123,15 @@ async fn consolidate_live_lease(
             parked.push(live);
             Consolidation::KeptServing
         }
+    }
+}
+
+/// Every publication retains the displaced grant, including a grant another
+/// publisher installed while consolidation awaited the store. Only the store's
+/// confirmed settlement may dispose of the consolidation predecessor directly.
+fn publish_and_park(slot: &LeaseSlot, lease: Arc<LocalLease>, parked: &mut Vec<Arc<LocalLease>>) {
+    if let Some(previous) = slot.replace(lease) {
+        parked.push(previous);
     }
 }
 
@@ -1525,6 +1536,7 @@ mod tests {
     struct ConsolidatingAllocator {
         answer: Mutex<Option<Result<LeaseGrant, AllocateError>>>,
         calls: AtomicU64,
+        publish_during_call: Option<Arc<LeaseSlot>>,
     }
 
     impl ConsolidatingAllocator {
@@ -1532,6 +1544,7 @@ mod tests {
             Arc::new(Self {
                 answer: Mutex::new(Some(answer)),
                 calls: AtomicU64::new(0),
+                publish_during_call: None,
             })
         }
     }
@@ -1568,6 +1581,9 @@ mod tests {
             _now: Timestamp,
         ) -> Result<LeaseGrant, AllocateError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(slot) = &self.publish_during_call {
+                assert!(slot.replace(parked_lease(99)).is_none());
+            }
             self.answer
                 .lock()
                 .unwrap()
@@ -1601,7 +1617,7 @@ mod tests {
         harness: &Harness,
         lease: Arc<LocalLease>,
     ) -> (Consolidation, Option<u128>, Vec<u128>) {
-        harness.slot.install(lease);
+        drop(harness.slot.replace(lease));
         let mut parked = Vec::new();
         let (_tx, mut shutdown) = watch::channel(false);
         let outcome = consolidate_live_lease(
@@ -1647,6 +1663,37 @@ mod tests {
         assert_eq!(stats.released, 1, "consolidation settled its predecessor");
         assert!(!harness.counters.acquire_pending());
         assert_eq!(stats.acquired_units, 500);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consolidation_retains_a_grant_published_during_the_store_call() {
+        for (answer, expected_outcome, expected_served) in [
+            (Ok(grant(2, 500)), Consolidation::Installed, 2),
+            (
+                Err(AllocateError::InsufficientBalance),
+                Consolidation::KeptServing,
+                1,
+            ),
+            (
+                Err(AllocateError::InvalidRelease),
+                Consolidation::KeptServing,
+                1,
+            ),
+        ] {
+            let harness = Harness::new();
+            let mut allocator = ConsolidatingAllocator::new(answer);
+            Arc::get_mut(&mut allocator).unwrap().publish_during_call =
+                Some(Arc::clone(&harness.slot));
+            let (outcome, served, parked) =
+                consolidate_once(allocator, &harness, parked_lease(1)).await;
+            assert_eq!(outcome, expected_outcome);
+            assert_eq!(served, Some(expected_served));
+            assert_eq!(
+                parked,
+                vec![99],
+                "a concurrent publisher's grant must remain available for quiesced release"
+            );
+        }
     }
 
     /// A refusal from inside the transaction rolled it back, so the lease is
@@ -1877,7 +1924,7 @@ mod tests {
             (Refusal::Hang, 0, false),
         ] {
             let harness = Harness::new();
-            harness.slot.install(parked_lease(1));
+            drop(harness.slot.replace(parked_lease(1)));
             let manager = LeaseManager::spawn(
                 ScriptedAllocator::new([(LeaseId(1), refusal)]),
                 harness.slot,
@@ -1903,7 +1950,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn runtime_deadline_shortens_the_managers_actual_release_pass() {
         let harness = Harness::new();
-        harness.slot.install(parked_lease(1));
+        drop(harness.slot.replace(parked_lease(1)));
         let manager = LeaseManager::spawn(
             ScriptedAllocator::new([(LeaseId(1), Refusal::Hang)]),
             harness.slot,
@@ -1968,7 +2015,7 @@ mod tests {
             let scripted = ScriptedAllocator::new([(LeaseId(3), refusal)]);
             let allocator: Arc<dyn LeaseAllocator> = Arc::clone(&scripted) as _;
             let harness = Harness::new();
-            harness.slot.install(parked_lease(99));
+            drop(harness.slot.replace(parked_lease(99)));
             let mut parked = vec![parked_lease(3)];
 
             harness.release_quiesced(&allocator, &mut parked).await;
@@ -1993,7 +2040,7 @@ mod tests {
         let scripted = ScriptedAllocator::new([(LeaseId(3), Refusal::Fenced)]);
         let allocator: Arc<dyn LeaseAllocator> = Arc::clone(&scripted) as _;
         let harness = Harness::new();
-        harness.slot.install(parked_lease(99));
+        drop(harness.slot.replace(parked_lease(99)));
         let mut parked = vec![parked_lease(3)];
 
         harness.release_quiesced(&allocator, &mut parked).await;

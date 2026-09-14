@@ -77,11 +77,11 @@ fn snapshot_with_limits(
 fn engine_with_limits(limits: ResolvedLimits) -> AdmissionEngine<ArcSwapSnapshotMap> {
     let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
     let slot = LeaseSlot::for_account(AccountId(1));
-    slot.install(lease(
+    drop(slot.replace(lease(
         AccountId(1),
         CostUnits(u64::MAX / 2),
         LocalSharding::SINGLE,
-    ));
+    )));
     engine.map().install(
         Principal(1),
         snapshot_with_limits(AccountId(1), EnforcementMode::Strict, limits),
@@ -114,7 +114,7 @@ fn install(
 ) {
     let sharding = map.local_sharding();
     let slot = LeaseSlot::with_sharding(account, sharding);
-    slot.install(lease(account, units, sharding));
+    drop(slot.replace(lease(account, units, sharding)));
     map.install(principal, snapshot(account, mode), slot);
 }
 

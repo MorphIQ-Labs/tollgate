@@ -156,6 +156,60 @@ fn assert_error(output: &Output, expected: &str) {
 }
 
 #[test]
+fn unknown_manifest_keys_fail_before_measurement_reads_or_output_changes() {
+    let fixture = Fixture::new();
+    let manifest = fixture.read("manifest.json");
+    let baseline = std::fs::read(fixture.root.join("baseline.json")).unwrap();
+    fixture.write("report.json", &json!({"previous": "report"}));
+    std::fs::remove_dir_all(fixture.root.join("criterion")).unwrap();
+    for (pointer, key, value) in [
+        ("", "truts", json!({"moved_shift": 0.2})),
+        ("", "ratios_typo", json!([])),
+        ("/trust", "moved_shft", json!(0.2)),
+        ("/benchmarks/0", "threshold_typo", json!(5)),
+        ("/ratios/0", "max_ratio_typo", json!(1)),
+    ] {
+        let mut invalid = manifest.clone();
+        invalid["trust"] = json!({});
+        invalid.pointer_mut(pointer).unwrap()[key] = value;
+        fixture.write("manifest.json", &invalid);
+        let output = fixture.run(&["--record", "baseline.json"], &[]);
+        assert_error(&output, &format!("unknown field `{key}`"));
+        assert_eq!(fixture.read("report.json"), json!({"previous": "report"}));
+        assert_eq!(
+            std::fs::read(fixture.root.join("baseline.json")).unwrap(),
+            baseline
+        );
+        assert!(!fixture.root.join("samples").exists());
+    }
+}
+
+#[test]
+fn unknown_baseline_keys_cannot_be_used_for_comparison_or_promoted_over() {
+    let fixture = Fixture::new();
+    fixture.collect_two();
+    let mut baseline = fixture.read("baseline.json");
+    let entry = baseline["benchmarks"][0].as_object_mut().unwrap();
+    let bound = entry.remove("max_regression").unwrap();
+    entry.insert("max_regresion".to_owned(), bound);
+    fixture.write("baseline.json", &baseline);
+    let previous = std::fs::read(fixture.root.join("baseline.json")).unwrap();
+    let previous_report = std::fs::read(fixture.root.join("report.json")).unwrap();
+    let comparison = fixture.run(&["--baseline", "baseline.json"], &[]);
+    assert_error(&comparison, "unknown field `max_regresion`");
+    assert_eq!(
+        std::fs::read(fixture.root.join("report.json")).unwrap(),
+        previous_report
+    );
+    let recording = fixture.run(&["--record", "baseline.json"], &[]);
+    assert_error(&recording, "unknown field `max_regresion`");
+    assert_eq!(
+        std::fs::read(fixture.root.join("baseline.json")).unwrap(),
+        previous
+    );
+}
+
+#[test]
 fn optional_samples_preserve_gate_verdicts_without_recordable_provenance() {
     let fixture = Fixture::new();
     assert_exit(

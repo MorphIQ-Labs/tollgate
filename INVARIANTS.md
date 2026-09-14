@@ -417,6 +417,7 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    `an_expired_lease_reports_its_refusal_rather_than_waiting_for_the_tick`,
    `a_refused_lease_consolidates_rather_than_stranding_the_tail`,
    `a_successful_consolidation_installs_the_grant_and_parks_nothing`,
+   `consolidation_retains_a_grant_published_during_the_store_call`,
    `a_rolled_back_consolidation_returns_the_lease_to_the_slot`,
    `an_ambiguous_consolidation_parks_the_grant_rather_than_reinstating_it`,
    `a_settled_lease_falls_through_to_an_ordinary_acquire`,
@@ -521,6 +522,20 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    `expired_lease_units_reclaimed` and
    `expired_backlog_is_reclaimed_in_bounded_batches` (store suites), plus
    `one_scheduled_sweep_drains_every_saturated_batch` (server suite).
+
+   Routine publication preserves ownership of the displaced grant. `LeaseSlot`
+   exposes only `replace` and `take`, both returning a must-use handle; no
+   convenience mutation silently drops it. The caller retains that handle for
+   quiesced release or explicitly abandons it to TTL reclamation. `LeaseManager`
+   owns retention through `publish_and_park`, including publications after a
+   consolidation call while another publisher may have filled the slot.
+   Enforcement: the API removes silent-discard operations; must-use diagnostics
+   catch ignored outcomes; the manager retains displaced handles internally.
+   A caller can still deliberately drop a handle, so this does not prove every
+   external embedder releases it. *Tests:* `superseding_a_lease_hands_back_the_old_one`,
+   `racing_mutators_never_leave_a_slot_holding_two_answers`,
+   `consolidation_retains_a_grant_published_during_the_store_call`, and the
+   compile-fail examples on `LeaseSlot`, `LeaseSlot::replace`, and `LeaseSlot::take`.
 
    Both backends retain exact nanosecond expiry and grace. PostgreSQL stores
    a canonical integer pair and compares it to `GrantPolicy::reclaim_cutoff`;
@@ -837,6 +852,26 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `invalid_wire_ttls_never_debit_or_settle_a_lease`,
     `legacy_servers_reject_precise_ttls_and_invalid_input_never_reaches_http`,
     and `fractional_and_wide_lease_ttls_remain_valid_configuration`.
+
+    Performance-gate configuration rejects unknown keys before policy is used.
+    This includes the benchmark manifest, its trust policy and bounds, recorded
+    baseline settings and load thresholds. A misspelled optional key cannot
+    activate its default or disable a comparison. Explicitly documented comment
+    and reserved-ID metadata is inert; it is not an open extension namespace.
+    Omitted optional trust settings and legacy baseline defaults retain their
+    existing meanings. Every operational load setting remains required; `null`
+    disables a nullable bound only when its key is explicitly present.
+    Enforcement is inside each owning serde decoder. These are schema and CLI
+    witnesses, not new numerical or performance proofs. *Tests:*
+    `misspelled_gate_settings_never_become_defaults`,
+    `partial_trust_settings_preserve_explicit_values_and_omitted_defaults`,
+    `gate_metadata_is_explicit_and_does_not_hide_unknown_settings`,
+    `baseline_setting_typos_are_rejected_without_changing_legacy_defaults`,
+    `every_load_setting_is_required_independent_of_json_layout`,
+    `load_settings_accept_documented_comments_and_reject_unknown_keys`,
+    `unknown_manifest_keys_fail_before_measurement_reads_or_output_changes`,
+    `unknown_baseline_keys_cannot_be_used_for_comparison_or_promoted_over`, and
+    `unknown_load_settings_produce_parse_errors_in_both_verdict_modes`.
 
 17. **Negative caching is bounded and self-healing.** The ArcSwap map retains
     at most its configured count of request-visible negatives, removes
@@ -2025,3 +2060,42 @@ exists to detect corrupt state and must not be able to launder it.
     `benchmark_information_precedes_validation_and_uses_the_first_flag`,
     `benchmark_native_arguments_report_errors_after_information_flags_are_checked`,
     and `command_line_controls_precede_validation_and_terminator_is_respected`.
+
+39. **Load execution failures remain reportable under the deployment panic policy.**
+    Socket and protocol failures are returned by the owning client, never
+    converted to a panic. Every client must finish warmup before measurement
+    starts; failure or coordinator destruction releases waiting clients, and an
+    incomplete run cannot return successful sample data. Only an HTTP 503 problem
+    explicitly naming capacity unavailability is a shed outcome; other refusals
+    are execution failures. Readiness and socket inactivity are bounded.
+
+    Once command parsing supplies a report destination, configuration and
+    execution errors publish a failed report with stage, message and run context
+    and exit unsuccessfully in both verdict modes. Partial measurements are not
+    presented as latency evidence. Reports are exclusively staged, validated and
+    atomically replaced; a publication failure preserves the old destination
+    and explicitly reports that the new report is unavailable. Concurrent writers
+    have last-successful-publication semantics, with no merging of partial files.
+    Response payloads do not enter diagnostics. Arbitrary panics or process death
+    cannot be recovered under abort and are not covered by this guarantee.
+
+    Enforcement: fallible client operations, one owned coordinator whose Drop
+    releases the rendezvous, and the common atomic report publisher. These are
+    component-owned contracts with implementation evidence, not an accounting
+    proof or a formal refinement of Tokio and filesystem behavior.
+    *Tests:* `concurrent_driver_surfaces_client_startup_failure_without_deadlock`,
+    `failed_clients_publish_diagnostics_without_measurements`,
+    `response_framing_accepts_fragmentation_and_only_capacity_shedding`,
+    `invalid_responses_are_errors_without_response_payloads`,
+    `socket_failures_are_returned_at_the_io_boundary`,
+    `measurement_gate_publishes_run_and_abort_decisions`,
+    `coordinator_drop_releases_waiters_and_poison_is_an_error`,
+    `cancelling_the_driver_releases_ready_clients_and_refuses_late_readiness`,
+    `readiness_io_cannot_outlive_the_startup_deadline`,
+    `readiness_retries_incomplete_responses_until_a_complete_success`,
+    `reports_replace_atomically_and_failures_keep_the_previous_file`, and
+    `load_configuration_failures_write_reports_even_in_evidence_mode`, and
+    `load_runtime_configuration_errors_are_reported_before_starting_tasks`.
+    The CI production-profile fixture reuses the client/report implementation
+    to witness ordinary process completion and readable failure reports with
+    abort enabled; it performs no performance measurement.

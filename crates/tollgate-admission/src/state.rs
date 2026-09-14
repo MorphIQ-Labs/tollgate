@@ -28,6 +28,25 @@ pub use tollgate_core::Principal;
 /// INVARIANTS.md #5 and #10 honest; under `Elastic` it is one of the states
 /// the overage counter answers for.
 ///
+/// Every mutation returns the displaced lease through [`Self::replace`] or
+/// [`Self::take`]. There is no convenience method that silently drops it.
+///
+/// ```compile_fail,E0599
+/// # use std::sync::Arc;
+/// # use tollgate_admission::LeaseSlot;
+/// # use tollgate_core::LocalLease;
+/// fn rotate(slot: &LeaseSlot, fresh: Arc<LocalLease>) {
+///     slot.install(fresh);
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// # use tollgate_admission::LeaseSlot;
+/// fn retire(slot: &LeaseSlot) {
+///     slot.clear();
+/// }
+/// ```
+///
 /// **The overage counter lives here, and that is a decision worth stating.**
 /// It has to outlive individual leases — the account is elastic precisely when
 /// it has no usable lease — so it cannot hang off `LocalLease`. It also has to
@@ -63,7 +82,7 @@ enum LeaseSlotCurrent {
     /// multi-view publication indivisible *between mutators*.
     ///
     /// A single-view slot publishes in one swap, so two mutators can only
-    /// order themselves. N swaps cannot: without this lock a `clear` racing a
+    /// order themselves. N swaps cannot: without this lock a `take` racing a
     /// `replace` would interleave and leave some localities empty and others
     /// holding the fresh lease — a mixed state the single-view slot cannot
     /// reach, and one that would let a locality keep spending after a
@@ -128,34 +147,46 @@ impl LeaseSlot {
         &self.overage
     }
 
-    /// Install a fresh lease. The old lease (if any) is dropped here — never
-    /// mid-request, since in-flight reservations hold their own `Arc`.
-    pub fn install(&self, lease: Arc<LocalLease>) {
-        let _ = self.publish(Some(lease));
-    }
-
     /// Install `lease`, returning the previously installed lease if one was
     /// present. The refill plane uses this to retain every superseded grant
     /// until it can be released safely.
+    ///
+    /// Retain the returned handle until every in-flight reservation and local
+    /// view has quiesced, then release its unspent units to the allocator.
+    /// Dropping it instead deliberately leaves recovery to TTL reclamation.
+    ///
+    /// ```compile_fail
+    /// #![deny(unused_must_use)]
+    /// # use std::sync::Arc;
+    /// # use tollgate_admission::LeaseSlot;
+    /// # use tollgate_core::LocalLease;
+    /// fn rotate(slot: &LeaseSlot, fresh: Arc<LocalLease>) {
+    ///     slot.replace(fresh); // The superseded grant needs a disposition.
+    /// }
+    /// ```
+    #[must_use = "retain the superseded lease for quiesced release, or explicitly abandon it"]
     pub fn replace(&self, lease: Arc<LocalLease>) -> Option<Arc<LocalLease>> {
         self.publish(Some(lease))
-    }
-
-    /// Drop the current lease after the control plane invalidates local lease
-    /// state or shutdown returns it. Subsequent requests deny until a new
-    /// lease arrives.
-    ///
-    /// The overage counter is deliberately untouched: losing a lease is not a
-    /// funding event, and clearing spend here would hand an elastic account a
-    /// fresh cap on every control-plane hiccup.
-    pub fn clear(&self) {
-        let _ = self.publish(None);
     }
 
     /// Remove every published local view and return one handle to their
     /// shared lease state. A concurrent request may already have loaded a
     /// view, exactly as it could have loaded the single-view slot before its
     /// swap; quiescence detection accounts for that handle.
+    ///
+    /// As with [`Self::replace`], retain it for quiesced release. An explicit
+    /// `drop(slot.take())` abandons it to TTL reclamation; removal alone does
+    /// not return units to the allocator. The overage counter is untouched:
+    /// losing a lease is not a funding event and cannot reset a spend cap.
+    ///
+    /// ```compile_fail
+    /// #![deny(unused_must_use)]
+    /// # use tollgate_admission::LeaseSlot;
+    /// fn retire(slot: &LeaseSlot) {
+    ///     slot.take(); // The removed grant needs a disposition.
+    /// }
+    /// ```
+    #[must_use = "retain the removed lease for quiesced release, or explicitly abandon it"]
     pub fn take(&self) -> Option<Arc<LocalLease>> {
         self.publish(None)
     }
@@ -1290,7 +1321,7 @@ fn build_limiter(rate: u32, burst: u32) -> AccountRateLimiter {
     //
     // These clamps decide bucket *construction* only, never a verdict. A
     // schedule whose burst cannot hold a request is refused upstream in
-    // `AdmissionEngine::admit`, comparing the quote against
+    // `RequestContext::admit`, comparing the quote against
     // `rate_burst_units` in full width — so a burst above u32::MAX admits by
     // the same comparison it was configured with (#40). `narrow` supplies the
     // `max(1)` these conversions rely on because governor requires a nonzero
@@ -1849,21 +1880,18 @@ mod tests {
         }
     }
 
-    /// `state.rs` carried no tests at all, and the slot's whole job is to say
-    /// whether this instance may spend. `clear` in particular could be
-    /// replaced by a no-op with the entire suite still green (#43): the refill
-    /// plane happens to use `take` everywhere, so the documented invalidation
-    /// path — "subsequent requests deny until a new lease arrives" — had no
-    /// witness at all.
+    /// Taking a slot withdraws the published lease and returns its handle for
+    /// release; no locality may keep obtaining the removed grant afterwards.
     #[test]
     fn a_cleared_slot_stops_the_instance_spending() {
         let slot = LeaseSlot::for_account(AccountId(1));
         assert!(slot.load().is_none(), "a cold slot denies");
 
-        slot.install(lease(100));
+        drop(slot.replace(lease(100)));
         assert!(slot.load().is_some());
 
-        slot.clear();
+        let retired = slot.take().expect("the installed lease is returned");
+        assert_eq!(retired.remaining(), CostUnits(100));
         assert!(
             slot.load().is_none(),
             "an instance with invalidated lease state must hold no lease"
@@ -1875,23 +1903,34 @@ mod tests {
     /// return value strands units until TTL reclaim.
     #[test]
     fn superseding_a_lease_hands_back_the_old_one() {
-        let slot = LeaseSlot::for_account(AccountId(1));
-        assert!(
-            slot.replace(lease(100)).is_none(),
-            "nothing was installed, so there is nothing to give back"
-        );
+        for shards in [1, 8] {
+            let slot = LeaseSlot::with_sharding(
+                AccountId(1),
+                LocalSharding::new(NonZeroUsize::new(shards).unwrap()),
+            );
+            assert!(
+                slot.replace(identified_lease(LeaseId(1), 100)).is_none(),
+                "nothing was installed, so there is nothing to give back"
+            );
 
-        let superseded = slot.replace(lease(200)).expect("the first lease");
-        assert_eq!(superseded.remaining(), CostUnits(100));
-        assert_eq!(
-            slot.load().expect("the second lease").remaining(),
-            CostUnits(200)
-        );
+            let superseded = slot
+                .replace(identified_lease(LeaseId(2), 200))
+                .expect("the first lease");
+            assert_eq!(superseded.grant().lease_id, LeaseId(1));
+            assert_eq!(superseded.remaining(), CostUnits(100));
+            assert!(superseded.is_only_local_view());
+            assert_eq!(
+                slot.load().expect("the second lease").remaining(),
+                CostUnits(200)
+            );
 
-        let taken = slot.take().expect("the second lease");
-        assert_eq!(taken.remaining(), CostUnits(200));
-        assert!(slot.load().is_none(), "take leaves the slot empty");
-        assert!(slot.take().is_none(), "and taking again yields nothing");
+            let taken = slot.take().expect("the second lease");
+            assert_eq!(taken.grant().lease_id, LeaseId(2));
+            assert_eq!(taken.remaining(), CostUnits(200));
+            assert!(taken.is_only_local_view());
+            assert!(slot.load().is_none(), "take leaves the slot empty");
+            assert!(slot.take().is_none(), "and taking again yields nothing");
+        }
     }
 
     /// A sharded slot publishes N views, so two mutators that interleave
@@ -1903,18 +1942,18 @@ mod tests {
         let sharding = LocalSharding::new(NonZeroUsize::new(8).unwrap());
         for round in 0..500 {
             let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
-            slot.install(identified_lease(LeaseId(1), 100));
+            drop(slot.replace(identified_lease(LeaseId(1), 100)));
 
             let replacer = {
                 let slot = Arc::clone(&slot);
                 std::thread::spawn(move || slot.replace(identified_lease(LeaseId(2), 100)))
             };
-            let clearer = {
+            let taker = {
                 let slot = Arc::clone(&slot);
-                std::thread::spawn(move || slot.clear())
+                std::thread::spawn(move || slot.take())
             };
-            replacer.join().unwrap();
-            clearer.join().unwrap();
+            let replaced = replacer.join().unwrap();
+            let taken = taker.join().unwrap();
 
             let published: Vec<_> = slot
                 .published_views()
@@ -1925,6 +1964,17 @@ mod tests {
                 published.iter().all(|view| *view == published[0]),
                 "round {round}: localities disagree about the slot: {published:?}"
             );
+            let mut retained: Vec<_> = [replaced, taken, slot.load()]
+                .into_iter()
+                .flatten()
+                .map(|lease| lease.grant().lease_id)
+                .collect();
+            retained.sort_by_key(|id| id.0);
+            assert_eq!(
+                retained,
+                vec![LeaseId(1), LeaseId(2)],
+                "each grant is returned or still published exactly once"
+            );
         }
     }
 
@@ -1932,7 +1982,7 @@ mod tests {
     fn sharded_slot_keeps_release_parked_while_any_local_view_is_held() {
         let sharding = LocalSharding::new(NonZeroUsize::new(4).unwrap());
         let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
-        slot.install(lease(100));
+        drop(slot.replace(lease(100)));
         let sibling = match &slot.current {
             LeaseSlotCurrent::Sharded { views, .. } => views[1].load_full().unwrap(),
             LeaseSlotCurrent::Single(_) => unreachable!(),

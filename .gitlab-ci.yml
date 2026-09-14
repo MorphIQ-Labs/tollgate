@@ -274,6 +274,21 @@ bench-compile:
   script:
     - cargo bench --locked --workspace --no-run
 
+# Fixed I/O/protocol failures, with the same panic policy as the real load
+# tool. No pricing workload, timed measurement or threshold verdict runs here.
+load-failure-reporting:
+  dependencies: []
+  extends: .merge-request
+  stage: test
+  interruptible: true
+  cache: *cargo-build-cache
+  script:
+    - cargo run --locked --profile production -p pricing-api --example load_gate_failure_probe
+  artifacts:
+    when: always
+    paths:
+      - reports/load-failure-fixtures
+
 formal:
   allow_failure: false
   dependencies: []

@@ -2916,7 +2916,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate-repo-check"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "proc-macro2",
  "serde_json",
@@ -2948,6 +2948,7 @@ dependencies = [
  "tollgate-auth",
  "tollgate-client",
  "tollgate-core",
+ "tollgate-server",
  "tollgate-store",
  "tollgate-store-postgres",
  "tower",
@@ -2985,6 +2986,7 @@ dependencies = [
  "tokio",
  "tollgate-core",
  "tollgate-store",
+ "tollgate-store-postgres",
  "tracing",
  "uuid",
 ]

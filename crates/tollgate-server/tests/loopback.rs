@@ -259,18 +259,20 @@ async fn http_negative_ttl_refetches_without_push() {
     store
         .publish_snapshot(PRINCIPAL, publishable(snapshot()))
         .expect("snapshot fixture matches its account and credential");
-    slots.slot(ACCOUNT).install(Arc::new(LocalLease::new(
-        LeaseGrant {
-            lease_id: LeaseId(1),
-            account_id: ACCOUNT,
-            fencing_token: FencingToken(1),
-            units: CostUnits(1_000),
-            expires_at: Timestamp::now()
-                .checked_add(SignedDuration::from_secs(60))
-                .unwrap(),
-        },
-        CostUnits::ZERO,
-    )));
+    drop(
+        slots.slot(ACCOUNT).replace(Arc::new(LocalLease::new(
+            LeaseGrant {
+                lease_id: LeaseId(1),
+                account_id: ACCOUNT,
+                fencing_token: FencingToken(1),
+                units: CostUnits(1_000),
+                expires_at: Timestamp::now()
+                    .checked_add(SignedDuration::from_secs(60))
+                    .unwrap(),
+            },
+            CostUnits::ZERO,
+        ))),
+    );
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             match engine

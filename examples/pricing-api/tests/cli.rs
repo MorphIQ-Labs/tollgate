@@ -128,17 +128,124 @@ fn load_cli_information_does_not_open_files_or_start_measurements() {
             assert!(stdout(&output).contains("usage: load_gate"));
         }
     }
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     let output = run(Command::new(env!("CARGO_BIN_EXE_load_gate"))
         .current_dir(directory.path())
         .args(["--", "--help", "report.json"]));
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert!(stderr(&output).contains("read --help:"), "{output:?}");
-    assert!(!directory.path().join("report.json").exists());
+    assert!(
+        stderr(&output).contains("read thresholds failed:"),
+        "{output:?}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.path().join("report.json")).unwrap())
+            .unwrap();
+    assert_eq!(report["passed"], false);
+    assert_eq!(report["error"]["stage"], "read thresholds");
     let version = run(Command::new(env!("CARGO_BIN_EXE_load_gate")).args(["--version", "--help"]));
     assert_eq!(
         stdout(&version),
         format!("load_gate {}\n", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn load_configuration_failures_write_reports_even_in_evidence_mode() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("thresholds.json");
+    let report = directory.path().join("nested/report.json");
+    for evidence in [false, true] {
+        for (contents, stage) in [
+            ("{".to_owned(), "parse thresholds"),
+            (
+                {
+                    let mut value: serde_json::Value =
+                        serde_json::from_str(include_str!("../../../testing/load_thresholds.json"))
+                            .unwrap();
+                    value["concurrent_connections"] = 0.into();
+                    value.to_string()
+                },
+                "validate thresholds",
+            ),
+        ] {
+            std::fs::write(&input, contents).unwrap();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_load_gate"));
+            if evidence {
+                command.arg("--evidence");
+            }
+            let output = run(command.arg(&input).arg(&report));
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert!(stderr(&output).contains("load-gate: FAIL — see"));
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+            assert_eq!(value["passed"], false);
+            assert_eq!(value["error"]["stage"], stage);
+            assert!(value["error"]["message"].is_string());
+            assert!(value.get("baseline").is_none());
+        }
+    }
+    let previous = std::fs::read(&report).unwrap();
+    let output = run(Command::new(env!("CARGO_BIN_EXE_load_gate"))
+        .arg(&input)
+        .arg(report.join("impossible")));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("report unavailable"));
+    assert_eq!(std::fs::read(&report).unwrap(), previous);
+}
+
+#[test]
+fn load_runtime_configuration_errors_are_reported_before_starting_tasks() {
+    let directory = tempfile::tempdir().unwrap();
+    let report = directory.path().join("report.json");
+    for value in ["0", "not-a-number"] {
+        let output = run(Command::new(env!("CARGO_BIN_EXE_load_gate"))
+            .env("TOKIO_WORKER_THREADS", value)
+            .args(["--evidence", "unread-thresholds.json"])
+            .arg(&report));
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(!stderr(&output).contains("panicked"));
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        assert_eq!(value["passed"], false);
+        assert_eq!(value["error"]["stage"], "runtime configuration");
+        assert_eq!(
+            value["error"]["message"],
+            "TOKIO_WORKER_THREADS must be a positive integer"
+        );
+    }
+}
+
+#[test]
+fn unknown_load_settings_produce_parse_errors_in_both_verdict_modes() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("thresholds.json");
+    let report = directory.path().join("report.json");
+    let mut thresholds: serde_json::Value =
+        serde_json::from_str(include_str!("../../../testing/load_thresholds_ci.json")).unwrap();
+    // Even the old permissive parser cannot run a workload with this fixture.
+    // Unknown-key refusal must precede that independent validation error.
+    thresholds["concurrent_connections"] = 0.into();
+    thresholds["max_p50_ns_typo"] = 10.into();
+    std::fs::write(&input, thresholds.to_string()).unwrap();
+    for evidence in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_load_gate"));
+        if evidence {
+            command.arg("--evidence");
+        }
+        let output = run(command.arg(&input).arg(&report));
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        assert_eq!(report["passed"], false);
+        assert_eq!(report["error"]["stage"], "parse thresholds");
+        assert!(
+            report["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown field `max_p50_ns_typo`")
+        );
+        assert!(report.get("baseline").is_none());
+    }
 }
 
 #[cfg(unix)]

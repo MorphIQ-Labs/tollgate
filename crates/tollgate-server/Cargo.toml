@@ -11,6 +11,8 @@ publish.workspace = true
 [features]
 default = ["postgres"]
 postgres = ["dep:tollgate-store-postgres"]
+# Weak forwarding preserves the no-Postgres server build, including its tests.
+test-support = ["tollgate-store-postgres?/test-support"]
 
 [dependencies]
 tollgate-auth = { path = "../tollgate-auth", version = "=0.21.0" }
@@ -35,6 +37,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+# Test-only self edge: ordinary test commands opt in without production builds doing so.
+tollgate-server = { path = ".", version = "=0.21.0", default-features = false, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 rcgen = { workspace = true }

@@ -61,6 +61,77 @@ run-to-run trust verdict is `no_history` unless you carry one. Pass
 `--history <path>` through to the gate to point successive runs at a stable
 file when you want that verdict.
 
+## Configuration keys
+
+The gate decoders reject unknown configuration keys. A typo such as
+`trust.moved_shft` is an error; it cannot silently select the default
+`moved_shift`. The same rule covers the manifest's optional `trust` and `ratios`
+keys, benchmark and ratio rows, load settings, and baseline settings such as
+`samples` and `max_regression`. Comparison and recording use the same baseline
+decoder; an invalid recording destination is preserved.
+
+Documentation is supported only at these locations:
+
+| Configuration | Inert metadata keys |
+| --- | --- |
+| Benchmark manifest root | `_comment`, `_reserved_ids` |
+| Benchmark and ratio rows | `_comment` |
+| Load manifest root | `_comment` |
+| Baseline root | `_comment` (a string) |
+| Trust policy, baseline host and baseline rows | None |
+
+For custom manifests, remove unsupported annotations or put them in a supported
+comment. Generated baselines must match the recorder's schema: use a compatible
+tool version or record a complete new file at a new destination; never hand-edit
+a baseline. There is no numeric migration for valid files: known settings and
+all checked-in files keep their meanings. An omitted trust
+block still selects the defaults, and a partial block overrides only its named
+fields. Older baselines without `samples` still mean one sample; an omitted row
+regression allowance still means 5%. Every load setting remains required,
+including the nullable bounds: `null` means deliberately disabled and an absent
+key is an error. No manifest or baseline needs recalibration for this parser
+change, and its tests perform no measurement.
+
+## Load execution failures
+
+The load tool returns socket, HTTP framing, coordination and scenario failures
+as errors under the production profile, including `panic=abort`. Once it has a
+valid command and report destination, configuration and execution failures write
+an error report and exit 1 in both normal and `--evidence` modes. A failed run
+contains `passed: false`, `error.stage`, `error.message` and `run` context; it has
+no latency or throughput fields. Consumers must check for `error` before reading
+measurement fields. Complete measurement reports retain their existing shape.
+Argument errors have no validated report destination and remain stderr-only.
+
+Only an HTTP 503 problem with code `capacity-unavailable` counts as capacity
+shedding. Other refusals, unexpected statuses, malformed framing, truncated
+responses and oversized replies fail the scenario. Diagnostics identify the
+client and warmup/measurement phase without copying response bodies or headers.
+Every client must finish warmup before measurement starts; a warmup failure or
+coordinator cancellation releases waiting clients without measured requests.
+Partial client samples are discarded on failure. Clients use ten-second socket
+inactivity timeouts, and readiness has a five-second deadline covering its I/O.
+
+Both report shapes are serialized, exclusively staged in the destination
+directory, read back and validated, then atomically renamed. Publication failure
+preserves the previous destination and prints `report unavailable`, never a
+successful verdict or a claim that the old report belongs to this run. Concurrent
+writers publish complete files; the last successful rename wins. These reports
+are observations, not a merged history or durable billing records.
+
+CI's `load-failure-reporting` job executes fixed failure fixtures against the
+same client and report modules under the production profile:
+
+```sh
+cargo run --locked --profile production -p pricing-api --example load_gate_failure_probe
+```
+
+It retains `reports/load-failure-fixtures/`. This is correctness evidence only:
+the fixture starts no pricing service, runs no performance workload and produces
+no timing verdict. Ordinary unit tests separately exercise protocol boundaries,
+poisoned coordination state and report-publication failures. Arbitrary panics
+and whole-process termination remain outside the reporting guarantee.
+
 ## Recalibrating the baseline
 
 `testing/perf_baseline.json` is generated, never hand-edited. A readable,
