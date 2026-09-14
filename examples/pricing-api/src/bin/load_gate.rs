@@ -629,7 +629,13 @@ struct ClassOutcome {
 
 impl ClassOutcome {
     /// Refusals as a fraction of everything this class asked for.
-    #[allow(clippy::cast_precision_loss)]
+    ///
+    /// Both operands are request counts from one bounded load run, exact in
+    /// `f64` far below the 2^53 where the conversion stops being.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "request counts from one bounded run, exact in f64 far below 2^53"
+    )]
     fn shed_fraction(&self) -> f64 {
         let asked = self.served + self.shed;
         if asked == 0 {

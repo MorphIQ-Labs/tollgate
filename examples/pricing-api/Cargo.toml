@@ -23,13 +23,13 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # fast-rng: v4 ids from a userspace CSPRNG seeded once — a getrandom
 # syscall per request measurably regressed the loopback overhead gate.
-uuid = { version = "1", features = ["v4", "fast-rng"] }
+uuid = { workspace = true, features = ["fast-rng"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-http-body-util = "0.1"
-tower = { version = "0.5", features = ["util"] }
+http-body-util = { workspace = true }
+tower = { workspace = true }
 
 [[bin]]
 name = "pricing-api"

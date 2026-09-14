@@ -9,7 +9,10 @@
 //! As in `loopback.rs`, the oneshot teardown signals here are outside the
 //! discard rule this MR installs: the assertions below are what fail if
 //! shutdown misbehaves.
-#![allow(clippy::let_underscore_must_use)]
+#![allow(
+    clippy::let_underscore_must_use,
+    reason = "test teardown discards results the assertions have already read"
+)]
 
 mod common;
 

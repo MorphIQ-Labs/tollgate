@@ -9,7 +9,10 @@
 //! signals are the exception the rule is not aimed at: the test's assertions
 //! are what fail if shutdown misbehaves, and a receiver that has already gone
 //! away is the normal end of a test.
-#![allow(clippy::let_underscore_must_use)]
+#![allow(
+    clippy::let_underscore_must_use,
+    reason = "test teardown discards results the assertions have already read"
+)]
 
 mod common;
 

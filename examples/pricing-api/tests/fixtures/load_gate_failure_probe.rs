@@ -1,6 +1,9 @@
 //! Production-profile assurance fixture; never launches the pricing workload.
 
-#[allow(dead_code)] // Successful measurements are intentionally unused here.
+#[allow(
+    dead_code,
+    reason = "successful measurements are intentionally unused here"
+)]
 #[path = "../../src/bin/load_gate/client.rs"]
 mod client;
 mod load_failures;

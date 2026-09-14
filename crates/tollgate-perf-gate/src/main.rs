@@ -175,7 +175,13 @@ fn one_sample() -> usize {
     1
 }
 
-#[allow(clippy::trivially_copy_pass_by_ref)]
+// serde's `skip_serializing_if` hands the predicate a reference whatever the
+// field's type, so the signature is the attribute's, not a choice to pass a
+// `f64` by reference.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if hands the predicate a reference whatever the field's type"
+)]
 fn is_default_max_regression(value: &f64) -> bool {
     *value == default_max_regression()
 }
@@ -347,7 +353,12 @@ fn assess_trust(
     // ratio failures had 8 of 33 and 6 of 33. A quiet controlled host still
     // marks the odd contention benchmark, so the fraction sits below those
     // 18-24% and above that handful.
-    #[allow(clippy::cast_precision_loss)]
+    // Both operands are benchmark counts — tens, not billions — so the `f64`
+    // conversion is exact far below the 2^53 where it stops being.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "both operands are benchmark counts, exact in f64 far below 2^53"
+    )]
     // `measured > 0` is load-bearing rather than defensive: the division below
     // is what decides the verdict, and a run that measured nothing would make
     // it NaN or infinite — either of which compares its way to "unreadable"
@@ -374,7 +385,12 @@ fn assess_trust(
     // Guard the degenerate case: with one or two benchmarks in common, any
     // single genuine change clears the fraction, so require a plurality to
     // be more than one benchmark.
-    #[allow(clippy::cast_precision_loss)]
+    //
+    // Both operands are benchmark counts, exact in `f64` far below 2^53.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "both operands are benchmark counts, exact in f64 far below 2^53"
+    )]
     let broad = moved > 1 && (moved as f64) / (compared as f64) >= policy.moved_fraction;
     if broad {
         Trust::Untrusted { moved, compared }

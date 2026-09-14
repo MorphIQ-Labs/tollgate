@@ -571,7 +571,12 @@ impl Drop for LeaseManager {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+// The task entry point: every argument is a handle the loop must own for its
+// lifetime, and they are already assembled once by `spawn`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "task entry point: every argument is a handle the loop owns for its lifetime, assembled once by spawn"
+)]
 async fn run(
     allocator: Arc<dyn LeaseAllocator>,
     slot: Arc<LeaseSlot>,
@@ -1004,7 +1009,10 @@ fn consolidation_failure(error: &AllocateError) -> ConsolidationFailure {
 /// next refused debit rings again — and in the state this exists to fix there
 /// are no successful requests holding the lease, so the test passes on the
 /// first attempt exactly when it matters.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one consolidation step over the loop's own borrowed state"
+)]
 async fn consolidate_live_lease(
     allocator: &Arc<dyn LeaseAllocator>,
     parked: &mut Vec<Arc<LocalLease>>,
@@ -1214,7 +1222,10 @@ enum ReleasePass {
 // same reason as `snapshot_manager::refresh_all_cancellable`, which carries
 // the same allow. Bundling these into a struct for one of the two and not the
 // other would trade a lint for an asymmetry.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one release step over the loop's own borrowed state"
+)]
 async fn release_quiesced(
     allocator: &Arc<dyn LeaseAllocator>,
     parked: &mut Vec<Arc<LocalLease>>,

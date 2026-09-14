@@ -1130,7 +1130,10 @@ fn negative_deadline(
 /// Refresh a set of principals with bounded concurrency, then apply every
 /// positive and negative result in one logical map write. A shutdown signal
 /// aborts outstanding source futures immediately.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one refresh pass's inputs, owned by the enclosing task; a parameter struct would rename that task's state"
+)]
 async fn refresh_all_cancellable(
     source: &Arc<dyn SnapshotSource>,
     slots: &Arc<SlotRegistry>,
@@ -1162,7 +1165,13 @@ async fn refresh_all_cancellable(
     Some(pending)
 }
 
-#[allow(clippy::too_many_arguments)]
+// One refresh pass's inputs, threaded rather than bundled: the enclosing task
+// owns them all and hands each chunk the same set, so a parameter struct would
+// be a second name for that task's state.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each chunk takes the same set the enclosing pass owns"
+)]
 async fn refresh_chunk_cancellable(
     source: &Arc<dyn SnapshotSource>,
     slots: &Arc<SlotRegistry>,
@@ -1449,7 +1458,12 @@ async fn discover(
     Some(())
 }
 
-#[allow(clippy::too_many_arguments)]
+// The task entry point: every argument is a handle the loop must own for its
+// lifetime, and they are already assembled once by `spawn`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "task entry point: every argument is a handle the loop owns for its lifetime, assembled once by spawn"
+)]
 async fn run(
     source: Arc<dyn SnapshotSource>,
     map: Arc<dyn SnapshotMap>,

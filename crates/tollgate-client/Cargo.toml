@@ -25,7 +25,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-async-trait = { workspace = true }
 # The indexed resolution set (#22) must answer exactly what the scans it
 # replaced answered; a property test against a naive reference is the only way
 # to cover the interleavings the fixed tests do not reach.
@@ -36,7 +35,7 @@ tokio = { workspace = true, features = ["test-util"] }
 # are behavior rather than decoration. Subscribers stay out of the library.
 tracing-subscriber = { workspace = true }
 tollgate-alloc-count = { workspace = true }
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true }
 
 [features]
 # HTTP transport implementing the store traits against a tollgate-server —
