@@ -48,30 +48,34 @@ fn reclaim_interval(secs: u64) -> Option<std::time::Duration> {
     (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }
 
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
-    let args: Vec<_> = std::env::args().skip(1).collect();
-    for arg in args.iter().take_while(|arg| arg.as_str() != "--") {
-        match arg.as_str() {
-            "--help" | "-h" => {
+fn main() -> std::io::Result<()> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    for arg in args.iter().take_while(|arg| *arg != "--") {
+        match arg.to_str() {
+            Some("--help" | "-h") => {
                 println!(
                     "tollgate-server {}\nUsage: tollgate-server [--help | --version] [--]\nConfiguration: TOLLGATE_SECURITY_CONFIG (required JSON manifest), TOLLGATE_BIND (default 127.0.0.1:8080), TOLLGATE_STORE ({COMPILED_BACKENDS}), TOLLGATE_PG_URL, TOLLGATE_RECLAIM_INTERVAL_SECS (default 5).\nSee docs/CONTROL_PLANE_SECURITY.md. Credentials reload every five seconds.",
                     env!("CARGO_PKG_VERSION")
                 );
                 return Ok(());
             }
-            "--version" | "-V" => {
+            Some("--version" | "-V") => {
                 println!("tollgate-server {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
             _ => {}
         }
     }
-    init_tracing();
     if !(args.is_empty() || args == ["--"]) {
-        tracing::error!("unexpected argument; use --help");
+        eprintln!("tollgate-server: unexpected argument; use --help");
         std::process::exit(2);
     }
+    run_server()
+}
+
+#[tokio::main]
+async fn run_server() -> std::io::Result<()> {
+    init_tracing();
     let bind = std::env::var("TOLLGATE_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     let reclaim_secs: u64 = std::env::var("TOLLGATE_RECLAIM_INTERVAL_SECS")
         .unwrap_or_else(|_| "5".into())

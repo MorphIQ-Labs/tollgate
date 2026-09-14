@@ -2218,6 +2218,137 @@ mod tests {
         assert_eq!(later.generation(), Generation(2));
     }
 
+    #[test]
+    fn a_staged_context_keeps_principal_policy_after_republication_and_owner_drop() {
+        fn owned_send_sync<T: Send + Sync + 'static>(_: &T) {}
+        let engine = engine_with(AccountStatus::Active, Some(10_000));
+        let context = engine
+            .begin(Principal(1), PermissionBits::bit(0), t(0))
+            .unwrap();
+        owned_send_sync(&context);
+        let mut replacement = AccountSnapshot::clone(&snapshot(AccountStatus::Suspended));
+        replacement.generation = Generation(2);
+        replacement.limits = ResolvedLimits::new(1).with_weighted_rate(1_000_000, 1_000_000);
+        engine.map().install(
+            Principal(1),
+            Arc::new(replacement),
+            LeaseSlot::for_account(AccountId(1)),
+        );
+        assert!(
+            engine
+                .begin(Principal(1), PermissionBits::bit(0), t(0))
+                .is_err()
+        );
+        drop(engine);
+
+        std::thread::spawn(move || {
+            assert_eq!(context.generation(), Generation(1));
+            assert_eq!(context.snapshot().status, AccountStatus::Active);
+            let pending = context
+                .admit(&[(&Op::Price, 2)], DiscardedUsage::new().slot(), t(0))
+                .unwrap();
+            assert_eq!(pending.quote().total, CostUnits(52));
+            pending.cancel();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn stage_two_checks_the_pinned_expiry_after_republication() {
+        for now in [t(9), t(10)] {
+            let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+            let slot = LeaseSlot::for_account(AccountId(1));
+            slot.install(lease(10_000));
+            let mut original = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
+            original.valid_until = t(10);
+            engine
+                .map()
+                .install(Principal(1), Arc::new(original), Arc::clone(&slot));
+            let context = engine
+                .begin(Principal(1), PermissionBits::bit(0), t(0))
+                .unwrap();
+            let mut replacement = AccountSnapshot::clone(&snapshot(AccountStatus::Suspended));
+            replacement.generation = Generation(2);
+            engine
+                .map()
+                .install(Principal(1), Arc::new(replacement), slot);
+            let result = context.admit(&[(&Op::Price, 1)], DiscardedUsage::new().slot(), now);
+            if now == t(9) {
+                result
+                    .expect("the pinned active snapshot is still fresh")
+                    .cancel();
+            } else {
+                assert!(
+                    matches!(result, Err(DenyReason::SnapshotExpired)),
+                    "{result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_counters_follow_engines_and_owned_contexts() {
+        fn check(map: impl SnapshotMap) {
+            let map = Arc::new(map);
+            let slot = LeaseSlot::for_account(AccountId(1));
+            slot.install(lease(10_000));
+            map.install(Principal(1), snapshot(AccountStatus::Active), slot);
+            let first = AdmissionEngine::new(Arc::clone(&map));
+            let second = AdmissionEngine::new(Arc::clone(&map));
+            let context = first
+                .begin(Principal(1), PermissionBits::bit(0), t(0))
+                .unwrap();
+            assert!(
+                second
+                    .begin(Principal(2), PermissionBits::bit(0), t(0))
+                    .is_err()
+            );
+            assert_eq!(first.counters().snapshot().denied(), 1);
+            drop(first);
+            context
+                .admit(&[(&Op::Price, 1)], DiscardedUsage::new().slot(), t(0))
+                .unwrap()
+                .cancel();
+            assert_eq!(second.counters().snapshot().admitted, 1);
+            assert_eq!(map.counters().snapshot().canceled_before_start, 1);
+            assert_eq!(second.counters().snapshot().denied(), 1);
+        }
+        check(ArcSwapSnapshotMap::new());
+        check(crate::MokaSnapshotMap::new(1_000));
+    }
+
+    #[test]
+    fn a_staged_context_observes_account_rate_published_after_begin() {
+        let engine = engine_with(AccountStatus::Active, Some(10_000));
+        let context = engine
+            .begin(Principal(1), PermissionBits::bit(0), t(0))
+            .unwrap();
+        let mut replacement = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
+        replacement.generation = Generation(2);
+        replacement.limits = ResolvedLimits::new(1).with_weighted_rate(1_000_000, 51);
+        engine.map().install(
+            Principal(1),
+            Arc::new(replacement),
+            LeaseSlot::for_account(AccountId(1)),
+        );
+        // The old principal permits two items, quoted at 52. Account rate is
+        // current, so its new 51-unit burst refuses before any lease debit.
+        let result = context.admit(&[(&Op::Price, 2)], DiscardedUsage::new().slot(), t(0));
+        assert!(
+            matches!(
+                result,
+                Err(DenyReason::UnpriceableUnderLimits {
+                    weight: CostUnits(52),
+                    burst_units: CostUnits(51)
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(engine.counters().snapshot().admitted, 0);
+        assert_eq!(engine.counters().snapshot().denied(), 1);
+    }
+
     /// The consumer topology this whole lifecycle exists for: an asynchronous
     /// waiter holds a cancel handle while a worker thread holds the only value
     /// that can commit. The worker wins, and the charge stands.

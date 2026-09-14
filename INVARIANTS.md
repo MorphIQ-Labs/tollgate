@@ -2,7 +2,17 @@
 
 A change that violates one of these is a defect even when every test passes.
 Each invariant names the test(s) that enforce it; a new invariant is not "done"
-until it has one.
+until it has one. `scripts/check_invariant_witnesses.sh` checks backticked
+snake-case references (including qualified brace groups) against Rust
+declarations and Lean definitions/theorems, and verifies named proof files.
+External API, lint, SQL and event names are documented explicitly in
+`testing/invariant_external_symbols.json`. This checks citation integrity,
+not whether a declaration enforces the surrounding claim; test execution,
+mutation assurance and Lean elaboration remain separate gates. See
+`docs/INVARIANT_REFERENCES.md` for the supported notation and limitations.
+The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
+`comments_strings_and_unexpanded_generators_cannot_supply_a_witness`, and
+`a_missing_or_misqualified_lean_witness_fails_even_when_mentioned_in_comments`.
 
 1. **Bounded spend.** Under `EnforcementMode::Strict`, total committed usage
    across all instances never exceeds the units allocated to the account, under
@@ -148,7 +158,7 @@ until it has one.
    commit-time elastic fallback is a *commit*, not a release: it returns the
    lease receipt because overage now funds the same units, and the charge
    stands in full. *Tests:*
-   `reservation::tests::{drop_releases_pending, cancel_charges_zero}`,
+   `reservation::tests::{drop_releases_pending, cancel_charges_zero_and_refunds}`,
    `fragmented_reservation_refunds_without_stranding_capacity`,
    `a_fallback_commit_refunds_its_lease_exactly_once`, and
    `lease_units_are_conserved`.
@@ -795,7 +805,7 @@ until it has one.
     `invalid_lease_manager_durations_are_rejected`,
     `invalid_snapshot_manager_intervals_are_rejected`,
     `invalid_grant_policy_is_rejected`, `zero_reclaim_interval_is_rejected`,
-    `zero_drain_deadline_is_rejected`, `invalid_writer_config_is_rejected`,
+    `invalid_writer_config_is_rejected`,
     `invalid_lease_manager_timeouts_are_rejected`, and
     `invalid_pool_config_is_rejected_before_connecting`, plus
     `publication_uses_the_largest_registered_weight`,
@@ -1036,9 +1046,7 @@ until it has one.
     `labels_are_distinct_and_payload_free`, `payload_does_not_affect_the_slot`,
     `counters_attribute_every_outcome`, `each_reason_reaches_its_own_slot`,
     `denied_requests_add_no_units`, `concurrent_increments_are_not_lost`,
-    `staged_outcomes_are_counted_once_at_their_deciding_stage`,
-    `engines_sharing_a_map_export_one_counter_identity`,
-    `moka_engine_and_installed_context_share_one_counter_identity`,
+    `shared_counters_follow_engines_and_owned_contexts`,
     `metrics_separate_admissions_from_each_kind_of_refusal`,
     `an_elastic_account_serves_past_its_deposit_and_bills_the_overage`,
     `elastic_readiness_serves_before_the_first_grant_and_recovers_after_funding`,
@@ -1207,6 +1215,11 @@ until it has one.
     internal monotonic reads likewise do not become policy time; snapshot and
     lease decisions continue to use the caller's `Timestamp`.
 
+    Moka's access-log housekeeping is dependency-owned amortized allocation,
+    not a strict zero-allocation promise for every individual cache read. Its
+    separate allocation witness enforces the existing per-call average budget
+    over its batch; Tollgate-owned admission scopes remain zero.
+
     *Tests:* `a_box_inside_the_scope_is_counted`,
     `alloc_zeroed_and_realloc_are_both_visible`,
     `a_pure_scope_is_zero_and_outside_work_is_excluded`,
@@ -1217,7 +1230,7 @@ until it has one.
     `a_cached_credential_allocates_nothing` (auth);
     `admission_allocates_nothing_on_the_arc_swap_default`,
     `configured_and_disabled_guards_allocate_nothing_after_warmup`,
-    `moka_reads_are_allocation_free_after_current_thread_warmup`, and
+    `moka_reads_stay_within_their_amortized_allocation_budget`, and
     `admit_consults_the_map_exactly_once` (admission); and
     `embedding_path_allocates_nothing_after_warmup` (client). The required
     `allocation-assertions` CI job runs them through
@@ -1325,15 +1338,17 @@ until it has one.
     mutation excluded in `.cargo/mutants.toml` is equivalent rather than
     untested.
 
-26. **A staged request is governed by exactly the generation with which it
-    began.** `AdmissionEngine::begin` performs the one principal lookup and
-    returns an owned `RequestContext` containing the exact
+26. **A staged request retains its principal generation and reads one current
+    account authority at admission.** `AdmissionEngine::begin` performs the one
+    principal lookup and returns an owned `RequestContext` containing the exact
     `Arc<AccountAdmissionState>` and its selected locality. The installed state
-    pins its immutable snapshot and both rate buckets; a later publication
-    cannot change its permissions, limits, cost table, or limiter
-    configuration. Stable concurrency gauges remain shared across generations
-    because resetting live occupancy would violate their ceiling. Stage two
-    consults only the pinned snapshot: it rechecks that snapshot's expiry
+    pins its immutable snapshot; a later publication cannot change its principal
+    permissions, batch limit, cost table or policy revision. Account-wide rate
+    and concurrency policy is shared through one authority, loaded once in
+    stage two (5). Retaining an old independently spendable rate bucket would
+    multiply capacity. Stable concurrency gauges remain shared across
+    generations because resetting live occupancy would violate their ceiling.
+    For principal validity, stage two consults the pinned snapshot: it rechecks that snapshot's expiry
     boundary and tests the workload's per-class work permissions against the
     permissions that snapshot pinned. Both read the context it is consuming,
     never the map, so neither can observe a generation the request did not
@@ -1348,9 +1363,10 @@ until it has one.
     witness in (24). *Tests:*
     `a_workload_requiring_ungranted_bits_is_denied_at_stage_two`,
     `a_workload_within_granted_bits_admits`,
-    `staged_context_is_owned_send_sync_and_generation_pinned`,
-    `stage_two_rechecks_expiry_without_rechecking_status`,
-    `limit_change_pins_each_principal_until_its_own_reinstall`, and
+    `a_staged_context_keeps_principal_policy_after_republication_and_owner_drop`,
+    `stage_two_checks_the_pinned_expiry_after_republication`,
+    `a_staged_context_observes_account_rate_published_after_begin`,
+    `limit_change_is_one_account_authority_for_every_principal`, and
     `admit_consults_the_map_exactly_once`.
 
 Ledger roles (context for 1 and 7): leases **bound** spend; usage events **are**
@@ -1667,7 +1683,7 @@ exists to detect corrupt state and must not be able to launder it.
     `engine::tests::a_capacity_shed_is_counted_without_a_second_denial`, and
     the account-ownership witnesses named in 22. The allocation-free and
     disabled-costs-nothing claims are gated rather than asserted:
-    `tests::allocations::acquiring_and_refusing_execution_capacity_allocates_nothing`
+    `allocations::acquiring_and_refusing_execution_capacity_allocates_nothing`
     records the `capacity/disabled`, `capacity/uniform`,
     `capacity/reserved_shared`, `capacity/reserved_fallback` and
     `capacity/shed` scopes at zero under `./scripts/check_allocations.sh`, and
@@ -1982,3 +1998,30 @@ exists to detect corrupt state and must not be able to launder it.
     `a_failing_sweep_reports_consecutive_failures`,
     `failed_rollover_retains_safe_progress_without_backend_text`, and
     `backend_startup_failure_never_discloses_connection_strings_or_driver_text`.
+
+38. **CLI information requests precede application startup and validation.**
+    Every binary recognizes `--help`/`-h` and `--version`/`-V`; the first such
+    argument before `--` selects an information response and exits successfully.
+    Those commands do not construct async runtimes, bind application listeners, start application tasks,
+    read gate inputs or run measurements. After `--`, all arguments are literal
+    positional inputs. The service binaries accept no positionals; a bare marker
+    is equivalent to their ordinary no-argument startup. Invalid service
+    arguments return status 2 with a visible diagnostic, regardless of log
+    filtering. Native arguments are inspected before UTF-8 validation, so a
+    non-UTF-8 argument cannot panic or conceal a subsequent information flag.
+
+    Enforcement: each entry point owns the control decision; the pricing
+    executable's `Startup` result selects whether its runtime is constructed.
+    Gate parsers return their existing `Command` variants before decoding or
+    validating operational arguments. This is component-owned enforcement with
+    a cross-binary tested convention, not a mathematical proof of process I/O.
+    *Tests:* `pricing_help_and_version_precede_configuration_and_argument_validation`,
+    `pricing_information_does_not_attempt_to_bind_a_configured_listener`,
+    `pricing_rejects_arguments_and_treats_everything_after_the_marker_literally`,
+    `load_cli_information_does_not_open_files_or_start_measurements`,
+    `native_arguments_cannot_panic_or_hide_information_flags`,
+    `help_and_version_precede_configuration_and_respect_the_end_marker`,
+    `server_native_arguments_cannot_panic_or_hide_help_and_version`,
+    `benchmark_information_precedes_validation_and_uses_the_first_flag`,
+    `benchmark_native_arguments_report_errors_after_information_flags_are_checked`,
+    and `command_line_controls_precede_validation_and_terminator_is_respected`.

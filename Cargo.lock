@@ -1738,6 +1738,7 @@ dependencies = [
  "jiff",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tollgate-admission",
  "tollgate-auth",
@@ -2911,6 +2912,16 @@ dependencies = [
  "jiff",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "tollgate-repo-check"
+version = "0.20.0"
+dependencies = [
+ "proc-macro2",
+ "serde_json",
+ "syn 2.0.119",
+ "tempfile",
 ]
 
 [[package]]

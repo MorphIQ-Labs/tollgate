@@ -83,6 +83,7 @@ fn help_and_version_precede_configuration_and_respect_the_end_marker() {
     for argument in ["--help", "-h", "--version", "-V"] {
         let output = server_command()
             .args(["unknown", argument])
+            .env("TOKIO_WORKER_THREADS", "0")
             .env("TOLLGATE_STORE", "invalid")
             .env_remove("TOLLGATE_SECURITY_CONFIG")
             .output()
@@ -97,6 +98,51 @@ fn help_and_version_precede_configuration_and_respect_the_end_marker() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(diagnostics(&output).contains("unexpected argument"));
+
+    let output = server_command()
+        .args(["--version", "--help"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        diagnostics(&output),
+        format!("tollgate-server {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    let output = server_command()
+        .args(["--"])
+        .env("TOLLGATE_STORE", "invalid")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(diagnostics(&output).contains("unknown TOLLGATE_STORE"));
+}
+
+#[cfg(unix)]
+#[test]
+fn server_native_arguments_cannot_panic_or_hide_help_and_version() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    for flag in ["--help", "--version"] {
+        let output = server_command()
+            .arg(OsString::from_vec(vec![0xff]))
+            .arg(flag)
+            .env("TOLLGATE_STORE", "invalid")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty());
+    }
+    for leading in [vec![], vec!["--"]] {
+        let output = server_command()
+            .args(leading)
+            .arg(OsString::from_vec(vec![0xff]))
+            .env("TOLLGATE_STORE", "invalid")
+            .env("RUST_LOG", "off")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(diagnostics(&output).contains("unexpected argument"));
+        assert!(!diagnostics(&output).contains("panicked"));
+    }
 }
 
 #[test]

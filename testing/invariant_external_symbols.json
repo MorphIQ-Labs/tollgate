@@ -1,0 +1,7 @@
+{
+  "catch_unwind": "std::panic::catch_unwind, the standard-library panic boundary",
+  "clippy::let_underscore_must_use": "Clippy lint for discarding a must-use result",
+  "error_id_unavailable": "Static diagnostic event name, not a Rust declaration; diagnostic middleware reports failed entropy acquisition",
+  "tollgate_accounts.status": "SQL account-status column; enforced by migrations and backend scenario tests",
+  "unused_must_use": "Rust compiler lint for discarding a must-use value"
+}

@@ -10,6 +10,7 @@ members = [
     "crates/tollgate-client",
     "crates/tollgate-core",
     "crates/tollgate-perf-gate",
+    "crates/tollgate-repo-check",
     "crates/tollgate-server",
     "crates/tollgate-store",
     "crates/tollgate-store-postgres",
@@ -35,6 +36,10 @@ publish = false
 jiff = "0.2"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
+# Repository tooling parses Rust declarations, including macro token streams.
+# Both packages already occur in Cargo.lock; this adds no runtime dependency.
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = "1"
 
 # Dev/bench
 criterion = "0.5"

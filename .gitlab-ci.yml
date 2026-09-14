@@ -145,6 +145,7 @@ repository-hygiene:
     # stage's own rules, so it must run in a pipeline where those rules have
     # already decided whether that stage exists (#106).
     - ./scripts/check_ci_rules.sh
+    - ./scripts/check_invariant_witnesses.sh
 
 fmt:
   dependencies: []

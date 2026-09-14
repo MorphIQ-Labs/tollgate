@@ -37,7 +37,8 @@ TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
 ./scripts/check_load_thresholds.sh
 ./scripts/check_allocations.sh
 ./scripts/check_ci_rules.sh
-cargo run -p pricing-api
+./scripts/check_invariant_witnesses.sh
+cargo run -p pricing-api --bin pricing-api
 cargo run -p tollgate-server
 ```
 
