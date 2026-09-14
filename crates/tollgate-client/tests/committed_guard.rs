@@ -6,7 +6,6 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use jiff::Timestamp;
 use tollgate_admission::{
     AdmissionEngine, ArcSwapSnapshotMap, Committed, LeaseSlot, NoCapacityPermit, NoGate, Principal,
@@ -16,9 +15,13 @@ use tollgate_client::{ManualClock, UsagePermit, UsageWriter, UsageWriterConfig};
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CommitError, CostTable, CostUnits, DenyReason,
     DiscardedUsage, FencingToken, Generation, LeaseGrant, LeaseId, LocalLease, OpIndex,
-    PermissionBits, RequestId, ResolvedLimits, UsageEvent,
+    PermissionBits, RequestId, ResolvedLimits,
 };
-use tollgate_store::{IngestError, IngestReport, UsageSink};
+#[path = "../../tollgate-store/tests/support/delegating.rs"]
+mod delegating;
+use delegating::{DelegatingStore, RejectingStore, rejecting};
+
+use tollgate_store::IngestReport;
 
 const ACCOUNT: AccountId = AccountId(1);
 const PRINCIPAL: Principal = Principal(1);
@@ -32,22 +35,20 @@ impl OpIndex for Operation {
     }
 }
 
-struct AcceptAll;
-
-#[async_trait]
-impl UsageSink for AcceptAll {
-    async fn ingest(
-        &self,
-        events: &[UsageEvent],
-        _now: Timestamp,
-    ) -> Result<IngestReport, IngestError> {
-        Ok(IngestReport {
-            unattributed: None,
-            accepted: u64::try_from(events.len()).unwrap(),
-            duplicate: 0,
-            rejected: 0,
-        })
-    }
+/// Accepts every event. No inner store, so everything else rejects.
+fn accept_all() -> Arc<DelegatingStore<RejectingStore>> {
+    Arc::new(
+        rejecting("an accept-all fixture answers ingest and nothing else").on_ingest(
+            |_, events, _now| async move {
+                Ok(IngestReport {
+                    unattributed: None,
+                    accepted: u64::try_from(events.len()).unwrap(),
+                    duplicate: 0,
+                    rejected: 0,
+                })
+            },
+        ),
+    )
 }
 
 fn t(seconds: i64) -> Timestamp {
@@ -135,7 +136,7 @@ fn probe(
 async fn committed_charge_holds_concurrency_until_execution_guard_drops() {
     let engine = engine();
     let (recorder, writer) = UsageWriter::spawn(
-        Arc::new(AcceptAll),
+        accept_all(),
         Arc::new(ManualClock::new(t(0))),
         UsageWriterConfig {
             queue_capacity: 2,
@@ -170,7 +171,7 @@ async fn committed_charge_holds_concurrency_until_execution_guard_drops() {
 async fn failed_commit_releases_concurrency_and_accounting_capacity() {
     let engine = engine();
     let (recorder, writer) = UsageWriter::spawn(
-        Arc::new(AcceptAll),
+        accept_all(),
         Arc::new(ManualClock::new(t(0))),
         UsageWriterConfig {
             queue_capacity: 1,

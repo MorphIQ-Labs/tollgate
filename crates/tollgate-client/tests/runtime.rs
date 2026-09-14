@@ -4,7 +4,6 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
 
 use tollgate_admission::{
@@ -20,6 +19,10 @@ use tollgate_core::{
     Generation, LeaseGrant, LocalLease, LocalSharding, OpIndex, PermissionBits, PolicyRevision,
     Principal, RequestId, ResolvedLimits, UsageEvent, UsageSource,
 };
+#[path = "../../tollgate-store/tests/support/delegating.rs"]
+mod delegating;
+use delegating::{DelegatingStore, RejectingStore, rejecting};
+
 use tollgate_store::{
     AccountConfig, GrantPolicy, IngestError, IngestReport, LeaseAllocator, MemoryStore,
     ReclaimBatch, StoreError, UsageSink,
@@ -629,10 +632,8 @@ async fn a_failing_sink_does_not_advance_the_last_ingest_time() {
         .await
         .unwrap();
     // Never recovers on its own: the outage lasts until this test ends it.
-    let sink = Arc::new(FlakySink {
-        inner: store.clone(),
-        failures_left: AtomicU32::new(u32::MAX),
-    });
+    let failures_left = Arc::new(AtomicU32::new(u32::MAX));
+    let sink = flaky_sink(&store.clone(), &failures_left);
     let clock = Arc::new(ManualClock::new(t(500)));
     let (recorder, writer) =
         UsageWriter::spawn(sink.clone(), clock.clone(), writer_config(64)).unwrap();
@@ -654,7 +655,7 @@ async fn a_failing_sink_does_not_advance_the_last_ingest_time() {
     );
 
     // Recovery: the sink answers, and only then does the time advance.
-    sink.failures_left.store(0, Ordering::Relaxed);
+    failures_left.store(0, Ordering::Relaxed);
     settle().await;
     let after = recorder.health();
     assert_eq!(after.stats.accepted, 1);
@@ -760,43 +761,41 @@ async fn full_queue_sheds_before_admission() {
 }
 
 /// A sink that fails its first N calls, then delegates to the store.
-struct FlakySink {
-    inner: Arc<MemoryStore>,
-    failures_left: AtomicU32,
-}
-
-struct BatchCappedSink {
-    cap: usize,
+/// What a capped sink saw, shared with the test.
+#[derive(Default)]
+struct BatchCap {
     largest: AtomicUsize,
     ingested: AtomicUsize,
 }
 
-#[async_trait]
-impl UsageSink for BatchCappedSink {
-    async fn ingest(
-        &self,
-        events: &[UsageEvent],
-        _now: Timestamp,
-    ) -> Result<IngestReport, IngestError> {
-        self.largest.fetch_max(events.len(), Ordering::AcqRel);
-        if events.len() > self.cap {
-            return Err(StoreError("batch exceeds sink limit".into()).into());
-        }
-        self.ingested.fetch_add(events.len(), Ordering::AcqRel);
-        Ok(IngestReport {
-            accepted: events.len() as u64,
-            ..IngestReport::default()
-        })
-    }
+/// A sink that refuses any batch above `cap`. It has no inner store, so it
+/// rejects anything it is not given rather than delegating.
+fn batch_capped_sink(cap: usize, seen: &Arc<BatchCap>) -> Arc<DelegatingStore<RejectingStore>> {
+    let seen = Arc::clone(seen);
+    Arc::new(
+        rejecting("a capped-sink fixture answers ingest and nothing else").on_ingest(
+            move |_, events, _now| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.largest.fetch_max(events.len(), Ordering::AcqRel);
+                    if events.len() > cap {
+                        return Err(StoreError("batch exceeds sink limit".into()).into());
+                    }
+                    seen.ingested.fetch_add(events.len(), Ordering::AcqRel);
+                    Ok(IngestReport {
+                        accepted: events.len() as u64,
+                        ..IngestReport::default()
+                    })
+                }
+            },
+        ),
+    )
 }
 
 #[tokio::test(start_paused = true)]
 async fn steady_state_flushes_in_configured_batch_sizes() {
-    let sink = Arc::new(BatchCappedSink {
-        cap: 2,
-        largest: AtomicUsize::new(0),
-        ingested: AtomicUsize::new(0),
-    });
+    let seen = Arc::new(BatchCap::default());
+    let sink = batch_capped_sink(2, &seen);
     let grant = tollgate_core::LeaseGrant {
         lease_id: tollgate_core::LeaseId(1),
         account_id: ACCOUNT,
@@ -830,8 +829,8 @@ async fn steady_state_flushes_in_configured_batch_sizes() {
     }
 
     settle().await;
-    assert_eq!(sink.ingested.load(Ordering::Acquire), 4);
-    assert_eq!(sink.largest.load(Ordering::Acquire), 2);
+    assert_eq!(seen.ingested.load(Ordering::Acquire), 4);
+    assert_eq!(seen.largest.load(Ordering::Acquire), 2);
 
     let stats = writer.shutdown().await.unwrap();
     assert_eq!(stats.accepted, 4);
@@ -840,11 +839,8 @@ async fn steady_state_flushes_in_configured_batch_sizes() {
 
 #[tokio::test(start_paused = true)]
 async fn shutdown_flushes_in_configured_batch_sizes() {
-    let sink = Arc::new(BatchCappedSink {
-        cap: 2,
-        largest: AtomicUsize::new(0),
-        ingested: AtomicUsize::new(0),
-    });
+    let seen = Arc::new(BatchCap::default());
+    let sink = batch_capped_sink(2, &seen);
     let grant = tollgate_core::LeaseGrant {
         lease_id: tollgate_core::LeaseId(1),
         account_id: ACCOUNT,
@@ -875,25 +871,29 @@ async fn shutdown_flushes_in_configured_batch_sizes() {
     let stats = writer.shutdown().await.unwrap();
     assert_eq!(stats.accepted, 6);
     assert_eq!(stats.lost, 0);
-    assert_eq!(sink.largest.load(Ordering::Acquire), 2);
+    assert_eq!(seen.largest.load(Ordering::Acquire), 2);
 }
 
-#[async_trait]
-impl UsageSink for FlakySink {
-    async fn ingest(
-        &self,
-        events: &[UsageEvent],
-        now: Timestamp,
-    ) -> Result<IngestReport, IngestError> {
-        if self
-            .failures_left
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-            .is_ok()
-        {
-            return Err(StoreError("injected outage".into()).into());
-        }
-        self.inner.ingest(events, now).await
-    }
+/// Fails a fixed number of ingests, then behaves like the store it wraps.
+fn flaky_sink(
+    store: &Arc<MemoryStore>,
+    failures_left: &Arc<AtomicU32>,
+) -> Arc<DelegatingStore<MemoryStore>> {
+    let failures_left = Arc::clone(failures_left);
+    Arc::new(
+        DelegatingStore::wrapping(Arc::clone(store)).on_ingest(move |inner, events, now| {
+            let failures_left = Arc::clone(&failures_left);
+            async move {
+                if failures_left
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                    .is_ok()
+                {
+                    return Err(StoreError("injected outage".into()).into());
+                }
+                inner.ingest(&events, now).await
+            }
+        }),
+    )
 }
 
 #[tokio::test(start_paused = true)]
@@ -909,10 +909,8 @@ async fn writer_retries_through_outage_without_losing_events() {
         .await
         .unwrap();
     let clock = Arc::new(ManualClock::new(t(0)));
-    let sink = Arc::new(FlakySink {
-        inner: store.clone(),
-        failures_left: AtomicU32::new(3),
-    });
+    let failures_left = Arc::new(AtomicU32::new(3));
+    let sink = flaky_sink(&store.clone(), &failures_left);
     let (recorder, writer) = UsageWriter::spawn(sink, clock, writer_config(64)).unwrap();
 
     recorder.try_reserve().unwrap().record(event(1, 25, &lease));
@@ -1022,10 +1020,8 @@ async fn shutdown_during_outage_terminates_and_reports_loss() {
         .unwrap();
     let clock = Arc::new(ManualClock::new(t(0)));
     // Sink that never recovers.
-    let sink = Arc::new(FlakySink {
-        inner: store.clone(),
-        failures_left: AtomicU32::new(u32::MAX),
-    });
+    let failures_left = Arc::new(AtomicU32::new(u32::MAX));
+    let sink = flaky_sink(&store.clone(), &failures_left);
     let (recorder, writer) = UsageWriter::spawn(sink, clock, writer_config(64)).unwrap();
 
     recorder.try_reserve().unwrap().record(event(1, 25, &lease));
@@ -1060,10 +1056,8 @@ async fn shutdown_after_recovery_delivers_everything() {
     let clock = Arc::new(ManualClock::new(t(0)));
     // Fails long enough to outlast several retry backoffs, then recovers in
     // time for the final flush.
-    let sink = Arc::new(FlakySink {
-        inner: store.clone(),
-        failures_left: AtomicU32::new(4),
-    });
+    let failures_left = Arc::new(AtomicU32::new(4));
+    let sink = flaky_sink(&store.clone(), &failures_left);
     let (recorder, writer) = UsageWriter::spawn(sink, clock, writer_config(64)).unwrap();
     recorder.try_reserve().unwrap().record(event(1, 25, &lease));
     settle().await;
@@ -1303,10 +1297,8 @@ async fn final_flush_backs_off_only_between_attempts() {
         .await
         .unwrap();
     let clock = Arc::new(ManualClock::new(t(0)));
-    let sink = Arc::new(FlakySink {
-        inner: store.clone(),
-        failures_left: AtomicU32::new(u32::MAX),
-    });
+    let failures_left = Arc::new(AtomicU32::new(u32::MAX));
+    let sink = flaky_sink(&store.clone(), &failures_left);
     let backoff = std::time::Duration::from_millis(100);
     let mut config = writer_config(16);
     config.flush_interval = std::time::Duration::from_secs(3_600);
@@ -1340,27 +1332,26 @@ async fn drain_deadline_reports_every_unresolved_permit() {
 // ---- a dead writer never reports zero loss (issue #41) --------------------
 
 /// A sink that panics once it has been called `panic_after` times.
-struct PanickingSink {
-    inner: Arc<MemoryStore>,
-    calls_before_panic: AtomicU32,
-}
-
-#[async_trait]
-impl UsageSink for PanickingSink {
-    async fn ingest(
-        &self,
-        events: &[UsageEvent],
-        now: Timestamp,
-    ) -> Result<IngestReport, IngestError> {
-        if self
-            .calls_before_panic
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-            .is_err()
-        {
-            panic!("sink exploded mid-ingest");
-        }
-        self.inner.ingest(events, now).await
-    }
+/// Panics once its budget of clean calls runs out.
+fn panicking_sink(
+    store: &Arc<MemoryStore>,
+    calls_before_panic: u32,
+) -> Arc<DelegatingStore<MemoryStore>> {
+    let budget = Arc::new(AtomicU32::new(calls_before_panic));
+    Arc::new(
+        DelegatingStore::wrapping(Arc::clone(store)).on_ingest(move |inner, events, now| {
+            let budget = Arc::clone(&budget);
+            async move {
+                if budget
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                    .is_err()
+                {
+                    panic!("sink exploded mid-ingest");
+                }
+                inner.ingest(&events, now).await
+            }
+        }),
+    )
 }
 
 /// The #41 defect: a writer that dies holding committed charges must say so,
@@ -1378,10 +1369,7 @@ async fn panicked_writer_reports_unaccounted_charges() {
         .await
         .unwrap();
     let clock = Arc::new(ManualClock::new(t(0)));
-    let sink = Arc::new(PanickingSink {
-        inner: store.clone(),
-        calls_before_panic: AtomicU32::new(0),
-    });
+    let sink = panicking_sink(&store.clone(), 0);
     let mut config = writer_config(16);
     config.flush_interval = std::time::Duration::from_secs(3_600);
     let (recorder, writer) = UsageWriter::spawn(sink, clock, config).unwrap();
@@ -1422,10 +1410,7 @@ async fn panic_after_partial_flush_counts_only_unflushed() {
         .unwrap();
     let clock = Arc::new(ManualClock::new(t(0)));
     // The first batch is ingested; the second kills the task.
-    let sink = Arc::new(PanickingSink {
-        inner: store.clone(),
-        calls_before_panic: AtomicU32::new(1),
-    });
+    let sink = panicking_sink(&store.clone(), 1);
     let mut config = writer_config(16);
     config.max_batch = 2;
     config.flush_interval = std::time::Duration::from_secs(3_600);
@@ -1458,17 +1443,12 @@ async fn panic_after_partial_flush_counts_only_unflushed() {
 
 /// A sink whose `ingest` never resolves — a backend that is hung rather than
 /// erroring, which retry *counts* alone cannot bound.
-struct HangingSink;
-
-#[async_trait]
-impl UsageSink for HangingSink {
-    async fn ingest(
-        &self,
-        _events: &[UsageEvent],
-        _now: Timestamp,
-    ) -> Result<IngestReport, IngestError> {
-        std::future::pending().await
-    }
+/// An ingest that never returns.
+fn hanging_sink() -> Arc<DelegatingStore<RejectingStore>> {
+    Arc::new(
+        rejecting("a hanging-sink fixture answers ingest and nothing else")
+            .on_ingest(|_, _events, _now| async { std::future::pending().await }),
+    )
 }
 
 /// The #34 defect: a hung ingest parked the writer task forever, and with it
@@ -1489,7 +1469,7 @@ async fn hung_ingest_cannot_stall_shutdown() {
     let mut config = writer_config(16);
     config.flush_interval = std::time::Duration::from_secs(3_600);
     let (recorder, writer) =
-        UsageWriter::spawn(Arc::new(HangingSink) as Arc<dyn UsageSink>, clock, config).unwrap();
+        UsageWriter::spawn(hanging_sink() as Arc<dyn UsageSink>, clock, config).unwrap();
     recorder.try_reserve().unwrap().record(event(1, 25, &lease));
 
     let stats = tokio::time::timeout(std::time::Duration::from_secs(300), writer.shutdown())
@@ -1521,7 +1501,7 @@ async fn hung_ingest_times_out_into_the_retry_path() {
     let mut config = writer_config(16);
     config.ingest_timeout = std::time::Duration::from_millis(100);
     let (recorder, writer) =
-        UsageWriter::spawn(Arc::new(HangingSink) as Arc<dyn UsageSink>, clock, config).unwrap();
+        UsageWriter::spawn(hanging_sink() as Arc<dyn UsageSink>, clock, config).unwrap();
     recorder.try_reserve().unwrap().record(event(1, 25, &lease));
 
     // Several timeout+backoff rounds elapse; the task stays responsive.
@@ -1536,21 +1516,17 @@ async fn hung_ingest_times_out_into_the_retry_path() {
 
 /// A sink that is slow but healthy must still be delivered to: the timeout
 /// bounds a hang, it does not shorten the budget of a working call.
-struct SlowSink {
-    inner: Arc<MemoryStore>,
+/// Delays, then behaves like the store it wraps.
+fn slow_sink(
+    store: &Arc<MemoryStore>,
     delay: std::time::Duration,
-}
-
-#[async_trait]
-impl UsageSink for SlowSink {
-    async fn ingest(
-        &self,
-        events: &[UsageEvent],
-        now: Timestamp,
-    ) -> Result<IngestReport, IngestError> {
-        tokio::time::sleep(self.delay).await;
-        self.inner.ingest(events, now).await
-    }
+) -> Arc<DelegatingStore<MemoryStore>> {
+    Arc::new(DelegatingStore::wrapping(Arc::clone(store)).on_ingest(
+        move |inner, events, now| async move {
+            tokio::time::sleep(delay).await;
+            inner.ingest(&events, now).await
+        },
+    ))
 }
 
 #[tokio::test(start_paused = true)]
@@ -1566,10 +1542,7 @@ async fn slow_but_healthy_sink_still_delivers_at_shutdown() {
         .await
         .unwrap();
     let clock = Arc::new(ManualClock::new(t(0)));
-    let sink = Arc::new(SlowSink {
-        inner: store.clone(),
-        delay: std::time::Duration::from_millis(50),
-    });
+    let sink = slow_sink(&store.clone(), std::time::Duration::from_millis(50));
     let mut config = writer_config(16);
     config.flush_interval = std::time::Duration::from_secs(3_600);
     config.ingest_timeout = std::time::Duration::from_secs(5);
@@ -1585,49 +1558,22 @@ async fn slow_but_healthy_sink_still_delivers_at_shutdown() {
 /// An allocator that never answers an acquire. Distinct from refusing: the
 /// grant may well have been made, so the client cannot treat this as a
 /// domain answer.
-struct HangingAcquireAllocator;
-
-#[async_trait]
-impl LeaseAllocator for HangingAcquireAllocator {
-    async fn acquire(
-        &self,
-        _account: AccountId,
-        _requested: CostUnits,
-        _ttl: SignedDuration,
-        _now: Timestamp,
-    ) -> Result<tollgate_core::LeaseGrant, tollgate_store::AllocateError> {
-        std::future::pending().await
-    }
-
-    async fn release(
-        &self,
-        _lease_id: tollgate_core::LeaseId,
-        _fencing_token: tollgate_core::FencingToken,
-        _unspent: CostUnits,
-        _now: Timestamp,
-    ) -> Result<(), tollgate_store::AllocateError> {
-        Ok(())
-    }
-
-    async fn consolidate(
-        &self,
-        _lease_id: tollgate_core::LeaseId,
-        _fencing_token: tollgate_core::FencingToken,
-        _unspent: tollgate_core::CostUnits,
-        _requested: tollgate_core::CostUnits,
-        _ttl: jiff::SignedDuration,
-        _now: jiff::Timestamp,
-    ) -> Result<tollgate_core::LeaseGrant, tollgate_store::AllocateError> {
-        unreachable!("this fixture never consolidates")
-    }
-
-    async fn reclaim_expired_batch(
-        &self,
-        _now: Timestamp,
-        limit: NonZeroUsize,
-    ) -> Result<ReclaimBatch, StoreError> {
-        ReclaimBatch::try_new(Vec::new(), limit)
-    }
+/// An `acquire` that never returns, over no store at all.
+///
+/// `reclaim_expired` is not hooked and needs no inner store: the wrapper
+/// inherits the trait default, which drains through the `reclaim_expired_batch`
+/// hook below and so still answers with an empty batch.
+fn hanging_acquire() -> Arc<DelegatingStore<RejectingStore>> {
+    Arc::new(
+        rejecting("this fixture never consolidates")
+            .on_acquire(|_, _account, _requested, _ttl, _now| async {
+                std::future::pending().await
+            })
+            .on_release(|_, _lease, _fence, _unspent, _now| async { Ok(()) })
+            .on_reclaim_expired_batch(|_, _now, limit| async move {
+                ReclaimBatch::try_new(Vec::new(), limit)
+            }),
+    )
 }
 
 /// INVARIANTS.md #18, issue #78: the shutdown signal is observed inside a
@@ -1647,7 +1593,7 @@ async fn shutdown_during_a_hung_acquire_is_not_delayed_by_it() {
         ..manager_config()
     };
     let manager = LeaseManager::spawn(
-        Arc::new(HangingAcquireAllocator) as Arc<dyn LeaseAllocator>,
+        hanging_acquire() as Arc<dyn LeaseAllocator>,
         Arc::clone(&slot),
         clock,
         config,
@@ -1681,7 +1627,7 @@ async fn a_hung_acquire_is_counted_as_a_timeout_not_a_refusal() {
     let slot = LeaseSlot::for_account(ACCOUNT);
     let clock = Arc::new(ManualClock::new(t(0)));
     let manager = LeaseManager::spawn(
-        Arc::new(HangingAcquireAllocator) as Arc<dyn LeaseAllocator>,
+        hanging_acquire() as Arc<dyn LeaseAllocator>,
         Arc::clone(&slot),
         clock,
         LeaseManagerConfig {
@@ -1712,51 +1658,18 @@ async fn a_hung_acquire_is_counted_as_a_timeout_not_a_refusal() {
     manager.shutdown().await;
 }
 
-struct HangingReleaseAllocator {
-    inner: Arc<MemoryStore>,
-}
-
-#[async_trait]
-impl LeaseAllocator for HangingReleaseAllocator {
-    async fn acquire(
-        &self,
-        account: AccountId,
-        requested: CostUnits,
-        ttl: SignedDuration,
-        now: Timestamp,
-    ) -> Result<tollgate_core::LeaseGrant, tollgate_store::AllocateError> {
-        self.inner.acquire(account, requested, ttl, now).await
-    }
-
-    async fn release(
-        &self,
-        _lease_id: tollgate_core::LeaseId,
-        _fencing_token: tollgate_core::FencingToken,
-        _unspent: CostUnits,
-        _now: Timestamp,
-    ) -> Result<(), tollgate_store::AllocateError> {
-        std::future::pending().await
-    }
-
-    async fn consolidate(
-        &self,
-        _lease_id: tollgate_core::LeaseId,
-        _fencing_token: tollgate_core::FencingToken,
-        _unspent: tollgate_core::CostUnits,
-        _requested: tollgate_core::CostUnits,
-        _ttl: jiff::SignedDuration,
-        _now: jiff::Timestamp,
-    ) -> Result<tollgate_core::LeaseGrant, tollgate_store::AllocateError> {
-        unreachable!("this fixture never consolidates")
-    }
-
-    async fn reclaim_expired_batch(
-        &self,
-        now: Timestamp,
-        limit: NonZeroUsize,
-    ) -> Result<ReclaimBatch, StoreError> {
-        self.inner.reclaim_expired_batch(now, limit).await
-    }
+/// A `release` that never returns, over a real store.
+///
+/// `consolidate` keeps its `unreachable!()`: delegation would quietly give
+/// this fixture a working exchange it is not supposed to have.
+fn hanging_release(store: &Arc<MemoryStore>) -> Arc<DelegatingStore<MemoryStore>> {
+    Arc::new(
+        DelegatingStore::wrapping(Arc::clone(store))
+            .on_release(|_, _lease, _fence, _unspent, _now| async { std::future::pending().await })
+            .on_consolidate(|_, _, _, _, _, _, _| async {
+                unreachable!("this fixture never consolidates")
+            }),
+    )
 }
 
 /// INVARIANTS.md #6, issue #78: a refill must not queue behind the release
@@ -1769,9 +1682,7 @@ async fn a_refill_does_not_wait_behind_the_release_pass() {
     let store = store(100_000);
     let slot = LeaseSlot::for_account(ACCOUNT);
     let clock = Arc::new(ManualClock::new(t(0)));
-    let allocator = Arc::new(HangingReleaseAllocator {
-        inner: store.clone(),
-    });
+    let allocator = hanging_release(&store.clone());
     let manager = LeaseManager::spawn(
         allocator as Arc<dyn LeaseAllocator>,
         Arc::clone(&slot),
@@ -1865,9 +1776,7 @@ async fn hung_release_cannot_stall_shutdown() {
     let store = store(10_000);
     let slot = LeaseSlot::for_account(ACCOUNT);
     let clock = Arc::new(ManualClock::new(t(0)));
-    let allocator = Arc::new(HangingReleaseAllocator {
-        inner: store.clone(),
-    });
+    let allocator = hanging_release(&store.clone());
     let manager = LeaseManager::spawn(
         allocator as Arc<dyn LeaseAllocator>,
         Arc::clone(&slot),
@@ -2064,10 +1973,8 @@ async fn the_final_flush_backoff_cannot_overrun_the_drain_deadline() {
         .await
         .unwrap();
     let clock = Arc::new(ManualClock::new(t(0)));
-    let sink = Arc::new(FlakySink {
-        inner: store.clone(),
-        failures_left: AtomicU32::new(u32::MAX),
-    });
+    let failures_left = Arc::new(AtomicU32::new(u32::MAX));
+    let sink = flaky_sink(&store.clone(), &failures_left);
     let mut config = writer_config(16);
     config.flush_interval = std::time::Duration::from_secs(3_600);
     // The shape that exposes it: a backoff longer than the whole budget.
@@ -2109,22 +2016,22 @@ fn refused_event(request: u128) -> UsageEvent {
 
 /// A sink that refuses every batch and will keep refusing it, as an
 /// over-limit body or an undecodable event does.
-struct AlwaysRefusesSink {
-    attempts: Arc<AtomicUsize>,
-}
-
-#[async_trait]
-impl UsageSink for AlwaysRefusesSink {
-    async fn ingest(
-        &self,
-        _events: &[UsageEvent],
-        _now: Timestamp,
-    ) -> Result<IngestReport, IngestError> {
-        self.attempts.fetch_add(1, Ordering::AcqRel);
-        Err(IngestError::Refused(StoreError(
-            "413 batch-too-large: request body exceeds this endpoint's limit".into(),
-        )))
-    }
+/// A sink that refuses every batch with the same permanent error.
+fn always_refuses_sink(attempts: &Arc<AtomicUsize>) -> Arc<DelegatingStore<RejectingStore>> {
+    let attempts = Arc::clone(attempts);
+    Arc::new(
+        rejecting("a refusing-sink fixture answers ingest and nothing else").on_ingest(
+            move |_, _events, _now| {
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    attempts.fetch_add(1, Ordering::AcqRel);
+                    Err(IngestError::Refused(StoreError(
+                        "413 batch-too-large: request body exceeds this endpoint's limit".into(),
+                    )))
+                }
+            },
+        ),
+    )
 }
 
 /// Issue #61: a batch the sink will never accept must not block every later
@@ -2165,9 +2072,7 @@ fn a_max_batch_beyond_the_ingest_limit_is_rejected() {
 #[tokio::test(start_paused = true)]
 async fn a_refused_batch_is_counted_lost_rather_than_retried_forever() {
     let attempts = Arc::new(AtomicUsize::new(0));
-    let sink = Arc::new(AlwaysRefusesSink {
-        attempts: Arc::clone(&attempts),
-    });
+    let sink = always_refuses_sink(&attempts);
     let clock = Arc::new(ManualClock::new(t(0)));
     let (recorder, writer) = UsageWriter::spawn(sink, clock, writer_config(8)).unwrap();
 
@@ -2200,24 +2105,27 @@ async fn a_refused_batch_is_counted_lost_rather_than_retried_forever() {
     );
 }
 
-struct ObservedHungSink(Arc<AtomicUsize>);
-#[async_trait]
-impl UsageSink for ObservedHungSink {
-    async fn ingest(
-        &self,
-        _events: &[UsageEvent],
-        _now: Timestamp,
-    ) -> Result<IngestReport, IngestError> {
-        struct Active(Arc<AtomicUsize>);
-        impl Drop for Active {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-        self.0.fetch_add(1, Ordering::AcqRel);
-        let _active = Active(self.0.clone());
-        std::future::pending().await
-    }
+/// Hangs, and reports how many ingests are parked inside it.
+fn observed_hung_sink(active: &Arc<AtomicUsize>) -> Arc<DelegatingStore<RejectingStore>> {
+    let active = Arc::clone(active);
+    Arc::new(
+        rejecting("a hung-sink fixture answers ingest and nothing else").on_ingest(
+            move |_, _events, _now| {
+                let active = Arc::clone(&active);
+                async move {
+                    struct Active(Arc<AtomicUsize>);
+                    impl Drop for Active {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::AcqRel);
+                        }
+                    }
+                    active.fetch_add(1, Ordering::AcqRel);
+                    let _active = Active(Arc::clone(&active));
+                    std::future::pending().await
+                }
+            },
+        ),
+    )
 }
 
 #[tokio::test(start_paused = true)]
@@ -2228,7 +2136,7 @@ async fn cancelling_writer_shutdown_aborts_the_owned_ingest_task() {
     config.ingest_timeout = std::time::Duration::from_secs(120);
     config.shutdown_drain_deadline = std::time::Duration::from_secs(60);
     let (recorder, writer) = UsageWriter::spawn(
-        Arc::new(ObservedHungSink(active.clone())),
+        observed_hung_sink(&active),
         Arc::new(ManualClock::new(t(0))),
         config,
     )
@@ -2259,7 +2167,7 @@ async fn shutdown_interrupts_normal_ingest_before_its_long_timeout() {
     config.ingest_timeout = std::time::Duration::from_secs(120);
     config.shutdown_drain_deadline = std::time::Duration::from_millis(10);
     let (recorder, writer) = UsageWriter::spawn(
-        Arc::new(ObservedHungSink(active.clone())),
+        observed_hung_sink(&active),
         Arc::new(ManualClock::new(t(0))),
         config,
     )
@@ -2280,7 +2188,7 @@ async fn cancelling_lease_shutdown_aborts_the_owned_release_task() {
     let store = store(10_000);
     let slot = LeaseSlot::for_account(ACCOUNT);
     let manager = LeaseManager::spawn(
-        Arc::new(HangingReleaseAllocator { inner: store }),
+        hanging_release(&store),
         slot.clone(),
         Arc::new(ManualClock::new(t(0))),
         manager_config(),

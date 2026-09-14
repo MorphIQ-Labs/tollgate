@@ -6,7 +6,6 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
 
 use tollgate_admission::{AdmissionEngine, ArcSwapSnapshotMap, MapEntry, SnapshotMap};
@@ -19,6 +18,10 @@ use tollgate_core::{
     DiscardedUsage, FencingToken, Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding,
     OpIndex, PermissionBits, Principal, PublishableSnapshot, ResolvedLimits,
 };
+#[path = "../../tollgate-store/tests/support/delegating.rs"]
+mod delegating;
+use delegating::{DelegatingStore, RejectingStore, rejecting};
+
 use tollgate_store::{
     AccountConfig, GrantPolicy, MemoryStore, SnapshotPush, SnapshotResolution, SnapshotSource,
     StoreError,
@@ -198,9 +201,9 @@ async fn a_snapshot_task_panic_withdraws_the_retained_readiness_value() {
         }
     }
     let clock = Arc::new(PanicClock(AtomicBool::new(false)));
-    let source = DrivenPushSource::new(SnapshotResolution::Unknown);
+    let (source, pulls) = DrivenPushSource::new(SnapshotResolution::Unknown);
     let manager = SnapshotManager::spawn(
-        source.clone(),
+        pulls.clone(),
         Arc::new(ArcSwapSnapshotMap::new()),
         SlotRegistry::new(),
         clock.clone(),
@@ -310,17 +313,66 @@ enum MutableMode {
     Failing,
 }
 
+/// A receiver that never yields a push: the sender is dropped immediately.
+///
+/// Nine fixtures in this file wrote this out; it is one function now.
+fn no_pushes() -> tokio::sync::broadcast::Receiver<SnapshotPush> {
+    let (sender, receiver) = tokio::sync::broadcast::channel(1);
+    drop(sender);
+    receiver
+}
+
+/// The shape most fixtures here have: no pushes and no catalogue.
+///
+/// Both answers are *stated*. `principals` has a default body -- the `Ok(None)`
+/// sentinel -- and these doubles used to get it by omission, which is the same
+/// silence that made wrappers elsewhere lie about a catalogue they did have
+/// (#83). Saying it is the difference between the two.
+fn bare_source(reason: &'static str) -> DelegatingStore<RejectingStore> {
+    rejecting(reason)
+        .on_subscribe(|_| no_pushes())
+        .on_principals(|_| async { Ok(None) })
+}
+
+/// A source whose answer the test rewrites between passes.
 struct MutableNoPushSource {
     mode: Mutex<MutableMode>,
     calls: AtomicUsize,
 }
 
 impl MutableNoPushSource {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
+    /// The handle and the source to hand [`SnapshotManager::spawn`].
+    fn new() -> (Arc<Self>, Arc<DelegatingStore<RejectingStore>>) {
+        let source = Arc::new(Self {
             mode: Mutex::new(MutableMode::Unknown),
             calls: AtomicUsize::new(0),
-        })
+        });
+        let pulls = Arc::clone(&source);
+        (
+            source,
+            Arc::new(
+                bare_source("a mutable fixture answers snapshots and nothing else").on_snapshot(
+                    move |_, _principal| {
+                        let source = Arc::clone(&pulls);
+                        async move {
+                            source.calls.fetch_add(1, Ordering::AcqRel);
+                            match source.mode.lock().expect("source mode poisoned").clone() {
+                                MutableMode::Unknown => Ok(SnapshotResolution::Unknown),
+                                MutableMode::Revoked => Ok(SnapshotResolution::Revoked {
+                                    generation: Generation(9),
+                                }),
+                                MutableMode::Present(snapshot) => {
+                                    Ok(SnapshotResolution::Present(publishable(snapshot)))
+                                }
+                                MutableMode::Failing => {
+                                    Err(StoreError("injected targeted-refetch outage".into()))
+                                }
+                            }
+                        }
+                    },
+                ),
+            ),
+        )
     }
 
     fn set(&self, mode: MutableMode) {
@@ -328,35 +380,12 @@ impl MutableNoPushSource {
     }
 }
 
-#[async_trait]
-impl SnapshotSource for MutableNoPushSource {
-    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
-        self.calls.fetch_add(1, Ordering::AcqRel);
-        match self.mode.lock().expect("source mode poisoned").clone() {
-            MutableMode::Unknown => Ok(SnapshotResolution::Unknown),
-            MutableMode::Revoked => Ok(SnapshotResolution::Revoked {
-                generation: Generation(9),
-            }),
-            MutableMode::Present(snapshot) => {
-                Ok(SnapshotResolution::Present(publishable(snapshot)))
-            }
-            MutableMode::Failing => Err(StoreError("injected targeted-refetch outage".into())),
-        }
-    }
-
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-        let (sender, receiver) = tokio::sync::broadcast::channel(1);
-        drop(sender);
-        receiver
-    }
-}
-
 #[tokio::test]
 async fn negative_ttl_retry_is_backed_off_and_recovers_without_push() {
-    let source = MutableNoPushSource::new();
+    let (source, pulls) = MutableNoPushSource::new();
     let map = Arc::new(ArcSwapSnapshotMap::new());
     let manager = SnapshotManager::spawn(
-        source.clone(),
+        pulls.clone(),
         map.clone(),
         SlotRegistry::new(),
         Arc::new(SystemClock),
@@ -413,48 +442,49 @@ async fn negative_ttl_retry_is_backed_off_and_recovers_without_push() {
     manager.shutdown().await;
 }
 
+/// A source with live pushes whose pulls can be switched to failing.
 struct ToggleSource {
-    snapshot: Arc<AccountSnapshot>,
     fail: AtomicBool,
     push: tokio::sync::broadcast::Sender<SnapshotPush>,
 }
 
 impl ToggleSource {
-    fn new(snapshot: Arc<AccountSnapshot>) -> Arc<Self> {
+    fn new(snapshot: Arc<AccountSnapshot>) -> (Arc<Self>, Arc<DelegatingStore<RejectingStore>>) {
         let (push, _) = tokio::sync::broadcast::channel(4);
-        Arc::new(Self {
-            snapshot,
+        let source = Arc::new(Self {
             fail: AtomicBool::new(false),
             push,
-        })
-    }
-}
-
-#[async_trait]
-impl SnapshotSource for ToggleSource {
-    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
-        if self.fail.load(Ordering::Acquire) {
-            Err(StoreError("injected snapshot outage".into()))
-        } else {
-            Ok(SnapshotResolution::Present(publishable(Arc::clone(
-                &self.snapshot,
-            ))))
-        }
-    }
-
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-        self.push.subscribe()
+        });
+        let (pulls, subs) = (Arc::clone(&source), Arc::clone(&source));
+        (
+            source,
+            Arc::new(
+                rejecting("a toggle fixture answers snapshots and nothing else")
+                    .on_snapshot(move |_, _principal| {
+                        let (source, snapshot) = (Arc::clone(&pulls), Arc::clone(&snapshot));
+                        async move {
+                            if source.fail.load(Ordering::Acquire) {
+                                Err(StoreError("injected snapshot outage".into()))
+                            } else {
+                                Ok(SnapshotResolution::Present(publishable(snapshot)))
+                            }
+                        }
+                    })
+                    .on_subscribe(move |_| subs.push.subscribe())
+                    .on_principals(|_| async { Ok(None) }),
+            ),
+        )
     }
 }
 
 #[tokio::test(start_paused = true)]
 async fn readiness_falls_when_snapshot_expires_during_outage() {
-    let source = ToggleSource::new(snapshot(1, PermissionBits::bit(0)));
+    let (source, pulls) = ToggleSource::new(snapshot(1, PermissionBits::bit(0)));
     let map = Arc::new(ArcSwapSnapshotMap::new());
     let slots = SlotRegistry::new();
     let clock = Arc::new(ManualClock::new(t(0)));
     let manager = SnapshotManager::spawn(
-        source.clone(),
+        pulls.clone(),
         map,
         slots,
         Arc::clone(&clock) as _,
@@ -489,12 +519,12 @@ async fn readiness_falls_when_snapshot_expires_during_outage() {
 /// construction rather than by luck.
 #[tokio::test(start_paused = true)]
 async fn snapshot_counters_track_failures_and_the_unresolved_gauge() {
-    let source = ToggleSource::new(snapshot(1, PermissionBits::bit(0)));
+    let (source, pulls) = ToggleSource::new(snapshot(1, PermissionBits::bit(0)));
     let map = Arc::new(ArcSwapSnapshotMap::new());
     let slots = SlotRegistry::new();
     let clock = Arc::new(ManualClock::new(t(0)));
     let manager = SnapshotManager::spawn(
-        source.clone(),
+        pulls.clone(),
         map,
         slots,
         Arc::clone(&clock) as _,
@@ -544,27 +574,27 @@ async fn snapshot_counters_track_failures_and_the_unresolved_gauge() {
     manager.shutdown().await;
 }
 
-struct FirstThenHangsSource {
+/// Answers the first pull, then never answers again.
+fn first_then_hangs_source(
     snapshot: Arc<AccountSnapshot>,
-    calls: AtomicUsize,
     push: tokio::sync::broadcast::Sender<SnapshotPush>,
-}
-
-#[async_trait]
-impl SnapshotSource for FirstThenHangsSource {
-    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
-        if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
-            Ok(SnapshotResolution::Present(publishable(Arc::clone(
-                &self.snapshot,
-            ))))
-        } else {
-            std::future::pending().await
-        }
-    }
-
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-        self.push.subscribe()
-    }
+) -> Arc<DelegatingStore<RejectingStore>> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    Arc::new(
+        rejecting("a first-then-hangs fixture answers snapshots and nothing else")
+            .on_snapshot(move |_, _principal| {
+                let (calls, snapshot) = (Arc::clone(&calls), Arc::clone(&snapshot));
+                async move {
+                    if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                        Ok(SnapshotResolution::Present(publishable(snapshot)))
+                    } else {
+                        std::future::pending().await
+                    }
+                }
+            })
+            .on_subscribe(move |_| push.subscribe())
+            .on_principals(|_| async { Ok(None) }),
+    )
 }
 
 #[tokio::test]
@@ -574,11 +604,7 @@ async fn readiness_falls_if_refresh_hangs_across_snapshot_expiry() {
         .checked_add(SignedDuration::from_millis(500))
         .unwrap();
     let (push, _) = tokio::sync::broadcast::channel(4);
-    let source = Arc::new(FirstThenHangsSource {
-        snapshot: Arc::new(expiring),
-        calls: AtomicUsize::new(0),
-        push,
-    });
+    let source = first_then_hangs_source(Arc::new(expiring), push);
     let manager = SnapshotManager::spawn(
         source,
         Arc::new(ArcSwapSnapshotMap::new()),
@@ -612,26 +638,23 @@ async fn readiness_falls_if_refresh_hangs_across_snapshot_expiry() {
         .expect("shutdown must cancel the hung refresh");
 }
 
-struct HangingSource {
+/// A pull that never returns.
+fn hanging_source(
     push: tokio::sync::broadcast::Sender<SnapshotPush>,
-}
-
-#[async_trait]
-impl SnapshotSource for HangingSource {
-    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
-        std::future::pending().await
-    }
-
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-        self.push.subscribe()
-    }
+) -> Arc<DelegatingStore<RejectingStore>> {
+    Arc::new(
+        rejecting("a hanging fixture answers snapshots and nothing else")
+            .on_snapshot(|_, _principal| async { std::future::pending().await })
+            .on_subscribe(move |_| push.subscribe())
+            .on_principals(|_| async { Ok(None) }),
+    )
 }
 
 #[tokio::test]
 async fn shutdown_cancels_in_flight_snapshot_fetches() {
     let (push, _) = tokio::sync::broadcast::channel(4);
     let manager = SnapshotManager::spawn(
-        Arc::new(HangingSource { push }),
+        hanging_source(push),
         Arc::new(ArcSwapSnapshotMap::new()),
         SlotRegistry::new(),
         Arc::new(ManualClock::new(t(0))),
@@ -663,24 +686,14 @@ async fn shutdown_cancels_in_flight_snapshot_fetches() {
 /// manager itself dying, which is what `task_died` is for.
 #[tokio::test]
 async fn a_panicking_fetch_does_not_kill_the_manager() {
-    struct PanickingSource {
-        push: tokio::sync::broadcast::Sender<SnapshotPush>,
-    }
-
-    #[async_trait]
-    impl SnapshotSource for PanickingSource {
-        async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
-            panic!("source exploded");
-        }
-
-        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-            self.push.subscribe()
-        }
-    }
-
     let (push, _keep) = tokio::sync::broadcast::channel(4);
     let manager = SnapshotManager::spawn(
-        Arc::new(PanickingSource { push }),
+        Arc::new(
+            rejecting("a panicking fixture answers snapshots and nothing else")
+                .on_snapshot(|_, _principal| async { panic!("source exploded") })
+                .on_subscribe(move |_| push.subscribe())
+                .on_principals(|_| async { Ok(None) }),
+        ),
         Arc::new(ArcSwapSnapshotMap::new()),
         SlotRegistry::new(),
         Arc::new(ManualClock::new(t(0))),
@@ -945,31 +958,24 @@ async fn a_revoked_principal_stays_tracked_and_cannot_be_resurrected() {
 /// negative resolution counts as resolved. The only thing that genuinely
 /// leaves a principal unresolved is a fetch that errors, so that is what this
 /// injects.
-struct OneUnanswerableSource {
-    good: Arc<AccountSnapshot>,
-}
-
-#[async_trait]
-impl SnapshotSource for OneUnanswerableSource {
-    async fn snapshot(&self, principal: Principal) -> Result<SnapshotResolution, StoreError> {
-        if principal == PRINCIPAL {
-            Ok(SnapshotResolution::Present(publishable(Arc::clone(
-                &self.good,
-            ))))
-        } else {
-            Err(StoreError("injected permanent fetch failure".into()))
-        }
-    }
-
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-        let (sender, receiver) = tokio::sync::broadcast::channel(1);
-        drop(sender);
-        receiver
-    }
-
-    async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
-        Ok(Some(vec![PRINCIPAL, LATER_PRINCIPAL]))
-    }
+/// Answers for one principal and permanently refuses the other, while
+/// enumerating both.
+fn one_unanswerable_source(good: Arc<AccountSnapshot>) -> Arc<DelegatingStore<RejectingStore>> {
+    Arc::new(
+        rejecting("an unanswerable fixture answers snapshots and enumeration")
+            .on_snapshot(move |_, principal| {
+                let good = Arc::clone(&good);
+                async move {
+                    if principal == PRINCIPAL {
+                        Ok(SnapshotResolution::Present(publishable(good)))
+                    } else {
+                        Err(StoreError("injected permanent fetch failure".into()))
+                    }
+                }
+            })
+            .on_subscribe(|_| no_pushes())
+            .on_principals(|_| async { Ok(Some(vec![PRINCIPAL, LATER_PRINCIPAL])) }),
+    )
 }
 
 /// Readiness under `All` means "I can serve someone", not "I can serve
@@ -981,9 +987,7 @@ impl SnapshotSource for OneUnanswerableSource {
 #[tokio::test(start_paused = true)]
 async fn one_unanswerable_principal_unreadies_only_a_fixed_instance() {
     fn spawn(mode: TrackedPrincipals) -> Fixture {
-        let source = Arc::new(OneUnanswerableSource {
-            good: snapshot(1, PermissionBits::bit(0)),
-        });
+        let source = one_unanswerable_source(snapshot(1, PermissionBits::bit(0)));
         let map = Arc::new(ArcSwapSnapshotMap::new());
         let engine = AdmissionEngine::new(Arc::clone(&map));
         let slots = SlotRegistry::new();
@@ -1037,102 +1041,80 @@ async fn one_unanswerable_principal_unreadies_only_a_fixed_instance() {
 
 /// A source with no catalogue at all — it does not override `principals`, so
 /// it takes the trait's default.
-struct NoCatalogueSource {
-    snapshot: Arc<AccountSnapshot>,
-}
-
-#[async_trait]
-impl SnapshotSource for NoCatalogueSource {
-    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
-        Ok(SnapshotResolution::Present(publishable(Arc::clone(
-            &self.snapshot,
-        ))))
-    }
-
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-        let (sender, receiver) = tokio::sync::broadcast::channel(1);
-        drop(sender);
-        receiver
-    }
+/// Answers snapshots and cannot enumerate.
+fn no_catalogue_source(snapshot: Arc<AccountSnapshot>) -> Arc<DelegatingStore<RejectingStore>> {
+    Arc::new(
+        bare_source("a no-catalogue fixture answers snapshots and nothing else").on_snapshot(
+            move |_, _principal| {
+                let snapshot = Arc::clone(&snapshot);
+                async move { Ok(SnapshotResolution::Present(publishable(snapshot))) }
+            },
+        ),
+    )
 }
 
 /// A source that enumerates but always fails to.
-struct FailingCatalogueSource {
+fn failing_catalogue_source(
     snapshot: Arc<AccountSnapshot>,
-    failures: Arc<AtomicUsize>,
-}
-
-#[async_trait]
-impl SnapshotSource for FailingCatalogueSource {
-    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
-        Ok(SnapshotResolution::Present(publishable(Arc::clone(
-            &self.snapshot,
-        ))))
-    }
-
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-        let (sender, receiver) = tokio::sync::broadcast::channel(1);
-        drop(sender);
-        receiver
-    }
-
-    async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
-        self.failures.fetch_add(1, Ordering::AcqRel);
-        Err(StoreError("injected catalogue outage".into()))
-    }
+    failures: &Arc<AtomicUsize>,
+) -> Arc<DelegatingStore<RejectingStore>> {
+    let failures = Arc::clone(failures);
+    Arc::new(
+        rejecting("a failing-catalogue fixture answers snapshots and enumeration")
+            .on_snapshot(move |_, _principal| {
+                let snapshot = Arc::clone(&snapshot);
+                async move { Ok(SnapshotResolution::Present(publishable(snapshot))) }
+            })
+            .on_subscribe(|_| no_pushes())
+            .on_principals(move |_| {
+                let failures = Arc::clone(&failures);
+                async move {
+                    failures.fetch_add(1, Ordering::AcqRel);
+                    Err(StoreError("injected catalogue outage".into()))
+                }
+            }),
+    )
 }
 
 /// A source that answers snapshots but never answers enumeration.
-struct HangingCatalogueSource {
+fn hanging_catalogue_source(
     snapshot: Arc<AccountSnapshot>,
-}
-
-#[async_trait]
-impl SnapshotSource for HangingCatalogueSource {
-    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
-        Ok(SnapshotResolution::Present(publishable(Arc::clone(
-            &self.snapshot,
-        ))))
-    }
-
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-        let (sender, receiver) = tokio::sync::broadcast::channel(1);
-        drop(sender);
-        receiver
-    }
-
-    async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
-        std::future::pending().await
-    }
+) -> Arc<DelegatingStore<RejectingStore>> {
+    Arc::new(
+        rejecting("a hanging-catalogue fixture answers snapshots and enumeration")
+            .on_snapshot(move |_, _principal| {
+                let snapshot = Arc::clone(&snapshot);
+                async move { Ok(SnapshotResolution::Present(publishable(snapshot))) }
+            })
+            .on_subscribe(|_| no_pushes())
+            .on_principals(|_| async { std::future::pending().await }),
+    )
 }
 
 /// A source whose enumeration hangs until released, and which answers
 /// snapshots normally throughout.
-struct HangsOnEnumerationSource {
+fn hangs_on_enumeration_source(
     snapshot: Arc<AccountSnapshot>,
-    release: Arc<tokio::sync::Notify>,
-    enumerations: Arc<AtomicUsize>,
-}
-
-#[async_trait]
-impl SnapshotSource for HangsOnEnumerationSource {
-    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
-        Ok(SnapshotResolution::Present(publishable(Arc::clone(
-            &self.snapshot,
-        ))))
-    }
-
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-        let (sender, receiver) = tokio::sync::broadcast::channel(1);
-        drop(sender);
-        receiver
-    }
-
-    async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
-        self.enumerations.fetch_add(1, Ordering::AcqRel);
-        self.release.notified().await;
-        Ok(Some(vec![PRINCIPAL]))
-    }
+    release: &Arc<tokio::sync::Notify>,
+    enumerations: &Arc<AtomicUsize>,
+) -> Arc<DelegatingStore<RejectingStore>> {
+    let (release, enumerations) = (Arc::clone(release), Arc::clone(enumerations));
+    Arc::new(
+        rejecting("an enumeration-hang fixture answers snapshots and enumeration")
+            .on_snapshot(move |_, _principal| {
+                let snapshot = Arc::clone(&snapshot);
+                async move { Ok(SnapshotResolution::Present(publishable(snapshot))) }
+            })
+            .on_subscribe(|_| no_pushes())
+            .on_principals(move |_| {
+                let (release, enumerations) = (Arc::clone(&release), Arc::clone(&enumerations));
+                async move {
+                    enumerations.fetch_add(1, Ordering::AcqRel);
+                    release.notified().await;
+                    Ok(Some(vec![PRINCIPAL]))
+                }
+            }),
+    )
 }
 
 /// Issue #59: an enumeration that never answers is abandoned at
@@ -1151,11 +1133,7 @@ async fn a_hung_enumeration_is_abandoned_so_the_loop_keeps_sweeping() {
     let release = Arc::new(tokio::sync::Notify::new());
     let enumerations = Arc::new(AtomicUsize::new(0));
     let fixture = spawn_with(
-        Arc::new(HangsOnEnumerationSource {
-            snapshot: snapshot(1, PermissionBits::bit(0)),
-            release: Arc::clone(&release),
-            enumerations: Arc::clone(&enumerations),
-        }),
+        hangs_on_enumeration_source(snapshot(1, PermissionBits::bit(0)), &release, &enumerations),
         SnapshotManagerConfig {
             // `All` is what makes the manager enumerate at all.
             principals: TrackedPrincipals::All {
@@ -1222,9 +1200,7 @@ fn a_zero_enumeration_timeout_is_rejected() {
 #[tokio::test(start_paused = true)]
 async fn a_hung_enumeration_does_not_hold_shutdown_open() {
     let fixture = spawn_with(
-        Arc::new(HangingCatalogueSource {
-            snapshot: snapshot(1, PermissionBits::bit(0)),
-        }),
+        hanging_catalogue_source(snapshot(1, PermissionBits::bit(0))),
         SnapshotManagerConfig {
             // `All` is what makes the manager enumerate at all.
             principals: TrackedPrincipals::All { seed: Vec::new() },
@@ -1250,30 +1226,32 @@ async fn a_hung_enumeration_does_not_hold_shutdown_open() {
 
 /// A source that hangs on one principal until released, and answers every
 /// other principal normally.
-struct HangsOnOneSource {
+/// Blocks on one principal and answers the rest.
+fn hangs_on_one_source(
     snapshot: Arc<AccountSnapshot>,
     hung: Principal,
-    release: Arc<tokio::sync::Notify>,
-    answered: Arc<AtomicUsize>,
-}
-
-#[async_trait]
-impl SnapshotSource for HangsOnOneSource {
-    async fn snapshot(&self, principal: Principal) -> Result<SnapshotResolution, StoreError> {
-        if principal == self.hung {
-            self.release.notified().await;
-        }
-        self.answered.fetch_add(1, Ordering::AcqRel);
-        Ok(SnapshotResolution::Present(publishable(Arc::clone(
-            &self.snapshot,
-        ))))
-    }
-
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-        let (sender, receiver) = tokio::sync::broadcast::channel(1);
-        drop(sender);
-        receiver
-    }
+    release: &Arc<tokio::sync::Notify>,
+    answered: &Arc<AtomicUsize>,
+) -> Arc<DelegatingStore<RejectingStore>> {
+    let (release, answered) = (Arc::clone(release), Arc::clone(answered));
+    Arc::new(
+        bare_source("a one-hang fixture answers snapshots and nothing else").on_snapshot(
+            move |_, principal| {
+                let (snapshot, release, answered) = (
+                    Arc::clone(&snapshot),
+                    Arc::clone(&release),
+                    Arc::clone(&answered),
+                );
+                async move {
+                    if principal == hung {
+                        release.notified().await;
+                    }
+                    answered.fetch_add(1, Ordering::AcqRel);
+                    Ok(SnapshotResolution::Present(publishable(snapshot)))
+                }
+            },
+        ),
+    )
 }
 
 /// Issue #103: a fetch that never resolves is abandoned at `fetch_timeout`,
@@ -1291,12 +1269,12 @@ async fn a_hung_fetch_is_abandoned_so_the_sweep_keeps_running() {
     let answered = Arc::new(AtomicUsize::new(0));
     let hung = Principal(99);
     let fixture = spawn_with(
-        Arc::new(HangsOnOneSource {
-            snapshot: snapshot(1, PermissionBits::bit(0)),
+        hangs_on_one_source(
+            snapshot(1, PermissionBits::bit(0)),
             hung,
-            release: Arc::clone(&release),
-            answered: Arc::clone(&answered),
-        }),
+            &release,
+            &answered,
+        ),
         SnapshotManagerConfig {
             principals: TrackedPrincipals::Fixed(vec![PRINCIPAL, hung]),
             refresh_interval: std::time::Duration::from_millis(50),
@@ -1349,24 +1327,21 @@ async fn a_hung_fetch_is_abandoned_so_the_sweep_keeps_running() {
 
 /// Answers `Unknown` once — putting the principal into a negative resolution
 /// with a live refetch deadline — and hangs on every fetch after that.
-struct UnknownThenHangsSource {
-    calls: Arc<AtomicUsize>,
-}
-
-#[async_trait]
-impl SnapshotSource for UnknownThenHangsSource {
-    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
-        if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
-            return Ok(SnapshotResolution::Unknown);
-        }
-        std::future::pending().await
-    }
-
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-        let (sender, receiver) = tokio::sync::broadcast::channel(1);
-        drop(sender);
-        receiver
-    }
+/// Answers `Unknown` once, then never answers again.
+fn unknown_then_hangs_source(calls: &Arc<AtomicUsize>) -> Arc<DelegatingStore<RejectingStore>> {
+    let calls = Arc::clone(calls);
+    Arc::new(
+        bare_source("an unknown-then-hangs fixture answers snapshots and nothing else")
+            .on_snapshot(move |_, _principal| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                        return Ok(SnapshotResolution::Unknown);
+                    }
+                    std::future::pending().await
+                }
+            }),
+    )
 }
 
 /// Issue #103 meets issue #53: an abandoned fetch must land in the failed set
@@ -1388,9 +1363,7 @@ impl SnapshotSource for UnknownThenHangsSource {
 async fn an_abandoned_fetch_is_throttled_like_a_refusal() {
     let calls = Arc::new(AtomicUsize::new(0));
     let manager = SnapshotManager::spawn(
-        Arc::new(UnknownThenHangsSource {
-            calls: Arc::clone(&calls),
-        }),
+        unknown_then_hangs_source(&calls),
         Arc::new(ArcSwapSnapshotMap::new()),
         SlotRegistry::new(),
         Arc::new(SystemClock),
@@ -1475,9 +1448,7 @@ fn discovering_config(refresh_ms: u64) -> SnapshotManagerConfig {
 #[tokio::test(start_paused = true)]
 async fn a_source_that_cannot_enumerate_keeps_the_configured_set() {
     let fixture = spawn_with(
-        Arc::new(NoCatalogueSource {
-            snapshot: snapshot(1, PermissionBits::bit(0)),
-        }),
+        no_catalogue_source(snapshot(1, PermissionBits::bit(0))),
         discovering_config(20),
     );
     stock_slot(&fixture);
@@ -1499,10 +1470,7 @@ async fn a_source_that_cannot_enumerate_keeps_the_configured_set() {
 async fn a_failing_enumeration_is_counted_and_keeps_the_current_set() {
     let failures = Arc::new(AtomicUsize::new(0));
     let fixture = spawn_with(
-        Arc::new(FailingCatalogueSource {
-            snapshot: snapshot(1, PermissionBits::bit(0)),
-            failures: Arc::clone(&failures),
-        }),
+        failing_catalogue_source(snapshot(1, PermissionBits::bit(0)), &failures),
         discovering_config(20),
     );
     stock_slot(&fixture);
@@ -1562,26 +1530,17 @@ async fn a_push_discovers_the_principal_it_names() {
 /// below it however many principals it tracks.
 #[tokio::test(start_paused = true)]
 async fn a_discovering_instance_with_nothing_resolvable_is_unready() {
-    struct AllFail;
-
-    #[async_trait]
-    impl SnapshotSource for AllFail {
-        async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
-            Err(StoreError("injected total source outage".into()))
-        }
-
-        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-            let (sender, receiver) = tokio::sync::broadcast::channel(1);
-            drop(sender);
-            receiver
-        }
-
-        async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
-            Ok(Some(vec![PRINCIPAL, LATER_PRINCIPAL]))
-        }
-    }
-
-    let fixture = spawn_with(Arc::new(AllFail), discovering_config(20));
+    let fixture = spawn_with(
+        Arc::new(
+            rejecting("an all-fail fixture answers snapshots and enumeration")
+                .on_snapshot(|_, _principal| async {
+                    Err(StoreError("injected total source outage".into()))
+                })
+                .on_subscribe(|_| no_pushes())
+                .on_principals(|_| async { Ok(Some(vec![PRINCIPAL, LATER_PRINCIPAL])) }),
+        ),
+        discovering_config(20),
+    );
     stock_slot(&fixture);
     settle().await;
 
@@ -1595,54 +1554,52 @@ async fn a_discovering_instance_with_nothing_resolvable_is_unready() {
 
 /// A source that counts fetches per principal and can be flipped between
 /// serving and revoking, so a test can watch what a sweep actually asks for.
+/// Counts pulls per half of a two-principal catalogue, one of which the test
+/// can revoke.
 struct CountingSource {
     revoked: AtomicBool,
     live_calls: AtomicUsize,
     dead_calls: AtomicUsize,
-    snapshot: Arc<AccountSnapshot>,
 }
 
 impl CountingSource {
-    fn new() -> Arc<Self> {
-        Arc::new(CountingSource {
+    /// The handle and the source to hand [`SnapshotManager::spawn`].
+    fn new() -> (Arc<Self>, Arc<DelegatingStore<RejectingStore>>) {
+        let source = Arc::new(CountingSource {
             revoked: AtomicBool::new(false),
             live_calls: AtomicUsize::new(0),
             dead_calls: AtomicUsize::new(0),
-            snapshot: snapshot(1, PermissionBits::bit(0)),
-        })
-    }
-}
-
-#[async_trait]
-impl SnapshotSource for CountingSource {
-    async fn snapshot(&self, principal: Principal) -> Result<SnapshotResolution, StoreError> {
-        if principal == LATER_PRINCIPAL {
-            // The permanently-dead half of the catalogue.
-            self.dead_calls.fetch_add(1, Ordering::AcqRel);
-            return Ok(SnapshotResolution::Revoked {
-                generation: Generation(9),
-            });
-        }
-        self.live_calls.fetch_add(1, Ordering::AcqRel);
-        if self.revoked.load(Ordering::Acquire) {
-            Ok(SnapshotResolution::Revoked {
-                generation: Generation(9),
-            })
-        } else {
-            Ok(SnapshotResolution::Present(publishable(Arc::clone(
-                &self.snapshot,
-            ))))
-        }
-    }
-
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-        let (sender, receiver) = tokio::sync::broadcast::channel(1);
-        drop(sender);
-        receiver
-    }
-
-    async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
-        Ok(Some(vec![PRINCIPAL, LATER_PRINCIPAL]))
+        });
+        let snapshot = snapshot(1, PermissionBits::bit(0));
+        let pulls = Arc::clone(&source);
+        (
+            source,
+            Arc::new(
+                rejecting("a counting fixture answers snapshots and enumeration")
+                    .on_snapshot(move |_, principal| {
+                        let (source, snapshot) = (Arc::clone(&pulls), Arc::clone(&snapshot));
+                        async move {
+                            if principal == LATER_PRINCIPAL {
+                                // The permanently-dead half of the catalogue.
+                                source.dead_calls.fetch_add(1, Ordering::AcqRel);
+                                return Ok(SnapshotResolution::Revoked {
+                                    generation: Generation(9),
+                                });
+                            }
+                            source.live_calls.fetch_add(1, Ordering::AcqRel);
+                            if source.revoked.load(Ordering::Acquire) {
+                                Ok(SnapshotResolution::Revoked {
+                                    generation: Generation(9),
+                                })
+                            } else {
+                                Ok(SnapshotResolution::Present(publishable(snapshot)))
+                            }
+                        }
+                    })
+                    .on_subscribe(|_| no_pushes())
+                    .on_principals(|_| async { Ok(Some(vec![PRINCIPAL, LATER_PRINCIPAL])) }),
+            ),
+        )
     }
 }
 
@@ -1665,9 +1622,9 @@ fn churn_config(revoked_ttl: SignedDuration) -> SnapshotManagerConfig {
 /// is wrong, #52 traded away the wrong direction.
 #[tokio::test(start_paused = true)]
 async fn revocation_still_propagates_within_the_refresh_interval() {
-    let source = CountingSource::new();
+    let (source, pulls) = CountingSource::new();
     let fixture = spawn_with(
-        Arc::clone(&source) as Arc<dyn SnapshotSource>,
+        Arc::clone(&pulls) as Arc<dyn SnapshotSource>,
         // A revoked TTL far longer than the test could ever wait.
         churn_config(SignedDuration::from_secs(86_400)),
     );
@@ -1691,9 +1648,9 @@ async fn revocation_still_propagates_within_the_refresh_interval() {
 /// keeps being refreshed.
 #[tokio::test(start_paused = true)]
 async fn the_sweep_does_not_refetch_tombstones() {
-    let source = CountingSource::new();
+    let (source, pulls) = CountingSource::new();
     let fixture = spawn_with(
-        Arc::clone(&source) as Arc<dyn SnapshotSource>,
+        Arc::clone(&pulls) as Arc<dyn SnapshotSource>,
         churn_config(SignedDuration::from_secs(86_400)),
     );
     stock_slot(&fixture);
@@ -1727,11 +1684,11 @@ async fn the_sweep_does_not_refetch_tombstones() {
 /// the *targeted* refetch to have fired on the short TTL.
 #[tokio::test]
 async fn a_live_principal_that_goes_absent_recovers_on_the_unknown_ttl() {
-    let source = MutableNoPushSource::new();
+    let (source, pulls) = MutableNoPushSource::new();
     source.set(MutableMode::Present(snapshot(1, PermissionBits::bit(0))));
     let map = Arc::new(ArcSwapSnapshotMap::new());
     let manager = SnapshotManager::spawn(
-        source.clone(),
+        pulls.clone(),
         map.clone(),
         SlotRegistry::new(),
         Arc::new(SystemClock),
@@ -1795,11 +1752,11 @@ async fn a_live_principal_that_goes_absent_recovers_on_the_unknown_ttl() {
 /// and a reinstatement that only the tombstone's own schedule can deliver.
 #[tokio::test]
 async fn a_reinstated_principal_comes_back_on_the_revoked_ttl() {
-    let source = MutableNoPushSource::new();
+    let (source, pulls) = MutableNoPushSource::new();
     source.set(MutableMode::Revoked);
     let map = Arc::new(ArcSwapSnapshotMap::new());
     let manager = SnapshotManager::spawn(
-        source.clone(),
+        pulls.clone(),
         map.clone(),
         SlotRegistry::new(),
         Arc::new(SystemClock),
@@ -1870,12 +1827,12 @@ fn expiring_snapshot(generation: u64, valid_until: Timestamp) -> Arc<AccountSnap
 /// they all observe the *map*, which protects itself.
 #[tokio::test]
 async fn a_stale_positive_cannot_drop_readiness() {
-    let source = MutableNoPushSource::new();
+    let (source, pulls) = MutableNoPushSource::new();
     source.set(MutableMode::Present(snapshot(5, PermissionBits::bit(0))));
     let clock = Arc::new(ManualClock::new(t(0)));
     let map = Arc::new(ArcSwapSnapshotMap::new());
     let manager = SnapshotManager::spawn(
-        source.clone(),
+        pulls.clone(),
         map.clone(),
         SlotRegistry::new(),
         clock,
@@ -1930,10 +1887,10 @@ async fn a_stale_positive_cannot_drop_readiness() {
 #[tokio::test]
 async fn a_push_reinstates_an_absent_principal_at_its_own_generation() {
     let live = SnapshotResolution::Present(publishable(snapshot(5, PermissionBits::bit(0))));
-    let source = DrivenPushSource::new(live.clone());
+    let (source, pulls) = DrivenPushSource::new(live.clone());
     let map = Arc::new(ArcSwapSnapshotMap::new());
     let manager = SnapshotManager::spawn(
-        source.clone(),
+        pulls.clone(),
         map.clone(),
         SlotRegistry::new(),
         Arc::new(ManualClock::new(t(0))),
@@ -2000,11 +1957,11 @@ async fn a_push_reinstates_an_absent_principal_at_its_own_generation() {
 /// it was retried.
 #[tokio::test]
 async fn a_refused_answer_is_retried_with_backoff_not_at_source_latency() {
-    let source = MutableNoPushSource::new();
+    let (source, pulls) = MutableNoPushSource::new();
     source.set(MutableMode::Revoked);
     let map = Arc::new(ArcSwapSnapshotMap::new());
     let manager = SnapshotManager::spawn(
-        source.clone(),
+        pulls.clone(),
         map.clone(),
         SlotRegistry::new(),
         Arc::new(SystemClock),
@@ -2060,7 +2017,7 @@ async fn reclaimed_principals_refetch_authority_instead_of_replaying_a_push() {
             NonZeroUsize::new(1).unwrap(),
         )),
     ] {
-        let source = DrivenPushSource::new(SnapshotResolution::Revoked {
+        let (source, pulls) = DrivenPushSource::new(SnapshotResolution::Revoked {
             generation: Generation(9),
         });
         let slots = SlotRegistry::new();
@@ -2068,7 +2025,7 @@ async fn reclaimed_principals_refetch_authority_instead_of_replaying_a_push() {
         let mut config = discovering_config(3_600_000);
         config.max_concurrent_fetches = 8;
         let manager = SnapshotManager::spawn(
-            source.clone(),
+            pulls.clone(),
             map.clone(),
             slots.clone(),
             Arc::new(ManualClock::new(t(0))),
@@ -2122,7 +2079,7 @@ async fn reclaimed_principals_refetch_authority_instead_of_replaying_a_push() {
 
 #[tokio::test(start_paused = true)]
 async fn a_discovered_catalogue_larger_than_history_is_refreshed_in_bounded_batches() {
-    let source = CountingSource::new();
+    let (_source, pulls) = CountingSource::new();
     let map = Arc::new(ArcSwapSnapshotMap::with_capacities(
         LocalSharding::SINGLE,
         1,
@@ -2131,7 +2088,7 @@ async fn a_discovered_catalogue_larger_than_history_is_refreshed_in_bounded_batc
     let mut config = churn_config(SignedDuration::from_secs(3_600));
     config.refresh_interval = std::time::Duration::from_secs(3_600);
     let manager = SnapshotManager::spawn(
-        source,
+        pulls,
         map.clone(),
         SlotRegistry::new(),
         Arc::new(ManualClock::new(t(0))),
@@ -2150,7 +2107,7 @@ async fn a_discovered_catalogue_larger_than_history_is_refreshed_in_bounded_batc
 
 #[tokio::test]
 async fn a_fixed_set_larger_than_history_is_rejected_before_tasks_start() {
-    let source = DrivenPushSource::new(SnapshotResolution::Unknown);
+    let (_source, pulls) = DrivenPushSource::new(SnapshotResolution::Unknown);
     let map = Arc::new(ArcSwapSnapshotMap::with_capacities(
         LocalSharding::SINGLE,
         1,
@@ -2159,7 +2116,7 @@ async fn a_fixed_set_larger_than_history_is_rejected_before_tasks_start() {
     let mut config = discovering_config(1000);
     config.principals = TrackedPrincipals::Fixed(vec![Principal(1), Principal(2)]);
     let error = SnapshotManager::spawn(
-        source,
+        pulls,
         map.clone(),
         SlotRegistry::new(),
         Arc::new(ManualClock::new(t(0))),
@@ -2180,12 +2137,12 @@ async fn same_generation_refresh_repairs_a_visible_cache_eviction() {
         Arc::new(ArcSwapSnapshotMap::new()) as Arc<dyn SnapshotMap>,
         Arc::new(tollgate_admission::MokaSnapshotMap::new(8)),
     ] {
-        let source = MutableNoPushSource::new();
+        let (source, pulls) = MutableNoPushSource::new();
         source.set(MutableMode::Present(snapshot(5, PermissionBits::bit(0))));
         let mut config = discovering_config(1000);
         config.principals = TrackedPrincipals::Fixed(vec![PRINCIPAL]);
         let manager = SnapshotManager::spawn(
-            source,
+            pulls,
             map.clone(),
             SlotRegistry::new(),
             Arc::new(ManualClock::new(t(0))),
@@ -2207,7 +2164,12 @@ async fn same_generation_refresh_repairs_a_visible_cache_eviction() {
     }
 }
 
-/// Records the size of every reservation a refresh pass makes. The pass must
+/// Records the size of every reservation a refresh pass makes.
+///
+/// Still hand-written after #83: `SnapshotMap` belongs to `tollgate-admission`,
+/// so a delegating double for it is a second shared module in a second crate
+/// for one call site. Its seven inherited defaults are all written over `Self`
+/// methods this double does override, so nothing is bypassed. #120 tracks it. The pass must
 /// reserve at the retention budget: reserving one principal at a time would
 /// still resolve the catalogue, but it would pay a reservation, a publication
 /// and a concurrency window per principal instead of per budget-sized chunk.
@@ -2308,13 +2270,13 @@ impl SnapshotMap for ReservationSizes {
 
 #[tokio::test(start_paused = true)]
 async fn a_refresh_pass_reserves_at_the_retention_budget_not_per_principal() {
-    let source = MutableNoPushSource::new();
+    let (source, pulls) = MutableNoPushSource::new();
     source.set(MutableMode::Present(snapshot(1, PermissionBits::bit(0))));
     let map = ReservationSizes::new(3);
     let mut config = discovering_config(3_600_000);
     config.principals = TrackedPrincipals::Fixed(vec![Principal(1), Principal(2), Principal(3)]);
     let manager = SnapshotManager::spawn(
-        source,
+        pulls,
         map.clone(),
         SlotRegistry::new(),
         Arc::new(ManualClock::new(t(0))),
@@ -2339,10 +2301,10 @@ async fn a_refresh_pass_reserves_at_the_retention_budget_not_per_principal() {
 /// the push's own payload.
 #[tokio::test(start_paused = true)]
 async fn a_push_for_an_unresolved_principal_is_discovery_not_authority() {
-    let source = DrivenPushSource::new(SnapshotResolution::Revoked {
+    let (source, pulls) = DrivenPushSource::new(SnapshotResolution::Revoked {
         generation: Generation(9),
     });
-    let fixture = spawn_with(source.clone(), discovering_config(600_000));
+    let fixture = spawn_with(pulls.clone(), discovering_config(600_000));
     stock_slot(&fixture);
     settle().await;
     assert_eq!(

@@ -67,15 +67,7 @@ async fn call(
             .body(Body::empty())
             .unwrap(),
     };
-    let response = router.clone().oneshot(request).await.unwrap();
-    let status = response.status();
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let value = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap()
-    };
-    (status, value)
+    common::send(router, request).await
 }
 
 #[tokio::test]

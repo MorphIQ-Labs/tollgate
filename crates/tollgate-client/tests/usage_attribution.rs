@@ -1,10 +1,13 @@
-use async_trait::async_trait;
 use jiff::Timestamp;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
+#[path = "../../tollgate-store/tests/support/delegating.rs"]
+mod delegating;
+use delegating::DelegatingStore;
+
 use tollgate_client::{UsageWriter, UsageWriterConfig};
 use tollgate_core::{
     AccountId, AccountStatus, CapacityClass, CostUnits, KeyId, PolicyRevision, Principal,
@@ -15,32 +18,33 @@ use tollgate_store::{
     KeyRecord, ManualClock, MemoryStore, StoreError, UsageSink,
 };
 
-struct UncertainSink {
-    store: Arc<MemoryStore>,
-    calls: AtomicUsize,
+/// Commits, then loses its acknowledgement -- or reports an incomplete
+/// success without committing at all.
+fn uncertain_sink(
+    store: &Arc<MemoryStore>,
+    calls: &Arc<AtomicUsize>,
     commit_before_lost_reply: bool,
-}
-
-#[async_trait]
-impl UsageSink for UncertainSink {
-    async fn ingest(
-        &self,
-        events: &[UsageEvent],
-        now: Timestamp,
-    ) -> Result<IngestReport, IngestError> {
-        let first = self.calls.fetch_add(1, Ordering::Relaxed) == 0;
-        if first && !self.commit_before_lost_reply {
-            return Ok(IngestReport::default()); // Incomplete success from a custom sink.
-        }
-        let report = self.store.ingest(events, now).await?;
-        if first {
-            Err(IngestError::Unavailable(StoreError(
-                "fixture lost acknowledgement".into(),
-            )))
-        } else {
-            Ok(report)
-        }
-    }
+) -> Arc<DelegatingStore<MemoryStore>> {
+    let calls = Arc::clone(calls);
+    Arc::new(
+        DelegatingStore::wrapping(Arc::clone(store)).on_ingest(move |inner, events, now| {
+            let calls = Arc::clone(&calls);
+            async move {
+                let first = calls.fetch_add(1, Ordering::Relaxed) == 0;
+                if first && !commit_before_lost_reply {
+                    return Ok(IngestReport::default()); // Incomplete success from a custom sink.
+                }
+                let report = inner.ingest(&events, now).await?;
+                if first {
+                    Err(IngestError::Unavailable(StoreError(
+                        "fixture lost acknowledgement".into(),
+                    )))
+                } else {
+                    Ok(report)
+                }
+            }
+        }),
+    )
 }
 
 fn config() -> UsageWriterConfig {
@@ -77,11 +81,8 @@ async fn both_writer_drains_preserve_evidence_until_a_complete_acknowledgement()
                 })
                 .await
                 .unwrap();
-            let sink = Arc::new(UncertainSink {
-                store: store.clone(),
-                calls: AtomicUsize::new(0),
-                commit_before_lost_reply,
-            });
+            let calls = Arc::new(AtomicUsize::new(0));
+            let sink = uncertain_sink(&store.clone(), &calls, commit_before_lost_reply);
             let (recorder, writer) = UsageWriter::spawn(
                 sink.clone(),
                 Arc::new(ManualClock::new(Timestamp::UNIX_EPOCH)),
@@ -99,7 +100,7 @@ async fn both_writer_drains_preserve_evidence_until_a_complete_acknowledgement()
             ));
             if !shutdown_immediately {
                 tokio::time::timeout(Duration::from_secs(1), async {
-                    while sink.calls.load(Ordering::Relaxed) < 2 {
+                    while calls.load(Ordering::Relaxed) < 2 {
                         tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                 })
@@ -107,7 +108,7 @@ async fn both_writer_drains_preserve_evidence_until_a_complete_acknowledgement()
                 .unwrap();
             }
             let stats = writer.shutdown().await.unwrap();
-            assert_eq!(sink.calls.load(Ordering::Relaxed), 2);
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
             assert_eq!((stats.lost, stats.unresolved, stats.rejected), (0, 0, 0));
             assert_eq!(stats.accepted + stats.duplicate, 1);
             assert_eq!(stats.duplicate, u64::from(commit_before_lost_reply));

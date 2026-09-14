@@ -44,5 +44,5 @@ pub use traits::{
     KeyDirectory, KeyError, KeyRecord, LeaseAllocator, MAX_INGEST_BATCH, PUSH_CHANNEL_CAPACITY,
     PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation, RolledAccount, RolloverBatch,
     SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource, StatusChange, StoreError,
-    StoreHealth, UsageSink, pushes_exceed_capacity,
+    StoreHealth, UsageSink, drain_reclaim_expired, pushes_exceed_capacity,
 };

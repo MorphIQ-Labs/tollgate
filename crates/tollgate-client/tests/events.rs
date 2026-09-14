@@ -7,10 +7,8 @@
 //! message text, which would be the source-text assertion AGENTS.md forbids.
 
 use std::cell::RefCell;
-use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, Once};
 
-use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
 
 use tollgate_admission::LeaseSlot;
@@ -18,9 +16,13 @@ use tollgate_client::{LeaseManager, LeaseManagerConfig, ManualClock, UsageWriter
 use tollgate_core::{
     AccountId, AccountStatus, CapacityClass, CostUnits, PolicyRevision, UsageEvent, UsageSource,
 };
+#[path = "../../tollgate-store/tests/support/delegating.rs"]
+mod delegating;
+use delegating::{DelegatingStore, RejectingStore, rejecting};
+
 use tollgate_store::{
-    AccountConfig, AllocateError, GrantPolicy, IngestError, IngestReport, LeaseAllocator,
-    MemoryStore, ReclaimBatch, StoreError, UsageSink,
+    AccountConfig, AllocateError, GrantPolicy, IngestReport, LeaseAllocator, MemoryStore,
+    ReclaimBatch, StoreError, UsageSink,
 };
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
@@ -55,7 +57,7 @@ fn positive(generation: u64) -> tollgate_store::SnapshotResolution {
 }
 
 fn snapshots(
-    source: Arc<DrivenPushSource>,
+    source: Arc<snapshot_source::DelegatingStore<snapshot_source::RejectingStore>>,
     clock: Arc<ManualClock>,
 ) -> (
     tollgate_client::SnapshotManager,
@@ -99,9 +101,9 @@ async fn snapshot_refusals_are_reported_and_counted_for_pushes_and_refreshes() {
     use tollgate_store::SnapshotResolution;
     for push in [true, false] {
         let (captor, _guard) = capture();
-        let source = DrivenPushSource::new(positive(5));
+        let (source, pulls) = DrivenPushSource::new(positive(5));
         let clock = Arc::new(ManualClock::new(t(0)));
-        let (manager, map) = snapshots(source.clone(), clock.clone());
+        let (manager, map) = snapshots(pulls.clone(), clock.clone());
         let counters = manager.counters();
         wait_for(|| *manager.ready().borrow()).await;
         let offer = |resolution: SnapshotResolution| {
@@ -170,8 +172,8 @@ async fn unchanged_snapshots_and_accepted_updates_do_not_report_refusals() {
     use tollgate_admission::{MapEntry, SnapshotMap};
     use tollgate_core::Generation;
     let (captor, _guard) = capture();
-    let source = DrivenPushSource::new(positive(5));
-    let (manager, map) = snapshots(source.clone(), Arc::new(ManualClock::new(t(0))));
+    let (source, pulls) = DrivenPushSource::new(positive(5));
+    let (manager, map) = snapshots(pulls.clone(), Arc::new(ManualClock::new(t(0))));
     let counters = manager.counters();
     wait_for(|| counters.snapshot().refresh_attempts >= 2).await;
     source.send(PRINCIPAL, positive(5));
@@ -386,49 +388,21 @@ fn manager_config() -> LeaseManagerConfig {
 }
 
 /// An allocator that refuses every acquire, as an unreachable backend does.
-struct RefusingAllocator;
-
-#[async_trait]
-impl LeaseAllocator for RefusingAllocator {
-    async fn acquire(
-        &self,
-        _account: AccountId,
-        _requested: CostUnits,
-        _ttl: SignedDuration,
-        _now: Timestamp,
-    ) -> Result<tollgate_core::LeaseGrant, AllocateError> {
-        Err(AllocateError::Storage(StoreError("backend down".into())))
-    }
-
-    async fn release(
-        &self,
-        _lease_id: tollgate_core::LeaseId,
-        _fencing_token: tollgate_core::FencingToken,
-        _unspent: CostUnits,
-        _now: Timestamp,
-    ) -> Result<(), AllocateError> {
-        Ok(())
-    }
-
-    async fn consolidate(
-        &self,
-        _lease_id: tollgate_core::LeaseId,
-        _fencing_token: tollgate_core::FencingToken,
-        _unspent: tollgate_core::CostUnits,
-        _requested: tollgate_core::CostUnits,
-        _ttl: jiff::SignedDuration,
-        _now: jiff::Timestamp,
-    ) -> Result<tollgate_core::LeaseGrant, tollgate_store::AllocateError> {
-        unreachable!("these fixtures never consolidate")
-    }
-
-    async fn reclaim_expired_batch(
-        &self,
-        _now: Timestamp,
-        limit: NonZeroUsize,
-    ) -> Result<ReclaimBatch, StoreError> {
-        ReclaimBatch::try_new(Vec::new(), limit)
-    }
+/// Refuses every acquire with a backend error, over no store at all.
+///
+/// `consolidate` is left to `rejecting`, which panics naming the method --
+/// the same claim the hand-written `unreachable!()` made.
+fn refusing_allocator() -> Arc<DelegatingStore<RejectingStore>> {
+    Arc::new(
+        rejecting("these fixtures never consolidate")
+            .on_acquire(|_, _account, _requested, _ttl, _now| async {
+                Err(AllocateError::Storage(StoreError("backend down".into())))
+            })
+            .on_release(|_, _lease, _fence, _unspent, _now| async { Ok(()) })
+            .on_reclaim_expired_batch(|_, _now, limit| async move {
+                ReclaimBatch::try_new(Vec::new(), limit)
+            }),
+    )
 }
 
 /// The condition an operator most needs to see: this instance is denying
@@ -438,7 +412,7 @@ impl LeaseAllocator for RefusingAllocator {
 async fn refill_failure_with_an_empty_slot_warns() {
     let (captor, _guard) = capture();
     let manager = LeaseManager::spawn(
-        Arc::new(RefusingAllocator) as Arc<dyn LeaseAllocator>,
+        refusing_allocator() as Arc<dyn LeaseAllocator>,
         LeaseSlot::for_account(ACCOUNT),
         Arc::new(ManualClock::new(t(0))),
         manager_config(),
@@ -485,31 +459,27 @@ async fn healthy_refill_emits_no_warning() {
 }
 
 /// A sink that fails a fixed number of times, then delegates.
-struct FlakySink {
-    inner: Arc<MemoryStore>,
-    failures_left: std::sync::atomic::AtomicU32,
-}
-
-#[async_trait]
-impl UsageSink for FlakySink {
-    async fn ingest(
-        &self,
-        events: &[UsageEvent],
-        now: Timestamp,
-    ) -> Result<IngestReport, IngestError> {
-        if self
-            .failures_left
-            .fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |n| n.checked_sub(1),
-            )
-            .is_ok()
-        {
-            return Err(StoreError("sink unavailable".into()).into());
-        }
-        self.inner.ingest(events, now).await
-    }
+/// Fails a fixed number of ingests, then behaves like the store it wraps.
+fn flaky_sink(store: Arc<MemoryStore>, failures: u32) -> Arc<DelegatingStore<MemoryStore>> {
+    let failures_left = Arc::new(std::sync::atomic::AtomicU32::new(failures));
+    Arc::new(
+        DelegatingStore::wrapping(store).on_ingest(move |inner, events, now| {
+            let failures_left = Arc::clone(&failures_left);
+            async move {
+                if failures_left
+                    .fetch_update(
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                        |n| n.checked_sub(1),
+                    )
+                    .is_ok()
+                {
+                    return Err(StoreError("sink unavailable".into()).into());
+                }
+                inner.ingest(&events, now).await
+            }
+        }),
+    )
 }
 
 /// An outage is a duration, not an event. `WriterStats` reports a recovered
@@ -528,10 +498,7 @@ async fn usage_sink_outage_and_recovery_are_reported() {
         .await
         .unwrap();
     let (captor, _guard) = capture();
-    let sink = Arc::new(FlakySink {
-        inner: store.clone(),
-        failures_left: std::sync::atomic::AtomicU32::new(3),
-    });
+    let sink = flaky_sink(store.clone(), 3);
     let (recorder, writer) = UsageWriter::spawn(
         sink as Arc<dyn UsageSink>,
         Arc::new(ManualClock::new(t(0))),
@@ -634,32 +601,37 @@ async fn missing_credential_attribution_emits_a_structured_coverage_event() {
     );
 }
 
-struct AttributionSink(std::sync::atomic::AtomicU8);
-
-#[async_trait]
-impl UsageSink for AttributionSink {
-    async fn ingest(
-        &self,
-        events: &[UsageEvent],
-        _now: Timestamp,
-    ) -> Result<IngestReport, IngestError> {
-        Ok(IngestReport {
-            accepted: events.len() as u64,
-            duplicate: 0,
-            rejected: 0,
-            unattributed: match self.0.load(std::sync::atomic::Ordering::Relaxed) {
-                0 => Some(0),
-                1 => Some(events.len() as u64),
-                _ => None,
+/// Reports attribution three ways, as the `mode` byte says.
+fn attribution_sink(
+    mode: &Arc<std::sync::atomic::AtomicU8>,
+) -> Arc<DelegatingStore<RejectingStore>> {
+    let mode = Arc::clone(mode);
+    Arc::new(
+        rejecting("an attribution fixture answers ingest and nothing else").on_ingest(
+            move |_, events, _now| {
+                let mode = Arc::clone(&mode);
+                async move {
+                    Ok(IngestReport {
+                        accepted: events.len() as u64,
+                        duplicate: 0,
+                        rejected: 0,
+                        unattributed: match mode.load(std::sync::atomic::Ordering::Relaxed) {
+                            0 => Some(0),
+                            1 => Some(events.len() as u64),
+                            _ => None,
+                        },
+                    })
+                }
             },
-        })
-    }
+        ),
+    )
 }
 
 #[tokio::test(start_paused = true)]
 async fn attribution_coverage_reports_transitions_without_repeating_incidents() {
     let (captor, _guard) = capture();
-    let sink = Arc::new(AttributionSink(std::sync::atomic::AtomicU8::new(0)));
+    let mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let sink = attribution_sink(&mode);
     let (recorder, writer) = UsageWriter::spawn(
         sink.clone(),
         Arc::new(ManualClock::new(t(0))),
@@ -673,7 +645,7 @@ async fn attribution_coverage_reports_transitions_without_repeating_incidents() 
         },
     )
     .unwrap();
-    for (request, (mode, transitions)) in [
+    for (request, (reported, transitions)) in [
         (0, 0),
         (0, 0),
         (1, 1),
@@ -687,7 +659,7 @@ async fn attribution_coverage_reports_transitions_without_repeating_incidents() 
     .into_iter()
     .enumerate()
     {
-        sink.0.store(mode, std::sync::atomic::Ordering::Relaxed);
+        mode.store(reported, std::sync::atomic::Ordering::Relaxed);
         recorder.try_reserve().unwrap().record(UsageEvent::new(
             tollgate_core::RequestId(request as u128),
             ACCOUNT,
@@ -744,56 +716,24 @@ async fn attribution_coverage_reports_transitions_without_repeating_incidents() 
 }
 
 /// An allocator that grants normally and rejects every release capability.
-struct RefusingReleaseAllocator {
-    inner: Arc<MemoryStore>,
-    invalid: bool,
-}
-
-#[async_trait]
-impl LeaseAllocator for RefusingReleaseAllocator {
-    async fn acquire(
-        &self,
-        account: AccountId,
-        requested: CostUnits,
-        ttl: SignedDuration,
-        now: Timestamp,
-    ) -> Result<tollgate_core::LeaseGrant, AllocateError> {
-        self.inner.acquire(account, requested, ttl, now).await
-    }
-
-    async fn release(
-        &self,
-        _lease_id: tollgate_core::LeaseId,
-        _fencing_token: tollgate_core::FencingToken,
-        _unspent: CostUnits,
-        _now: Timestamp,
-    ) -> Result<(), AllocateError> {
-        Err(if self.invalid {
-            AllocateError::InvalidRelease
-        } else {
-            AllocateError::Fenced
-        })
-    }
-
-    async fn consolidate(
-        &self,
-        _lease_id: tollgate_core::LeaseId,
-        _fencing_token: tollgate_core::FencingToken,
-        _unspent: tollgate_core::CostUnits,
-        _requested: tollgate_core::CostUnits,
-        _ttl: jiff::SignedDuration,
-        _now: jiff::Timestamp,
-    ) -> Result<tollgate_core::LeaseGrant, tollgate_store::AllocateError> {
-        unreachable!("these fixtures never consolidate")
-    }
-
-    async fn reclaim_expired_batch(
-        &self,
-        now: Timestamp,
-        limit: NonZeroUsize,
-    ) -> Result<ReclaimBatch, StoreError> {
-        self.inner.reclaim_expired_batch(now, limit).await
-    }
+/// Refuses every release, fenced or invalid, over a real store.
+///
+/// `consolidate` keeps its `unreachable!()`: this wrapper has a store behind
+/// it, so delegation would silently give it a working exchange.
+fn refusing_release(store: Arc<MemoryStore>, invalid: bool) -> Arc<DelegatingStore<MemoryStore>> {
+    Arc::new(
+        DelegatingStore::wrapping(store)
+            .on_release(move |_, _lease, _fence, _unspent, _now| async move {
+                Err(if invalid {
+                    AllocateError::InvalidRelease
+                } else {
+                    AllocateError::Fenced
+                })
+            })
+            .on_consolidate(|_, _, _, _, _, _, _| async {
+                unreachable!("these fixtures never consolidate")
+            }),
+    )
 }
 
 /// A fenced capability is obsolete; invalid counts are an integrity fault
@@ -803,10 +743,7 @@ async fn refused_release_at_shutdown_is_reported() {
     for invalid in [false, true] {
         let (captor, _guard) = capture();
         let manager = LeaseManager::spawn(
-            Arc::new(RefusingReleaseAllocator {
-                inner: store(10_000),
-                invalid,
-            }) as Arc<dyn LeaseAllocator>,
+            refusing_release(store(10_000), invalid) as Arc<dyn LeaseAllocator>,
             LeaseSlot::for_account(ACCOUNT),
             Arc::new(ManualClock::new(t(0))),
             manager_config(),
@@ -834,27 +771,32 @@ async fn refused_release_at_shutdown_is_reported() {
     }
 }
 
-struct RefusingKeys(std::sync::atomic::AtomicBool);
-#[async_trait]
-impl tollgate_store::KeySource for RefusingKeys {
-    async fn active_keys_page(
-        &self,
-        now: Timestamp,
-        after: Option<tollgate_core::KeyId>,
-        limit: NonZeroUsize,
-    ) -> Result<tollgate_store::KeyPage, StoreError> {
-        if self.0.load(std::sync::atomic::Ordering::SeqCst) {
-            tollgate_store::KeyPage::try_new(1, now, after, limit, vec![], None)
-        } else {
-            Err(StoreError("fixture-sensitive-response-body".into()))
-        }
-    }
+/// Serves an empty key page, or refuses, as the `healthy` flag says.
+fn refusing_keys(
+    healthy: &Arc<std::sync::atomic::AtomicBool>,
+) -> Arc<DelegatingStore<RejectingStore>> {
+    let healthy = Arc::clone(healthy);
+    Arc::new(
+        rejecting("a key-source fixture answers pages and nothing else").on_active_keys_page(
+            move |_, now, after, limit| {
+                let healthy = Arc::clone(&healthy);
+                async move {
+                    if healthy.load(std::sync::atomic::Ordering::SeqCst) {
+                        tollgate_store::KeyPage::try_new(1, now, after, limit, vec![], None)
+                    } else {
+                        Err(StoreError("fixture-sensitive-response-body".into()))
+                    }
+                }
+            },
+        ),
+    )
 }
 
 #[tokio::test(start_paused = true)]
 async fn credential_refresh_failure_is_structured_without_exposing_the_source_body() {
     let (captor, _guard) = capture();
-    let source = Arc::new(RefusingKeys(std::sync::atomic::AtomicBool::new(false)));
+    let healthy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let source = refusing_keys(&healthy);
     let manager = tollgate_client::KeyManager::spawn(
         source.clone(),
         b"fixture-events-credential-secret-108",
@@ -878,7 +820,7 @@ async fn credential_refresh_failure_is_structured_without_exposing_the_source_bo
             .flat_map(|event| &event.fields)
             .all(|(_, value)| !value.contains("fixture-sensitive-response-body"))
     );
-    source.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    healthy.store(true, std::sync::atomic::Ordering::SeqCst);
     for completed in 1..=2 {
         tokio::time::advance(std::time::Duration::from_secs(5)).await;
         while monitor.report(t(100)).stats.refreshes < completed {

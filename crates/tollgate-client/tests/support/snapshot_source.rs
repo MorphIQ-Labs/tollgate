@@ -1,7 +1,12 @@
-use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use tollgate_core::Principal;
-use tollgate_store::{SnapshotPush, SnapshotResolution, SnapshotSource, StoreError};
+use tollgate_store::{SnapshotPush, SnapshotResolution};
+
+// The delegating double is a sibling module in whichever test binary includes
+// this file, so it is referred to rather than included again: loading the same
+// file as a module twice in one binary is `clippy::duplicate_mod`.
+use crate::delegating::rejecting;
+pub(crate) use crate::delegating::{DelegatingStore, RejectingStore};
 
 /// A source whose pulls are fixed and whose pushes the test drives directly.
 ///
@@ -15,12 +20,31 @@ pub(crate) struct DrivenPushSource {
 }
 
 impl DrivenPushSource {
-    pub(crate) fn new(pull: SnapshotResolution) -> Arc<Self> {
+    /// The handle and the source to hand `SnapshotManager::spawn`.
+    pub(crate) fn new(
+        pull: SnapshotResolution,
+    ) -> (Arc<Self>, Arc<DelegatingStore<RejectingStore>>) {
         let (push, _) = tokio::sync::broadcast::channel(8);
-        Arc::new(Self {
+        let source = Arc::new(Self {
             pull: Mutex::new(pull),
             push,
-        })
+        });
+        let (pulls, subs) = (Arc::clone(&source), Arc::clone(&source));
+        (
+            source,
+            Arc::new(
+                rejecting("a driven-push fixture answers snapshots and nothing else")
+                    .on_snapshot(move |_, _principal| {
+                        let source = Arc::clone(&pulls);
+                        async move { Ok(source.pull.lock().expect("pull mode poisoned").clone()) }
+                    })
+                    .on_subscribe(move |_| subs.push.subscribe())
+                    // Stated, not inherited: this source has no catalogue, and
+                    // saying so is what keeps it distinguishable from a wrapper
+                    // that forgot to forward one it did have (#83).
+                    .on_principals(|_| async { Ok(None) }),
+            ),
+        )
     }
 
     pub(crate) fn set_pull(&self, resolution: SnapshotResolution) {
@@ -40,16 +64,5 @@ impl DrivenPushSource {
             })
             .expect("the manager must be subscribed");
         assert_eq!(delivered, 1, "exactly one subscriber must receive the push");
-    }
-}
-
-#[async_trait]
-impl SnapshotSource for DrivenPushSource {
-    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
-        Ok(self.pull.lock().expect("pull mode poisoned").clone())
-    }
-
-    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-        self.push.subscribe()
     }
 }

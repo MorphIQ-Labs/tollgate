@@ -5,21 +5,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use jiff::Timestamp;
 use tokio::sync::Notify;
 use tollgate_client::{
     ManualClock, PeriodRoller, PeriodRollerConfig, PeriodRollerHealth, PeriodRollerMonitor,
     PeriodRollerReport,
 };
-use tollgate_core::{
-    AccountId, AccountStatus, BudgetSchedule, CapacityClass, CostUnits, Principal,
-    PublishableSnapshot,
-};
-use tollgate_store::{
-    AccountConfig, AdminStore, AllocateError, BudgetError, CreateAccountError, GrantPolicy,
-    MemoryStore, PublishSnapshotError, RolloverBatch, SetStatusError, StatusChange, StoreError,
-};
+use tollgate_core::{AccountId, AccountStatus, BudgetSchedule, CapacityClass, CostUnits};
+use tollgate_store::{AccountConfig, AdminStore, GrantPolicy, MemoryStore, StoreError};
+
+#[path = "../../tollgate-store/tests/support/delegating.rs"]
+mod delegating;
+use delegating::DelegatingStore;
 
 fn t(value: &str) -> Timestamp {
     value.parse().unwrap()
@@ -102,8 +99,12 @@ enum Action {
     Advance(Timestamp),
     Panic,
 }
+/// The rollover script and everything the tests observe about it.
+///
+/// This used to implement `AdminStore` itself, and spent 47 of its 89 lines on
+/// seven `unreachable!()` stubs for methods a period roller never calls. It is
+/// now just the state; [`rolling`] pairs it with a store.
 struct Scripted {
-    store: Arc<MemoryStore>,
     clock: Arc<ManualClock>,
     actions: Mutex<VecDeque<Action>>,
     calls: Mutex<Vec<(Timestamp, usize)>>,
@@ -111,25 +112,29 @@ struct Scripted {
     active: AtomicUsize,
     max_active: AtomicUsize,
 }
+
 impl Scripted {
+    /// The observation handle and the store to hand [`PeriodRoller::spawn`].
     fn new(
         store: Arc<MemoryStore>,
         clock: Arc<ManualClock>,
         actions: impl IntoIterator<Item = Action>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            store,
+    ) -> (Arc<Self>, Arc<DelegatingStore<MemoryStore>>) {
+        let scripted = Arc::new(Self {
             clock,
             actions: Mutex::new(actions.into_iter().collect()),
             calls: Mutex::new(Vec::new()),
             notified: Notify::new(),
             active: AtomicUsize::new(0),
             max_active: AtomicUsize::new(0),
-        })
+        });
+        (Arc::clone(&scripted), rolling(store, &scripted))
     }
+
     fn calls(&self) -> Vec<(Timestamp, usize)> {
         self.calls.lock().unwrap().clone()
     }
+
     async fn wait_calls(&self, count: usize) {
         tokio::time::timeout(secs(120), async {
             while self.calls().len() < count {
@@ -140,101 +145,59 @@ impl Scripted {
         .unwrap();
     }
 }
+
 struct Active<'a>(&'a AtomicUsize);
 impl Drop for Active<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
-#[async_trait]
-impl AdminStore for Scripted {
-    async fn roll_due_periods(
-        &self,
-        now: Timestamp,
-        limit: NonZeroUsize,
-    ) -> Result<RolloverBatch, StoreError> {
-        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-        self.max_active.fetch_max(active, Ordering::SeqCst);
-        let _active = Active(&self.active);
-        self.calls.lock().unwrap().push((now, limit.get()));
-        self.notified.notify_one();
-        let action = self
-            .actions
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or(Action::Normal);
-        match action {
-            Action::Fail => return Err(StoreError("roll unavailable".into())),
-            Action::Hang => return std::future::pending().await,
-            Action::Delay(duration) => tokio::time::sleep(duration).await,
-            Action::Advance(to) => self.clock.set(to),
-            Action::Panic => panic!("injected rollover task failure"),
-            Action::Normal | Action::CommitThenHang | Action::CommitThenFail => {}
-        }
-        let batch = AdminStore::roll_due_periods(&*self.store, now, limit).await?;
-        match action {
-            Action::CommitThenHang => std::future::pending().await,
-            Action::CommitThenFail => Err(StoreError("reply lost after commit".into())),
-            _ => Ok(batch),
-        }
-    }
-    async fn create_account(
-        &self,
-        _: AccountConfig,
-    ) -> Result<tollgate_store::AdminReceipt<()>, CreateAccountError> {
-        unreachable!("roller never creates accounts")
-    }
-    async fn deposit(
-        &self,
-        _: AccountId,
-        _: CostUnits,
-    ) -> Result<tollgate_store::AdminReceipt<()>, AllocateError> {
-        unreachable!("roller never deposits directly")
-    }
-    async fn set_account_status(
-        &self,
-        _: AccountId,
-        _: AccountStatus,
-    ) -> Result<tollgate_store::AdminReceipt<StatusChange>, SetStatusError> {
-        unreachable!("roller never changes status")
-    }
-    async fn set_capacity_class(
-        &self,
-        _: AccountId,
-        _: CapacityClass,
-    ) -> Result<tollgate_store::AdminReceipt<StatusChange>, SetStatusError> {
-        unreachable!("roller never changes capacity")
-    }
-    async fn set_budget_schedule(
-        &self,
-        _: AccountId,
-        _: Option<BudgetSchedule>,
-    ) -> Result<(), BudgetError> {
-        unreachable!("roller never changes schedules")
-    }
-    async fn publish_snapshot(
-        &self,
-        _: Principal,
-        _: PublishableSnapshot,
-    ) -> Result<tollgate_store::AdminReceipt<()>, PublishSnapshotError> {
-        unreachable!("roller never publishes snapshots")
-    }
-    async fn remove_snapshot(
-        &self,
-        _: Principal,
-    ) -> Result<tollgate_store::AdminReceipt<()>, StoreError> {
-        unreachable!("roller never removes snapshots")
-    }
+
+/// A store whose `roll_due_periods` follows `scripted`, and whose every other
+/// method is the wrapped store's.
+fn rolling(store: Arc<MemoryStore>, scripted: &Arc<Scripted>) -> Arc<DelegatingStore<MemoryStore>> {
+    let scripted = Arc::clone(scripted);
+    Arc::new(
+        DelegatingStore::wrapping(store).on_roll_due_periods(move |inner, now, limit| {
+            let scripted = Arc::clone(&scripted);
+            async move {
+                let active = scripted.active.fetch_add(1, Ordering::SeqCst) + 1;
+                scripted.max_active.fetch_max(active, Ordering::SeqCst);
+                let _active = Active(&scripted.active);
+                scripted.calls.lock().unwrap().push((now, limit.get()));
+                scripted.notified.notify_one();
+                let action = scripted
+                    .actions
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Action::Normal);
+                match action {
+                    Action::Fail => return Err(StoreError("roll unavailable".into())),
+                    Action::Hang => return std::future::pending().await,
+                    Action::Delay(duration) => tokio::time::sleep(duration).await,
+                    Action::Advance(to) => scripted.clock.set(to),
+                    Action::Panic => panic!("injected rollover task failure"),
+                    Action::Normal | Action::CommitThenHang | Action::CommitThenFail => {}
+                }
+                let batch = AdminStore::roll_due_periods(&*inner, now, limit).await?;
+                match action {
+                    Action::CommitThenHang => std::future::pending().await,
+                    Action::CommitThenFail => Err(StoreError("reply lost after commit".into())),
+                    _ => Ok(batch),
+                }
+            }
+        }),
+    )
 }
 
 #[tokio::test(start_paused = true)]
 async fn startup_drains_saturated_batches_without_waiting_for_a_tick() {
     let store = store(5).await;
     let clock = Arc::new(ManualClock::new(january()));
-    let scripted = Scripted::new(store.clone(), clock.clone(), []);
+    let (scripted, rolling) = Scripted::new(store.clone(), clock.clone(), []);
     let started = tokio::time::Instant::now();
-    let roller = PeriodRoller::spawn(scripted.clone(), clock, config()).unwrap();
+    let roller = PeriodRoller::spawn(rolling, clock, config()).unwrap();
     let mut monitor = roller.monitor();
     assert_eq!(monitor.report().health, PeriodRollerHealth::Starting);
     let report = observe(&mut monitor, |r| r.stats.passes_completed == 1).await;
@@ -257,8 +220,8 @@ async fn a_pass_freezes_its_cutoff_even_when_the_clock_crosses_another_boundary(
     let store = store(5).await;
     let clock = Arc::new(ManualClock::new(january()));
     let march = t("2026-03-01T00:00:00Z");
-    let scripted = Scripted::new(store.clone(), clock.clone(), [Action::Advance(march)]);
-    let roller = PeriodRoller::spawn(scripted.clone(), clock, config()).unwrap();
+    let (scripted, rolling) = Scripted::new(store.clone(), clock.clone(), [Action::Advance(march)]);
+    let roller = PeriodRoller::spawn(rolling, clock, config()).unwrap();
     let mut monitor = roller.monitor();
     observe(&mut monitor, |r| r.stats.passes_completed == 1).await;
     assert_eq!(scripted.calls(), vec![(january(), 2); 3]);
@@ -343,8 +306,8 @@ async fn racing_rollers_do_not_duplicate_an_allowance() {
 async fn failure_preserves_confirmed_progress_and_waits_before_retrying() {
     let store = store(5).await;
     let clock = Arc::new(ManualClock::new(january()));
-    let scripted = Scripted::new(store, clock.clone(), [Action::Normal, Action::Fail]);
-    let roller = PeriodRoller::spawn(scripted.clone(), clock, config()).unwrap();
+    let (scripted, rolling) = Scripted::new(store, clock.clone(), [Action::Normal, Action::Fail]);
+    let roller = PeriodRoller::spawn(rolling, clock, config()).unwrap();
     let mut monitor = roller.monitor();
     let failed = observe(&mut monitor, |r| r.stats.failures == 1).await;
     assert_eq!(failed.health, PeriodRollerHealth::Degraded);
@@ -365,8 +328,8 @@ async fn failure_preserves_confirmed_progress_and_waits_before_retrying() {
 #[tokio::test(start_paused = true)]
 async fn a_hung_call_times_out_and_the_next_pass_recovers() {
     let clock = Arc::new(ManualClock::new(january()));
-    let scripted = Scripted::new(store(1).await, clock.clone(), [Action::Hang]);
-    let roller = PeriodRoller::spawn(scripted.clone(), clock, config()).unwrap();
+    let (scripted, rolling) = Scripted::new(store(1).await, clock.clone(), [Action::Hang]);
+    let roller = PeriodRoller::spawn(rolling, clock, config()).unwrap();
     let mut monitor = roller.monitor();
     let timed_out = observe(&mut monitor, |r| r.stats.call_timeouts == 1).await;
     assert_eq!(timed_out.stats.pass_timeouts, 0);
@@ -382,9 +345,10 @@ async fn a_hung_call_times_out_and_the_next_pass_recovers() {
 #[tokio::test(start_paused = true)]
 async fn one_pass_budget_bounds_every_batch_and_preserves_its_progress() {
     let clock = Arc::new(ManualClock::new(january()));
-    let scripted = Scripted::new(store(8).await, clock.clone(), [Action::Delay(secs(4)); 4]);
+    let (scripted, rolling) =
+        Scripted::new(store(8).await, clock.clone(), [Action::Delay(secs(4)); 4]);
     let started = tokio::time::Instant::now();
-    let roller = PeriodRoller::spawn(scripted.clone(), clock, config()).unwrap();
+    let roller = PeriodRoller::spawn(rolling, clock, config()).unwrap();
     let mut monitor = roller.monitor();
     let report = observe(&mut monitor, |r| r.stats.pass_timeouts == 1).await;
     assert_eq!(tokio::time::Instant::now() - started, secs(12));
@@ -404,7 +368,7 @@ async fn one_pass_budget_bounds_every_batch_and_preserves_its_progress() {
 #[tokio::test(start_paused = true)]
 async fn a_pass_deadline_can_interrupt_a_call_before_its_own_timeout() {
     let clock = Arc::new(ManualClock::new(january()));
-    let scripted = Scripted::new(
+    let (_scripted, rolling) = Scripted::new(
         store(5).await,
         clock.clone(),
         [Action::Delay(secs(4)), Action::Hang],
@@ -412,7 +376,7 @@ async fn a_pass_deadline_can_interrupt_a_call_before_its_own_timeout() {
     let mut cfg = config();
     cfg.pass_timeout = secs(6);
     let started = tokio::time::Instant::now();
-    let roller = PeriodRoller::spawn(scripted, clock, cfg).unwrap();
+    let roller = PeriodRoller::spawn(rolling, clock, cfg).unwrap();
     let mut monitor = roller.monitor();
     let report = observe(&mut monitor, |r| r.stats.pass_timeouts == 1).await;
     assert_eq!(tokio::time::Instant::now() - started, secs(6));
@@ -427,8 +391,8 @@ async fn uncertain_commits_remain_visible_after_recovery_and_shutdown() {
     for action in [Action::CommitThenHang, Action::CommitThenFail] {
         let store = store(1).await;
         let clock = Arc::new(ManualClock::new(january()));
-        let scripted = Scripted::new(store.clone(), clock.clone(), [action]);
-        let roller = PeriodRoller::spawn(scripted, clock, config()).unwrap();
+        let (_scripted, rolling) = Scripted::new(store.clone(), clock.clone(), [action]);
+        let roller = PeriodRoller::spawn(rolling, clock, config()).unwrap();
         let mut monitor = roller.monitor();
         observe(&mut monitor, |r| r.stats.passes_incomplete == 1).await;
         let report = observe(&mut monitor, |r| r.stats.passes_completed == 1).await;
@@ -445,8 +409,9 @@ async fn uncertain_commits_remain_visible_after_recovery_and_shutdown() {
 #[tokio::test(start_paused = true)]
 async fn shutdown_interrupts_a_hung_call_and_reports_its_uncertainty() {
     let clock = Arc::new(ManualClock::new(january()));
-    let scripted = Scripted::new(store(1).await, clock.clone(), [Action::CommitThenHang]);
-    let roller = PeriodRoller::spawn(scripted.clone(), clock, config()).unwrap();
+    let (scripted, rolling) =
+        Scripted::new(store(1).await, clock.clone(), [Action::CommitThenHang]);
+    let roller = PeriodRoller::spawn(rolling, clock, config()).unwrap();
     let monitor = roller.monitor();
     scripted.wait_calls(1).await;
     let started = tokio::time::Instant::now();
@@ -466,8 +431,8 @@ async fn shutdown_interrupts_a_hung_call_and_reports_its_uncertainty() {
 async fn dropping_the_owner_or_an_unpolled_shutdown_aborts_the_task() {
     for cancel_shutdown in [false, true] {
         let clock = Arc::new(ManualClock::new(january()));
-        let scripted = Scripted::new(store(1).await, clock.clone(), [Action::Hang]);
-        let roller = PeriodRoller::spawn(scripted.clone(), clock, config()).unwrap();
+        let (scripted, rolling) = Scripted::new(store(1).await, clock.clone(), [Action::Hang]);
+        let roller = PeriodRoller::spawn(rolling, clock, config()).unwrap();
         let mut monitor = roller.monitor();
         scripted.wait_calls(1).await;
         if cancel_shutdown {
@@ -495,12 +460,12 @@ async fn dropping_the_owner_or_an_unpolled_shutdown_aborts_the_task() {
 #[tokio::test(start_paused = true)]
 async fn a_task_that_dies_after_a_healthy_pass_is_reported_failed() {
     let clock = Arc::new(ManualClock::new(january()));
-    let scripted = Scripted::new(
+    let (_scripted, rolling) = Scripted::new(
         store(1).await,
         clock.clone(),
         [Action::Normal, Action::Panic],
     );
-    let roller = PeriodRoller::spawn(scripted, clock, config()).unwrap();
+    let roller = PeriodRoller::spawn(rolling, clock, config()).unwrap();
     let mut monitor = roller.monitor();
     observe(&mut monitor, |r| r.health == PeriodRollerHealth::Healthy).await;
     closed(&mut monitor).await;
@@ -544,8 +509,8 @@ fn invalid_durations_are_rejected_before_a_task_can_start() {
 #[tokio::test(start_paused = true)]
 async fn shutdown_before_the_task_starts_makes_no_store_call() {
     let clock = Arc::new(ManualClock::new(january()));
-    let scripted = Scripted::new(store(1).await, clock.clone(), []);
-    let roller = PeriodRoller::spawn(scripted.clone(), clock, config()).unwrap();
+    let (scripted, rolling) = Scripted::new(store(1).await, clock.clone(), []);
+    let roller = PeriodRoller::spawn(rolling, clock, config()).unwrap();
     let report = roller.shutdown().await;
     assert_eq!(report.report.health, PeriodRollerHealth::Stopped);
     assert_eq!(report.report.stats.passes_started, 0);
@@ -559,8 +524,8 @@ async fn cancelling_a_polled_shutdown_keeps_ownership_of_the_task() {
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
     let clock = Arc::new(ManualClock::new(january()));
-    let scripted = Scripted::new(store(1).await, clock.clone(), [Action::Hang]);
-    let roller = PeriodRoller::spawn(scripted.clone(), clock, config()).unwrap();
+    let (scripted, rolling) = Scripted::new(store(1).await, clock.clone(), [Action::Hang]);
+    let roller = PeriodRoller::spawn(rolling, clock, config()).unwrap();
     let mut monitor = roller.monitor();
     scripted.wait_calls(1).await;
     let mut shutdown = Box::pin(roller.shutdown());
@@ -586,8 +551,8 @@ proptest::proptest! {
         tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap().block_on(async {
             let store = store(1).await;
             let clock = Arc::new(ManualClock::new(january()));
-            let scripted = Scripted::new(store.clone(), clock.clone(), []);
-            let roller = PeriodRoller::spawn(scripted.clone(), clock.clone(), config()).unwrap();
+            let (scripted, rolling) = Scripted::new(store.clone(), clock.clone(), []);
+            let roller = PeriodRoller::spawn(rolling, clock.clone(), config()).unwrap();
             let mut monitor = roller.monitor();
             let mut period = 0;
             let mut deposits = 0;
