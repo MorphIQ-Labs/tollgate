@@ -9,10 +9,21 @@
 //! 5. principal and account concurrency acquisition,
 //! 6. lease debit, opening the typed pending state.
 //!
-//! Nothing in this crate performs I/O, takes a lock on the request path, or
-//! reads a clock (`now` is an argument; `governor` uses its own monotonic
-//! clock for bucket arithmetic only). Misses deny — resolution is the
-//! background plane's job (INVARIANTS.md #5).
+//! Nothing in this crate performs I/O, takes a blocking lock on the request
+//! path, or reads a wall/business clock for a policy decision: `now` is an
+//! argument. Misses deny — resolution is the background plane's job
+//! (INVARIANTS.md #5).
+//!
+//! Two dependencies do their own bookkeeping underneath that, and the budget
+//! counts it rather than pretending it away. `governor` reads its own
+//! monotonic clock for bucket arithmetic. [`MokaSnapshotMap`] reads one too,
+//! and roughly every sixty-fourth lookup its housekeeper takes a
+//! *non-blocking* `try_lock` and drains its read log inline — updating the
+//! frequency sketch, and evicting when the cache is at capacity. Neither is a
+//! source of snapshot or lease truth, and neither can block a request; both
+//! are measured mechanism costs, carried by the `admission/snapshot_lookup_*`
+//! rows and by `moka_reads_stay_within_their_amortized_allocation_budget`.
+//! [`ArcSwapSnapshotMap`] takes no lock on a read at all.
 //!
 //! That prohibition covers logging too, so what this plane reports about
 //! itself is a tally rather than an event stream: every outcome lands in

@@ -244,7 +244,28 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    under `Strict`; it is the one condition `Elastic` may admit past, because it
    is the one that says something about *funding* rather than about validity
    (1). Nothing else in this list is mode-dependent. The request path performs no database, file, lock-file, or network
-   access — not even on a miss. A deny also says which kind it is: a request
+   access — not even on a miss.
+
+   This is a rule about I/O, and it is worth saying what it is *not*, because
+   two other documents used to cite it as forbidding locks outright. The hot
+   path takes no *blocking* lock and reads no wall or business clock for a
+   policy decision. A dependency's own bounded, non-blocking bookkeeping is a
+   different thing and is permitted: `MokaSnapshotMap` lets moka's housekeeper
+   drain its read log inline behind a `try_lock`, updating the frequency
+   sketch and evicting at capacity, and `governor` reads a monotonic clock for
+   bucket arithmetic. Neither can block a request and neither is a source of
+   snapshot or lease truth. They are measured, not assumed: the allocation
+   share by
+   `moka_reads_stay_within_their_amortized_allocation_budget` (24), and the
+   latency by the `admission/snapshot_lookup_moka` row, and — once its bound
+   is recorded on the controlled host — by the at-capacity benchmark beside
+   it, which exists because a moka cache below half its capacity does not
+   enable its frequency sketch at all, so an under-filled benchmark prices
+   neither the sketch nor eviction.
+   No test asserts the absence of a `try_lock` on the request path; this
+   invariant does not claim one does.
+
+   A deny also says which kind it is: a request
    that can *never* be admitted under the account's current schedule — its
    quote exceeds the whole burst — is `UnpriceableUnderLimits`, never
    `RateLimited`, so a caller is never told to retry something that cannot

@@ -3,5 +3,6 @@
   "clippy::let_underscore_must_use": "Clippy lint for discarding a must-use result",
   "error_id_unavailable": "Static diagnostic event name, not a Rust declaration; diagnostic middleware reports failed entropy acquisition",
   "tollgate_accounts.status": "SQL account-status column; enforced by migrations and backend scenario tests",
+  "try_lock": "parking_lot::Mutex::try_lock, the non-blocking acquisition moka's housekeeper uses to drain its read log inline",
   "unused_must_use": "Rust compiler lint for discarding a must-use value"
 }

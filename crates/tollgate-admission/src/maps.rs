@@ -493,6 +493,31 @@ macro_rules! publication_methods {
 /// on its *write* path too, so a stored value must not resolve anything
 /// request-local in `Clone`: it would be resolved against the installing
 /// thread before any request saw it. Locality is applied in `get_at`.
+///
+/// **This map does maintenance on the request path, and that is the price of
+/// being bounded.** A `get` records a read op; when the read log reaches
+/// `READ_LOG_FLUSH_POINT` (64) or a 300 ms monotonic deadline passes, moka's
+/// housekeeper drains it — behind a `try_lock` on a `parking_lot::Mutex`,
+/// updating the TinyLFU frequency sketch, and evicting when the cache is at
+/// capacity (moka 0.12.16). The `try_lock` never blocks: a request that finds
+/// the housekeeper busy skips the drain and returns. So this is bounded,
+/// amortized, non-blocking work on the hot path rather than a stall — but it
+/// is not nothing, and the crate's budget counts it rather than claiming the
+/// request path takes no lock at all.
+///
+/// Two consequences worth knowing before choosing this map over
+/// [`ArcSwapSnapshotMap`], whose reads take no lock and evict nothing:
+///
+/// * Below half of `max_capacity`, moka does not enable the frequency sketch
+///   at all, so a cache that is never filled pays neither the sketch nor
+///   eviction. The `admission/snapshot_lookup_moka` bench row measures that
+///   under-filled state; `admission/snapshot_lookup_moka_at_capacity`
+///   measures a full one. Both run; the second is reserved in the threshold
+///   manifest rather than gated by it, because its bound has to be recorded
+///   on the controlled host before it is a contract.
+/// * A bounded map can evict an entry the control plane still believes is
+///   published. That is not a defect — it is what `SnapshotMap::needs_refresh`
+///   and the generation history below exist to repair.
 pub struct MokaSnapshotMap {
     cache: moka::sync::Cache<Principal, StoredEntry, PrincipalHasher>,
     watermarks: Mutex<GenerationHistory>,

@@ -7,7 +7,11 @@
     "#93": [
       "reservation/commit_split"
     ],
-    "#99": []
+    "#99": [],
+    "#68": [
+      "admission/snapshot_lookup_arc_swap_at_capacity",
+      "admission/snapshot_lookup_moka_at_capacity"
+    ]
   },
   "benchmarks": [
     {

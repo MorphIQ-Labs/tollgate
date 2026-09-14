@@ -128,8 +128,12 @@ thresholds require deliberate calibration evidence.
 
 ## Design rules
 
-- The request path performs no I/O, takes no locks, reads no clock (`now` is
-  an argument). Everything slow is a background plane.
+- The request path performs no I/O, takes no blocking locks, and reads no
+  wall clock for a policy decision (`now` is an argument). Everything slow is
+  a background plane. Moka's cache housekeeping and governor's bucket
+  arithmetic do read their own monotonic clocks, and moka's takes a
+  non-blocking `try_lock` on roughly every sixty-fourth lookup; those are
+  measured mechanism costs, never sources of truth.
 - Fail closed: unknown, stale, exhausted, or backpressured states deny with
   zero units charged — there is no slower fallback path.
 - Snapshot revocations are durable, generation-ordered tombstones; delayed
