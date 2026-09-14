@@ -7,6 +7,18 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.22.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.21.3...v0.22.0) - 2026-09-14
+
+### Fixed
+
+- *(store)* [**breaking**] order the expiry sweep by the index it already had
+
+### Other
+
+- *(deps)* centralize shared declarations and make allow reasons mechanical
+- *(design)* correct the at-capacity map-gap claim
+- *(admission)* move the lease handle into the reservation
+
 ## [0.21.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.21.2...v0.21.3) - 2026-09-14
 
 ### Fixed
