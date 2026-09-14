@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.22.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.22.1...v0.22.2) - 2026-09-14
+
+### Other
+
+- *(admission)* record SnapshotMap's forward-or-inherit rule on the trait
+
 ## [0.22.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.22.0...v0.22.1) - 2026-09-14
 
 ### Other
