@@ -547,9 +547,17 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    units only until the lease TTL expires, after which the allocator reclaims
    them. Each reclaim transaction is bounded; the server fixes one expiry
    cutoff and drains saturated batches immediately, so bounding lock scope
-   never caps the legitimate backlog that returns. *Tests:*
-   `expired_lease_units_reclaimed` and
-   `expired_backlog_is_reclaimed_in_bounded_batches` (store suites), plus
+   never caps the legitimate backlog that returns. A bounded batch is also the
+   *oldest due* leases and stops at the first one that is not due, identically
+   in both backends — and on PostgreSQL the batch's read work is bounded by the
+   batch rather than by the backlog, because the sweep orders by the expiry
+   index's own columns so the `LIMIT` stops the walk (#65). *Tests:*
+   `expired_lease_units_reclaimed`,
+   `expired_backlog_is_reclaimed_in_bounded_batches` and
+   `a_bounded_reclaim_page_settles_the_oldest_due_leases_first` (store suites),
+   `the_expiry_sweep_stops_at_its_batch_instead_of_sorting_the_backlog` and
+   `a_bounded_rollover_page_crosses_the_oldest_boundaries_first` (PostgreSQL
+   plan and page order), plus
    `one_scheduled_sweep_drains_every_saturated_batch` (server suite).
 
    Routine publication preserves ownership of the displaced grant. `LeaseSlot`

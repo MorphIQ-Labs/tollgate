@@ -23,8 +23,9 @@ use tollgate_core::{
 };
 use tollgate_store::{
     AccountConfig, AdminStore, AllocateError, BudgetError, Conservation, CreateAccountError,
-    GrantPolicy, KeyDirectory, KeyError, KeyRecord, LeaseAllocator, PublishSnapshotError,
-    Revocation, RolledAccount, SetStatusError, SnapshotResolution, SnapshotSource, UsageSink,
+    DEFAULT_RECLAIM_BATCH_LIMIT, GrantPolicy, KeyDirectory, KeyError, KeyRecord, LeaseAllocator,
+    PublishSnapshotError, Revocation, RolledAccount, SetStatusError, SnapshotResolution,
+    SnapshotSource, UsageSink,
 };
 use tollgate_store_postgres::PostgresStore;
 
@@ -470,6 +471,92 @@ async fn expired_backlog_is_reclaimed_in_bounded_batches() {
         other_conservation.holds(),
         "conservation violated: {other_conservation:?}"
     );
+}
+
+/// INVARIANTS.md #9: a bounded batch settles the *oldest due* leases, and
+/// stops at the first one that is not due.
+///
+/// `expired_backlog_is_reclaimed_in_bounded_batches` can see neither property:
+/// its three leases are all due, all share one expiry, and their ids are
+/// sorted before comparing. Here every lease has a distinct expiry, one is not
+/// yet due, and the owning account ids run *opposite* to expiry order — so a
+/// backend paging by account rather than by expiry returns a different page
+/// and fails, instead of silently settling different leases from the reference
+/// backend (#65).
+#[tokio::test]
+async fn a_bounded_reclaim_page_settles_the_oldest_due_leases_first() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    for id in 2..=4u128 {
+        AdminStore::create_account(
+            &*store,
+            AccountConfig {
+                account_id: AccountId(id),
+                initial_balance: CostUnits(100),
+                status: AccountStatus::Active,
+                capacity_class: CapacityClass::Assured,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    // Account 4 expires first, account 1 last and not yet due at the cutoff.
+    let mut leases = Vec::new();
+    for (id, acquired_at) in [(4u128, 0i64), (3, 10), (2, 20), (1, 600)] {
+        leases.push(
+            store
+                .acquire(AccountId(id), CostUnits(100), TTL, t(acquired_at))
+                .await
+                .unwrap(),
+        );
+    }
+
+    let limit = NonZeroUsize::new(2).unwrap();
+    let first = store.reclaim_expired_batch(t(100), limit).await.unwrap();
+    assert!(
+        first.is_saturated(),
+        "the page is full, so ordering decides it"
+    );
+    assert_eq!(
+        first
+            .reclaimed()
+            .iter()
+            .map(|lease| lease.account_id.0)
+            .collect::<Vec<_>>(),
+        vec![4, 3],
+        "the two oldest expiries settle first; account order would give [2, 3]"
+    );
+
+    let second = store.reclaim_expired_batch(t(100), limit).await.unwrap();
+    assert!(
+        !second.is_saturated(),
+        "the due prefix ends at the third lease"
+    );
+    assert_eq!(
+        second
+            .reclaimed()
+            .iter()
+            .map(|lease| lease.lease_id)
+            .collect::<Vec<_>>(),
+        vec![leases[2].lease_id],
+        "the walk stops at the lease that is not yet due"
+    );
+
+    // The survivor keeps its units until its own expiry passes.
+    assert_eq!(store.balance(AccountId(1)).await.unwrap(), CostUnits::ZERO);
+    let last = store.reclaim_expired_batch(t(700), limit).await.unwrap();
+    assert_eq!(
+        last.reclaimed()
+            .iter()
+            .map(|lease| lease.lease_id)
+            .collect::<Vec<_>>(),
+        vec![leases[3].lease_id]
+    );
+    assert_eq!(store.balance(AccountId(1)).await.unwrap(), CostUnits(100));
+    assert_conserved(&store).await;
 }
 
 #[tokio::test]
@@ -1668,6 +1755,190 @@ async fn the_account_filter_is_answered_by_an_index_not_by_discarding_rows() {
         !plan.contains("Filter: (account_id"),
         "the account predicate is still being applied by discarding rows other \
          accounts own, which is the cost #12 exists to remove; plan was:\n{plan}"
+    );
+}
+
+/// Issue #65: the sweep's `LIMIT` must stop an index walk, not slice a sort of
+/// the whole backlog.
+///
+/// The predicate always matched `tollgate_leases_expiry`. What did not was the
+/// `ORDER BY`: `(account_id, lease_id)` is answered by no index, so the planner
+/// read every expired row and sorted it to return one bounded page — making a
+/// drain quadratic in the backlog it exists to clear. A `Sort` above the scan
+/// is exactly that defect, so its absence is the property pinned here.
+#[tokio::test]
+async fn the_expiry_sweep_stops_at_its_batch_instead_of_sorting_the_backlog() {
+    /// Enough expired rows that a sort of them is visibly not the batch, and
+    /// that the planner prefers the index over reading the relation.
+    const BACKLOG: usize = 1_200;
+
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000_000).await else {
+        return;
+    };
+    // Distinct expiries, so ordering by the expiry pair is a total order here
+    // and the walk's stopping point is unambiguous.
+    for i in 0..BACKLOG {
+        store
+            .acquire(ACCOUNT, CostUnits(1), TTL, t(i as i64))
+            .await
+            .unwrap();
+    }
+
+    let limit = i64::try_from(DEFAULT_RECLAIM_BATCH_LIMIT.get()).unwrap();
+    let plan = tollgate_store_postgres::test_support::explain_reclaim_due_leases(
+        &store,
+        t(BACKLOG as i64 + 1_000),
+        limit,
+    )
+    .await
+    .unwrap();
+    assert!(
+        plan.contains("tollgate_leases_expiry"),
+        "the sweep must reach its partial expiry index; plan was:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Sort"),
+        "the batch is still being taken from a sort of the whole backlog, which \
+         is the cost #65 exists to remove; plan was:\n{plan}"
+    );
+}
+
+/// #65's sibling, at the plan: the rollover sweep's bounded page must be an
+/// index-range stop too.
+///
+/// The shape that matters is the production one — many accounts carrying a
+/// schedule, few of them actually past a boundary on any given tick, which is
+/// what `tollgate_accounts_due_rollover` was added for. `ORDER BY account_id`
+/// could not be answered by that index, so the due set was sorted before the
+/// `LIMIT` could cut it; `budget_period = $1` is an equality, so ordering by
+/// `period_start_us` is the index's own order within that prefix.
+#[tokio::test]
+async fn the_rollover_sweep_reaches_its_index_instead_of_sorting_the_due_set() {
+    const ACCOUNTS: u128 = 400;
+    const DUE: u128 = 5;
+
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+        return;
+    };
+    for id in 2..=ACCOUNTS {
+        AdminStore::create_account(
+            &*store,
+            AccountConfig {
+                account_id: AccountId(id),
+                initial_balance: CostUnits::ZERO,
+                status: AccountStatus::Active,
+                capacity_class: CapacityClass::Assured,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    for id in 1..=ACCOUNTS {
+        AdminStore::set_budget_schedule(&*store, AccountId(id), Some(monthly(100)))
+            .await
+            .unwrap();
+    }
+
+    // Everyone is current except a handful, the shape a sweep tick actually
+    // sees. Planted directly because the schedule API takes no clock.
+    let pool = corruption_pool().await;
+    sqlx::query("UPDATE tollgate_accounts SET period_start_us = $1")
+        .bind(FEB * 1_000_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for id in 1..=DUE {
+        sqlx::query("UPDATE tollgate_accounts SET period_start_us = $2 WHERE account_id = $1")
+            .bind(id.to_be_bytes().to_vec())
+            .bind(JAN * 1_000_000)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let plan = tollgate_store_postgres::test_support::explain_due_periods(
+        &store,
+        "monthly",
+        FEB * 1_000_000,
+        64,
+    )
+    .await
+    .unwrap();
+    assert!(
+        plan.contains("tollgate_accounts_due_rollover"),
+        "the rollover sweep must reach its partial index; plan was:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Sort"),
+        "the bounded page is still taken from a sort of every due account, \
+         which is the cost #65 exists to remove; plan was:\n{plan}"
+    );
+}
+
+/// #65's sibling: a bounded rollover page takes the *most overdue* accounts.
+///
+/// `budget_period = $1` is an equality, so within that prefix of
+/// `tollgate_accounts_due_rollover (budget_period, period_start_us)` the scan
+/// is already ordered by `period_start_us` — ordering by it costs nothing and
+/// crosses the oldest boundary first, where `ORDER BY account_id` sorted every
+/// due account and then served them in an order unrelated to how overdue they
+/// were. The boundaries here are planted directly because the schedule API
+/// takes no clock, and account id order is made to contradict them.
+#[tokio::test]
+async fn a_bounded_rollover_page_crosses_the_oldest_boundaries_first() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+        return;
+    };
+    for id in 2..=4u128 {
+        AdminStore::create_account(
+            &*store,
+            AccountConfig {
+                account_id: AccountId(id),
+                initial_balance: CostUnits::ZERO,
+                status: AccountStatus::Active,
+                capacity_class: CapacityClass::Assured,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    for id in 1..=4u128 {
+        AdminStore::set_budget_schedule(&*store, AccountId(id), Some(monthly(100)))
+            .await
+            .unwrap();
+    }
+
+    // Lowest account id is the *least* overdue, so an account-ordered page and
+    // a boundary-ordered one cannot agree.
+    let pool = corruption_pool().await;
+    for (id, months_behind) in [(1u128, 1i64), (2, 2), (3, 3), (4, 4)] {
+        sqlx::query("UPDATE tollgate_accounts SET period_start_us = $2 WHERE account_id = $1")
+            .bind(id.to_be_bytes().to_vec())
+            .bind((JAN - months_behind * 86_400 * 31) * 1_000_000)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let batch = AdminStore::roll_due_periods(&*store, t(FEB), NonZeroUsize::new(2).unwrap())
+        .await
+        .unwrap();
+    assert!(
+        batch.is_saturated(),
+        "the page is full, so ordering decides it"
+    );
+    let rolled: Vec<u128> = batch
+        .rolled()
+        .iter()
+        .map(|account| account.account_id.0)
+        .collect();
+    assert_eq!(
+        rolled,
+        vec![4, 3],
+        "the two oldest boundaries cross first; account order would have given [1, 2]"
     );
 }
 

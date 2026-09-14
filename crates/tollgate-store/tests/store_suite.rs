@@ -412,6 +412,89 @@ async fn expired_backlog_is_reclaimed_in_bounded_batches() {
     );
 }
 
+/// INVARIANTS.md #9: a bounded batch settles the *oldest due* leases, and
+/// stops at the first one that is not due.
+///
+/// `expired_backlog_is_reclaimed_in_bounded_batches` can see neither property:
+/// its three leases are all due, all share one expiry, and their ids are
+/// sorted before comparing. Here every lease has a distinct expiry, one is not
+/// yet due, and the owning account ids run *opposite* to expiry order — so a
+/// backend paging by account rather than by expiry returns a different page
+/// and fails, instead of silently settling different leases from the reference
+/// backend (#65).
+#[tokio::test]
+async fn a_bounded_reclaim_page_settles_the_oldest_due_leases_first() {
+    let store = store_with_balance(full_grant_policy(), 100);
+    for id in 2..=4u128 {
+        AdminStore::create_account(
+            &*store,
+            AccountConfig {
+                account_id: AccountId(id),
+                initial_balance: CostUnits(100),
+                status: AccountStatus::Active,
+                capacity_class: CapacityClass::Assured,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    // Account 4 expires first, account 1 last and not yet due at the cutoff.
+    let mut leases = Vec::new();
+    for (id, acquired_at) in [(4u128, 0i64), (3, 10), (2, 20), (1, 600)] {
+        leases.push(
+            store
+                .acquire(AccountId(id), CostUnits(100), TTL, t(acquired_at))
+                .await
+                .unwrap(),
+        );
+    }
+
+    let limit = NonZeroUsize::new(2).unwrap();
+    let first = store.reclaim_expired_batch(t(100), limit).await.unwrap();
+    assert!(
+        first.is_saturated(),
+        "the page is full, so ordering decides it"
+    );
+    assert_eq!(
+        first
+            .reclaimed()
+            .iter()
+            .map(|lease| lease.account_id.0)
+            .collect::<Vec<_>>(),
+        vec![4, 3],
+        "the two oldest expiries settle first; account order would give [2, 3]"
+    );
+
+    let second = store.reclaim_expired_batch(t(100), limit).await.unwrap();
+    assert!(
+        !second.is_saturated(),
+        "the due prefix ends at the third lease"
+    );
+    assert_eq!(
+        second
+            .reclaimed()
+            .iter()
+            .map(|lease| lease.lease_id)
+            .collect::<Vec<_>>(),
+        vec![leases[2].lease_id],
+        "the walk stops at the lease that is not yet due"
+    );
+
+    // The survivor keeps its units until its own expiry passes.
+    assert_eq!(store.balance(AccountId(1)), CostUnits::ZERO);
+    let last = store.reclaim_expired_batch(t(700), limit).await.unwrap();
+    assert_eq!(
+        last.reclaimed()
+            .iter()
+            .map(|lease| lease.lease_id)
+            .collect::<Vec<_>>(),
+        vec![leases[3].lease_id]
+    );
+    assert_eq!(store.balance(AccountId(1)), CostUnits(100));
+    assert_conserved(&store);
+}
+
 #[test]
 fn reclaim_batch_rejects_backend_results_over_the_limit() {
     let reclaimed = (0..3)
