@@ -126,6 +126,18 @@ allow_attributes_without_reason = "deny"
 
 # Deployment profile for load-gate runs and production builds; kept separate so
 # Criterion benches retain the default calibrated release codegen policy.
+# Criterion's measurements are a recorded contract (`testing/perf_baseline.json`),
+# so the profile they are taken under has to be reproducible across changes that
+# do not touch the measured path. The default release profile is not: at
+# `codegen-units = 16` rustc repartitions a crate whenever its code grows, and
+# cross-unit inlining decisions move with it. #114 was that effect and nothing
+# else -- `admission/snapshot_lookup_moka` read 66.92ns at `1a3a260` and 88.19ns
+# at `f6aaa28` with its lookup path byte-identical, while one codegen unit put
+# the same two revisions at 55.84ns and 56.40ns. One unit also measures what is
+# actually deployed, since `production` below compiles the same way.
+[profile.bench]
+codegen-units = 1
+
 [profile.production]
 inherits = "release"
 codegen-units = 1

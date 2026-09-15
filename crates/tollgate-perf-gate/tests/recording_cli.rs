@@ -40,7 +40,7 @@ impl Fixture {
                     "os": "test-os", "rustc": "test-rustc"
                 },
                 "recorded_at": "2026-09-11T00:00:00Z", "git_revision": REVISION,
-                "profile": "criterion release", "samples": 3,
+                "profile": "criterion release, codegen-units=1", "samples": 3,
                 "benchmarks": [
                     {"id": "a", "mean_ns": 100.0, "max_regression": 0.15},
                     {"id": "b", "mean_ns": 200.0}
