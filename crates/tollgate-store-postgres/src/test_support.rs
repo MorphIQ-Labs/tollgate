@@ -124,3 +124,21 @@ pub async fn truncate_all(store: &PostgresStore) -> Result<(), StoreError> {
     .map_err(storage)?;
     Ok(())
 }
+
+/// The statements [`KeyDirectory::insert_key_within`] serialises with, exposed
+/// so a test can demonstrate the race the lock prevents by driving the same
+/// SQL rather than a copy of it (#121).
+///
+/// [`KeyDirectory::insert_key_within`]: tollgate_store::KeyDirectory::insert_key_within
+pub mod issuance_sql {
+    /// Takes the account row; the statement whose absence is the race.
+    pub const ACCOUNT_LOCK: &str = crate::ACCOUNT_LOCK_SQL;
+    /// Counts the credentials that can still authenticate.
+    pub const LIVE_KEY_COUNT: &str = crate::LIVE_KEY_COUNT_SQL;
+}
+
+/// The store's pool, for a test that must hold two transactions open at once.
+#[must_use]
+pub fn pool(store: &PostgresStore) -> sqlx::PgPool {
+    store.pool.clone()
+}

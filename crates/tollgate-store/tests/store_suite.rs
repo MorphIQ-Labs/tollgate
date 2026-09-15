@@ -4408,3 +4408,69 @@ async fn credential_expiry_is_exact_in_directory_and_every_page() {
     let store = store_with_balance(full_grant_policy(), 100).await;
     credential_expiry::exact_expiry(&*store, ACCOUNT).await;
 }
+
+#[path = "support/account_keys.rs"]
+mod account_keys;
+
+#[tokio::test]
+async fn account_key_listing_is_scoped_ordered_and_paged() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    account_keys::listing_is_scoped_ordered_and_paged(&*store).await;
+}
+
+#[tokio::test]
+async fn account_key_listing_separates_expiry_from_revocation() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    account_keys::listing_separates_expiry_from_revocation(&*store).await;
+}
+
+#[tokio::test]
+async fn the_active_key_bound_counts_only_live_credentials() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    account_keys::the_active_bound_counts_only_live_credentials(&*store).await;
+}
+
+#[tokio::test]
+async fn the_active_key_bound_is_per_account_and_preserves_issuance_rules() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    account_keys::the_bound_is_per_account_and_preserves_issuance_rules(&*store).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_issuers_cannot_exceed_the_active_key_bound() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    account_keys::concurrent_issuers_cannot_exceed_the_bound(store).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_issuers_report_duplicates() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    account_keys::mixed_issuers_report_duplicates(store).await;
+}
+
+#[path = "support/account_view.rs"]
+mod account_view;
+
+#[tokio::test]
+async fn an_unknown_account_view_is_absent_not_empty() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    account_view::an_unknown_account_is_absent_not_empty(&*store).await;
+}
+
+#[tokio::test]
+async fn the_account_view_reports_what_was_administered() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    account_view::the_view_reports_what_was_administered(&*store).await;
+}
+
+#[tokio::test]
+async fn funding_out_on_lease_is_not_reported_as_usage() {
+    let store = MemoryStore::new(full_grant_policy()).unwrap();
+    account_view::funding_out_on_lease_is_not_reported_as_usage(&*store).await;
+}
+
+#[tokio::test]
+async fn setting_a_budget_schedule_reports_what_it_replaced() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    account_view::setting_a_schedule_reports_what_it_replaced(&*store).await;
+}

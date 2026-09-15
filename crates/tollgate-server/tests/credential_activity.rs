@@ -169,6 +169,7 @@ async fn invalid_published_key_binding_has_a_structured_code() {
         store,
         clock: Arc::new(ManualClock::new(jiff::Timestamp::UNIX_EPOCH)),
         security: common::security(),
+        issuer: None,
     });
     let response = app
         .oneshot(

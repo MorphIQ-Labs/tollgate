@@ -50,11 +50,12 @@ use tollgate_core::{
     Rollover, UsageEvent,
 };
 use tollgate_store::{
-    AccountConfig, AdminReceipt, AdminState, AdminStore, AllocateError, BudgetError, Conservation,
-    CreateAccountError, GrantPolicy, IngestError, IngestReport, KeyDirectory, KeyError, KeyRecord,
-    LeaseAllocator, PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease,
-    Revocation, RolledAccount, RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution,
-    SnapshotSource, StatusChange, StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
+    AccountConfig, AccountView, AdminReceipt, AdminState, AdminStore, AllocateError, BudgetError,
+    Conservation, CreateAccountError, GrantPolicy, IngestError, IngestReport, KeyDirectory,
+    KeyError, KeyRecord, KeySummary, LeaseAllocator, PUSH_CHANNEL_CAPACITY, PublishSnapshotError,
+    ReclaimBatch, ReclaimedLease, Revocation, RolledAccount, RolloverBatch, SetStatusError,
+    SnapshotPush, SnapshotResolution, SnapshotSource, StatusChange, StoreError, StoreHealth,
+    UsageSink, pushes_exceed_capacity, validate_key_page_limit,
 };
 
 const STATE_ACTIVE: i16 = 0;
@@ -175,41 +176,7 @@ impl KeyDirectory for PostgresStore {
     }
 
     async fn insert_key(&self, record: KeyRecord) -> Result<(), KeyError> {
-        let expiry = record.not_after.map(StoredInstant::from);
-        // The account reference is checked by the foreign key rather than by a
-        // prior SELECT: a check-then-insert would admit a credential against
-        // an account deleted between the two, and this backend refuses to
-        // hold a credential no account owns.
-        let result = sqlx::query(
-            "INSERT INTO tollgate_credential_keys
-             (key_id, account_id, principal, digest, not_after_floor_us,
-              not_after_submicro_ns, not_after_is_lower_bound, revoked_at_us)
-             VALUES ($1, $2, $3, $4, $5, $6, FALSE, NULL)
-             ON CONFLICT (key_id) DO NOTHING",
-        )
-        .bind(id_bytes(record.key_id.0))
-        .bind(id_bytes(record.account_id.0))
-        .bind(id_bytes(record.principal.0))
-        .bind(record.digest.to_vec())
-        .bind(expiry.map(|expiry| expiry.micros))
-        .bind(expiry.map(|expiry| expiry.submicro_nanos))
-        .execute(&self.pool)
-        .await;
-        match result {
-            Ok(done) if done.rows_affected() == 0 => Err(KeyError::AlreadyExists),
-            Ok(_) => Ok(()),
-            // A violated foreign key is the account not existing; a violated
-            // unique index on `principal` is two credentials colliding on the
-            // identity admission decides with, which at 128 bits of HMAC
-            // output means secret reuse or corruption rather than chance.
-            Err(sqlx::Error::Database(e)) if e.is_foreign_key_violation() => {
-                Err(KeyError::UnknownAccount)
-            }
-            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-                Err(KeyError::AlreadyExists)
-            }
-            Err(e) => Err(KeyError::Storage(storage(e))),
-        }
+        self.insert_credential(record, None).await
     }
 
     async fn revoke_key(&self, key_id: KeyId, now: Timestamp) -> Result<Revocation, KeyError> {
@@ -266,6 +233,187 @@ impl KeyDirectory for PostgresStore {
 
         rows.into_iter().map(credential_from_row).collect()
     }
+
+    async fn account_keys(
+        &self,
+        account: AccountId,
+        after: Option<KeyId>,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<KeySummary>, StoreError> {
+        validate_key_page_limit(limit)?;
+        // Separate SQL shapes preserve an indexable range in prepared plans,
+        // as `active_keys_page` does for the same reason.
+        let sql = if after.is_some() {
+            "SELECT key_id, not_after_floor_us, not_after_submicro_ns,
+                    not_after_is_lower_bound, revoked_at_us
+             FROM tollgate_credential_keys
+             WHERE account_id = $1 AND key_id > $3
+             ORDER BY key_id LIMIT $2"
+        } else {
+            "SELECT key_id, not_after_floor_us, not_after_submicro_ns,
+                    not_after_is_lower_bound, revoked_at_us
+             FROM tollgate_credential_keys
+             WHERE account_id = $1
+             ORDER BY key_id LIMIT $2"
+        };
+        let mut query = sqlx::query(sql)
+            .bind(id_bytes(account.0))
+            .bind(i64::try_from(limit.get()).unwrap_or(i64::MAX));
+        if let Some(cursor) = after {
+            query = query.bind(id_bytes(cursor.0));
+        }
+        let rows = query.fetch_all(&self.pool).await.map_err(storage)?;
+        rows.into_iter().map(summary_from_row).collect()
+    }
+
+    async fn insert_key_within(
+        &self,
+        record: KeyRecord,
+        max_active: NonZeroUsize,
+        now: Timestamp,
+    ) -> Result<(), KeyError> {
+        self.insert_credential(record, Some((max_active, now)))
+            .await
+    }
+}
+
+impl PostgresStore {
+    /// Both issuance APIs enter the same account-first transaction. The lock
+    /// covers the optional bound check, unique-index insertion, foreign-key
+    /// check and revision trigger through commit. Acquiring it after inserting
+    /// would invert the bounded issuer's order and permit a deadlock.
+    async fn insert_credential(
+        &self,
+        record: KeyRecord,
+        bound: Option<(NonZeroUsize, Timestamp)>,
+    ) -> Result<(), KeyError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| KeyError::Storage(storage(e)))?;
+        // Take the account row first. Counting and inserting without it is the
+        // race this method exists to prevent: under READ COMMITTED neither
+        // transaction sees the other's uncommitted credential, so both count
+        // `max_active - 1`, both insert, and the account ends up over the
+        // bound with no error raised anywhere. This is the same row
+        // `set_account_status` and `acquire` serialise on, so an issuance in
+        // flight also orders against a suspension.
+        let account = sqlx::query(ACCOUNT_LOCK_SQL)
+            .bind(id_bytes(record.account_id.0))
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| KeyError::Storage(storage(e)))?;
+        if account.is_none() {
+            return Err(KeyError::UnknownAccount);
+        }
+
+        if let Some((max_active, now)) = bound {
+            // Identity before the bound, and the order is load-bearing. A caller
+            // that lost the response resends the same `key_id`; by then its own
+            // successful write may have filled the bound, and answering
+            // `ActiveKeyLimit` would tell it to retire a credential when in fact
+            // its first call worked. `AlreadyExists` is both true and what makes
+            // the retry safe (#121).
+            let existing: Option<i32> = sqlx::query_scalar(
+                "SELECT 1 FROM tollgate_credential_keys WHERE key_id = $1 OR principal = $2",
+            )
+            .bind(id_bytes(record.key_id.0))
+            .bind(id_bytes(record.principal.0))
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| KeyError::Storage(storage(e)))?;
+            if existing.is_some() {
+                return Err(KeyError::AlreadyExists);
+            }
+
+            let cutoff = StoredInstant::from(now);
+            let live: i64 = sqlx::query_scalar(LIVE_KEY_COUNT_SQL)
+                .bind(id_bytes(record.account_id.0))
+                .bind(cutoff.micros)
+                .bind(cutoff.submicro_nanos)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| KeyError::Storage(storage(e)))?;
+            if u128::from(live.max(0).unsigned_abs())
+                >= u128::try_from(max_active.get()).unwrap_or(u128::MAX)
+            {
+                return Err(KeyError::ActiveKeyLimit { limit: max_active });
+            }
+        }
+
+        let expiry = record.not_after.map(StoredInstant::from);
+        let result = sqlx::query(
+            "INSERT INTO tollgate_credential_keys
+             (key_id, account_id, principal, digest, not_after_floor_us,
+              not_after_submicro_ns, not_after_is_lower_bound, revoked_at_us)
+             VALUES ($1, $2, $3, $4, $5, $6, FALSE, NULL)
+             ON CONFLICT (key_id) DO NOTHING",
+        )
+        .bind(id_bytes(record.key_id.0))
+        .bind(id_bytes(record.account_id.0))
+        .bind(id_bytes(record.principal.0))
+        .bind(record.digest.to_vec())
+        .bind(expiry.map(|expiry| expiry.micros))
+        .bind(expiry.map(|expiry| expiry.submicro_nanos))
+        .execute(&mut *tx)
+        .await;
+        let outcome = match result {
+            Ok(done) if done.rows_affected() == 0 => Err(KeyError::AlreadyExists),
+            Ok(_) => Ok(()),
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                Err(KeyError::AlreadyExists)
+            }
+            // No arm for the foreign key, deliberately. The account row was
+            // taken `FOR UPDATE` above and its absence already answered
+            // `UnknownAccount`; nothing in this crate deletes an account, so a
+            // violation here cannot mean "no such account". It would mean the
+            // row vanished under a held lock, and reporting that as a caller
+            // error would absorb storage corruption as a routine refusal --
+            // the caller would retire a credential over a broken database.
+            // `Storage` is the truthful answer, and the mutation gate is what
+            // noticed the old arm could not be reached to be tested.
+            Err(e) => Err(KeyError::Storage(storage(e))),
+        };
+        outcome?;
+        tx.commit()
+            .await
+            .map_err(|e| KeyError::Storage(storage(e)))?;
+        Ok(())
+    }
+}
+
+fn summary_from_row(row: sqlx::postgres::PgRow) -> Result<KeySummary, StoreError> {
+    let bytes: Vec<u8> = row.get(0);
+    let fixed: [u8; 16] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| StoreError("credential identifier is not 16 bytes".into()))?;
+    let not_after = match (row.get::<Option<i64>, _>(1), row.get::<Option<i16>, _>(2)) {
+        (None, None) if !row.get::<bool, _>(3) => None,
+        (Some(micros), Some(submicro_nanos)) => Some(
+            StoredInstant {
+                micros,
+                submicro_nanos,
+            }
+            .timestamp()?,
+        ),
+        _ => return Err(StoreError("incomplete stored credential expiry".into())),
+    };
+    Ok(KeySummary {
+        key_id: KeyId(u128::from_be_bytes(fixed)),
+        not_after,
+        revoked_at: row
+            .get::<Option<i64>, _>(4)
+            .map(|micros| {
+                StoredInstant {
+                    micros,
+                    submicro_nanos: 0,
+                }
+                .timestamp()
+            })
+            .transpose()?,
+    })
 }
 
 fn credential_from_row(row: sqlx::postgres::PgRow) -> Result<KeyRecord, StoreError> {
@@ -306,7 +454,7 @@ impl tollgate_store::KeySource for PostgresStore {
         after: Option<KeyId>,
         limit: NonZeroUsize,
     ) -> Result<tollgate_store::KeyPage, StoreError> {
-        tollgate_store::validate_key_page_limit(limit)?;
+        validate_key_page_limit(limit)?;
         let cutoff = StoredInstant::from(now);
         // One short snapshot per page, never a transaction held across HTTP
         // requests. Revision and records therefore cannot describe two commits.
@@ -542,6 +690,22 @@ const ACTIVE_LEASE_SUM_SQL: &str =
 /// the backlog it exists to clear (#65). Ordering by the expiry pair makes
 /// the `LIMIT` a range stop, and settles oldest-due-first like the reference
 /// backend does.
+/// Takes the account row before an issuance counts against its bound.
+///
+/// Hoisted so the test that demonstrates the race can drive the *same*
+/// statements this method does, rather than a copy that could drift from them
+/// — the convention `RECLAIM_DUE_LEASES_SQL` established.
+pub(crate) const ACCOUNT_LOCK_SQL: &str =
+    "SELECT 1 FROM tollgate_accounts WHERE account_id = $1 FOR UPDATE";
+
+/// Credentials that can still authenticate at the given instant: not revoked,
+/// and not past `not_after`. The predicate the bound counts with.
+pub(crate) const LIVE_KEY_COUNT_SQL: &str = "SELECT count(*) FROM tollgate_credential_keys
+     WHERE account_id = $1
+       AND revoked_at_us IS NULL
+       AND (not_after_floor_us IS NULL OR not_after_submicro_ns IS NULL
+            OR (not_after_floor_us, not_after_submicro_ns) > ($2, $3))";
+
 const RECLAIM_DUE_LEASES_SQL: &str =
     "SELECT lease_id, account_id, granted, used, from_allowance, period_start_us
      FROM tollgate_leases
@@ -568,8 +732,18 @@ const RECLAIM_DUE_LEASES_SQL: &str =
 /// non-null, and `budget_period = $1` has ruled out all-null. Measured on 400
 /// accounts with five due: seq scan and sort at cost 25.02, versus an index
 /// scan with no sort at 5.92.
+/// The crossed-from boundary is returned so the caller can order the batch.
+///
+/// `RETURNING` has no defined row order: PostgreSQL emits rows in whatever
+/// order the update's join produced, which is physical order, not the boundary
+/// order the CTE selected by. Ordering it *here* would mean a trailing
+/// `ORDER BY` and a `Sort` node, which is the cost
+/// `the_rollover_sweep_reaches_its_index_instead_of_sorting_the_due_set`
+/// forbids (#65) — so the page is ordered in Rust instead, where it is bounded
+/// by the batch limit rather than by how many accounts are due.
 const DUE_PERIODS_SQL: &str = "WITH due AS (
-         SELECT account_id, allowance_balance AS prior, budget_allowance AS allowance
+         SELECT account_id, allowance_balance AS prior, budget_allowance AS allowance,
+                period_start_us AS crossed_from
          FROM tollgate_accounts
          WHERE budget_allowance IS NOT NULL
            AND budget_period = $1 AND period_start_us < $2
@@ -583,7 +757,7 @@ const DUE_PERIODS_SQL: &str = "WITH due AS (
          period_start_us = $2
      FROM due
      WHERE account.account_id = due.account_id
-     RETURNING due.account_id, due.allowance, due.prior";
+     RETURNING due.account_id, due.allowance, due.prior, due.crossed_from";
 
 fn id_bytes(id: u128) -> Vec<u8> {
     id.to_be_bytes().to_vec()
@@ -2450,7 +2624,7 @@ impl AdminStore for PostgresStore {
         &self,
         account: AccountId,
         schedule: Option<BudgetSchedule>,
-    ) -> Result<(), BudgetError> {
+    ) -> Result<AdminReceipt<()>, BudgetError> {
         // No deposit here. Were setting a schedule also a funding operation,
         // an operator correcting a mistyped allowance would fund the account
         // twice, and there would be no way to describe next month's budget
@@ -2464,22 +2638,116 @@ impl AdminStore for PostgresStore {
             .map(|s| to_i64(s.allowance, "budget allowance"))
             .transpose()
             .map_err(BudgetError::Storage)?;
-        let result = sqlx::query(
-            "UPDATE tollgate_accounts
+        // `RETURNING` the *old* columns, so the receipt reports what this
+        // statement replaced. A separate SELECT would be a different snapshot:
+        // a concurrent change between the two would be attributed to this call
+        // or hidden by it, and the audit is supposed to describe what actually
+        // committed here.
+        let replaced = sqlx::query(
+            "UPDATE tollgate_accounts AS updated
              SET budget_allowance = $2, budget_period = $3, budget_rollover = $4
-             WHERE account_id = $1",
+             FROM tollgate_accounts AS previous
+             WHERE updated.account_id = $1 AND previous.account_id = updated.account_id
+             RETURNING previous.budget_allowance, previous.budget_period,
+                       previous.budget_rollover",
         )
         .bind(id_bytes(account.0))
         .bind(allowance)
         .bind(schedule.map(|s| s.period.as_str()))
         .bind(schedule.map(|s| s.rollover.as_str()))
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|e| BudgetError::Storage(storage(e)))?;
-        if result.rows_affected() == 0 {
+        let Some(row) = replaced else {
             return Err(BudgetError::UnknownAccount);
+        };
+        let before = decode_schedule(
+            row.get::<Option<i64>, _>(0),
+            row.get::<Option<String>, _>(1),
+            row.get::<Option<String>, _>(2),
+        )
+        .map_err(BudgetError::Storage)?;
+        Ok(AdminReceipt::new(
+            (),
+            AdminState::Budget { schedule: before },
+            AdminState::Budget { schedule },
+        ))
+    }
+
+    async fn account_view(&self, account: AccountId) -> Result<Option<AccountView>, StoreError> {
+        // One `REPEATABLE READ, READ ONLY` snapshot over the account row and
+        // its live leases, for the reason `conservation` takes one (#56): the
+        // stored totals and the sums over active leases move together in a
+        // single `ingest` transaction, so reading them under separate
+        // snapshots can pair a pre-write total with a post-write sum and
+        // report corruption on a correct ledger. Status and schedule join that
+        // same snapshot here, so a view cannot straddle a suspension or a
+        // rollover and describe a state the account was never in.
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let result = async {
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?;
+            let account_row = sqlx::query(
+                "SELECT deposited, balance, usage_recorded, settlement_loss, overage_recorded,
+                        expired, status, capacity_class, budget_allowance, budget_period,
+                        budget_rollover, period_start_us
+                 FROM tollgate_accounts WHERE account_id = $1",
+            )
+            .bind(id_bytes(account.0))
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(storage)?;
+            let lease_row = sqlx::query(ACTIVE_LEASE_SUM_SQL)
+                .bind(id_bytes(account.0))
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(storage)?;
+            Ok::<_, StoreError>((account_row, lease_row))
         }
-        Ok(())
+        .await;
+        let (account_row, lease_row) = finish_transaction(tx, result).await?;
+
+        let Some(row) = account_row else {
+            return Ok(None);
+        };
+        let active_grants = to_units(lease_row.get::<i64, _>(0), "active lease grants")?;
+        let active_used = to_units(lease_row.get::<i64, _>(1), "active lease usage")?;
+        let recorded = to_units(row.get::<i64, _>(2), "usage_recorded")?;
+        Ok(Some(AccountView {
+            account_id: account,
+            status: decode_status(row.get::<String, _>(6))?,
+            capacity_class: decode_capacity_class(row.get::<String, _>(7))?,
+            schedule: decode_schedule(
+                row.get::<Option<i64>, _>(8),
+                row.get::<Option<String>, _>(9),
+                row.get::<Option<String>, _>(10),
+            )?,
+            period_start: StoredInstant {
+                micros: row.get::<i64, _>(11),
+                submicro_nanos: 0,
+            }
+            .timestamp()?,
+            conservation: Conservation {
+                deposited: to_units(row.get::<i64, _>(0), "deposited")?,
+                overage_recorded: to_units(row.get::<i64, _>(4), "overage_recorded")?,
+                balance: to_units(row.get::<i64, _>(1), "balance")?,
+                active_lease_grants: active_grants,
+                // Surfaced rather than panicked on, as `conservation` does:
+                // two stored columns from a database this process does not
+                // exclusively own, so this is corruption to report.
+                settled_usage: recorded.checked_sub(active_used).ok_or_else(|| {
+                    StoreError(format!(
+                        "active lease usage {} exceeds recorded usage {} for account {account}",
+                        active_used.get(),
+                        recorded.get()
+                    ))
+                })?,
+                settlement_loss: to_units(row.get::<i64, _>(3), "settlement_loss")?,
+                expired: to_units(row.get::<i64, _>(5), "expired")?,
+            },
+        }))
     }
 
     async fn roll_due_periods(
@@ -2523,14 +2791,28 @@ impl AdminStore for PostgresStore {
                 .map_err(storage)?;
 
             for row in rows {
-                rolled.push(RolledAccount {
-                    account_id: AccountId(id_from(&row.get::<Vec<u8>, _>(0))),
-                    deposited: to_units(row.get::<i64, _>(1), "budget allowance")?,
-                    expired: to_units(row.get::<i64, _>(2), "expiring allowance")?,
-                });
+                rolled.push((
+                    row.get::<i64, _>(3),
+                    RolledAccount {
+                        account_id: AccountId(id_from(&row.get::<Vec<u8>, _>(0))),
+                        deposited: to_units(row.get::<i64, _>(1), "budget allowance")?,
+                        expired: to_units(row.get::<i64, _>(2), "expiring allowance")?,
+                    },
+                ));
             }
         }
-        RolloverBatch::try_new(rolled, limit)
+        // Oldest boundary first, account id breaking ties, which is the order
+        // `MemoryStore` reports and therefore the one this backend owes. The
+        // rows arrive unordered from `RETURNING` and, across more than one
+        // period kind, in per-period groups; sorting the assembled page is what
+        // makes the report a function of the stored state rather than of the
+        // planner. Bounded by `limit`, not by how many accounts are due.
+        rolled
+            .sort_unstable_by_key(|(crossed_from, account)| (*crossed_from, account.account_id.0));
+        RolloverBatch::try_new(
+            rolled.into_iter().map(|(_, account)| account).collect(),
+            limit,
+        )
     }
 
     async fn set_account_status(

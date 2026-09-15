@@ -35,22 +35,26 @@ pub mod transport;
 
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use tracing::Instrument as _;
 
-use tollgate_core::{AccountId, CapacityClass, CostUnits, Principal, PublishableSnapshot};
+use tollgate_auth::CredentialIssuer;
+use tollgate_core::{AccountId, CapacityClass, CostUnits, KeyId, Principal, PublishableSnapshot};
 use tollgate_store::wire::{
-    API_PREFIX, AcquireRequest, AcquireResponse, ConsolidateRequest, ConsolidateResponse,
-    CreateAccountRequest, DepositRequest, IngestRequest, MAX_INGEST_BODY_BYTES,
+    API_PREFIX, AccountKeyResponse, AccountKeysResponse, AccountResponse, AcquireRequest,
+    AcquireResponse, ConsolidateRequest, ConsolidateResponse, CreateAccountRequest, DepositRequest,
+    IngestRequest, IssueKeyRequest, IssuedKeyResponse, MAX_INGEST_BODY_BYTES,
     MAX_SNAPSHOT_BODY_BYTES, PrincipalsResponse, PublishSnapshotRequest, ReleaseRequest,
-    SetCapacityClassRequest, SetStatusRequest, SetStatusResponse,
+    RevokeKeyResponse, SetBudgetRequest, SetBudgetResponse, SetCapacityClassRequest,
+    SetStatusRequest, SetStatusResponse,
 };
 use tollgate_store::{
-    AccountConfig, AdminStore, Clock, DEFAULT_RECLAIM_BATCH_LIMIT, DEFAULT_ROLLOVER_BATCH_LIMIT,
-    IngestReport, KeySource, LeaseAllocator, ReclaimBatch, ReclaimedLease, SnapshotResolution,
+    AccountConfig, AdminState, AdminStore, Clock, DEFAULT_KEY_PAGE_LIMIT,
+    DEFAULT_RECLAIM_BATCH_LIMIT, DEFAULT_ROLLOVER_BATCH_LIMIT, IngestReport, KeyDirectory,
+    KeyRecord, KeySource, LeaseAllocator, ReclaimBatch, ReclaimedLease, SnapshotResolution,
     SnapshotSource, StoreError, StoreHealth, UsageSink,
 };
 
@@ -63,6 +67,14 @@ pub struct ServerState<S> {
     pub store: Arc<S>,
     pub clock: Arc<dyn Clock>,
     pub security: Arc<ServerSecurity>,
+    /// Who may mint credentials, if this deployment issues them at all (#121).
+    ///
+    /// `None` is a deliberate answer, not an omission: an instance that only
+    /// verifies has no business holding the capability to create credentials,
+    /// and the issuance routes answer `501` rather than pretending. That is the
+    /// shape `list_principals` already uses for a backend that cannot
+    /// enumerate — an unsupported capability is reported, never faked.
+    pub issuer: Option<Arc<dyn CredentialIssuer + Send + Sync>>,
 }
 
 impl<S> Clone for ServerState<S> {
@@ -71,6 +83,7 @@ impl<S> Clone for ServerState<S> {
             store: Arc::clone(&self.store),
             clock: Arc::clone(&self.clock),
             security: Arc::clone(&self.security),
+            issuer: self.issuer.clone(),
         }
     }
 }
@@ -82,6 +95,11 @@ pub trait Backend:
     + UsageSink
     + AdminStore
     + KeySource
+    // A server administers credentials as well as projecting them (#121), so
+    // its backend must be the credential *directory* and not only a source.
+    // `HttpStore` implements `KeySource` but not this — correctly: it is a
+    // client of a server, never the authority behind one.
+    + KeyDirectory
     + StoreHealth
     + Send
     + Sync
@@ -94,6 +112,7 @@ impl<T> Backend for T where
         + UsageSink
         + AdminStore
         + KeySource
+        + KeyDirectory
         + StoreHealth
         + Send
         + Sync
@@ -134,6 +153,16 @@ fn router_with_maintenance<S: Backend>(
         ));
     let operator = Router::new()
         .route("/accounts", post(create_account::<S>))
+        .route("/accounts/{account}", get(account::<S>))
+        .route("/accounts/{account}/budget", put(set_budget::<S>))
+        .route(
+            "/accounts/{account}/keys",
+            post(issue_key::<S>).get(list_account_keys::<S>),
+        )
+        .route(
+            "/accounts/{account}/keys/{key}",
+            axum::routing::delete(revoke_account_key::<S>),
+        )
         .route("/accounts/{account}/deposit", post(deposit::<S>))
         .route("/accounts/{account}/status", post(set_status::<S>))
         .route(
@@ -735,6 +764,262 @@ async fn set_status<S: Backend>(
         republished: change.republished,
         unreadable: change.unreadable,
     }))
+}
+
+/// One account's administrative state, for an operator or an application
+/// backend acting for its customer (#121).
+///
+/// A read, so it takes no audit receipt: the receipt convention describes
+/// committed *outcomes*, and this commits nothing. It is still operator-only —
+/// an instance credential cannot reach it, because it exposes an account's
+/// funding position.
+///
+/// 404 for an unknown account rather than a zeroed body, so a caller cannot
+/// read "does not exist" as "exists with no funding".
+async fn account<S: Backend>(
+    _operator: OperatorIdentity,
+    State(state): State<ServerState<S>>,
+    ApiPath(account): ApiPath<AccountId>,
+) -> Result<Json<AccountResponse>, ApiError> {
+    let as_of = state.clock.now();
+    let view = state
+        .store
+        .account_view(account)
+        .await?
+        .ok_or_else(|| ApiError::not_found("unknown-account", "no such account"))?;
+    let funding = view.conservation;
+    Ok(Json(AccountResponse {
+        account_id: view.account_id,
+        as_of,
+        status: view.status,
+        capacity_class: view.capacity_class,
+        budget: view.schedule,
+        period_start: view.period_start,
+        balance: funding.balance,
+        outstanding_lease_grants: funding.active_lease_grants,
+        settled_usage: funding.settled_usage,
+        expired_allowance: funding.expired,
+        settlement_loss: funding.settlement_loss,
+        deposited: funding.deposited,
+        overage_recorded: funding.overage_recorded,
+    }))
+}
+
+/// Set or clear an account's periodic allowance (#121).
+///
+/// Audited through the receipt convention, so the response reports what the
+/// call actually replaced rather than echoing the request back. A repeat is a
+/// success with equal `previous` and `current`: the caller's intent is
+/// satisfied, and saying so is more useful than a conflict.
+async fn set_budget<S: Backend>(
+    operator: OperatorIdentity,
+    State(state): State<ServerState<S>>,
+    ApiPath(account): ApiPath<AccountId>,
+    ApiJson(request): ApiJson<SetBudgetRequest>,
+) -> Result<Json<SetBudgetResponse>, ApiError> {
+    // The receipt carries what this call actually replaced, so the outcome is
+    // mapped to it rather than re-read. Reporting `request.budget` as
+    // `previous` would echo the caller's own input back as history, and a
+    // separate read afterwards would be a different snapshot — either way the
+    // response would stop describing what committed here.
+    let previous = operator
+        .run(
+            "set_budget_schedule",
+            account,
+            state.clock.as_ref(),
+            async {
+                state
+                    .store
+                    .set_budget_schedule(account, request.budget)
+                    .await
+                    .map(|receipt| {
+                        let replaced = match receipt.before {
+                            AdminState::Budget { schedule } => schedule,
+                            _ => None,
+                        };
+                        tollgate_store::AdminReceipt::new(replaced, receipt.before, receipt.after)
+                    })
+            },
+        )
+        .await?;
+    Ok(Json(SetBudgetResponse {
+        previous,
+        current: request.budget,
+    }))
+}
+
+/// Issue one credential for an account, disclosing its secret exactly once.
+///
+/// **Order matters and is the contract.** The credential is minted, then
+/// stored, and only then returned. A crash between minting and storing loses a
+/// secret nobody has — harmless. The reverse order would hand out a credential
+/// the server has never heard of, and no later reconciliation could repair it,
+/// because what persists is a digest and the secret cannot be derived from it.
+///
+/// A lost *response* is recoverable without reissuing: the caller chose the
+/// `key_id`, so resending the same request answers `409` — the credential
+/// exists, and its secret is gone. The remedy is to revoke and issue a new
+/// one, never to ask for the same secret again.
+async fn issue_key<S: Backend>(
+    operator: OperatorIdentity,
+    State(state): State<ServerState<S>>,
+    ApiPath(account): ApiPath<AccountId>,
+    ApiJson(request): ApiJson<IssueKeyRequest>,
+) -> Result<(StatusCode, Json<IssuedKeyResponse>), ApiError> {
+    let issuer = state.issuer.as_ref().ok_or_else(|| {
+        ApiError::not_implemented(
+            "issuance-unsupported",
+            "this deployment does not issue credentials",
+        )
+    })?;
+    let minted = issuer.mint(request.key_id).map_err(|_| {
+        // 503, not 500: entropy exhaustion is an operational condition the
+        // caller should retry, not a defect in the request.
+        ApiError {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            code: "entropy-unavailable",
+            title: "credential entropy unavailable".into(),
+            generation: None,
+        }
+    })?;
+    let secret = hex_encode(&minted.secret);
+
+    let record = KeyRecord {
+        key_id: minted.key_id,
+        account_id: account,
+        principal: minted.principal,
+        digest: minted.digest,
+        not_after: request.not_after,
+    };
+    operator
+        .run("issue_key", account, state.clock.as_ref(), async {
+            state
+                .store
+                .insert_key_within(record, request.max_active_keys, state.clock.now())
+                .await
+                .map(|()| {
+                    tollgate_store::AdminReceipt::new((), AdminState::Absent, AdminState::Absent)
+                })
+        })
+        .await?;
+
+    // 201, as `create_account` answers: this made a credential that did not
+    // exist. It is also what distinguishes the successful call from the 409 a
+    // resent request gets, which is the signal a retrying caller reads.
+    Ok((
+        StatusCode::CREATED,
+        Json(IssuedKeyResponse {
+            key_id: minted.key_id,
+            secret,
+            not_after: request.not_after,
+        }),
+    ))
+}
+
+/// One page of an account's credentials — metadata only.
+///
+/// Never the secret, never the digest, and never the principal: the principal
+/// is the digest's leading 128 bits, so a listing carrying it would leak half
+/// of what the verifier compares against.
+async fn list_account_keys<S: Backend>(
+    _operator: OperatorIdentity,
+    State(state): State<ServerState<S>>,
+    ApiPath(account): ApiPath<AccountId>,
+    Query(page): Query<KeyPageQuery>,
+) -> Result<Json<AccountKeysResponse>, ApiError> {
+    let limit = page.limit.unwrap_or(DEFAULT_KEY_PAGE_LIMIT);
+    let as_of = state.clock.now();
+    let summaries = state.store.account_keys(account, page.after, limit).await?;
+    // A full page may or may not be the last; a short one certainly is. Saying
+    // "there may be more" costs the caller one extra request and never skips a
+    // credential, which is the safe direction for a cursor.
+    let next_after = (summaries.len() == limit.get())
+        .then(|| summaries.last().map(|summary| summary.key_id))
+        .flatten();
+    Ok(Json(AccountKeysResponse {
+        as_of,
+        keys: summaries
+            .into_iter()
+            .map(|summary| AccountKeyResponse {
+                key_id: summary.key_id,
+                not_after: summary.not_after,
+                revoked_at: summary.revoked_at,
+                live: summary.is_live(as_of),
+            })
+            .collect(),
+        next_after,
+    }))
+}
+
+/// Revoke one of an account's credentials.
+///
+/// **Bound to the account in the path.** A `key_id` belonging to someone else
+/// is answered 404, not revoked: an application backend administering its own
+/// customer must not be able to retire another customer's credential by
+/// guessing or mistyping an id. The check is a read of the account's own
+/// listing, so it cannot be satisfied by a credential the account does not own.
+async fn revoke_account_key<S: Backend>(
+    operator: OperatorIdentity,
+    State(state): State<ServerState<S>>,
+    ApiPath((account, key)): ApiPath<(AccountId, KeyId)>,
+) -> Result<Json<RevokeKeyResponse>, ApiError> {
+    let owned = state
+        .store
+        .account_keys(account, key.0.checked_sub(1).map(KeyId), one())
+        .await?
+        .into_iter()
+        .any(|summary| summary.key_id == key);
+    if !owned {
+        return Err(ApiError::not_found(
+            "unknown-credential",
+            "no such credential for this account",
+        ));
+    }
+    let now = state.clock.now();
+    let outcome = operator
+        .run("revoke_key", account, state.clock.as_ref(), async {
+            state.store.revoke_key(key, now).await.map(|revocation| {
+                tollgate_store::AdminReceipt::new(
+                    revocation,
+                    AdminState::Absent,
+                    AdminState::Absent,
+                )
+            })
+        })
+        .await?;
+    Ok(Json(RevokeKeyResponse {
+        key_id: key,
+        retired: matches!(outcome, tollgate_store::Revocation::Retired),
+    }))
+}
+
+/// Cursor and page size for a credential listing.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyPageQuery {
+    #[serde(default)]
+    after: Option<KeyId>,
+    #[serde(default)]
+    limit: Option<std::num::NonZeroUsize>,
+}
+
+fn one() -> std::num::NonZeroUsize {
+    std::num::NonZeroUsize::new(1).expect("one is nonzero")
+}
+
+/// Lowercase hex, for handing a secret to its owner exactly once.
+///
+/// Written out rather than pulled in: this is four lines against a dependency
+/// on the request path's crate graph, and the secret's encoding is something
+/// the wire contract should be able to state without consulting one.
+fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    out
 }
 
 async fn set_capacity_class<S: Backend>(

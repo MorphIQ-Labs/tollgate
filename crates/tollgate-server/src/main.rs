@@ -164,6 +164,13 @@ async fn run_server() -> std::io::Result<()> {
                         .expect("default grant policy is valid"),
                     clock: Arc::clone(&clock),
                     security: Arc::clone(&security),
+                    // This binary issues no customer credentials: the registry
+                    // `config.rs` builds digests control-plane bearer tokens
+                    // under a secret regenerated every start, which is the
+                    // wrong authority and the wrong lifetime for credentials a
+                    // customer keeps. Issuance therefore answers 501 here until
+                    // a deployment supplies a durable one (#121).
+                    issuer: None,
                 },
                 reclaim,
                 shutdown,
@@ -196,6 +203,13 @@ async fn run_server() -> std::io::Result<()> {
                     store,
                     clock: Arc::clone(&clock),
                     security: Arc::clone(&security),
+                    // This binary issues no customer credentials: the registry
+                    // `config.rs` builds digests control-plane bearer tokens
+                    // under a secret regenerated every start, which is the
+                    // wrong authority and the wrong lifetime for credentials a
+                    // customer keeps. Issuance therefore answers 501 here until
+                    // a deployment supplies a durable one (#121).
+                    issuer: None,
                 },
                 reclaim,
                 shutdown,

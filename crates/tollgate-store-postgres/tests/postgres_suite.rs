@@ -97,6 +97,29 @@ fn redact_url(url: &str) -> String {
     }
 }
 
+/// Connect (or skip) and truncate, leaving no account behind.
+///
+/// `store_with_balance` creates the standard account, which a scenario that
+/// administers its own account from scratch would collide with.
+async fn empty_store(policy: GrantPolicy) -> Option<Arc<PostgresStore>> {
+    let Ok(url) = std::env::var("TOLLGATE_PG_URL") else {
+        assert!(
+            std::env::var_os("TOLLGATE_REQUIRE_PG").is_none(),
+            "TOLLGATE_PG_URL is unset but TOLLGATE_REQUIRE_PG is set; \
+             the Postgres gate must not pass without a database"
+        );
+        eprintln!("SKIPPED: TOLLGATE_PG_URL not set (see docker-compose.yml)");
+        return None;
+    };
+    let store = PostgresStore::connect(&url, policy)
+        .await
+        .unwrap_or_else(|e| panic!("postgres unreachable at {}: {e}", redact_url(&url)));
+    tollgate_store_postgres::test_support::truncate_all(&store)
+        .await
+        .unwrap();
+    Some(store)
+}
+
 /// Connect (or skip), truncate, create the standard account.
 ///
 /// `TOLLGATE_REQUIRE_PG` turns the local-development skip into a failure, so
@@ -4238,6 +4261,72 @@ async fn the_active_set_is_ordered_so_two_instances_project_alike() {
 /// No memory mirror: `MemoryStore` has no storage layer to fail, so the
 /// distinction is unrepresentable there.
 ///
+/// A stored expiry that is neither absent nor complete is surfaced, not read
+/// as "no expiry".
+///
+/// Migration 0018 makes the state unrepresentable: its
+/// `tollgate_credential_keys_expiry_domain` check requires both expiry columns
+/// NULL *and* `not_after_is_lower_bound` false, or both columns present. The
+/// decode still tests the flag, and this is what that arm is for — a schema
+/// that is wrong, or a row that predates the constraint, must not be read as a
+/// credential that never expires. Absorbing it would hand back a credential
+/// the listing calls permanent while its real expiry is unknown, which is the
+/// silent-absorption failure rather than a loud one.
+///
+/// The check is suspended to plant the row and restored `NOT VALID`, so the
+/// planted row survives and every later write stays guarded.
+#[tokio::test]
+async fn a_half_written_credential_expiry_is_refused_not_read_as_absent() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    store
+        .insert_key(key(77, 77, 0xc3, None))
+        .await
+        .expect("a credential with no expiry is the honest form of this row");
+
+    let pool = corruption_pool().await;
+    let dropped = suspend_checks(
+        &pool,
+        "tollgate_credential_keys",
+        "not_after_is_lower_bound",
+        None,
+    )
+    .await;
+    assert!(
+        !dropped.is_empty(),
+        "0018's expiry-domain check must exist, or this fixture is proving nothing"
+    );
+    sqlx::query(
+        "UPDATE tollgate_credential_keys SET not_after_is_lower_bound = TRUE WHERE key_id = $1",
+    )
+    .bind(77u128.to_be_bytes().to_vec())
+    .execute(&pool)
+    .await
+    .unwrap();
+    restore_checks(&pool, "tollgate_credential_keys", dropped).await;
+
+    let listed = store
+        .account_keys(ACCOUNT, None, NonZeroUsize::new(10).unwrap())
+        .await;
+    match listed {
+        Err(error) => assert!(
+            error
+                .to_string()
+                .contains("incomplete stored credential expiry"),
+            "the refusal must name the corruption it found: {error}"
+        ),
+        Ok(summaries) => panic!(
+            "a lower-bound flag with no expiry was absorbed as absent: {:?}",
+            summaries
+                .iter()
+                .map(|summary| (summary.key_id, summary.not_after))
+                .collect::<Vec<_>>()
+        ),
+    }
+}
+
 /// The constraint is dropped before any assertion runs, so a failure here
 /// cannot leave it behind for the tests that follow.
 #[tokio::test]
@@ -6278,4 +6367,262 @@ async fn credential_expiry_is_exact_in_directory_and_every_page() {
         return;
     };
     credential_expiry::exact_expiry(&*store, ACCOUNT).await;
+}
+
+#[path = "../../tollgate-store/tests/support/account_keys.rs"]
+mod account_keys;
+
+#[tokio::test]
+async fn account_key_listing_is_scoped_ordered_and_paged() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    account_keys::listing_is_scoped_ordered_and_paged(&*store).await;
+}
+
+#[tokio::test]
+async fn account_key_listing_separates_expiry_from_revocation() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    account_keys::listing_separates_expiry_from_revocation(&*store).await;
+}
+
+#[tokio::test]
+async fn the_active_key_bound_counts_only_live_credentials() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    account_keys::the_active_bound_counts_only_live_credentials(&*store).await;
+}
+
+#[tokio::test]
+async fn the_active_key_bound_is_per_account_and_preserves_issuance_rules() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    account_keys::the_bound_is_per_account_and_preserves_issuance_rules(&*store).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_issuers_cannot_exceed_the_active_key_bound() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    account_keys::concurrent_issuers_cannot_exceed_the_bound(store).await;
+}
+
+/// The race `insert_key_within` takes the account row to prevent, shown.
+///
+/// `concurrent_issuers_cannot_exceed_the_bound` asserts the outcome but cannot
+/// discriminate: its transactions are too short to overlap where it matters,
+/// and it passes with the lock removed. So the hazard is demonstrated directly
+/// here instead, by driving the *same* statements the method uses — exported
+/// as consts so this cannot drift from the implementation — in two overlapping
+/// transactions with the lock deliberately withheld.
+///
+/// Both count below the bound, because under READ COMMITTED neither sees the
+/// other's uncommitted insert. That is the whole argument for the lock, and it
+/// is a property of the isolation level rather than of timing, which is why it
+/// can be shown deterministically here and not by racing tasks.
+#[tokio::test]
+async fn without_the_account_lock_two_issuers_both_see_room_under_the_bound() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    let pool = tollgate_store_postgres::test_support::pool(&store);
+    let count_sql = tollgate_store_postgres::test_support::issuance_sql::LIVE_KEY_COUNT;
+    // The 16-byte big-endian encoding the backend stores ids in.
+    let bytes = |value: u128| value.to_be_bytes().to_vec();
+    let account = bytes(ACCOUNT.0);
+
+    // Two transactions open at once, interleaved by hand. No account lock is
+    // taken, which is the only difference from `insert_key_within`.
+    let mut first = pool.begin().await.unwrap();
+    let mut second = pool.begin().await.unwrap();
+
+    let seen_by_first: i64 = sqlx::query_scalar(count_sql)
+        .bind(account.clone())
+        .bind(0i64)
+        .bind(0i16)
+        .fetch_one(&mut *first)
+        .await
+        .unwrap();
+
+    // The first issuer commits a credential the second has not seen.
+    sqlx::query(
+        "INSERT INTO tollgate_credential_keys
+         (key_id, account_id, principal, digest, not_after_floor_us,
+          not_after_submicro_ns, not_after_is_lower_bound, revoked_at_us)
+         VALUES ($1, $2, $3, $4, NULL, NULL, FALSE, NULL)",
+    )
+    .bind(bytes(1))
+    .bind(account.clone())
+    .bind(bytes(1))
+    .bind(vec![0u8; 32])
+    .execute(&mut *first)
+    .await
+    .unwrap();
+
+    // The second issuer's count began before that commit and cannot see it.
+    let seen_by_second: i64 = sqlx::query_scalar(count_sql)
+        .bind(account.clone())
+        .bind(0i64)
+        .bind(0i16)
+        .fetch_one(&mut *second)
+        .await
+        .unwrap();
+
+    first.commit().await.unwrap();
+    second.rollback().await.unwrap();
+
+    assert_eq!(seen_by_first, 0);
+    assert_eq!(
+        seen_by_second, 0,
+        "both issuers read a count below a bound of one, so both would insert — \
+         which is why the account row is taken FOR UPDATE before the count"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_issuers_report_duplicates() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    account_keys::mixed_issuers_report_duplicates(store).await;
+}
+
+/// Hold the account row until both real APIs are waiting. With the former
+/// credential-first insertion, the unbounded issuer has already reserved the
+/// unique-index entry when it waits on the FK; releasing the account then
+/// deadlocks the bounded issuer against it. Test key and principal collisions.
+#[tokio::test]
+async fn mixed_issuers_waiting_on_an_account_report_duplicates() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    let pool = tollgate_store_postgres::test_support::pool(&store);
+    for same_key in [true, false] {
+        let id = if same_key { 10 } else { 20 };
+        let first = key(id, id, 0xa1, None);
+        let second = key(
+            if same_key { id } else { id + 1 },
+            if same_key { id + 1 } else { id },
+            0xb2,
+            None,
+        );
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query(tollgate_store_postgres::test_support::issuance_sql::ACCOUNT_LOCK)
+            .bind(ACCOUNT.0.to_be_bytes().to_vec())
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+        let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+        let mut attempts = tokio::task::JoinSet::new();
+        let bounded_store = Arc::clone(&store);
+        attempts.spawn(async move {
+            bounded_store
+                .insert_key_within(first, NonZeroUsize::new(32).unwrap(), t(100))
+                .await
+        });
+        wait_for_blocked_issuers(&pool, blocker_pid, 1).await;
+        let unbounded_store = Arc::clone(&store);
+        attempts.spawn(async move { unbounded_store.insert_key(second).await });
+        wait_for_blocked_issuers(&pool, blocker_pid, 2).await;
+        blocker.commit().await.unwrap();
+
+        let outcomes = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            [
+                attempts.join_next().await.unwrap().unwrap(),
+                attempts.join_next().await.unwrap().unwrap(),
+            ]
+        })
+        .await
+        .expect("both issuers finish after the account lock is released");
+        assert!(
+            matches!(
+                outcomes,
+                [Ok(()), Err(KeyError::AlreadyExists)] | [Err(KeyError::AlreadyExists), Ok(())]
+            ),
+            "one success and one duplicate, including principal collisions: {outcomes:?}"
+        );
+    }
+    assert_eq!(store.active_keys(t(100)).await.unwrap().len(), 2);
+}
+
+/// Observe the blocker and its queue through PostgreSQL's lock graph, without
+/// relying on sleeps to guess whether the issuer has reached the critical point.
+async fn wait_for_blocked_issuers(pool: &sqlx::PgPool, blocker_pid: i32, expected: i64) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "WITH RECURSIVE blocked(pid) AS (
+                    SELECT $1::integer
+                    UNION
+                    SELECT a.pid FROM pg_stat_activity a JOIN blocked b
+                        ON b.pid = ANY(pg_blocking_pids(a.pid))
+                 ) SELECT count(*) - 1 FROM blocked",
+            )
+            .bind(blocker_pid)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting == expected {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("issuers reach the account lock queue");
+}
+
+#[path = "../../tollgate-store/tests/support/account_view.rs"]
+mod account_view;
+
+#[tokio::test]
+async fn an_unknown_account_view_is_absent_not_empty() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    account_view::an_unknown_account_is_absent_not_empty(&*store).await;
+}
+
+#[tokio::test]
+async fn the_account_view_reports_what_was_administered() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = empty_store(GrantPolicy::default()).await else {
+        return;
+    };
+    account_view::the_view_reports_what_was_administered(&*store).await;
+}
+
+#[tokio::test]
+async fn funding_out_on_lease_is_not_reported_as_usage() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = empty_store(full_grant_policy()).await else {
+        return;
+    };
+    account_view::funding_out_on_lease_is_not_reported_as_usage(&*store).await;
+}
+
+#[tokio::test]
+async fn setting_a_budget_schedule_reports_what_it_replaced() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = empty_store(GrantPolicy::default()).await else {
+        return;
+    };
+    account_view::setting_a_schedule_reports_what_it_replaced(&*store).await;
 }

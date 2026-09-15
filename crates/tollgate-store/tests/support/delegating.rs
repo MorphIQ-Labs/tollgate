@@ -35,11 +35,11 @@ use tollgate_core::{
     LeaseGrant, LeaseId, Principal, PublishableSnapshot, UsageEvent,
 };
 use tollgate_store::{
-    AccountConfig, AdminReceipt, AdminStore, AllocateError, BudgetError, CreateAccountError,
-    CredentialActivity, IngestError, IngestReport, KeyDirectory, KeyError, KeyPage, KeyRecord,
-    KeySource, LeaseAllocator, PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation,
-    RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource, StatusChange,
-    StoreError, StoreHealth, UsageSink, drain_reclaim_expired,
+    AccountConfig, AccountView, AdminReceipt, AdminStore, AllocateError, BudgetError,
+    CreateAccountError, CredentialActivity, IngestError, IngestReport, KeyDirectory, KeyError,
+    KeyPage, KeyRecord, KeySource, KeySummary, LeaseAllocator, PublishSnapshotError, ReclaimBatch,
+    ReclaimedLease, Revocation, RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution,
+    SnapshotSource, StatusChange, StoreError, StoreHealth, UsageSink, drain_reclaim_expired,
 };
 
 /// A hook's future. Owned and `'static`: nothing borrowed from the wrapper
@@ -93,17 +93,21 @@ type SetAccountStatusHook<S> =
 type SetCapacityClassHook<S> =
     Hook<S, (AccountId, CapacityClass), Result<AdminReceipt<StatusChange>, SetStatusError>>;
 type SetBudgetScheduleHook<S> =
-    Hook<S, (AccountId, Option<BudgetSchedule>), Result<(), BudgetError>>;
+    Hook<S, (AccountId, Option<BudgetSchedule>), Result<AdminReceipt<()>, BudgetError>>;
 type RollDuePeriodsHook<S> = Hook<S, (Timestamp, NonZeroUsize), Result<RolloverBatch, StoreError>>;
 type PublishSnapshotHook<S> =
     Hook<S, (Principal, PublishableSnapshot), Result<AdminReceipt<()>, PublishSnapshotError>>;
 type RemoveSnapshotHook<S> = Hook<S, Principal, Result<AdminReceipt<()>, StoreError>>;
+type AccountViewHook<S> = Hook<S, AccountId, Result<Option<AccountView>, StoreError>>;
 type ActiveKeysPageHook<S> =
     Hook<S, (Timestamp, Option<KeyId>, NonZeroUsize), Result<KeyPage, StoreError>>;
 type CredentialActivityHook<S> = Hook<S, Vec<KeyId>, Result<Vec<CredentialActivity>, StoreError>>;
 type InsertKeyHook<S> = Hook<S, KeyRecord, Result<(), KeyError>>;
 type RevokeKeyHook<S> = Hook<S, (KeyId, Timestamp), Result<Revocation, KeyError>>;
 type ActiveKeysHook<S> = Hook<S, Timestamp, Result<Vec<KeyRecord>, StoreError>>;
+type AccountKeysHook<S> =
+    Hook<S, (AccountId, Option<KeyId>, NonZeroUsize), Result<Vec<KeySummary>, StoreError>>;
+type InsertKeyWithinHook<S> = Hook<S, (KeyRecord, NonZeroUsize, Timestamp), Result<(), KeyError>>;
 type PingHook<S> = Hook<S, (), Result<(), StoreError>>;
 
 pub struct DelegatingStore<S> {
@@ -129,6 +133,7 @@ pub struct DelegatingStore<S> {
     roll_due_periods: Option<RollDuePeriodsHook<S>>,
     publish_snapshot: Option<PublishSnapshotHook<S>>,
     remove_snapshot: Option<RemoveSnapshotHook<S>>,
+    account_view: Option<AccountViewHook<S>>,
     // KeySource
     active_keys_page: Option<ActiveKeysPageHook<S>>,
     // KeyDirectory
@@ -136,6 +141,8 @@ pub struct DelegatingStore<S> {
     insert_key: Option<InsertKeyHook<S>>,
     revoke_key: Option<RevokeKeyHook<S>>,
     active_keys: Option<ActiveKeysHook<S>>,
+    account_keys: Option<AccountKeysHook<S>>,
+    insert_key_within: Option<InsertKeyWithinHook<S>>,
     // StoreHealth
     ping: Option<PingHook<S>>,
 }
@@ -162,11 +169,14 @@ impl<S: Send + Sync + 'static> DelegatingStore<S> {
             roll_due_periods: None,
             publish_snapshot: None,
             remove_snapshot: None,
+            account_view: None,
             active_keys_page: None,
             credential_activity: None,
             insert_key: None,
             revoke_key: None,
             active_keys: None,
+            account_keys: None,
+            insert_key_within: None,
             ping: None,
         }
     }
@@ -353,7 +363,7 @@ impl<S: Send + Sync + 'static> DelegatingStore<S> {
     pub fn on_set_budget_schedule<F, Fut>(mut self, f: F) -> Self
     where
         F: Fn(Arc<S>, AccountId, Option<BudgetSchedule>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<(), BudgetError>> + Send + 'static,
+        Fut: Future<Output = Result<AdminReceipt<()>, BudgetError>> + Send + 'static,
     {
         self.set_budget_schedule = Some(Arc::new(move |inner, (account, schedule)| {
             Box::pin(f(inner, account, schedule))
@@ -394,6 +404,16 @@ impl<S: Send + Sync + 'static> DelegatingStore<S> {
         self.remove_snapshot = Some(Arc::new(move |inner, principal| {
             Box::pin(f(inner, principal))
         }));
+        self
+    }
+
+    /// Replace [`AdminStore::account_view`].
+    pub fn on_account_view<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(Arc<S>, AccountId) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<AccountView>, StoreError>> + Send + 'static,
+    {
+        self.account_view = Some(Arc::new(move |inner, account| Box::pin(f(inner, account))));
         self
     }
 
@@ -448,6 +468,30 @@ impl<S: Send + Sync + 'static> DelegatingStore<S> {
         Fut: Future<Output = Result<Vec<KeyRecord>, StoreError>> + Send + 'static,
     {
         self.active_keys = Some(Arc::new(move |inner, now| Box::pin(f(inner, now))));
+        self
+    }
+
+    /// Replace [`KeyDirectory::account_keys`].
+    pub fn on_account_keys<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(Arc<S>, AccountId, Option<KeyId>, NonZeroUsize) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<KeySummary>, StoreError>> + Send + 'static,
+    {
+        self.account_keys = Some(Arc::new(move |inner, (account, after, limit)| {
+            Box::pin(f(inner, account, after, limit))
+        }));
+        self
+    }
+
+    /// Replace [`KeyDirectory::insert_key_within`].
+    pub fn on_insert_key_within<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(Arc<S>, KeyRecord, NonZeroUsize, Timestamp) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), KeyError>> + Send + 'static,
+    {
+        self.insert_key_within = Some(Arc::new(move |inner, (record, max_active, now)| {
+            Box::pin(f(inner, record, max_active, now))
+        }));
         self
     }
 
@@ -660,7 +704,7 @@ where
         &self,
         account: AccountId,
         schedule: Option<BudgetSchedule>,
-    ) -> Result<(), BudgetError> {
+    ) -> Result<AdminReceipt<()>, BudgetError> {
         match &self.set_budget_schedule {
             Some(hook) => hook(Arc::clone(&self.inner), (account, schedule)).await,
             None => AdminStore::set_budget_schedule(&*self.inner, account, schedule).await,
@@ -693,6 +737,13 @@ where
         match &self.remove_snapshot {
             Some(hook) => hook(Arc::clone(&self.inner), principal).await,
             None => AdminStore::remove_snapshot(&*self.inner, principal).await,
+        }
+    }
+
+    async fn account_view(&self, account: AccountId) -> Result<Option<AccountView>, StoreError> {
+        match &self.account_view {
+            Some(hook) => hook(Arc::clone(&self.inner), account).await,
+            None => AdminStore::account_view(&*self.inner, account).await,
         }
     }
 }
@@ -748,6 +799,30 @@ where
         match &self.active_keys {
             Some(hook) => hook(Arc::clone(&self.inner), now).await,
             None => KeyDirectory::active_keys(&*self.inner, now).await,
+        }
+    }
+
+    async fn account_keys(
+        &self,
+        account: AccountId,
+        after: Option<KeyId>,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<KeySummary>, StoreError> {
+        match &self.account_keys {
+            Some(hook) => hook(Arc::clone(&self.inner), (account, after, limit)).await,
+            None => KeyDirectory::account_keys(&*self.inner, account, after, limit).await,
+        }
+    }
+
+    async fn insert_key_within(
+        &self,
+        record: KeyRecord,
+        max_active: NonZeroUsize,
+        now: Timestamp,
+    ) -> Result<(), KeyError> {
+        match &self.insert_key_within {
+            Some(hook) => hook(Arc::clone(&self.inner), (record, max_active, now)).await,
+            None => KeyDirectory::insert_key_within(&*self.inner, record, max_active, now).await,
         }
     }
 }
@@ -898,7 +973,7 @@ impl AdminStore for RejectingStore {
         &self,
         _account: AccountId,
         _schedule: Option<BudgetSchedule>,
-    ) -> Result<(), BudgetError> {
+    ) -> Result<AdminReceipt<()>, BudgetError> {
         unreachable!("{}: AdminStore::set_budget_schedule", self.reason)
     }
 
@@ -920,6 +995,10 @@ impl AdminStore for RejectingStore {
 
     async fn remove_snapshot(&self, _principal: Principal) -> Result<AdminReceipt<()>, StoreError> {
         unreachable!("{}: AdminStore::remove_snapshot", self.reason)
+    }
+
+    async fn account_view(&self, _account: AccountId) -> Result<Option<AccountView>, StoreError> {
+        unreachable!("{}: AdminStore::account_view", self.reason)
     }
 }
 
@@ -954,6 +1033,24 @@ impl KeyDirectory for RejectingStore {
 
     async fn active_keys(&self, _now: Timestamp) -> Result<Vec<KeyRecord>, StoreError> {
         unreachable!("{}: KeyDirectory::active_keys", self.reason)
+    }
+
+    async fn account_keys(
+        &self,
+        _account: AccountId,
+        _after: Option<KeyId>,
+        _limit: NonZeroUsize,
+    ) -> Result<Vec<KeySummary>, StoreError> {
+        unreachable!("{}: KeyDirectory::account_keys", self.reason)
+    }
+
+    async fn insert_key_within(
+        &self,
+        _record: KeyRecord,
+        _max_active: NonZeroUsize,
+        _now: Timestamp,
+    ) -> Result<(), KeyError> {
+        unreachable!("{}: KeyDirectory::insert_key_within", self.reason)
     }
 }
 

@@ -15,7 +15,9 @@ use tower::ServiceExt;
 
 use tollgate_core::{AccountId, AccountStatus, CapacityClass, CostUnits, Principal};
 use tollgate_store::wire::API_PREFIX;
-use tollgate_store::{AccountConfig, GrantPolicy, ManualClock, MemoryStore};
+use tollgate_store::{
+    AccountConfig, AdminStore, GrantPolicy, LeaseAllocator, ManualClock, MemoryStore,
+};
 
 use tollgate_server::{ServerState, router};
 
@@ -35,6 +37,7 @@ fn state() -> (Arc<MemoryStore>, axum::Router) {
     let store = MemoryStore::new(GrantPolicy::default()).unwrap();
     let router = router(ServerState {
         security: common::security(),
+        issuer: None,
         store: Arc::clone(&store),
         clock: Arc::new(ManualClock::new(t(0))),
     });
@@ -694,5 +697,515 @@ async fn an_oversized_ingest_body_is_refused_as_batch_too_large() {
             .unwrap()
             .contains(&tollgate_store::MAX_INGEST_BATCH.to_string()),
         "the refusal must name the limit a client should batch against; got {problem}"
+    );
+}
+
+/// The operator account read reports funding and billing as different things
+/// (#121).
+///
+/// The distinction the issue asks the surface to preserve: a balance falls
+/// when units go out on a lease that has not settled, and that is not spend.
+/// A dashboard reading depletion alone would bill a customer for capacity it
+/// still holds.
+#[tokio::test]
+async fn the_account_read_separates_outstanding_grants_from_settled_usage() {
+    let (store, app) = state();
+    let account = AccountId(1);
+    AdminStore::create_account(
+        &*store,
+        AccountConfig {
+            account_id: account,
+            initial_balance: CostUnits(1_000),
+            status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = call(
+        &app,
+        "GET",
+        &api(&format!("/admin/accounts/{}", id(1))),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["balance"], 1_000);
+    assert_eq!(body["outstanding_lease_grants"], 0);
+    assert_eq!(body["settled_usage"], 0);
+    // The wire form is the variant name, as `SetStatusRequest` already sends it.
+    assert_eq!(body["status"], "Active");
+    assert_eq!(body["budget"], Value::Null, "no schedule is null, not zero");
+
+    let grant = store
+        .acquire(
+            account,
+            CostUnits(400),
+            jiff::SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap();
+
+    let (_, held) = call(
+        &app,
+        "GET",
+        &api(&format!("/admin/accounts/{}", id(1))),
+        None,
+    )
+    .await;
+    assert_eq!(
+        held["outstanding_lease_grants"],
+        grant.units.get(),
+        "the units are out on lease"
+    );
+    assert_eq!(
+        held["settled_usage"], 0,
+        "and nothing has been billed for them"
+    );
+    assert!(
+        held["balance"].as_u64().unwrap() < 1_000,
+        "the balance fell, which is precisely why it is not the usage figure"
+    );
+}
+
+/// An unknown account is 404, never a zeroed body: "does not exist" and
+/// "exists with no funding" are different answers.
+#[tokio::test]
+async fn reading_an_unknown_account_is_not_an_empty_account() {
+    let (_store, app) = state();
+    let (status, body) = call(
+        &app,
+        "GET",
+        &api(&format!("/admin/accounts/{}", id(77))),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "unknown-account");
+}
+
+/// The read is operator-only. An instance credential authenticates for the
+/// request path; it must not be able to read a customer's funding position.
+#[tokio::test]
+async fn an_instance_credential_cannot_read_an_account() {
+    let (store, app) = state();
+    AdminStore::create_account(
+        &*store,
+        AccountConfig {
+            account_id: AccountId(1),
+            initial_balance: CostUnits(10),
+            status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
+        },
+    )
+    .await
+    .unwrap();
+
+    let request = axum::http::Request::builder()
+        .method("GET")
+        .uri(api(&format!("/admin/accounts/{}", id(1))))
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", common::INSTANCE),
+        )
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let (status, _) = common::send(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the instance role does not administer accounts"
+    );
+}
+
+/// An issuer for tests: the real `HmacRegistry`, behind the seam.
+fn issuing_state() -> (Arc<MemoryStore>, axum::Router) {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    let router = router(ServerState {
+        security: common::security(),
+        store: Arc::clone(&store),
+        clock: Arc::new(ManualClock::new(t(0))),
+        issuer: Some(Arc::new(tollgate_auth::HmacRegistry::new(
+            b"fixture-issuance-secret-121-only",
+        ))),
+    });
+    (store, router)
+}
+
+async fn make_account(store: &MemoryStore, id: u128) {
+    AdminStore::create_account(
+        store,
+        AccountConfig {
+            account_id: AccountId(id),
+            initial_balance: CostUnits(1_000),
+            status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// A secret is disclosed once, and resending the request does not disclose it
+/// again (#121).
+///
+/// The caller chooses the `key_id`, so a lost response is recoverable *as a
+/// fact* — "your credential exists" — without the server reissuing or
+/// repeating the secret. Nothing retained can reproduce it: what persists is
+/// an HMAC.
+#[tokio::test]
+async fn a_credential_secret_is_disclosed_once_and_a_retry_is_a_conflict() {
+    let (store, app) = issuing_state();
+    make_account(&store, 1).await;
+
+    let body = json!({"key_id": id(7), "max_active_keys": 3});
+    let (status, first) = call(
+        &app,
+        "POST",
+        &api(&format!("/admin/accounts/{}/keys", id(1))),
+        Some(body.clone()),
+    )
+    .await;
+    // 201, as `create_account` answers: a credential now exists that did not.
+    assert_eq!(status, StatusCode::CREATED);
+    let secret = first["secret"]
+        .as_str()
+        .expect("the secret is disclosed")
+        .to_owned();
+    // The encoding is the wire contract, so assert it rather than that the
+    // field is non-empty: `!is_empty()` accepts any string at all, including a
+    // constant, and a disclosed credential that is not the minted one is the
+    // single failure this endpoint cannot have. 32 bytes, lowercase hex.
+    assert_eq!(secret.len(), 64, "32 bytes as lowercase hex: {secret}");
+    assert!(
+        secret
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "lowercase hex only: {secret}"
+    );
+
+    let (again, repeat) = call(
+        &app,
+        "POST",
+        &api(&format!("/admin/accounts/{}/keys", id(1))),
+        Some(body),
+    )
+    .await;
+    assert_eq!(
+        again,
+        StatusCode::CONFLICT,
+        "the same key_id is a duplicate, not a second credential"
+    );
+    assert_eq!(repeat["code"], "credential-exists");
+    assert!(
+        repeat.get("secret").is_none(),
+        "a conflict never carries a secret"
+    );
+
+    // And the listing never carries one either.
+    let (_, listed) = call(
+        &app,
+        "GET",
+        &api(&format!("/admin/accounts/{}/keys", id(1))),
+        None,
+    )
+    .await;
+    let entry = &listed["keys"][0];
+    assert_eq!(entry["key_id"], id(7));
+    assert!(entry.get("secret").is_none(), "no secret in a listing");
+    assert!(entry.get("digest").is_none(), "no digest in a listing");
+    assert!(
+        entry.get("principal").is_none(),
+        "no principal either: it is the digest's leading 128 bits"
+    );
+    assert_eq!(entry["live"], true);
+}
+
+/// The bound is enforced through HTTP, and refuses rather than exceeding.
+#[tokio::test]
+async fn issuance_refuses_past_the_active_key_bound() {
+    let (store, app) = issuing_state();
+    make_account(&store, 1).await;
+
+    for key in 1..=2u128 {
+        let (status, _) = call(
+            &app,
+            "POST",
+            &api(&format!("/admin/accounts/{}/keys", id(1))),
+            Some(json!({"key_id": id(key), "max_active_keys": 2})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "credential {key} fits the bound"
+        );
+    }
+    let (status, body) = call(
+        &app,
+        "POST",
+        &api(&format!("/admin/accounts/{}/keys", id(1))),
+        Some(json!({"key_id": id(3), "max_active_keys": 2})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "active-key-limit");
+}
+
+/// A credential belonging to another account cannot be revoked through this
+/// account's path (#121).
+///
+/// The isolation an application backend administering one customer depends on:
+/// a mistyped or guessed id must not retire someone else's credential.
+#[tokio::test]
+async fn revocation_is_bound_to_the_account_in_the_path() {
+    let (store, app) = issuing_state();
+    make_account(&store, 1).await;
+    make_account(&store, 2).await;
+
+    let (status, _) = call(
+        &app,
+        "POST",
+        &api(&format!("/admin/accounts/{}/keys", id(2))),
+        Some(json!({"key_id": id(99), "max_active_keys": 3})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Account 1 tries to revoke account 2's credential.
+    let (status, body) = call(
+        &app,
+        "DELETE",
+        &api(&format!("/admin/accounts/{}/keys/{}", id(1), id(99))),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "unknown-credential");
+
+    // And it is still live for its owner.
+    let (_, listed) = call(
+        &app,
+        "GET",
+        &api(&format!("/admin/accounts/{}/keys", id(2))),
+        None,
+    )
+    .await;
+    assert_eq!(listed["keys"][0]["live"], true, "untouched");
+
+    // Its owner can revoke it, and a repeat reports that nothing was retired.
+    let (status, first) = call(
+        &app,
+        "DELETE",
+        &api(&format!("/admin/accounts/{}/keys/{}", id(2), id(99))),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["retired"], true);
+    let (_, repeat) = call(
+        &app,
+        "DELETE",
+        &api(&format!("/admin/accounts/{}/keys/{}", id(2), id(99))),
+        None,
+    )
+    .await;
+    assert_eq!(
+        repeat["retired"], false,
+        "already revoked is a fact to report, not an error"
+    );
+}
+
+/// A full page offers a cursor; a short page ends the listing.
+///
+/// The cursor is decided by `summaries.len() == limit`, and the two directions
+/// fail differently: a full page with no cursor silently truncates the
+/// listing, and a short page carrying one sends the caller back for a page
+/// that cannot exist. Both are checked, because an inverted comparison
+/// produces exactly one of each and either alone would look like a quirk.
+#[tokio::test]
+async fn a_full_key_page_offers_a_cursor_and_a_short_one_does_not() {
+    let (store, app) = issuing_state();
+    make_account(&store, 1).await;
+    for key in 1..=3u128 {
+        let (status, _) = call(
+            &app,
+            "POST",
+            &api(&format!("/admin/accounts/{}/keys", id(1))),
+            Some(json!({"key_id": id(key), "max_active_keys": 10})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let (_, full) = call(
+        &app,
+        "GET",
+        &api(&format!("/admin/accounts/{}/keys?limit=2", id(1))),
+        None,
+    )
+    .await;
+    assert_eq!(full["keys"].as_array().expect("keys").len(), 2);
+    assert_eq!(
+        full["next_after"], full["keys"][1]["key_id"],
+        "a full page hands back its last credential as the next cursor"
+    );
+
+    let (_, rest) = call(
+        &app,
+        "GET",
+        &api(&format!(
+            "/admin/accounts/{}/keys?limit=2&after={}",
+            id(1),
+            full["next_after"].as_str().expect("a cursor")
+        )),
+        None,
+    )
+    .await;
+    assert_eq!(rest["keys"].as_array().expect("keys").len(), 1);
+    assert!(
+        rest["next_after"].is_null(),
+        "a short page is the last page and ends the listing"
+    );
+}
+
+/// A deployment with no issuer says so, rather than pretending.
+#[tokio::test]
+async fn a_server_without_an_issuer_reports_issuance_unsupported() {
+    let (store, app) = state();
+    make_account(&store, 1).await;
+    let (status, body) = call(
+        &app,
+        "POST",
+        &api(&format!("/admin/accounts/{}/keys", id(1))),
+        Some(json!({"key_id": id(1), "max_active_keys": 1})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(body["code"], "issuance-unsupported");
+}
+
+/// Setting a budget reports what it replaced.
+#[tokio::test]
+async fn setting_a_budget_over_http_reports_what_it_replaced() {
+    let (store, app) = state();
+    make_account(&store, 1).await;
+    let path = api(&format!("/admin/accounts/{}/budget", id(1)));
+
+    let schedule = json!({"allowance": 500, "period": "UtcCalendarMonth", "rollover": "None"});
+    let (status, body) = call(&app, "PUT", &path, Some(json!({"budget": schedule}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["current"]["allowance"], 500);
+
+    let (_, cleared) = call(&app, "PUT", &path, Some(json!({"budget": null}))).await;
+    assert_eq!(
+        cleared["current"],
+        Value::Null,
+        "clearing a schedule is a state, not an absence"
+    );
+}
+
+/// The provisioning sequence `docs/ACCOUNT_ADMINISTRATION.md` publishes, run
+/// end to end — and run twice, because every step it documents is described as
+/// safe to repeat (#121).
+///
+/// A runbook nothing executes is a runbook that drifts. This is the executable
+/// half of the conformance list at the end of that document.
+#[tokio::test]
+async fn the_documented_provisioning_sequence_is_repeatable() {
+    let (_store, app) = issuing_state();
+    let account = api(&format!("/admin/accounts/{}", id(1)));
+
+    // 1. Create, suspended and unfunded.
+    let create = json!({"account_id": id(1), "initial_balance": 0, "status": "Suspended"});
+    let (first, _) = call(&app, "POST", &api("/admin/accounts"), Some(create.clone())).await;
+    assert_eq!(first, StatusCode::CREATED);
+    let (again, body) = call(&app, "POST", &api("/admin/accounts"), Some(create)).await;
+    assert_eq!(
+        again,
+        StatusCode::CONFLICT,
+        "repeating creation is a conflict"
+    );
+    assert_eq!(body["code"], "account-exists");
+
+    // 2. Capacity class, twice.
+    let class = api(&format!("/admin/accounts/{}/capacity-class", id(1)));
+    for _ in 0..2 {
+        let (status, _) = call(
+            &app,
+            "POST",
+            &class,
+            Some(json!({"capacity_class": "BestEffort"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // 3. Budget, twice: the repeat must report itself as a no-op.
+    let budget = api(&format!("/admin/accounts/{}/budget", id(1)));
+    let schedule = json!({"allowance": 500, "period": "UtcCalendarMonth", "rollover": "None"});
+    let (status, introduced) = call(&app, "PUT", &budget, Some(json!({"budget": schedule}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        introduced["previous"],
+        Value::Null,
+        "there was no schedule before"
+    );
+    assert_eq!(introduced["current"]["allowance"], 500);
+    let (_, repeated) = call(&app, "PUT", &budget, Some(json!({"budget": schedule}))).await;
+    assert_eq!(
+        repeated["previous"], repeated["current"],
+        "a repeat reports equal states, which is how the doc says a no-op looks"
+    );
+
+    // 4. Activate, twice.
+    let status_path = api(&format!("/admin/accounts/{}/status", id(1)));
+    for _ in 0..2 {
+        let (code, _) = call(
+            &app,
+            "POST",
+            &status_path,
+            Some(json!({"status": "Active"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+    }
+
+    // 5. Issue, then resend the identical request.
+    let issue = api(&format!("/admin/accounts/{}/keys", id(1)));
+    let request = json!({"key_id": id(42), "max_active_keys": 3});
+    let (created, issued) = call(&app, "POST", &issue, Some(request.clone())).await;
+    assert_eq!(created, StatusCode::CREATED);
+    assert!(!issued["secret"].as_str().unwrap().is_empty());
+    let (conflict, resent) = call(&app, "POST", &issue, Some(request)).await;
+    assert_eq!(
+        conflict,
+        StatusCode::CONFLICT,
+        "a resent issuance is a conflict"
+    );
+    assert_eq!(resent["code"], "credential-exists");
+    assert!(resent.get("secret").is_none(), "and carries no secret");
+
+    // The account the document describes: active, scheduled, one live key.
+    let (_, view) = call(&app, "GET", &account, None).await;
+    assert_eq!(view["status"], "Active");
+    assert_eq!(view["capacity_class"], "BestEffort");
+    assert_eq!(view["budget"]["allowance"], 500);
+    let (_, keys) = call(&app, "GET", &issue, None).await;
+    assert_eq!(keys["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(keys["keys"][0]["live"], true);
+
+    // The funding equation the document invites a caller to check.
+    let total = |k: &str| view[k].as_u64().unwrap();
+    assert_eq!(
+        total("deposited") + total("overage_recorded"),
+        total("balance")
+            + total("outstanding_lease_grants")
+            + total("settled_usage")
+            + total("settlement_loss")
+            + total("expired_allowance"),
+        "the funding equation holds exactly"
     );
 }

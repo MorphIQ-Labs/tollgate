@@ -23,6 +23,7 @@ fn state(security: Arc<ServerSecurity>) -> ServerState<MemoryStore> {
         store: MemoryStore::new(GrantPolicy::default()).unwrap(),
         clock: Arc::new(SystemClock),
         security,
+        issuer: None,
     }
 }
 

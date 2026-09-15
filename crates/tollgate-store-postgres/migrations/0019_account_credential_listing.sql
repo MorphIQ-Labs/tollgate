@@ -1,0 +1,36 @@
+-- An account-scoped credential listing needs its own index (#121).
+--
+-- `KeyDirectory::account_keys` filters on `account_id`, orders by `key_id`,
+-- and pages with `key_id > $cursor`. Neither existing index serves it:
+--
+--   tollgate_credential_keys_live       (account_id) WHERE revoked_at_us IS NULL
+--   tollgate_credential_keys_projection (key_id)     WHERE revoked_at_us IS NULL
+--
+-- Both are partial on the live set, and the listing deliberately includes
+-- retired credentials — an administrator deciding whether to issue a
+-- replacement needs to see what became of the last one. So the planner fell
+-- back to the primary key, taking the ordering from it and applying
+-- `account_id` as a Filter rather than an Index Cond: correct, and it walks
+-- every other account's credentials to find one account's. Measured on 20k
+-- rows across 50 accounts:
+--
+--   Limit -> Index Scan using ..._pkey
+--              Filter: (account_id = $1)
+--
+-- This is the shape #65 found in the reclaim sweep — an index that supplies
+-- the order while the selective predicate degrades to a filter — and it gets
+-- worse exactly as a deployment grows, because the rows walked per match
+-- scale with the number of accounts.
+--
+-- A composite on (account_id, key_id) gives both halves to the index: the
+-- account becomes the range, and the cursor becomes the range's start, the way
+-- `LIMIT` became a stop in #65. The same measurement afterwards:
+--
+--   Limit -> Index Only Scan using ..._account_listing
+--              Index Cond: ((account_id = $1) AND (key_id > $2))
+--
+-- Not partial, because retired rows are part of the answer. The live partial
+-- index stays: it is smaller and it is what the issuance bound's count uses,
+-- where `revoked_at_us IS NULL` is part of the predicate.
+CREATE INDEX IF NOT EXISTS tollgate_credential_keys_account_listing
+    ON tollgate_credential_keys (account_id, key_id);

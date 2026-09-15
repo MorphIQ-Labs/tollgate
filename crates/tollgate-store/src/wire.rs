@@ -388,3 +388,148 @@ mod tests {
         assert_eq!(received.events, events);
     }
 }
+
+/// One account as an operator reads it (#121).
+///
+/// **Authoritative, not an estimate**, and as of the instant it was read: every
+/// field comes from one consistent backend snapshot, so the terms agree with
+/// each other. It is not a live feed — an admission committed a millisecond
+/// later is not in it — so a caller comparing two reads is comparing two
+/// instants, which is why `as_of` is part of the answer rather than left to a
+/// header.
+///
+/// **Funding is not billing.** `balance` is what remains *spendable*, and it
+/// falls for three different reasons that must not be conflated:
+/// units going out on a lease that has not settled
+/// (`outstanding_lease_grants`), units actually consumed (`settled_usage`),
+/// and a budget period closing on an unspent allowance (`expired_allowance`).
+/// Only the second is billed. A surface reporting depletion alone would let a
+/// customer read a grant as spend.
+///
+/// All unit counts are `CostUnits` — whole units, never fractional and never a
+/// currency; converting to money is the application's job, with its own
+/// prices.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct AccountResponse {
+    pub account_id: tollgate_core::AccountId,
+    /// When this view was read. Every other field is as of this instant.
+    pub as_of: jiff::Timestamp,
+    pub status: tollgate_core::AccountStatus,
+    pub capacity_class: tollgate_core::CapacityClass,
+    /// The periodic allowance, or `None` for "no schedule; the balance does
+    /// not expire". Not the same as an allowance of zero.
+    pub budget: Option<tollgate_core::BudgetSchedule>,
+    /// First instant of the period currently in force. Meaningful only
+    /// alongside `budget`.
+    pub period_start: jiff::Timestamp,
+    /// Still spendable. **Not** a bill, and not what has been used.
+    pub balance: tollgate_core::CostUnits,
+    /// Out on leases that have not settled: committed capacity, not yet spend,
+    /// and not yet billable.
+    pub outstanding_lease_grants: tollgate_core::CostUnits,
+    /// Consumed and billable. This is the usage number.
+    pub settled_usage: tollgate_core::CostUnits,
+    /// Funded but never spendable again, because the period that funded them
+    /// closed.
+    pub expired_allowance: tollgate_core::CostUnits,
+    /// Granted units that settled without being accounted for by usage —
+    /// reported rather than absorbed, because silence would make loss look
+    /// like unspent capacity.
+    pub settlement_loss: tollgate_core::CostUnits,
+    /// Everything ever deposited, and unfunded units admitted under
+    /// `Elastic`. Together these are the left side of the funding equation
+    /// whose right side is the four figures above.
+    pub deposited: tollgate_core::CostUnits,
+    pub overage_recorded: tollgate_core::CostUnits,
+}
+
+/// Set or clear an account's periodic allowance (#121).
+///
+/// `budget: null` clears the schedule, which is a different request from one
+/// with an allowance of zero: the first means "this balance does not expire",
+/// the second means "this account is funded nothing each period". The field is
+/// required rather than defaulted so neither can be reached by omission.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetBudgetRequest {
+    pub budget: Option<tollgate_core::BudgetSchedule>,
+}
+
+/// What a budget change committed.
+///
+/// Both states, because "set to 500" is not the useful answer on its own — an
+/// operator needs to know whether that introduced a schedule, replaced a
+/// different one, or changed nothing. Equal values mean the call was a no-op.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SetBudgetResponse {
+    pub previous: Option<tollgate_core::BudgetSchedule>,
+    pub current: Option<tollgate_core::BudgetSchedule>,
+}
+
+/// Issue one credential for an account (#121).
+///
+/// The caller chooses `key_id`, and that choice is the retry contract: a
+/// request that is lost after the credential is stored can be resent with the
+/// same id and will be refused as a duplicate rather than minting a second
+/// credential. Choose an unguessable one (a v4 UUID) and keep it until the
+/// call is acknowledged.
+///
+/// `max_active_keys` is the caller's own policy, enforced here atomically
+/// against concurrent issuers. It is supplied per request because what counts
+/// as a reasonable number of credentials belongs to the application's plan.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssueKeyRequest {
+    pub key_id: tollgate_core::KeyId,
+    pub max_active_keys: std::num::NonZeroUsize,
+    /// When the credential stops being valid of its own accord. `None` means
+    /// it lapses only on revocation.
+    #[serde(default)]
+    pub not_after: Option<jiff::Timestamp>,
+}
+
+/// A newly issued credential — **the only time its secret is ever returned**.
+///
+/// The secret is not stored anywhere in recoverable form: what persists is an
+/// HMAC of it. A caller that loses this response cannot get the secret back by
+/// any means, and resending the request answers `409` rather than reissuing.
+/// The recovery is to revoke the credential and issue a new one under a new
+/// `key_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssuedKeyResponse {
+    pub key_id: tollgate_core::KeyId,
+    /// The bearer secret, hex-encoded. Disclosed once.
+    pub secret: String,
+    pub not_after: Option<jiff::Timestamp>,
+}
+
+/// One credential in an account listing. Never carries the secret, the
+/// verifier digest, or the principal — the principal is the leading 128 bits
+/// of the digest, so exposing it would leak half of it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct AccountKeyResponse {
+    pub key_id: tollgate_core::KeyId,
+    pub not_after: Option<jiff::Timestamp>,
+    pub revoked_at: Option<jiff::Timestamp>,
+    /// Whether this credential can still authenticate as of `as_of` in the
+    /// enclosing page. Derived, so a caller need not re-implement the rule.
+    pub live: bool,
+}
+
+/// One page of an account's credentials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountKeysResponse {
+    pub as_of: jiff::Timestamp,
+    pub keys: Vec<AccountKeyResponse>,
+    /// Cursor for the next page, or `None` when this page is the last.
+    pub next_after: Option<tollgate_core::KeyId>,
+}
+
+/// What a revocation did. `retired: false` means the credential was already
+/// revoked — reported rather than treated as an error, because the caller's
+/// intent is satisfied either way, but the distinction matters in an audit.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RevokeKeyResponse {
+    pub key_id: tollgate_core::KeyId,
+    pub retired: bool,
+}

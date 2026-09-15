@@ -30,6 +30,14 @@ pub enum AdminState {
         generation: Generation,
         revoked: bool,
     },
+    /// An account's periodic allowance, whole. The schedule is three coupled
+    /// values — allowance, period, rollover — and the row's own CHECK treats
+    /// them as all-or-nothing, so auditing one without the others would record
+    /// a state the ledger cannot hold. `None` is "no schedule", which is a
+    /// different fact from an allowance of zero (#121).
+    Budget {
+        schedule: Option<tollgate_core::BudgetSchedule>,
+    },
 }
 
 /// A successful operation and the exact before/after states of the fields it

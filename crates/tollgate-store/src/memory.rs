@@ -37,7 +37,7 @@
 //! [`MemoryStore::stored_records`] reports the numbers, and the server logs
 //! them once per sweep.
 
-use crate::{AdminReceipt, AdminState};
+use crate::{AccountView, AdminReceipt, AdminState};
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -58,7 +58,7 @@ use crate::leases::{LeaseRecord, Leases, Settled};
 pub use crate::traits::{AccountConfig, Conservation, StatusChange};
 use crate::traits::{
     AdminStore, AllocateError, BudgetError, CreateAccountError, GrantPolicy, GrantPolicyError,
-    IngestError, IngestReport, KeyDirectory, KeyError, KeyRecord, LeaseAllocator,
+    IngestError, IngestReport, KeyDirectory, KeyError, KeyRecord, KeySummary, LeaseAllocator,
     PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation,
     RolledAccount, RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource,
     StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
@@ -1190,14 +1190,23 @@ impl AdminStore for MemoryStore {
         &self,
         account: AccountId,
         schedule: Option<BudgetSchedule>,
-    ) -> Result<(), BudgetError> {
+    ) -> Result<crate::AdminReceipt<()>, BudgetError> {
         let mut inner = self.lock();
         let record = inner
             .accounts
             .get_mut(&account)
             .ok_or(BudgetError::UnknownAccount)?;
+        // Read before write, under the one guard, so the receipt reports what
+        // this call replaced rather than what a later reader happens to find.
+        let before = AdminState::Budget {
+            schedule: record.schedule,
+        };
         record.schedule = schedule;
-        Ok(())
+        Ok(crate::AdminReceipt::new(
+            (),
+            before,
+            AdminState::Budget { schedule },
+        ))
     }
 
     async fn roll_due_periods(
@@ -1445,6 +1454,47 @@ impl AdminStore for MemoryStore {
             });
         }
         Ok(AdminReceipt::new((), before, after))
+    }
+
+    async fn account_view(&self, account: AccountId) -> Result<Option<AccountView>, StoreError> {
+        // One guard over status, schedule and the funding equation. Reading
+        // them separately could straddle a rollover or a status change and
+        // describe a state this account was never in.
+        let inner = self.lock();
+        let Some(record) = inner.accounts.get(&account) else {
+            return Ok(None);
+        };
+        let mut active_grants = CostUnits::ZERO;
+        let mut active_used = CostUnits::ZERO;
+        for lease in inner.leases.active_of(account) {
+            active_grants = active_grants
+                .checked_add(lease.granted)
+                .ok_or_else(|| StoreError(format!("grant sum overflow for account {account}")))?;
+            active_used = active_used
+                .checked_add(lease.used)
+                .ok_or_else(|| StoreError(format!("used sum overflow for account {account}")))?;
+        }
+        Ok(Some(AccountView {
+            account_id: account,
+            status: record.status,
+            capacity_class: record.capacity_class,
+            schedule: record.schedule,
+            period_start: record.period_start,
+            conservation: Conservation {
+                deposited: record.deposited,
+                overage_recorded: record.overage_recorded,
+                balance: record.balance.total(),
+                active_lease_grants: active_grants,
+                settled_usage: record
+                    .usage_recorded
+                    .checked_sub(active_used)
+                    .ok_or_else(|| {
+                        StoreError(format!("active usage exceeds recorded for {account}"))
+                    })?,
+                settlement_loss: record.settlement_loss,
+                expired: record.expired,
+            },
+        }))
     }
 
     async fn remove_snapshot(
@@ -1741,36 +1791,7 @@ impl KeyDirectory for MemoryStore {
 
     async fn insert_key(&self, record: KeyRecord) -> Result<(), KeyError> {
         let mut inner = self.lock();
-        if !inner.accounts.contains_key(&record.account_id) {
-            return Err(KeyError::UnknownAccount);
-        }
-        // Never destructive, for the reason `create_account` is not: an
-        // overwrite would retire a live credential without saying so, and the
-        // digest it replaced is unrecoverable.
-        if inner.keys.contains_key(&record.key_id) {
-            return Err(KeyError::AlreadyExists);
-        }
-        // Two credentials cannot share a principal. That value is the identity
-        // admission decides with, so a collision would make one account's
-        // revocation withdraw another's credential. At 128 bits of HMAC output
-        // it means secret reuse or corruption rather than chance, and the
-        // stored backend enforces it with a UNIQUE index — this is the
-        // reference implementation of the same rule.
-        if inner.key_principals.contains_key(&record.principal) {
-            return Err(KeyError::AlreadyExists);
-        }
-        let revision = next_credential_revision(inner.credential_revision)?;
-        inner.key_principals.insert(record.principal, record.key_id);
-        inner.unrevoked_keys.insert(record.key_id);
-        inner.keys.insert(
-            record.key_id,
-            StoredKey {
-                record,
-                revoked_at: None,
-            },
-        );
-        inner.credential_revision = revision;
-        Ok(())
+        insert_key_locked(&mut inner, record)
     }
 
     async fn revoke_key(&self, key_id: KeyId, now: Timestamp) -> Result<Revocation, KeyError> {
@@ -1816,6 +1837,126 @@ impl KeyDirectory for MemoryStore {
         // differ in a way no test would reproduce.
         Ok(active)
     }
+
+    async fn account_keys(
+        &self,
+        account: AccountId,
+        after: Option<KeyId>,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<KeySummary>, StoreError> {
+        crate::validate_key_page_limit(limit)?;
+        let inner = self.lock();
+        // Revoked credentials are included, so `unrevoked_keys` is not the
+        // index to read here; `keys` is a `HashMap`, so the order is imposed
+        // rather than inherited. Sorting before truncating is what makes the
+        // page a function of the stored state instead of the hash seed — the
+        // same rule `principals` follows.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "sorted below before the page is truncated, so the hash order never reaches the caller"
+        )]
+        let mut summaries: Vec<KeySummary> = inner
+            .keys
+            .values()
+            .filter(|stored| stored.record.account_id == account)
+            .filter(|stored| after.is_none_or(|cursor| stored.record.key_id > cursor))
+            .map(|stored| KeySummary {
+                key_id: stored.record.key_id,
+                not_after: stored.record.not_after,
+                revoked_at: stored.revoked_at,
+            })
+            .collect();
+        summaries.sort_unstable_by_key(|summary| summary.key_id);
+        summaries.truncate(limit.get());
+        Ok(summaries)
+    }
+
+    async fn insert_key_within(
+        &self,
+        record: KeyRecord,
+        max_active: NonZeroUsize,
+        now: Timestamp,
+    ) -> Result<(), KeyError> {
+        // One guard across the count and the write. That is the whole point of
+        // the method: releasing it between them would let two issuers each see
+        // room for one more and both take it.
+        let mut inner = self.lock();
+        // Identity is decided *before* the bound, and the order is load-bearing.
+        // A caller that lost the response resends the same `key_id`; by then
+        // its own successful write may have filled the bound, and answering
+        // `ActiveKeyLimit` would tell it to retire a credential when what
+        // actually happened is that its first call worked. `AlreadyExists` is
+        // both the true answer and the one that makes the retry safe (#121).
+        if !inner.accounts.contains_key(&record.account_id) {
+            return Err(KeyError::UnknownAccount);
+        }
+        if inner.keys.contains_key(&record.key_id)
+            || inner.key_principals.contains_key(&record.principal)
+        {
+            return Err(KeyError::AlreadyExists);
+        }
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "counts live credentials; a count does not depend on the order they are counted in"
+        )]
+        let live = inner
+            .keys
+            .values()
+            .filter(|stored| stored.record.account_id == record.account_id)
+            .filter(|stored| {
+                KeySummary {
+                    key_id: stored.record.key_id,
+                    not_after: stored.record.not_after,
+                    revoked_at: stored.revoked_at,
+                }
+                .is_live(now)
+            })
+            .count();
+        if live >= max_active.get() {
+            return Err(KeyError::ActiveKeyLimit { limit: max_active });
+        }
+        insert_key_locked(&mut inner, record)
+    }
+}
+
+/// The credential write both [`KeyDirectory::insert_key`] and
+/// [`KeyDirectory::insert_key_within`] perform, with the guard already held.
+///
+/// Shared rather than copied so the bounded path cannot drift from the
+/// unbounded one on what it validates — and taken by `&mut Inner` so it
+/// *cannot* acquire a lock, which is what makes the caller's guard span the
+/// count and the write.
+fn insert_key_locked(inner: &mut Inner, record: KeyRecord) -> Result<(), KeyError> {
+    if !inner.accounts.contains_key(&record.account_id) {
+        return Err(KeyError::UnknownAccount);
+    }
+    // Never destructive, for the reason `create_account` is not: an
+    // overwrite would retire a live credential without saying so, and the
+    // digest it replaced is unrecoverable.
+    if inner.keys.contains_key(&record.key_id) {
+        return Err(KeyError::AlreadyExists);
+    }
+    // Two credentials cannot share a principal. That value is the identity
+    // admission decides with, so a collision would make one account's
+    // revocation withdraw another's credential. At 128 bits of HMAC output
+    // it means secret reuse or corruption rather than chance, and the
+    // stored backend enforces it with a UNIQUE index — this is the
+    // reference implementation of the same rule.
+    if inner.key_principals.contains_key(&record.principal) {
+        return Err(KeyError::AlreadyExists);
+    }
+    let revision = next_credential_revision(inner.credential_revision)?;
+    inner.key_principals.insert(record.principal, record.key_id);
+    inner.unrevoked_keys.insert(record.key_id);
+    inner.keys.insert(
+        record.key_id,
+        StoredKey {
+            record,
+            revoked_at: None,
+        },
+    );
+    inner.credential_revision = revision;
+    Ok(())
 }
 
 fn next_credential_revision(revision: u64) -> Result<u64, KeyError> {
