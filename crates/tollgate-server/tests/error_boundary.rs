@@ -143,6 +143,7 @@ async fn router_correlates_backend_failures_without_logging_request_or_error_pay
         store,
         clock: Arc::new(SystemClock),
         security: common::security(),
+        issuer: None,
     });
     let capture = common::EventCapture::default();
     let expected = async {

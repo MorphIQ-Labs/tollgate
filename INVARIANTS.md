@@ -1549,6 +1549,17 @@ exists to detect corrupt state and must not be able to launder it.
     projection may cross the instance-only secured control-plane link (32);
     it cannot invent liveness absent from the selected ledger revision.
 
+    Both credential issuance methods serialize on the owning account before
+    inserting a credential. PostgreSQL owns this order in one shared transaction
+    implementation; MemoryStore holds its shared mutex. With an existing
+    account and room under the supplied bound, two competing attempts to create
+    the same previously absent key or principal yield one success and one
+    `AlreadyExists`, without an account/credential lock cycle. The unbounded API
+    still omits the live-key limit.
+    *Tests:* `mixed_issuers_report_duplicates` (shared backend scenario),
+    `mixed_issuers_waiting_on_an_account_report_duplicates` (PostgreSQL lock-queue
+    witness, covering key and principal uniqueness).
+
     New credential expiry is preserved at nanosecond precision through every
     backend read and projection. PostgreSQL's `StoredInstant` representation
     and schema constraints own the exact pair; a missing component is a storage

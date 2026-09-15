@@ -227,6 +227,46 @@ impl From<CreateAccountError> for ApiError {
     }
 }
 
+impl From<tollgate_store::KeyError> for ApiError {
+    fn from(e: tollgate_store::KeyError) -> Self {
+        use tollgate_store::KeyError;
+        let (status, code) = match &e {
+            KeyError::UnknownAccount => (StatusCode::NOT_FOUND, "unknown-account"),
+            KeyError::UnknownKey => (StatusCode::NOT_FOUND, "unknown-credential"),
+            // 409, not 422: the request is well-formed and the caller is not
+            // at fault for asking. It is also the retry answer — a caller that
+            // lost the response and resent the same `key_id` is being told its
+            // first call worked, which is the truth and discloses nothing.
+            KeyError::AlreadyExists => (StatusCode::CONFLICT, "credential-exists"),
+            // 409 for the same reason: nothing about the request is malformed.
+            // The account is at the bound it was asked to respect, and the
+            // remedy is to revoke a credential, not to rephrase the call.
+            KeyError::ActiveKeyLimit { .. } => (StatusCode::CONFLICT, "active-key-limit"),
+            KeyError::Storage(inner) => return inner.clone().into(),
+        };
+        ApiError {
+            status,
+            code,
+            title: e.to_string(),
+            generation: None,
+        }
+    }
+}
+
+impl From<tollgate_store::BudgetError> for ApiError {
+    fn from(e: tollgate_store::BudgetError) -> Self {
+        match e {
+            tollgate_store::BudgetError::UnknownAccount => ApiError {
+                status: StatusCode::NOT_FOUND,
+                code: "unknown-account",
+                title: e.to_string(),
+                generation: None,
+            },
+            tollgate_store::BudgetError::Storage(inner) => inner.into(),
+        }
+    }
+}
+
 impl From<SetStatusError> for ApiError {
     fn from(e: SetStatusError) -> Self {
         match e {

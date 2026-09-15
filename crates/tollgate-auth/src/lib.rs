@@ -71,4 +71,4 @@ mod verifier;
 
 pub use hmac_registry::HmacRegistry;
 pub use session::SessionCredential;
-pub use verifier::{CredentialVerifier, Verified};
+pub use verifier::{CredentialIssuer, CredentialVerifier, Verified};

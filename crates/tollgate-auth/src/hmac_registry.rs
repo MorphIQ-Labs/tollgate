@@ -274,6 +274,16 @@ impl CredentialVerifier for HmacRegistry {
     }
 }
 
+impl crate::CredentialIssuer for HmacRegistry {
+    /// The inherent method, exposed through the seam. Minting is the registry's
+    /// job either way; the trait exists so a server can hold the capability
+    /// without naming this type — and so a deployment that does not issue can
+    /// hold nothing at all.
+    fn mint(&self, key_id: KeyId) -> Result<MintedKey, EntropyUnavailable> {
+        HmacRegistry::mint(self, key_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(

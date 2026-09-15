@@ -38,6 +38,7 @@ async fn exact_projection<S: Backend + KeyDirectory>(store: Arc<S>) {
         listener,
         ServerState {
             security: common::security(),
+            issuer: None,
             store: store.clone(),
             clock: clock.clone(),
         },

@@ -38,11 +38,12 @@ pub use credentials::{
 };
 pub use memory::{MemoryStore, StoredRecords};
 pub use traits::{
-    AccountConfig, AdminStore, AllocateError, BudgetError, Conservation, CreateAccountError,
-    CredentialActivity, CredentialActivityState, DEFAULT_RECLAIM_BATCH_LIMIT,
+    AccountConfig, AccountView, AdminStore, AllocateError, BudgetError, Conservation,
+    CreateAccountError, CredentialActivity, CredentialActivityState, DEFAULT_RECLAIM_BATCH_LIMIT,
     DEFAULT_ROLLOVER_BATCH_LIMIT, GrantPolicy, GrantPolicyError, IngestError, IngestReport,
-    KeyDirectory, KeyError, KeyRecord, LeaseAllocator, MAX_INGEST_BATCH, PUSH_CHANNEL_CAPACITY,
-    PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation, RolledAccount, RolloverBatch,
-    SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource, StatusChange, StoreError,
-    StoreHealth, UsageSink, drain_reclaim_expired, pushes_exceed_capacity,
+    KeyDirectory, KeyError, KeyRecord, KeySummary, LeaseAllocator, MAX_INGEST_BATCH,
+    PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation,
+    RolledAccount, RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource,
+    StatusChange, StoreError, StoreHealth, UsageSink, drain_reclaim_expired,
+    pushes_exceed_capacity,
 };

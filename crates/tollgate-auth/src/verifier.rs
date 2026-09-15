@@ -1,7 +1,9 @@
 //! The seam: what it means to verify a credential, independent of how.
 
 use jiff::Timestamp;
-use tollgate_core::Principal;
+use tollgate_core::{KeyId, Principal};
+
+use crate::hmac_registry::{EntropyUnavailable, MintedKey};
 
 /// A successful verification: who presented the credential, and how long that
 /// answer may be reused without asking again.
@@ -86,6 +88,36 @@ pub trait CredentialVerifier {
     /// `credential` is the credential itself, with transport framing already
     /// removed — no `Bearer ` prefix, no header name, no cookie attributes.
     fn verify(&self, credential: &[u8]) -> Option<Verified>;
+}
+
+/// Minting the credentials a [`CredentialVerifier`] will later accept (#121).
+///
+/// Separate from verification on purpose, and not merged into it. Every
+/// deployment verifies; only one that administers accounts over HTTP needs to
+/// *mint*, and a server that never issues should not hold the capability to.
+/// Keeping them apart lets a deployment answer "this instance does not issue
+/// credentials" by simply not having an issuer, rather than by configuration
+/// that could be got wrong.
+///
+/// **The secret exists exactly once.** An implementation returns it in
+/// [`MintedKey`] and retains nothing from which it can be recovered — what
+/// persists is a digest. A caller therefore has one opportunity to deliver it,
+/// and losing it means revoking the credential and issuing another, never
+/// asking for the same secret again.
+pub trait CredentialIssuer {
+    /// Mint a credential for `key_id`, chosen by the caller.
+    ///
+    /// The caller supplies the id so that a lost response is recoverable: the
+    /// same request resent is refused as a duplicate by the directory instead
+    /// of minting a second credential. An implementation must not derive the
+    /// id from the secret, or the two would share a fate.
+    fn mint(&self, key_id: KeyId) -> Result<MintedKey, EntropyUnavailable>;
+}
+
+impl<I: CredentialIssuer + ?Sized> CredentialIssuer for &I {
+    fn mint(&self, key_id: KeyId) -> Result<MintedKey, EntropyUnavailable> {
+        (**self).mint(key_id)
+    }
 }
 
 impl<V: CredentialVerifier + ?Sized> CredentialVerifier for &V {

@@ -190,7 +190,18 @@ async fn invalid_history_blocks_validation_but_leaves_write_guards_and_can_be_re
             .fetch_one(&mut connection)
             .await
             .unwrap();
-        assert_eq!(applied, 18);
+        // Head, derived rather than written down. The point of this assertion
+        // is that repair lets the catalogue reach the latest migration, not
+        // which number that happens to be — and a literal here fails on every
+        // migration added afterwards, for a reason unrelated to what the test
+        // is about (#121 was the one that tripped it).
+        let head = sqlx::migrate!("./migrations")
+            .migrations
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .expect("the migrator carries migrations");
+        assert_eq!(applied, head, "repair leaves the catalogue at head");
         cleanup(connection, &schema).await;
     }
 }

@@ -112,6 +112,7 @@ impl ControlledServer {
                 store: Arc::clone(&store),
                 clock: Arc::new(SystemClock),
                 security: common::security(),
+                issuer: None,
             },
             std::time::Duration::from_millis(1),
             async {
@@ -382,6 +383,7 @@ async fn invalid_maintenance_intervals_are_rejected_without_starting_tasks() {
                 store: Arc::clone(&store),
                 clock: Arc::new(SystemClock),
                 security: common::security(),
+                issuer: None,
             },
             interval,
             std::future::pending(),
@@ -690,6 +692,7 @@ async fn spawn_server(
         listener,
         ServerState {
             security: common::security(),
+            issuer: None,
             store,
             clock,
         },

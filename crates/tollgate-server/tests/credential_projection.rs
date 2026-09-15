@@ -50,6 +50,7 @@ async fn only_instances_receive_active_keys_at_the_server_clock_without_caching(
         store: store.clone(),
         clock: clock.clone(),
         security: common::security(),
+        issuer: None,
     });
     for (credential, expected) in [
         (None, StatusCode::UNAUTHORIZED),
@@ -256,6 +257,7 @@ async fn key_query_errors_are_structured_and_authentication_precedes_input_valid
         store: MemoryStore::new(GrantPolicy::default()).unwrap(),
         clock: Arc::new(ManualClock::new(t(100))),
         security: common::security(),
+        issuer: None,
     });
     for (query, status, code) in [
         ("limit=0", StatusCode::UNPROCESSABLE_ENTITY, "invalid-limit"),

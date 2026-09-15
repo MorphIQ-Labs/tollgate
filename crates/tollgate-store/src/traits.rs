@@ -893,6 +893,38 @@ impl From<StoreError> for PublishSnapshotError {
     }
 }
 
+/// One account's administrative state, for an operator read (#121).
+///
+/// Assembled from types that already exist rather than a parallel vocabulary,
+/// so the HTTP surface reports the same terms the ledger reasons in and a
+/// reader can hold a dashboard next to a conservation check.
+///
+/// **Funding is not billing, and the shape says so.** A falling `balance` does
+/// not mean units were billed: it also falls when they go out on a lease that
+/// has not settled, and it falls when a budget period closes and takes its
+/// unspent allowance with it. Those are three different facts, and
+/// [`Conservation`] keeps them apart — `active_lease_grants` is capacity
+/// currently out, `settled_usage` is what was actually consumed,
+/// `settlement_loss` and `expired` are what will never be. A surface that
+/// reported only a balance would let a customer read depletion as spend, which
+/// is exactly what #121 asks not to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountView {
+    pub account_id: AccountId,
+    pub status: AccountStatus,
+    pub capacity_class: CapacityClass,
+    /// The periodic allowance, if this account has one. `None` is "no
+    /// schedule, the balance does not expire" — not "unknown".
+    pub schedule: Option<BudgetSchedule>,
+    /// First instant of the period currently in force. Meaningful only
+    /// alongside a `schedule`; it is the marker rollover is idempotent
+    /// against.
+    pub period_start: Timestamp,
+    /// Every term of the funding equation, so a caller can distinguish
+    /// remaining funding from outstanding grants from settled usage.
+    pub conservation: Conservation,
+}
+
 /// Administrative writes: the control plane's mutation surface. Kept apart
 /// from the data-plane traits so a read-only replica can implement those
 /// without this.
@@ -989,11 +1021,19 @@ pub trait AdminStore: Send + Sync {
     /// `None` removes the schedule and leaves the balance alone — including
     /// any unspent allowance, which simply stops expiring. Removing a schedule
     /// is not a way to claw units back.
+    /// Set or clear an account's periodic allowance.
+    ///
+    /// Returns a receipt rather than `()` so the change can be audited like
+    /// every other administrative mutation: an operator surface has to be able
+    /// to report what a call actually committed, and a bare `Ok` cannot say
+    /// whether a schedule was introduced, replaced, or was already what the
+    /// caller asked for (#121). A repeat returns equal before/after states,
+    /// which is how the convention expresses an idempotent no-op.
     async fn set_budget_schedule(
         &self,
         account: AccountId,
         schedule: Option<BudgetSchedule>,
-    ) -> Result<(), BudgetError>;
+    ) -> Result<crate::AdminReceipt<()>, BudgetError>;
 
     /// Cross the period boundary for up to `limit` accounts that are past it:
     /// expire each closed period's unspent allowance and deposit the next one,
@@ -1036,6 +1076,20 @@ pub trait AdminStore: Send + Sync {
         &self,
         principal: Principal,
     ) -> Result<crate::AdminReceipt<()>, StoreError>;
+
+    /// One account's administrative state, or `None` if no such account (#121).
+    ///
+    /// The read an operator surface needs and the traits did not have. Both
+    /// backends already expose `conservation` as an inherent method, but with
+    /// different signatures — one synchronous returning an `Option`, one
+    /// asynchronous returning a `Result` — so nothing generic over a backend
+    /// could read an account at all.
+    ///
+    /// A single call rather than several, because the terms have to agree with
+    /// each other: status, schedule and the funding equation read separately
+    /// can straddle a rollover or a suspension and describe a state the account
+    /// was never in. A backend answers this from one consistent read.
+    async fn account_view(&self, account: AccountId) -> Result<Option<AccountView>, StoreError>;
 }
 
 /// Outcome of one ingest batch.
@@ -1247,7 +1301,21 @@ pub enum KeyError {
     /// This `key_id` is already recorded. Issuance is never destructive, for
     /// the reason account creation is not ([`CreateAccountError`]): an
     /// overwrite would silently retire a live credential.
+    ///
+    /// This is also the retry answer. A caller that supplies the `key_id` and
+    /// loses the response resends the same one and is told the credential
+    /// exists — which is the truth, and which discloses no secret. That is why
+    /// issuance must never become an upsert (#121).
     AlreadyExists,
+    /// The account already holds `limit` live credentials, so issuing another
+    /// would exceed the bound the caller supplied.
+    ///
+    /// "Live" excludes revoked keys and keys whose `not_after` has passed: a
+    /// bound that counted expired credentials would strand an account behind
+    /// keys nobody can authenticate with.
+    ActiveKeyLimit {
+        limit: NonZeroUsize,
+    },
     Storage(StoreError),
 }
 
@@ -1257,12 +1325,48 @@ impl std::fmt::Display for KeyError {
             KeyError::UnknownKey => f.write_str("no such credential"),
             KeyError::UnknownAccount => f.write_str("no such account"),
             KeyError::AlreadyExists => f.write_str("credential already exists"),
+            KeyError::ActiveKeyLimit { limit } => {
+                write!(f, "account already holds {limit} live credentials")
+            }
             KeyError::Storage(e) => write!(f, "{e}"),
         }
     }
 }
 
 impl std::error::Error for KeyError {}
+
+/// One credential as an *administrator* sees it (#121).
+///
+/// Deliberately not a [`KeyRecord`]. A record carries `digest` — the HMAC the
+/// verifier compares against — and `principal`, documented there as "the
+/// leading 128 bits of `digest`". Both are digest material, and an
+/// account-scoped listing is reachable by an application backend and from
+/// there a browser, so neither may appear in it. `key_id` is the non-secret
+/// handle: what the caller chose, what revocation names, what an audit shows.
+///
+/// Expiry and revocation are surfaced separately. A credential that lapsed on
+/// its own is a different operational fact from one an operator withdrew, and
+/// collapsing both into "inactive" loses the distinction exactly where someone
+/// is deciding whether to issue a replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeySummary {
+    pub key_id: KeyId,
+    /// When the credential stops being valid of its own accord, if ever.
+    pub not_after: Option<Timestamp>,
+    /// When an operator withdrew it, if they did. Terminal.
+    pub revoked_at: Option<Timestamp>,
+}
+
+impl KeySummary {
+    /// Whether this credential can still authenticate at `now`.
+    ///
+    /// The predicate the issuance bound counts with, written once so a listing
+    /// and a limit cannot disagree about what "live" means.
+    #[must_use]
+    pub fn is_live(&self, now: Timestamp) -> bool {
+        self.revoked_at.is_none() && self.not_after.is_none_or(|until| now < until)
+    }
+}
 
 /// Durable credential lifecycle: the half of key management that outlives a
 /// process and is shared by a fleet.
@@ -1310,11 +1414,91 @@ pub trait KeyDirectory: crate::KeySource {
     /// instances use `KeySource` pages and an owned, bounded drain instead.
     /// Retained for existing direct-store lifecycle tooling; no hidden page cap.
     async fn active_keys(&self, now: Timestamp) -> Result<Vec<KeyRecord>, StoreError>;
+
+    /// One account's credentials, ordered by `key_id`, for an operator
+    /// listing (#121).
+    ///
+    /// Distinct from [`active_keys`](Self::active_keys), which is the
+    /// fleet-wide, digest-bearing projection an *instance* pulls: this is
+    /// account-scoped, bounded, and carries no digest material, because it
+    /// answers a different question for a different caller.
+    ///
+    /// Paginate with `after` — the greatest `key_id` already seen, exclusive.
+    /// Revoked and expired credentials are included, because an administrator
+    /// deciding whether to issue a replacement needs to see what became of the
+    /// last one; [`KeySummary::is_live`] separates them.
+    async fn account_keys(
+        &self,
+        account: AccountId,
+        after: Option<KeyId>,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<KeySummary>, StoreError>;
+
+    /// Record a credential only if the account holds fewer than `max_active`
+    /// live ones, counting and inserting indivisibly (#121).
+    ///
+    /// The bound is supplied per call rather than stored: what counts as a
+    /// reasonable number of credentials belongs to the application's plan, not
+    /// to Tollgate, and a value in the request is one the caller can change
+    /// without a migration.
+    ///
+    /// **Why this is not [`active_keys`](Self::active_keys) then
+    /// [`insert_key`](Self::insert_key).** Two issuers racing that pair both
+    /// read `max_active - 1`, both insert, and the account ends up over the
+    /// bound with no error raised anywhere — the more replicas, the likelier.
+    /// A backend must make the count and the insert one indivisible step:
+    /// `MemoryStore` holds a single lock across both, and `PostgresStore`
+    /// takes the account row `FOR UPDATE` first — the row
+    /// `set_account_status` already serialises against.
+    ///
+    /// Live excludes revoked credentials, and those whose `not_after` has
+    /// passed at `now`, so an account cannot be stranded behind keys that can
+    /// no longer authenticate.
+    async fn insert_key_within(
+        &self,
+        record: KeyRecord,
+        max_active: NonZeroUsize,
+        now: Timestamp,
+    ) -> Result<(), KeyError>;
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::KeySummary;
+    use jiff::Timestamp;
+    use tollgate_core::KeyId;
+
+    fn at(seconds: i64) -> Timestamp {
+        Timestamp::from_second(seconds).expect("a test instant")
+    }
+
+    /// `not_after` is exclusive, and the instant itself is the whole question.
+    ///
+    /// Both backends filter with `now < not_after` — `memory.rs` in three
+    /// places, and four SQL predicates written `not_after > $now`. `is_live`
+    /// is the summary of exactly those queries, so `<=` here would not merely
+    /// be off by an instant: a listing would report a credential live for the
+    /// one instant at which every query that selects credentials has already
+    /// dropped it, and the issuance bound counts with this predicate.
+    #[test]
+    fn a_credential_is_dead_at_its_expiry_instant_not_after_it() {
+        let expiring = |not_after| KeySummary {
+            key_id: KeyId(1),
+            not_after: Some(not_after),
+            revoked_at: None,
+        };
+        assert!(
+            expiring(at(100)).is_live(at(99)),
+            "live up to the instant before"
+        );
+        assert!(
+            !expiring(at(100)).is_live(at(100)),
+            "dead *at* the boundary: expiry is exclusive, as both backends filter it"
+        );
+        assert!(!expiring(at(100)).is_live(at(101)), "and dead after it");
+    }
 
     use super::*;
 

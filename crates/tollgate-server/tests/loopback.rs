@@ -61,6 +61,7 @@ async fn zero_reclaim_interval_is_rejected() {
         listener,
         ServerState {
             security: common::security(),
+            issuer: None,
             store,
             clock: Arc::new(SystemClock),
         },
@@ -223,6 +224,7 @@ async fn http_negative_ttl_refetches_without_push() {
         listener,
         ServerState {
             security: common::security(),
+            issuer: None,
             store: Arc::clone(&store),
             clock: Arc::new(SystemClock),
         },
@@ -355,6 +357,7 @@ async fn a_consolidation_folds_the_tail_grant_over_http() {
         listener,
         ServerState {
             security: common::security(),
+            issuer: None,
             store: Arc::clone(&store),
             clock: Arc::new(SystemClock),
         },
@@ -614,6 +617,7 @@ async fn controlled_shutdown(mode: common::TransportMode) {
                     security,
                     store: store.clone(),
                     clock: clock.clone(),
+                    issuer: None,
                 },
                 std::time::Duration::from_millis(200),
                 async move {
@@ -815,6 +819,7 @@ async fn full_stack(mode: common::TransportMode) {
             security,
             store: Arc::clone(&store),
             clock: Arc::new(SystemClock),
+            issuer: None,
         },
         std::time::Duration::from_millis(200),
         async move {
@@ -996,6 +1001,7 @@ async fn http_instance_discovers_a_principal_published_after_it_started() {
         listener,
         ServerState {
             security: common::security(),
+            issuer: None,
             store: Arc::clone(&store),
             clock: Arc::new(SystemClock),
         },
@@ -1083,6 +1089,7 @@ async fn an_oversized_batch_comes_back_refused_not_retryable() {
     });
     let app = router(ServerState {
         security: common::security(),
+        issuer: None,
         store: Arc::clone(&store),
         clock: Arc::new(tollgate_client::ManualClock::new(at(0))),
     });

@@ -26,6 +26,7 @@ async fn security_reload_stages_validates_and_only_then_replaces() {
         store: MemoryStore::new(GrantPolicy::default()).unwrap(),
         clock: Arc::new(SystemClock),
         security: Arc::clone(&security),
+        issuer: None,
     });
     assert!(
         loader.load(SystemClock.now()).await.unwrap().is_none(),

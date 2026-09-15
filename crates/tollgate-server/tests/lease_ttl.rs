@@ -71,6 +71,7 @@ async fn serve_store<S: Backend>(store: Arc<S>) -> TestServer<S> {
         listener,
         ServerState {
             security: common::security(),
+            issuer: None,
             store: store.clone(),
             clock: Arc::new(ManualClock::new(now())),
         },

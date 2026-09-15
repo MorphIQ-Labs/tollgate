@@ -42,6 +42,7 @@ async fn readyz_status(healthy: bool) -> axum::http::StatusCode {
 
     let app = router(ServerState {
         security: common::security(),
+        issuer: None,
         store: Arc::new(ping_only(healthy)),
         clock: Arc::new(SystemClock),
     });
