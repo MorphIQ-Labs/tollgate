@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.22.5](https://github.com/MorphIQ-Labs/tollgate/compare/v0.22.4...v0.22.5) - 2026-09-15
+
+### Added
+
+- *(server)* administer accounts, budgets, and credentials over HTTP
+
 ## [0.22.4](https://github.com/MorphIQ-Labs/tollgate/compare/v0.22.3...v0.22.4) - 2026-09-15
 
 ### Other
