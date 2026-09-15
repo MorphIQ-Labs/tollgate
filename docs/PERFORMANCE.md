@@ -21,8 +21,18 @@ filtered benchmarks are useful diagnostics but do not replace the full workload.
 ./scripts/check_allocations.sh
 ```
 
-Criterion uses the ordinary release profile. Load tests use the production
-profile (fat LTO, `panic=abort`). Preserve `reports/perf_gate_report.json`,
+Criterion uses the release profile with `codegen-units = 1`, pinned as
+`[profile.bench]` in the workspace manifest. The default sixteen units are not
+reproducible across unrelated change: rustc repartitions a crate as its code
+grows and cross-unit inlining moves with it, so a row's measurement shifts
+while its own source stands still. That is what #114 was --
+`admission/snapshot_lookup_moka` read 66.92ns before a feature commit and
+88.19ns after it, with `get_at`, the cache builder, `StoredEntry`, `MapEntry`
+and the hasher byte-identical across the pair; one codegen unit put the same
+two revisions at 55.84ns and 56.40ns. One unit is also what `production`
+compiles, so the gate stops pricing a configuration nobody deploys. The cost is
+slower benchmark builds. Load tests use the production profile (fat LTO,
+`panic=abort`). Preserve `reports/perf_gate_report.json`,
 `reports/load_gate_report.json`, the allocation report and command logs with the
 review evidence. Reports are generated artifacts, not files to add to the source
 tree. Attach them to the MR or retain an inspectable evidence artifact and link it.

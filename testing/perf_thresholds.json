@@ -8,10 +8,7 @@
       "reservation/commit_split"
     ],
     "#99": [],
-    "#68": [
-      "admission/snapshot_lookup_arc_swap_at_capacity",
-      "admission/snapshot_lookup_moka_at_capacity"
-    ]
+    "#68": []
   },
   "benchmarks": [
     {
@@ -47,6 +44,7 @@
       "threshold_ns": 25.0
     },
     {
+      "_comment": "#79 moved the lease handle into the reservation, which put the refcount operation ahead of the reservation compare-exchange instead of after it, and the recorded median rose from 40.1 to 50.9ns. That is the row becoming faithful rather than regressing: `LeaseSlot::load_at` returns an owned `Arc` from `ArcSwapOption::load_full`, so the engine has always paid one increment before the CAS, and the earlier baseline measured a shape the request path never executed. The engine's own rows fell by the clone this removed.",
       "id": "lease/reserve_commit",
       "target_ns": 30.0,
       "threshold_ns": 80.0
@@ -125,6 +123,18 @@
       "id": "admission/snapshot_lookup_moka",
       "target_ns": 90.0,
       "threshold_ns": 220.0
+    },
+    {
+      "_comment": "#68 the configuration a bounded cache exists for: exactly max_capacity (4,096) principals resident, rotated through a fixed permutation. Recorded on the controlled host at 21.55ns (median of four full runs) against the under-filled row's 13.82ns, so the working-set growth alone costs this map 7.7ns (#119).",
+      "id": "admission/snapshot_lookup_arc_swap_at_capacity",
+      "target_ns": 30.0,
+      "threshold_ns": 70.0
+    },
+    {
+      "_comment": "#68 the same working set through moka with its frequency sketch enabled and its access-order deques full. Recorded on the controlled host at 75.51ns (median of four full runs). Its four samples ran 66.67, 73.21, 77.80 and 81.20ns in series order, the widest dispersion of any uncontended row, which is why its baseline carries a 10% allowance like the under-filled row rather than the default 5%. The same-run ratios below are the portable claims (#119).",
+      "id": "admission/snapshot_lookup_moka_at_capacity",
+      "target_ns": 115.0,
+      "threshold_ns": 280.0
     },
     {
       "_comment": "#91 stage one: one map lookup plus status, freshness, and route permission, returning the owned generation pin. Provisional bound; the controlled-host baseline is recorded with the staged rollout.",
@@ -509,6 +519,24 @@
       "numerator": "admission/commit_usage_fallback_key_split",
       "denominator": "admission/commit_usage_fallback_unattributed_split",
       "max_ratio": 1.25
+    },
+    {
+      "_comment": "#68 what filling the cache costs moka, stated portably: the same lookup with the frequency sketch enabled, the access-order deques full and the working set past L1. The recorded medians put it at x1.34. The 2.0 bound rejects a map whose maintenance grew super-constant with occupancy without asserting that being bounded is free; the arc-swap pair below separates moka's maintenance from the memory hierarchy both maps pay.",
+      "numerator": "admission/snapshot_lookup_moka_at_capacity",
+      "denominator": "admission/snapshot_lookup_moka",
+      "max_ratio": 2.0
+    },
+    {
+      "_comment": "#68 the control for the ratio above: the same working-set growth through the map that evicts nothing and takes no lock. The recorded medians put it at x1.56, larger than moka's x1.34, which is what establishes that most of the at-capacity cost is cache misses rather than maintenance.",
+      "numerator": "admission/snapshot_lookup_arc_swap_at_capacity",
+      "denominator": "admission/snapshot_lookup_arc_swap",
+      "max_ratio": 2.5
+    },
+    {
+      "_comment": "#68 the map-choice evidence measured where a bounded cache actually runs. maps.rs cites the gap as the reason to carry both maps; the recorded medians put it at x3.50 at capacity against x4.09 under-filled, so the gap narrows rather than widens when the cache fills. The 8.0 bound is the cross-host allowance the contention ratios use.",
+      "numerator": "admission/snapshot_lookup_moka_at_capacity",
+      "denominator": "admission/snapshot_lookup_arc_swap_at_capacity",
+      "max_ratio": 8.0
     }
   ]
 }

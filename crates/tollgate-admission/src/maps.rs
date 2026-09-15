@@ -512,9 +512,11 @@ macro_rules! publication_methods {
 ///   at all, so a cache that is never filled pays neither the sketch nor
 ///   eviction. The `admission/snapshot_lookup_moka` bench row measures that
 ///   under-filled state; `admission/snapshot_lookup_moka_at_capacity`
-///   measures a full one. Both run; the second is reserved in the threshold
-///   manifest rather than gated by it, because its bound has to be recorded
-///   on the controlled host before it is a contract.
+///   measures a full one. Both are gated: each carries an absolute bound
+///   recorded on the controlled host, and the manifest's same-run ratios
+///   price moka's at-capacity surcharge against an arc-swap control, which
+///   is what separates that surcharge from the memory hierarchy both maps
+///   pay for the same working-set growth (#119).
 /// * A bounded map can evict an entry the control plane still believes is
 ///   published. That is not a defect — it is what `SnapshotMap::needs_refresh`
 ///   and the generation history below exist to repair.
