@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.22.4](https://github.com/MorphIQ-Labs/tollgate/compare/v0.22.3...v0.22.4) - 2026-09-15
+
+### Other
+
+- *(ci)* #114 #119 pin the benchmark profile and record the baseline whole
+
 ## [0.22.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.22.2...v0.22.3) - 2026-09-14
 
 ### Other

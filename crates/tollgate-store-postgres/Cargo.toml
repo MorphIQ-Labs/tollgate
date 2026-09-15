@@ -13,8 +13,8 @@ publish.workspace = true
 test-support = []
 
 [dependencies]
-tollgate-core = { path = "../tollgate-core", version = "=0.22.3", features = ["serde"] }
-tollgate-store = { path = "../tollgate-store", version = "=0.22.3", features = ["wire"] }
+tollgate-core = { path = "../tollgate-core", version = "=0.22.4", features = ["serde"] }
+tollgate-store = { path = "../tollgate-store", version = "=0.22.4", features = ["wire"] }
 async-trait = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true }
@@ -29,7 +29,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 # Enable helpers for this package's integration tests, never normal consumers.
-tollgate-store-postgres = { path = ".", version = "=0.22.3", default-features = false, features = ["test-support"] }
+tollgate-store-postgres = { path = ".", version = "=0.22.4", default-features = false, features = ["test-support"] }
 criterion = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
