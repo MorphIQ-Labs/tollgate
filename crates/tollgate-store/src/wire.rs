@@ -452,7 +452,19 @@ pub struct AccountResponse {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetBudgetRequest {
+    #[serde(deserialize_with = "required_budget")]
     pub budget: Option<tollgate_core::BudgetSchedule>,
+}
+
+// A custom field deserializer makes omission an error while still accepting
+// explicit JSON null. Plain Option deserialization also accepts missing fields.
+fn required_budget<'de, D>(
+    deserializer: D,
+) -> Result<Option<tollgate_core::BudgetSchedule>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer)
 }
 
 /// What a budget change committed.

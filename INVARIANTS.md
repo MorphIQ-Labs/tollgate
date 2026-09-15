@@ -1922,13 +1922,23 @@ exists to detect corrupt state and must not be able to launder it.
     `full_stack_over_tls_bearer` and `full_stack_over_mtls`.
 
 33. **An administrative audit receipt describes its own serialized mutation.**
-    Each successful HTTP-facing `AdminStore` mutation returns a typed receipt
+    Each successful HTTP-facing store mutation returns a typed receipt
     alongside its result, captured under the owning memory lock or PostgreSQL
     transaction. Concurrent operations must name the actual predecessor they
     replaced; a separate audit read cannot substitute for that evidence.
     Idempotent no-ops have equal before/after states. Snapshot state is identified
     by principal, immutable generation and revocation status; receipts do not
     duplicate complete policy graphs.
+
+    Budget changes require the `budget` field; only explicit `null` clears a
+    schedule. PostgreSQL locks the predecessor before updating the coupled
+    schedule columns. Credential administration uses `KeyDirectory`'s audited
+    methods; issuance reports absence to an unrevoked credential, and retirement
+    reports the actual prior retirement state. Receipts include the owning
+    account and non-secret key ID, never a digest or principal. Expiry is
+    independent of the retirement flag. Repeated retirement returns equal states.
+    Both credential listings reject malformed or oversized queries as structured
+    client errors before a backend read.
 
     The HTTP operator guard emits actor, operation ID, action, resource and time
     before a store call, then confirms with the receipt, or reports failure or
@@ -1949,6 +1959,19 @@ exists to detect corrupt state and must not be able to launder it.
     HTTP witnesses: `every_admin_mutation_logs_its_actor_and_the_backend_receipt`,
     `cancelled_admin_operations_report_an_unknown_commit_without_a_receipt`, and
     `normal_log_verbosity_cannot_silence_the_binarys_audit_target`.
+    Additional witnesses: `a_budget_mutation_requires_explicit_field_presence`,
+    `explicit_null_clears_while_zero_remains_a_budget_schedule`,
+    `an_omitted_budget_is_rejected_without_clearing_the_schedule`,
+    `concurrent_budget_receipts_form_one_serial_history` (both stores),
+    `queued_budget_updates_report_the_locked_predecessor` (PostgreSQL),
+    `credential_receipts_identify_issuance_and_concurrent_revocation` (both stores),
+    `credential_auditing_refuses_a_corrupt_owner_without_retiring_it` (PostgreSQL),
+    `credential_audits_name_the_key_and_actual_lifecycle_transition`, and
+    `both_credential_listings_validate_queries_before_backend_reads`.
+    `ControlPlane` additionally proves generic replacement predecessor composition
+    and credential retirement identity preservation, idempotency and terminality;
+    these models assume serialization rather than prove the SQL lock behavior.
+
 
 34. **A credential projection cannot renew stale identity evidence.** A single
     owned publisher replaces the complete validated active-key table. Duplicate

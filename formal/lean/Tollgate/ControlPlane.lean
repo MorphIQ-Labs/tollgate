@@ -83,4 +83,46 @@ theorem deposits_conserve_the_funding_difference
   simp only [deposit]
   omega
 
+/-! Replacements model the complete budget schedule as a value. Serialization
+is a precondition: PostgreSQL row locks and the memory mutex are witnessed
+separately by the concurrent backend tests. -/
+structure ReplacementReceipt (α : Type) where
+  before : α
+  after : α
+
+def replaceValue {α : Type} (before after : α) : ReplacementReceipt α :=
+  ⟨before, after⟩
+
+theorem replacement_records_predecessor {α : Type} (before after : α) :
+    (replaceValue before after).before = before := by rfl
+
+theorem serialized_replacements_join {α : Type} (before a b : α) :
+    (replaceValue (replaceValue before a).after b).before =
+      (replaceValue before a).after := by rfl
+
+theorem repeated_replacement_is_a_noop {α : Type} (value : α) :
+    (replaceValue value value).before = (replaceValue value value).after := by rfl
+
+structure CredentialState where
+  account : Nat
+  key : Nat
+  revoked : Bool
+  deriving DecidableEq, Repr
+
+def retire (before : CredentialState) : ReplacementReceipt CredentialState :=
+  replaceValue before { before with revoked := true }
+
+theorem retirement_preserves_identity (before : CredentialState) :
+    (retire before).after.account = before.account ∧
+    (retire before).after.key = before.key := by exact ⟨rfl, rfl⟩
+
+theorem retirement_records_predecessor (before : CredentialState) :
+    (retire before).before = before := by rfl
+
+theorem repeated_retirement_is_a_noop (before : CredentialState) :
+    (retire (retire before).after).before = (retire (retire before).after).after := by rfl
+
+theorem retirement_is_terminal (before : CredentialState) :
+    (retire (retire before).after).after.revoked = true := by rfl
+
 end Tollgate.ControlPlane
