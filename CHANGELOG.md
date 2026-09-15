@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.23.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.22.5...v0.23.0) - 2026-09-15
+
+### Fixed
+
+- *(admin)* [**breaking**] preserve mutation intent and audit predecessors
+
 ## [0.22.5](https://github.com/MorphIQ-Labs/tollgate/compare/v0.22.4...v0.22.5) - 2026-09-15
 
 ### Added
