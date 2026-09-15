@@ -1791,16 +1791,36 @@ impl KeyDirectory for MemoryStore {
 
     async fn insert_key(&self, record: KeyRecord) -> Result<(), KeyError> {
         let mut inner = self.lock();
-        insert_key_locked(&mut inner, record)
+        insert_key_locked(&mut inner, record).map(|receipt| receipt.outcome)
     }
 
     async fn revoke_key(&self, key_id: KeyId, now: Timestamp) -> Result<Revocation, KeyError> {
+        self.revoke_key_audited(key_id, now)
+            .await
+            .map(|receipt| receipt.outcome)
+    }
+
+    async fn revoke_key_audited(
+        &self,
+        key_id: KeyId,
+        now: Timestamp,
+    ) -> Result<crate::AdminReceipt<Revocation>, KeyError> {
         let mut inner = self.lock();
         let Some(stored) = inner.keys.get(&key_id) else {
             return Err(KeyError::UnknownKey);
         };
+        let account_id = stored.record.account_id;
+        let before = AdminState::Credential {
+            account_id,
+            key_id,
+            revoked: stored.revoked_at.is_some(),
+        };
         if stored.revoked_at.is_some() {
-            return Ok(Revocation::AlreadyRetired);
+            return Ok(crate::AdminReceipt::new(
+                Revocation::AlreadyRetired,
+                before,
+                before,
+            ));
         }
         let revision = next_credential_revision(inner.credential_revision)?;
         inner
@@ -1810,7 +1830,15 @@ impl KeyDirectory for MemoryStore {
             .revoked_at = Some(now);
         inner.unrevoked_keys.remove(&key_id);
         inner.credential_revision = revision;
-        Ok(Revocation::Retired)
+        Ok(crate::AdminReceipt::new(
+            Revocation::Retired,
+            before,
+            AdminState::Credential {
+                account_id,
+                key_id,
+                revoked: true,
+            },
+        ))
     }
 
     async fn active_keys(&self, now: Timestamp) -> Result<Vec<KeyRecord>, StoreError> {
@@ -1877,6 +1905,17 @@ impl KeyDirectory for MemoryStore {
         max_active: NonZeroUsize,
         now: Timestamp,
     ) -> Result<(), KeyError> {
+        self.insert_key_within_audited(record, max_active, now)
+            .await
+            .map(|receipt| receipt.outcome)
+    }
+
+    async fn insert_key_within_audited(
+        &self,
+        record: KeyRecord,
+        max_active: NonZeroUsize,
+        now: Timestamp,
+    ) -> Result<crate::AdminReceipt<()>, KeyError> {
         // One guard across the count and the write. That is the whole point of
         // the method: releasing it between them would let two issuers each see
         // room for one more and both take it.
@@ -1926,7 +1965,10 @@ impl KeyDirectory for MemoryStore {
 /// unbounded one on what it validates — and taken by `&mut Inner` so it
 /// *cannot* acquire a lock, which is what makes the caller's guard span the
 /// count and the write.
-fn insert_key_locked(inner: &mut Inner, record: KeyRecord) -> Result<(), KeyError> {
+fn insert_key_locked(
+    inner: &mut Inner,
+    record: KeyRecord,
+) -> Result<crate::AdminReceipt<()>, KeyError> {
     if !inner.accounts.contains_key(&record.account_id) {
         return Err(KeyError::UnknownAccount);
     }
@@ -1948,6 +1990,11 @@ fn insert_key_locked(inner: &mut Inner, record: KeyRecord) -> Result<(), KeyErro
     let revision = next_credential_revision(inner.credential_revision)?;
     inner.key_principals.insert(record.principal, record.key_id);
     inner.unrevoked_keys.insert(record.key_id);
+    let after = AdminState::Credential {
+        account_id: record.account_id,
+        key_id: record.key_id,
+        revoked: false,
+    };
     inner.keys.insert(
         record.key_id,
         StoredKey {
@@ -1956,7 +2003,7 @@ fn insert_key_locked(inner: &mut Inner, record: KeyRecord) -> Result<(), KeyErro
         },
     );
     inner.credential_revision = revision;
-    Ok(())
+    Ok(crate::AdminReceipt::new((), AdminState::Absent, after))
 }
 
 fn next_credential_revision(revision: u64) -> Result<u64, KeyError> {

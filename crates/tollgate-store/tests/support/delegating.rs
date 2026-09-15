@@ -104,10 +104,14 @@ type ActiveKeysPageHook<S> =
 type CredentialActivityHook<S> = Hook<S, Vec<KeyId>, Result<Vec<CredentialActivity>, StoreError>>;
 type InsertKeyHook<S> = Hook<S, KeyRecord, Result<(), KeyError>>;
 type RevokeKeyHook<S> = Hook<S, (KeyId, Timestamp), Result<Revocation, KeyError>>;
+type RevokeKeyAuditedHook<S> =
+    Hook<S, (KeyId, Timestamp), Result<AdminReceipt<Revocation>, KeyError>>;
 type ActiveKeysHook<S> = Hook<S, Timestamp, Result<Vec<KeyRecord>, StoreError>>;
 type AccountKeysHook<S> =
     Hook<S, (AccountId, Option<KeyId>, NonZeroUsize), Result<Vec<KeySummary>, StoreError>>;
 type InsertKeyWithinHook<S> = Hook<S, (KeyRecord, NonZeroUsize, Timestamp), Result<(), KeyError>>;
+type InsertKeyWithinAuditedHook<S> =
+    Hook<S, (KeyRecord, NonZeroUsize, Timestamp), Result<AdminReceipt<()>, KeyError>>;
 type PingHook<S> = Hook<S, (), Result<(), StoreError>>;
 
 pub struct DelegatingStore<S> {
@@ -140,9 +144,11 @@ pub struct DelegatingStore<S> {
     credential_activity: Option<CredentialActivityHook<S>>,
     insert_key: Option<InsertKeyHook<S>>,
     revoke_key: Option<RevokeKeyHook<S>>,
+    revoke_key_audited: Option<RevokeKeyAuditedHook<S>>,
     active_keys: Option<ActiveKeysHook<S>>,
     account_keys: Option<AccountKeysHook<S>>,
     insert_key_within: Option<InsertKeyWithinHook<S>>,
+    insert_key_within_audited: Option<InsertKeyWithinAuditedHook<S>>,
     // StoreHealth
     ping: Option<PingHook<S>>,
 }
@@ -174,9 +180,11 @@ impl<S: Send + Sync + 'static> DelegatingStore<S> {
             credential_activity: None,
             insert_key: None,
             revoke_key: None,
+            revoke_key_audited: None,
             active_keys: None,
             account_keys: None,
             insert_key_within: None,
+            insert_key_within_audited: None,
             ping: None,
         }
     }
@@ -461,6 +469,18 @@ impl<S: Send + Sync + 'static> DelegatingStore<S> {
         self
     }
 
+    /// Replace [`KeyDirectory::revoke_key_audited`].
+    pub fn on_revoke_key_audited<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(Arc<S>, KeyId, Timestamp) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<AdminReceipt<Revocation>, KeyError>> + Send + 'static,
+    {
+        self.revoke_key_audited = Some(Arc::new(move |inner, (key_id, now)| {
+            Box::pin(f(inner, key_id, now))
+        }));
+        self
+    }
+
     /// Replace [`KeyDirectory::active_keys`].
     pub fn on_active_keys<F, Fut>(mut self, f: F) -> Self
     where
@@ -490,6 +510,18 @@ impl<S: Send + Sync + 'static> DelegatingStore<S> {
         Fut: Future<Output = Result<(), KeyError>> + Send + 'static,
     {
         self.insert_key_within = Some(Arc::new(move |inner, (record, max_active, now)| {
+            Box::pin(f(inner, record, max_active, now))
+        }));
+        self
+    }
+
+    /// Replace [`KeyDirectory::insert_key_within_audited`].
+    pub fn on_insert_key_within_audited<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(Arc<S>, KeyRecord, NonZeroUsize, Timestamp) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<AdminReceipt<()>, KeyError>> + Send + 'static,
+    {
+        self.insert_key_within_audited = Some(Arc::new(move |inner, (record, max_active, now)| {
             Box::pin(f(inner, record, max_active, now))
         }));
         self
@@ -795,6 +827,17 @@ where
         }
     }
 
+    async fn revoke_key_audited(
+        &self,
+        key_id: KeyId,
+        now: Timestamp,
+    ) -> Result<AdminReceipt<Revocation>, KeyError> {
+        match &self.revoke_key_audited {
+            Some(hook) => hook(Arc::clone(&self.inner), (key_id, now)).await,
+            None => KeyDirectory::revoke_key_audited(&*self.inner, key_id, now).await,
+        }
+    }
+
     async fn active_keys(&self, now: Timestamp) -> Result<Vec<KeyRecord>, StoreError> {
         match &self.active_keys {
             Some(hook) => hook(Arc::clone(&self.inner), now).await,
@@ -823,6 +866,20 @@ where
         match &self.insert_key_within {
             Some(hook) => hook(Arc::clone(&self.inner), (record, max_active, now)).await,
             None => KeyDirectory::insert_key_within(&*self.inner, record, max_active, now).await,
+        }
+    }
+
+    async fn insert_key_within_audited(
+        &self,
+        record: KeyRecord,
+        max_active: NonZeroUsize,
+        now: Timestamp,
+    ) -> Result<AdminReceipt<()>, KeyError> {
+        match &self.insert_key_within_audited {
+            Some(hook) => hook(Arc::clone(&self.inner), (record, max_active, now)).await,
+            None => {
+                KeyDirectory::insert_key_within_audited(&*self.inner, record, max_active, now).await
+            }
         }
     }
 }
@@ -1031,6 +1088,14 @@ impl KeyDirectory for RejectingStore {
         unreachable!("{}: KeyDirectory::revoke_key", self.reason)
     }
 
+    async fn revoke_key_audited(
+        &self,
+        _key_id: KeyId,
+        _now: Timestamp,
+    ) -> Result<AdminReceipt<Revocation>, KeyError> {
+        unreachable!("{}: KeyDirectory::revoke_key_audited", self.reason)
+    }
+
     async fn active_keys(&self, _now: Timestamp) -> Result<Vec<KeyRecord>, StoreError> {
         unreachable!("{}: KeyDirectory::active_keys", self.reason)
     }
@@ -1051,6 +1116,15 @@ impl KeyDirectory for RejectingStore {
         _now: Timestamp,
     ) -> Result<(), KeyError> {
         unreachable!("{}: KeyDirectory::insert_key_within", self.reason)
+    }
+
+    async fn insert_key_within_audited(
+        &self,
+        _record: KeyRecord,
+        _max_active: NonZeroUsize,
+        _now: Timestamp,
+    ) -> Result<AdminReceipt<()>, KeyError> {
+        unreachable!("{}: KeyDirectory::insert_key_within_audited", self.reason)
     }
 }
 

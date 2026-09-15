@@ -176,38 +176,72 @@ impl KeyDirectory for PostgresStore {
     }
 
     async fn insert_key(&self, record: KeyRecord) -> Result<(), KeyError> {
-        self.insert_credential(record, None).await
+        self.insert_credential(record, None)
+            .await
+            .map(|receipt| receipt.outcome)
     }
 
     async fn revoke_key(&self, key_id: KeyId, now: Timestamp) -> Result<Revocation, KeyError> {
-        // One statement decides all three answers, so "did this retire
-        // anything" cannot race a concurrent revocation between a read and a
-        // write: the UPDATE matches only live rows, and the RETURNING tells us
-        // whether it matched. A follow-up existence check separates "no such
-        // key" from "already retired".
-        let retired = sqlx::query(
-            "UPDATE tollgate_credential_keys SET revoked_at_us = $2
-             WHERE key_id = $1 AND revoked_at_us IS NULL
-             RETURNING key_id",
-        )
-        .bind(id_bytes(key_id.0))
-        .bind(ts_micros(now))
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| KeyError::Storage(storage(e)))?;
-        if retired.is_some() {
-            return Ok(Revocation::Retired);
-        }
-        let exists = sqlx::query("SELECT 1 FROM tollgate_credential_keys WHERE key_id = $1")
-            .bind(id_bytes(key_id.0))
-            .fetch_optional(&self.pool)
+        self.revoke_key_audited(key_id, now)
             .await
-            .map_err(|e| KeyError::Storage(storage(e)))?;
-        if exists.is_some() {
-            Ok(Revocation::AlreadyRetired)
-        } else {
-            Err(KeyError::UnknownKey)
+            .map(|receipt| receipt.outcome)
+    }
+
+    async fn revoke_key_audited(
+        &self,
+        key_id: KeyId,
+        now: Timestamp,
+    ) -> Result<AdminReceipt<Revocation>, KeyError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let result = async {
+            // The row lock captures the actual predecessor, including a prior
+            // retirement committed while this call waited. No account lock is
+            // acquired after the credential lock.
+            let row = sqlx::query(
+                "SELECT account_id, revoked_at_us IS NOT NULL
+                 FROM tollgate_credential_keys WHERE key_id = $1 FOR UPDATE",
+            )
+            .bind(id_bytes(key_id.0))
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(storage)?
+            .ok_or(KeyError::UnknownKey)?;
+            let account_bytes: Vec<u8> = row.get(0);
+            let account_bytes: [u8; 16] = account_bytes
+                .try_into()
+                .map_err(|_| StoreError("credential account identifier is not 16 bytes".into()))?;
+            let account_id = AccountId(u128::from_be_bytes(account_bytes));
+            let revoked: bool = row.get(1);
+            let before = AdminState::Credential {
+                account_id,
+                key_id,
+                revoked,
+            };
+            let outcome = if revoked {
+                Revocation::AlreadyRetired
+            } else {
+                sqlx::query(
+                    "UPDATE tollgate_credential_keys SET revoked_at_us = $2 WHERE key_id = $1",
+                )
+                .bind(id_bytes(key_id.0))
+                .bind(ts_micros(now))
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?;
+                Revocation::Retired
+            };
+            Ok(AdminReceipt::new(
+                outcome,
+                before,
+                AdminState::Credential {
+                    account_id,
+                    key_id,
+                    revoked: true,
+                },
+            ))
         }
+        .await;
+        finish_transaction(tx, result).await
     }
 
     async fn active_keys(&self, now: Timestamp) -> Result<Vec<KeyRecord>, StoreError> {
@@ -272,6 +306,17 @@ impl KeyDirectory for PostgresStore {
         max_active: NonZeroUsize,
         now: Timestamp,
     ) -> Result<(), KeyError> {
+        self.insert_key_within_audited(record, max_active, now)
+            .await
+            .map(|receipt| receipt.outcome)
+    }
+
+    async fn insert_key_within_audited(
+        &self,
+        record: KeyRecord,
+        max_active: NonZeroUsize,
+        now: Timestamp,
+    ) -> Result<AdminReceipt<()>, KeyError> {
         self.insert_credential(record, Some((max_active, now)))
             .await
     }
@@ -286,7 +331,7 @@ impl PostgresStore {
         &self,
         record: KeyRecord,
         bound: Option<(NonZeroUsize, Timestamp)>,
-    ) -> Result<(), KeyError> {
+    ) -> Result<AdminReceipt<()>, KeyError> {
         let mut tx = self
             .pool
             .begin()
@@ -379,7 +424,15 @@ impl PostgresStore {
         tx.commit()
             .await
             .map_err(|e| KeyError::Storage(storage(e)))?;
-        Ok(())
+        Ok(AdminReceipt::new(
+            (),
+            AdminState::Absent,
+            AdminState::Credential {
+                account_id: record.account_id,
+                key_id: record.key_id,
+                revoked: false,
+            },
+        ))
     }
 }
 
@@ -2638,40 +2691,41 @@ impl AdminStore for PostgresStore {
             .map(|s| to_i64(s.allowance, "budget allowance"))
             .transpose()
             .map_err(BudgetError::Storage)?;
-        // `RETURNING` the *old* columns, so the receipt reports what this
-        // statement replaced. A separate SELECT would be a different snapshot:
-        // a concurrent change between the two would be attributed to this call
-        // or hidden by it, and the audit is supposed to describe what actually
-        // committed here.
-        let replaced = sqlx::query(
-            "UPDATE tollgate_accounts AS updated
-             SET budget_allowance = $2, budget_period = $3, budget_rollover = $4
-             FROM tollgate_accounts AS previous
-             WHERE updated.account_id = $1 AND previous.account_id = updated.account_id
-             RETURNING previous.budget_allowance, previous.budget_period,
-                       previous.budget_rollover",
-        )
-        .bind(id_bytes(account.0))
-        .bind(allowance)
-        .bind(schedule.map(|s| s.period.as_str()))
-        .bind(schedule.map(|s| s.rollover.as_str()))
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| BudgetError::Storage(storage(e)))?;
-        let Some(row) = replaced else {
-            return Err(BudgetError::UnknownAccount);
-        };
-        let before = decode_schedule(
-            row.get::<Option<i64>, _>(0),
-            row.get::<Option<String>, _>(1),
-            row.get::<Option<String>, _>(2),
-        )
-        .map_err(BudgetError::Storage)?;
-        Ok(AdminReceipt::new(
-            (),
-            AdminState::Budget { schedule: before },
-            AdminState::Budget { schedule },
-        ))
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let result = async {
+            // A self-join's `previous` alias retains its statement snapshot
+            // after waiting for a writer. Lock first so the receipt observes
+            // the committed predecessor, then update under that same lock.
+            let row = sqlx::query(
+                "SELECT budget_allowance, budget_period, budget_rollover
+                 FROM tollgate_accounts WHERE account_id = $1 FOR UPDATE",
+            )
+            .bind(id_bytes(account.0))
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(storage)?
+            .ok_or(BudgetError::UnknownAccount)?;
+            let before = decode_schedule(row.get(0), row.get(1), row.get(2))?;
+            sqlx::query(
+                "UPDATE tollgate_accounts
+                 SET budget_allowance = $2, budget_period = $3, budget_rollover = $4
+                 WHERE account_id = $1",
+            )
+            .bind(id_bytes(account.0))
+            .bind(allowance)
+            .bind(schedule.map(|s| s.period.as_str()))
+            .bind(schedule.map(|s| s.rollover.as_str()))
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+            Ok(AdminReceipt::new(
+                (),
+                AdminState::Budget { schedule: before },
+                AdminState::Budget { schedule },
+            ))
+        }
+        .await;
+        finish_transaction(tx, result).await
     }
 
     async fn account_view(&self, account: AccountId) -> Result<Option<AccountView>, StoreError> {

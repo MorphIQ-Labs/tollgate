@@ -4474,3 +4474,18 @@ async fn setting_a_budget_schedule_reports_what_it_replaced() {
     let store = MemoryStore::new(GrantPolicy::default()).unwrap();
     account_view::setting_a_schedule_reports_what_it_replaced(&*store).await;
 }
+
+#[path = "support/admin_receipts.rs"]
+mod admin_receipts;
+
+#[tokio::test]
+async fn concurrent_budget_receipts_form_one_serial_history() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    admin_receipts::budget_receipts_form_a_serial_history(store).await;
+}
+
+#[tokio::test]
+async fn credential_receipts_identify_issuance_and_concurrent_revocation() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    admin_receipts::credential_receipts_capture_lifecycle(store).await;
+}

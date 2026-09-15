@@ -1209,3 +1209,245 @@ async fn the_documented_provisioning_sequence_is_repeatable() {
         "the funding equation holds exactly"
     );
 }
+
+#[path = "../../tollgate-store/tests/support/delegating.rs"]
+mod delegating;
+
+#[tokio::test]
+async fn an_omitted_budget_is_rejected_without_clearing_the_schedule() {
+    let (store, app) = state();
+    make_account(&store, 1).await;
+    let path = api(&format!("/admin/accounts/{}/budget", id(1)));
+    let schedule = json!({"allowance": 500, "period": "UtcCalendarMonth", "rollover": "None"});
+    assert_eq!(
+        call(&app, "PUT", &path, Some(json!({"budget": schedule})))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (status, problem) = call(&app, "PUT", &path, Some(json!({}))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(problem["code"], "invalid-json");
+    assert_eq!(
+        store
+            .account_view(AccountId(1))
+            .await
+            .unwrap()
+            .unwrap()
+            .schedule
+            .unwrap()
+            .allowance,
+        CostUnits(500)
+    );
+    let (status, cleared) = call(&app, "PUT", &path, Some(json!({"budget": null}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cleared["previous"], schedule);
+    assert!(cleared["current"].is_null());
+    assert!(
+        store
+            .account_view(AccountId(1))
+            .await
+            .unwrap()
+            .unwrap()
+            .schedule
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn both_credential_listings_validate_queries_before_backend_reads() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tollgate_store::{KeyDirectory, KeySource};
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+    let reads = Arc::new(AtomicUsize::new(0));
+    let directory_reads = Arc::clone(&reads);
+    let projection_reads = Arc::clone(&reads);
+    let store =
+        delegating::DelegatingStore::wrapping(MemoryStore::new(GrantPolicy::default()).unwrap())
+            .on_account_keys(move |inner, account, after, limit| {
+                directory_reads.fetch_add(1, Ordering::SeqCst);
+                async move { inner.account_keys(account, after, limit).await }
+            })
+            .on_active_keys_page(move |inner, now, after, limit| {
+                projection_reads.fetch_add(1, Ordering::SeqCst);
+                async move { inner.active_keys_page(now, after, limit).await }
+            });
+    let app = router(ServerState {
+        security: common::security(),
+        issuer: None,
+        store: Arc::new(store),
+        clock: Arc::new(ManualClock::new(t(0))),
+    });
+    let capture = common::EventCapture::default();
+    async {
+        for (path, token) in [
+            (
+                api(&format!("/admin/accounts/{}/keys", id(1))),
+                common::OPERATOR,
+            ),
+            (api("/keys"), common::INSTANCE),
+        ] {
+            let oversized = format!("limit={}", tollgate_store::MAX_KEY_PAGE_LIMIT + 1);
+            for (query, status, code) in [
+                ("after=bad", StatusCode::BAD_REQUEST, "invalid-query"),
+                ("limit=wat", StatusCode::BAD_REQUEST, "invalid-query"),
+                ("unexpected=1", StatusCode::BAD_REQUEST, "invalid-query"),
+                ("limit=0", StatusCode::UNPROCESSABLE_ENTITY, "invalid-limit"),
+                (
+                    oversized.as_str(),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid-limit",
+                ),
+            ] {
+                let previous_reads = reads.load(Ordering::SeqCst);
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("{path}?{query}"))
+                            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status, "{query}");
+                assert_eq!(
+                    response.headers()[header::CONTENT_TYPE],
+                    "application/problem+json"
+                );
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let problem: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(problem["code"], code);
+                assert_eq!(
+                    reads.load(Ordering::SeqCst),
+                    previous_reads,
+                    "invalid input never reaches a backend"
+                );
+            }
+            for limit in [1, tollgate_store::MAX_KEY_PAGE_LIMIT] {
+                assert_eq!(
+                    call(&app, "GET", &format!("{path}?limit={limit}"), None)
+                        .await
+                        .0,
+                    StatusCode::OK
+                );
+            }
+        }
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        4,
+        "both valid boundaries reach both backends"
+    );
+    assert!(
+        capture
+            .events()
+            .iter()
+            .all(|event| event.target != "tollgate::diagnostics"),
+        "client validation must not report a backend incident"
+    );
+}
+
+#[tokio::test]
+async fn credential_audits_name_the_key_and_actual_lifecycle_transition() {
+    use tollgate_core::KeyId;
+    use tollgate_store::{AdminState, KeyDirectory};
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+    let (store, app) = issuing_state();
+    make_account(&store, 1).await;
+    let path = api(&format!("/admin/accounts/{}/keys", id(1)));
+    let capture = common::EventCapture::default();
+    let mut secret = String::new();
+    let mut digest = String::new();
+    async {
+        let (status, issued) = call(
+            &app,
+            "POST",
+            &path,
+            Some(json!({"key_id": id(7), "max_active_keys": 1})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        secret = issued["secret"].as_str().unwrap().to_owned();
+        digest = format!("{:?}", store.active_keys(t(0)).await.unwrap()[0].digest);
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                &path,
+                Some(json!({"key_id": id(7), "max_active_keys": 1}))
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        for retired in [true, false] {
+            let (status, result) = call(&app, "DELETE", &format!("{path}/{}", id(7)), None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(result["retired"], retired);
+        }
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    let events = capture.events();
+    let confirmed: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.target == "tollgate::audit"
+                && event
+                    .fields
+                    .get("outcome")
+                    .is_some_and(|outcome| outcome == "confirmed")
+        })
+        .collect();
+    let unrevoked = AdminState::Credential {
+        account_id: AccountId(1),
+        key_id: KeyId(7),
+        revoked: false,
+    };
+    let revoked = AdminState::Credential {
+        account_id: AccountId(1),
+        key_id: KeyId(7),
+        revoked: true,
+    };
+    assert_eq!(confirmed.len(), 3);
+    for (event, (action, before, after)) in confirmed.iter().zip([
+        ("issue_key", AdminState::Absent, unrevoked),
+        ("revoke_key", unrevoked, revoked),
+        ("revoke_key", revoked, revoked),
+    ]) {
+        assert_eq!(event.fields["actor"], "test-operator");
+        assert_eq!(event.fields["action"], action);
+        assert_eq!(
+            event.fields["resource"],
+            format!("{}/keys/{}", id(1), id(7))
+        );
+        assert_eq!(event.fields["before"], format!("{before:?}"));
+        assert_eq!(event.fields["after"], format!("{after:?}"));
+    }
+    let failed: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event
+                .fields
+                .get("outcome")
+                .is_some_and(|outcome| outcome == "failed")
+        })
+        .collect();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(
+        failed[0].fields["resource"],
+        confirmed[0].fields["resource"]
+    );
+    assert!(!failed[0].fields.contains_key("before") && !failed[0].fields.contains_key("after"));
+    let rendered = format!("{events:?}");
+    assert!(!rendered.contains(&secret));
+    assert!(!rendered.contains(&digest));
+    assert!(!rendered.contains("principal"));
+    assert!(!rendered.contains("fixture-issuance-secret-121-only"));
+}

@@ -30,6 +30,13 @@ pub enum AdminState {
         generation: Generation,
         revoked: bool,
     },
+    /// Durable credential identity and retirement state, without digest material.
+    /// Expiry is independent of revocation; `revoked: false` does not imply live.
+    Credential {
+        account_id: tollgate_core::AccountId,
+        key_id: tollgate_core::KeyId,
+        revoked: bool,
+    },
     /// An account's periodic allowance, whole. The schedule is three coupled
     /// values — allowance, period, rollover — and the row's own CHECK treats
     /// them as all-or-nothing, so auditing one without the others would record

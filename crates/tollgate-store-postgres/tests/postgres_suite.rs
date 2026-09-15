@@ -6536,10 +6536,10 @@ async fn mixed_issuers_waiting_on_an_account_report_duplicates() {
                 .insert_key_within(first, NonZeroUsize::new(32).unwrap(), t(100))
                 .await
         });
-        wait_for_blocked_issuers(&pool, blocker_pid, 1).await;
+        wait_for_blocked_operations(&pool, blocker_pid, 1).await;
         let unbounded_store = Arc::clone(&store);
         attempts.spawn(async move { unbounded_store.insert_key(second).await });
-        wait_for_blocked_issuers(&pool, blocker_pid, 2).await;
+        wait_for_blocked_operations(&pool, blocker_pid, 2).await;
         blocker.commit().await.unwrap();
 
         let outcomes = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -6563,7 +6563,7 @@ async fn mixed_issuers_waiting_on_an_account_report_duplicates() {
 
 /// Observe the blocker and its queue through PostgreSQL's lock graph, without
 /// relying on sleeps to guess whether the issuer has reached the critical point.
-async fn wait_for_blocked_issuers(pool: &sqlx::PgPool, blocker_pid: i32, expected: i64) {
+async fn wait_for_blocked_operations(pool: &sqlx::PgPool, blocker_pid: i32, expected: i64) {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let waiting: i64 = sqlx::query_scalar(
@@ -6625,4 +6625,139 @@ async fn setting_a_budget_schedule_reports_what_it_replaced() {
         return;
     };
     account_view::setting_a_schedule_reports_what_it_replaced(&*store).await;
+}
+
+#[path = "../../tollgate-store/tests/support/admin_receipts.rs"]
+mod admin_receipts;
+
+#[tokio::test]
+async fn concurrent_budget_receipts_form_one_serial_history() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    admin_receipts::budget_receipts_form_a_serial_history(store).await;
+}
+
+#[tokio::test]
+async fn credential_receipts_identify_issuance_and_concurrent_revocation() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    admin_receipts::credential_receipts_capture_lifecycle(store).await;
+}
+
+/// Force the second request to start before the first can commit. An UPDATE
+/// self-join retains the earlier statement snapshot here and misreports 100
+/// as the predecessor of both updates.
+#[tokio::test]
+async fn queued_budget_updates_report_the_locked_predecessor() {
+    use tollgate_store::AdminState;
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    store
+        .set_budget_schedule(ACCOUNT, Some(admin_receipts::schedule(100)))
+        .await
+        .unwrap();
+    let pool = tollgate_store_postgres::test_support::pool(&store);
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query(tollgate_store_postgres::test_support::issuance_sql::ACCOUNT_LOCK)
+        .bind(ACCOUNT.0.to_be_bytes().to_vec())
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    for (waiting, allowance) in [(1, 200), (2, 300)] {
+        let store = Arc::clone(&store);
+        tasks.spawn(async move {
+            (
+                allowance,
+                store
+                    .set_budget_schedule(ACCOUNT, Some(admin_receipts::schedule(allowance)))
+                    .await,
+            )
+        });
+        wait_for_blocked_operations(&pool, pid, waiting).await;
+    }
+    blocker.commit().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(result) = tasks.join_next().await {
+            let (allowance, receipt) = result.unwrap();
+            let receipt = receipt.unwrap();
+            assert_eq!(
+                receipt.before,
+                AdminState::Budget {
+                    schedule: Some(admin_receipts::schedule(allowance - 100))
+                }
+            );
+            assert_eq!(
+                receipt.after,
+                AdminState::Budget {
+                    schedule: Some(admin_receipts::schedule(allowance))
+                }
+            );
+        }
+    })
+    .await
+    .expect("queued budget mutations complete");
+    assert_eq!(
+        store.account_view(ACCOUNT).await.unwrap().unwrap().schedule,
+        Some(admin_receipts::schedule(300))
+    );
+}
+
+#[tokio::test]
+async fn credential_auditing_refuses_a_corrupt_owner_without_retiring_it() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    let pool = tollgate_store_postgres::test_support::pool(&store);
+    // BYTEA account IDs have no length constraint. A valid FK alone therefore
+    // cannot establish that an owner can be represented by an audit receipt.
+    sqlx::query(
+        "INSERT INTO tollgate_accounts
+        (account_id, balance, deposited, status, capacity_class, next_fence,
+         usage_recorded, settlement_loss, overage_recorded)
+        VALUES ($1, 0, 0, 'Active', 'Assured', 1, 0, 0, 0)",
+    )
+    .bind(vec![1u8])
+    .execute(&pool)
+    .await
+    .unwrap();
+    let key = KeyId(900);
+    sqlx::query(
+        "INSERT INTO tollgate_credential_keys
+        (key_id, account_id, principal, digest, not_after_is_lower_bound)
+        VALUES ($1, $2, $1, $3, FALSE)",
+    )
+    .bind(key.0.to_be_bytes().to_vec())
+    .bind(vec![1u8])
+    .bind(vec![0u8; 32])
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        store.revoke_key_audited(key, t(100)).await,
+        Err(KeyError::Storage(_))
+    ));
+    let revoked: bool = sqlx::query_scalar(
+        "SELECT revoked_at_us IS NOT NULL
+        FROM tollgate_credential_keys WHERE key_id = $1",
+    )
+    .bind(key.0.to_be_bytes().to_vec())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !revoked,
+        "invalid audit evidence must not commit a retirement"
+    );
 }

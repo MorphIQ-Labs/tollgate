@@ -1335,6 +1335,12 @@ impl std::fmt::Display for KeyError {
 
 impl std::error::Error for KeyError {}
 
+impl From<StoreError> for KeyError {
+    fn from(error: StoreError) -> Self {
+        Self::Storage(error)
+    }
+}
+
 /// One credential as an *administrator* sees it (#121).
 ///
 /// Deliberately not a [`KeyRecord`]. A record carries `digest` — the HMAC the
@@ -1460,6 +1466,23 @@ pub trait KeyDirectory: crate::KeySource {
         max_active: NonZeroUsize,
         now: Timestamp,
     ) -> Result<(), KeyError>;
+
+    /// Bounded issuance with lifecycle evidence captured under the mutation lock.
+    /// HTTP administrators must use this receipt rather than synthesize history.
+    async fn insert_key_within_audited(
+        &self,
+        record: KeyRecord,
+        max_active: NonZeroUsize,
+        now: Timestamp,
+    ) -> Result<crate::AdminReceipt<()>, KeyError>;
+
+    /// Retire a credential and capture its actual owner, key and predecessor
+    /// under the mutation lock. A repeated revocation returns equal states.
+    async fn revoke_key_audited(
+        &self,
+        key_id: KeyId,
+        now: Timestamp,
+    ) -> Result<crate::AdminReceipt<Revocation>, KeyError>;
 }
 
 #[cfg(test)]

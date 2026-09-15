@@ -62,7 +62,9 @@ The response reports both states, so a repeat is visibly a no-op:
 
 `"budget": null` clears the schedule. That is **not** the same as an allowance
 of zero: `null` means the balance does not expire, zero means the account is
-funded nothing each period.
+funded nothing each period. The `budget` field must be present:
+`{}` is rejected as `422 invalid-json` and preserves the existing schedule.
+Concurrent updates report the predecessor captured under the account lock.
 
 **A one-off deposit is not a substitute for an allowance.**
 `POST /v1/admin/accounts/{account}/deposit` adds units once; a schedule funds
@@ -132,6 +134,9 @@ Revoked and expired credentials are listed, and distinguishable: `revoked_at`
 says an operator withdrew it, `not_after` says it lapsed on its own. `live` is
 derived against `as_of` so you need not re-implement the rule. Page with
 `next_after`; `null` means this page is the last.
+`limit` must be between 1 and 4096. Malformed cursors or query values return
+`400 invalid-query`; zero or oversized limits return `422 invalid-limit`.
+These are client errors and do not trigger a store read or backend diagnostic.
 
 ### Revoking
 
@@ -140,6 +145,12 @@ derived against `as_of` so you need not re-implement the rule. Page with
 
 `retired: false` means it was already revoked. That is a success, not an error —
 your intent is satisfied — but the distinction is what an audit needs.
+Audit resources identify `{account}/keys/{key}`. Confirmed issuance records
+`Absent` to `Credential { account_id, key_id, revoked: false }`; first retirement
+changes `revoked` to `true`, and repeated retirement records equal states. These
+receipts come from the store's mutation lock, not a separate HTTP read. An
+unrevoked credential may still be expired. No secret, digest or principal is
+included in the audit receipt.
 
 **Revocation is bound to the account in the path.** A `key_id` belonging to
 another account answers `404 unknown-credential` and revokes nothing. You
@@ -203,6 +214,9 @@ Every failure is RFC 7807 with a stable `code`. Retry behaviour by class:
 
 | code | status | meaning | retry |
 | --- | --- | --- | --- |
+| `invalid-json` | 422 | malformed body or missing required budget field | no — fix the body |
+| `invalid-query` | 400 | malformed or unsupported query | no — fix the query |
+| `invalid-limit` | 422 | credential page limit outside 1–4096 | no — fix the limit |
 | `unknown-account` | 404 | no such account | no — fix the id |
 | `account-exists` | 409 | already created | no — you are done |
 | `account-closed` | 409 | terminal status | no |
@@ -213,8 +227,8 @@ Every failure is RFC 7807 with a stable `code`. Retry behaviour by class:
 | `entropy-unavailable` | 503 | no credential entropy | yes, with backoff |
 | `storage` | 503 | backend unavailable | yes, with backoff |
 
-409 rather than 422 throughout: those requests are well-formed and the caller
-is not at fault for asking. Secrets and digest material never appear in an
+State conflicts return 409: those requests are well-formed. Invalid bodies and
+limits return 422; malformed queries return 400. Secrets and digest material never appear in an
 error body or a log line.
 
 ## Deployment

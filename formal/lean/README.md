@@ -70,7 +70,9 @@ This Lean package contains exact models for critical contracts:
   Watch-channel closure, task cancellation, HTTP delivery and finite counters
   remain separate implementation obligations.
 - `ControlPlane` models disjoint role evidence and serialized administrative
-  receipt composition. It assumes credential authenticity and atomic policy
+  receipt composition, whole-value replacement predecessors, and credential
+  retirement identity preservation, idempotency and terminality. It assumes
+  credential authenticity and atomic policy
   selection; it does not prove cryptography or database serialization.
 - `CredentialProjection` models exact integer-time expiry intersection and
   complete table replacement. It proves that fetch delay consumes freshness,

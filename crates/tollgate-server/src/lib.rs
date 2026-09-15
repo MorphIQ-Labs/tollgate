@@ -35,7 +35,7 @@ pub mod transport;
 
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, Query, State};
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -661,18 +661,7 @@ async fn active_keys<S: Backend>(
     State(state): State<ServerState<S>>,
     ApiQuery(query): ApiQuery<KeyQuery>,
 ) -> Result<impl axum::response::IntoResponse, ApiError> {
-    let limit = std::num::NonZeroUsize::new(
-        query
-            .limit
-            .unwrap_or(tollgate_store::DEFAULT_KEY_PAGE_LIMIT.get()),
-    )
-    .filter(|limit| limit.get() <= tollgate_store::MAX_KEY_PAGE_LIMIT)
-    .ok_or_else(|| ApiError {
-        status: StatusCode::UNPROCESSABLE_ENTITY,
-        code: "invalid-limit",
-        title: "credential page limit must be between 1 and 4096".into(),
-        generation: None,
-    })?;
+    let limit = credential_page_limit(query.limit)?;
     let page = state
         .store
         .active_keys_page(state.clock.now(), query.after, limit)
@@ -892,15 +881,17 @@ async fn issue_key<S: Backend>(
         not_after: request.not_after,
     };
     operator
-        .run("issue_key", account, state.clock.as_ref(), async {
-            state
-                .store
-                .insert_key_within(record, request.max_active_keys, state.clock.now())
-                .await
-                .map(|()| {
-                    tollgate_store::AdminReceipt::new((), AdminState::Absent, AdminState::Absent)
-                })
-        })
+        .run(
+            "issue_key",
+            format!("{account}/keys/{}", minted.key_id),
+            state.clock.as_ref(),
+            async {
+                state
+                    .store
+                    .insert_key_within_audited(record, request.max_active_keys, state.clock.now())
+                    .await
+            },
+        )
         .await?;
 
     // 201, as `create_account` answers: this made a credential that did not
@@ -925,9 +916,9 @@ async fn list_account_keys<S: Backend>(
     _operator: OperatorIdentity,
     State(state): State<ServerState<S>>,
     ApiPath(account): ApiPath<AccountId>,
-    Query(page): Query<KeyPageQuery>,
+    ApiQuery(page): ApiQuery<KeyQuery>,
 ) -> Result<Json<AccountKeysResponse>, ApiError> {
-    let limit = page.limit.unwrap_or(DEFAULT_KEY_PAGE_LIMIT);
+    let limit = credential_page_limit(page.limit)?;
     let as_of = state.clock.now();
     let summaries = state.store.account_keys(account, page.after, limit).await?;
     // A full page may or may not be the last; a short one certainly is. Saying
@@ -977,15 +968,12 @@ async fn revoke_account_key<S: Backend>(
     }
     let now = state.clock.now();
     let outcome = operator
-        .run("revoke_key", account, state.clock.as_ref(), async {
-            state.store.revoke_key(key, now).await.map(|revocation| {
-                tollgate_store::AdminReceipt::new(
-                    revocation,
-                    AdminState::Absent,
-                    AdminState::Absent,
-                )
-            })
-        })
+        .run(
+            "revoke_key",
+            format!("{account}/keys/{key}"),
+            state.clock.as_ref(),
+            state.store.revoke_key_audited(key, now),
+        )
         .await?;
     Ok(Json(RevokeKeyResponse {
         key_id: key,
@@ -993,14 +981,19 @@ async fn revoke_account_key<S: Backend>(
     }))
 }
 
-/// Cursor and page size for a credential listing.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct KeyPageQuery {
-    #[serde(default)]
-    after: Option<KeyId>,
-    #[serde(default)]
-    limit: Option<std::num::NonZeroUsize>,
+/// Both credential feeds validate input before any backend read.
+fn credential_page_limit(limit: Option<usize>) -> Result<std::num::NonZeroUsize, ApiError> {
+    std::num::NonZeroUsize::new(limit.unwrap_or(DEFAULT_KEY_PAGE_LIMIT.get()))
+        .filter(|limit| limit.get() <= tollgate_store::MAX_KEY_PAGE_LIMIT)
+        .ok_or_else(|| ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "invalid-limit",
+            title: format!(
+                "credential page limit must be between 1 and {}",
+                tollgate_store::MAX_KEY_PAGE_LIMIT
+            ),
+            generation: None,
+        })
 }
 
 fn one() -> std::num::NonZeroUsize {
