@@ -7,6 +7,16 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.23.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.23.2...v0.23.3) - 2026-09-22
+
+### Added
+
+- *(core)* report shard occupancy and preserve request affinities
+
+### Fixed
+
+- *(docs)* declare the published seam, and give its rule a backstop
+
 ## [0.23.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.23.1...v0.23.2) - 2026-09-22
 
 ### Other
