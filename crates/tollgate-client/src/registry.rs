@@ -135,7 +135,7 @@ impl SlotRegistry {
                 .total_overage_spent
                 .checked_add(u128::from(slot.overage().spent().get()))
                 .expect("at most usize::MAX u64 contributions fit u128");
-            if let Some(lease) = slot.load() {
+            if let Some(lease) = slot.load_observed() {
                 let sum = report
                     .total_lease_remaining
                     .unwrap_or(0)
@@ -152,7 +152,7 @@ impl SlotRegistry {
             if members
                 .values()
                 .any(|s| s.status == AccountStatus::Active && now < s.valid_until)
-                && let Some(lease) = inner.slots[account].load()
+                && let Some(lease) = inner.slots[account].load_observed()
             {
                 let until = lease.usable_until();
                 report.earliest_lease_usable_until = Some(
@@ -356,7 +356,7 @@ impl Registry {
 
 fn quota_usable(slot: &LeaseSlot, mode: EnforcementMode, now: Timestamp) -> bool {
     let lease_usable = slot
-        .load()
+        .load_observed()
         .is_some_and(|lease| now < lease.usable_until() && !lease.remaining().is_zero());
     lease_usable
         || mode

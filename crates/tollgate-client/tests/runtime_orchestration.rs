@@ -16,6 +16,8 @@ use tollgate_core::{
 };
 #[path = "../../tollgate-store/tests/support/delegating.rs"]
 mod delegating;
+#[path = "../../tollgate-core/tests/support/isolated.rs"]
+mod isolated;
 use delegating::{DelegatingStore, RejectingStore, rejecting};
 
 use tollgate_store::{AccountConfig, AllocateError, GrantPolicy, LeaseAllocator, MemoryStore};
@@ -1475,4 +1477,73 @@ async fn ambiguous_consolidations_remain_visible_after_a_clean_shutdown() {
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(store.balance(AccountId(1)), CostUnits(100));
     }
+}
+
+/// An instance reports the layout it is running and whether that layout still
+/// buys anything (#124).
+///
+/// Sharding is worth its memory only while a request-serving thread writes to
+/// lines no peer writes, and that holds only while the affinities handed out do
+/// not outnumber the shards. When it stops holding, the instance degrades
+/// toward the unsharded cost while looking exactly like the contention the
+/// layout was enabled to remove — so the report carries it rather than leaving
+/// an operator to infer it from latency.
+///
+/// The reading has to be live, not a copy taken at startup, because crowding
+/// arrives *after* startup: threads take their affinity on first use. So this
+/// stands one instance up with room to spare, confirms it reports room, then
+/// consumes the headroom and confirms the same handle now says so.
+#[tokio::test(start_paused = true)]
+async fn a_runtime_report_carries_the_effective_shard_layout() {
+    if isolated::rerun_in_child() {
+        return;
+    }
+    let store = store();
+    // Isolation prevents parallel tests from consuming this headroom while
+    // readiness is awaited. This Tokio runtime uses only the current thread.
+    assert_eq!(tollgate_core::Locality::assigned(), 0);
+    let shards = 8;
+    let mut cfg = config();
+    cfg.sharding = tollgate_core::LocalSharding::new(std::num::NonZeroUsize::new(shards).unwrap());
+    let (runtime, handle) = start(&store, cfg);
+    wait(|| handle.readiness(t(100)).is_ready()).await;
+
+    let spread = handle.report().sharding;
+    assert_eq!(
+        spread.shards, shards,
+        "the report names the configured count"
+    );
+    assert_eq!(
+        spread.affinities_assigned,
+        tollgate_core::Locality::assigned(),
+        "and reads the live counter"
+    );
+    assert!(
+        !spread.is_crowded(),
+        "every affinity fits, so every thread can still have its own shard"
+    );
+    assert_eq!(spread.crowded_shards(), 0);
+
+    // Consume the headroom the way a deployment does — threads taking their
+    // number on first use — and the same handle must change its answer.
+    for _ in 0..16 {
+        std::thread::spawn(|| {
+            let _claimed = tollgate_core::Locality::current();
+        })
+        .join()
+        .unwrap();
+    }
+    let crowded = handle.report().sharding;
+    assert_eq!(crowded.shards, shards, "the layout itself did not move");
+    assert!(
+        crowded.affinities_assigned > spread.affinities_assigned,
+        "the affinities did"
+    );
+    assert!(
+        crowded.is_crowded(),
+        "more affinities than shards must be reported, not inferred from latency"
+    );
+    assert_eq!(crowded.affinities_assigned, spread.affinities_assigned + 16);
+    assert_eq!(crowded.crowded_shards(), shards);
+    drop(runtime.shutdown().await.unwrap());
 }

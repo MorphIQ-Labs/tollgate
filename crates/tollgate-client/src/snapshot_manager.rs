@@ -37,7 +37,7 @@ use tollgate_admission::{
     PublicationError, PublishableSnapshotUpdate, RefreshBatch, Refreshed, SnapshotMap, Watermark,
     accept_positive, accept_revoked, accept_unknown,
 };
-use tollgate_core::{Generation, Principal};
+use tollgate_core::{Generation, Locality, Principal};
 use tollgate_store::{Clock, SnapshotResolution, SnapshotSource, StoreError};
 
 pub use crate::registry::SlotRegistry;
@@ -557,11 +557,12 @@ impl Publication {
             Publications::Push(updates) => self.map.apply_publishable_many_at(updates, now)?,
             Publications::Refreshed(updates) => self.map.apply_refreshed_many_at(updates, now)?,
         }
-        self.slots.observe_many(
-            principals
-                .into_iter()
-                .map(|principal| (principal, self.map.get(&principal))),
-        );
+        self.slots
+            .observe_many(principals.into_iter().map(|principal| {
+                // Observing our own publication is control-plane work, so it
+                // reads a fixed affinity rather than claiming one (#124).
+                (principal, self.map.get_at(&principal, Locality::OBSERVER))
+            }));
         Ok(())
     }
 }
@@ -1732,6 +1733,138 @@ mod tests {
 
     fn t(seconds: i64) -> jiff::Timestamp {
         jiff::Timestamp::from_second(seconds).unwrap()
+    }
+
+    /// Publishing and observing is control-plane work, and it must not spend
+    /// a request-serving thread's affinity to do it (#124).
+    ///
+    /// `Locality` is handed out on a thread's *first* access from one
+    /// process-global counter that never recycles, and every number it hands
+    /// out pushes the live request-serving threads one step closer to sharing
+    /// a shard. `apply` used to observe its own publication through
+    /// `SnapshotMap::get`, which resolves `Locality::current()` — so a control
+    /// plane on a thread that serves no requests charged the request path for
+    /// its own bookkeeping.
+    ///
+    /// Asserted against the call the map receives rather than against the
+    /// counter. The counter is process-global and every other test in this
+    /// binary spends from it concurrently, so a before/after delta is a race;
+    /// which affinity the observation *asks for* is a fact about this code.
+    #[test]
+    fn observing_a_publication_does_not_consume_an_affinity() {
+        use std::sync::Mutex;
+        use tollgate_admission::{
+            AdmissionCounters, ArcSwapSnapshotMap, LeaseSlot, MapEntry, PublicationError,
+        };
+        use tollgate_core::{
+            AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, Generation,
+            LocalSharding, PermissionBits, PublishableSnapshot, ResolvedLimits,
+        };
+
+        /// Records how each read asked, so the distinction this test is about
+        /// is visible: `None` is a `get`, which resolves — and therefore may
+        /// assign — the calling thread's affinity.
+        struct RecordingMap {
+            inner: ArcSwapSnapshotMap,
+            reads: Mutex<Vec<Option<Locality>>>,
+        }
+
+        impl SnapshotMap for RecordingMap {
+            fn get(&self, principal: &Principal) -> Option<MapEntry> {
+                self.reads
+                    .lock()
+                    .expect("recording map poisoned")
+                    .push(None);
+                self.inner.get(principal)
+            }
+            fn get_at(&self, principal: &Principal, locality: Locality) -> Option<MapEntry> {
+                self.reads
+                    .lock()
+                    .expect("recording map poisoned")
+                    .push(Some(locality));
+                self.inner.get_at(principal, locality)
+            }
+            fn counters(&self) -> &Arc<AdmissionCounters> {
+                self.inner.counters()
+            }
+            fn install(
+                &self,
+                principal: Principal,
+                snapshot: Arc<AccountSnapshot>,
+                lease: Arc<LeaseSlot>,
+            ) -> Result<(), PublicationError> {
+                self.inner.install(principal, snapshot, lease)
+            }
+            fn install_revoked(
+                &self,
+                principal: Principal,
+                until: jiff::Timestamp,
+                generation: Generation,
+            ) -> Result<(), PublicationError> {
+                self.inner.install_revoked(principal, until, generation)
+            }
+            fn install_unknown(
+                &self,
+                principal: Principal,
+                until: jiff::Timestamp,
+            ) -> Result<(), PublicationError> {
+                self.inner.install_unknown(principal, until)
+            }
+            fn remove(&self, principal: &Principal) {
+                self.inner.remove(principal);
+            }
+        }
+
+        let map = Arc::new(RecordingMap {
+            inner: ArcSwapSnapshotMap::new(),
+            reads: Mutex::new(Vec::new()),
+        });
+        let (slots, _changes) = SlotRegistry::observed(LocalSharding::SINGLE);
+        assert!(
+            slots.observes(),
+            "an observing registry is what reaches the read under test"
+        );
+        let publication = Publication {
+            map: Arc::clone(&map) as Arc<dyn SnapshotMap>,
+            slots,
+        };
+        let principal = Principal(7);
+        let snapshot = PublishableSnapshot::try_new(Arc::new(
+            AccountSnapshot::builder(
+                AccountId(1),
+                Generation(1),
+                AccountStatus::Active,
+                t(3_600),
+                PermissionBits::bit(0),
+                ResolvedLimits::new(16),
+                Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+            )
+            .build(),
+        ))
+        .expect("test snapshot limits are valid");
+
+        publication
+            .apply(
+                Publications::Push(vec![PublishableSnapshotUpdate::Present {
+                    principal,
+                    snapshot,
+                    lease: LeaseSlot::for_account(AccountId(1)),
+                }]),
+                t(0),
+            )
+            .expect("the fixture publishes a well-formed snapshot");
+
+        let reads = map.reads.lock().expect("recording map poisoned").clone();
+        assert_eq!(
+            reads,
+            vec![Some(Locality::OBSERVER)],
+            "the publication must observe itself at the observer affinity, never \
+             through a read that resolves the calling thread's"
+        );
+        assert!(
+            map.get_at(&principal, Locality::OBSERVER).is_some(),
+            "and the publication still landed"
+        );
     }
 
     #[test]

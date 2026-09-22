@@ -643,7 +643,7 @@ async fn run(
         {
             break;
         }
-        let rotation = match slot.load() {
+        let rotation = match slot.load_observed() {
             None => Rotation::Acquire,
             Some(lease) if now >= lease.usable_until() => {
                 // This inspection is not an in-flight request. Keeping its
@@ -757,7 +757,7 @@ async fn run(
             // against an empty slot means this instance is denying every
             // request, which is the condition an operator must see.
             outcome => {
-                let serving = slot.load().is_some();
+                let serving = slot.load_observed().is_some();
                 // A timeout is not a domain answer — the allocator may have
                 // granted and merely failed to say so — so it is counted
                 // apart from the refusals rather than folded into one of them.

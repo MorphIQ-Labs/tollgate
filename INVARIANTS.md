@@ -2214,3 +2214,44 @@ exists to detect corrupt state and must not be able to launder it.
     The CI production-profile fixture reuses the client/report implementation
     to witness ordinary process completion and readable failure reports with
     abort enabled; it performs no performance measurement.
+
+40. **Instance-local sharding separates request-serving threads only while
+    affinities outnumber neither the shards nor their holders.** A thread takes
+    its affinity from one process-global counter on its first use of the request
+    path, never at spawn and never recycled, and each component reduces that
+    number by its own shard count. Two threads whose affinities are congruent
+    modulo that count therefore share every sharded structure they touch:
+    admission state, lease counters, rate buckets and outcome tallies. Because
+    the counter issues `0, 1, 2, …`, the separation the layout is bought for
+    holds exactly while the affinities issued do not outnumber the shards.
+    Losing it costs performance and nothing else — an affinity is a cache
+    locality hint, carries no authorization or accounting meaning, and selecting
+    a shared shard still conserves every unit (3, 25, 26).
+
+    Control-plane work never spends an affinity. Reads that ask whether a grant
+    is present, until when, or what a published generation says are answered
+    identically by every view of one slot and every shard of one entry, so they
+    resolve a fixed observer affinity rather than claiming the caller's. An
+    instance reports what its layout is carrying — the shard count, the
+    affinities issued, and how many shards hold more than one — as a
+    control-plane read that no admission decision consults.
+
+    Enforcement: the two control-plane readers own their half — `load_observed`
+    on the slot and the observer affinity threaded through snapshot
+    publication — and `crowded_shards` is exact arithmetic over the counter's
+    own output rather than a sample. The other half is a **deployment
+    responsibility** and is reported, not enforced: this library does not choose
+    how many threads serve requests, cannot know which threads still hold the
+    affinities it issued, and so cannot make crowding unrepresentable. Sizing
+    shards against the worker pool, and keeping the request path off threads
+    outside it, belong to the embedder; `docs/LOCAL_SHARDING.md` is that
+    guidance. This is component-owned enforcement for what the library controls
+    plus a reported contract for what it does not, never a proof that a
+    deployment's threads are distinct.
+    *Tests:* `crowded_shards_counts_the_residues_the_counter_hands_out`,
+    `a_layout_with_room_reports_every_affinity_distinct`,
+    `occupancy_reports_the_counter_without_consuming_from_it`,
+    `the_observer_affinity_costs_nothing_and_never_moves`,
+    `observing_a_publication_does_not_consume_an_affinity`,
+    `an_observed_slot_read_answers_without_claiming_an_affinity`, and
+    `a_runtime_report_carries_the_effective_shard_layout`.
