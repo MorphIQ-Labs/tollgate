@@ -13,12 +13,10 @@ type Conversion = fn(StoreError) -> ApiError;
 
 #[tokio::test]
 async fn every_backend_error_conversion_keeps_opaque_details_out_of_responses_and_debug() {
-    use tracing_subscriber::layer::SubscriberExt;
     let capture = common::EventCapture::default();
     // This current-thread test never spawns; conversions and response decoding
     // remain inside this dispatcher, including any accidental diagnostic log.
-    let _guard =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+    let _guard = capture.on_this_thread();
     let conversions: [(Conversion, u16, &str, &str); 7] = [
         (ApiError::from, 503, "storage", "backend unavailable"),
         (
@@ -109,8 +107,6 @@ async fn router_correlates_backend_failures_without_logging_request_or_error_pay
     use tollgate_server::{ServerState, router};
     use tollgate_store::{AccountConfig, GrantPolicy, MemoryStore, SystemClock, UsageSink};
     use tower::ServiceExt;
-    use tracing::instrument::WithSubscriber;
-    use tracing_subscriber::layer::SubscriberExt;
 
     const FORGED_ID: &str = "00000000000000000000000000000070aa";
     let account = AccountId(70);
@@ -146,7 +142,8 @@ async fn router_correlates_backend_failures_without_logging_request_or_error_pay
         issuer: None,
     });
     let capture = common::EventCapture::default();
-    let expected = async {
+    let expected = capture
+        .during(async {
         let mut expected = Vec::new();
         for (path, token, body, status, code, route) in [
             (
@@ -226,10 +223,9 @@ async fn router_correlates_backend_failures_without_logging_request_or_error_pay
                 assert!(body.get("error_id").is_none());
             }
         }
-        expected
-    }
-    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
-    .await;
+            expected
+        })
+        .await;
     assert_ne!(expected[0].0, expected[1].0);
     let events = capture.events();
     let incidents: Vec<_> = events

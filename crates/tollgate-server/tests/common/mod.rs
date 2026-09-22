@@ -58,6 +58,71 @@ impl EventCapture {
     pub fn events(&self) -> Vec<CapturedEvent> {
         self.0.lock().unwrap().clone()
     }
+
+    /// Capture every event `work` emits, and nothing emitted outside it.
+    pub async fn during<T>(&self, work: impl std::future::Future<Output = T>) -> T {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+        arm();
+        work.with_subscriber(tracing_subscriber::registry().with(self.clone()))
+            .await
+    }
+
+    /// Capture this thread's events until the guard drops.
+    ///
+    /// The sibling of [`during`](Self::during) for a fixture whose emissions
+    /// do not all happen inside one future — a task spawned onto the test's
+    /// current-thread runtime runs on this thread and so shares this
+    /// dispatcher, which a future-scoped subscriber would not reach.
+    #[must_use]
+    pub fn on_this_thread(&self) -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt;
+        arm();
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+    }
+}
+
+/// Install a process-global dispatcher, once per test binary, so that no
+/// callsite is ever cached as disabled.
+///
+/// `tracing` keeps each callsite's `Interest` in a process-global slot and
+/// computes it the first time *any* thread reaches that callsite, against
+/// that thread's current dispatcher. A thread-local or future-scoped
+/// subscriber therefore does not make the decision local: one test reaching a
+/// callsite while no dispatcher is installed caches `Interest::never()` for
+/// the whole process, and every other test's capture of that callsite
+/// silently returns nothing.
+///
+/// The failure is partial and order-dependent, which is what makes it worth
+/// owning here rather than leaving to each test. `api.rs`'s credential-audit
+/// witness failed three runs in fifteen locally and once in CI, capturing the
+/// two `revoke_key` pairs while both `issue_key` events — same callsite,
+/// emitted earlier in the same scope — were dropped, because another test's
+/// dispatcher rebuilt the cache partway through. The dangerous direction is
+/// the quiet one: `dropping_an_unpolled_reloader_is_an_expected_stop` asserts
+/// that *no* event was emitted, and a callsite cached as `never` makes that
+/// pass for the wrong reason.
+///
+/// A global dispatcher makes it unrepresentable: every thread always has a
+/// real subscriber, so interest is never `never`, whoever reaches a callsite
+/// first. Per-test isolation stays with the scoped subscribers above, which
+/// `tracing` consults ahead of this one.
+///
+/// Arming is part of subscribing rather than a setup call each test makes
+/// first, because a convention upheld at every capturing call site is exactly
+/// what drifted here: `tests/sweep.rs` and `tollgate-client/tests/events.rs`
+/// already carry this lesson in their own `Router`, and five capture sites in
+/// four other binaries did not.
+fn arm() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        // A binary that installs its own global (see `tests/sweep.rs`) has
+        // already satisfied the requirement, so losing this race is success
+        // and the error is dropped deliberately rather than ignored.
+        drop(tracing::subscriber::set_global_default(
+            tracing_subscriber::registry(),
+        ));
+    });
 }
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {

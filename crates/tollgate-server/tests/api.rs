@@ -1258,8 +1258,6 @@ async fn an_omitted_budget_is_rejected_without_clearing_the_schedule() {
 async fn both_credential_listings_validate_queries_before_backend_reads() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tollgate_store::{KeyDirectory, KeySource};
-    use tracing::instrument::WithSubscriber;
-    use tracing_subscriber::layer::SubscriberExt;
     let reads = Arc::new(AtomicUsize::new(0));
     let directory_reads = Arc::clone(&reads);
     let projection_reads = Arc::clone(&reads);
@@ -1280,64 +1278,64 @@ async fn both_credential_listings_validate_queries_before_backend_reads() {
         clock: Arc::new(ManualClock::new(t(0))),
     });
     let capture = common::EventCapture::default();
-    async {
-        for (path, token) in [
-            (
-                api(&format!("/admin/accounts/{}/keys", id(1))),
-                common::OPERATOR,
-            ),
-            (api("/keys"), common::INSTANCE),
-        ] {
-            let oversized = format!("limit={}", tollgate_store::MAX_KEY_PAGE_LIMIT + 1);
-            for (query, status, code) in [
-                ("after=bad", StatusCode::BAD_REQUEST, "invalid-query"),
-                ("limit=wat", StatusCode::BAD_REQUEST, "invalid-query"),
-                ("unexpected=1", StatusCode::BAD_REQUEST, "invalid-query"),
-                ("limit=0", StatusCode::UNPROCESSABLE_ENTITY, "invalid-limit"),
+    capture
+        .during(async {
+            for (path, token) in [
                 (
-                    oversized.as_str(),
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "invalid-limit",
+                    api(&format!("/admin/accounts/{}/keys", id(1))),
+                    common::OPERATOR,
                 ),
+                (api("/keys"), common::INSTANCE),
             ] {
-                let previous_reads = reads.load(Ordering::SeqCst);
-                let response = app
-                    .clone()
-                    .oneshot(
-                        Request::builder()
-                            .uri(format!("{path}?{query}"))
-                            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(response.status(), status, "{query}");
-                assert_eq!(
-                    response.headers()[header::CONTENT_TYPE],
-                    "application/problem+json"
-                );
-                let bytes = response.into_body().collect().await.unwrap().to_bytes();
-                let problem: Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(problem["code"], code);
-                assert_eq!(
-                    reads.load(Ordering::SeqCst),
-                    previous_reads,
-                    "invalid input never reaches a backend"
-                );
-            }
-            for limit in [1, tollgate_store::MAX_KEY_PAGE_LIMIT] {
-                assert_eq!(
-                    call(&app, "GET", &format!("{path}?limit={limit}"), None)
+                let oversized = format!("limit={}", tollgate_store::MAX_KEY_PAGE_LIMIT + 1);
+                for (query, status, code) in [
+                    ("after=bad", StatusCode::BAD_REQUEST, "invalid-query"),
+                    ("limit=wat", StatusCode::BAD_REQUEST, "invalid-query"),
+                    ("unexpected=1", StatusCode::BAD_REQUEST, "invalid-query"),
+                    ("limit=0", StatusCode::UNPROCESSABLE_ENTITY, "invalid-limit"),
+                    (
+                        oversized.as_str(),
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "invalid-limit",
+                    ),
+                ] {
+                    let previous_reads = reads.load(Ordering::SeqCst);
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .uri(format!("{path}?{query}"))
+                                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
                         .await
-                        .0,
-                    StatusCode::OK
-                );
+                        .unwrap();
+                    assert_eq!(response.status(), status, "{query}");
+                    assert_eq!(
+                        response.headers()[header::CONTENT_TYPE],
+                        "application/problem+json"
+                    );
+                    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                    let problem: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(problem["code"], code);
+                    assert_eq!(
+                        reads.load(Ordering::SeqCst),
+                        previous_reads,
+                        "invalid input never reaches a backend"
+                    );
+                }
+                for limit in [1, tollgate_store::MAX_KEY_PAGE_LIMIT] {
+                    assert_eq!(
+                        call(&app, "GET", &format!("{path}?limit={limit}"), None)
+                            .await
+                            .0,
+                        StatusCode::OK
+                    );
+                }
             }
-        }
-    }
-    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
-    .await;
+        })
+        .await;
     assert_eq!(
         reads.load(Ordering::SeqCst),
         4,
@@ -1356,44 +1354,43 @@ async fn both_credential_listings_validate_queries_before_backend_reads() {
 async fn credential_audits_name_the_key_and_actual_lifecycle_transition() {
     use tollgate_core::KeyId;
     use tollgate_store::{AdminState, KeyDirectory};
-    use tracing::instrument::WithSubscriber;
-    use tracing_subscriber::layer::SubscriberExt;
     let (store, app) = issuing_state();
     make_account(&store, 1).await;
     let path = api(&format!("/admin/accounts/{}/keys", id(1)));
     let capture = common::EventCapture::default();
     let mut secret = String::new();
     let mut digest = String::new();
-    async {
-        let (status, issued) = call(
-            &app,
-            "POST",
-            &path,
-            Some(json!({"key_id": id(7), "max_active_keys": 1})),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CREATED);
-        secret = issued["secret"].as_str().unwrap().to_owned();
-        digest = format!("{:?}", store.active_keys(t(0)).await.unwrap()[0].digest);
-        assert_eq!(
-            call(
+    capture
+        .during(async {
+            let (status, issued) = call(
                 &app,
                 "POST",
                 &path,
-                Some(json!({"key_id": id(7), "max_active_keys": 1}))
+                Some(json!({"key_id": id(7), "max_active_keys": 1})),
             )
-            .await
-            .0,
-            StatusCode::CONFLICT
-        );
-        for retired in [true, false] {
-            let (status, result) = call(&app, "DELETE", &format!("{path}/{}", id(7)), None).await;
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(result["retired"], retired);
-        }
-    }
-    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
-    .await;
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            secret = issued["secret"].as_str().unwrap().to_owned();
+            digest = format!("{:?}", store.active_keys(t(0)).await.unwrap()[0].digest);
+            assert_eq!(
+                call(
+                    &app,
+                    "POST",
+                    &path,
+                    Some(json!({"key_id": id(7), "max_active_keys": 1}))
+                )
+                .await
+                .0,
+                StatusCode::CONFLICT
+            );
+            for retired in [true, false] {
+                let (status, result) =
+                    call(&app, "DELETE", &format!("{path}/{}", id(7)), None).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(result["retired"], retired);
+            }
+        })
+        .await;
     let events = capture.events();
     let confirmed: Vec<_> = events
         .iter()

@@ -660,41 +660,7 @@ async fn control_plane_redirects_are_not_followed() {
 
 #[tokio::test]
 async fn every_admin_mutation_logs_its_actor_and_the_backend_receipt() {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    use tracing::instrument::WithSubscriber;
-    use tracing_subscriber::layer::SubscriberExt;
-    #[derive(Clone, Default)]
-    struct Capture(Arc<Mutex<Vec<HashMap<String, String>>>>);
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if event.metadata().target() != "tollgate::audit" {
-                return;
-            }
-            #[derive(Default)]
-            struct Fields(HashMap<String, String>);
-            impl tracing::field::Visit for Fields {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    self.0.insert(field.name().into(), format!("{value:?}"));
-                }
-                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                    self.0.insert(field.name().into(), value.into());
-                }
-            }
-            let mut fields = Fields::default();
-            event.record(&mut fields);
-            self.0.lock().unwrap().push(fields.0);
-        }
-    }
-    let capture = Capture::default();
+    let capture = common::EventCapture::default();
     let app = router(state(common::security()));
     let account = AccountId(1).to_string();
     let principal = Principal(1).to_string();
@@ -743,50 +709,57 @@ async fn every_admin_mutation_logs_its_actor_and_the_backend_receipt() {
             Value::Null,
         ),
     ];
-    async {
-        for (method, path, body) in requests {
+    capture
+        .during(async {
+            for (method, path, body) in requests {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(path)
+                            .header(
+                                header::AUTHORIZATION,
+                                format!("Bearer {}", common::OPERATOR),
+                            )
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(response.status().is_success(), "{}", response.status());
+            }
             let response = app
-                .clone()
                 .oneshot(
                     Request::builder()
-                        .method(method)
-                        .uri(path)
+                        .method("POST")
+                        .uri(format!("/v1/admin/accounts/{}/deposit", AccountId(999)))
                         .header(
                             header::AUTHORIZATION,
                             format!("Bearer {}", common::OPERATOR),
                         )
                         .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(body.to_string()))
+                        .body(Body::from(r#"{"units":1}"#))
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-            assert!(response.status().is_success(), "{}", response.status());
-        }
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/v1/admin/accounts/{}/deposit", AccountId(999)))
-                    .header(
-                        header::AUTHORIZATION,
-                        format!("Bearer {}", common::OPERATOR),
-                    )
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"units":1}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
-    .await;
-    let events = capture.0.lock().unwrap();
-    let confirmed: Vec<_> = events
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        })
+        .await;
+    let events = capture.events();
+    // `EventCapture` keeps every target, where the layer this replaced
+    // filtered as it recorded; the audit selection is explicit now.
+    let audited: Vec<_> = events
         .iter()
-        .filter(|event| {
-            event
+        .filter(|event| event.target == "tollgate::audit")
+        .map(|event| &event.fields)
+        .collect();
+    let confirmed: Vec<_> = audited
+        .iter()
+        .filter(|fields| {
+            fields
                 .get("outcome")
                 .is_some_and(|outcome| outcome == "confirmed")
         })
@@ -798,7 +771,7 @@ async fn every_admin_mutation_logs_its_actor_and_the_backend_receipt() {
             event.contains_key("before") && event.contains_key("after") && event.contains_key("at")
         );
         assert_eq!(
-            events
+            audited
                 .iter()
                 .filter(|other| other.get("operation_id") == event.get("operation_id"))
                 .count(),
@@ -817,9 +790,9 @@ async fn every_admin_mutation_logs_its_actor_and_the_backend_receipt() {
         .unwrap();
     assert!(removed["before"].contains("revoked: false"));
     assert!(removed["after"].contains("revoked: true"));
-    let failed: Vec<_> = events
+    let failed: Vec<_> = audited
         .iter()
-        .filter(|event| event.get("outcome").is_some_and(|v| v == "failed"))
+        .filter(|fields| fields.get("outcome").is_some_and(|v| v == "failed"))
         .collect();
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0]["actor"], "test-operator");

@@ -14,8 +14,8 @@
 
 use std::hint::black_box;
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use jiff::Timestamp;
@@ -27,8 +27,8 @@ use tollgate_admission::{
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, FencingToken,
-    Generation, KeyId, LeaseGrant, LeaseId, LocalLease, LocalSharding, OpIndex, PermissionBits,
-    PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent, UsageSlot,
+    Generation, KeyId, LeaseGrant, LeaseId, LocalLease, LocalSharding, Locality, OpIndex,
+    PermissionBits, PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent, UsageSlot,
 };
 
 #[derive(Debug)]
@@ -510,11 +510,40 @@ impl Drop for Contended {
     }
 }
 
+/// Advance the process-global locality counter until the next thread to take
+/// a number will land one shard past the foreground thread.
+///
+/// A probe consumes exactly one number and reports where it landed, which is
+/// the only way to read a counter that exposes no reader. Probes are taken
+/// one at a time and nothing else in the process is running by the time a
+/// fixture is built — the previous fixture's contenders are stopped and
+/// joined in `Contended::drop` — so the indices walk consecutively and one of
+/// them is the foreground's within a single cycle. The bound is generous
+/// rather than exact because a fixture that could not align must say so
+/// instead of timing a mapping it did not arrange.
+fn align_next_locality_after(sharding: LocalSharding, foreground: usize) {
+    for _ in 0..(4 * sharding.get()) {
+        let landed = std::thread::spawn(move || Locality::current().index(sharding))
+            .join()
+            .expect("a locality probe thread has nothing to panic on");
+        if landed == foreground {
+            return;
+        }
+    }
+    panic!(
+        "could not align the locality counter onto shard {foreground} of {}: something else in \
+         this process is consuming localities, and the contended fixtures cannot pin their \
+         thread-to-shard mapping while it does",
+        sharding.get()
+    );
+}
+
 fn spawn_contenders(
     engine: AdmissionEngine<ArcSwapSnapshotMap>,
     principals: impl IntoIterator<Item = Principal>,
 ) -> Contended {
-    spawn_contenders_with(engine, principals, admit_once)
+    let sharding = engine.map().local_sharding();
+    spawn_contenders_with(engine, sharding, principals, admit_once)
 }
 
 /// The background load is a parameter because #99's capacity fixtures need
@@ -524,32 +553,117 @@ fn spawn_contenders(
 /// contenders are left exactly as they were — their manifest rows are
 /// calibrated against background threads that do not call a gate, and
 /// silently changing the load would redefine those baselines.
+///
+/// `sharding` is the layout the fixture's threads are spread across, passed
+/// rather than read from the engine because the two are independent axes: the
+/// capacity rows run a single-counter map against an eight-way sharded
+/// *pool*, and it is the pool the threads must spread across there.
+///
+/// # Pinning the thread-to-shard mapping
+///
+/// [`Locality`] is assigned to a thread on its *first access*, not at spawn,
+/// from one process-global counter. Which shard each thread of a contended
+/// fixture lands on therefore depends on how many threads earlier benchmarks
+/// in the same Criterion process already consumed — and the foreground thread
+/// took its number in an earlier row, at an unrelated position in that
+/// counter, so it is not adjacent to the contenders spawned here.
+///
+/// Left to chance that made two rows measure the lottery rather than the
+/// sharded path (#123). Whether one contender happened to share the
+/// foreground thread's shard moved `full_check_contended_8_sharded` between
+/// 176 ns and 862 ns on a 24-core x86_64 host — a 4.9x step with no overlap,
+/// recurring with period 8 as the counter's offset walked — and the
+/// `distinct_accounts` row between 172 ns and 238 ns. Seven offsets in eight
+/// collide, so the rows usually measured a collision and occasionally did
+/// not, and their recorded medians sat between two values neither row ever
+/// produced.
+///
+/// So the counter is aligned before the contenders are spawned, putting them
+/// on the shards the foreground thread does not occupy, and the mapping they
+/// actually realized is asserted before anything is timed. Pinning it is the
+/// point: these rows exist to price the opt-in layout working as designed,
+/// and question 2 of #123 — whether a deployment's threads map as cleanly —
+/// is a property of the deployment, not something a benchmark can average
+/// its way to. Asserting it is the same discipline `sweep` applies to the
+/// at-capacity maps: a fixture that silently stopped being the thing the row
+/// names fails loudly instead of being measured.
+///
+/// The readiness barrier comes with the assertion and is worth having on its
+/// own — it is what makes the contenders provably running, rather than
+/// probably running because Criterion warms up first.
 fn spawn_contenders_with(
     engine: AdmissionEngine<ArcSwapSnapshotMap>,
+    sharding: LocalSharding,
     principals: impl IntoIterator<Item = Principal>,
     work: impl Fn(&AdmissionEngine<ArcSwapSnapshotMap>, Principal, Timestamp) + Clone + Send + 'static,
 ) -> Contended {
     let now = Timestamp::from_second(1_755_600_000).unwrap();
+    let principals: Vec<Principal> = principals.into_iter().collect();
+
+    let foreground = Locality::current().index(sharding);
+    align_next_locality_after(sharding, foreground);
+
     let engine = Arc::new(engine);
     let stop = Arc::new(AtomicBool::new(false));
-    let workers = principals
+    let ready = Arc::new(Barrier::new(principals.len() + 1));
+    let occupied = Arc::new(Mutex::new(vec![foreground]));
+    let workers: Vec<_> = principals
         .into_iter()
         .map(|principal| {
             let engine = Arc::clone(&engine);
             let stop = Arc::clone(&stop);
+            let ready = Arc::clone(&ready);
+            let occupied = Arc::clone(&occupied);
             let work = work.clone();
             std::thread::spawn(move || {
+                // Taken here rather than inside the loop so the number this
+                // thread reports is the one it then runs on: `Locality` is
+                // assigned once per thread and never moves.
+                let shard = Locality::current().index(sharding);
+                occupied
+                    .lock()
+                    .expect("no contender panics holding this")
+                    .push(shard);
+                ready.wait();
                 while !stop.load(Ordering::Relaxed) {
                     work(&engine, principal, now);
                 }
             })
         })
         .collect();
-    Contended {
+    ready.wait();
+
+    // Built before the mapping is judged, so a fixture that failed to arrange
+    // the one it wanted still stops and joins its contenders as it unwinds
+    // rather than leaving them spinning on a benchmark nobody is running.
+    let contended = Contended {
         engine,
         stop,
         workers,
-    }
+    };
+
+    let mut occupied = occupied
+        .lock()
+        .expect("every contender released this before the barrier")
+        .clone();
+    let threads = occupied.len();
+    occupied.sort_unstable();
+    occupied.dedup();
+    // As widely as the layout allows: one shard each while there are shards
+    // to go round, and every shard occupied once there are not. Stated
+    // against the arithmetic so it holds for the single-counter rows too,
+    // where all eight threads share shard zero by construction, rather than
+    // as a second assertion that could disagree with this one.
+    assert_eq!(
+        occupied.len(),
+        threads.min(sharding.get()),
+        "{threads} contended-fixture threads on {} shard(s) must occupy {} of \
+         them, not {occupied:?}",
+        sharding.get(),
+        threads.min(sharding.get()),
+    );
+
+    contended
 }
 
 fn contended_engine(sharding: LocalSharding) -> Contended {
@@ -818,8 +932,12 @@ fn bench_capacity(c: &mut Criterion) {
         let background = Arc::clone(&gate);
         // Principal 0 stays reserved for the foreground request, as in the
         // ungated pair, so what is measured is engine-global contention.
+        // Pinned against the *pool's* layout, not the map's: the map is on
+        // its shipped single-counter default here, and the eight-way axis
+        // these threads must spread across is the gate they all acquire from.
         let contended = spawn_contenders_with(
             distinct_engine(LocalSharding::SINGLE),
+            sharded,
             (1..=7).map(Principal),
             move |engine, principal, now| {
                 admit_and_start_once(engine, background.as_ref(), principal, now);

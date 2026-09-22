@@ -3,7 +3,6 @@ mod common;
 use std::sync::Arc;
 use tollgate_server::config::{SecurityLoader, SecurityReloader};
 use tollgate_store::Clock;
-use tracing_subscriber::layer::SubscriberExt;
 
 struct PanicClock(Arc<tokio::sync::Notify>);
 impl Clock for PanicClock {
@@ -16,8 +15,7 @@ impl Clock for PanicClock {
 #[tokio::test(start_paused = true)]
 async fn a_dead_security_reloader_reports_a_safe_error() {
     let capture = common::EventCapture::default();
-    let _subscriber =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+    let _subscriber = capture.on_this_thread();
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("security.json");
     std::fs::write(&path, "{}").unwrap();
@@ -42,8 +40,7 @@ async fn a_dead_security_reloader_reports_a_safe_error() {
 #[tokio::test(start_paused = true)]
 async fn dropping_an_unpolled_reloader_is_an_expected_stop() {
     let capture = common::EventCapture::default();
-    let _subscriber =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+    let _subscriber = capture.on_this_thread();
     let clock = Arc::new(tollgate_store::SystemClock);
     let retained = Arc::downgrade(&clock);
     let reloader = SecurityReloader::spawn(
