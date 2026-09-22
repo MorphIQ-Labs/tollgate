@@ -27,6 +27,10 @@ permission bits — never plan names, FCUs, or SQL.
 Contract: [`INVARIANTS.md`](INVARIANTS.md). Architecture and findings:
 [`docs/DESIGN.md`](docs/DESIGN.md).
 
+Putting Tollgate in front of your own service: [embedding
+guide](docs/EMBEDDING.md) — the supported request order, what you implement,
+what is sealed, and how to shut down without losing usage.
+
 Direct-store applications using budget schedules run a `PeriodRoller` beside
 their admission runtime. It funds schedules at startup, rolls due periods in
 bounded batches, and exposes health and shutdown reports. See the
