@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.23.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.23.0...v0.23.1) - 2026-09-22
+
+### Fixed
+
+- *(test)* make the sharded benchmark and audit-capture fixtures deterministic
+
 ## [0.23.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.22.5...v0.23.0) - 2026-09-15
 
 ### Fixed
