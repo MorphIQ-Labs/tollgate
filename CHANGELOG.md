@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.23.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.23.1...v0.23.2) - 2026-09-22
+
+### Other
+
+- add the embedder integration guide for the request-path seam
+
 ## [0.23.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.23.0...v0.23.1) - 2026-09-22
 
 ### Fixed
