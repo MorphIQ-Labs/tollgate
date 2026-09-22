@@ -240,6 +240,22 @@ impl LeaseSlot {
         self.load_at(Locality::current())
     }
 
+    /// Read the slot without claiming an affinity for the reading thread.
+    ///
+    /// [`load`](Self::load) resolves [`Locality::current`], which *assigns* a
+    /// number the first time a thread asks. That is right for a request, which
+    /// wants the shard it will keep using, and wrong for the control plane,
+    /// which is only asking whether a grant is present and until when — facts
+    /// every view answers identically, since the views of one slot share their
+    /// accounting and their grant. A background task that reads through
+    /// `load` on a thread that never serves a request spends an affinity on
+    /// that answer, and every affinity spent moves a request-serving thread one
+    /// step closer to sharing a shard with a peer (#124).
+    #[must_use]
+    pub fn load_observed(&self) -> Option<Arc<LocalLease>> {
+        self.load_at(Locality::OBSERVER)
+    }
+
     #[must_use]
     pub(crate) fn load_at(&self, locality: Locality) -> Option<Arc<LocalLease>> {
         match &self.current {
@@ -1852,6 +1868,10 @@ impl<T: SnapshotMap + ?Sized> SnapshotMap for Arc<T> {
 }
 
 #[cfg(test)]
+#[path = "../../tollgate-core/tests/support/isolated.rs"]
+mod isolated;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
@@ -2138,6 +2158,76 @@ mod tests {
                 "each grant is returned or still published exactly once"
             );
         }
+    }
+
+    /// A control-plane read of the slot answers the same question from any
+    /// view, and must not claim an affinity to ask it (#124).
+    ///
+    /// `load` resolves `Locality::current()`, which *assigns* on a thread's
+    /// first access. The runtime's health reporting, lease rotation and
+    /// readiness checks all read the slot for presence and timing — facts every
+    /// view of one slot answers identically — so paying an affinity for them
+    /// only displaces the request-serving threads that come after.
+    ///
+    /// The counter is checked in an isolated process, on untouched threads,
+    /// so one accidental first-use claim fails without racing other tests.
+    #[test]
+    fn an_observed_slot_read_answers_without_claiming_an_affinity() {
+        if isolated::rerun_in_child() {
+            return;
+        }
+        let sharding = LocalSharding::new(NonZeroUsize::new(4).unwrap());
+        let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
+        drop(slot.replace(lease(100)));
+
+        for _ in 0..2 {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let before = Locality::assigned();
+                        for _ in 0..2 {
+                            let observed = slot.load_observed().expect("the slot is stocked");
+                            assert_eq!(observed.grant().account_id, AccountId(1));
+                            assert_eq!(observed.remaining(), CostUnits(100));
+                            assert_eq!(Locality::assigned(), before, "observing spends nothing");
+                        }
+                        // Positive control: this fresh thread's request read
+                        // must still claim exactly one affinity.
+                        assert!(slot.load().is_some());
+                        assert_eq!(Locality::assigned(), before + 1);
+                    })
+                    .join()
+                    .unwrap();
+            });
+        }
+
+        // Every view answers this identically, which is what makes a fixed
+        // affinity the right one to ask with rather than a lucky one. Read
+        // from separate threads, since each takes its own affinity and they
+        // land on different views of the same slot.
+        let grants: Vec<_> = (0..sharding.get())
+            .map(|_| {
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            let view = slot.load().expect("the slot is stocked");
+                            (*view.grant(), view.remaining())
+                        })
+                        .join()
+                        .expect("a slot read cannot panic")
+                })
+            })
+            .collect();
+        let view = slot.load_observed().expect("the slot is stocked");
+        let observed = (*view.grant(), view.remaining());
+        assert!(
+            grants.iter().all(|answer| *answer == observed),
+            "every view answers the control plane's question identically"
+        );
+
+        // And the request-path read is unchanged: it still resolves the
+        // caller's own affinity, because that is the shard it will keep using.
+        assert!(slot.load().is_some());
     }
 
     #[test]

@@ -11,7 +11,9 @@ use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tollgate_admission::{AdmissionCounters, AdmissionEngine, ArcSwapSnapshotMap, RequestContext};
-use tollgate_core::{AccountId, DenyReason, LocalSharding, PermissionBits, Principal};
+use tollgate_core::{
+    AccountId, DenyReason, LocalSharding, PermissionBits, Principal, ShardOccupancy,
+};
 use tollgate_store::{Clock, LeaseAllocator, SnapshotSource, UsageSink};
 
 use crate::registry::AccountBinding;
@@ -163,6 +165,16 @@ pub struct RuntimeReport {
     pub refill: Option<LeaseStats>,
     pub snapshots: SnapshotStats,
     pub accounting: WriterHealth,
+    /// What this instance's shard layout is carrying (#124).
+    ///
+    /// Sharding buys one thing — a request-serving thread writing to lines no
+    /// peer writes — and that holds only while the affinities handed out do not
+    /// outnumber the shards. When it stops holding, the instance degrades
+    /// toward the unsharded cost while looking exactly like the contention the
+    /// layout was enabled to remove, so it is reported rather than left to be
+    /// inferred from latency. `ShardOccupancy::is_crowded` is the question;
+    /// `docs/LOCAL_SHARDING.md` is what to do about the answer.
+    pub sharding: ShardOccupancy,
 }
 
 #[derive(Debug)]
@@ -407,6 +419,7 @@ impl RuntimeHandle {
             refill: Some(LeaseStats::ZERO),
             snapshots: self.shared.snapshot_counters.snapshot(),
             accounting: self.shared.recorder.health(),
+            sharding: self.shared.slots.sharding().occupancy(),
         };
         for o in observations.values() {
             report.counter_overflow |= o.overflow;
@@ -595,7 +608,7 @@ impl Supervisor {
     }
     fn start(&mut self, account: AccountId) {
         let record = self.accounts.get_mut(&account).expect("managed account");
-        let inherited_grants = u64::from(record.binding.slot.load().is_some());
+        let inherited_grants = u64::from(record.binding.slot.load_observed().is_some());
         let manager = LeaseManager::spawn(
             Arc::clone(&self.allocator),
             Arc::clone(&record.binding.slot),
@@ -735,7 +748,13 @@ impl Supervisor {
             // At task termination these counters are stable. Current slot
             // ownership survives; parked grants and unknown acquire outcomes
             // do not. Report them as crash exposure, never routine cleanup.
-            let current = u64::from(self.accounts[&account].binding.slot.load().is_some());
+            let current = u64::from(
+                self.accounts[&account]
+                    .binding
+                    .slot
+                    .load_observed()
+                    .is_some(),
+            );
             // A replacement may have released the capability inherited
             // from its predecessor. Include that opening inventory before
             // subtracting releases, or a second crash hides a parked grant.

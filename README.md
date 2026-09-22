@@ -91,6 +91,11 @@ Cloud Run service identity, credential rotation, audit collection, and the Rust
 API/configuration rollout. Remote plaintext and anonymous control-plane calls
 are refused.
 
+[Instance-local sharding](docs/LOCAL_SHARDING.md) covers what the opt-in above
+buys, how to size it against your worker pool, and how to read the occupancy an
+instance reports — sharding separates threads only while the affinities issued
+do not outnumber the shards, and an instance says when they do.
+
 Every binary accepts `--help`/`-h` and `--version`/`-V` before validating other
 arguments or application configuration. The first information flag before `--`
 wins; everything after that marker is positional. `pricing-api` and

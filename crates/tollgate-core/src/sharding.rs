@@ -4,7 +4,22 @@
 //! tasks may move, operating-system threads may migrate between cores, and
 //! stable core identifiers are not portable. Assigning each participating OS
 //! thread one process-local number gives worker-thread workloads the property
-//! that matters here: their routine writes land on different cache lines.
+//! that matters here: a thread's routine writes land on the *same* cache
+//! lines every time.
+//!
+//! Whether they land on lines *no other thread writes* is a separate claim,
+//! and this module does not make it (#124). Affinities come from one
+//! process-global counter shared by every component and every thread that
+//! reaches one, and [`Locality::index`] reduces them onto each component's own
+//! shard count — so two threads whose numbers are congruent modulo that count
+//! share every sharded structure they touch. The counter is never recycled, so
+//! a thread that took a number and exited keeps pushing the live ones apart.
+//!
+//! Distinctness therefore holds while the affinities handed out do not
+//! outnumber the shards, which is a property of the deployment rather than one
+//! this module can enforce: it does not choose how many threads serve requests,
+//! and cannot know which of them still exist. What it can do is report, and
+//! [`LocalSharding::occupancy`] is that report.
 
 use std::cell::Cell;
 use std::num::NonZeroUsize;
@@ -69,6 +84,69 @@ impl LocalSharding {
     pub const fn get(self) -> usize {
         self.shards.get()
     }
+
+    /// How this layout is holding up against the affinities handed out.
+    ///
+    /// Metrics only, like [`CapacityOccupancy`]: no decision reads it, and it
+    /// is a control-plane call rather than a request-path one.
+    ///
+    /// [`CapacityOccupancy`]: https://docs.rs/tollgate-admission
+    #[must_use]
+    pub fn occupancy(self) -> ShardOccupancy {
+        ShardOccupancy {
+            shards: self.get(),
+            affinities_assigned: Locality::assigned(),
+        }
+    }
+}
+
+/// What an instance's shard layout is actually carrying.
+///
+/// Counts only. There is no per-shard breakdown and no thread identity,
+/// because neither is knowable: affinities are never recycled, so the process
+/// can say how many it handed out but not which threads still hold them.
+///
+/// That is enough to answer the question an operator has. Affinities come from
+/// one `fetch_add`, so `affinities_assigned` of `n` means exactly the values
+/// `0..n` were handed out, and reducing those onto `shards` is arithmetic
+/// rather than estimation — see [`crowded_shards`](Self::crowded_shards).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardOccupancy {
+    /// The effective shard count this instance runs.
+    pub shards: usize,
+    /// How many affinities the *process* has handed out, across every
+    /// component and every thread that ever reached one — not how many threads
+    /// are alive, and not how many serve requests.
+    pub affinities_assigned: usize,
+}
+
+impl ShardOccupancy {
+    /// How many shards carry more than one affinity.
+    ///
+    /// The values handed out are `0..affinities_assigned`, so shard `i` carries
+    /// every `j` below that bound with `j % shards == i`. Each shard therefore
+    /// carries either `n / shards` or one more than that, and the ones carrying
+    /// more are the first `n % shards`. Counting the shards left above one
+    /// collapses to the expression below, which is why this is exact and not a
+    /// sample.
+    #[must_use]
+    pub fn crowded_shards(self) -> usize {
+        self.shards
+            .min(self.affinities_assigned.saturating_sub(self.shards))
+    }
+
+    /// Whether any shard carries more than one affinity.
+    ///
+    /// True means this instance has handed out more affinities than it has
+    /// shards, so some threads provably share sharded state — the contention
+    /// the layout was enabled to remove, looking exactly like ordinary load.
+    /// It does not mean two *live request-serving* threads collided: an
+    /// affinity a departed thread took still counts, because it still displaces
+    /// the ones that came after it.
+    #[must_use]
+    pub fn is_crowded(self) -> bool {
+        self.affinities_assigned > self.shards
+    }
 }
 
 impl Default for LocalSharding {
@@ -92,10 +170,35 @@ thread_local! {
 pub struct Locality(usize);
 
 impl Locality {
+    /// The affinity a control-plane read uses.
+    ///
+    /// Reading published state is not request work and must not spend a
+    /// number: every affinity the control plane takes displaces a
+    /// request-serving thread onto a shard one of its peers already holds, and
+    /// `SnapshotManager` observing its own publications is exactly how that
+    /// happened (#124).
+    ///
+    /// It aliases shard zero under every layout, deliberately. A reader that
+    /// wants the generation, the validity bound or the presence of an entry
+    /// gets the same answer from any shard, so there is nothing to choose
+    /// between them — and a constant cannot drift the way "whichever number
+    /// this thread happens to hold" does.
+    pub const OBSERVER: Self = Self(0);
+
     #[inline]
     #[must_use]
     pub fn current() -> Self {
         LOCALITY.with(|locality| Self(locality.get()))
+    }
+
+    /// How many affinities this process has handed out.
+    ///
+    /// Control plane only — no policy decision reads it, and it is relaxed
+    /// because it answers "roughly how crowded is this instance", never
+    /// "which shard is this request on".
+    #[must_use]
+    pub fn assigned() -> usize {
+        NEXT_LOCALITY.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -114,6 +217,10 @@ impl Locality {
         Self(value)
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/isolated.rs"]
+mod isolated;
 
 #[cfg(test)]
 mod tests {
@@ -226,5 +333,112 @@ mod tests {
         assert_eq!(four, LocalSharding::new(NonZeroUsize::new(4).unwrap()));
         assert_ne!(four, LocalSharding::new(NonZeroUsize::new(5).unwrap()));
         assert_eq!(LocalSharding::SINGLE, LocalSharding::default());
+    }
+
+    /// Counted against the residues the counter actually produces, not against
+    /// a table of expected answers.
+    ///
+    /// `crowded_shards` is a closed form for "how many shards receive more
+    /// than one of `0..n`", so the thing it has to agree with is that tally —
+    /// written out here the slow way for every shard count and every load up
+    /// to three times it, including the boundaries on either side of `n ==
+    /// shards` where the answer turns over.
+    #[test]
+    fn crowded_shards_counts_the_residues_the_counter_hands_out() {
+        for shards in 1..=16usize {
+            let sharding = LocalSharding::new(NonZeroUsize::new(shards).unwrap());
+            for assigned in 0..=(3 * shards) {
+                let occupancy = ShardOccupancy {
+                    shards,
+                    affinities_assigned: assigned,
+                };
+                let mut carried = vec![0usize; shards];
+                for affinity in 0..assigned {
+                    carried[Locality(affinity).index(sharding)] += 1;
+                }
+                let expected = carried.iter().filter(|held| **held > 1).count();
+                assert_eq!(
+                    occupancy.crowded_shards(),
+                    expected,
+                    "{assigned} affinities on {shards} shard(s) crowd {expected} of them"
+                );
+                assert_eq!(
+                    occupancy.is_crowded(),
+                    expected > 0,
+                    "{assigned} on {shards}: crowding must agree with the count"
+                );
+                assert!(occupancy.crowded_shards() <= shards);
+            }
+        }
+    }
+
+    /// The case the layout is bought for, stated on its own so a regression
+    /// that crowded *every* instance could not hide inside the sweep above.
+    #[test]
+    fn a_layout_with_room_reports_every_affinity_distinct() {
+        for shards in 1..=16usize {
+            let sharding = LocalSharding::new(NonZeroUsize::new(shards).unwrap());
+            for assigned in 0..=shards {
+                let occupancy = ShardOccupancy {
+                    shards,
+                    affinities_assigned: assigned,
+                };
+                assert!(
+                    !occupancy.is_crowded(),
+                    "{assigned} affinities fit {shards} shard(s)"
+                );
+                assert_eq!(occupancy.crowded_shards(), 0);
+            }
+            // And one past the count is the first crowding, whatever the size.
+            let over = ShardOccupancy {
+                shards,
+                affinities_assigned: shards + 1,
+            };
+            assert!(over.is_crowded());
+            assert_eq!(over.crowded_shards(), 1);
+            assert_eq!(sharding.get(), shards);
+        }
+    }
+
+    /// Reading the report is not itself a claim on an affinity.
+    ///
+    /// Isolated from other tests' claims, and read on an untouched thread:
+    /// even one accidental first-use claim must fail this witness.
+    #[test]
+    fn occupancy_reports_the_counter_without_consuming_from_it() {
+        if isolated::rerun_in_child() {
+            return;
+        }
+        let sharding = LocalSharding::new(NonZeroUsize::new(4).unwrap());
+        assert_eq!(Locality::assigned(), 0);
+        for expected in 0..=5 {
+            // The reporting thread never claims an affinity, even after
+            // other threads have advanced the live counter past crowding.
+            for _ in 0..2 {
+                let now = sharding.occupancy();
+                assert_eq!(now.shards, 4);
+                assert_eq!(now.affinities_assigned, expected, "the counter is live");
+                assert_eq!(Locality::assigned(), expected, "reporting spends nothing");
+            }
+            std::thread::spawn(Locality::current).join().unwrap();
+        }
+    }
+
+    /// The observer affinity is a constant, spends nothing, and lands on the
+    /// same shard under every layout.
+    #[test]
+    fn the_observer_affinity_costs_nothing_and_never_moves() {
+        if isolated::rerun_in_child() {
+            return;
+        }
+        let before = Locality::assigned();
+        assert_eq!(before, 0, "the thread has never claimed an affinity");
+        for shards in 1..=16usize {
+            let sharding = LocalSharding::new(NonZeroUsize::new(shards).unwrap());
+            for _ in 0..64 {
+                assert_eq!(Locality::OBSERVER.index(sharding), 0, "{shards} shards");
+            }
+        }
+        assert_eq!(Locality::assigned(), before, "observing spends nothing");
     }
 }
