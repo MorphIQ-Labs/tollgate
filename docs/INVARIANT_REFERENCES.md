@@ -38,6 +38,14 @@ are single-word or CamelCase type names. Use ordinary inline snake-case names
 for test witnesses. The guard intentionally does not scan historical narrative
 in `docs/DESIGN.md`, where removed test names remain useful explanations.
 
+A second checker, `scripts/check_seam_contract.sh`, does read `docs/DESIGN.md`,
+and the two rules are opposite on purpose. This guard skips fenced blocks
+because there an example is prose; that one reads *only* code — fenced blocks
+and inline spans — because the staged admission seam's blocks are its
+declaration, and its English is not. It also reads one section rather than the
+document: that section makes a binding promise about signatures, while the rest
+of `docs/DESIGN.md` is the history this guard is right to leave alone.
+
 External APIs, compiler lints, SQL objects and static event names that are not
 Rust/Lean declarations have exact entries with reasons in
 `testing/invariant_external_symbols.json`. Do not add a test name there to

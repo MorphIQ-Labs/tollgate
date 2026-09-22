@@ -3,6 +3,7 @@
 
 pub mod cli;
 pub mod parity;
+pub mod seam;
 
 use proc_macro2::{TokenStream, TokenTree};
 use std::{
