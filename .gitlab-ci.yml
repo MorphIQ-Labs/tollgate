@@ -150,6 +150,11 @@ repository-hygiene:
     # `MemoryStore` has inherent helpers shadowing its `AdminStore` methods and
     # `PostgresStore` has none, so the drift is silent and recurring (#43, #85).
     - ./scripts/check_backend_parity.sh
+    # The staged admission seam's contract says an implementing issue amends it
+    # before publishing a different seam. That rule had no backstop and drifted:
+    # `estimate_remaining` shipped on three stages declared in none of them, and
+    # the engine's own `new`/`map` were never in a block at all (#126).
+    - ./scripts/check_seam_contract.sh
 
 fmt:
   dependencies: []
