@@ -199,6 +199,41 @@ pub struct BalanceExhaustion {
     pub period_end: Option<Timestamp>,
 }
 
+/// Allocator evidence of an account's remaining funding: what it was funded
+/// with minus what it has consumed or lost, including units held in leases.
+///
+/// An upper bound on what the account can still spend. Unreported
+/// consumption can only lower true remaining funding, so a quote above
+/// `remaining` cannot be funded until new funding or a new period arrives.
+/// The converse does not hold: a quote within it may still find no lease.
+/// `period_end` bounds validity as it does for [`BalanceExhaustion`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct BalanceShortfall {
+    pub remaining: CostUnits,
+    #[cfg_attr(feature = "serde", serde(deserialize_with = "required_period_end"))]
+    pub period_end: Option<Timestamp>,
+}
+
+impl BalanceShortfall {
+    /// Zero remaining is exhaustion, the one shortfall no quote survives.
+    #[must_use]
+    pub fn exhaustion(self) -> Option<BalanceExhaustion> {
+        self.remaining.is_zero().then_some(BalanceExhaustion {
+            period_end: self.period_end,
+        })
+    }
+}
+
+impl From<BalanceExhaustion> for BalanceShortfall {
+    fn from(evidence: BalanceExhaustion) -> Self {
+        BalanceShortfall {
+            remaining: CostUnits::ZERO,
+            period_end: evidence.period_end,
+        }
+    }
+}
+
 #[cfg(feature = "serde")]
 fn required_period_end<'de, D>(deserializer: D) -> Result<Option<Timestamp>, D::Error>
 where
@@ -209,14 +244,14 @@ where
 
 impl BudgetView {
     /// Called by a store against its transaction's current ledger, never an
-    /// instance's stale snapshot or remaining-balance estimate.
+    /// instance's stale snapshot or remaining-balance estimate. Exhaustion is
+    /// [`BalanceShortfall::exhaustion`] of the result.
     #[must_use]
-    pub fn exhaustion(self) -> Option<BalanceExhaustion> {
-        self.balance_at_publish
-            .is_zero()
-            .then_some(BalanceExhaustion {
-                period_end: self.period_end,
-            })
+    pub fn shortfall(self) -> BalanceShortfall {
+        BalanceShortfall {
+            remaining: self.balance_at_publish,
+            period_end: self.period_end,
+        }
     }
 }
 

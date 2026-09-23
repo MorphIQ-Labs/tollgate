@@ -57,11 +57,11 @@ use tollgate_core::{
 use crate::leases::{LeaseRecord, Leases, Settled};
 pub use crate::traits::{AccountConfig, Conservation, StatusChange};
 use crate::traits::{
-    AdminStore, AllocateError, BudgetError, CreateAccountError, GrantPolicy, GrantPolicyError,
-    IngestError, IngestReport, KeyDirectory, KeyError, KeyRecord, KeySummary, LeaseAllocator,
-    PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation,
-    RolledAccount, RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource,
-    StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
+    AdminStore, AllocateError, Allocation, BudgetError, CreateAccountError, GrantPolicy,
+    GrantPolicyError, IngestError, IngestReport, KeyDirectory, KeyError, KeyRecord, KeySummary,
+    LeaseAllocator, PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease,
+    Revocation, RolledAccount, RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution,
+    SnapshotSource, StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
 };
 
 /// An account's balance, split by what expires and what does not (#97).
@@ -782,6 +782,7 @@ fn plan_grant(
     account: AccountId,
     requested: CostUnits,
     incoming: CostUnits,
+    attest_refusal: bool,
 ) -> Result<GrantPlan, AllocateError> {
     let next_lease_id = inner
         .next_lease_id
@@ -806,12 +807,14 @@ fn plan_grant(
     let granted = policy
         .grant(requested, balance)
         .ok_or_else(|| {
-            if !requested.is_zero()
-                && let Some(evidence) = record.budget_view().exhaustion()
-            {
-                return AllocateError::BalanceExhausted(evidence);
+            // A refused consolidation's settlement never applies. Attest
+            // only where that settlement would not itself have removed
+            // funding, the same rule the SQL backend needs because its
+            // transaction has already applied the settlement it rolls back.
+            if requested.is_zero() || !attest_refusal {
+                return AllocateError::InsufficientBalance;
             }
-            AllocateError::InsufficientBalance
+            funding_refusal(record.budget_view().shortfall())
         })?
         .max(incoming.min(balance));
     let next_fence = record
@@ -824,6 +827,30 @@ fn plan_grant(
         next_fence,
         next_lease_id,
     })
+}
+
+/// The refusal a ledger with nothing allocatable attests: exhaustion when no
+/// funding remains, otherwise how much remains in other leases.
+fn funding_refusal(evidence: tollgate_core::BalanceShortfall) -> AllocateError {
+    match evidence.exhaustion() {
+        Some(exhausted) => AllocateError::BalanceExhausted(exhausted),
+        None => AllocateError::BalanceInsufficient(evidence),
+    }
+}
+
+/// Read after every half of the exchange has applied: the evidence must
+/// describe the ledger the grant committed into, settlement loss included.
+fn allocation(inner: &Inner, grant: LeaseGrant) -> Allocation {
+    let funding = inner
+        .accounts
+        .get(&grant.account_id)
+        .expect("a granted account exists")
+        .budget_view()
+        .shortfall();
+    Allocation {
+        grant,
+        funding: Some(funding),
+    }
 }
 
 fn apply_grant(
@@ -869,11 +896,19 @@ impl LeaseAllocator for MemoryStore {
         requested: CostUnits,
         ttl: SignedDuration,
         now: Timestamp,
-    ) -> Result<LeaseGrant, AllocateError> {
+    ) -> Result<Allocation, AllocateError> {
         let expires_at = self.grant_expiry(ttl, now)?;
         let mut inner = self.lock();
-        let plan = plan_grant(&inner, &self.policy, account, requested, CostUnits::ZERO)?;
-        Ok(apply_grant(&mut inner, account, plan, expires_at))
+        let plan = plan_grant(
+            &inner,
+            &self.policy,
+            account,
+            requested,
+            CostUnits::ZERO,
+            true,
+        )?;
+        let grant = apply_grant(&mut inner, account, plan, expires_at);
+        Ok(allocation(&inner, grant))
     }
 
     async fn release(
@@ -897,7 +932,7 @@ impl LeaseAllocator for MemoryStore {
         requested: CostUnits,
         ttl: SignedDuration,
         now: Timestamp,
-    ) -> Result<LeaseGrant, AllocateError> {
+    ) -> Result<Allocation, AllocateError> {
         let expires_at = self.grant_expiry(ttl, now)?;
         let mut inner = self.lock();
         // Both halves are planned before either is applied. The reference
@@ -915,10 +950,19 @@ impl LeaseAllocator for MemoryStore {
         // period expires rather than returning, so the grant is sized against
         // what the credit will actually restore (#97).
         let restored = spendable_credit(record, release.funding, release.period_start, unspent);
-        let grant = plan_grant(&inner, &self.policy, account, requested, restored)?;
+        let preserves_funding = release.loss.is_zero() && restored == unspent;
+        let grant = plan_grant(
+            &inner,
+            &self.policy,
+            account,
+            requested,
+            restored,
+            preserves_funding,
+        )?;
 
         apply_release(&mut inner, lease_id, &release);
-        Ok(apply_grant(&mut inner, account, grant, expires_at))
+        let grant = apply_grant(&mut inner, account, grant, expires_at);
+        Ok(allocation(&inner, grant))
     }
 
     async fn reclaim_expired_batch(
@@ -2154,7 +2198,8 @@ mod tests {
             let lease = store
                 .acquire(ACCOUNT, CostUnits(1), TTL, t(0))
                 .await
-                .expect("funded");
+                .expect("funded")
+                .grant;
             store
                 .release(lease.lease_id, lease.fencing_token, lease.units, t(1))
                 .await
@@ -2163,7 +2208,8 @@ mod tests {
         let due = store
             .acquire(ACCOUNT, CostUnits(1), TTL, t(0))
             .await
-            .expect("funded");
+            .expect("funded")
+            .grant;
 
         let before = store.leases_examined();
         let batch = store
@@ -2206,7 +2252,8 @@ mod tests {
                 let lease = store
                     .acquire(ACCOUNT, CostUnits(1), TTL, t(0))
                     .await
-                    .expect("funded");
+                    .expect("funded")
+                    .grant;
                 store
                     .release(lease.lease_id, lease.fencing_token, lease.units, t(1))
                     .await

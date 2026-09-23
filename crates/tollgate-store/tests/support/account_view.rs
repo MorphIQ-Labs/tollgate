@@ -115,7 +115,8 @@ pub async fn funding_out_on_lease_is_not_reported_as_usage(store: &impl Backend)
     let grant = store
         .acquire(ACCOUNT, CostUnits(400), SignedDuration::from_secs(60), t(0))
         .await
-        .expect("a lease is granted");
+        .expect("a lease is granted")
+        .grant;
 
     let held = store
         .account_view(ACCOUNT)

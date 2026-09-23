@@ -746,7 +746,8 @@ async fn the_account_read_separates_outstanding_grants_from_settled_usage() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
 
     let (_, held) = call(
         &app,

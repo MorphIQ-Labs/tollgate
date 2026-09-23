@@ -362,10 +362,16 @@ async fn exhausted_quota_returns_429_and_never_overspends() {
     let mut ok = 0;
     let mut denied = 0;
     for _ in 0..10 {
-        let (status, _) = call(&router, Some(DEMO_API_KEY), price_body(1)).await;
+        let (status, body) = call(&router, Some(DEMO_API_KEY), price_body(1)).await;
         match status {
             StatusCode::OK => ok += 1,
             StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => denied += 1,
+            // Once usage has settled and a refusal has consolidated the tail,
+            // the ledger attests the 47 units left cannot fund 51 (#130).
+            StatusCode::PAYMENT_REQUIRED => {
+                assert_eq!(body["code"], "balance-insufficient", "{body}");
+                denied += 1;
+            }
             other => panic!("unexpected status {other}"),
         }
     }
@@ -374,6 +380,70 @@ async fn exhausted_quota_returns_429_and_never_overspends() {
     let store = runtime.store.clone();
     runtime.shutdown().await;
     assert!(store.usage_recorded(DEMO_ACCOUNT).get() <= 200);
+}
+
+/// #130 over HTTP: funding left, but less than the quote, is 402 and not
+/// retryable at that quote; a top-up admits the same request again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quote_above_remaining_funding_is_payment_required_until_a_top_up() {
+    let (router, runtime) = build_test_app(110, true).await;
+    wait_ready(&router).await;
+    wait_for_first_grant(&router, 51).await;
+    let (status, body) = call(&router, Some(DEMO_API_KEY), price_body(1)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // 59 units remain and 20 contracts quote 70. Until usage settles the
+    // ledger cannot attest that, and the honest answer is the transient lease
+    // refusal; afterwards a refusal-driven consolidation carries the evidence.
+    let body = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let (status, body) = call(&router, Some(DEMO_API_KEY), price_body(20)).await;
+            match status {
+                StatusCode::PAYMENT_REQUIRED => break body,
+                StatusCode::TOO_MANY_REQUESTS => {
+                    assert_eq!(body["code"], "quota-exhausted", "{body}");
+                }
+                other => panic!("unexpected status {other}: {body}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("settled usage and a consolidation must attest the shortfall");
+    assert_eq!(body["code"], "balance-insufficient", "{body}");
+    assert_eq!(body["units_charged"], 0);
+    assert!(
+        metrics(&router).await["denials"]["balance_insufficient"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    // A quote the remaining funding could cover is never told it cannot be.
+    let (status, body) = call(&router, Some(DEMO_API_KEY), price_body(1)).await;
+    assert_ne!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
+
+    runtime.store.deposit(DEMO_ACCOUNT, CostUnits(200)).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let (status, body) = call(&router, Some(DEMO_API_KEY), price_body(20)).await;
+            if status == StatusCode::OK {
+                break;
+            }
+            assert!(
+                matches!(
+                    status,
+                    StatusCode::PAYMENT_REQUIRED | StatusCode::TOO_MANY_REQUESTS
+                ),
+                "{status}: {body}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the top-up must clear the evidence");
+    let store = runtime.store.clone();
+    runtime.shutdown().await;
+    assert!(store.conservation(DEMO_ACCOUNT).unwrap().holds());
 }
 
 /// The elastic twin of `exhausted_quota_returns_429_and_never_overspends`,

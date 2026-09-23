@@ -731,7 +731,8 @@ async fn the_server_reclaims_expired_leases_on_its_interval() {
     let grant = inner
         .acquire(ACCOUNT, CostUnits(400), SignedDuration::from_secs(1), t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(inner.balance(ACCOUNT), CostUnits(600));
 
     let state = Arc::new(SweepState::default());

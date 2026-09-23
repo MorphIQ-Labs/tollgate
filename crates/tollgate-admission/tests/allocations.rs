@@ -718,7 +718,7 @@ fn confirmed_balance_exhaustion_allocates_nothing() {
     state
         .lease
         .funding_attempt()
-        .exhausted(tollgate_core::BalanceExhaustion { period_end: None });
+        .shortfall(tollgate_core::BalanceExhaustion { period_end: None }.into());
     let refuse = || {
         assert_eq!(
             engine
@@ -731,4 +731,38 @@ fn confirmed_balance_exhaustion_allocates_nothing() {
     };
     refuse();
     assert_zero("admission/balance_exhausted", refuse);
+}
+
+#[test]
+fn confirmed_shortfall_allocates_nothing() {
+    let engine = engine(
+        LocalSharding::SINGLE,
+        Principal(1),
+        EnforcementMode::Strict,
+        CostUnits::ZERO,
+    );
+    let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
+        panic!()
+    };
+    state
+        .lease
+        .funding_attempt()
+        .shortfall(tollgate_core::BalanceShortfall {
+            remaining: CostUnits(1),
+            period_end: None,
+        });
+    let refuse = || {
+        assert_eq!(
+            engine
+                .begin(Principal(1), PermissionBits::bit(0), now())
+                .unwrap()
+                .admit(&[(PriceOp, 1)], AllocationSlot, now())
+                .unwrap_err(),
+            tollgate_core::DenyReason::BalanceInsufficient {
+                remaining: CostUnits(1)
+            }
+        );
+    };
+    refuse();
+    assert_zero("admission/balance_insufficient", refuse);
 }

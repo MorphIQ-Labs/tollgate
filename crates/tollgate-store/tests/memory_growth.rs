@@ -238,7 +238,8 @@ async fn holdings_climb_with_traffic_while_the_live_count_returns_to_zero() {
         let lease = store
             .acquire(ACCOUNT, CostUnits(10), TTL, t(0))
             .await
-            .expect("funded");
+            .expect("funded")
+            .grant;
         assert_eq!(store.stored_records().active_leases, 1);
         store
             .ingest(

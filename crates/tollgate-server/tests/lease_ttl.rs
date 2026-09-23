@@ -123,7 +123,8 @@ async fn postgres_and_http_preserve_ttl_across_acquire_and_consolidation() {
             let original = allocator
                 .acquire(ACCOUNT, CostUnits(10), ttl, now())
                 .await
-                .unwrap();
+                .unwrap()
+                .grant;
             let expected = now().checked_add(ttl.min(MAX_TTL)).unwrap();
             assert_eq!(original.expires_at, expected);
             let grant = allocator
@@ -136,7 +137,8 @@ async fn postgres_and_http_preserve_ttl_across_acquire_and_consolidation() {
                     now(),
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .grant;
             assert_eq!(grant.expires_at, expected);
             allocator
                 .release(grant.lease_id, grant.fencing_token, grant.units, now())
@@ -156,7 +158,8 @@ async fn http_acquire_preserves_positive_ttl() {
             .http
             .acquire(ACCOUNT, CostUnits(10), ttl, Timestamp::MAX)
             .await
-            .unwrap_or_else(|error| panic!("acquire TTL {ttl}: {error}"));
+            .unwrap_or_else(|error| panic!("acquire TTL {ttl}: {error}"))
+            .grant;
         assert_eq!(
             grant.expires_at,
             now().checked_add(ttl.min(MAX_TTL)).unwrap()
@@ -179,7 +182,8 @@ async fn http_consolidation_preserves_positive_ttl() {
             .http
             .acquire(ACCOUNT, CostUnits(10), SignedDuration::from_secs(60), now())
             .await
-            .unwrap();
+            .unwrap()
+            .grant;
         let grant = server
             .http
             .consolidate(
@@ -191,7 +195,8 @@ async fn http_consolidation_preserves_positive_ttl() {
                 Timestamp::MAX,
             )
             .await
-            .unwrap_or_else(|error| panic!("consolidation TTL {ttl}: {error}"));
+            .unwrap_or_else(|error| panic!("consolidation TTL {ttl}: {error}"))
+            .grant;
         assert_eq!(
             grant.expires_at,
             now().checked_add(ttl.min(MAX_TTL)).unwrap()
@@ -215,7 +220,8 @@ async fn invalid_wire_ttls_never_debit_or_settle_a_lease() {
         .http
         .acquire(ACCOUNT, CostUnits(10), SignedDuration::from_secs(60), now())
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     for ttl in [
         json!({"ttl_seconds": 0}),
         json!({"ttl_seconds": 0, "ttl": "PT0S"}),
@@ -342,11 +348,11 @@ async fn legacy_servers_reject_precise_ttls_and_invalid_input_never_reaches_http
             || ttl == SignedDuration::from_secs(i64::from(u32::MAX))
         {
             assert_eq!(
-                acquire.unwrap().expires_at,
+                acquire.unwrap().grant.expires_at,
                 now().checked_add(ttl.min(MAX_TTL)).unwrap()
             );
             assert_eq!(
-                consolidate.unwrap().expires_at,
+                consolidate.unwrap().grant.expires_at,
                 now().checked_add(ttl.min(MAX_TTL)).unwrap()
             );
         } else {

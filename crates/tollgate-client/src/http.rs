@@ -19,16 +19,16 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, CostUnits, FencingToken, LeaseGrant, LeaseId, Principal,
-    PublishableSnapshot, UsageEvent,
+    AccountId, AccountSnapshot, CostUnits, FencingToken, LeaseId, Principal, PublishableSnapshot,
+    UsageEvent,
 };
 use tollgate_store::wire::{
     API_PREFIX, AcquireRequest, ConsolidateRequest, IngestRequestRef, LeaseTtl, PrincipalsResponse,
     Problem, ReleaseRequest,
 };
 use tollgate_store::{
-    AllocateError, IngestError, IngestReport, LeaseAllocator, ReclaimBatch, SnapshotPush,
-    SnapshotResolution, SnapshotSource, StoreError, UsageSink,
+    AllocateError, Allocation, IngestError, IngestReport, LeaseAllocator, ReclaimBatch,
+    SnapshotPush, SnapshotResolution, SnapshotSource, StoreError, UsageSink,
 };
 
 pub struct HttpStore {
@@ -151,7 +151,15 @@ fn problem_to_allocate(problem: Problem) -> AllocateError {
     match problem.code.as_str() {
         "unknown-account" => AllocateError::UnknownAccount,
         "account-inactive" => AllocateError::AccountInactive,
-        "insufficient-balance" => AllocateError::InsufficientBalance,
+        // The code alone is a complete, unattested refusal. Evidence rides
+        // beside it and is discarded, not escalated, when it cannot be valid:
+        // zero remaining must arrive as `balance-exhausted`.
+        "insufficient-balance" => match problem.balance_shortfall {
+            Some(evidence) if problem.status == 409 && !evidence.remaining.is_zero() => {
+                AllocateError::BalanceInsufficient(evidence)
+            }
+            _ => AllocateError::InsufficientBalance,
+        },
         "balance-exhausted" => match problem.balance_exhaustion {
             Some(evidence) if problem.status == 409 => AllocateError::BalanceExhausted(evidence),
             _ => AllocateError::Storage(StoreError(
@@ -191,6 +199,27 @@ async fn read_problem(response: reqwest::Response) -> AllocateError {
     }
 }
 
+/// A grant's evidence counts the grant's own units, so a smaller remaining
+/// cannot describe the ledger that granted it. Discard such evidence rather
+/// than let it refuse quotes the account can fund; the grant itself stands.
+async fn read_allocation(response: reqwest::Response) -> Result<Allocation, AllocateError> {
+    require_complete(response)?
+        .json()
+        .await
+        .map(credible_evidence)
+        .map_err(transport_error)
+}
+
+fn credible_evidence(mut allocation: Allocation) -> Allocation {
+    if allocation
+        .funding
+        .is_some_and(|funding| funding.remaining < allocation.grant.units)
+    {
+        allocation.funding = None;
+    }
+    allocation
+}
+
 #[async_trait]
 impl LeaseAllocator for HttpStore {
     async fn acquire(
@@ -199,7 +228,7 @@ impl LeaseAllocator for HttpStore {
         requested: CostUnits,
         ttl: SignedDuration,
         _now: Timestamp,
-    ) -> Result<LeaseGrant, AllocateError> {
+    ) -> Result<Allocation, AllocateError> {
         // The server stamps its own clock; `now` stays local-only.
         let ttl = LeaseTtl::try_from(ttl)?;
         let response = self
@@ -214,10 +243,7 @@ impl LeaseAllocator for HttpStore {
         if !response.status().is_success() {
             return Err(read_problem(response).await);
         }
-        require_complete(response)?
-            .json()
-            .await
-            .map_err(transport_error)
+        read_allocation(response).await
     }
 
     async fn release(
@@ -250,7 +276,7 @@ impl LeaseAllocator for HttpStore {
         requested: CostUnits,
         ttl: SignedDuration,
         _now: Timestamp,
-    ) -> Result<LeaseGrant, AllocateError> {
+    ) -> Result<Allocation, AllocateError> {
         // One request, because the guarantee is transactional: two calls over
         // this transport would reintroduce exactly the gap the operation
         // exists to close. The server stamps its own clock, as it does for
@@ -270,10 +296,7 @@ impl LeaseAllocator for HttpStore {
         if !response.status().is_success() {
             return Err(read_problem(response).await);
         }
-        require_complete(response)?
-            .json()
-            .await
-            .map_err(transport_error)
+        read_allocation(response).await
     }
 
     async fn reclaim_expired_batch(
@@ -512,6 +535,7 @@ impl tollgate_store::KeySource for HttpStore {
 #[cfg(test)]
 mod exhaustion_tests {
     use super::*;
+    use tollgate_core::LeaseGrant;
 
     #[test]
     fn incomplete_exhaustion_responses_never_become_authoritative() {
@@ -532,5 +556,107 @@ mod exhaustion_tests {
         )
         .unwrap();
         assert_eq!(problem_to_allocate(old), AllocateError::InsufficientBalance);
+    }
+
+    /// Every plain domain code maps back to its refusal. A code that fell
+    /// through to `Storage` would turn a definite answer into an ambiguous one.
+    #[test]
+    fn plain_refusal_codes_round_trip() {
+        for (code, expected) in [
+            ("unknown-account", AllocateError::UnknownAccount),
+            ("account-inactive", AllocateError::AccountInactive),
+            ("insufficient-balance", AllocateError::InsufficientBalance),
+            ("invalid-ttl", AllocateError::InvalidTtl),
+            ("unknown-lease", AllocateError::UnknownLease),
+            ("fenced", AllocateError::Fenced),
+            ("lease-not-active", AllocateError::LeaseNotActive),
+            ("invalid-release", AllocateError::InvalidRelease),
+        ] {
+            let problem = Problem {
+                status: 409,
+                code: code.into(),
+                title: code.into(),
+                generation: None,
+                balance_exhaustion: None,
+                balance_shortfall: None,
+            };
+            assert_eq!(problem_to_allocate(problem), expected, "{code}");
+        }
+    }
+
+    #[test]
+    fn incomplete_shortfall_responses_never_become_authoritative() {
+        for body in [
+            // Zero remaining is exhaustion and must arrive under its own code.
+            r#"{"status":409,"code":"insufficient-balance","title":"short","balance_shortfall":{"remaining":0,"period_end":null}}"#,
+            r#"{"status":503,"code":"insufficient-balance","title":"short","balance_shortfall":{"remaining":5,"period_end":null}}"#,
+        ] {
+            let problem = serde_json::from_str::<Problem>(body).unwrap();
+            assert_eq!(
+                problem_to_allocate(problem),
+                AllocateError::InsufficientBalance,
+                "{body}"
+            );
+        }
+        // A period end is required, never defaulted to "unscheduled".
+        assert!(
+            serde_json::from_str::<Problem>(
+                r#"{"status":409,"code":"insufficient-balance","title":"short","balance_shortfall":{"remaining":5}}"#
+            )
+            .is_err()
+        );
+        let attested = serde_json::from_str::<Problem>(
+            r#"{"status":409,"code":"insufficient-balance","title":"short","balance_shortfall":{"remaining":5,"period_end":null}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            problem_to_allocate(attested),
+            AllocateError::BalanceInsufficient(tollgate_core::BalanceShortfall {
+                remaining: CostUnits(5),
+                period_end: None,
+            })
+        );
+    }
+
+    /// A server that predates evidence sends a bare grant, which reads as a
+    /// grant with nothing attested.
+    #[test]
+    fn a_grant_without_evidence_parses_as_unattested() {
+        let grant = LeaseGrant {
+            lease_id: LeaseId(1),
+            account_id: AccountId(1),
+            fencing_token: FencingToken(1),
+            units: CostUnits(10),
+            expires_at: jiff::Timestamp::UNIX_EPOCH,
+        };
+        let old = serde_json::to_string(&grant).unwrap();
+        let parsed: Allocation = serde_json::from_str(&old).unwrap();
+        assert_eq!(
+            parsed,
+            Allocation {
+                grant,
+                funding: None
+            }
+        );
+    }
+
+    #[test]
+    fn grant_evidence_below_the_grant_itself_is_discarded() {
+        let grant = LeaseGrant {
+            lease_id: LeaseId(1),
+            account_id: AccountId(1),
+            fencing_token: FencingToken(1),
+            units: CostUnits(10),
+            expires_at: jiff::Timestamp::UNIX_EPOCH,
+        };
+        let with = |remaining| Allocation {
+            grant,
+            funding: Some(tollgate_core::BalanceShortfall {
+                remaining: CostUnits(remaining),
+                period_end: None,
+            }),
+        };
+        assert_eq!(credible_evidence(with(9)).funding, None);
+        assert_eq!(credible_evidence(with(10)), with(10));
     }
 }

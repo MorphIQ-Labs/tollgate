@@ -496,7 +496,8 @@ async fn usage_sink_outage_and_recovery_are_reported() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let (captor, _guard) = capture();
     let sink = flaky_sink(store.clone(), 3);
     let (recorder, writer) = UsageWriter::spawn(

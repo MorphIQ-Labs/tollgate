@@ -149,13 +149,18 @@ pub enum DenyReason {
     /// The allocator confirmed that account funding is exhausted. Retry
     /// requires new funding or a new budget period; this is not a lease gap.
     BalanceExhausted,
+    /// The allocator confirmed that the account's remaining funding, counting
+    /// units held in leases, is below this request's quote. Retry requires a
+    /// smaller quote, new funding, or a new budget period; quotes within
+    /// `remaining` are unaffected and keep their own lease-gap advice.
+    BalanceInsufficient { remaining: CostUnits },
 }
 
 impl DenyReason {
     /// Stable metric labels, in [`index`](DenyReason::index) order.
     ///
     /// These are the *variant* names, not [`Display`](fmt::Display) output.
-    /// Six variants interpolate runtime values into their message
+    /// Seven variants interpolate runtime values into their message
     /// (`max_items`, `weight`/`burst_units`, `remaining`, `spent`), so using the
     /// rendered text as a label would mint a fresh time series per distinct
     /// value — unbounded cardinality from a fixed enum. The label says which
@@ -184,14 +189,15 @@ impl DenyReason {
         "funding_expired_at_start",
         "capacity_unavailable",
         "balance_exhausted",
+        "balance_insufficient",
     ];
 
     /// How many distinct reasons exist — the width of any per-reason array.
-    pub const COUNT: usize = 23;
+    pub const COUNT: usize = 24;
 
     /// This reason's dense slot, for direct-indexed per-reason tallies.
     ///
-    /// Six variants carry data, so there is no discriminant to cast: the
+    /// Seven variants carry data, so there is no discriminant to cast: the
     /// mapping is written out, and the match is exhaustive on purpose. A new
     /// variant fails to compile until it is given a slot, which is what stops
     /// a reason from silently landing in another's bucket — the same forcing
@@ -222,6 +228,7 @@ impl DenyReason {
             DenyReason::FundingExpiredAtStart => 20,
             DenyReason::CapacityUnavailable => 21,
             DenyReason::BalanceExhausted => 22,
+            DenyReason::BalanceInsufficient { .. } => 23,
         }
     }
 
@@ -257,7 +264,8 @@ impl DenyReason {
             | DenyReason::UnpriceableUnderLimits { .. }
             | DenyReason::CostOverflow
             | DenyReason::EmptyWorkload
-            | DenyReason::BalanceExhausted => Retry::Never,
+            | DenyReason::BalanceExhausted
+            | DenyReason::BalanceInsufficient { .. } => Retry::Never,
         }
     }
 }
@@ -266,6 +274,10 @@ impl fmt::Display for DenyReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DenyReason::BalanceExhausted => f.write_str("account balance exhausted"),
+            DenyReason::BalanceInsufficient { remaining } => write!(
+                f,
+                "account funding ({remaining} units remaining) cannot cover this request"
+            ),
             DenyReason::UnknownPrincipal => f.write_str("unknown principal"),
             DenyReason::AccountSuspended => f.write_str("account suspended"),
             DenyReason::AccountClosed => f.write_str("account closed"),
@@ -364,6 +376,9 @@ mod tests {
         DenyReason::FundingExpiredAtStart,
         DenyReason::CapacityUnavailable,
         DenyReason::BalanceExhausted,
+        DenyReason::BalanceInsufficient {
+            remaining: CostUnits(1),
+        },
     ];
 
     /// The indices must be a permutation of `0..COUNT`. Two reasons sharing a
@@ -481,6 +496,13 @@ mod tests {
             ),
             (DenyReason::CapacityUnavailable, 21, "capacity_unavailable"),
             (DenyReason::BalanceExhausted, 22, "balance_exhausted"),
+            (
+                DenyReason::BalanceInsufficient {
+                    remaining: CostUnits(1),
+                },
+                23,
+                "balance_insufficient",
+            ),
         ];
 
         for (reason, slot, label) in shipped {
@@ -498,7 +520,7 @@ mod tests {
 
         assert_eq!(
             DenyReason::COUNT,
-            23,
+            24,
             "COUNT may only grow, and only by appending"
         );
     }
@@ -553,6 +575,16 @@ mod tests {
             .index()
         );
         assert_eq!(
+            DenyReason::BalanceInsufficient {
+                remaining: CostUnits::ZERO
+            }
+            .index(),
+            DenyReason::BalanceInsufficient {
+                remaining: CostUnits(u64::MAX)
+            }
+            .index()
+        );
+        assert_eq!(
             DenyReason::OverageCapTemporarilyExhausted {
                 spent: CostUnits::ZERO,
                 overage_cap: CostUnits(1),
@@ -584,7 +616,9 @@ mod tests {
             let expected = match reason {
                 DenyReason::OverageCommitInProgress { .. } => Retry::AfterInFlight,
                 DenyReason::FundingExpiredAtStart => Retry::Transient,
-                DenyReason::EmptyWorkload | DenyReason::BalanceExhausted => Retry::Never,
+                DenyReason::EmptyWorkload
+                | DenyReason::BalanceExhausted
+                | DenyReason::BalanceInsufficient { .. } => Retry::Never,
                 DenyReason::RateLimited
                 | DenyReason::RequestRateLimited
                 | DenyReason::ConcurrencyLimited

@@ -151,49 +151,79 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    `an_elastic_lapse_overlapping_a_sibling_publication_reports_an_in_flight_commit`.
    *Proof:* `formal/lean/Tollgate/OveragePublication.lean`.
 
-   **Exhaustion requires ledger evidence.** An allocatable balance of zero
-   does not prove spent funding: another instance may return a lease. Only
-   the allocator's locked ledger, including outstanding units and recorded
-   consumption, produces `BalanceExhaustion`. Unreported consumption remains
-   unknown; a rolled-back consolidation cannot certify exhaustion caused by
-   its uncommitted loss or expiry. Admission uses this evidence only after
-   local lease funding and any elastic fallback fail. Refundable overage and
-   in-flight commits retain their own retry classes. Confirmed exhaustion
-   produces `BalanceExhausted` with `Retry::Never` under the current funding;
-   a new grant or accepted changed funding snapshot invalidates it, as does
-   reaching its stored period boundary. This classification charges no units.
+   **Funding refusals require ledger evidence.** An allocatable balance of
+   zero does not prove spent funding: another instance may return a lease.
+   Only the allocator's locked ledger, including outstanding units and recorded
+   consumption, produces `BalanceShortfall { remaining, period_end }`:
+   what the account was funded with minus what it consumed or lost. Unreported
+   consumption can only lower true remaining funding, so `remaining` is an upper
+   bound and a quote above it cannot be funded under current funding; a quote
+   within it proves nothing. Every grant carries this evidence as read from the
+   ledger it commits into, settlement included; a refusal carries it as
+   `BalanceExhausted` when `remaining` is zero and `BalanceInsufficient`
+   otherwise. A rolled-back consolidation cannot certify a shortfall caused by
+   its uncommitted loss or expiry, and returns the unattested
+   `InsufficientBalance`. Admission uses the evidence only after local lease
+   funding and any elastic fallback fail. Refundable overage and in-flight
+   commits retain their own retry classes. Zero remaining produces
+   `BalanceExhausted`; a quote above a positive remaining produces
+   `BalanceInsufficient { remaining }`; both are `Retry::Never` under the
+   current funding. A quote within `remaining` keeps the lease refusal's
+   transient advice. A new grant replaces the evidence with its own; an
+   accepted changed funding snapshot invalidates it, as does reaching its
+   stored period boundary. This classification charges no units.
 
    Enforcement: the allocator owns ledger classification; `FundingAttempt`
-   binds response publication to an identity epoch in the account's
-   `LeaseSlot`. Control-plane publishers serialize; a new grant or changed
-   funding snapshot replaces that identity before clearing the atomic marker.
+   binds publication to an identity epoch in the account's `LeaseSlot`.
+   Control-plane publishers serialize; a new grant or changed funding snapshot
+   replaces that identity before clearing the evidence. `FundingAttempt::granted`
+   installs a grant and publishes its evidence under that same lock, and only
+   when no funding change was accepted while the call was outstanding.
    Snapshot maps order generations per principal before publication; the
    account-shared slot compares only budget and enforcement mode, so an accepted
    change from any principal invalidates the account's evidence.
    Restoring the same lease does not clear it. Admission reads one atomic
-   deadline only on a funding refusal, using caller-supplied time. Deadline
-   flooring can discard evidence early, never extend it. No request-path I/O,
-   allocation or blocking lock is added.
+   deadline on a funding refusal, using caller-supplied time; only live
+   evidence costs a `remaining` load and a deadline re-read, and a pair that
+   straddles a publication is discarded. Deadline flooring can discard evidence
+   early, never extend it. An HTTP grant whose evidence is below its own units
+   carries none. No request-path I/O, allocation or blocking lock is added.
 
    Witnesses: `an_insufficient_balance_recovers_when_another_instance_returns_its_lease`,
    `an_insufficient_balance_recovers_when_another_instances_lease_is_reclaimed`,
    `exhaustion_requires_recorded_consumption_and_survives_lease_expiry`,
    `exhaustion_evidence_names_the_stored_period_and_rollover_restores_funding`,
-   `zero_requested_units_never_produce_exhaustion_evidence`, and
+   `zero_requested_units_never_produce_exhaustion_evidence`,
+   `grants_report_ledger_remaining_including_outstanding_leases`,
+   `a_partial_balance_refusal_reports_remaining_funding`,
+   `shortfall_evidence_names_the_stored_period`, and
    `a_refused_consolidation_leaves_the_original_lease_spendable` in both backend
    suites; `authoritative_exhaustion_classifies_only_failed_local_funding`,
+   `insufficient_funding_refuses_only_quotes_above_evidence`,
+   `grant_evidence_is_published_with_its_lease`,
    `exhausted_evidence_survives_local_expiry_but_not_its_period_end`,
    `central_exhaustion_does_not_hide_refundable_elastic_capacity`,
+   `central_shortfall_does_not_hide_elastic_capacity`,
    `exhaustion_is_shared_by_account_and_isolated_from_other_accounts`,
    `exhaustion_deadlines_are_conservative_at_subsecond_and_domain_boundaries`,
+   `paired_evidence_reads_are_conservative`,
    `funding_publication_invalidates_late_exhaustion_responses`,
    `accepted_funding_changes_from_independently_versioned_principals_clear_exhaustion`,
    `refill_publishes_exhaustion_and_a_topup_clears_it`,
+   `refill_publishes_shortfall_and_a_topup_clears_it`,
+   `a_refill_gap_with_credit_held_elsewhere_is_not_exhaustion`,
    `a_rolled_back_consolidation_returns_the_lease_to_the_slot`,
+   `a_consolidated_tail_publishes_the_accounts_remaining_funding`,
    `authoritative_exhaustion_round_trips_over_http`,
-   `incomplete_exhaustion_responses_never_become_authoritative`, and
-   `confirmed_balance_exhaustion_allocates_nothing`.
-   Exact ledger and epoch laws: `formal/lean/Tollgate/BalanceExhaustion.lean`.
+   `shortfall_evidence_round_trips_over_http`,
+   `incomplete_exhaustion_responses_never_become_authoritative`,
+   `incomplete_shortfall_responses_never_become_authoritative`,
+   `grant_evidence_below_the_grant_itself_is_discarded`,
+   `a_quote_above_remaining_funding_is_payment_required_until_a_top_up`,
+   `confirmed_balance_exhaustion_allocates_nothing`, and
+   `confirmed_shortfall_allocates_nothing`.
+   Exact ledger, shortfall, epoch and paired-read laws:
+   `formal/lean/Tollgate/BalanceExhaustion.lean`.
    These proofs assume serialized ledger/publication transitions; backend,
    transport, arithmetic and allocation tests are separate implementation evidence.
 

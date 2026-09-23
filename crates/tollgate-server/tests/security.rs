@@ -358,7 +358,8 @@ async fn mtls_and_bearer_fund_and_settle_over_tls_and_revocation_affects_keepali
                 SystemClock.now(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .grant;
         http.release(
             grant.lease_id,
             grant.fencing_token,
