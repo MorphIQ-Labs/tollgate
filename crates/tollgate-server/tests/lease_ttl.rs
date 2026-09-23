@@ -133,6 +133,7 @@ async fn postgres_and_http_preserve_ttl_across_acquire_and_consolidation() {
                     original.fencing_token,
                     original.units,
                     CostUnits(10),
+                    CostUnits::ZERO,
                     ttl,
                     now(),
                 )
@@ -191,6 +192,7 @@ async fn http_consolidation_preserves_positive_ttl() {
                 original.fencing_token,
                 original.units,
                 CostUnits(10),
+                CostUnits::ZERO,
                 ttl,
                 Timestamp::MAX,
             )
@@ -340,6 +342,7 @@ async fn legacy_servers_reject_precise_ttls_and_invalid_input_never_reaches_http
                 FencingToken(1),
                 CostUnits(10),
                 CostUnits(10),
+                CostUnits::ZERO,
                 ttl,
                 now(),
             )
@@ -379,6 +382,7 @@ async fn legacy_servers_reject_precise_ttls_and_invalid_input_never_reaches_http
                 FencingToken(1),
                 CostUnits(10),
                 CostUnits(10),
+                CostUnits::ZERO,
                 ttl,
                 now()
             )

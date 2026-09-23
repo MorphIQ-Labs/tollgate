@@ -1687,7 +1687,7 @@ fn hanging_release(store: &Arc<MemoryStore>) -> Arc<DelegatingStore<MemoryStore>
     Arc::new(
         DelegatingStore::wrapping(Arc::clone(store))
             .on_release(|_, _lease, _fence, _unspent, _now| async { std::future::pending().await })
-            .on_consolidate(|_, _, _, _, _, _, _| async {
+            .on_consolidate(|_, _, _, _, _, _, _, _| async {
                 unreachable!("this fixture never consolidates")
             }),
     )
@@ -2346,6 +2346,7 @@ async fn consolidation_under_a_shrinking_policy_never_returns_less_than_it_folde
             grant.fencing_token,
             grant.units,
             CostUnits(100),
+            CostUnits::ZERO,
             SignedDuration::from_secs(60),
             t(1),
         )
@@ -2388,6 +2389,55 @@ async fn refill_publishes_exhaustion_and_a_topup_clears_it() {
             .is_some_and(|remaining| remaining.is_zero())
     );
     assert_eq!(slot.load_observed().unwrap().remaining(), CostUnits(100));
+    manager.shutdown().await;
+}
+
+/// #131 end to end with `GrantPolicy::default()`: 60 units grant 30, and
+/// before #131 every refusal-driven consolidation re-granted 30, so a 51-unit
+/// quote the account could fund was refused until the period ended.
+#[tokio::test(start_paused = true)]
+async fn a_shrinking_policy_funds_a_quote_above_half_the_balance() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    store.create_account(AccountConfig {
+        account_id: ACCOUNT,
+        initial_balance: CostUnits(60),
+        status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
+    });
+    let slot = LeaseSlot::for_account(ACCOUNT);
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let manager = LeaseManager::spawn(
+        store.clone(),
+        Arc::clone(&slot),
+        clock,
+        LeaseManagerConfig {
+            // Only the refusal can explain a rotation in this test.
+            poll_interval: std::time::Duration::from_secs(60),
+            ..manager_config()
+        },
+    )
+    .unwrap();
+    settle().await;
+    let half = slot.load().expect("a lease is installed");
+    assert_eq!(half.remaining(), CostUnits(30));
+    assert!(matches!(
+        half.try_debit(CostUnits(51), t(0)),
+        Err(DenyReason::LeaseExhausted { .. })
+    ));
+    drop(half);
+    settle().await;
+
+    let grown = slot.load().expect("a lease is installed");
+    assert_eq!(
+        grown.remaining(),
+        CostUnits(51),
+        "grown to the refused quote"
+    );
+    grown
+        .try_debit(CostUnits(51), t(0))
+        .expect("the quote the account could always fund is admitted");
+    drop(grown);
+    assert_eq!(manager.counters().snapshot().consolidated, 1);
     manager.shutdown().await;
 }
 

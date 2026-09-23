@@ -248,7 +248,9 @@ impl Conservation {
 /// at `balance / shrink_divisor` (floored at `min_grant`, and never above the
 /// remaining balance). This is the design-review answer to the quota-edge
 /// problem: N instances can no longer strand a small balance behind one
-/// holder's oversized lease.
+/// holder's oversized lease. A consolidation may exceed the cap only to fund
+/// a quote the holder already refused ([`Self::consolidation_grant`]), which
+/// is demand rather than hoarding.
 #[derive(Debug, Clone, Copy)]
 pub struct GrantPolicy {
     pub shrink_divisor: u64,
@@ -333,6 +335,34 @@ impl GrantPolicy {
         Some(CostUnits(
             requested.get().min(cap).min(balance.get()).max(1),
         ))
+    }
+
+    /// The units a consolidation re-grants, or `None` exactly when
+    /// [`Self::grant`] refuses.
+    ///
+    /// `balance` already includes the credit the exchange restores, and
+    /// `floor` is that credit: the ordinary answer may not shrink the holding
+    /// (#109). `needed` is the largest quote the returned lease refused, and
+    /// the answer grows to it when `balance` can fund it (#131). The shrink
+    /// cap stops one holder hoarding a small balance ahead of demand; a quote
+    /// the holder already failed to fund is demand, and the request that
+    /// proved it spends it. A quote `balance` cannot fund grows nothing,
+    /// because no grant would serve it. A plain acquire is `floor` and
+    /// `needed` both zero, which is [`Self::grant`] unchanged.
+    #[must_use]
+    pub fn consolidation_grant(
+        &self,
+        requested: CostUnits,
+        balance: CostUnits,
+        floor: CostUnits,
+        needed: CostUnits,
+    ) -> Option<CostUnits> {
+        let sized = self.grant(requested, balance)?.max(floor.min(balance));
+        Some(if needed <= balance {
+            sized.max(needed)
+        } else {
+            sized
+        })
     }
 }
 
@@ -485,6 +515,15 @@ pub trait LeaseAllocator: Send + Sync {
     /// holding. A zero request or a balance unable to fund any grant refuses
     /// the whole exchange.
     ///
+    /// **The grant grows to `needed` when the restored balance can fund it.**
+    /// `needed` is the largest quote the returned lease refused, zero when
+    /// none. The shrink cap exists so one holder cannot hoard a small balance
+    /// ahead of demand; a refused quote is demand already proven, so under a
+    /// `shrink_divisor` above one it is what lets a single holder reach a
+    /// quote above `balance / shrink_divisor` at all. A `needed` the balance
+    /// cannot fund changes nothing. Sizing is
+    /// [`GrantPolicy::consolidation_grant`] in every backend.
+    ///
     /// The transaction applies both halves or neither. A domain refusal
     /// (`InsufficientBalance`, `BalanceExhausted`, `BalanceInsufficient`,
     /// `UnknownAccount`, `AccountInactive`, or `InvalidTtl`) leaves the
@@ -501,12 +540,18 @@ pub trait LeaseAllocator: Send + Sync {
     /// it could spend credited units twice. The unanswered replacement grant
     /// cannot be recovered through the old capability, must be reported as
     /// uncertain, and remains bounded by TTL reclaim.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one transactional exchange: the release half's capability and credit, the \
+                  grant half's size and demand, and the shared lifetime and clock"
+    )]
     async fn consolidate(
         &self,
         lease_id: LeaseId,
         fencing_token: FencingToken,
         unspent: CostUnits,
         requested: CostUnits,
+        needed: CostUnits,
         ttl: SignedDuration,
         now: Timestamp,
     ) -> Result<Allocation, AllocateError>;
@@ -1604,6 +1649,7 @@ mod tests {
             _fencing_token: FencingToken,
             _unspent: CostUnits,
             _requested: CostUnits,
+            _needed: CostUnits,
             _ttl: SignedDuration,
             _now: Timestamp,
         ) -> Result<Allocation, AllocateError> {
@@ -1627,6 +1673,64 @@ mod tests {
                 })
                 .collect();
             ReclaimBatch::try_new(reclaimed, limit)
+        }
+    }
+
+    /// #131: under the default divisor of 2, a 60-unit balance re-granted as
+    /// 30 forever, however often a 51-unit quote was refused.
+    #[test]
+    fn consolidation_grows_only_to_a_fundable_needed_quote() {
+        let policy = GrantPolicy::default();
+        let size = |requested, balance, floor, needed| {
+            policy.consolidation_grant(
+                CostUnits(requested),
+                CostUnits(balance),
+                CostUnits(floor),
+                CostUnits(needed),
+            )
+        };
+        assert_eq!(
+            size(1_000, 60, 30, 0),
+            Some(CostUnits(30)),
+            "the #109 floor"
+        );
+        assert_eq!(
+            size(1_000, 60, 30, 51),
+            Some(CostUnits(51)),
+            "proven demand"
+        );
+        assert_eq!(
+            size(1_000, 60, 30, 60),
+            Some(CostUnits(60)),
+            "all of it, inclusive"
+        );
+        assert_eq!(
+            size(1_000, 60, 30, 61),
+            Some(CostUnits(30)),
+            "an unfundable quote grows nothing"
+        );
+        assert_eq!(
+            size(1_000, 60, 40, 35),
+            Some(CostUnits(40)),
+            "demand never shrinks the floor"
+        );
+        assert_eq!(
+            size(10, 60, 0, 51),
+            Some(CostUnits(51)),
+            "past a small target"
+        );
+        assert_eq!(
+            size(1_000, 0, 0, 51),
+            None,
+            "an empty balance still refuses"
+        );
+        assert_eq!(size(0, 60, 0, 51), None, "a zero request still refuses");
+        for (requested, balance) in [(1_000, 60), (7, 60), (1_000, 1)] {
+            assert_eq!(
+                size(requested, balance, 0, 0),
+                policy.grant(CostUnits(requested), CostUnits(balance)),
+                "a plain acquire is the ordinary policy"
+            );
         }
     }
 

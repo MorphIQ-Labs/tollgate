@@ -1253,22 +1253,44 @@ async fn lock_lease(
     }))
 }
 
+/// What a consolidation's release half hands the grant half of the same
+/// transaction. A plain acquire returns nothing: [`Exchange::ACQUIRE`].
+struct Exchange {
+    /// The credit this transaction restored to the account, which the grant
+    /// policy's shrink cap may not size the result below (see
+    /// [`LeaseAllocator::consolidate`]).
+    floor: CostUnits,
+    /// The largest quote the returned lease refused, which the grant may grow
+    /// to when the restored balance funds it (#131).
+    needed: CostUnits,
+    /// Whether the settlement left total funding unchanged, so a refusal may
+    /// attest the ledger it reads (#130).
+    preserves_funding: bool,
+}
+
+impl Exchange {
+    const ACQUIRE: Exchange = Exchange {
+        floor: CostUnits::ZERO,
+        needed: CostUnits::ZERO,
+        preserves_funding: true,
+    };
+}
+
 impl PostgresStore {
     /// One grant, inside a caller-owned transaction.
-    ///
-    /// `floor` is the units the caller is returning to this same account in
-    /// this same transaction, which the grant policy's shrink cap may not size
-    /// the result below (see [`LeaseAllocator::consolidate`]). A plain acquire
-    /// returns nothing and passes zero, leaving the policy's answer untouched.
     async fn acquire_in_tx(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         account: AccountId,
         requested: CostUnits,
         expires_at: Timestamp,
-        floor: CostUnits,
-        settlement_preserves_funding: bool,
+        exchange: Exchange,
     ) -> Result<Allocation, AllocateError> {
+        let Exchange {
+            floor,
+            needed,
+            preserves_funding: settlement_preserves_funding,
+        } = exchange;
         let row = sqlx::query(
             "SELECT balance, status, next_fence, allowance_balance, period_start_us
              FROM tollgate_accounts WHERE account_id = $1 FOR UPDATE",
@@ -1289,13 +1311,16 @@ impl PostgresStore {
         }
         let balance =
             to_units(row.get::<i64, _>(0), "account balance").map_err(AllocateError::Storage)?;
-        // The floor is applied to the policy's answer, not to the
-        // balance test: the units the caller returned rejoined `balance`
-        // earlier in this same transaction, so a floor can only re-select
-        // capacity the account demonstrably has, and an account with
-        // nothing left still refuses.
-        let granted = match self.policy.grant(requested, balance) {
-            Some(granted) => granted.max(floor.min(balance)),
+        // The floor and demand are applied to the policy's answer, not to
+        // the balance test: the units the caller returned rejoined `balance`
+        // earlier in this same transaction, and both are capped by it, so
+        // they can only re-select capacity the account demonstrably has, and
+        // an account with nothing left still refuses.
+        let granted = match self
+            .policy
+            .consolidation_grant(requested, balance, floor, needed)
+        {
+            Some(granted) => granted,
             None => {
                 // A refused consolidation rolls its settlement back. Only
                 // attest when that settlement did not remove funding itself.
@@ -1508,14 +1533,7 @@ impl LeaseAllocator for PostgresStore {
         let expires_at = self.grant_expiry(ttl, now)?;
         let mut tx = self.pool.begin().await.map_err(alloc_storage)?;
         let result = self
-            .acquire_in_tx(
-                &mut tx,
-                account,
-                requested,
-                expires_at,
-                CostUnits::ZERO,
-                true,
-            )
+            .acquire_in_tx(&mut tx, account, requested, expires_at, Exchange::ACQUIRE)
             .await;
         finish_transaction(tx, result).await
     }
@@ -1541,6 +1559,7 @@ impl LeaseAllocator for PostgresStore {
         fencing_token: FencingToken,
         unspent: CostUnits,
         requested: CostUnits,
+        needed: CostUnits,
         ttl: SignedDuration,
         now: Timestamp,
     ) -> Result<Allocation, AllocateError> {
@@ -1563,8 +1582,11 @@ impl LeaseAllocator for PostgresStore {
                 released.account,
                 requested,
                 expires_at,
-                released.restored,
-                released.preserves_funding,
+                Exchange {
+                    floor: released.restored,
+                    needed,
+                    preserves_funding: released.preserves_funding,
+                },
             )
             .await
         }

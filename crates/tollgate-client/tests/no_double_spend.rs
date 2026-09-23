@@ -139,10 +139,15 @@ fn hammer(instance: &mut Instance, burst: usize) -> usize {
                 committed += 1;
                 drop(committed_guard);
             }
+            // Spending an account down ends in lease refusals and, once the
+            // allocator has attested what is left, funding refusals (#130).
+            // All are zero-charge.
             Err(
                 DenyReason::LeaseUnavailable
                 | DenyReason::LeaseExhausted { .. }
-                | DenyReason::LeaseExpired,
+                | DenyReason::LeaseExpired
+                | DenyReason::BalanceExhausted
+                | DenyReason::BalanceInsufficient { .. },
             ) => {
                 // Quota denied: permit drops, slot is freed, zero charged.
             }

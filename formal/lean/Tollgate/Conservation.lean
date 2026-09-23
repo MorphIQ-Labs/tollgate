@@ -153,6 +153,28 @@ theorem consolidation_grant_respects_restored_balance
         balance + consolidationCredit toAllowance toTopup samePeriod := by
   omega
 
+/-- #131: the consolidation grant may grow to `needed`, the largest quote the
+returned lease refused, only when the restored balance funds it. `available`
+is the ledger balance plus the restored credit; `sized` is the ordinary answer,
+the policy grant raised to the credit floor. -/
+def consolidationGrant (available sized needed : Nat) : Nat :=
+  if needed ≤ available then max sized needed else sized
+
+theorem consolidation_growth_is_bounded (available sized floor needed : Nat)
+    (sized_funded : sized ≤ available) (floor_kept : floor ≤ sized) :
+    floor ≤ consolidationGrant available sized needed ∧
+      consolidationGrant available sized needed ≤ available ∧
+      (sized < consolidationGrant available sized needed →
+        consolidationGrant available sized needed = needed) := by
+  unfold consolidationGrant
+  split <;> omega
+
+theorem unfundable_demand_changes_nothing (available sized needed : Nat)
+    (unfundable : available < needed) :
+    consolidationGrant available sized needed = sized := by
+  unfold consolidationGrant
+  split <;> omega
+
 theorem expired_allowance_cannot_enlarge_consolidation
     (policyGrant toAllowance toTopup : Nat) :
     max policyGrant (consolidationCredit toAllowance toTopup false) =

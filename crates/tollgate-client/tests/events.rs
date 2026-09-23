@@ -731,7 +731,7 @@ fn refusing_release(store: Arc<MemoryStore>, invalid: bool) -> Arc<DelegatingSto
                     AllocateError::Fenced
                 })
             })
-            .on_consolidate(|_, _, _, _, _, _, _| async {
+            .on_consolidate(|_, _, _, _, _, _, _, _| async {
                 unreachable!("these fixtures never consolidate")
             }),
     )

@@ -132,6 +132,7 @@ async fn lease_grants_reject_partial_success_responses() {
                     FencingToken(1),
                     CostUnits(0),
                     CostUnits(1),
+                    CostUnits::ZERO,
                     ttl,
                     now,
                 )

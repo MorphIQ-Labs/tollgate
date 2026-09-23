@@ -41,10 +41,16 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    no other instance can take the returned units in between. Neither property
    is available to a holder composing `release` and `acquire` itself, which is
    why the operation belongs to the component that owns both the policy and the
-   transaction. What still bounds reachability is the policy: under a
-   `shrink_divisor` above one a quote larger than `balance / shrink_divisor` is
-   deliberately unfundable by any single lease, which is that policy's fairness
-   trade across instances and not a stranding.
+   transaction. The policy's shrink cap does not bound reachability either:
+   it stops one holder hoarding a small balance ahead of demand, and a quote
+   the holder already refused is demand. The lease records the largest quote
+   it refused for want of units, the refill plane forwards it, and the
+   exchange grows the replacement to it when the restored balance can fund it
+   and never otherwise. Growth is at most that one quote, and the request that
+   proved it spends it; a plain acquire and the rest of the balance keep the
+   ordinary policy. Enforcement: the allocator owns sizing, in one
+   `GrantPolicy::consolidation_grant` both backends call; the lease owns the
+   record of demand.
 
    A consolidation is a settlement, so the boundary rule applies to it in full:
    the allowance half of a lease funded by a period that has since closed
@@ -59,6 +65,16 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    `consolidation_after_a_budget_reduction_uses_only_restored_credit_as_floor`
    (memory and Postgres variants),
    `consolidation_under_a_shrinking_policy_never_returns_less_than_it_folded`,
+   `consolidation_grows_to_a_proven_quote_under_a_shrinking_policy`,
+   `consolidation_never_grows_past_the_restored_balance`, and
+   `growth_leaves_the_rest_for_another_instance` (memory and Postgres
+   variants), `consolidation_grows_only_to_a_fundable_needed_quote`,
+   `a_refused_debit_records_its_largest_quote`,
+   `consolidation_carries_the_refused_quote`,
+   `a_shrinking_policy_funds_a_quote_above_half_the_balance`,
+   `a_quote_above_half_the_balance_is_funded_after_one_refusal`,
+   `consolidation_demand_is_invisible_until_used`,
+   `consolidation_needed_round_trips_over_http`,
    and `a_consolidation_folds_the_tail_grant_over_http` for the wire. The
    reference backend holds a mutex where the SQL backend holds a transaction
    and so has nothing to roll back: it establishes all-or-nothing by planning
@@ -68,8 +84,10 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    settles the old grant; the replacement consumes that evidence.
    `Conservation.settlement_restores_consolidation_credit`,
    `consolidation_grant_respects_restored_balance`, and
-   `expired_allowance_cannot_enlarge_consolidation` prove the exact-model
-   credit and floor bounds; the mirrored tests witness backend arithmetic.
+   `expired_allowance_cannot_enlarge_consolidation`,
+   `consolidation_growth_is_bounded`, and
+   `unfundable_demand_changes_nothing` prove the exact-model credit, floor and
+   growth bounds; the mirrored tests witness backend arithmetic.
 
    Under `EnforcementMode::Elastic { overage_cap }` an account may spend beyond
    its allocation, and the bound becomes a different one: **at most
@@ -459,7 +477,9 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    itself below. Acquiring alongside such a lease sizes the next grant against
    a balance its own unspent units are missing from, and installs the smaller
    answer; the plane must instead *consolidate*, folding those units back in as
-   it re-grants (1's reachability clause).
+   it re-grants (1's reachability clause). A refusal for units also records its
+   quote on the lease, keeping the largest, and the consolidation carries it
+   to the allocator as the demand the replacement may grow to.
 
    The units are exact only once the lease has quiesced, so consolidation takes
    it out of the slot first. That is a deny window, so quiescence is tested and

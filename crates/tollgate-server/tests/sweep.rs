@@ -543,7 +543,7 @@ fn flaky(inner: Arc<MemoryStore>, state: &Arc<SweepState>) -> Arc<SweepStore> {
                     }
                 }
             })
-            .on_consolidate(|_, _, _, _, _, _, _| async {
+            .on_consolidate(|_, _, _, _, _, _, _, _| async {
                 unreachable!("the sweep never consolidates")
             }),
     )
