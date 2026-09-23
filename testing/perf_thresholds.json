@@ -185,8 +185,14 @@
       "threshold_ns": 40.0
     },
     {
-      "_comment": "Added by #1. The lease-exhausted path had no benchmark at all: `admit_once` uses a giant lease and cancels, so the quota step's failure branch never ran under measurement \u2014 and elastic mode adds a branch exactly there. This is the strict regression guard: the added match must cost a strict account nothing, and a refusal here is dearer than `full_check_denied` because it has already paid for the quote and the rate token. After #91 made disabled concurrency track both occupancies, five controlled-host means were 60.11, 55.98, 57.42, 56.44, and 56.00ns (median 56.44ns). Its row-specific 7% allowance covers that measured 6.5% upper spread without weakening any absolute threshold.",
+      "_comment": "Added by #1. The lease-exhausted path had no benchmark at all: `admit_once` uses a giant lease and cancels, so the quota step's failure branch never ran under measurement \u2014 and elastic mode adds a branch exactly there. This is the strict regression guard: the added match must cost a strict account nothing, and a refusal here is dearer than `full_check_denied` because it has already paid for the quote and the rate token. After #91 made disabled concurrency track both occupancies, five controlled-host means were 60.11, 55.98, 57.42, 56.44, and 56.00ns (median 56.44ns). #128 added one atomic load of the account's exhaustion deadline to this refusal: an interleaved A/B against the pre-#128 revision measured +2.5-2.8ns with the unknown-principal control unchanged, and #129's three recording runs measured 60.33-62.48ns. The baseline enforces the default 5% allowance on this row.",
       "id": "admission/full_check_lease_exhausted_strict",
+      "target_ns": 40.0,
+      "threshold_ns": 90.0
+    },
+    {
+      "_comment": "Added by #129 for #128's confirmed-exhaustion branch: the same strict refusal fixture, but the allocator has recorded authoritative empty-balance evidence, so the failed funding step is reclassified as `BalanceExhausted` and counted under its own denial index. The row above pays the same atomic load and finds no evidence. A filtered diagnostic run (not calibration) measured 55.49ns against the lease-exhausted row's 55.40ns; bounds mirror that row because the work differs only in the comparison result and the counter slot.",
+      "id": "admission/full_check_balance_exhausted_strict",
       "target_ns": 40.0,
       "threshold_ns": 90.0
     },
@@ -537,6 +543,12 @@
       "numerator": "admission/snapshot_lookup_moka_at_capacity",
       "denominator": "admission/snapshot_lookup_arc_swap_at_capacity",
       "max_ratio": 8.0
+    },
+    {
+      "_comment": "#129: reclassifying a failed funding step as confirmed account exhaustion must stay a comparison and a different counter index, not a second path. Measured x1.00 in a filtered diagnostic run; x1.2 covers two ~55ns rows' same-run spread and still rejects any lookup, lock or allocation added to the branch.",
+      "numerator": "admission/full_check_balance_exhausted_strict",
+      "denominator": "admission/full_check_lease_exhausted_strict",
+      "max_ratio": 1.2
     }
   ]
 }
