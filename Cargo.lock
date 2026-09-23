@@ -1731,7 +1731,7 @@ dependencies = [
 
 [[package]]
 name = "pricing-api"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "axum",
  "http-body-util",
@@ -2831,7 +2831,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate-admission"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -2846,7 +2846,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate-alloc-count"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2854,7 +2854,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate-auth"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -2870,7 +2870,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate-client"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2895,7 +2895,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate-core"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "criterion",
  "jiff",
@@ -2907,7 +2907,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate-perf-gate"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "jiff",
  "serde",
@@ -2916,7 +2916,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate-repo-check"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "proc-macro2",
  "serde_json",
@@ -2926,7 +2926,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate-server"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2959,7 +2959,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate-store"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "async-trait",
  "jiff",
@@ -2974,7 +2974,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate-store-postgres"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "async-trait",
  "criterion",
