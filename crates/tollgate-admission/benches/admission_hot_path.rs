@@ -22,13 +22,14 @@ use jiff::Timestamp;
 
 use tollgate_admission::{
     AdmissionEngine, ArcSwapSnapshotMap, CapacityGate, ExecutionCapacityGate,
-    ExecutionCapacityMode, LeaseSlot, MokaSnapshotMap, NoGate, Pending, Principal,
+    ExecutionCapacityMode, LeaseSlot, MapEntry, MokaSnapshotMap, NoGate, Pending, Principal,
     PublishableSnapshotUpdate, SnapshotMap,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, FencingToken,
-    Generation, KeyId, LeaseGrant, LeaseId, LocalLease, LocalSharding, Locality, OpIndex,
-    PermissionBits, PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent, UsageSlot,
+    AccountId, AccountSnapshot, AccountStatus, BalanceExhaustion, CostTable, CostUnits,
+    EnforcementMode, FencingToken, Generation, KeyId, LeaseGrant, LeaseId, LocalLease,
+    LocalSharding, Locality, OpIndex, PermissionBits, PublishableSnapshot, RequestId,
+    ResolvedLimits, UsageEvent, UsageSlot,
 };
 
 #[derive(Debug)]
@@ -770,6 +771,33 @@ fn bench_full_check(c: &mut Criterion) {
     group.bench_function("full_check_lease_exhausted_strict", |b| {
         b.iter(|| {
             let denied = staged_admission(&strict, black_box(Principal(97)), 64, now);
+            black_box(denied.unwrap_err())
+        })
+    });
+
+    // #128 classifies a failed local funding step as `BalanceExhausted` when
+    // the allocator has confirmed the account is empty. The strict row above
+    // pays the one atomic load and finds no evidence; this one finds it, so
+    // the reclassification and its distinct denial counter are measured too.
+    let confirmed = exhausted_engine(EnforcementMode::Strict);
+    for i in 0..512u128 {
+        let MapEntry::Present(state) = confirmed.map().get(&Principal(i)).unwrap() else {
+            unreachable!("exhausted_engine installs every principal")
+        };
+        state
+            .lease
+            .funding_attempt()
+            .shortfall(BalanceExhaustion { period_end: None }.into());
+    }
+    // A fixture that silently fell through to `LeaseExhausted` would measure
+    // the row above under a second name.
+    assert_eq!(
+        staged_admission(&confirmed, Principal(97), 64, now).unwrap_err(),
+        tollgate_core::DenyReason::BalanceExhausted
+    );
+    group.bench_function("full_check_balance_exhausted_strict", |b| {
+        b.iter(|| {
+            let denied = staged_admission(&confirmed, black_box(Principal(97)), 64, now);
             black_box(denied.unwrap_err())
         })
     });
