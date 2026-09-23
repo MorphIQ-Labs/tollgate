@@ -290,6 +290,9 @@ pub struct Problem {
     /// Optional extension used by versioned tombstone responses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<Generation>,
+    /// Authoritative exhaustion, present only on a confirmed allocator refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_exhaustion: Option<tollgate_core::BalanceExhaustion>,
 }
 
 #[cfg(test)]

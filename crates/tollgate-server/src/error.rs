@@ -25,6 +25,7 @@ pub struct ApiError {
     pub code: &'static str,
     pub title: String,
     pub generation: Option<Generation>,
+    pub balance_exhaustion: Option<tollgate_core::BalanceExhaustion>,
 }
 
 /// JSON input whose extractor failures stay inside the RFC-7807 contract.
@@ -95,6 +96,7 @@ impl ApiError {
             code: "authentication-required",
             title: "valid control-plane credentials required".into(),
             generation: None,
+            balance_exhaustion: None,
         }
     }
 
@@ -104,6 +106,7 @@ impl ApiError {
             code: "scope-forbidden",
             title: "credential does not authorize this control-plane operation".into(),
             generation: None,
+            balance_exhaustion: None,
         }
     }
     pub fn not_found(code: &'static str, title: impl Into<String>) -> Self {
@@ -112,6 +115,7 @@ impl ApiError {
             code,
             title: title.into(),
             generation: None,
+            balance_exhaustion: None,
         }
     }
 
@@ -121,6 +125,7 @@ impl ApiError {
             code: "revoked-principal",
             title: "snapshot revoked".to_string(),
             generation: Some(generation),
+            balance_exhaustion: None,
         }
     }
 
@@ -130,6 +135,7 @@ impl ApiError {
             code,
             title: title.into(),
             generation: None,
+            balance_exhaustion: None,
         }
     }
 
@@ -142,6 +148,7 @@ impl ApiError {
             code,
             title: title.into(),
             generation: None,
+            balance_exhaustion: None,
         }
     }
 }
@@ -168,6 +175,7 @@ impl From<JsonRejection> for ApiError {
                      usage batches are capped at {MAX_INGEST_BATCH} events"
                 ),
                 generation: None,
+                balance_exhaustion: None,
             };
         }
         ApiError {
@@ -175,6 +183,7 @@ impl From<JsonRejection> for ApiError {
             code: "invalid-json",
             title: "request body is not valid JSON for this endpoint".to_string(),
             generation: None,
+            balance_exhaustion: None,
         }
     }
 }
@@ -187,16 +196,22 @@ impl From<PathRejection> for ApiError {
             code: "invalid-id",
             title: "path identifier must be exactly 32 lowercase hexadecimal digits".to_string(),
             generation: None,
+            balance_exhaustion: None,
         }
     }
 }
 
 impl From<AllocateError> for ApiError {
     fn from(e: AllocateError) -> Self {
+        let balance_exhaustion = match &e {
+            AllocateError::BalanceExhausted(evidence) => Some(*evidence),
+            _ => None,
+        };
         let (status, code) = match e {
             AllocateError::UnknownAccount => (StatusCode::NOT_FOUND, "unknown-account"),
             AllocateError::AccountInactive => (StatusCode::CONFLICT, "account-inactive"),
             AllocateError::InsufficientBalance => (StatusCode::CONFLICT, "insufficient-balance"),
+            AllocateError::BalanceExhausted(_) => (StatusCode::CONFLICT, "balance-exhausted"),
             AllocateError::InvalidTtl => (StatusCode::UNPROCESSABLE_ENTITY, "invalid-ttl"),
             AllocateError::UnknownLease => (StatusCode::NOT_FOUND, "unknown-lease"),
             AllocateError::Fenced => (StatusCode::CONFLICT, "fenced"),
@@ -209,6 +224,7 @@ impl From<AllocateError> for ApiError {
             code,
             title: e.to_string(),
             generation: None,
+            balance_exhaustion,
         }
     }
 }
@@ -221,6 +237,7 @@ impl From<CreateAccountError> for ApiError {
                 code: "account-exists",
                 title: "account already exists".to_string(),
                 generation: None,
+                balance_exhaustion: None,
             },
             CreateAccountError::Storage(inner) => ApiError::from(inner),
         }
@@ -249,6 +266,7 @@ impl From<tollgate_store::KeyError> for ApiError {
             code,
             title: e.to_string(),
             generation: None,
+            balance_exhaustion: None,
         }
     }
 }
@@ -261,6 +279,7 @@ impl From<tollgate_store::BudgetError> for ApiError {
                 code: "unknown-account",
                 title: e.to_string(),
                 generation: None,
+                balance_exhaustion: None,
             },
             tollgate_store::BudgetError::Storage(inner) => inner.into(),
         }
@@ -275,6 +294,7 @@ impl From<SetStatusError> for ApiError {
                 code: "unknown-account",
                 title: e.to_string(),
                 generation: None,
+                balance_exhaustion: None,
             },
             // 409, not 422: the request is well-formed and the operator is
             // not at fault for asking. The account is simply in a state no
@@ -284,6 +304,7 @@ impl From<SetStatusError> for ApiError {
                 code: "account-closed",
                 title: e.to_string(),
                 generation: None,
+                balance_exhaustion: None,
             },
             SetStatusError::Storage(inner) => ApiError::from(inner),
         }
@@ -298,12 +319,14 @@ impl From<PublishSnapshotError> for ApiError {
                 code: "invalid-credential-binding",
                 title: e.to_string(),
                 generation: None,
+                balance_exhaustion: None,
             },
             PublishSnapshotError::StatusMismatch { .. } => ApiError {
                 status: StatusCode::CONFLICT,
                 code: "snapshot-status-mismatch",
                 title: e.to_string(),
                 generation: None,
+                balance_exhaustion: None,
             },
             // 409 for the reason the status mismatch is: the request is
             // well-formed and the operator is not at fault — the account
@@ -314,6 +337,7 @@ impl From<PublishSnapshotError> for ApiError {
                 code: "snapshot-capacity-class-mismatch",
                 title: e.to_string(),
                 generation: None,
+                balance_exhaustion: None,
             },
             PublishSnapshotError::Storage(inner) => ApiError::from(inner),
         }
@@ -329,6 +353,7 @@ impl From<StoreError> for ApiError {
             // private row values. Never format it into a public diagnostic.
             title: "backend unavailable".into(),
             generation: None,
+            balance_exhaustion: None,
         }
     }
 }
@@ -350,6 +375,7 @@ impl From<IngestError> for ApiError {
                 code: "usage-refused",
                 title: "usage batch refused".into(),
                 generation: None,
+                balance_exhaustion: None,
             },
         }
     }
@@ -362,6 +388,7 @@ impl From<SnapshotValidationError> for ApiError {
             code: "invalid-snapshot-limits",
             title: error.to_string(),
             generation: None,
+            balance_exhaustion: None,
         }
     }
 }
@@ -399,6 +426,7 @@ impl ApiError {
             code: self.code.to_string(),
             title: self.title,
             generation: self.generation,
+            balance_exhaustion: self.balance_exhaustion,
         };
         // Keep the public Problem Rust shape intact. This optional JSON
         // extension is ignored by existing clients and carries no authority.

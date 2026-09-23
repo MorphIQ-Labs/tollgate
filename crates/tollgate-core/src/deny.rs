@@ -29,7 +29,8 @@ pub enum Retry {
     /// does not promise admission: the stable retry may then report transient
     /// capacity.
     AfterInFlight,
-    /// Retrying the same request cannot make it admissible.
+    /// Retrying the same request under the current policy and funding cannot
+    /// make it admissible. New funding or a new budget period can change that.
     Never,
 }
 
@@ -145,6 +146,9 @@ pub enum DenyReason {
     /// that has nothing to do with it. Transient, and honestly so — capacity
     /// is returned by every request that finishes.
     CapacityUnavailable,
+    /// The allocator confirmed that account funding is exhausted. Retry
+    /// requires new funding or a new budget period; this is not a lease gap.
+    BalanceExhausted,
 }
 
 impl DenyReason {
@@ -179,10 +183,11 @@ impl DenyReason {
         "empty_workload",
         "funding_expired_at_start",
         "capacity_unavailable",
+        "balance_exhausted",
     ];
 
     /// How many distinct reasons exist — the width of any per-reason array.
-    pub const COUNT: usize = 22;
+    pub const COUNT: usize = 23;
 
     /// This reason's dense slot, for direct-indexed per-reason tallies.
     ///
@@ -216,6 +221,7 @@ impl DenyReason {
             DenyReason::EmptyWorkload => 19,
             DenyReason::FundingExpiredAtStart => 20,
             DenyReason::CapacityUnavailable => 21,
+            DenyReason::BalanceExhausted => 22,
         }
     }
 
@@ -250,7 +256,8 @@ impl DenyReason {
             | DenyReason::UnpricedOperation
             | DenyReason::UnpriceableUnderLimits { .. }
             | DenyReason::CostOverflow
-            | DenyReason::EmptyWorkload => Retry::Never,
+            | DenyReason::EmptyWorkload
+            | DenyReason::BalanceExhausted => Retry::Never,
         }
     }
 }
@@ -258,6 +265,7 @@ impl DenyReason {
 impl fmt::Display for DenyReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            DenyReason::BalanceExhausted => f.write_str("account balance exhausted"),
             DenyReason::UnknownPrincipal => f.write_str("unknown principal"),
             DenyReason::AccountSuspended => f.write_str("account suspended"),
             DenyReason::AccountClosed => f.write_str("account closed"),
@@ -355,6 +363,7 @@ mod tests {
         DenyReason::EmptyWorkload,
         DenyReason::FundingExpiredAtStart,
         DenyReason::CapacityUnavailable,
+        DenyReason::BalanceExhausted,
     ];
 
     /// The indices must be a permutation of `0..COUNT`. Two reasons sharing a
@@ -471,6 +480,7 @@ mod tests {
                 "funding_expired_at_start",
             ),
             (DenyReason::CapacityUnavailable, 21, "capacity_unavailable"),
+            (DenyReason::BalanceExhausted, 22, "balance_exhausted"),
         ];
 
         for (reason, slot, label) in shipped {
@@ -488,7 +498,7 @@ mod tests {
 
         assert_eq!(
             DenyReason::COUNT,
-            22,
+            23,
             "COUNT may only grow, and only by appending"
         );
     }
@@ -574,7 +584,7 @@ mod tests {
             let expected = match reason {
                 DenyReason::OverageCommitInProgress { .. } => Retry::AfterInFlight,
                 DenyReason::FundingExpiredAtStart => Retry::Transient,
-                DenyReason::EmptyWorkload => Retry::Never,
+                DenyReason::EmptyWorkload | DenyReason::BalanceExhausted => Retry::Never,
                 DenyReason::RateLimited
                 | DenyReason::RequestRateLimited
                 | DenyReason::ConcurrencyLimited

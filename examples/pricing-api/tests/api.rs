@@ -418,6 +418,10 @@ async fn an_elastic_account_serves_past_its_deposit_and_bills_the_overage() {
                 assert_eq!(body["code"], "overage-cap-exhausted");
                 capacity_unavailable += 1;
             }
+            StatusCode::PAYMENT_REQUIRED => {
+                assert_eq!(body["code"], "balance-exhausted");
+                capacity_unavailable += 1;
+            }
             other => panic!("unexpected status {other}: {body}"),
         }
     }
@@ -464,7 +468,11 @@ fn assert_elastic_totals(after: &Value, admitted: u64, on_credit: u64, denied: u
     assert_eq!(after["units_committed_at_overage"], 0);
     assert_eq!(after["execution_started"], admitted);
     assert_eq!(after["denied"], denied);
-    assert_eq!(after["denials"]["overage_cap_exhausted"], denied);
+    assert_eq!(
+        after["denials"]["overage_cap_exhausted"].as_u64().unwrap()
+            + after["denials"]["balance_exhausted"].as_u64().unwrap(),
+        denied
+    );
 }
 
 fn assert_elastic_bill(
@@ -498,6 +506,20 @@ async fn elastic_readiness_serves_before_the_first_grant_and_recovers_after_fund
     )
     .await;
     wait_ready(&router).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if metrics(&router).await["refill"]["refusals"]["balance_exhausted"]
+                .as_u64()
+                .unwrap()
+                > 0
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the zero balance must be confirmed before testing its HTTP classification");
     let before = metrics(&router).await;
     assert_eq!(before.get("total_lease_remaining"), Some(&Value::Null));
     assert_eq!(before["total_overage_cap"], CAP);
@@ -511,8 +533,8 @@ async fn elastic_readiness_serves_before_the_first_grant_and_recovers_after_fund
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(body["metadata"]["units_charged"], 51);
         } else {
-            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-            assert_eq!(body["code"], "overage-cap-exhausted");
+            assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
+            assert_eq!(body["code"], "balance-exhausted");
             assert_eq!(body["units_charged"], 0);
         }
     }

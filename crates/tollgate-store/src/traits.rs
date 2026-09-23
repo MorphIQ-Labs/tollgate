@@ -35,6 +35,8 @@ pub enum AllocateError {
     /// should keep polling, because usage settlement or a top-up can restore
     /// balance.
     InsufficientBalance,
+    /// The ledger confirms no funding remains, including outstanding leases.
+    BalanceExhausted(tollgate_core::BalanceExhaustion),
     /// A lease must specify one unambiguous, strictly positive lifetime.
     InvalidTtl,
     UnknownLease,
@@ -68,10 +70,11 @@ impl AllocateError {
         "lease_not_active",
         "invalid_release",
         "storage",
+        "balance_exhausted",
     ];
 
     /// How many distinct refusals exist — the width of a per-reason tally.
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 10;
 
     /// This refusal's dense slot, for direct-indexed per-reason counters.
     ///
@@ -91,6 +94,7 @@ impl AllocateError {
             AllocateError::LeaseNotActive => 6,
             AllocateError::InvalidRelease => 7,
             AllocateError::Storage(_) => 8,
+            AllocateError::BalanceExhausted(_) => 9,
         }
     }
 
@@ -107,6 +111,7 @@ impl std::fmt::Display for AllocateError {
             AllocateError::UnknownAccount => f.write_str("unknown account"),
             AllocateError::AccountInactive => f.write_str("account inactive"),
             AllocateError::InsufficientBalance => f.write_str("insufficient balance"),
+            AllocateError::BalanceExhausted(_) => f.write_str("account balance exhausted"),
             AllocateError::InvalidTtl => {
                 f.write_str("lease TTL must specify one positive duration")
             }
@@ -448,9 +453,10 @@ pub trait LeaseAllocator: Send + Sync {
     /// the whole exchange.
     ///
     /// The transaction applies both halves or neither. A domain refusal
-    /// (`InsufficientBalance`, `UnknownAccount`, `AccountInactive`, or
-    /// `InvalidTtl`) leaves the original lease unchanged. `InvalidRelease`
-    /// also leaves it unchanged but reports an accounting-integrity fault.
+    /// (`InsufficientBalance`, `BalanceExhausted`, `UnknownAccount`,
+    /// `AccountInactive`, or `InvalidTtl`) leaves the original lease unchanged.
+    /// `InvalidRelease` also leaves it unchanged but reports an
+    /// accounting-integrity fault.
     /// `UnknownLease`, `Fenced`, and `LeaseNotActive` provide no authority to
     /// resume spending from the old lease.
     ///
@@ -1603,6 +1609,7 @@ mod tests {
             AllocateError::LeaseNotActive,
             AllocateError::InvalidRelease,
             AllocateError::Storage(StoreError("connection reset".into())),
+            AllocateError::BalanceExhausted(tollgate_core::BalanceExhaustion { period_end: None }),
         ]
     }
 

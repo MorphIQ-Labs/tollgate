@@ -2,7 +2,7 @@
 
 use std::hash::Hash;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU32, Ordering};
 
 use arc_swap::{ArcSwap, ArcSwapOption, Guard};
 use governor::clock::DefaultClock;
@@ -73,6 +73,54 @@ pub struct LeaseSlot {
     current: LeaseSlotCurrent,
     sharding: LocalSharding,
     overage: Arc<AccountOverage>,
+    funding: std::sync::Mutex<FundingObservation>,
+    exhausted_until: AtomicI64,
+}
+
+/// Control-plane publication state. The identity token prevents an older
+/// allocator response from undoing a later grant or funding snapshot.
+#[derive(Debug, Default)]
+struct FundingObservation {
+    epoch: Arc<()>,
+    last_grant: u64,
+    snapshot: Option<(
+        Option<tollgate_core::BudgetView>,
+        tollgate_core::EnforcementMode,
+    )>,
+}
+
+/// An allocator attempt tied to this account's current funding observation.
+/// Dropping an unanswered attempt publishes nothing; only a verified domain
+/// response may publish exhaustion. All synchronization here is control plane.
+#[derive(Debug)]
+pub struct FundingAttempt<'a> {
+    slot: &'a LeaseSlot,
+    epoch: Arc<()>,
+}
+
+impl FundingAttempt<'_> {
+    /// Record authoritative evidence unless a newer funding observation won.
+    pub fn exhausted(self, evidence: tollgate_core::BalanceExhaustion) {
+        let current = self
+            .slot
+            .funding
+            .lock()
+            .expect("funding publication poisoned");
+        if Arc::ptr_eq(&current.epoch, &self.epoch) {
+            // Floor to seconds: a subsecond boundary can only invalidate the
+            // evidence early, never extend its lifetime. Admission needs one
+            // word, and makes no calendar or clock call to read it.
+            let until = evidence.period_end.map_or(i64::MAX, funding_second);
+            self.slot.exhausted_until.store(until, Ordering::Release);
+        }
+    }
+}
+
+// Jiff truncates negative fractional timestamps toward zero. Floor both
+// sides of the deadline comparison instead. Timestamp's civil range is far
+// inside i64 seconds, so subtracting one cannot overflow.
+fn funding_second(at: Timestamp) -> i64 {
+    at.as_second() - i64::from(at.subsec_nanosecond() < 0)
 }
 
 #[derive(Debug)]
@@ -131,7 +179,43 @@ impl LeaseSlot {
             current,
             sharding,
             overage: Arc::new(AccountOverage::new(account)),
+            funding: std::sync::Mutex::new(FundingObservation::default()),
+            exhausted_until: AtomicI64::new(i64::MIN),
         })
+    }
+
+    /// Capture before starting an allocator call; no request-path caller
+    /// needs this control-plane operation.
+    pub fn funding_attempt(&self) -> FundingAttempt<'_> {
+        let current = self.funding.lock().expect("funding publication poisoned");
+        FundingAttempt {
+            slot: self,
+            epoch: Arc::clone(&current.epoch),
+        }
+    }
+
+    fn invalidate_funding(&self, current: &mut FundingObservation) {
+        current.epoch = Arc::new(());
+        self.exhausted_until.store(i64::MIN, Ordering::Release);
+    }
+
+    fn observe_funding(&self, snapshot: &AccountSnapshot) {
+        let mut current = self.funding.lock().expect("funding publication poisoned");
+        // The map has already accepted this publication for its principal.
+        // Generations from different principals cannot be ordered here: this
+        // slot is shared by the account, whose funding changes invalidate all
+        // outstanding attempts regardless of the publishing principal.
+        let next = (snapshot.budget, snapshot.enforcement_mode);
+        if current.snapshot != Some(next) {
+            self.invalidate_funding(&mut current);
+        }
+        current.snapshot = Some(next);
+    }
+
+    /// One atomic read, used only after local funding has refused a request.
+    #[must_use]
+    pub fn balance_exhausted(&self, now: Timestamp) -> bool {
+        funding_second(now) < self.exhausted_until.load(Ordering::Acquire)
     }
 
     #[must_use]
@@ -166,6 +250,14 @@ impl LeaseSlot {
     /// ```
     #[must_use = "retain the superseded lease for quiesced release, or explicitly abandon it"]
     pub fn replace(&self, lease: Arc<LocalLease>) -> Option<Arc<LocalLease>> {
+        let mut funding = self.funding.lock().expect("funding publication poisoned");
+        let fence = lease.grant().fencing_token.0;
+        if fence > funding.last_grant {
+            funding.last_grant = fence;
+            self.invalidate_funding(&mut funding);
+        }
+        // Restoring the same lease after a refused consolidation is not a
+        // funding change. Serialize the clear and publication with evidence.
         self.publish(Some(lease))
     }
 
@@ -866,6 +958,7 @@ impl AccountAdmissionState {
         limiter: Arc<AccountLimiter>,
         principal_gauge: Arc<PrincipalGauge>,
     ) -> Arc<Self> {
+        lease.observe_funding(&snapshot);
         Arc::new(AccountAdmissionState {
             units_admitted_at_publish: counters.units_admitted(),
             snapshot,
@@ -2731,5 +2824,44 @@ mod tests {
             5 * word,
             "the execution-lifetime guard grew: justify what it now carries"
         );
+    }
+}
+
+#[cfg(test)]
+mod funding_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn exhaustion_deadlines_are_conservative_at_subsecond_and_domain_boundaries() {
+        for shards in [1, 8] {
+            let slot = LeaseSlot::with_sharding(
+                AccountId(1),
+                LocalSharding::new(std::num::NonZeroUsize::new(shards).unwrap()),
+            );
+            assert!(!slot.balance_exhausted(Timestamp::MIN));
+            slot.funding_attempt()
+                .exhausted(tollgate_core::BalanceExhaustion { period_end: None });
+            assert!(slot.balance_exhausted(Timestamp::MIN));
+            assert!(slot.balance_exhausted(Timestamp::MAX));
+            for nanos in [-1_500_000_000i128, 1_500_000_000] {
+                let end = Timestamp::from_nanosecond(nanos).unwrap();
+                slot.funding_attempt()
+                    .exhausted(tollgate_core::BalanceExhaustion {
+                        period_end: Some(end),
+                    });
+                let floor =
+                    Timestamp::from_second(i64::try_from(nanos.div_euclid(1_000_000_000)).unwrap())
+                        .unwrap();
+                assert!(
+                    slot.balance_exhausted(
+                        floor
+                            .checked_sub(jiff::SignedDuration::from_nanos(1))
+                            .unwrap()
+                    )
+                );
+                assert!(!slot.balance_exhausted(floor));
+                assert!(!slot.balance_exhausted(end));
+            }
+        }
     }
 }

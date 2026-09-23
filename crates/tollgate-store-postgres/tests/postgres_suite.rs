@@ -6761,3 +6761,210 @@ async fn credential_auditing_refuses_a_corrupt_owner_without_retiring_it() {
         "invalid audit evidence must not commit a retirement"
     );
 }
+
+/// An empty allocatable balance is not evidence that the account spent its
+/// funding: another instance may hold it, and settlement can restore it.
+#[tokio::test]
+async fn an_insufficient_balance_recovers_when_another_instance_returns_its_lease() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    let held = store
+        .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
+        .await
+        .unwrap();
+    assert_eq!(held.units, CostUnits(100));
+    assert_eq!(
+        store
+            .acquire(ACCOUNT, CostUnits(100), TTL, t(1))
+            .await
+            .unwrap_err(),
+        AllocateError::InsufficientBalance,
+    );
+    store
+        .release(held.lease_id, held.fencing_token, held.units, t(2))
+        .await
+        .unwrap();
+    let recovered = store
+        .acquire(ACCOUNT, CostUnits(100), TTL, t(3))
+        .await
+        .unwrap();
+    assert_eq!(recovered.units, held.units);
+    assert_conserved(&store).await;
+}
+
+/// Reclaim can restore the same funding without a top-up or a period change.
+#[tokio::test]
+async fn an_insufficient_balance_recovers_when_another_instances_lease_is_reclaimed() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    let held = store
+        .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .acquire(ACCOUNT, CostUnits(100), TTL, t(1))
+            .await
+            .unwrap_err(),
+        AllocateError::InsufficientBalance,
+    );
+    let reclaimed = store
+        .reclaim_expired_batch(t(61), NonZeroUsize::new(1).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(reclaimed.reclaimed().len(), 1);
+    assert_eq!(reclaimed.reclaimed()[0].reclaimed, held.units);
+    let recovered = store
+        .acquire(ACCOUNT, CostUnits(100), TTL, t(62))
+        .await
+        .unwrap();
+    assert_eq!(recovered.units, held.units);
+    assert_conserved(&store).await;
+}
+
+/// Until usage arrives, the allocator must treat a lease as potentially
+/// refundable. Afterwards the same empty balance can carry exact evidence.
+#[tokio::test]
+async fn exhaustion_requires_recorded_consumption_and_survives_lease_expiry() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    let held = store
+        .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .acquire(ACCOUNT, CostUnits(1), TTL, t(1))
+            .await
+            .unwrap_err(),
+        AllocateError::InsufficientBalance
+    );
+    store
+        .ingest(&[usage(&held, 1, 100, 1)], t(1))
+        .await
+        .unwrap();
+    let exhausted =
+        AllocateError::BalanceExhausted(tollgate_core::BalanceExhaustion { period_end: None });
+    assert_eq!(
+        store
+            .acquire(ACCOUNT, CostUnits(1), TTL, t(2))
+            .await
+            .unwrap_err(),
+        exhausted
+    );
+    assert_eq!(
+        store
+            .consolidate(
+                held.lease_id,
+                held.fencing_token,
+                CostUnits::ZERO,
+                CostUnits(1),
+                TTL,
+                t(2)
+            )
+            .await
+            .unwrap_err(),
+        exhausted
+    );
+    store
+        .reclaim_expired_batch(t(61), NonZeroUsize::new(1).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .acquire(ACCOUNT, CostUnits(1), TTL, t(62))
+            .await
+            .unwrap_err(),
+        exhausted
+    );
+    AdminStore::deposit(&*store, ACCOUNT, CostUnits(10))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .acquire(ACCOUNT, CostUnits(10), TTL, t(63))
+            .await
+            .unwrap()
+            .units,
+        CostUnits(10)
+    );
+    assert_conserved(&store).await;
+}
+
+#[tokio::test]
+async fn zero_requested_units_never_produce_exhaustion_evidence() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+        return;
+    };
+    assert_eq!(
+        store
+            .acquire(ACCOUNT, CostUnits::ZERO, TTL, t(0))
+            .await
+            .unwrap_err(),
+        AllocateError::InsufficientBalance
+    );
+    assert_eq!(
+        store
+            .acquire(ACCOUNT, CostUnits(1), TTL, t(0))
+            .await
+            .unwrap_err(),
+        AllocateError::BalanceExhausted(tollgate_core::BalanceExhaustion { period_end: None })
+    );
+    assert_conserved(&store).await;
+}
+
+#[tokio::test]
+async fn exhaustion_evidence_names_the_stored_period_and_rollover_restores_funding() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+        return;
+    };
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(100)))
+        .await
+        .unwrap();
+    roll(&store, FEB).await.unwrap();
+    let held = store
+        .acquire(ACCOUNT, CostUnits(100), TTL, t(FEB))
+        .await
+        .unwrap();
+    store
+        .ingest(&[usage(&held, 1, 100, FEB)], t(FEB))
+        .await
+        .unwrap();
+    let exhausted = AllocateError::BalanceExhausted(tollgate_core::BalanceExhaustion {
+        period_end: Some(t(MAR)),
+    });
+    assert_eq!(
+        store
+            .acquire(ACCOUNT, CostUnits(1), TTL, t(FEB + 1))
+            .await
+            .unwrap_err(),
+        exhausted
+    );
+    // Caller time alone does not advance the ledger. A late response must
+    // still carry the old boundary, which admission will regard as expired.
+    assert_eq!(
+        store
+            .acquire(ACCOUNT, CostUnits(1), TTL, t(MAR))
+            .await
+            .unwrap_err(),
+        exhausted
+    );
+    roll(&store, MAR).await.unwrap();
+    assert_eq!(
+        store
+            .acquire(ACCOUNT, CostUnits(100), TTL, t(MAR))
+            .await
+            .unwrap()
+            .units,
+        CostUnits(100)
+    );
+    assert_conserved(&store).await;
+}

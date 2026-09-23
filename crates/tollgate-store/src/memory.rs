@@ -805,7 +805,14 @@ fn plan_grant(
     // account demonstrably has.
     let granted = policy
         .grant(requested, balance)
-        .ok_or(AllocateError::InsufficientBalance)?
+        .ok_or_else(|| {
+            if !requested.is_zero()
+                && let Some(evidence) = record.budget_view().exhaustion()
+            {
+                return AllocateError::BalanceExhausted(evidence);
+            }
+            AllocateError::InsufficientBalance
+        })?
         .max(incoming.min(balance));
     let next_fence = record
         .next_fence

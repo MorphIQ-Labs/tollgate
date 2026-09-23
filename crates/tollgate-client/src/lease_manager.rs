@@ -724,6 +724,7 @@ async fn run(
                 Consolidation::AcquireInstead => {}
             }
         }
+        let funding_attempt = slot.funding_attempt();
         counters.acquire_pending.store(true, Ordering::Release);
         let acquire = tokio::time::timeout(
             config.store_call_timeout,
@@ -763,6 +764,9 @@ async fn run(
                 // apart from the refusals rather than folded into one of them.
                 let reason: &dyn std::fmt::Display = match &outcome {
                     Ok(Err(error)) => {
+                        if let AllocateError::BalanceExhausted(evidence) = error {
+                            funding_attempt.exhausted(*evidence);
+                        }
                         counters.record_acquire_refused(error);
                         error
                     }
@@ -902,6 +906,7 @@ fn release_failure(error: &AllocateError) -> ReleaseFailure {
         | AllocateError::UnknownAccount
         | AllocateError::AccountInactive
         | AllocateError::InsufficientBalance
+        | AllocateError::BalanceExhausted(_)
         | AllocateError::InvalidTtl => ReleaseFailure::Integrity,
     }
 }
@@ -992,6 +997,7 @@ fn consolidation_failure(error: &AllocateError) -> ConsolidationFailure {
         // integrity fault the same code means for a *release*, which never
         // draws a grant (#109).
         AllocateError::InsufficientBalance
+        | AllocateError::BalanceExhausted(_)
         | AllocateError::UnknownAccount
         | AllocateError::AccountInactive
         | AllocateError::InvalidTtl => ConsolidationFailure::RolledBack,
@@ -1038,6 +1044,7 @@ async fn consolidate_live_lease(
     // refund, which is the condition `LocalLease::remaining` documents.
     let unspent = live.remaining();
     let grant = *live.grant();
+    let funding_attempt = slot.funding_attempt();
     counters.acquire_pending.store(true, Ordering::Release);
     let call = tokio::time::timeout(
         config.store_call_timeout,
@@ -1095,6 +1102,9 @@ async fn consolidate_live_lease(
             return Consolidation::KeptServing;
         }
     };
+    if let AllocateError::BalanceExhausted(evidence) = &error {
+        funding_attempt.exhausted(*evidence);
+    }
     counters.record_acquire_refused(&error);
     match consolidation_failure(&error) {
         ConsolidationFailure::RolledBack => {
@@ -1714,6 +1724,7 @@ mod tests {
     async fn a_rolled_back_consolidation_returns_the_lease_to_the_slot() {
         for error in [
             AllocateError::InsufficientBalance,
+            AllocateError::BalanceExhausted(tollgate_core::BalanceExhaustion { period_end: None }),
             AllocateError::AccountInactive,
             AllocateError::UnknownAccount,
         ] {
@@ -1733,6 +1744,10 @@ mod tests {
                 "still serving the untouched lease: {error}"
             );
             assert!(parked.is_empty(), "{error}");
+            assert_eq!(
+                harness.slot.balance_exhausted(Timestamp::UNIX_EPOCH),
+                matches!(error, AllocateError::BalanceExhausted(_))
+            );
             assert!(harness.is_healthy(), "an ordinary refusal is not a fault");
         }
     }

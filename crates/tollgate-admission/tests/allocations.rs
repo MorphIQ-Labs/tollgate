@@ -703,3 +703,32 @@ fn admit_consults_the_map_exactly_once() {
         );
     });
 }
+
+#[test]
+fn confirmed_balance_exhaustion_allocates_nothing() {
+    let engine = engine(
+        LocalSharding::SINGLE,
+        Principal(1),
+        EnforcementMode::Strict,
+        CostUnits::ZERO,
+    );
+    let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
+        panic!()
+    };
+    state
+        .lease
+        .funding_attempt()
+        .exhausted(tollgate_core::BalanceExhaustion { period_end: None });
+    let refuse = || {
+        assert_eq!(
+            engine
+                .begin(Principal(1), PermissionBits::bit(0), now())
+                .unwrap()
+                .admit(&[(PriceOp, 1)], AllocationSlot, now())
+                .unwrap_err(),
+            tollgate_core::DenyReason::BalanceExhausted
+        );
+    };
+    refuse();
+    assert_zero("admission/balance_exhausted", refuse);
+}

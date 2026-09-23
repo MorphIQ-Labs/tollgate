@@ -848,6 +848,20 @@ fn admit_priced(
         Err(denied) => match reserve_from_overage(concurrency.state(), quote.total, denied) {
             Ok(reservation) => reservation,
             Err(reason) => {
+                // Refundable pending occupancy and a commit in progress can
+                // recover locally even when the central balance is spent.
+                let reason = if matches!(
+                    reason,
+                    DenyReason::LeaseUnavailable
+                        | DenyReason::LeaseExpired
+                        | DenyReason::LeaseExhausted { .. }
+                        | DenyReason::OverageCapExhausted { .. }
+                ) && concurrency.state().lease.balance_exhausted(now)
+                {
+                    DenyReason::BalanceExhausted
+                } else {
+                    reason
+                };
                 concurrency
                     .state()
                     .counters
@@ -1116,6 +1130,287 @@ mod tests {
             .install(Principal(1), Arc::new(snapshot), slot)
             .unwrap();
         engine
+    }
+
+    #[test]
+    fn authoritative_exhaustion_classifies_only_failed_local_funding() {
+        for units in [None, Some(0), Some(100)] {
+            let engine = engine_with(AccountStatus::Active, units);
+            let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
+                panic!()
+            };
+            state
+                .lease
+                .funding_attempt()
+                .exhausted(tollgate_core::BalanceExhaustion {
+                    period_end: Some(t(100)),
+                });
+            let outcome = engine.admit_one(request(1), t(0));
+            if units == Some(100) {
+                assert!(outcome.is_ok(), "usable local credit takes precedence");
+            } else {
+                assert_eq!(outcome.unwrap_err(), DenyReason::BalanceExhausted);
+                assert_eq!(
+                    state.counters.snapshot().denials[DenyReason::BalanceExhausted.index()],
+                    1
+                );
+                assert_eq!(
+                    engine.admit_one(request(1), t(100)).unwrap_err().retry(),
+                    Retry::Transient
+                );
+            }
+        }
+        let engine = engine_with(AccountStatus::Active, None);
+        assert_eq!(
+            engine.admit_one(request(1), t(0)).unwrap_err(),
+            DenyReason::LeaseUnavailable
+        );
+    }
+
+    #[test]
+    fn exhausted_evidence_survives_local_expiry_but_not_its_period_end() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        drop(slot.replace(lease_until(0, t(5))));
+        engine
+            .map()
+            .install(Principal(1), snapshot(AccountStatus::Active), slot.clone())
+            .unwrap();
+        slot.funding_attempt()
+            .exhausted(tollgate_core::BalanceExhaustion {
+                period_end: Some(t(100)),
+            });
+        for now in [t(0), t(5), t(99)] {
+            assert_eq!(
+                engine.admit_one(request(1), now).unwrap_err(),
+                DenyReason::BalanceExhausted
+            );
+        }
+        drop(slot.take());
+        assert_eq!(
+            engine.admit_one(request(1), t(99)).unwrap_err(),
+            DenyReason::BalanceExhausted
+        );
+        assert_eq!(
+            engine.admit_one(request(1), t(100)).unwrap_err(),
+            DenyReason::LeaseUnavailable
+        );
+    }
+
+    #[test]
+    fn exhaustion_is_shared_by_account_and_isolated_from_other_accounts() {
+        for shards in [1, 8] {
+            let sharding = LocalSharding::new(std::num::NonZeroUsize::new(shards).unwrap());
+            let engine = AdmissionEngine::new(ArcSwapSnapshotMap::with_sharding(sharding));
+            let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
+            engine
+                .map()
+                .install(Principal(1), snapshot(AccountStatus::Active), slot.clone())
+                .unwrap();
+            slot.funding_attempt()
+                .exhausted(tollgate_core::BalanceExhaustion { period_end: None });
+            engine
+                .map()
+                .install(Principal(2), snapshot(AccountStatus::Active), slot)
+                .unwrap();
+            let mut unrelated = (*snapshot(AccountStatus::Active)).clone();
+            unrelated.account_id = AccountId(2);
+            engine
+                .map()
+                .install(
+                    Principal(3),
+                    Arc::new(unrelated),
+                    LeaseSlot::with_sharding(AccountId(2), sharding),
+                )
+                .unwrap();
+            for principal in [Principal(1), Principal(2)] {
+                assert_eq!(
+                    engine
+                        .admit_one(
+                            TestRequest {
+                                principal,
+                                ..request(1)
+                            },
+                            t(0)
+                        )
+                        .unwrap_err(),
+                    DenyReason::BalanceExhausted
+                );
+            }
+            assert_eq!(
+                engine
+                    .admit_one(
+                        TestRequest {
+                            principal: Principal(3),
+                            ..request(1)
+                        },
+                        t(0)
+                    )
+                    .unwrap_err(),
+                DenyReason::LeaseUnavailable
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_funding_changes_from_independently_versioned_principals_clear_exhaustion() {
+        for shards in [1, 8] {
+            let sharding = LocalSharding::new(std::num::NonZeroUsize::new(shards).unwrap());
+            for change_mode in [false, true] {
+                let maps: [Arc<dyn SnapshotMap>; 2] = [
+                    Arc::new(ArcSwapSnapshotMap::with_sharding(sharding)),
+                    Arc::new(MokaSnapshotMap::with_sharding(8, sharding)),
+                ];
+                for map in maps {
+                    let engine = AdmissionEngine::new(map);
+                    let slot = LeaseSlot::with_sharding(AccountId(1), sharding);
+                    let mut next = (*snapshot(AccountStatus::Active)).clone();
+                    for (principal, generation) in [(Principal(1), 7), (Principal(2), 2)] {
+                        next.generation = Generation(generation);
+                        engine
+                            .map()
+                            .install(principal, Arc::new(next.clone()), slot.clone())
+                            .unwrap();
+                    }
+                    let evidence = tollgate_core::BalanceExhaustion { period_end: None };
+                    slot.funding_attempt().exhausted(evidence);
+                    assert_eq!(
+                        engine.admit_one(request(1), t(0)).unwrap_err(),
+                        DenyReason::BalanceExhausted
+                    );
+                    let late = slot.funding_attempt();
+                    next.generation = Generation(3);
+                    if change_mode {
+                        next.enforcement_mode = EnforcementMode::Elastic {
+                            overage_cap: CostUnits(100),
+                        };
+                    } else {
+                        next.budget = Some(BudgetView {
+                            balance_at_publish: CostUnits(100),
+                            period_end: None,
+                        });
+                    }
+                    engine
+                        .map()
+                        .install(Principal(2), Arc::new(next.clone()), slot.clone())
+                        .unwrap();
+                    assert!(!slot.balance_exhausted(t(0)));
+                    late.exhausted(evidence);
+                    // P1 still uses strict mode, but P2's accepted change clears
+                    // the evidence for the whole account, including late replies.
+                    assert_eq!(
+                        engine.admit_one(request(1), t(0)).unwrap_err(),
+                        DenyReason::LeaseUnavailable
+                    );
+                    slot.funding_attempt().exhausted(evidence);
+                    next.generation = Generation(4);
+                    engine
+                        .map()
+                        .install(Principal(2), Arc::new(next), slot.clone())
+                        .unwrap();
+                    assert!(slot.balance_exhausted(t(0)), "unchanged funding");
+                    for generation in [3, 4] {
+                        let mut replay = (*snapshot(AccountStatus::Active)).clone();
+                        replay.generation = Generation(generation);
+                        engine
+                            .map()
+                            .install(Principal(2), Arc::new(replay), slot.clone())
+                            .unwrap();
+                        assert!(slot.balance_exhausted(t(0)), "rejected replay");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn central_exhaustion_does_not_hide_refundable_elastic_capacity() {
+        let engine = elastic_engine(51, None);
+        let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
+            panic!()
+        };
+        state
+            .lease
+            .funding_attempt()
+            .exhausted(tollgate_core::BalanceExhaustion { period_end: None });
+        let pending = engine.admit_one(request(1), t(0)).unwrap();
+        assert!(matches!(
+            engine.admit_one(request(1), t(0)).unwrap_err(),
+            DenyReason::OverageCapTemporarilyExhausted { .. }
+        ));
+        drop(pending);
+        let ready = engine
+            .admit_one(request(1), t(0))
+            .unwrap()
+            .acquire_capacity(&NoGate)
+            .unwrap();
+        drop(ready.commit(RequestId(1), t(0)).unwrap());
+        assert_eq!(
+            engine.admit_one(request(1), t(0)).unwrap_err(),
+            DenyReason::BalanceExhausted
+        );
+    }
+
+    #[test]
+    fn funding_publication_invalidates_late_exhaustion_responses() {
+        let engine = engine_with(AccountStatus::Active, Some(0));
+        let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
+            panic!()
+        };
+        let slot = &state.lease;
+        let evidence = tollgate_core::BalanceExhaustion { period_end: None };
+        slot.funding_attempt().exhausted(evidence);
+        let late = slot.funding_attempt();
+        // Restoring the same capability does not manufacture new funding.
+        let old = slot.take().unwrap();
+        drop(slot.replace(old));
+        assert!(slot.balance_exhausted(t(0)));
+        let mut grant = *lease(100).grant();
+        grant.fencing_token = FencingToken(2);
+        drop(slot.replace(Arc::new(LocalLease::new(grant, CostUnits::ZERO))));
+        late.exhausted(evidence);
+        assert!(
+            !slot.balance_exhausted(t(0)),
+            "late refusal cannot undo a grant"
+        );
+        slot.funding_attempt().exhausted(evidence);
+        let late = slot.funding_attempt();
+        let mut next = (*snapshot(AccountStatus::Active)).clone();
+        next.generation = Generation(2);
+        next.budget = Some(BudgetView {
+            balance_at_publish: CostUnits(100),
+            period_end: Some(t(100)),
+        });
+        engine
+            .map()
+            .install(Principal(1), Arc::new(next.clone()), slot.clone())
+            .unwrap();
+        late.exhausted(evidence);
+        assert!(
+            !slot.balance_exhausted(t(0)),
+            "late refusal cannot undo new funding policy"
+        );
+        slot.funding_attempt().exhausted(evidence);
+        // An unrelated generation refresh must not erase known exhaustion.
+        next.generation = Generation(3);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(next), slot.clone())
+            .unwrap();
+        assert!(slot.balance_exhausted(t(0)));
+        let mut stale = (*snapshot(AccountStatus::Active)).clone();
+        stale.generation = Generation(2);
+        stale.enforcement_mode = EnforcementMode::Elastic {
+            overage_cap: CostUnits(100),
+        };
+        engine
+            .map()
+            .install(Principal(1), Arc::new(stale), slot.clone())
+            .unwrap();
+        assert!(
+            slot.balance_exhausted(t(0)),
+            "a rejected publication cannot invalidate evidence"
+        );
     }
 
     /// The three lease conditions elastic mode intercepts, each of which says

@@ -1213,3 +1213,54 @@ async fn a_rate_limited_or_timed_out_ingest_stays_retryable() {
         server.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn authoritative_exhaustion_round_trips_over_http() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    store.create_account(AccountConfig {
+        account_id: ACCOUNT,
+        initial_balance: CostUnits::ZERO,
+        status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
+    });
+    let clock = Arc::new(tollgate_client::ManualClock::new(at(0)));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerState {
+            security: common::security(),
+            issuer: None,
+            store: store.clone(),
+            clock,
+        },
+        std::time::Duration::from_secs(60),
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
+    let http = common::http(format!("http://{address}"));
+    for scheduled in [false, true] {
+        let period_end = if scheduled {
+            tollgate_store::AdminStore::set_budget_schedule(
+                &*store,
+                ACCOUNT,
+                Some(tollgate_core::BudgetSchedule::monthly(CostUnits::ZERO)),
+            )
+            .await
+            .unwrap();
+            Some(tollgate_core::Period::UtcCalendarMonth.end_after(at(0)))
+        } else {
+            None
+        };
+        assert_eq!(
+            http.acquire(ACCOUNT, CostUnits(1), SignedDuration::from_secs(60), at(0))
+                .await
+                .unwrap_err(),
+            AllocateError::BalanceExhausted(tollgate_core::BalanceExhaustion { period_end })
+        );
+    }
+    let _ = stop_tx.send(());
+    server.await.unwrap().unwrap();
+}
