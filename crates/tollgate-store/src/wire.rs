@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CapacityClass, CostUnits, FencingToken, Generation,
-    LeaseGrant, LeaseId, UsageEvent,
+    LeaseId, UsageEvent,
 };
 
 /// Current HTTP wire-contract prefix.
@@ -165,7 +165,10 @@ pub struct AcquireRequest {
     pub ttl: LeaseTtl,
 }
 
-pub type AcquireResponse = LeaseGrant;
+/// A grant with its funding evidence flattened beside it. A client that
+/// predates the evidence reads the grant and ignores `funding`; a server that
+/// predates it omits `funding`, which reads as no attestation.
+pub type AcquireResponse = crate::Allocation;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ReleaseRequest {
@@ -189,7 +192,7 @@ pub struct ConsolidateRequest {
     pub ttl: LeaseTtl,
 }
 
-pub type ConsolidateResponse = LeaseGrant;
+pub type ConsolidateResponse = crate::Allocation;
 
 /// The owned form, which the server needs: axum's `Json<T>` extractor requires
 /// `DeserializeOwned`, so the receiving side cannot borrow from the body.
@@ -293,6 +296,11 @@ pub struct Problem {
     /// Authoritative exhaustion, present only on a confirmed allocator refusal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub balance_exhaustion: Option<tollgate_core::BalanceExhaustion>,
+    /// Authoritative remaining funding on an `insufficient-balance` refusal.
+    /// The code is unchanged, so a client that ignores this extension reads
+    /// the same unattested refusal it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_shortfall: Option<tollgate_core::BalanceShortfall>,
 }
 
 #[cfg(test)]

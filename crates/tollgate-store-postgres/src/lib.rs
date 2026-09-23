@@ -50,12 +50,12 @@ use tollgate_core::{
     Rollover, UsageEvent,
 };
 use tollgate_store::{
-    AccountConfig, AccountView, AdminReceipt, AdminState, AdminStore, AllocateError, BudgetError,
-    Conservation, CreateAccountError, GrantPolicy, IngestError, IngestReport, KeyDirectory,
-    KeyError, KeyRecord, KeySummary, LeaseAllocator, PUSH_CHANNEL_CAPACITY, PublishSnapshotError,
-    ReclaimBatch, ReclaimedLease, Revocation, RolledAccount, RolloverBatch, SetStatusError,
-    SnapshotPush, SnapshotResolution, SnapshotSource, StatusChange, StoreError, StoreHealth,
-    UsageSink, pushes_exceed_capacity, validate_key_page_limit,
+    AccountConfig, AccountView, AdminReceipt, AdminState, AdminStore, AllocateError, Allocation,
+    BudgetError, Conservation, CreateAccountError, GrantPolicy, IngestError, IngestReport,
+    KeyDirectory, KeyError, KeyRecord, KeySummary, LeaseAllocator, PUSH_CHANNEL_CAPACITY,
+    PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation, RolledAccount, RolloverBatch,
+    SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource, StatusChange, StoreError,
+    StoreHealth, UsageSink, pushes_exceed_capacity, validate_key_page_limit,
 };
 
 const STATE_ACTIVE: i16 = 0;
@@ -1268,7 +1268,7 @@ impl PostgresStore {
         expires_at: Timestamp,
         floor: CostUnits,
         settlement_preserves_funding: bool,
-    ) -> Result<LeaseGrant, AllocateError> {
+    ) -> Result<Allocation, AllocateError> {
         let row = sqlx::query(
             "SELECT balance, status, next_fence, allowance_balance, period_start_us
              FROM tollgate_accounts WHERE account_id = $1 FOR UPDATE",
@@ -1300,22 +1300,18 @@ impl PostgresStore {
                 // A refused consolidation rolls its settlement back. Only
                 // attest when that settlement did not remove funding itself.
                 if settlement_preserves_funding && !requested.is_zero() {
-                    let budget = sqlx::query(
-                        "SELECT account_id, deposited, overage_recorded, usage_recorded,
-                                settlement_loss, expired, budget_allowance, budget_period,
-                                budget_rollover, period_start_us
-                         FROM tollgate_accounts WHERE account_id = $1",
-                    )
-                    .bind(id_bytes(account.0))
-                    .fetch_one(&mut **tx)
-                    .await
-                    .map_err(alloc_storage)?;
-                    if let Some(evidence) = budget_view(&budget)
+                    let budget = sqlx::query(BUDGET_VIEW_SQL)
+                        .bind(id_bytes(account.0))
+                        .fetch_one(&mut **tx)
+                        .await
+                        .map_err(alloc_storage)?;
+                    let evidence = budget_view(&budget)
                         .map_err(AllocateError::Storage)?
-                        .exhaustion()
-                    {
-                        return Err(AllocateError::BalanceExhausted(evidence));
-                    }
+                        .shortfall();
+                    return Err(match evidence.exhaustion() {
+                        Some(exhausted) => AllocateError::BalanceExhausted(exhausted),
+                        None => AllocateError::BalanceInsufficient(evidence),
+                    });
                 }
                 return Err(AllocateError::InsufficientBalance);
             }
@@ -1333,19 +1329,19 @@ impl PostgresStore {
 
         let lease_id = LeaseId(uuid::Uuid::new_v4().as_u128());
 
-        sqlx::query(
-            "UPDATE tollgate_accounts
-             SET balance = balance - $2,
-                 allowance_balance = allowance_balance - $3,
-                 next_fence = next_fence + 1
-             WHERE account_id = $1",
-        )
-        .bind(id_bytes(account.0))
-        .bind(granted_i)
-        .bind(from_allowance)
-        .execute(&mut **tx)
-        .await
-        .map_err(alloc_storage)?;
+        // The grant commits with this transaction, and a consolidation's
+        // settlement has already applied inside it, so the row this returns is
+        // the ledger the grant lands in: loss and expiry included.
+        let budget = sqlx::query(GRANT_DEBIT_SQL)
+            .bind(id_bytes(account.0))
+            .bind(granted_i)
+            .bind(from_allowance)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(alloc_storage)?;
+        let funding = budget_view(&budget)
+            .map_err(AllocateError::Storage)?
+            .shortfall();
         sqlx::query(
             "INSERT INTO tollgate_leases
              (lease_id, account_id, fencing_token, granted, used, credited, expires_at_floor_us,
@@ -1364,12 +1360,15 @@ impl PostgresStore {
         .await
         .map_err(alloc_storage)?;
 
-        Ok(LeaseGrant {
-            lease_id,
-            account_id: account,
-            fencing_token: fence_token,
-            units: granted,
-            expires_at,
+        Ok(Allocation {
+            grant: LeaseGrant {
+                lease_id,
+                account_id: account,
+                fencing_token: fence_token,
+                units: granted,
+                expires_at,
+            },
+            funding: Some(funding),
         })
     }
 
@@ -1505,7 +1504,7 @@ impl LeaseAllocator for PostgresStore {
         requested: CostUnits,
         ttl: SignedDuration,
         now: Timestamp,
-    ) -> Result<LeaseGrant, AllocateError> {
+    ) -> Result<Allocation, AllocateError> {
         let expires_at = self.grant_expiry(ttl, now)?;
         let mut tx = self.pool.begin().await.map_err(alloc_storage)?;
         let result = self
@@ -1544,7 +1543,7 @@ impl LeaseAllocator for PostgresStore {
         requested: CostUnits,
         ttl: SignedDuration,
         now: Timestamp,
-    ) -> Result<LeaseGrant, AllocateError> {
+    ) -> Result<Allocation, AllocateError> {
         let expires_at = self.grant_expiry(ttl, now)?;
         let mut tx = self.pool.begin().await.map_err(alloc_storage)?;
         // One transaction for both halves is the whole point. Lease row first
@@ -2393,6 +2392,24 @@ fn decode_schedule(
         rollover,
     }))
 }
+
+/// The ledger row [`budget_view`] decodes, for allocator evidence read inside
+/// the grant's own transaction.
+const BUDGET_VIEW_SQL: &str = "SELECT account_id, deposited, overage_recorded, usage_recorded,
+            settlement_loss, expired, budget_allowance, budget_period,
+            budget_rollover, period_start_us
+     FROM tollgate_accounts WHERE account_id = $1";
+
+/// Debit a grant and return the committed-to-be row [`budget_view`] decodes,
+/// in the same column order as [`BUDGET_VIEW_SQL`].
+const GRANT_DEBIT_SQL: &str = "UPDATE tollgate_accounts
+     SET balance = balance - $2,
+         allowance_balance = allowance_balance - $3,
+         next_fence = next_fence + 1
+     WHERE account_id = $1
+     RETURNING account_id, deposited, overage_recorded, usage_recorded,
+               settlement_loss, expired, budget_allowance, budget_period,
+               budget_rollover, period_start_us";
 
 /// What the account could still spend, for a snapshot's budget view (#97).
 ///

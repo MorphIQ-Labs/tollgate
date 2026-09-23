@@ -307,7 +307,8 @@ async fn expired_slot_fails_closed_then_recovers() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     clock.set(t(120)); // past the manager lease's 60s TTL
     settle().await;
     assert!(slot.load().is_none(), "expired slot must fail closed");
@@ -524,7 +525,8 @@ async fn running_totals_are_readable_and_match_the_final_report() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(100)));
     let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(64)).unwrap();
 
@@ -630,7 +632,8 @@ async fn a_failing_sink_does_not_advance_the_last_ingest_time() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     // Never recovers on its own: the outage lasts until this test ends it.
     let failures_left = Arc::new(AtomicU32::new(u32::MAX));
     let sink = flaky_sink(&store.clone(), &failures_left);
@@ -683,7 +686,8 @@ async fn rejected_events_are_visible_while_running() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(0)));
     let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(64)).unwrap();
 
@@ -719,7 +723,8 @@ async fn writer_flushes_batches_idempotently() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(0)));
     let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(64)).unwrap();
 
@@ -907,7 +912,8 @@ async fn writer_retries_through_outage_without_losing_events() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(0)));
     let failures_left = Arc::new(AtomicU32::new(3));
     let sink = flaky_sink(&store.clone(), &failures_left);
@@ -936,7 +942,8 @@ async fn panic_after_commit_still_bills() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(0)));
     let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8)).unwrap();
 
@@ -977,7 +984,8 @@ async fn a_panicking_kernel_under_catch_unwind_still_bills() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(0)));
     let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8)).unwrap();
 
@@ -1017,7 +1025,8 @@ async fn shutdown_during_outage_terminates_and_reports_loss() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(0)));
     // Sink that never recovers.
     let failures_left = Arc::new(AtomicU32::new(u32::MAX));
@@ -1052,7 +1061,8 @@ async fn shutdown_after_recovery_delivers_everything() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(0)));
     // Fails long enough to outlast several retry backoffs, then recovers in
     // time for the final flush.
@@ -1085,7 +1095,8 @@ async fn straggler_usage_after_reclaim_is_reported_rejected() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     store.reclaim_expired(t(120)).await.unwrap();
 
     let clock = Arc::new(ManualClock::new(t(121)));
@@ -1116,7 +1127,8 @@ async fn reserve_fails_once_shutdown_begins() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(0)));
     let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8)).unwrap();
 
@@ -1150,7 +1162,8 @@ async fn shutdown_waits_for_outstanding_permit() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(0)));
     let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8)).unwrap();
 
@@ -1182,7 +1195,8 @@ async fn shutdown_waits_for_committed_guard() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(0)));
     let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8)).unwrap();
 
@@ -1256,7 +1270,8 @@ async fn final_flush_counts_duplicates_and_rejections() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(0)));
     let mut config = writer_config(16);
     // Nothing flushes before shutdown, so every event meets the sink for the
@@ -1295,7 +1310,8 @@ async fn final_flush_backs_off_only_between_attempts() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(0)));
     let failures_left = Arc::new(AtomicU32::new(u32::MAX));
     let sink = flaky_sink(&store.clone(), &failures_left);
@@ -1367,7 +1383,8 @@ async fn panicked_writer_reports_unaccounted_charges() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(0)));
     let sink = panicking_sink(&store.clone(), 0);
     let mut config = writer_config(16);
@@ -1407,7 +1424,8 @@ async fn panic_after_partial_flush_counts_only_unflushed() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(0)));
     // The first batch is ingested; the second kills the task.
     let sink = panicking_sink(&store.clone(), 1);
@@ -1464,7 +1482,8 @@ async fn hung_ingest_cannot_stall_shutdown() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(0)));
     let mut config = writer_config(16);
     config.flush_interval = std::time::Duration::from_secs(3_600);
@@ -1496,7 +1515,8 @@ async fn hung_ingest_times_out_into_the_retry_path() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(0)));
     let mut config = writer_config(16);
     config.ingest_timeout = std::time::Duration::from_millis(100);
@@ -1540,7 +1560,8 @@ async fn slow_but_healthy_sink_still_delivers_at_shutdown() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(0)));
     let sink = slow_sink(&store.clone(), std::time::Duration::from_millis(50));
     let mut config = writer_config(16);
@@ -1971,7 +1992,8 @@ async fn the_final_flush_backoff_cannot_overrun_the_drain_deadline() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let clock = Arc::new(ManualClock::new(t(0)));
     let failures_left = Arc::new(AtomicU32::new(u32::MAX));
     let sink = flaky_sink(&store.clone(), &failures_left);
@@ -2314,7 +2336,8 @@ async fn consolidation_under_a_shrinking_policy_never_returns_less_than_it_folde
     let grant = store
         .acquire(ACCOUNT, CostUnits(49), SignedDuration::from_secs(60), t(0))
         .await
-        .expect("the first grant is funded");
+        .expect("the first grant is funded")
+        .grant;
     assert_eq!(grant.units, CostUnits(29), "the policy shrinks it by half");
 
     let folded = store
@@ -2327,7 +2350,8 @@ async fn consolidation_under_a_shrinking_policy_never_returns_less_than_it_folde
             t(1),
         )
         .await
-        .expect("consolidation is funded by the units it returns");
+        .expect("consolidation is funded by the units it returns")
+        .grant;
     assert!(
         folded.units >= grant.units,
         "a consolidation may grow the holding or leave it alone, never shrink it: \
@@ -2350,13 +2374,71 @@ async fn refill_publishes_exhaustion_and_a_topup_clears_it() {
     let manager =
         LeaseManager::spawn(store.clone(), slot.clone(), clock, manager_config()).unwrap();
     settle().await;
-    assert!(slot.balance_exhausted(t(0)));
+    assert!(
+        slot.funding_evidence(t(0))
+            .is_some_and(|remaining| remaining.is_zero())
+    );
     tollgate_store::AdminStore::deposit(&*store, ACCOUNT, CostUnits(100))
         .await
         .unwrap();
     settle().await;
-    assert!(!slot.balance_exhausted(t(0)));
+    assert!(
+        !slot
+            .funding_evidence(t(0))
+            .is_some_and(|remaining| remaining.is_zero())
+    );
     assert_eq!(slot.load_observed().unwrap().remaining(), CostUnits(100));
+    manager.shutdown().await;
+}
+
+/// #130 end to end: one unit left and a quote of 252. The refusal-driven
+/// consolidation re-grants the tail, whose evidence says the account cannot
+/// fund the quote; a top-up reaches the slot through the next refusal.
+#[tokio::test(start_paused = true)]
+async fn refill_publishes_shortfall_and_a_topup_clears_it() {
+    let store = store(1);
+    let slot = LeaseSlot::for_account(ACCOUNT);
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let manager = LeaseManager::spawn(
+        store.clone(),
+        slot.clone(),
+        clock,
+        LeaseManagerConfig {
+            // Only a refusal can explain a rotation in this test.
+            poll_interval: std::time::Duration::from_secs(60),
+            ..manager_config()
+        },
+    )
+    .unwrap();
+    settle().await;
+    assert_eq!(slot.load_observed().unwrap().remaining(), CostUnits(1));
+    assert_eq!(slot.funding_evidence(t(0)), Some(CostUnits(1)));
+
+    let refuse_252 = || {
+        let lease = slot.load().expect("a lease is installed");
+        assert!(matches!(
+            lease.try_debit(CostUnits(252), t(0)),
+            Err(DenyReason::LeaseExhausted { .. })
+        ));
+    };
+    refuse_252();
+    settle().await;
+    assert_eq!(
+        slot.funding_evidence(t(0)),
+        Some(CostUnits(1)),
+        "the consolidated tail carries the same attested remainder"
+    );
+
+    tollgate_store::AdminStore::deposit(&*store, ACCOUNT, CostUnits(300))
+        .await
+        .unwrap();
+    refuse_252();
+    settle().await;
+    assert_eq!(slot.funding_evidence(t(0)), Some(CostUnits(301)));
+    slot.load()
+        .expect("a lease is installed")
+        .try_debit(CostUnits(252), t(0))
+        .expect("the top-up funds the quote");
     manager.shutdown().await;
 }
 
@@ -2366,13 +2448,16 @@ async fn a_refill_gap_with_credit_held_elsewhere_is_not_exhaustion() {
     let held = store
         .acquire(ACCOUNT, CostUnits(100), SignedDuration::from_secs(60), t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let slot = LeaseSlot::for_account(ACCOUNT);
     let clock = Arc::new(ManualClock::new(t(0)));
     let manager =
         LeaseManager::spawn(store.clone(), slot.clone(), clock, manager_config()).unwrap();
     settle().await;
-    assert!(!slot.balance_exhausted(t(0)));
+    // The refusal attests the 100 units the other lease holds: any quote
+    // within them keeps the lease gap's transient advice.
+    assert_eq!(slot.funding_evidence(t(0)), Some(CostUnits(100)));
     assert!(slot.load_observed().is_none());
     store
         .release(held.lease_id, held.fencing_token, held.units, t(0))
@@ -2380,6 +2465,10 @@ async fn a_refill_gap_with_credit_held_elsewhere_is_not_exhaustion() {
         .unwrap();
     settle().await;
     assert!(slot.load_observed().is_some());
-    assert!(!slot.balance_exhausted(t(0)));
+    assert!(
+        !slot
+            .funding_evidence(t(0))
+            .is_some_and(|remaining| remaining.is_zero())
+    );
     manager.shutdown().await;
 }

@@ -2,7 +2,7 @@
 
 use std::hash::Hash;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering, fence};
 
 use arc_swap::{ArcSwap, ArcSwapOption, Guard};
 use governor::clock::DefaultClock;
@@ -74,7 +74,14 @@ pub struct LeaseSlot {
     sharding: LocalSharding,
     overage: Arc<AccountOverage>,
     funding: std::sync::Mutex<FundingObservation>,
-    exhausted_until: AtomicI64,
+    /// Floored second before which `evidence_remaining` is authoritative;
+    /// `i64::MIN` when no evidence is live.
+    evidence_until: AtomicI64,
+    evidence_remaining: AtomicU64,
+    /// Seqlock word for the pair above: odd while a publication writes it.
+    /// Deadlines cannot serve as the sequence, because two publications may
+    /// share one and bracket a third (see [`LeaseSlot::funding_evidence`]).
+    evidence_sequence: AtomicU64,
 }
 
 /// Control-plane publication state. The identity token prevents an older
@@ -91,7 +98,8 @@ struct FundingObservation {
 
 /// An allocator attempt tied to this account's current funding observation.
 /// Dropping an unanswered attempt publishes nothing; only a verified domain
-/// response may publish exhaustion. All synchronization here is control plane.
+/// response may publish funding evidence. All synchronization here is control
+/// plane.
 #[derive(Debug)]
 pub struct FundingAttempt<'a> {
     slot: &'a LeaseSlot,
@@ -99,21 +107,51 @@ pub struct FundingAttempt<'a> {
 }
 
 impl FundingAttempt<'_> {
-    /// Record authoritative evidence unless a newer funding observation won.
-    pub fn exhausted(self, evidence: tollgate_core::BalanceExhaustion) {
+    /// Record a refusal's authoritative evidence unless a newer funding
+    /// observation won. Exhaustion is the zero-remaining case.
+    pub fn shortfall(self, evidence: tollgate_core::BalanceShortfall) {
         let current = self
             .slot
             .funding
             .lock()
             .expect("funding publication poisoned");
         if Arc::ptr_eq(&current.epoch, &self.epoch) {
-            // Floor to seconds: a subsecond boundary can only invalidate the
-            // evidence early, never extend its lifetime. Admission needs one
-            // word, and makes no calendar or clock call to read it.
-            let until = evidence.period_end.map_or(i64::MAX, funding_second);
-            self.slot.exhausted_until.store(until, Ordering::Release);
+            self.slot.publish_evidence(evidence);
         }
     }
+
+    /// Install the lease this attempt was granted, with the evidence that
+    /// came with it, as one control-plane step.
+    ///
+    /// A new grant invalidates older evidence, as [`LeaseSlot::replace`] does;
+    /// the grant's own evidence is then published under the same lock, so the
+    /// install cannot clear it. It is published only if no funding change was
+    /// accepted while the call was outstanding: a top-up the allocator had not
+    /// yet seen would otherwise be hidden behind an older, smaller remaining.
+    #[must_use = "retain the superseded lease for quiesced release, or explicitly abandon it"]
+    pub fn granted(
+        self,
+        lease: Arc<LocalLease>,
+        evidence: Option<tollgate_core::BalanceShortfall>,
+    ) -> Option<Arc<LocalLease>> {
+        let mut current = self
+            .slot
+            .funding
+            .lock()
+            .expect("funding publication poisoned");
+        let current_epoch = Arc::ptr_eq(&current.epoch, &self.epoch);
+        self.slot.observe_grant(&mut current, &lease);
+        if current_epoch && let Some(evidence) = evidence {
+            self.slot.publish_evidence(evidence);
+        }
+        self.slot.publish(Some(lease))
+    }
+}
+
+/// One comparison for both deadline reads, so the unsynchronized fast-path
+/// read and the sequence-checked read cannot disagree about the boundary.
+fn evidence_live(now_second: i64, until: i64) -> bool {
+    now_second < until
 }
 
 // Jiff truncates negative fractional timestamps toward zero. Floor both
@@ -180,7 +218,9 @@ impl LeaseSlot {
             sharding,
             overage: Arc::new(AccountOverage::new(account)),
             funding: std::sync::Mutex::new(FundingObservation::default()),
-            exhausted_until: AtomicI64::new(i64::MIN),
+            evidence_until: AtomicI64::new(i64::MIN),
+            evidence_remaining: AtomicU64::new(0),
+            evidence_sequence: AtomicU64::new(0),
         })
     }
 
@@ -196,7 +236,34 @@ impl LeaseSlot {
 
     fn invalidate_funding(&self, current: &mut FundingObservation) {
         current.epoch = Arc::new(());
-        self.exhausted_until.store(i64::MIN, Ordering::Release);
+        self.evidence_until.store(i64::MIN, Ordering::Release);
+    }
+
+    /// Caller holds `funding`, so writers are serialized: a seqlock writer.
+    /// The sequence is odd for the whole write, which is what lets
+    /// [`Self::funding_evidence`] reject a pair that straddles a publication.
+    fn publish_evidence(&self, evidence: tollgate_core::BalanceShortfall) {
+        // Floor to seconds: a subsecond boundary can only invalidate the
+        // evidence early, never extend its lifetime. Admission makes no
+        // calendar or clock call to read it.
+        let until = evidence.period_end.map_or(i64::MAX, funding_second);
+        let sequence = self.evidence_sequence.load(Ordering::Relaxed);
+        self.evidence_sequence
+            .store(sequence.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        self.evidence_until.store(until, Ordering::Relaxed);
+        self.evidence_remaining
+            .store(evidence.remaining.get(), Ordering::Relaxed);
+        self.evidence_sequence
+            .store(sequence.wrapping_add(2), Ordering::Release);
+    }
+
+    fn observe_grant(&self, current: &mut FundingObservation, lease: &LocalLease) {
+        let fence = lease.grant().fencing_token.0;
+        if fence > current.last_grant {
+            current.last_grant = fence;
+            self.invalidate_funding(current);
+        }
     }
 
     fn observe_funding(&self, snapshot: &AccountSnapshot) {
@@ -212,10 +279,36 @@ impl LeaseSlot {
         current.snapshot = Some(next);
     }
 
-    /// One atomic read, used only after local funding has refused a request.
+    /// The account's evidenced remaining funding, read only after local
+    /// funding has refused a request. An upper bound on what the account can
+    /// still spend; zero is confirmed exhaustion.
+    ///
+    /// One atomic load when no evidence is live, which is every refusal in an
+    /// account nobody has attested: a torn "no evidence" answer is always
+    /// safe, because it only falls back to the lease refusal's own advice.
+    /// Live evidence is read as a seqlock reader reads, four more loads, and a
+    /// pair that straddled a publication is discarded the same way.
+    /// Invalidation clears only the deadline, so a read racing it is ordered
+    /// before it; publication is what the sequence guards.
     #[must_use]
-    pub fn balance_exhausted(&self, now: Timestamp) -> bool {
-        funding_second(now) < self.exhausted_until.load(Ordering::Acquire)
+    pub fn funding_evidence(&self, now: Timestamp) -> Option<CostUnits> {
+        self.evidence_pair(funding_second(now))
+            .map(|(_, remaining)| CostUnits(remaining))
+    }
+
+    /// The accepted `(deadline, remaining)` pair; split out so tests can check
+    /// that both halves came from one publication.
+    fn evidence_pair(&self, now_second: i64) -> Option<(i64, u64)> {
+        if !evidence_live(now_second, self.evidence_until.load(Ordering::Relaxed)) {
+            return None;
+        }
+        let before = self.evidence_sequence.load(Ordering::Acquire);
+        let until = self.evidence_until.load(Ordering::Relaxed);
+        let remaining = self.evidence_remaining.load(Ordering::Relaxed);
+        fence(Ordering::Acquire);
+        let after = self.evidence_sequence.load(Ordering::Relaxed);
+        (before == after && before.is_multiple_of(2) && evidence_live(now_second, until))
+            .then_some((until, remaining))
     }
 
     #[must_use]
@@ -251,13 +344,9 @@ impl LeaseSlot {
     #[must_use = "retain the superseded lease for quiesced release, or explicitly abandon it"]
     pub fn replace(&self, lease: Arc<LocalLease>) -> Option<Arc<LocalLease>> {
         let mut funding = self.funding.lock().expect("funding publication poisoned");
-        let fence = lease.grant().fencing_token.0;
-        if fence > funding.last_grant {
-            funding.last_grant = fence;
-            self.invalidate_funding(&mut funding);
-        }
         // Restoring the same lease after a refused consolidation is not a
         // funding change. Serialize the clear and publication with evidence.
+        self.observe_grant(&mut funding, &lease);
         self.publish(Some(lease))
     }
 
@@ -2831,6 +2920,13 @@ mod tests {
 mod funding_deadline_tests {
     use super::*;
 
+    fn shortfall(remaining: u64, period_end: Option<Timestamp>) -> tollgate_core::BalanceShortfall {
+        tollgate_core::BalanceShortfall {
+            remaining: CostUnits(remaining),
+            period_end,
+        }
+    }
+
     #[test]
     fn exhaustion_deadlines_are_conservative_at_subsecond_and_domain_boundaries() {
         for shards in [1, 8] {
@@ -2838,30 +2934,76 @@ mod funding_deadline_tests {
                 AccountId(1),
                 LocalSharding::new(std::num::NonZeroUsize::new(shards).unwrap()),
             );
-            assert!(!slot.balance_exhausted(Timestamp::MIN));
-            slot.funding_attempt()
-                .exhausted(tollgate_core::BalanceExhaustion { period_end: None });
-            assert!(slot.balance_exhausted(Timestamp::MIN));
-            assert!(slot.balance_exhausted(Timestamp::MAX));
+            assert_eq!(slot.funding_evidence(Timestamp::MIN), None);
+            slot.funding_attempt().shortfall(shortfall(0, None));
+            assert_eq!(slot.funding_evidence(Timestamp::MIN), Some(CostUnits::ZERO));
+            assert_eq!(slot.funding_evidence(Timestamp::MAX), Some(CostUnits::ZERO));
             for nanos in [-1_500_000_000i128, 1_500_000_000] {
                 let end = Timestamp::from_nanosecond(nanos).unwrap();
-                slot.funding_attempt()
-                    .exhausted(tollgate_core::BalanceExhaustion {
-                        period_end: Some(end),
-                    });
+                slot.funding_attempt().shortfall(shortfall(7, Some(end)));
                 let floor =
                     Timestamp::from_second(i64::try_from(nanos.div_euclid(1_000_000_000)).unwrap())
                         .unwrap();
-                assert!(
-                    slot.balance_exhausted(
+                assert_eq!(
+                    slot.funding_evidence(
                         floor
                             .checked_sub(jiff::SignedDuration::from_nanos(1))
                             .unwrap()
-                    )
+                    ),
+                    Some(CostUnits(7))
                 );
-                assert!(!slot.balance_exhausted(floor));
-                assert!(!slot.balance_exhausted(end));
+                assert_eq!(slot.funding_evidence(floor), None);
+                assert_eq!(slot.funding_evidence(end), None);
             }
         }
+    }
+
+    /// Two writers alternate publications whose deadline and remaining are
+    /// tied together. Every accepted read must be one publication's pair, never
+    /// a live deadline beside another publication's remaining. Deadlines
+    /// repeat on purpose: equal deadlines bracketing a different publication
+    /// are the case a deadline cannot detect and the sequence must.
+    #[test]
+    fn paired_evidence_reads_are_conservative() {
+        let slot = LeaseSlot::for_account(AccountId(1));
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        // Publication k has remaining k and a deadline derived from it, so a
+        // torn pair is recognisable from the values alone.
+        let second = |k: u64| 1_000 + i64::try_from(k % 3).unwrap();
+        let deadline = |k: u64| Timestamp::from_second(second(k)).unwrap();
+        std::thread::scope(|scope| {
+            for writer in 0..2u64 {
+                let (slot, stop) = (&slot, &stop);
+                scope.spawn(move || {
+                    let mut k = writer;
+                    while !stop.load(Ordering::Relaxed) {
+                        slot.funding_attempt()
+                            .shortfall(shortfall(k, Some(deadline(k))));
+                        k = (k + 2) % 500;
+                    }
+                });
+            }
+            // Stop the writers however the reader exits, so a failed
+            // assertion reports instead of leaving the scope joining forever.
+            struct StopOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+            impl Drop for StopOnDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
+            let _stop = StopOnDrop(&stop);
+            let mut accepted = 0u32;
+            for _ in 0..200_000 {
+                if let Some((until, remaining)) = slot.evidence_pair(i64::MIN + 1) {
+                    accepted += 1;
+                    assert_eq!(
+                        until,
+                        second(remaining),
+                        "a deadline was paired with another publication's remaining"
+                    );
+                }
+            }
+            assert!(accepted > 0, "the reader never observed live evidence");
+        });
     }
 }

@@ -172,7 +172,8 @@ async fn expiry_upgrade_preserves_accounting_and_fences_old_lease_queries() {
             Timestamp::new(-1, 0).unwrap(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let row = sqlx::query("SELECT expires_at_floor_us, expires_at_submicro_ns, expiry_is_upper_bound FROM tollgate_leases WHERE lease_id = $1")
         .bind(lease.lease_id.0.to_be_bytes().to_vec()).fetch_one(&mut connection).await.unwrap();
     assert_eq!(row.get::<i64, _>(0), -1_000_000);

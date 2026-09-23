@@ -231,18 +231,24 @@ async fn adaptive_grant_shrinks_near_exhaustion() {
     let grant = store
         .acquire(ACCOUNT, CostUnits(600), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(grant.units, CostUnits(500));
     let grant = store
         .acquire(ACCOUNT, CostUnits(600), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(grant.units, CostUnits(250));
     let mut drained = 0u64;
     loop {
         match store.acquire(ACCOUNT, CostUnits(600), TTL, t(0)).await {
-            Ok(g) => drained += g.units.get(),
-            Err(AllocateError::InsufficientBalance) => break,
+            Ok(g) => drained += g.grant.units.get(),
+            // Everything is out on lease: the ledger attests all of it.
+            Err(AllocateError::BalanceInsufficient(evidence)) => {
+                assert_eq!(evidence.remaining, CostUnits(1_000));
+                break;
+            }
             Err(other) => panic!("unexpected: {other}"),
         }
     }
@@ -264,8 +270,11 @@ async fn no_double_spend_across_instances() {
             let mut granted = 0u64;
             loop {
                 match store.acquire(ACCOUNT, CostUnits(1_000), TTL, t(0)).await {
-                    Ok(g) => granted += g.units.get(),
-                    Err(AllocateError::InsufficientBalance) => return granted,
+                    Ok(g) => granted += g.grant.units.get(),
+                    Err(AllocateError::BalanceInsufficient(evidence)) => {
+                        assert_eq!(evidence.remaining, CostUnits(100_000));
+                        return granted;
+                    }
                     Err(other) => panic!("unexpected: {other}"),
                 }
             }
@@ -289,11 +298,13 @@ async fn newer_lease_does_not_invalidate_older_active_capability() {
     let older = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let newer = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert!(newer.fencing_token > older.fencing_token);
 
     let report = store
@@ -330,7 +341,8 @@ async fn wrong_token_release_leaves_lease_reclaimable() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
 
     assert_eq!(
         store
@@ -374,7 +386,8 @@ async fn usage_rejects_mismatched_lease_capability() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
 
     let mut wrong_token = usage(&lease, 1, 10, 1);
     wrong_token.source = UsageSource::Leased {
@@ -413,7 +426,8 @@ async fn expired_lease_units_reclaimed() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(500));
 
     let report = store
@@ -461,15 +475,18 @@ async fn expired_backlog_is_reclaimed_in_bounded_batches() {
         store
             .acquire(ACCOUNT, CostUnits(200), TTL, t(0))
             .await
-            .unwrap(),
+            .unwrap()
+            .grant,
         store
             .acquire(OTHER, CostUnits(200), TTL, t(0))
             .await
-            .unwrap(),
+            .unwrap()
+            .grant,
         store
             .acquire(OTHER, CostUnits(200), TTL, t(0))
             .await
-            .unwrap(),
+            .unwrap()
+            .grant,
     ];
     store
         .ingest(
@@ -547,7 +564,8 @@ async fn a_bounded_reclaim_page_settles_the_oldest_due_leases_first() {
             store
                 .acquire(AccountId(id), CostUnits(100), TTL, t(acquired_at))
                 .await
-                .unwrap(),
+                .unwrap()
+                .grant,
         );
     }
 
@@ -605,7 +623,8 @@ async fn usage_replay_is_idempotent() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let batch = [usage(&lease, 1, 70, 10), usage(&lease, 2, 50, 10)];
 
     let first = store.ingest(&batch, t(10)).await.unwrap();
@@ -646,15 +665,18 @@ async fn mixed_usage_batch_preserves_partial_acceptance() {
     let active = store
         .acquire(ACCOUNT, CostUnits(300), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let settled = store
         .acquire(ACCOUNT, CostUnits(200), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let other = store
         .acquire(OTHER, CostUnits(300), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     store
         .release(
             settled.lease_id,
@@ -744,7 +766,8 @@ async fn unrepresentable_usage_rejects_only_that_event_and_does_not_claim_its_id
             let lease = store
                 .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
                 .await
-                .unwrap();
+                .unwrap()
+                .grant;
             let event = |id, units| {
                 if leased {
                     usage(&lease, id, units, 0)
@@ -805,19 +828,23 @@ async fn concurrent_multi_account_batches_use_stable_lock_order() {
     let a1 = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let a2 = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let b1 = store
         .acquire(OTHER, CostUnits(400), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let b2 = store
         .acquire(OTHER, CostUnits(400), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
 
     let left = tokio::spawn({
@@ -867,7 +894,8 @@ async fn graceful_release_returns_unspent() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     store
         .ingest(&[usage(&lease, 1, 100, 5)], t(5))
         .await
@@ -911,7 +939,8 @@ async fn consolidation_never_grants_less_than_it_folded_in() {
     let first = store
         .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(first.units, CostUnits(29));
     assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(29));
 
@@ -925,7 +954,8 @@ async fn consolidation_never_grants_less_than_it_folded_in() {
             t(1),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert!(
         folded.units >= first.units,
         "{} folded in, {} granted",
@@ -956,7 +986,8 @@ async fn consolidation_folds_the_tail_grant_and_the_ledger_into_one_lease() {
     let tail = store
         .acquire(ACCOUNT, CostUnits(49), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(tail.units, CostUnits(49));
     assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(9));
 
@@ -970,7 +1001,8 @@ async fn consolidation_folds_the_tail_grant_and_the_ledger_into_one_lease() {
             t(1),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(folded.units, CostUnits(58));
     assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits::ZERO);
     assert_conserved(&store).await;
@@ -988,9 +1020,12 @@ async fn a_refused_consolidation_leaves_the_original_lease_spendable() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits::ZERO);
 
+    // The refused settlement would have recorded all 100 units as loss, so
+    // the rolled-back exchange attests nothing about remaining funding.
     assert_eq!(
         store
             .consolidate(
@@ -1024,7 +1059,8 @@ async fn consolidating_without_the_lease_capability_moves_no_units() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let before = store.balance(ACCOUNT).await.unwrap();
 
     assert_eq!(
@@ -1084,7 +1120,8 @@ async fn a_consolidation_with_an_invalid_ttl_settles_nothing() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(
         store
             .consolidate(
@@ -1128,7 +1165,8 @@ async fn reclaim_waits_for_grace_and_release_works_within_it() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
-        .unwrap(); // expires t(60), reclaimable from t(90)
+        .unwrap()
+        .grant; // expires t(60), reclaimable from t(90)
 
     assert!(store.reclaim_expired(t(60)).await.unwrap().is_empty());
     assert!(store.reclaim_expired(t(89)).await.unwrap().is_empty());
@@ -1148,7 +1186,8 @@ async fn reclaim_waits_for_grace_and_release_works_within_it() {
     let lease2 = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(70))
         .await
-        .unwrap(); // expires t(130)
+        .unwrap()
+        .grant; // expires t(130)
     assert!(store.reclaim_expired(t(159)).await.unwrap().is_empty());
     let reclaimed = store.reclaim_expired(t(160)).await.unwrap();
     assert_eq!(reclaimed[0].lease_id, lease2.lease_id);
@@ -1165,7 +1204,8 @@ async fn straggler_usage_after_release_is_billed() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
 
     store
         .release(lease.lease_id, lease.fencing_token, CostUnits(470), t(10))
@@ -1248,7 +1288,8 @@ async fn recreate_account_is_refused_and_nondestructive() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
 
     assert_eq!(
         AdminStore::create_account(
@@ -1269,7 +1310,8 @@ async fn recreate_account_is_refused_and_nondestructive() {
     let replacement = store
         .acquire(ACCOUNT, CostUnits(100), TTL, t(1))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert!(replacement.fencing_token > lease.fencing_token);
     assert_conserved(&store).await;
 }
@@ -1412,7 +1454,8 @@ async fn a_ttl_beyond_the_policy_maximum_is_clamped() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(
         lease.expires_at,
         t(300),
@@ -1427,12 +1470,14 @@ async fn a_ttl_beyond_the_policy_maximum_is_clamped() {
             t(0),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(exact.expires_at, t(300));
     let shorter = store
         .acquire(ACCOUNT, CostUnits(100), SignedDuration::from_secs(30), t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(shorter.expires_at, t(30));
 }
 
@@ -1460,7 +1505,8 @@ async fn depositing_funds_the_account_and_the_ledger_agrees() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(lease.units, CostUnits(500));
     assert_conserved(&store).await;
 
@@ -2156,7 +2202,8 @@ async fn negative_lease_sum_fails_conservation_read() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let pool = corruption_pool().await;
 
     set_lease_column(&pool, lease.lease_id.0, "granted", -1).await;
@@ -2191,7 +2238,8 @@ async fn a_reconciliation_read_never_observes_a_torn_ledger() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(50_000), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
 
     const WRITES: u32 = 200;
     // The writer's progress, so the reader can prove it read *during* the
@@ -2285,7 +2333,8 @@ async fn usage_below_the_live_lease_sum_fails_the_conservation_read() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let pool = corruption_pool().await;
 
     // The lease has spent 100 of its grant while the account's total says
@@ -2332,7 +2381,8 @@ async fn reclaim_refuses_negative_credit() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let pool = corruption_pool().await;
     // used > granted makes the reclaim credit negative; paying it out would
     // silently debit the account.
@@ -2357,7 +2407,8 @@ async fn straggler_exceeding_recorded_loss_fails_ingest() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     store
         .release(lease.lease_id, lease.fencing_token, CostUnits(470), t(10))
         .await
@@ -2413,7 +2464,8 @@ async fn release_and_ingest_surface_nonpositive_stored_fence() {
         let lease = store
             .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
             .await
-            .unwrap();
+            .unwrap()
+            .grant;
         let pool = corruption_pool().await;
         set_lease_column(&pool, lease.lease_id.0, "fencing_token", invalid).await;
 
@@ -2445,7 +2497,8 @@ async fn checked_ledger_columns_reject_negative_writes() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(10), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let event = usage(&lease, 1, 0, 0);
     store.ingest(&[event], t(0)).await.unwrap();
     let pool = corruption_pool().await;
@@ -2531,7 +2584,8 @@ async fn zero_fences_are_refused_in_every_persisted_capability() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(10), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(lease.fencing_token, FencingToken(1));
     let event = usage(&lease, 1, 0, 0);
     store
@@ -2574,7 +2628,8 @@ async fn zero_fences_are_refused_in_every_persisted_capability() {
     let second = store
         .acquire(ACCOUNT, CostUnits(10), TTL, t(1))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(second.fencing_token, FencingToken(2));
     assert_conserved(&store).await;
 }
@@ -2592,7 +2647,8 @@ async fn the_allowance_split_cannot_exceed_what_it_is_part_of() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(10), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let pool = corruption_pool().await;
 
     for (table, column, id_column, id, value, constraint) in [
@@ -3874,7 +3930,8 @@ async fn a_commit_time_fallback_is_ingested_as_overage_after_its_lease_is_reclai
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
 
     let reclaimed = store.reclaim_expired(t(60)).await.unwrap();
     assert_eq!(reclaimed[0].reclaimed, CostUnits(500));
@@ -4017,11 +4074,13 @@ async fn settlement_is_unaffected_by_an_account_carrying_overage() {
     let released = store
         .acquire(ACCOUNT, CostUnits(300), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let expired = store
         .acquire(ACCOUNT, CostUnits(200), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
 
     assert_eq!(
         store
@@ -4428,7 +4487,8 @@ async fn a_failed_ingest_batch_leaves_the_ledger_untouched() {
         let lease = store
             .acquire(ACCOUNT, CostUnits(1_000), TTL, t(0))
             .await
-            .unwrap();
+            .unwrap()
+            .grant;
         let before = store.conservation(ACCOUNT).await.unwrap().unwrap();
 
         let ceiling = u64::try_from(i64::MAX).unwrap();
@@ -4650,7 +4710,8 @@ async fn a_lease_from_the_closed_period_expires_its_unspent_allowance() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(200), TTL, t(FEB - 30))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     roll(&store, FEB).await;
 
     store
@@ -4699,7 +4760,8 @@ async fn a_lease_funded_by_a_top_up_is_unaffected_by_a_boundary() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(200), TTL, t(FEB - 30))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     roll(&store, FEB).await;
     store
         .release(
@@ -4738,7 +4800,8 @@ async fn a_split_funded_lease_charges_the_allowance_half_first() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(160), TTL, t(FEB - 30))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     roll(&store, FEB).await;
     store
         .ingest(&[usage(&lease, 1, 10, FEB + 1)], t(FEB + 1))
@@ -4781,7 +4844,8 @@ async fn reclaim_expires_a_closed_period_lease_it_sweeps() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(200), TTL, t(FEB - 30))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     roll(&store, FEB).await;
 
     let batch = store
@@ -4921,7 +4985,8 @@ async fn a_grant_spends_the_expiring_allowance_before_a_top_up() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(40), TTL, t(JAN + 2))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     store
         .ingest(&[usage(&lease, 1, 40, JAN + 3)], t(JAN + 3))
         .await
@@ -4973,7 +5038,8 @@ async fn consolidating_inside_a_lease_own_period_expires_nothing() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(200), TTL, t(JAN + 2))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(lease.units, CostUnits(200), "drawn from the allowance");
 
     let folded = store
@@ -4986,7 +5052,8 @@ async fn consolidating_inside_a_lease_own_period_expires_nothing() {
             t(JAN + 3),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(
         folded.units,
         CostUnits(500),
@@ -5029,7 +5096,8 @@ async fn consolidating_across_a_boundary_regrants_only_what_the_credit_restores(
     let january = store
         .acquire(ACCOUNT, CostUnits(600), LONG, t(JAN + 2))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(january.units, CostUnits(600));
 
     roll(&store, FEB + 1).await;
@@ -5043,7 +5111,8 @@ async fn consolidating_across_a_boundary_regrants_only_what_the_credit_restores(
             t(FEB + 2),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(february.units, CostUnits(600));
     assert_eq!(
         store.conservation(ACCOUNT).await.unwrap().unwrap().expired,
@@ -5074,7 +5143,8 @@ async fn consolidation_after_a_budget_reduction_uses_only_restored_credit_as_flo
     let old = store
         .acquire(ACCOUNT, CostUnits(500), LONG, t(JAN + 2))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(old.units, CostUnits(250));
     AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(100)))
         .await
@@ -5090,7 +5160,8 @@ async fn consolidation_after_a_budget_reduction_uses_only_restored_credit_as_flo
             t(FEB + 2),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(
         fresh.units,
         CostUnits(50),
@@ -5113,7 +5184,8 @@ async fn a_lease_released_inside_its_own_period_expires_nothing() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(200), TTL, t(JAN + 2))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     store
         .release(
             lease.lease_id,
@@ -5273,7 +5345,8 @@ async fn a_usage_row_carries_its_policy_revision() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let revision = PolicyRevision([0x31; 32]);
 
     let event = UsageEvent::new(
@@ -5343,7 +5416,8 @@ async fn a_usage_row_cannot_carry_a_wrong_width_revision() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     let pool = corruption_pool().await;
 
     for wrong in [vec![0u8; 31], vec![0u8; 33], Vec::new()] {
@@ -5412,7 +5486,8 @@ async fn the_budget_view_counts_units_out_on_lease() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     store
         .ingest(&[usage(&lease, 1, 150, 1)], t(1))
         .await
@@ -5542,7 +5617,8 @@ async fn the_budget_view_writes_off_settlement_loss() {
     let lease = store
         .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     store
         .ingest(&[usage(&lease, 1, 150, 1)], t(1))
         .await
@@ -6154,7 +6230,8 @@ async fn usage_accepts_zero_and_the_backends_unit_ceiling() {
                 store
                     .acquire(ACCOUNT, CostUnits(ceiling), TTL, t(0))
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .grant,
             )
         } else {
             None
@@ -6210,7 +6287,8 @@ async fn nanosecond_lease_boundaries_preserve_release_reclaim_and_consolidation(
         let lease = store
             .acquire(ACCOUNT, CostUnits(10), ttl, now)
             .await
-            .unwrap();
+            .unwrap()
+            .grant;
         let expiry = now.checked_add(ttl.min(max_ttl)).unwrap();
         assert_eq!(lease.expires_at, expiry);
         let lease = store
@@ -6223,12 +6301,14 @@ async fn nanosecond_lease_boundaries_preserve_release_reclaim_and_consolidation(
                 now,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .grant;
         assert_eq!(lease.expires_at, expiry);
         let released = store
             .acquire(ACCOUNT, CostUnits(10), ttl, now)
             .await
-            .unwrap();
+            .unwrap()
+            .grant;
         let deadline = expiry.checked_add(grace).unwrap();
         let before = deadline - ns(1);
         assert!(
@@ -6283,7 +6363,8 @@ async fn a_grace_deadline_beyond_timestamp_max_never_reclaims_early() {
         let lease = store
             .acquire(ACCOUNT, CostUnits(10), SignedDuration::from_nanos(1), now)
             .await
-            .unwrap();
+            .unwrap()
+            .grant;
         assert!(
             store
                 .reclaim_expired(Timestamp::MIN)
@@ -6322,7 +6403,8 @@ async fn an_unrepresentable_replacement_expiry_leaves_the_original_grant_untouch
     let lease = store
         .acquire(ACCOUNT, CostUnits(10), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     for ttl in [SignedDuration::from_nanos(1), SignedDuration::MAX] {
         assert!(matches!(
             store
@@ -6762,6 +6844,123 @@ async fn credential_auditing_refuses_a_corrupt_owner_without_retiring_it() {
     );
 }
 
+/// The refusal an account with all `remaining` units out on other leases
+/// receives: the ledger attests how much funding those leases still hold.
+fn held_elsewhere(remaining: u64) -> AllocateError {
+    AllocateError::BalanceInsufficient(tollgate_core::BalanceShortfall {
+        remaining: CostUnits(remaining),
+        period_end: None,
+    })
+}
+
+/// Every grant carries the committed ledger's remaining funding, counting the
+/// new lease itself and every other lease still out.
+#[tokio::test]
+async fn grants_report_ledger_remaining_including_outstanding_leases() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    let first = store
+        .acquire(ACCOUNT, CostUnits(40), TTL, t(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        first.funding,
+        Some(tollgate_core::BalanceShortfall {
+            remaining: CostUnits(100),
+            period_end: None,
+        })
+    );
+    store
+        .ingest(&[usage(&first.grant, 1, 30, 0)], t(0))
+        .await
+        .unwrap();
+    let second = store
+        .acquire(ACCOUNT, CostUnits(60), TTL, t(1))
+        .await
+        .unwrap();
+    assert_eq!(second.grant.units, CostUnits(60));
+    assert_eq!(
+        second.funding.map(|funding| funding.remaining),
+        Some(CostUnits(70)),
+        "recorded usage is consumed; both leases' units are still the account's"
+    );
+    assert_conserved(&store).await;
+}
+
+/// #130: one unit left and a quote of 252. The consolidation floor re-grants
+/// the tail, so only the grant's evidence can say the quote is unfundable;
+/// another instance's acquire is refused with the same attested remainder.
+#[tokio::test]
+async fn a_partial_balance_refusal_reports_remaining_funding() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    let held = store
+        .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
+        .await
+        .unwrap()
+        .grant;
+    store.ingest(&[usage(&held, 1, 99, 0)], t(0)).await.unwrap();
+    let tail = store
+        .consolidate(
+            held.lease_id,
+            held.fencing_token,
+            CostUnits(1),
+            CostUnits(252),
+            TTL,
+            t(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tail.grant.units, CostUnits(1));
+    assert_eq!(
+        tail.funding.map(|funding| funding.remaining),
+        Some(CostUnits(1))
+    );
+    assert_eq!(
+        store
+            .acquire(ACCOUNT, CostUnits(252), TTL, t(2))
+            .await
+            .unwrap_err(),
+        held_elsewhere(1)
+    );
+    assert_conserved(&store).await;
+}
+
+/// Scheduled funding bounds evidence by the stored period, on grants and on
+/// refusals alike.
+#[tokio::test]
+async fn shortfall_evidence_names_the_stored_period() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+        return;
+    };
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(100)))
+        .await
+        .unwrap();
+    roll(&store, FEB).await.unwrap();
+    let evidence = tollgate_core::BalanceShortfall {
+        remaining: CostUnits(100),
+        period_end: Some(t(MAR)),
+    };
+    let held = store
+        .acquire(ACCOUNT, CostUnits(100), TTL, t(FEB))
+        .await
+        .unwrap();
+    assert_eq!(held.funding, Some(evidence));
+    assert_eq!(
+        store
+            .acquire(ACCOUNT, CostUnits(1), TTL, t(FEB + 1))
+            .await
+            .unwrap_err(),
+        AllocateError::BalanceInsufficient(evidence)
+    );
+    assert_conserved(&store).await;
+}
+
 /// An empty allocatable balance is not evidence that the account spent its
 /// funding: another instance may hold it, and settlement can restore it.
 #[tokio::test]
@@ -6773,14 +6972,15 @@ async fn an_insufficient_balance_recovers_when_another_instance_returns_its_leas
     let held = store
         .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(held.units, CostUnits(100));
     assert_eq!(
         store
             .acquire(ACCOUNT, CostUnits(100), TTL, t(1))
             .await
             .unwrap_err(),
-        AllocateError::InsufficientBalance,
+        held_elsewhere(100),
     );
     store
         .release(held.lease_id, held.fencing_token, held.units, t(2))
@@ -6789,7 +6989,8 @@ async fn an_insufficient_balance_recovers_when_another_instance_returns_its_leas
     let recovered = store
         .acquire(ACCOUNT, CostUnits(100), TTL, t(3))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(recovered.units, held.units);
     assert_conserved(&store).await;
 }
@@ -6804,13 +7005,14 @@ async fn an_insufficient_balance_recovers_when_another_instances_lease_is_reclai
     let held = store
         .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(
         store
             .acquire(ACCOUNT, CostUnits(100), TTL, t(1))
             .await
             .unwrap_err(),
-        AllocateError::InsufficientBalance,
+        held_elsewhere(100),
     );
     let reclaimed = store
         .reclaim_expired_batch(t(61), NonZeroUsize::new(1).unwrap())
@@ -6821,7 +7023,8 @@ async fn an_insufficient_balance_recovers_when_another_instances_lease_is_reclai
     let recovered = store
         .acquire(ACCOUNT, CostUnits(100), TTL, t(62))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(recovered.units, held.units);
     assert_conserved(&store).await;
 }
@@ -6837,13 +7040,14 @@ async fn exhaustion_requires_recorded_consumption_and_survives_lease_expiry() {
     let held = store
         .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(
         store
             .acquire(ACCOUNT, CostUnits(1), TTL, t(1))
             .await
             .unwrap_err(),
-        AllocateError::InsufficientBalance
+        held_elsewhere(100)
     );
     store
         .ingest(&[usage(&held, 1, 100, 1)], t(1))
@@ -6891,6 +7095,7 @@ async fn exhaustion_requires_recorded_consumption_and_survives_lease_expiry() {
             .acquire(ACCOUNT, CostUnits(10), TTL, t(63))
             .await
             .unwrap()
+            .grant
             .units,
         CostUnits(10)
     );
@@ -6933,7 +7138,8 @@ async fn exhaustion_evidence_names_the_stored_period_and_rollover_restores_fundi
     let held = store
         .acquire(ACCOUNT, CostUnits(100), TTL, t(FEB))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     store
         .ingest(&[usage(&held, 1, 100, FEB)], t(FEB))
         .await
@@ -6963,6 +7169,7 @@ async fn exhaustion_evidence_names_the_stored_period_and_rollover_restores_fundi
             .acquire(ACCOUNT, CostUnits(100), TTL, t(MAR))
             .await
             .unwrap()
+            .grant
             .units,
         CostUnits(100)
     );

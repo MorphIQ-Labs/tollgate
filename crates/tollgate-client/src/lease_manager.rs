@@ -739,13 +739,14 @@ async fn run(
         };
         counters.acquire_pending.store(false, Ordering::Release);
         match acquired {
-            Ok(Ok(grant)) => {
-                counters.record_acquired(grant.units);
+            Ok(Ok(allocation)) => {
+                counters.record_acquired(allocation.grant.units);
                 // Rotation: install the fresh lease and park the superseded
-                // one until it quiesces (module docs).
-                publish_and_park(
-                    &slot,
-                    install_lease(grant, &config, &slot, &refill),
+                // one until it quiesces (module docs). The grant's funding
+                // evidence is published in the same step as the lease.
+                let fresh = install_lease(allocation.grant, &config, &slot, &refill);
+                park(
+                    funding_attempt.granted(fresh, allocation.funding),
                     &mut parked,
                 );
             }
@@ -764,8 +765,8 @@ async fn run(
                 // apart from the refusals rather than folded into one of them.
                 let reason: &dyn std::fmt::Display = match &outcome {
                     Ok(Err(error)) => {
-                        if let AllocateError::BalanceExhausted(evidence) = error {
-                            funding_attempt.exhausted(*evidence);
+                        if let Some(evidence) = refusal_evidence(error) {
+                            funding_attempt.shortfall(evidence);
                         }
                         counters.record_acquire_refused(error);
                         error
@@ -907,6 +908,7 @@ fn release_failure(error: &AllocateError) -> ReleaseFailure {
         | AllocateError::AccountInactive
         | AllocateError::InsufficientBalance
         | AllocateError::BalanceExhausted(_)
+        | AllocateError::BalanceInsufficient(_)
         | AllocateError::InvalidTtl => ReleaseFailure::Integrity,
     }
 }
@@ -998,6 +1000,7 @@ fn consolidation_failure(error: &AllocateError) -> ConsolidationFailure {
         // draws a grant (#109).
         AllocateError::InsufficientBalance
         | AllocateError::BalanceExhausted(_)
+        | AllocateError::BalanceInsufficient(_)
         | AllocateError::UnknownAccount
         | AllocateError::AccountInactive
         | AllocateError::InvalidTtl => ConsolidationFailure::RolledBack,
@@ -1075,7 +1078,8 @@ async fn consolidate_live_lease(
     counters.acquire_pending.store(false, Ordering::Release);
 
     let error: AllocateError = match outcome {
-        Ok(Ok(fresh)) => {
+        Ok(Ok(allocation)) => {
+            let fresh = allocation.grant;
             counters.record_consolidated(fresh.units);
             tracing::debug!(
                 superseded = %grant.lease_id,
@@ -1088,7 +1092,8 @@ async fn consolidate_live_lease(
             // this grant, so it must not be parked: releasing it again would
             // claim units the ledger has already credited back.
             drop(live);
-            publish_and_park(slot, install_lease(fresh, config, slot, refill), parked);
+            let fresh = install_lease(fresh, config, slot, refill);
+            park(funding_attempt.granted(fresh, allocation.funding), parked);
             return Consolidation::Installed;
         }
         Ok(Err(error)) => error,
@@ -1102,8 +1107,8 @@ async fn consolidate_live_lease(
             return Consolidation::KeptServing;
         }
     };
-    if let AllocateError::BalanceExhausted(evidence) = &error {
-        funding_attempt.exhausted(*evidence);
+    if let Some(evidence) = refusal_evidence(&error) {
+        funding_attempt.shortfall(evidence);
     }
     counters.record_acquire_refused(&error);
     match consolidation_failure(&error) {
@@ -1148,8 +1153,22 @@ async fn consolidate_live_lease(
 /// publisher installed while consolidation awaited the store. Only the store's
 /// confirmed settlement may dispose of the consolidation predecessor directly.
 fn publish_and_park(slot: &LeaseSlot, lease: Arc<LocalLease>, parked: &mut Vec<Arc<LocalLease>>) {
-    if let Some(previous) = slot.replace(lease) {
+    park(slot.replace(lease), parked);
+}
+
+fn park(previous: Option<Arc<LocalLease>>, parked: &mut Vec<Arc<LocalLease>>) {
+    if let Some(previous) = previous {
         parked.push(previous);
+    }
+}
+
+/// The ledger evidence a domain refusal carries, if any. Exhaustion is the
+/// zero-remaining shortfall; every other refusal attests nothing.
+fn refusal_evidence(error: &AllocateError) -> Option<tollgate_core::BalanceShortfall> {
+    match error {
+        AllocateError::BalanceExhausted(evidence) => Some((*evidence).into()),
+        AllocateError::BalanceInsufficient(evidence) => Some(*evidence),
+        _ => None,
     }
 }
 
@@ -1370,7 +1389,7 @@ mod tests {
     use async_trait::async_trait;
     use jiff::Timestamp;
     use tollgate_core::{FencingToken, LeaseGrant, LeaseId};
-    use tollgate_store::{AllocateError, ReclaimBatch, StoreError, SystemClock};
+    use tollgate_store::{AllocateError, Allocation, ReclaimBatch, StoreError, SystemClock};
 
     use super::*;
 
@@ -1503,7 +1522,7 @@ mod tests {
             _requested: CostUnits,
             _ttl: SignedDuration,
             _now: Timestamp,
-        ) -> Result<LeaseGrant, AllocateError> {
+        ) -> Result<Allocation, AllocateError> {
             unreachable!("release_quiesced never acquires")
         }
 
@@ -1538,7 +1557,7 @@ mod tests {
             _requested: CostUnits,
             _ttl: SignedDuration,
             _now: Timestamp,
-        ) -> Result<LeaseGrant, AllocateError> {
+        ) -> Result<Allocation, AllocateError> {
             unreachable!("release_quiesced never consolidates")
         }
 
@@ -1555,13 +1574,13 @@ mod tests {
     /// tested for the thing that actually matters: whether the lease is put
     /// back where requests can reach it.
     struct ConsolidatingAllocator {
-        answer: Mutex<Option<Result<LeaseGrant, AllocateError>>>,
+        answer: Mutex<Option<Result<Allocation, AllocateError>>>,
         calls: AtomicU64,
         publish_during_call: Option<Arc<LeaseSlot>>,
     }
 
     impl ConsolidatingAllocator {
-        fn new(answer: Result<LeaseGrant, AllocateError>) -> Arc<Self> {
+        fn new(answer: Result<Allocation, AllocateError>) -> Arc<Self> {
             Arc::new(Self {
                 answer: Mutex::new(Some(answer)),
                 calls: AtomicU64::new(0),
@@ -1578,7 +1597,7 @@ mod tests {
             _requested: CostUnits,
             _ttl: SignedDuration,
             _now: Timestamp,
-        ) -> Result<LeaseGrant, AllocateError> {
+        ) -> Result<Allocation, AllocateError> {
             unreachable!("these tests drive consolidation directly")
         }
 
@@ -1600,7 +1619,7 @@ mod tests {
             _requested: CostUnits,
             _ttl: SignedDuration,
             _now: Timestamp,
-        ) -> Result<LeaseGrant, AllocateError> {
+        ) -> Result<Allocation, AllocateError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if let Some(slot) = &self.publish_during_call {
                 assert!(slot.replace(parked_lease(99)).is_none());
@@ -1628,6 +1647,13 @@ mod tests {
             fencing_token: FencingToken(1),
             units: CostUnits(units),
             expires_at: Timestamp::from_second(3_600).unwrap(),
+        }
+    }
+
+    fn allocation(id: u128, units: u64) -> Allocation {
+        Allocation {
+            grant: grant(id, units),
+            funding: None,
         }
     }
 
@@ -1664,7 +1690,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_successful_consolidation_installs_the_grant_and_parks_nothing() {
         let harness = Harness::new();
-        let allocator = ConsolidatingAllocator::new(Ok(grant(2, 500)));
+        let allocator = ConsolidatingAllocator::new(Ok(allocation(2, 500)));
         let (outcome, served, parked) = consolidate_once(
             Arc::clone(&allocator) as Arc<dyn LeaseAllocator>,
             &harness,
@@ -1686,10 +1712,34 @@ mod tests {
         assert_eq!(stats.acquired_units, 500);
     }
 
+    /// #130: the tail of an account is re-granted by the consolidation floor,
+    /// so no refusal ever arrives. The grant's own evidence is what lets
+    /// admission refuse a quote the whole account cannot fund.
+    #[tokio::test(start_paused = true)]
+    async fn a_consolidated_tail_publishes_the_accounts_remaining_funding() {
+        let harness = Harness::new();
+        let mut tail = grant(2, 1);
+        tail.fencing_token = FencingToken(2);
+        let allocator = ConsolidatingAllocator::new(Ok(Allocation {
+            grant: tail,
+            funding: Some(tollgate_core::BalanceShortfall {
+                remaining: CostUnits(1),
+                period_end: None,
+            }),
+        }));
+        let (outcome, served, _) = consolidate_once(allocator, &harness, parked_lease(1)).await;
+        assert_eq!(outcome, Consolidation::Installed);
+        assert_eq!(served, Some(2));
+        assert_eq!(
+            harness.slot.funding_evidence(Timestamp::UNIX_EPOCH),
+            Some(CostUnits(1))
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn consolidation_retains_a_grant_published_during_the_store_call() {
         for (answer, expected_outcome, expected_served) in [
-            (Ok(grant(2, 500)), Consolidation::Installed, 2),
+            (Ok(allocation(2, 500)), Consolidation::Installed, 2),
             (
                 Err(AllocateError::InsufficientBalance),
                 Consolidation::KeptServing,
@@ -1725,6 +1775,10 @@ mod tests {
         for error in [
             AllocateError::InsufficientBalance,
             AllocateError::BalanceExhausted(tollgate_core::BalanceExhaustion { period_end: None }),
+            AllocateError::BalanceInsufficient(tollgate_core::BalanceShortfall {
+                remaining: CostUnits(3),
+                period_end: None,
+            }),
             AllocateError::AccountInactive,
             AllocateError::UnknownAccount,
         ] {
@@ -1745,8 +1799,13 @@ mod tests {
             );
             assert!(parked.is_empty(), "{error}");
             assert_eq!(
-                harness.slot.balance_exhausted(Timestamp::UNIX_EPOCH),
-                matches!(error, AllocateError::BalanceExhausted(_))
+                harness.slot.funding_evidence(Timestamp::UNIX_EPOCH),
+                match error {
+                    AllocateError::BalanceExhausted(_) => Some(CostUnits::ZERO),
+                    AllocateError::BalanceInsufficient(evidence) => Some(evidence.remaining),
+                    _ => None,
+                },
+                "{error}"
             );
             assert!(harness.is_healthy(), "an ordinary refusal is not a fault");
         }
@@ -1827,7 +1886,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_consolidation_defers_while_a_reservation_is_in_flight() {
         let harness = Harness::new();
-        let allocator = ConsolidatingAllocator::new(Ok(grant(2, 500)));
+        let allocator = ConsolidatingAllocator::new(Ok(allocation(2, 500)));
         let lease = parked_lease(1);
         // Stands in for a request that loaded the lease and has not finished.
         let _in_flight = Arc::clone(&lease);

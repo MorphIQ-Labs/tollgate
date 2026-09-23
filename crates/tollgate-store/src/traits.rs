@@ -37,6 +37,11 @@ pub enum AllocateError {
     InsufficientBalance,
     /// The ledger confirms no funding remains, including outstanding leases.
     BalanceExhausted(tollgate_core::BalanceExhaustion),
+    /// No grant is possible, and the ledger confirms how much funding remains
+    /// outside this instance's reach — all of it held in other leases.
+    /// `remaining` is never zero; zero is [`Self::BalanceExhausted`].
+    /// `InsufficientBalance` stays the refusal that carries no attestation.
+    BalanceInsufficient(tollgate_core::BalanceShortfall),
     /// A lease must specify one unambiguous, strictly positive lifetime.
     InvalidTtl,
     UnknownLease,
@@ -71,10 +76,11 @@ impl AllocateError {
         "invalid_release",
         "storage",
         "balance_exhausted",
+        "balance_insufficient",
     ];
 
     /// How many distinct refusals exist — the width of a per-reason tally.
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 11;
 
     /// This refusal's dense slot, for direct-indexed per-reason counters.
     ///
@@ -95,6 +101,7 @@ impl AllocateError {
             AllocateError::InvalidRelease => 7,
             AllocateError::Storage(_) => 8,
             AllocateError::BalanceExhausted(_) => 9,
+            AllocateError::BalanceInsufficient(_) => 10,
         }
     }
 
@@ -112,6 +119,11 @@ impl std::fmt::Display for AllocateError {
             AllocateError::AccountInactive => f.write_str("account inactive"),
             AllocateError::InsufficientBalance => f.write_str("insufficient balance"),
             AllocateError::BalanceExhausted(_) => f.write_str("account balance exhausted"),
+            AllocateError::BalanceInsufficient(evidence) => write!(
+                f,
+                "insufficient balance ({} units remain, all held in leases)",
+                evidence.remaining
+            ),
             AllocateError::InvalidTtl => {
                 f.write_str("lease TTL must specify one positive duration")
             }
@@ -398,6 +410,27 @@ impl ReclaimBatch {
     }
 }
 
+/// A grant, and the ledger's remaining funding as of the transaction that
+/// made it.
+///
+/// `funding` is read from the committed ledger after the grant and any
+/// consolidation settlement, so it counts the new lease's units. It is an
+/// upper bound on what the account can still spend (see
+/// [`tollgate_core::BalanceShortfall`]), carried apart from the grant because
+/// the grant is a capability and this is evidence about the account. `None`
+/// means the answering allocator attested nothing, as an older server does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
+pub struct Allocation {
+    #[cfg_attr(feature = "wire", serde(flatten))]
+    pub grant: LeaseGrant,
+    #[cfg_attr(
+        feature = "wire",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub funding: Option<tollgate_core::BalanceShortfall>,
+}
+
 /// Atomic lease allocation against the account balance — the amortization
 /// point: one `acquire` funds thousands of local reservations.
 #[async_trait]
@@ -413,7 +446,7 @@ pub trait LeaseAllocator: Send + Sync {
         requested: CostUnits,
         ttl: SignedDuration,
         now: Timestamp,
-    ) -> Result<LeaseGrant, AllocateError>;
+    ) -> Result<Allocation, AllocateError>;
 
     /// Graceful return: require the stored `(lease_id, fencing_token)` pair,
     /// credit `unspent` back, and close the lease. Callers should flush usage
@@ -453,8 +486,9 @@ pub trait LeaseAllocator: Send + Sync {
     /// the whole exchange.
     ///
     /// The transaction applies both halves or neither. A domain refusal
-    /// (`InsufficientBalance`, `BalanceExhausted`, `UnknownAccount`,
-    /// `AccountInactive`, or `InvalidTtl`) leaves the original lease unchanged.
+    /// (`InsufficientBalance`, `BalanceExhausted`, `BalanceInsufficient`,
+    /// `UnknownAccount`, `AccountInactive`, or `InvalidTtl`) leaves the
+    /// original lease unchanged.
     /// `InvalidRelease` also leaves it unchanged but reports an
     /// accounting-integrity fault.
     /// `UnknownLease`, `Fenced`, and `LeaseNotActive` provide no authority to
@@ -475,7 +509,7 @@ pub trait LeaseAllocator: Send + Sync {
         requested: CostUnits,
         ttl: SignedDuration,
         now: Timestamp,
-    ) -> Result<LeaseGrant, AllocateError>;
+    ) -> Result<Allocation, AllocateError>;
 
     /// Settle at most `limit` active leases whose TTL (plus the policy's
     /// reclaim grace) has lapsed, crediting `granted - recorded usage` back
@@ -1550,7 +1584,7 @@ mod tests {
             _requested: CostUnits,
             _ttl: SignedDuration,
             _now: Timestamp,
-        ) -> Result<LeaseGrant, AllocateError> {
+        ) -> Result<Allocation, AllocateError> {
             unreachable!("the full-drain tests only reclaim")
         }
 
@@ -1572,7 +1606,7 @@ mod tests {
             _requested: CostUnits,
             _ttl: SignedDuration,
             _now: Timestamp,
-        ) -> Result<LeaseGrant, AllocateError> {
+        ) -> Result<Allocation, AllocateError> {
             unreachable!("the reclaim drain never consolidates")
         }
 
@@ -1610,6 +1644,10 @@ mod tests {
             AllocateError::InvalidRelease,
             AllocateError::Storage(StoreError("connection reset".into())),
             AllocateError::BalanceExhausted(tollgate_core::BalanceExhaustion { period_end: None }),
+            AllocateError::BalanceInsufficient(tollgate_core::BalanceShortfall {
+                remaining: CostUnits(1),
+                period_end: None,
+            }),
         ]
     }
 

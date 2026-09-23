@@ -38,7 +38,7 @@ pub use credentials::{
 };
 pub use memory::{MemoryStore, StoredRecords};
 pub use traits::{
-    AccountConfig, AccountView, AdminStore, AllocateError, BudgetError, Conservation,
+    AccountConfig, AccountView, AdminStore, AllocateError, Allocation, BudgetError, Conservation,
     CreateAccountError, CredentialActivity, CredentialActivityState, DEFAULT_RECLAIM_BATCH_LIMIT,
     DEFAULT_ROLLOVER_BATCH_LIMIT, GrantPolicy, GrantPolicyError, IngestError, IngestReport,
     KeyDirectory, KeyError, KeyRecord, KeySummary, LeaseAllocator, MAX_INGEST_BATCH,

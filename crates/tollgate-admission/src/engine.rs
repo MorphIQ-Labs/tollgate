@@ -850,15 +850,23 @@ fn admit_priced(
             Err(reason) => {
                 // Refundable pending occupancy and a commit in progress can
                 // recover locally even when the central balance is spent.
+                // Evidence is an upper bound on remaining funding, so it can
+                // only refuse a quote no refill could fund; a quote within it
+                // keeps the lease refusal's transient advice.
                 let reason = if matches!(
                     reason,
                     DenyReason::LeaseUnavailable
                         | DenyReason::LeaseExpired
                         | DenyReason::LeaseExhausted { .. }
                         | DenyReason::OverageCapExhausted { .. }
-                ) && concurrency.state().lease.balance_exhausted(now)
-                {
-                    DenyReason::BalanceExhausted
+                ) {
+                    match concurrency.state().lease.funding_evidence(now) {
+                        Some(remaining) if remaining.is_zero() => DenyReason::BalanceExhausted,
+                        Some(remaining) if quote.total > remaining => {
+                            DenyReason::BalanceInsufficient { remaining }
+                        }
+                        _ => reason,
+                    }
                 } else {
                     reason
                 };
@@ -1139,12 +1147,12 @@ mod tests {
             let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
                 panic!()
             };
-            state
-                .lease
-                .funding_attempt()
-                .exhausted(tollgate_core::BalanceExhaustion {
+            state.lease.funding_attempt().shortfall(
+                tollgate_core::BalanceExhaustion {
                     period_end: Some(t(100)),
-                });
+                }
+                .into(),
+            );
             let outcome = engine.admit_one(request(1), t(0));
             if units == Some(100) {
                 assert!(outcome.is_ok(), "usable local credit takes precedence");
@@ -1176,10 +1184,12 @@ mod tests {
             .map()
             .install(Principal(1), snapshot(AccountStatus::Active), slot.clone())
             .unwrap();
-        slot.funding_attempt()
-            .exhausted(tollgate_core::BalanceExhaustion {
+        slot.funding_attempt().shortfall(
+            tollgate_core::BalanceExhaustion {
                 period_end: Some(t(100)),
-            });
+            }
+            .into(),
+        );
         for now in [t(0), t(5), t(99)] {
             assert_eq!(
                 engine.admit_one(request(1), now).unwrap_err(),
@@ -1208,7 +1218,7 @@ mod tests {
                 .install(Principal(1), snapshot(AccountStatus::Active), slot.clone())
                 .unwrap();
             slot.funding_attempt()
-                .exhausted(tollgate_core::BalanceExhaustion { period_end: None });
+                .shortfall(tollgate_core::BalanceExhaustion { period_end: None }.into());
             engine
                 .map()
                 .install(Principal(2), snapshot(AccountStatus::Active), slot)
@@ -1273,7 +1283,7 @@ mod tests {
                             .unwrap();
                     }
                     let evidence = tollgate_core::BalanceExhaustion { period_end: None };
-                    slot.funding_attempt().exhausted(evidence);
+                    slot.funding_attempt().shortfall(evidence.into());
                     assert_eq!(
                         engine.admit_one(request(1), t(0)).unwrap_err(),
                         DenyReason::BalanceExhausted
@@ -1294,21 +1304,29 @@ mod tests {
                         .map()
                         .install(Principal(2), Arc::new(next.clone()), slot.clone())
                         .unwrap();
-                    assert!(!slot.balance_exhausted(t(0)));
-                    late.exhausted(evidence);
+                    assert!(
+                        !slot
+                            .funding_evidence(t(0))
+                            .is_some_and(|remaining| remaining.is_zero())
+                    );
+                    late.shortfall(evidence.into());
                     // P1 still uses strict mode, but P2's accepted change clears
                     // the evidence for the whole account, including late replies.
                     assert_eq!(
                         engine.admit_one(request(1), t(0)).unwrap_err(),
                         DenyReason::LeaseUnavailable
                     );
-                    slot.funding_attempt().exhausted(evidence);
+                    slot.funding_attempt().shortfall(evidence.into());
                     next.generation = Generation(4);
                     engine
                         .map()
                         .install(Principal(2), Arc::new(next), slot.clone())
                         .unwrap();
-                    assert!(slot.balance_exhausted(t(0)), "unchanged funding");
+                    assert!(
+                        slot.funding_evidence(t(0))
+                            .is_some_and(|remaining| remaining.is_zero()),
+                        "unchanged funding"
+                    );
                     for generation in [3, 4] {
                         let mut replay = (*snapshot(AccountStatus::Active)).clone();
                         replay.generation = Generation(generation);
@@ -1316,7 +1334,11 @@ mod tests {
                             .map()
                             .install(Principal(2), Arc::new(replay), slot.clone())
                             .unwrap();
-                        assert!(slot.balance_exhausted(t(0)), "rejected replay");
+                        assert!(
+                            slot.funding_evidence(t(0))
+                                .is_some_and(|remaining| remaining.is_zero()),
+                            "rejected replay"
+                        );
                     }
                 }
             }
@@ -1332,7 +1354,7 @@ mod tests {
         state
             .lease
             .funding_attempt()
-            .exhausted(tollgate_core::BalanceExhaustion { period_end: None });
+            .shortfall(tollgate_core::BalanceExhaustion { period_end: None }.into());
         let pending = engine.admit_one(request(1), t(0)).unwrap();
         assert!(matches!(
             engine.admit_one(request(1), t(0)).unwrap_err(),
@@ -1351,6 +1373,139 @@ mod tests {
         );
     }
 
+    fn shortfall(remaining: u64) -> tollgate_core::BalanceShortfall {
+        tollgate_core::BalanceShortfall {
+            remaining: CostUnits(remaining),
+            period_end: Some(t(100)),
+        }
+    }
+
+    /// #130: an account with funding, but less than a quote, refuses that
+    /// quote as not retryable and keeps admitting quotes that fit. A quote
+    /// here is 50 fixed + 1 per item.
+    #[test]
+    fn insufficient_funding_refuses_only_quotes_above_evidence() {
+        let engine = engine_with(AccountStatus::Active, Some(60));
+        let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
+            panic!()
+        };
+        // No evidence: an unfundable quote is still only a lease refusal.
+        assert!(matches!(
+            engine.admit_one(request(20), t(0)).unwrap_err(),
+            DenyReason::LeaseExhausted { .. }
+        ));
+        state.lease.funding_attempt().shortfall(shortfall(60));
+        let pending = engine.admit_one(request(1), t(0));
+        assert!(pending.is_ok(), "usable local credit takes precedence");
+        drop(pending);
+        let denied = engine.admit_one(request(20), t(0)).unwrap_err();
+        assert_eq!(
+            denied,
+            DenyReason::BalanceInsufficient {
+                remaining: CostUnits(60)
+            }
+        );
+        assert_eq!(denied.retry(), Retry::Never);
+        assert_eq!(
+            state.counters.snapshot().denials[denied.index()],
+            1,
+            "the refusal is tallied in its own slot"
+        );
+        // With the lease holding back 51 units, a quote of exactly the
+        // evidenced remaining is refused by the lease, and it is a lease gap:
+        // the boundary is inclusive, and so is any quote below it.
+        let _held = engine.admit_one(request(1), t(0)).unwrap();
+        for items in [10, 5] {
+            assert!(matches!(
+                engine.admit_one(request(items), t(0)).unwrap_err(),
+                DenyReason::LeaseExhausted { .. }
+            ));
+        }
+        assert_eq!(
+            engine.admit_one(request(11), t(0)).unwrap_err(),
+            DenyReason::BalanceInsufficient {
+                remaining: CostUnits(60)
+            }
+        );
+        // The stored period end bounds the evidence.
+        assert!(matches!(
+            engine.admit_one(request(20), t(100)).unwrap_err(),
+            DenyReason::LeaseExhausted { .. }
+        ));
+    }
+
+    #[test]
+    fn central_shortfall_does_not_hide_elastic_capacity() {
+        let engine = elastic_engine(51, None);
+        let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
+            panic!()
+        };
+        state.lease.funding_attempt().shortfall(shortfall(10));
+        let overage = engine.admit_one(request(1), t(0)).unwrap();
+        assert!(overage.funding.reservation().admitted_as_overage());
+    }
+
+    #[test]
+    fn grant_evidence_is_published_with_its_lease() {
+        let engine = engine_with(AccountStatus::Active, Some(0));
+        let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
+            panic!()
+        };
+        let slot = &state.lease;
+        slot.funding_attempt().shortfall(shortfall(0));
+        let mut grant = *lease(40).grant();
+        grant.fencing_token = FencingToken(2);
+        let old = slot.funding_attempt().granted(
+            Arc::new(LocalLease::new(grant, CostUnits::ZERO)),
+            Some(shortfall(40)),
+        );
+        drop(old);
+        assert_eq!(
+            slot.funding_evidence(t(0)),
+            Some(CostUnits(40)),
+            "the grant cleared older exhaustion and kept its own evidence"
+        );
+        assert_eq!(
+            engine.admit_one(request(20), t(0)).unwrap_err(),
+            DenyReason::BalanceInsufficient {
+                remaining: CostUnits(40)
+            }
+        );
+
+        // A grant without evidence (an older server) clears and publishes
+        // nothing.
+        grant.fencing_token = FencingToken(3);
+        drop(
+            slot.funding_attempt()
+                .granted(Arc::new(LocalLease::new(grant, CostUnits::ZERO)), None),
+        );
+        assert_eq!(slot.funding_evidence(t(0)), None);
+
+        // A funding change accepted while the call was out wins over the
+        // grant's older ledger reading; the grant itself still installs.
+        let late = slot.funding_attempt();
+        let mut next = (*snapshot(AccountStatus::Active)).clone();
+        next.generation = Generation(2);
+        next.budget = Some(BudgetView {
+            balance_at_publish: CostUnits(1_000),
+            period_end: None,
+        });
+        engine
+            .map()
+            .install(Principal(1), Arc::new(next), slot.clone())
+            .unwrap();
+        grant.fencing_token = FencingToken(4);
+        drop(late.granted(
+            Arc::new(LocalLease::new(grant, CostUnits::ZERO)),
+            Some(shortfall(40)),
+        ));
+        assert_eq!(slot.funding_evidence(t(0)), None);
+        assert_eq!(
+            slot.load().map(|lease| lease.grant().fencing_token),
+            Some(FencingToken(4))
+        );
+    }
+
     #[test]
     fn funding_publication_invalidates_late_exhaustion_responses() {
         let engine = engine_with(AccountStatus::Active, Some(0));
@@ -1359,21 +1514,26 @@ mod tests {
         };
         let slot = &state.lease;
         let evidence = tollgate_core::BalanceExhaustion { period_end: None };
-        slot.funding_attempt().exhausted(evidence);
+        slot.funding_attempt().shortfall(evidence.into());
         let late = slot.funding_attempt();
         // Restoring the same capability does not manufacture new funding.
         let old = slot.take().unwrap();
         drop(slot.replace(old));
-        assert!(slot.balance_exhausted(t(0)));
+        assert!(
+            slot.funding_evidence(t(0))
+                .is_some_and(|remaining| remaining.is_zero())
+        );
         let mut grant = *lease(100).grant();
         grant.fencing_token = FencingToken(2);
         drop(slot.replace(Arc::new(LocalLease::new(grant, CostUnits::ZERO))));
-        late.exhausted(evidence);
+        late.shortfall(evidence.into());
         assert!(
-            !slot.balance_exhausted(t(0)),
+            !slot
+                .funding_evidence(t(0))
+                .is_some_and(|remaining| remaining.is_zero()),
             "late refusal cannot undo a grant"
         );
-        slot.funding_attempt().exhausted(evidence);
+        slot.funding_attempt().shortfall(evidence.into());
         let late = slot.funding_attempt();
         let mut next = (*snapshot(AccountStatus::Active)).clone();
         next.generation = Generation(2);
@@ -1385,19 +1545,24 @@ mod tests {
             .map()
             .install(Principal(1), Arc::new(next.clone()), slot.clone())
             .unwrap();
-        late.exhausted(evidence);
+        late.shortfall(evidence.into());
         assert!(
-            !slot.balance_exhausted(t(0)),
+            !slot
+                .funding_evidence(t(0))
+                .is_some_and(|remaining| remaining.is_zero()),
             "late refusal cannot undo new funding policy"
         );
-        slot.funding_attempt().exhausted(evidence);
+        slot.funding_attempt().shortfall(evidence.into());
         // An unrelated generation refresh must not erase known exhaustion.
         next.generation = Generation(3);
         engine
             .map()
             .install(Principal(1), Arc::new(next), slot.clone())
             .unwrap();
-        assert!(slot.balance_exhausted(t(0)));
+        assert!(
+            slot.funding_evidence(t(0))
+                .is_some_and(|remaining| remaining.is_zero())
+        );
         let mut stale = (*snapshot(AccountStatus::Active)).clone();
         stale.generation = Generation(2);
         stale.enforcement_mode = EnforcementMode::Elastic {
@@ -1408,7 +1573,8 @@ mod tests {
             .install(Principal(1), Arc::new(stale), slot.clone())
             .unwrap();
         assert!(
-            slot.balance_exhausted(t(0)),
+            slot.funding_evidence(t(0))
+                .is_some_and(|remaining| remaining.is_zero()),
             "a rejected publication cannot invalidate evidence"
         );
     }

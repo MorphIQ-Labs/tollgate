@@ -98,7 +98,8 @@ fn bench_ingest(c: &mut Criterion) {
                         timestamp(0),
                     )
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .grant,
             );
         }
         (admin_pool, schema, store, leases)

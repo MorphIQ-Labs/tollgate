@@ -371,7 +371,8 @@ async fn a_consolidation_folds_the_tail_grant_over_http() {
     let tail = http
         .acquire(ACCOUNT, CostUnits(49), SignedDuration::from_secs(60), at(0))
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(tail.units, CostUnits(49), "49 held, 9 left in the ledger");
 
     let folded = http
@@ -384,7 +385,8 @@ async fn a_consolidation_folds_the_tail_grant_over_http() {
             at(1),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .grant;
     assert_eq!(folded.units, CostUnits(58), "one lease, the whole balance");
     assert_ne!(folded.lease_id, tail.lease_id);
 
@@ -443,14 +445,18 @@ fn held_grant_allocator(
 ) -> Arc<DelegatingStore<tollgate_client::HttpStore>> {
     async fn hold(
         held: &tokio::sync::mpsc::UnboundedSender<HeldGrant>,
-        grant: LeaseGrant,
-    ) -> LeaseGrant {
+        allocation: tollgate_store::Allocation,
+    ) -> tollgate_store::Allocation {
         let (deliver, received) = tokio::sync::oneshot::channel();
-        held.send(HeldGrant { grant, deliver }).unwrap();
+        held.send(HeldGrant {
+            grant: allocation.grant,
+            deliver,
+        })
+        .unwrap();
         received
             .await
             .expect("the test retains the delivery handle");
-        grant
+        allocation
     }
 
     let acquired = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1261,6 +1267,72 @@ async fn authoritative_exhaustion_round_trips_over_http() {
             AllocateError::BalanceExhausted(tollgate_core::BalanceExhaustion { period_end })
         );
     }
+    let _ = stop_tx.send(());
+    server.await.unwrap().unwrap();
+}
+
+/// Grants carry their funding evidence over the wire, and an attested
+/// shortfall keeps the `insufficient-balance` code with its extension.
+#[tokio::test]
+async fn shortfall_evidence_round_trips_over_http() {
+    let store = MemoryStore::new(GrantPolicy {
+        shrink_divisor: 1,
+        ..GrantPolicy::default()
+    })
+    .unwrap();
+    store.create_account(AccountConfig {
+        account_id: ACCOUNT,
+        initial_balance: CostUnits(10),
+        status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
+    });
+    let clock = Arc::new(tollgate_client::ManualClock::new(at(0)));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerState {
+            security: common::security(),
+            issuer: None,
+            store: store.clone(),
+            clock,
+        },
+        std::time::Duration::from_secs(60),
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
+    let http = common::http(format!("http://{address}"));
+    let ttl = SignedDuration::from_secs(60);
+    let evidence = tollgate_core::BalanceShortfall {
+        remaining: CostUnits(10),
+        period_end: None,
+    };
+    let held = http
+        .acquire(ACCOUNT, CostUnits(10), ttl, at(0))
+        .await
+        .unwrap();
+    assert_eq!(held.funding, Some(evidence));
+    assert_eq!(
+        http.acquire(ACCOUNT, CostUnits(252), ttl, at(0))
+            .await
+            .unwrap_err(),
+        AllocateError::BalanceInsufficient(evidence)
+    );
+    let folded = http
+        .consolidate(
+            held.grant.lease_id,
+            held.grant.fencing_token,
+            held.grant.units,
+            CostUnits(252),
+            ttl,
+            at(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(folded.grant.units, CostUnits(10));
+    assert_eq!(folded.funding, Some(evidence));
     let _ = stop_tx.send(());
     server.await.unwrap().unwrap();
 }

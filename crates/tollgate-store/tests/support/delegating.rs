@@ -32,10 +32,10 @@ use tokio::sync::broadcast;
 
 use tollgate_core::{
     AccountId, AccountStatus, BudgetSchedule, CapacityClass, CostUnits, FencingToken, KeyId,
-    LeaseGrant, LeaseId, Principal, PublishableSnapshot, UsageEvent,
+    LeaseId, Principal, PublishableSnapshot, UsageEvent,
 };
 use tollgate_store::{
-    AccountConfig, AccountView, AdminReceipt, AdminStore, AllocateError, BudgetError,
+    AccountConfig, AccountView, AdminReceipt, AdminStore, AllocateError, Allocation, BudgetError,
     CreateAccountError, CredentialActivity, IngestError, IngestReport, KeyDirectory, KeyError,
     KeyPage, KeyRecord, KeySource, KeySummary, LeaseAllocator, PublishSnapshotError, ReclaimBatch,
     ReclaimedLease, Revocation, RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution,
@@ -64,7 +64,7 @@ type SyncHook<S, R> = Arc<dyn Fn(Arc<S>) -> R + Send + Sync + 'static>;
 // reads as a list of methods, and so `clippy::type_complexity` has a name to
 // point at instead of a nested `Option<Arc<dyn Fn(..) -> Pin<Box<..>>>>`.
 type AcquireHook<S> =
-    Hook<S, (AccountId, CostUnits, SignedDuration, Timestamp), Result<LeaseGrant, AllocateError>>;
+    Hook<S, (AccountId, CostUnits, SignedDuration, Timestamp), Result<Allocation, AllocateError>>;
 type ReleaseHook<S> =
     Hook<S, (LeaseId, FencingToken, CostUnits, Timestamp), Result<(), AllocateError>>;
 type ConsolidateHook<S> = Hook<
@@ -77,7 +77,7 @@ type ConsolidateHook<S> = Hook<
         SignedDuration,
         Timestamp,
     ),
-    Result<LeaseGrant, AllocateError>,
+    Result<Allocation, AllocateError>,
 >;
 type ReclaimExpiredBatchHook<S> =
     Hook<S, (Timestamp, NonZeroUsize), Result<ReclaimBatch, StoreError>>;
@@ -201,7 +201,7 @@ impl<S: Send + Sync + 'static> DelegatingStore<S> {
             + Send
             + Sync
             + 'static,
-        Fut: Future<Output = Result<LeaseGrant, AllocateError>> + Send + 'static,
+        Fut: Future<Output = Result<Allocation, AllocateError>> + Send + 'static,
     {
         self.acquire = Some(Arc::new(move |inner, (account, requested, ttl, now)| {
             Box::pin(f(inner, account, requested, ttl, now))
@@ -238,7 +238,7 @@ impl<S: Send + Sync + 'static> DelegatingStore<S> {
             + Send
             + Sync
             + 'static,
-        Fut: Future<Output = Result<LeaseGrant, AllocateError>> + Send + 'static,
+        Fut: Future<Output = Result<Allocation, AllocateError>> + Send + 'static,
     {
         self.consolidate = Some(Arc::new(
             move |inner, (lease_id, fencing_token, unspent, requested, ttl, now)| {
@@ -549,7 +549,7 @@ where
         requested: CostUnits,
         ttl: SignedDuration,
         now: Timestamp,
-    ) -> Result<LeaseGrant, AllocateError> {
+    ) -> Result<Allocation, AllocateError> {
         match &self.acquire {
             Some(hook) => hook(Arc::clone(&self.inner), (account, requested, ttl, now)).await,
             None => LeaseAllocator::acquire(&*self.inner, account, requested, ttl, now).await,
@@ -585,7 +585,7 @@ where
         requested: CostUnits,
         ttl: SignedDuration,
         now: Timestamp,
-    ) -> Result<LeaseGrant, AllocateError> {
+    ) -> Result<Allocation, AllocateError> {
         match &self.consolidate {
             Some(hook) => {
                 hook(
@@ -928,7 +928,7 @@ impl LeaseAllocator for RejectingStore {
         _requested: CostUnits,
         _ttl: SignedDuration,
         _now: Timestamp,
-    ) -> Result<LeaseGrant, AllocateError> {
+    ) -> Result<Allocation, AllocateError> {
         unreachable!("{}: LeaseAllocator::acquire", self.reason)
     }
 
@@ -950,7 +950,7 @@ impl LeaseAllocator for RejectingStore {
         _requested: CostUnits,
         _ttl: SignedDuration,
         _now: Timestamp,
-    ) -> Result<LeaseGrant, AllocateError> {
+    ) -> Result<Allocation, AllocateError> {
         unreachable!("{}: LeaseAllocator::consolidate", self.reason)
     }
 
