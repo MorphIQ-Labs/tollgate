@@ -1181,6 +1181,7 @@ struct AccountCredit {
 struct ReleasedCredit {
     account: AccountId,
     restored: CostUnits,
+    preserves_funding: bool,
 }
 
 impl AccountCredit {
@@ -1266,6 +1267,7 @@ impl PostgresStore {
         requested: CostUnits,
         expires_at: Timestamp,
         floor: CostUnits,
+        settlement_preserves_funding: bool,
     ) -> Result<LeaseGrant, AllocateError> {
         let row = sqlx::query(
             "SELECT balance, status, next_fence, allowance_balance, period_start_us
@@ -1292,11 +1294,32 @@ impl PostgresStore {
         // earlier in this same transaction, so a floor can only re-select
         // capacity the account demonstrably has, and an account with
         // nothing left still refuses.
-        let granted = self
-            .policy
-            .grant(requested, balance)
-            .ok_or(AllocateError::InsufficientBalance)?
-            .max(floor.min(balance));
+        let granted = match self.policy.grant(requested, balance) {
+            Some(granted) => granted.max(floor.min(balance)),
+            None => {
+                // A refused consolidation rolls its settlement back. Only
+                // attest when that settlement did not remove funding itself.
+                if settlement_preserves_funding && !requested.is_zero() {
+                    let budget = sqlx::query(
+                        "SELECT account_id, deposited, overage_recorded, usage_recorded,
+                                settlement_loss, expired, budget_allowance, budget_period,
+                                budget_rollover, period_start_us
+                         FROM tollgate_accounts WHERE account_id = $1",
+                    )
+                    .bind(id_bytes(account.0))
+                    .fetch_one(&mut **tx)
+                    .await
+                    .map_err(alloc_storage)?;
+                    if let Some(evidence) = budget_view(&budget)
+                        .map_err(AllocateError::Storage)?
+                        .exhaustion()
+                    {
+                        return Err(AllocateError::BalanceExhausted(evidence));
+                    }
+                }
+                return Err(AllocateError::InsufficientBalance);
+            }
+        };
         // Allowance first: the units with an expiry date are spent
         // before the manual credits sitting beside them, and the lease
         // remembers the split so settlement can return each half to where
@@ -1452,6 +1475,7 @@ impl PostgresStore {
         .map_err(alloc_storage)?;
         Ok(ReleasedCredit {
             account,
+            preserves_funding: loss == 0 && restored == unspent_i,
             restored: to_units(restored, "restored release credit")
                 .map_err(AllocateError::Storage)?,
         })
@@ -1485,7 +1509,14 @@ impl LeaseAllocator for PostgresStore {
         let expires_at = self.grant_expiry(ttl, now)?;
         let mut tx = self.pool.begin().await.map_err(alloc_storage)?;
         let result = self
-            .acquire_in_tx(&mut tx, account, requested, expires_at, CostUnits::ZERO)
+            .acquire_in_tx(
+                &mut tx,
+                account,
+                requested,
+                expires_at,
+                CostUnits::ZERO,
+                true,
+            )
             .await;
         finish_transaction(tx, result).await
     }
@@ -1534,6 +1565,7 @@ impl LeaseAllocator for PostgresStore {
                 requested,
                 expires_at,
                 released.restored,
+                released.preserves_funding,
             )
             .await
         }

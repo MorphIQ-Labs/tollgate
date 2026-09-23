@@ -216,3 +216,49 @@ Contract:
   usability window* (why leases are released last), and #13 *a committed charge
   is always emitted* (whose process-loss boundary is what your panic boundary
   keeps you inside).
+
+## Funding refusal and retry advice
+
+`DenyReason::BalanceExhausted` means the allocator has confirmed that no account
+funding remains, including units held in leases. Its retry class is `Never`
+under the current funding: callers need a top-up, a changed funding policy, or
+the next budget period. The pricing example returns HTTP 402 with
+`balance-exhausted` and zero charge. Admission still tries available local lease
+and elastic capacity first.
+
+Ordinary lease refusals remain transient/unknown. They do not prove that the
+account is spent, even when the allocator returned `InsufficientBalance`:
+funds can be held elsewhere and return through settlement or expiry. Usage is
+batched, so confirmed exhaustion can lag actual consumption until billing has
+recorded it and the background manager retries. Do not turn an estimated
+remaining balance or a snapshot's old budget view into authoritative exhaustion.
+
+Evidence is shared by all principals and localities of an account. A successful
+new grant clears it; accepted snapshots clear it when the budget view or
+enforcement mode changes. Snapshot maps order generations separately for each
+principal: an accepted change clears account evidence even if its generation is
+below another principal's. Rejected replays and unchanged funding do not clear it.
+A stored period end expires the evidence using caller-supplied admission time,
+even if the allocator response arrives after rollover. Unscheduled balances
+retain evidence until a funding observation invalidates it. Top-ups propagate
+through the normal grant/snapshot loops, not synchronously. Refundable pending
+elastic reservations and an in-flight overage commit retain their transient
+and `AfterInFlight` advice, because they can recover without new funding.
+
+The allocator now returns `AllocateError::BalanceExhausted(BalanceExhaustion)`;
+`InsufficientBalance` keeps its existing, weaker meaning. Exhaustive Rust
+matches need the new variants. Dense counters append `balance_exhausted` without
+renumbering existing reasons. `Problem` and `ApiError` gain an optional
+`balance_exhaustion` field; Rust struct literals need updating. HTTP adds the
+`balance-exhausted` code with an evidence object whose required `period_end`
+is a timestamp or explicit null. Missing/malformed evidence is an operational
+error, never a permanent denial.
+
+Deploy updated HTTP clients before servers. New clients retain transient
+behavior with old servers; old clients treat the new code as an unknown storage
+error and cannot offer the improved advice. No database migration is needed.
+Custom allocators can continue returning `InsufficientBalance` until they can
+establish the stronger ledger fact; do not manufacture evidence from their
+allocatable balance alone. Local evidence publication uses a mutex only in the
+control plane. Admission adds one atomic load on stable funding refusals and
+no allocation, lock, I/O, or clock read.

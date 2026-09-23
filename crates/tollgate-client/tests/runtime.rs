@@ -2341,3 +2341,45 @@ async fn consolidation_under_a_shrinking_policy_never_returns_less_than_it_folde
         "the policy still caps growth at balance/2; the floor only forbids the downgrade"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn refill_publishes_exhaustion_and_a_topup_clears_it() {
+    let store = store(0);
+    let slot = LeaseSlot::for_account(ACCOUNT);
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let manager =
+        LeaseManager::spawn(store.clone(), slot.clone(), clock, manager_config()).unwrap();
+    settle().await;
+    assert!(slot.balance_exhausted(t(0)));
+    tollgate_store::AdminStore::deposit(&*store, ACCOUNT, CostUnits(100))
+        .await
+        .unwrap();
+    settle().await;
+    assert!(!slot.balance_exhausted(t(0)));
+    assert_eq!(slot.load_observed().unwrap().remaining(), CostUnits(100));
+    manager.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refill_gap_with_credit_held_elsewhere_is_not_exhaustion() {
+    let store = store(100);
+    let held = store
+        .acquire(ACCOUNT, CostUnits(100), SignedDuration::from_secs(60), t(0))
+        .await
+        .unwrap();
+    let slot = LeaseSlot::for_account(ACCOUNT);
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let manager =
+        LeaseManager::spawn(store.clone(), slot.clone(), clock, manager_config()).unwrap();
+    settle().await;
+    assert!(!slot.balance_exhausted(t(0)));
+    assert!(slot.load_observed().is_none());
+    store
+        .release(held.lease_id, held.fencing_token, held.units, t(0))
+        .await
+        .unwrap();
+    settle().await;
+    assert!(slot.load_observed().is_some());
+    assert!(!slot.balance_exhausted(t(0)));
+    manager.shutdown().await;
+}

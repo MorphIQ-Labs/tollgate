@@ -260,6 +260,16 @@ async fn retiring_an_elastic_account_does_not_reset_its_spend_cap() {
     publish(&store, 11, 1, 1, mode);
     let (runtime, handle) = start(&store, config());
     wait(|| handle.readiness(t(100)).is_ready()).await;
+    wait(|| {
+        handle.report().refill.is_some_and(|stats| {
+            stats.acquire_refused[AllocateError::BalanceExhausted(
+                tollgate_core::BalanceExhaustion { period_end: None },
+            )
+            .index()]
+                > 0
+        })
+    })
+    .await;
     charge(&handle, 11, 1, 3);
     store.remove_snapshot(Principal(11));
     wait(|| handle.account_reports(t(100))[0].phase == AccountPhase::Dormant).await;
@@ -270,7 +280,7 @@ async fn retiring_an_elastic_account_does_not_reset_its_spend_cap() {
         .unwrap();
     assert!(matches!(
         context.admit(&[(Op, 3)], handle.recorder().try_reserve().unwrap(), t(100)),
-        Err(tollgate_core::DenyReason::OverageCapExhausted { .. })
+        Err(tollgate_core::DenyReason::BalanceExhausted)
     ));
     charge(&handle, 11, 2, 2);
     assert_eq!(runtime.shutdown().await.unwrap().usage.unwrap().accepted, 2);

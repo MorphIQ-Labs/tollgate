@@ -1111,6 +1111,7 @@ fn deny_response(reason: DenyReason) -> Response {
         DenyReason::LeaseUnavailable | DenyReason::LeaseExpired => {
             (StatusCode::SERVICE_UNAVAILABLE, "quota-unavailable")
         }
+        DenyReason::BalanceExhausted => (StatusCode::PAYMENT_REQUIRED, "balance-exhausted"),
         DenyReason::LeaseExhausted { .. } => (StatusCode::TOO_MANY_REQUESTS, "quota-exhausted"),
         // The local overage cap does not refill, but this reason is observed
         // only after a lease failed to fund the request. The background lease

@@ -133,9 +133,10 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    a stable state, a refusal is
    `OverageCapTemporarilyExhausted`/`Transient` only when refunding all pending
    reservations would make that request fit; otherwise it is stable local
-   `OverageCapExhausted`. Both states are `Transient` at the admission
-   boundary: neither proves central account exhaustion, and an ordinary lease
-   refill can fund the unchanged request. *Tests:*
+   `OverageCapExhausted`. These reasons are `Transient`: neither alone proves
+   central account exhaustion, and an ordinary lease refill can fund the
+   unchanged request. Confirmed exhaustion may replace the committed-cap
+   refusal as described below; refundable occupancy remains transient. *Tests:*
    `pending_overage_is_transient_only_when_its_refund_would_make_room`,
    `overage_retry_class_matches_stable_occupancy`,
    `pending_overage_saturation_is_transient_until_cancel`, and
@@ -149,6 +150,52 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    and
    `an_elastic_lapse_overlapping_a_sibling_publication_reports_an_in_flight_commit`.
    *Proof:* `formal/lean/Tollgate/OveragePublication.lean`.
+
+   **Exhaustion requires ledger evidence.** An allocatable balance of zero
+   does not prove spent funding: another instance may return a lease. Only
+   the allocator's locked ledger, including outstanding units and recorded
+   consumption, produces `BalanceExhaustion`. Unreported consumption remains
+   unknown; a rolled-back consolidation cannot certify exhaustion caused by
+   its uncommitted loss or expiry. Admission uses this evidence only after
+   local lease funding and any elastic fallback fail. Refundable overage and
+   in-flight commits retain their own retry classes. Confirmed exhaustion
+   produces `BalanceExhausted` with `Retry::Never` under the current funding;
+   a new grant or accepted changed funding snapshot invalidates it, as does
+   reaching its stored period boundary. This classification charges no units.
+
+   Enforcement: the allocator owns ledger classification; `FundingAttempt`
+   binds response publication to an identity epoch in the account's
+   `LeaseSlot`. Control-plane publishers serialize; a new grant or changed
+   funding snapshot replaces that identity before clearing the atomic marker.
+   Snapshot maps order generations per principal before publication; the
+   account-shared slot compares only budget and enforcement mode, so an accepted
+   change from any principal invalidates the account's evidence.
+   Restoring the same lease does not clear it. Admission reads one atomic
+   deadline only on a funding refusal, using caller-supplied time. Deadline
+   flooring can discard evidence early, never extend it. No request-path I/O,
+   allocation or blocking lock is added.
+
+   Witnesses: `an_insufficient_balance_recovers_when_another_instance_returns_its_lease`,
+   `an_insufficient_balance_recovers_when_another_instances_lease_is_reclaimed`,
+   `exhaustion_requires_recorded_consumption_and_survives_lease_expiry`,
+   `exhaustion_evidence_names_the_stored_period_and_rollover_restores_funding`,
+   `zero_requested_units_never_produce_exhaustion_evidence`, and
+   `a_refused_consolidation_leaves_the_original_lease_spendable` in both backend
+   suites; `authoritative_exhaustion_classifies_only_failed_local_funding`,
+   `exhausted_evidence_survives_local_expiry_but_not_its_period_end`,
+   `central_exhaustion_does_not_hide_refundable_elastic_capacity`,
+   `exhaustion_is_shared_by_account_and_isolated_from_other_accounts`,
+   `exhaustion_deadlines_are_conservative_at_subsecond_and_domain_boundaries`,
+   `funding_publication_invalidates_late_exhaustion_responses`,
+   `accepted_funding_changes_from_independently_versioned_principals_clear_exhaustion`,
+   `refill_publishes_exhaustion_and_a_topup_clears_it`,
+   `a_rolled_back_consolidation_returns_the_lease_to_the_slot`,
+   `authoritative_exhaustion_round_trips_over_http`,
+   `incomplete_exhaustion_responses_never_become_authoritative`, and
+   `confirmed_balance_exhaustion_allocates_nothing`.
+   Exact ledger and epoch laws: `formal/lean/Tollgate/BalanceExhaustion.lean`.
+   These proofs assume serialized ledger/publication transitions; backend,
+   transport, arithmetic and allocation tests are separate implementation evidence.
 
 2. **Zero charge before execution.** A reservation that never reaches
    `commit_at_execution_start` charges zero units, and its units return to the

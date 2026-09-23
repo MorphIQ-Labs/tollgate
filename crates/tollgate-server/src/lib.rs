@@ -675,6 +675,7 @@ async fn active_keys<S: Backend>(
             code: "credential-source-unavailable",
             title: "credential source is unavailable".into(),
             generation: None,
+            balance_exhaustion: None,
         })?;
     let body = tollgate_store::wire::KeysResponse {
         revision: page.revision(),
@@ -869,6 +870,7 @@ async fn issue_key<S: Backend>(
             code: "entropy-unavailable",
             title: "credential entropy unavailable".into(),
             generation: None,
+            balance_exhaustion: None,
         }
     })?;
     let secret = hex_encode(&minted.secret);
@@ -993,6 +995,7 @@ fn credential_page_limit(limit: Option<usize>) -> Result<std::num::NonZeroUsize,
                 tollgate_store::MAX_KEY_PAGE_LIMIT
             ),
             generation: None,
+            balance_exhaustion: None,
         })
 }
 

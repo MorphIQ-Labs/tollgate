@@ -152,6 +152,12 @@ fn problem_to_allocate(problem: Problem) -> AllocateError {
         "unknown-account" => AllocateError::UnknownAccount,
         "account-inactive" => AllocateError::AccountInactive,
         "insufficient-balance" => AllocateError::InsufficientBalance,
+        "balance-exhausted" => match problem.balance_exhaustion {
+            Some(evidence) if problem.status == 409 => AllocateError::BalanceExhausted(evidence),
+            _ => AllocateError::Storage(StoreError(
+                "exhaustion response lacks valid evidence".into(),
+            )),
+        },
         "invalid-ttl" => AllocateError::InvalidTtl,
         "unknown-lease" => AllocateError::UnknownLease,
         "fenced" => AllocateError::Fenced,
@@ -500,5 +506,31 @@ impl tollgate_store::KeySource for HttpStore {
             body.keys,
             body.next_after,
         )
+    }
+}
+
+#[cfg(test)]
+mod exhaustion_tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_exhaustion_responses_never_become_authoritative() {
+        for body in [
+            r#"{"status":409,"code":"balance-exhausted","title":"empty"}"#,
+            r#"{"status":409,"code":"balance-exhausted","title":"empty","balance_exhaustion":{}}"#,
+            r#"{"status":503,"code":"balance-exhausted","title":"empty","balance_exhaustion":{"period_end":null}}"#,
+        ] {
+            if let Ok(problem) = serde_json::from_str::<Problem>(body) {
+                assert!(matches!(
+                    problem_to_allocate(problem),
+                    AllocateError::Storage(_)
+                ));
+            }
+        }
+        let old = serde_json::from_str::<Problem>(
+            r#"{"status":409,"code":"insufficient-balance","title":"empty"}"#,
+        )
+        .unwrap();
+        assert_eq!(problem_to_allocate(old), AllocateError::InsufficientBalance);
     }
 }

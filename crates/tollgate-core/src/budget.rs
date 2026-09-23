@@ -189,6 +189,37 @@ pub struct BudgetView {
     pub period_end: Option<Timestamp>,
 }
 
+/// Allocator evidence that all account funding has been consumed or lost,
+/// including units held in leases. Missing usage cannot establish this proof.
+/// A period end bounds its validity; no end means an unscheduled balance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct BalanceExhaustion {
+    #[cfg_attr(feature = "serde", serde(deserialize_with = "required_period_end"))]
+    pub period_end: Option<Timestamp>,
+}
+
+#[cfg(feature = "serde")]
+fn required_period_end<'de, D>(deserializer: D) -> Result<Option<Timestamp>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer)
+}
+
+impl BudgetView {
+    /// Called by a store against its transaction's current ledger, never an
+    /// instance's stale snapshot or remaining-balance estimate.
+    #[must_use]
+    pub fn exhaustion(self) -> Option<BalanceExhaustion> {
+        self.balance_at_publish
+            .is_zero()
+            .then_some(BalanceExhaustion {
+                period_end: self.period_end,
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
