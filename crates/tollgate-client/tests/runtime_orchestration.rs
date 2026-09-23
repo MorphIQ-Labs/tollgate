@@ -426,17 +426,19 @@ fn scripted_allocator(
             // Subject to the same injected `invalid_release`: a consolidation
             // is a release and an acquire, so a fixture that refuses one half
             // must refuse it here too.
-            .on_consolidate(move |inner, lease, fence, unspent, requested, ttl, now| {
-                let scripted = Arc::clone(&consolidate);
-                async move {
-                    if scripted.invalid_release {
-                        return Err(AllocateError::InvalidRelease);
+            .on_consolidate(
+                move |inner, lease, fence, unspent, requested, needed, ttl, now| {
+                    let scripted = Arc::clone(&consolidate);
+                    async move {
+                        if scripted.invalid_release {
+                            return Err(AllocateError::InvalidRelease);
+                        }
+                        inner
+                            .consolidate(lease, fence, unspent, requested, needed, ttl, now)
+                            .await
                     }
-                    inner
-                        .consolidate(lease, fence, unspent, requested, ttl, now)
-                        .await
-                }
-            }),
+                },
+            ),
     )
 }
 
@@ -1384,11 +1386,11 @@ fn unanswered_consolidator(
 ) -> Arc<DelegatingStore<MemoryStore>> {
     let committed = Arc::clone(committed);
     Arc::new(DelegatingStore::wrapping(Arc::clone(store)).on_consolidate(
-        move |inner, lease, fence, unspent, requested, ttl, now| {
+        move |inner, lease, fence, unspent, requested, needed, ttl, now| {
             let committed = Arc::clone(&committed);
             async move {
                 let _fresh = inner
-                    .consolidate(lease, fence, unspent, requested, ttl, now)
+                    .consolidate(lease, fence, unspent, requested, needed, ttl, now)
                     .await?;
                 committed.store(true, Ordering::SeqCst);
                 if reply_error {
@@ -1440,10 +1442,12 @@ async fn shutdown_reports_an_unanswered_consolidation_grant() {
     let (runtime, handle, store) = unanswered_consolidation(false).await;
     let stopped = runtime.shutdown().await.unwrap();
     assert!(!stopped.deadline_expired);
+    // The refused 60-unit quote grew the replacement past the policy's 50
+    // (#131); it still holds those units until reclaim.
     assert_eq!(
         store.balance(AccountId(1)),
-        CostUnits(50),
-        "the unanswered replacement still holds 50 units"
+        CostUnits(40),
+        "the unanswered replacement still holds 60 units"
     );
     assert_eq!(
         handle.report().uncertain_acquires,
@@ -1482,7 +1486,7 @@ async fn ambiguous_consolidations_remain_visible_after_a_clean_shutdown() {
             "retirement counts each ambiguous outcome once"
         );
         assert_eq!(handle.account_reports(t(100))[0].uncertain_acquires, 1);
-        assert_eq!(store.balance(AccountId(1)), CostUnits(50));
+        assert_eq!(store.balance(AccountId(1)), CostUnits(40));
         let reclaimed = store.reclaim_expired(t(10_000)).await.unwrap();
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(store.balance(AccountId(1)), CostUnits(100));

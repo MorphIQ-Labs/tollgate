@@ -274,6 +274,7 @@ impl LeaseAllocator for HttpStore {
         fencing_token: FencingToken,
         unspent: CostUnits,
         requested: CostUnits,
+        needed: CostUnits,
         ttl: SignedDuration,
         _now: Timestamp,
     ) -> Result<Allocation, AllocateError> {
@@ -289,6 +290,7 @@ impl LeaseAllocator for HttpStore {
                 fencing_token,
                 unspent,
                 requested,
+                needed,
                 ttl,
             })
             .send()

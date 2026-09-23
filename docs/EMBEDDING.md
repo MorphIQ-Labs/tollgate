@@ -304,3 +304,31 @@ Local evidence publication uses a mutex only in the control plane. Admission
 reads one atomic word on a stable funding refusal when no evidence is live.
 Live evidence is read as a seqlock, four more loads, with no allocation, lock,
 I/O or clock read.
+
+## Grant sizing and large quotes
+
+`GrantPolicy` halves grants near exhaustion by default (`shrink_divisor = 2`),
+so one instance cannot hoard a small balance ahead of demand. A quote larger
+than a lease the policy would grant is still reachable. The lease records the
+largest quote it refused for want of units. The refill plane consolidates the
+lease, and the allocator grows the replacement to that quote when the account's
+restored balance can fund it. The first such request is refused with transient
+`LeaseExhausted` advice, and a retry after the consolidation is funded. Growth
+is at most one refused quote. A quote the account cannot fund does not grow the
+grant; #130's evidence answers it instead.
+
+Consolidation is the safety net, not the steady state. A rising `consolidated`
+count means `target_grant` is undersized against the largest quote the service
+prices.
+
+### Contract changes (#131)
+
+- `LeaseAllocator::consolidate` takes `needed: CostUnits` after `requested`:
+  the largest quote the returned lease refused. Custom allocators should size
+  with `GrantPolicy::consolidation_grant`; passing zero keeps the earlier
+  sizing.
+- `LocalLease::largest_refused_quote` exposes the recorded demand, which is
+  exact at quiescence.
+- `ConsolidateRequest` gains an optional `needed` field, omitted when zero. Old
+  servers ignore it and keep the earlier sizing; old clients omit it. No
+  rollout order or migration is needed.

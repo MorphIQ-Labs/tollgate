@@ -382,6 +382,44 @@ async fn exhausted_quota_returns_429_and_never_overspends() {
     assert!(store.usage_recorded(DEMO_ACCOUNT).get() <= 200);
 }
 
+/// #131 over HTTP: the example halves grants, so 60 units grant 30 and a
+/// 51-unit request is refused once. The refusal-driven consolidation grows the
+/// lease to the refused quote, and the same request is then admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quote_above_half_the_balance_is_funded_after_one_refusal() {
+    let (router, runtime) = build_test_app(60, true).await;
+    wait_ready(&router).await;
+    wait_for_first_grant(&router, 30).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let (status, body) = call(&router, Some(DEMO_API_KEY), price_body(1)).await;
+            match status {
+                StatusCode::OK => {
+                    assert_eq!(body["metadata"]["units_charged"], 51);
+                    break;
+                }
+                StatusCode::TOO_MANY_REQUESTS => {
+                    assert_eq!(body["code"], "quota-exhausted", "{body}");
+                }
+                other => panic!("unexpected status {other}: {body}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a consolidation must grow the lease to the refused quote");
+    assert!(
+        metrics(&router).await["refill"]["acquired"]
+            .as_u64()
+            .unwrap()
+            >= 2,
+        "the first grant and the consolidation that grew it"
+    );
+    let store = runtime.store.clone();
+    runtime.shutdown().await;
+    assert_eq!(store.usage_recorded(DEMO_ACCOUNT), CostUnits(51));
+}
+
 /// #130 over HTTP: funding left, but less than the quote, is 402 and not
 /// retryable at that quote; a top-up admits the same request again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -488,8 +526,17 @@ async fn an_elastic_account_serves_past_its_deposit_and_bills_the_overage() {
                 assert_eq!(body["code"], "overage-cap-exhausted");
                 capacity_unavailable += 1;
             }
+            // Once the credit is spent, the account's own funding decides:
+            // none left, or less than one 51-unit quote (#130). Which one
+            // depends on how far usage has settled when the refusal lands.
             StatusCode::PAYMENT_REQUIRED => {
-                assert_eq!(body["code"], "balance-exhausted");
+                assert!(
+                    matches!(
+                        body["code"].as_str(),
+                        Some("balance-exhausted" | "balance-insufficient")
+                    ),
+                    "{body}"
+                );
                 capacity_unavailable += 1;
             }
             other => panic!("unexpected status {other}: {body}"),
@@ -540,7 +587,8 @@ fn assert_elastic_totals(after: &Value, admitted: u64, on_credit: u64, denied: u
     assert_eq!(after["denied"], denied);
     assert_eq!(
         after["denials"]["overage_cap_exhausted"].as_u64().unwrap()
-            + after["denials"]["balance_exhausted"].as_u64().unwrap(),
+            + after["denials"]["balance_exhausted"].as_u64().unwrap()
+            + after["denials"]["balance_insufficient"].as_u64().unwrap(),
         denied
     );
 }

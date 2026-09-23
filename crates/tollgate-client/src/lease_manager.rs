@@ -1046,6 +1046,8 @@ async fn consolidate_live_lease(
     // Exact: the predicate above establishes that no request can debit or
     // refund, which is the condition `LocalLease::remaining` documents.
     let unspent = live.remaining();
+    // Exact for the same reason: no request can still be refused by it.
+    let needed = live.largest_refused_quote();
     let grant = *live.grant();
     let funding_attempt = slot.funding_attempt();
     counters.acquire_pending.store(true, Ordering::Release);
@@ -1056,6 +1058,7 @@ async fn consolidate_live_lease(
             grant.fencing_token,
             unspent,
             config.target_grant,
+            needed,
             config.lease_ttl,
             clock.now(),
         ),
@@ -1555,6 +1558,7 @@ mod tests {
             _fencing_token: FencingToken,
             _unspent: CostUnits,
             _requested: CostUnits,
+            _needed: CostUnits,
             _ttl: SignedDuration,
             _now: Timestamp,
         ) -> Result<Allocation, AllocateError> {
@@ -1576,6 +1580,7 @@ mod tests {
     struct ConsolidatingAllocator {
         answer: Mutex<Option<Result<Allocation, AllocateError>>>,
         calls: AtomicU64,
+        needed: AtomicU64,
         publish_during_call: Option<Arc<LeaseSlot>>,
     }
 
@@ -1584,6 +1589,7 @@ mod tests {
             Arc::new(Self {
                 answer: Mutex::new(Some(answer)),
                 calls: AtomicU64::new(0),
+                needed: AtomicU64::new(0),
                 publish_during_call: None,
             })
         }
@@ -1617,10 +1623,12 @@ mod tests {
             _fencing_token: FencingToken,
             _unspent: CostUnits,
             _requested: CostUnits,
+            needed: CostUnits,
             _ttl: SignedDuration,
             _now: Timestamp,
         ) -> Result<Allocation, AllocateError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.needed.store(needed.get(), Ordering::SeqCst);
             if let Some(slot) = &self.publish_during_call {
                 assert!(slot.replace(parked_lease(99)).is_none());
             }
@@ -1710,6 +1718,35 @@ mod tests {
         assert_eq!(stats.released, 1, "consolidation settled its predecessor");
         assert!(!harness.counters.acquire_pending());
         assert_eq!(stats.acquired_units, 500);
+    }
+
+    /// #131: the allocator can grow the replacement only to demand it is
+    /// told about, so the plane forwards the largest quote the lease refused.
+    #[tokio::test(start_paused = true)]
+    async fn consolidation_carries_the_refused_quote() {
+        for refusals in [&[][..], &[150, 252, 101][..]] {
+            let harness = Harness::new();
+            let allocator = ConsolidatingAllocator::new(Ok(allocation(2, 500)));
+            let lease = parked_lease(1);
+            for &quote in refusals {
+                assert!(
+                    lease
+                        .try_debit(CostUnits(quote), Timestamp::UNIX_EPOCH)
+                        .is_err()
+                );
+            }
+            let (outcome, _, _) = consolidate_once(
+                Arc::clone(&allocator) as Arc<dyn LeaseAllocator>,
+                &harness,
+                lease,
+            )
+            .await;
+            assert_eq!(outcome, Consolidation::Installed);
+            assert_eq!(
+                allocator.needed.load(Ordering::SeqCst),
+                refusals.iter().copied().max().unwrap_or(0)
+            );
+        }
     }
 
     /// #130: the tail of an account is re-granted by the consolidation floor,

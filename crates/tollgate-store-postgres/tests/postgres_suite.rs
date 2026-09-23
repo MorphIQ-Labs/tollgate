@@ -950,6 +950,7 @@ async fn consolidation_never_grants_less_than_it_folded_in() {
             first.fencing_token,
             first.units,
             CostUnits(100),
+            CostUnits::ZERO,
             TTL,
             t(1),
         )
@@ -997,6 +998,7 @@ async fn consolidation_folds_the_tail_grant_and_the_ledger_into_one_lease() {
             tail.fencing_token,
             tail.units,
             CostUnits(100),
+            CostUnits::ZERO,
             TTL,
             t(1),
         )
@@ -1005,6 +1007,122 @@ async fn consolidation_folds_the_tail_grant_and_the_ledger_into_one_lease() {
         .grant;
     assert_eq!(folded.units, CostUnits(58));
     assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits::ZERO);
+    assert_conserved(&store).await;
+}
+
+/// #131: under the default divisor of 2, 30 held and 30 in the ledger
+/// re-granted as 30 however often a 51-unit quote was refused. A refused
+/// quote the restored balance can fund is demand, and the exchange grows to it.
+#[tokio::test]
+async fn consolidation_grows_to_a_proven_quote_under_a_shrinking_policy() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 60).await else {
+        return;
+    };
+    let held = store
+        .acquire(ACCOUNT, CostUnits(1_000), TTL, t(0))
+        .await
+        .unwrap()
+        .grant;
+    assert_eq!(held.units, CostUnits(30));
+    let same = store
+        .consolidate(
+            held.lease_id,
+            held.fencing_token,
+            held.units,
+            CostUnits(1_000),
+            CostUnits::ZERO,
+            TTL,
+            t(1),
+        )
+        .await
+        .unwrap()
+        .grant;
+    assert_eq!(same.units, CostUnits(30), "without demand, the #109 floor");
+    let grown = store
+        .consolidate(
+            same.lease_id,
+            same.fencing_token,
+            same.units,
+            CostUnits(1_000),
+            CostUnits(51),
+            TTL,
+            t(2),
+        )
+        .await
+        .unwrap()
+        .grant;
+    assert_eq!(grown.units, CostUnits(51));
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(9));
+    assert_conserved(&store).await;
+}
+
+/// Demand the restored balance cannot fund grows nothing: no grant would
+/// serve it, and taking everything would park the balance behind a holder
+/// that still refuses.
+#[tokio::test]
+async fn consolidation_never_grows_past_the_restored_balance() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 60).await else {
+        return;
+    };
+    let held = store
+        .acquire(ACCOUNT, CostUnits(1_000), TTL, t(0))
+        .await
+        .unwrap()
+        .grant;
+    let kept = store
+        .consolidate(
+            held.lease_id,
+            held.fencing_token,
+            held.units,
+            CostUnits(1_000),
+            CostUnits(61),
+            TTL,
+            t(1),
+        )
+        .await
+        .unwrap()
+        .grant;
+    assert_eq!(kept.units, CostUnits(30));
+    assert_eq!(store.balance(ACCOUNT).await.unwrap(), CostUnits(30));
+    assert_conserved(&store).await;
+}
+
+/// Growth takes one proven quote, not the balance: another instance still
+/// acquires from what is left, under the ordinary shrinking policy.
+#[tokio::test]
+async fn growth_leaves_the_rest_for_another_instance() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 100).await else {
+        return;
+    };
+    let held = store
+        .acquire(ACCOUNT, CostUnits(1_000), TTL, t(0))
+        .await
+        .unwrap()
+        .grant;
+    assert_eq!(held.units, CostUnits(50));
+    let grown = store
+        .consolidate(
+            held.lease_id,
+            held.fencing_token,
+            held.units,
+            CostUnits(1_000),
+            CostUnits(70),
+            TTL,
+            t(1),
+        )
+        .await
+        .unwrap()
+        .grant;
+    assert_eq!(grown.units, CostUnits(70));
+    let other = store
+        .acquire(ACCOUNT, CostUnits(1_000), TTL, t(1))
+        .await
+        .unwrap()
+        .grant;
+    assert_eq!(other.units, CostUnits(15), "30 left, halved by the policy");
     assert_conserved(&store).await;
 }
 
@@ -1033,8 +1151,9 @@ async fn a_refused_consolidation_leaves_the_original_lease_spendable() {
                 lease.fencing_token,
                 CostUnits::ZERO,
                 CostUnits(100),
+                CostUnits::ZERO,
                 TTL,
-                t(1),
+                t(1)
             )
             .await
             .unwrap_err(),
@@ -1070,8 +1189,9 @@ async fn consolidating_without_the_lease_capability_moves_no_units() {
                 FencingToken(lease.fencing_token.0 + 7),
                 CostUnits(400),
                 CostUnits(400),
+                CostUnits::ZERO,
                 TTL,
-                t(1),
+                t(1)
             )
             .await
             .unwrap_err(),
@@ -1084,8 +1204,9 @@ async fn consolidating_without_the_lease_capability_moves_no_units() {
                 lease.fencing_token,
                 CostUnits(400),
                 CostUnits(400),
+                CostUnits::ZERO,
                 TTL,
-                t(1),
+                t(1)
             )
             .await
             .unwrap_err(),
@@ -1098,8 +1219,9 @@ async fn consolidating_without_the_lease_capability_moves_no_units() {
                 lease.fencing_token,
                 CostUnits(401),
                 CostUnits(400),
+                CostUnits::ZERO,
                 TTL,
-                t(1),
+                t(1)
             )
             .await
             .unwrap_err(),
@@ -1129,8 +1251,9 @@ async fn a_consolidation_with_an_invalid_ttl_settles_nothing() {
                 lease.fencing_token,
                 CostUnits(400),
                 CostUnits(400),
+                CostUnits::ZERO,
                 SignedDuration::ZERO,
-                t(1),
+                t(1)
             )
             .await
             .unwrap_err(),
@@ -5048,6 +5171,7 @@ async fn consolidating_inside_a_lease_own_period_expires_nothing() {
             lease.fencing_token,
             lease.units,
             CostUnits(500),
+            CostUnits::ZERO,
             TTL,
             t(JAN + 3),
         )
@@ -5107,6 +5231,7 @@ async fn consolidating_across_a_boundary_regrants_only_what_the_credit_restores(
             january.fencing_token,
             CostUnits(600),
             CostUnits(1_000),
+            CostUnits::ZERO,
             LONG,
             t(FEB + 2),
         )
@@ -5156,6 +5281,7 @@ async fn consolidation_after_a_budget_reduction_uses_only_restored_credit_as_flo
             old.fencing_token,
             old.units,
             CostUnits(1_000),
+            CostUnits::ZERO,
             LONG,
             t(FEB + 2),
         )
@@ -6297,6 +6423,7 @@ async fn nanosecond_lease_boundaries_preserve_release_reclaim_and_consolidation(
                 lease.fencing_token,
                 CostUnits(10),
                 CostUnits(10),
+                CostUnits::ZERO,
                 ttl,
                 now,
             )
@@ -6419,6 +6546,7 @@ async fn an_unrepresentable_replacement_expiry_leaves_the_original_grant_untouch
                     lease.fencing_token,
                     CostUnits(10),
                     CostUnits(10),
+                    CostUnits::ZERO,
                     ttl,
                     Timestamp::MAX
                 )
@@ -6910,6 +7038,7 @@ async fn a_partial_balance_refusal_reports_remaining_funding() {
             held.fencing_token,
             CostUnits(1),
             CostUnits(252),
+            CostUnits::ZERO,
             TTL,
             t(1),
         )
@@ -7069,6 +7198,7 @@ async fn exhaustion_requires_recorded_consumption_and_survives_lease_expiry() {
                 held.fencing_token,
                 CostUnits::ZERO,
                 CostUnits(1),
+                CostUnits::ZERO,
                 TTL,
                 t(2)
             )

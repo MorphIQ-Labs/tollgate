@@ -381,6 +381,7 @@ async fn a_consolidation_folds_the_tail_grant_over_http() {
             tail.fencing_token,
             tail.units,
             CostUnits(100),
+            CostUnits::ZERO,
             SignedDuration::from_secs(60),
             at(1),
         )
@@ -475,19 +476,21 @@ fn held_grant_allocator(
                     })
                 }
             })
-            .on_consolidate(move |http, lease, fence, unspent, requested, ttl, now| {
-                let held = on_consolidate.clone();
-                async move {
-                    let grant = http
-                        .consolidate(lease, fence, unspent, requested, ttl, now)
-                        .await?;
-                    Ok(if operation == GrantOperation::Consolidate {
-                        hold(&held, grant).await
-                    } else {
-                        grant
-                    })
-                }
-            }),
+            .on_consolidate(
+                move |http, lease, fence, unspent, requested, needed, ttl, now| {
+                    let held = on_consolidate.clone();
+                    async move {
+                        let grant = http
+                            .consolidate(lease, fence, unspent, requested, needed, ttl, now)
+                            .await?;
+                        Ok(if operation == GrantOperation::Consolidate {
+                            hold(&held, grant).await
+                        } else {
+                            grant
+                        })
+                    }
+                },
+            ),
     )
 }
 
@@ -638,9 +641,9 @@ async fn controlled_shutdown(mode: common::TransportMode) {
             ));
             let mut config = runtime_config(PRINCIPAL);
             // 104 deposited -> 52 granted -> 51 billed, leaving 53 unspent.
-            // A crossing acquires 26 beside the old lease; a refusal folds
-            // its one-unit tail into a 26-unit replacement. Both can leave
-            // exactly the reported 27-versus-53 balance if the reply is lost.
+            // A crossing acquires 26 beside the old lease. A refusal folds its
+            // one-unit tail into a replacement grown to the refused 51-unit
+            // quote (#131). A lost reply leaves 53 less the replacement.
             config.leases.low_water = match operation {
                 GrantOperation::Acquire => CostUnits(51),
                 GrantOperation::Consolidate => CostUnits::ZERO,
@@ -696,7 +699,11 @@ async fn controlled_shutdown(mode: common::TransportMode) {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(held.grant.units, CostUnits(26));
+            let replacement = match operation {
+                GrantOperation::Acquire => 26,
+                GrantOperation::Consolidate => 51,
+            };
+            assert_eq!(held.grant.units, CostUnits(replacement));
             let mut deliver = Some(held.deliver);
             if deliver_result {
                 deliver.take().unwrap().send(()).unwrap();
@@ -722,11 +729,11 @@ async fn controlled_shutdown(mode: common::TransportMode) {
             assert!(stopped.unfinished_accounts.is_empty());
             assert_eq!(
                 ledger.balance,
-                CostUnits(if deliver_result { 53 } else { 27 })
+                CostUnits(if deliver_result { 53 } else { 53 - replacement })
             );
             assert_eq!(
                 ledger.active_lease_grants,
-                CostUnits(if deliver_result { 0 } else { 26 })
+                CostUnits(if deliver_result { 0 } else { replacement })
             );
             // Expiry alone is not enough: the allocator also promises grace.
             assert!(
@@ -756,7 +763,7 @@ async fn controlled_shutdown(mode: common::TransportMode) {
             assert_eq!(reclaimed.len(), usize::from(!deliver_result));
             if !deliver_result {
                 assert_eq!(reclaimed[0].lease_id, held.grant.lease_id);
-                assert_eq!(reclaimed[0].reclaimed, CostUnits(26));
+                assert_eq!(reclaimed[0].reclaimed, CostUnits(replacement));
             }
             assert_eq!(
                 handle.report().uncertain_acquires,
@@ -921,10 +928,15 @@ async fn full_stack(mode: common::TransportMode) {
                     round_commits += 1;
                     drop(committed);
                 }
+                // Spending an account down ends in lease refusals and, once the
+                // allocator has attested what is left, funding refusals (#130).
+                // All are zero-charge.
                 Err(
                     DenyReason::LeaseUnavailable
                     | DenyReason::LeaseExhausted { .. }
-                    | DenyReason::LeaseExpired,
+                    | DenyReason::LeaseExpired
+                    | DenyReason::BalanceExhausted
+                    | DenyReason::BalanceInsufficient { .. },
                 ) => {}
                 Err(other) => panic!("unexpected deny: {other}"),
             }
@@ -1326,6 +1338,7 @@ async fn shortfall_evidence_round_trips_over_http() {
             held.grant.fencing_token,
             held.grant.units,
             CostUnits(252),
+            CostUnits::ZERO,
             ttl,
             at(0),
         )
@@ -1333,6 +1346,60 @@ async fn shortfall_evidence_round_trips_over_http() {
         .unwrap();
     assert_eq!(folded.grant.units, CostUnits(10));
     assert_eq!(folded.funding, Some(evidence));
+    let _ = stop_tx.send(());
+    server.await.unwrap().unwrap();
+}
+
+/// #131 over the wire: the refused quote reaches the server's allocator, and
+/// the default shrinking policy grows the replacement to it.
+#[tokio::test]
+async fn consolidation_needed_round_trips_over_http() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    store.create_account(AccountConfig {
+        account_id: ACCOUNT,
+        initial_balance: CostUnits(60),
+        status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
+    });
+    let clock = Arc::new(tollgate_client::ManualClock::new(at(0)));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerState {
+            security: common::security(),
+            issuer: None,
+            store: store.clone(),
+            clock,
+        },
+        std::time::Duration::from_secs(60),
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
+    let http = common::http(format!("http://{address}"));
+    let ttl = SignedDuration::from_secs(60);
+    let held = http
+        .acquire(ACCOUNT, CostUnits(1_000), ttl, at(0))
+        .await
+        .unwrap()
+        .grant;
+    assert_eq!(held.units, CostUnits(30));
+    let grown = http
+        .consolidate(
+            held.lease_id,
+            held.fencing_token,
+            held.units,
+            CostUnits(1_000),
+            CostUnits(51),
+            ttl,
+            at(0),
+        )
+        .await
+        .unwrap()
+        .grant;
+    assert_eq!(grown.units, CostUnits(51));
     let _ = stop_tx.send(());
     server.await.unwrap().unwrap();
 }

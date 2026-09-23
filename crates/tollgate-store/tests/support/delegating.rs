@@ -74,6 +74,7 @@ type ConsolidateHook<S> = Hook<
         FencingToken,
         CostUnits,
         CostUnits,
+        CostUnits,
         SignedDuration,
         Timestamp,
     ),
@@ -232,6 +233,7 @@ impl<S: Send + Sync + 'static> DelegatingStore<S> {
                 FencingToken,
                 CostUnits,
                 CostUnits,
+                CostUnits,
                 SignedDuration,
                 Timestamp,
             ) -> Fut
@@ -241,13 +243,14 @@ impl<S: Send + Sync + 'static> DelegatingStore<S> {
         Fut: Future<Output = Result<Allocation, AllocateError>> + Send + 'static,
     {
         self.consolidate = Some(Arc::new(
-            move |inner, (lease_id, fencing_token, unspent, requested, ttl, now)| {
+            move |inner, (lease_id, fencing_token, unspent, requested, needed, ttl, now)| {
                 Box::pin(f(
                     inner,
                     lease_id,
                     fencing_token,
                     unspent,
                     requested,
+                    needed,
                     ttl,
                     now,
                 ))
@@ -583,6 +586,7 @@ where
         fencing_token: FencingToken,
         unspent: CostUnits,
         requested: CostUnits,
+        needed: CostUnits,
         ttl: SignedDuration,
         now: Timestamp,
     ) -> Result<Allocation, AllocateError> {
@@ -590,7 +594,15 @@ where
             Some(hook) => {
                 hook(
                     Arc::clone(&self.inner),
-                    (lease_id, fencing_token, unspent, requested, ttl, now),
+                    (
+                        lease_id,
+                        fencing_token,
+                        unspent,
+                        requested,
+                        needed,
+                        ttl,
+                        now,
+                    ),
                 )
                 .await
             }
@@ -601,6 +613,7 @@ where
                     fencing_token,
                     unspent,
                     requested,
+                    needed,
                     ttl,
                     now,
                 )
@@ -948,6 +961,7 @@ impl LeaseAllocator for RejectingStore {
         _fencing_token: FencingToken,
         _unspent: CostUnits,
         _requested: CostUnits,
+        _needed: CostUnits,
         _ttl: SignedDuration,
         _now: Timestamp,
     ) -> Result<Allocation, AllocateError> {

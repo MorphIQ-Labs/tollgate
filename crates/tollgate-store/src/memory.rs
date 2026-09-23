@@ -782,6 +782,7 @@ fn plan_grant(
     account: AccountId,
     requested: CostUnits,
     incoming: CostUnits,
+    needed: CostUnits,
     attest_refusal: bool,
 ) -> Result<GrantPlan, AllocateError> {
     let next_lease_id = inner
@@ -800,12 +801,12 @@ fn plan_grant(
         .total()
         .checked_add(incoming)
         .ok_or_else(|| AllocateError::Storage(StoreError("account balance overflow".into())))?;
-    // The floor is applied to the policy's answer, never to the balance test:
-    // an account with nothing left still refuses, and `incoming` is capped by
-    // the balance it is part of, so a floor can only re-select capacity the
-    // account demonstrably has.
+    // The floor and demand are applied to the policy's answer, never to the
+    // balance test: an account with nothing left still refuses, and both are
+    // capped by the balance `incoming` is part of, so they can only re-select
+    // capacity the account demonstrably has.
     let granted = policy
-        .grant(requested, balance)
+        .consolidation_grant(requested, balance, incoming, needed)
         .ok_or_else(|| {
             // A refused consolidation's settlement never applies. Attest
             // only where that settlement would not itself have removed
@@ -815,8 +816,7 @@ fn plan_grant(
                 return AllocateError::InsufficientBalance;
             }
             funding_refusal(record.budget_view().shortfall())
-        })?
-        .max(incoming.min(balance));
+        })?;
     let next_fence = record
         .next_fence
         .checked_add(1)
@@ -905,6 +905,7 @@ impl LeaseAllocator for MemoryStore {
             account,
             requested,
             CostUnits::ZERO,
+            CostUnits::ZERO,
             true,
         )?;
         let grant = apply_grant(&mut inner, account, plan, expires_at);
@@ -930,6 +931,7 @@ impl LeaseAllocator for MemoryStore {
         fencing_token: FencingToken,
         unspent: CostUnits,
         requested: CostUnits,
+        needed: CostUnits,
         ttl: SignedDuration,
         now: Timestamp,
     ) -> Result<Allocation, AllocateError> {
@@ -957,6 +959,7 @@ impl LeaseAllocator for MemoryStore {
             account,
             requested,
             restored,
+            needed,
             preserves_funding,
         )?;
 

@@ -188,11 +188,25 @@ pub struct ConsolidateRequest {
     pub fencing_token: FencingToken,
     pub unspent: CostUnits,
     pub requested: CostUnits,
+    /// The largest quote the returned lease refused (#131). Omitted when
+    /// zero, so a server that predates it sees the request it always did;
+    /// absent from an older client, it reads as zero: today's sizing.
+    #[serde(default, skip_serializing_if = "no_demand")]
+    pub needed: CostUnits,
     #[serde(flatten)]
     pub ttl: LeaseTtl,
 }
 
 pub type ConsolidateResponse = crate::Allocation;
+
+// Serde passes a reference; `CostUnits::is_zero` takes the value.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn no_demand(units: &CostUnits) -> bool {
+    units.is_zero()
+}
 
 /// The owned form, which the server needs: axum's `Json<T>` extractor requires
 /// `DeserializeOwned`, so the receiving side cannot borrow from the body.
@@ -310,6 +324,29 @@ mod tests {
     use tollgate_core::PolicyRevision;
     use tollgate_core::RequestId;
     use tollgate_core::UsageSource;
+
+    /// #131's demand field changes nothing on the wire until it is used: an
+    /// older server never sees it at zero, and an older client's request
+    /// reads as zero.
+    #[test]
+    fn consolidation_demand_is_invisible_until_used() {
+        let request = |needed| ConsolidateRequest {
+            lease_id: LeaseId(1),
+            fencing_token: FencingToken(1),
+            unspent: CostUnits(30),
+            requested: CostUnits(1_000),
+            needed: CostUnits(needed),
+            ttl: LeaseTtl::try_from(SignedDuration::from_secs(60)).unwrap(),
+        };
+        let idle = serde_json::to_value(request(0)).unwrap();
+        assert!(idle.get("needed").is_none(), "{idle}");
+        let old: ConsolidateRequest = serde_json::from_value(idle).unwrap();
+        assert_eq!(old.needed, CostUnits::ZERO);
+        let demand = serde_json::to_value(request(51)).unwrap();
+        assert_eq!(demand["needed"], 51);
+        let parsed: ConsolidateRequest = serde_json::from_value(demand).unwrap();
+        assert_eq!(parsed.needed, CostUnits(51));
+    }
 
     fn event(seq: u128) -> UsageEvent {
         UsageEvent::new(

@@ -466,6 +466,11 @@ struct LeaseInner {
     /// doorbell's once-token, which is why a refusal wakes the plane even
     /// when a low-water crossing already spent this lease's shard flags.
     refused: AtomicBool,
+    /// The largest quote this lease refused for want of units: the demand a
+    /// consolidation may grow to (#131). Raised before the doorbell's swap,
+    /// which publishes it, and read by the plane only at quiescence. Zero
+    /// until a refusal, and never set by an expiry refusal, which rotates.
+    refused_quote: AtomicU64,
     /// Local end of life: `expires_at - safety margin`. Debits and commits
     /// stop here, *before* the server-stamped expiry, so clock skew between
     /// allocator and holder plus in-flight request time fit inside the
@@ -537,6 +542,7 @@ impl LocalLease {
                 balance: LeaseBalance::Single(LeaseShard::new(grant.units.get(), low_water.get())),
                 low_water: low_water.get(),
                 refused: AtomicBool::new(false),
+                refused_quote: AtomicU64::new(0),
                 usable_until,
                 refill: OnceLock::new(),
                 grant,
@@ -577,6 +583,7 @@ impl LocalLease {
                 refill: OnceLock::new(),
                 low_water: low_water.get(),
                 refused: AtomicBool::new(false),
+                refused_quote: AtomicU64::new(0),
                 usable_until,
             }),
         }
@@ -630,6 +637,16 @@ impl LocalLease {
     /// missed. Hence the clamp: the sum can exceed the grant, so it is
     /// saturated and bounded rather than asserted, and no reader of a live
     /// lease may treat the result as an exact balance.
+    /// The largest quote this lease refused for want of units, or zero.
+    ///
+    /// Demand the refill plane has proof of: a consolidation may grow the
+    /// replacement to it when the account can fund it (#131). Exact only once
+    /// the lease has quiesced, the same condition [`Self::remaining`] needs.
+    #[must_use]
+    pub fn largest_refused_quote(&self) -> CostUnits {
+        CostUnits(self.inner.refused_quote.load(Ordering::Acquire))
+    }
+
     #[must_use]
     pub fn remaining(&self) -> CostUnits {
         let remaining = self
@@ -759,7 +776,9 @@ impl LocalLease {
 
         self.credit_to(first, want - needed);
         // Reported after the rollback, so the plane that answers this refusal
-        // reads the restored aggregate rather than a torn one.
+        // reads the restored aggregate rather than a torn one. The quote is
+        // raised first so the doorbell's release carries it.
+        self.inner.refused_quote.fetch_max(want, Ordering::Relaxed);
         self.signal_refusal();
         Err(DenyReason::LeaseExhausted {
             remaining: self.remaining(),
@@ -1442,6 +1461,32 @@ mod tests {
             CostUnits(49),
             "a refusal is still zero-charge"
         );
+    }
+
+    /// #131: a consolidation may grow only to demand the lease has proven, so
+    /// the refusal records its quote, keeps the largest across a storm, and an
+    /// expiry refusal records nothing because it rotates rather than folds.
+    #[test]
+    fn a_refused_debit_records_its_largest_quote() {
+        for l in [lease(49, 1_000, 25), sharded_lease(49, 25, 4)] {
+            assert_eq!(l.largest_refused_quote(), CostUnits::ZERO);
+            for quote in [51, 90, 60] {
+                assert!(l.try_debit(CostUnits(quote), t(0)).is_err());
+            }
+            assert_eq!(l.largest_refused_quote(), CostUnits(90));
+            l.try_debit(CostUnits(10), t(0)).unwrap();
+            assert_eq!(
+                l.largest_refused_quote(),
+                CostUnits(90),
+                "a funded debit is not demand the grant failed"
+            );
+        }
+        let expired = lease(49, 1_000, 25);
+        assert!(matches!(
+            expired.try_debit(CostUnits(51), t(1_000)),
+            Err(DenyReason::LeaseExpired)
+        ));
+        assert_eq!(expired.largest_refused_quote(), CostUnits::ZERO);
     }
 
     /// The doorbell is rung once however hard the caller retries: the plane's

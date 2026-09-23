@@ -128,7 +128,7 @@ proptest! {
 
         let consolidate = ConsolidateRequest {
             lease_id: LeaseId(1), fencing_token: FencingToken(1),
-            unspent: CostUnits(10), requested: CostUnits(10), ttl,
+            unspent: CostUnits(10), requested: CostUnits(10), needed: CostUnits::ZERO, ttl,
         };
         let consolidate: ConsolidateRequest =
             serde_json::from_slice(&serde_json::to_vec(&consolidate).unwrap()).unwrap();

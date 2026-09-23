@@ -590,6 +590,7 @@ async fn consolidate<S: Backend>(
             request.fencing_token,
             request.unspent,
             request.requested,
+            request.needed,
             request.ttl.duration()?,
             state.clock.now(),
         )
