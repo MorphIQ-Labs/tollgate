@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.26.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.25.1...v0.26.0) - 2026-09-23
+
+### Fixed
+
+- *(allocator)* [**breaking**] #131 grow consolidation to a proven quote
+
 ## [0.25.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.25.0...v0.25.1) - 2026-09-23
 
 ### Other

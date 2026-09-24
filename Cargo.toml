@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.25.1"
+version = "0.26.0"
 edition = "2024"
 rust-version = "1.89"
 authors = ["MorphIQ Labs"]
@@ -45,7 +45,7 @@ proc-macro2 = "1"
 criterion = "0.5"
 proptest = "1.7"
 tempfile = "3"
-tollgate-alloc-count = { path = "crates/tollgate-alloc-count", version = "=0.25.1" }
+tollgate-alloc-count = { path = "crates/tollgate-alloc-count", version = "=0.26.0" }
 # Axum/tower test scaffolding: `oneshot` against a built router, and the body
 # collector that reads its response. Dev-only in every member that takes them.
 http-body-util = "0.1"
