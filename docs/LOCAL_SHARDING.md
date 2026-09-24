@@ -1,7 +1,14 @@
 # Instance-local sharding
 
 Opt-in. The default, `LocalSharding::SINGLE`, is one shard and this document
-does not apply to it.
+does not apply to it — with one exception. The engine's outcome tallies
+(`AdmissionCounters`) are one set per instance, shared by every account, so
+they are partitioned per locality under every layout, including the default:
+at least as finely as the lease layout and the host's parallelism, as a power
+of two (#132). `AdmissionCounters::local_sharding` reports that layout. It
+carries none of the condition below, because a tally is a sum however it is
+split — two threads that share a tally shard cost each other contention, never
+correctness.
 
 ## What it buys, and the condition attached
 

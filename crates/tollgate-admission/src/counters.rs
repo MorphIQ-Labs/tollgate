@@ -5,8 +5,8 @@
 //! from outside. The control plane closes that gap with structured events,
 //! but this plane cannot — INVARIANTS.md #5 forbids I/O, locks and clock
 //! reads on the request path, and a logging call is all three. What remains
-//! affordable is a counter: no allocation, no formatting, and only the fixed
-//! single-vs-sharded layout branch selected at engine construction.
+//! affordable is a counter: no allocation, no formatting, and a shard index
+//! that is a mask fixed at engine construction.
 //!
 //! [`DenyReason`] is a closed enum, so the tally is a fixed array indexed by
 //! [`DenyReason::index`] — never a map, never a string key. That is what
@@ -159,68 +159,52 @@ impl CommitRefusal {
 /// admissions a second the `admitted` counter would need roughly 584 years to
 /// reach the wrap; adding a branch on the request path to guard against it
 /// would cost more than it could ever save.
+///
 /// # Layout
 ///
-/// `repr(C)`, so the declaration order below *is* the layout. Without it the
-/// compiler arranges the fields however it likes, and adding one silently
-/// rearranges the rest — which is not theoretical: #99's two per-class arrays
-/// moved the request-path counters and cost `admission/full_check` 3.5%
-/// (122.30 ns to 126.55 ns, three runs each on the controlled host) while
-/// touching no code that benchmark executes. Restoring the order gave all of
-/// it back.
+/// The counters every request touches — `admitted`, `units_admitted`, the
+/// denial slots, and the execution-start and pre-start-cancel transitions —
+/// live in per-locality shards under **every** lease layout. One
+/// instance serves every account in the map, so an unsharded tally is a
+/// cache line that unrelated tenants fight over: eight threads on eight
+/// distinct accounts measured 772 ns per admission against the inline
+/// counters and 181 ns with only the counters sharded (#132). Lease sharding
+/// stays opt-in because splitting a grant strands headroom; a monitoring
+/// total is a sum however it is split, so the counters carry no such cost.
 ///
-/// So the arrangement below is *calibrated*, not derived: it is the order the
-/// recorded baselines were measured against, and new counters are appended
-/// after every field that predates them rather than filed next to the ones
-/// they relate to. Hoisting the two per-request counters to the front was
-/// tried and measured 1.5% worse than leaving them where they are, which is
-/// the point — this is not a layout to reason about from first principles.
-/// The padding buys false-sharing isolation between counters; `repr(C)` is
-/// what stops the arrangement itself from being a lottery each new field
-/// re-enters.
+/// The shard count is the larger of the lease sharding and the host's
+/// parallelism, rounded up to a power of two so the locality reduction is
+/// always a mask. It is fixed at construction and never read by a policy
+/// decision.
+///
+/// The fields below are the bounded exceptions — overage, sheds, abandoned
+/// contexts, commit refusals — which stay inline because their paths either
+/// already serialize on a shared compare-exchange or run far below the
+/// admission rate. `repr(C)` keeps their declaration order the layout, so a
+/// new counter cannot silently rearrange the rest (#99 measured a 3.5%
+/// `full_check` swing from a rearrangement alone); append new fields after
+/// every field that predates them.
 #[derive(Debug)]
 #[repr(C)]
 pub struct AdmissionCounters {
-    admitted: Padded,
-    units_admitted: Padded,
+    shards: Box<[CounterShard]>,
+    layout: LocalSharding,
     admitted_overage: Padded,
     units_admitted_overage: Padded,
-    denials: [Padded; DenyReason::COUNT],
-    // Post-admission phase outcomes (INVARIANTS.md #20). None of these touch
-    // `denials`: a request counted here was already counted under `admitted`,
-    // and adding it to the pre-admission refusal total a second time would
-    // give one request two contradictory identities.
-    //
-    // `execution_started` and `canceled_before_start` shard with `admitted`,
-    // because every request reaches exactly one of them and they run at the
-    // same rate as admission itself. The rest stay inline: a shed, an
-    // abandoned context, a commit refusal, and a commit-time fallback are
-    // bounded exceptions, and the fallback already serializes on the overage
-    // counter's own compare-exchange one step earlier.
-    // The sharded layout keeps these two in `CounterShard`; these inline
-    // copies serve the single-locality layout, exactly as `admitted` does.
-    execution_started: Padded,
-    canceled_before_start: Padded,
     contexts_abandoned: Padded,
     capacity_shed: Padded,
     committed_at_overage: Padded,
     units_committed_at_overage: Padded,
     commit_refusals: [Padded; CommitRefusal::COUNT],
-    /// The per-class breakdown of the two capacity outcomes (#99).
-    ///
-    /// Two classes, so a small dense array rather than a `DenyReason`-shaped
-    /// table — the reasoning `CommitRefusal` records. Inline rather than
-    /// sharded: a shed is a bounded exception, and an execution start already
-    /// shards through `execution_started`, so these carry the *breakdown*
-    /// beside totals that are already partitioned.
+    /// The per-class breakdown of capacity sheds (#99). Inline: a shed is a
+    /// bounded exception. The per-class *starts* shard with the start total,
+    /// because every executed request bumps one.
     capacity_shed_by_class: [Padded; CAPACITY_CLASS_COUNT],
-    execution_started_by_class: [Padded; CAPACITY_CLASS_COUNT],
-    shards: Option<Box<[CounterShard]>>,
 }
 
-/// One locality's complete tally. Different localities never share a cache
-/// line; counters within one locality are deliberately compact because the
-/// same request updates them.
+/// One locality's complete per-request tally. Different localities never
+/// share a cache line; counters within one locality are deliberately compact
+/// because the same request updates them.
 #[repr(align(128))]
 #[derive(Debug)]
 struct CounterShard {
@@ -229,6 +213,7 @@ struct CounterShard {
     execution_started: AtomicU64,
     canceled_before_start: AtomicU64,
     denials: [AtomicU64; DenyReason::COUNT],
+    execution_started_by_class: [AtomicU64; CAPACITY_CLASS_COUNT],
 }
 
 impl CounterShard {
@@ -239,61 +224,75 @@ impl CounterShard {
             execution_started: AtomicU64::new(0),
             canceled_before_start: AtomicU64::new(0),
             denials: std::array::from_fn(|_| AtomicU64::new(0)),
+            execution_started_by_class: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
 
+/// Relaxed throughout: nothing is published through these counters, so no
+/// other memory needs to become visible with them. Atomicity still holds —
+/// concurrent increments never lose an update.
+#[inline]
+fn bump(counter: &AtomicU64, by: u64) {
+    counter.fetch_add(by, Ordering::Relaxed);
+}
+
+/// Wrapping, for the reason the type docs give.
+fn sum(shards: &[CounterShard], read: impl Fn(&CounterShard) -> &AtomicU64) -> u64 {
+    shards.iter().fold(0u64, |total, shard| {
+        total.wrapping_add(read(shard).load(Ordering::Relaxed))
+    })
+}
+
 impl AdmissionCounters {
+    /// Counters for the default single-locality lease layout.
     #[must_use]
-    pub const fn new() -> Self {
-        AdmissionCounters {
-            admitted: Padded::zero(),
-            units_admitted: Padded::zero(),
+    pub fn new() -> Self {
+        Self::with_sharding(LocalSharding::SINGLE)
+    }
+
+    /// Counters for an engine whose leases use `sharding`. The counters shard
+    /// at least that finely, and at least as finely as the host's parallelism.
+    #[must_use]
+    pub fn with_sharding(sharding: LocalSharding) -> Self {
+        Self::with_layout(counter_layout(
+            sharding,
+            LocalSharding::available_parallelism(),
+        ))
+    }
+
+    fn with_layout(layout: LocalSharding) -> Self {
+        Self {
+            shards: (0..layout.get())
+                .map(|_| CounterShard::zero())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            layout,
             admitted_overage: Padded::zero(),
             units_admitted_overage: Padded::zero(),
-            denials: [const { Padded::zero() }; DenyReason::COUNT],
-            execution_started: Padded::zero(),
-            canceled_before_start: Padded::zero(),
             contexts_abandoned: Padded::zero(),
             capacity_shed: Padded::zero(),
-            capacity_shed_by_class: [const { Padded::zero() }; CAPACITY_CLASS_COUNT],
-            execution_started_by_class: [const { Padded::zero() }; CAPACITY_CLASS_COUNT],
             committed_at_overage: Padded::zero(),
             units_committed_at_overage: Padded::zero(),
             commit_refusals: [const { Padded::zero() }; CommitRefusal::COUNT],
-            shards: None,
+            capacity_shed_by_class: [const { Padded::zero() }; CAPACITY_CLASS_COUNT],
         }
     }
 
-    /// Create counters partitioned by the same sticky locality used by lease
-    /// and rate state. One shard preserves the inline historical layout.
+    /// How the per-request tallies are partitioned: at least as finely as
+    /// the leases and the host's parallelism, as a power of two.
+    ///
+    /// Two request threads whose affinities reduce to the same index here
+    /// share their tally lines, which is what a contended fixture pins
+    /// against. Metrics only; no decision reads it.
     #[must_use]
-    pub fn with_sharding(sharding: LocalSharding) -> Self {
-        if sharding == LocalSharding::SINGLE {
-            return Self::new();
-        }
-        Self {
-            admitted: Padded::zero(),
-            units_admitted: Padded::zero(),
-            admitted_overage: Padded::zero(),
-            units_admitted_overage: Padded::zero(),
-            denials: [const { Padded::zero() }; DenyReason::COUNT],
-            execution_started: Padded::zero(),
-            canceled_before_start: Padded::zero(),
-            contexts_abandoned: Padded::zero(),
-            capacity_shed: Padded::zero(),
-            capacity_shed_by_class: [const { Padded::zero() }; CAPACITY_CLASS_COUNT],
-            execution_started_by_class: [const { Padded::zero() }; CAPACITY_CLASS_COUNT],
-            committed_at_overage: Padded::zero(),
-            units_committed_at_overage: Padded::zero(),
-            commit_refusals: [const { Padded::zero() }; CommitRefusal::COUNT],
-            shards: Some(
-                (0..sharding.get())
-                    .map(|_| CounterShard::zero())
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            ),
-        }
+    pub fn local_sharding(&self) -> LocalSharding {
+        self.layout
+    }
+
+    #[inline]
+    fn shard(&self, locality: Locality) -> &CounterShard {
+        &self.shards[locality.index(self.layout)]
     }
 
     /// Record an admitted request and the units it was quoted.
@@ -304,18 +303,9 @@ impl AdmissionCounters {
 
     #[inline]
     pub(crate) fn record_admit_at(&self, units: CostUnits, locality: Locality) {
-        if let Some(shards) = &self.shards {
-            let shard = &shards[locality.index(LocalSharding::new(
-                std::num::NonZeroUsize::new(shards.len()).expect("sharded counters are non-empty"),
-            ))];
-            shard.admitted.fetch_add(1, Ordering::Relaxed);
-            shard
-                .units_admitted
-                .fetch_add(units.get(), Ordering::Relaxed);
-            return;
-        }
-        self.admitted.bump(1);
-        self.units_admitted.bump(units.get());
+        let shard = self.shard(locality);
+        bump(&shard.admitted, 1);
+        bump(&shard.units_admitted, units.get());
     }
 
     /// Record an admission that no lease funded.
@@ -331,12 +321,11 @@ impl AdmissionCounters {
     /// [`DenyReason::index`] for two counters would add the machinery without
     /// the forcing function that justifies it there.
     ///
-    /// The qualifier pair stays unsharded while `admitted` shards. Sharding
-    /// buys nothing here: this path runs only when the account had no lease
-    /// able to fund the quote, and it already serializes on the overage
-    /// counter's own compare-exchange one step earlier. Two more relaxed
-    /// bumps on that path add no contention class that the cap has not
-    /// already imposed.
+    /// The qualifier pair stays inline while `admitted` shards. Sharding buys
+    /// nothing here: this path runs only when the account had no lease able
+    /// to fund the quote, and it already serializes on the overage counter's
+    /// own compare-exchange one step earlier. Two more relaxed bumps on that
+    /// path add no contention class that the cap has not already imposed.
     #[inline]
     pub fn record_admit_overage(&self, units: CostUnits) {
         self.record_admit_overage_at(units, Locality::current());
@@ -384,29 +373,16 @@ impl AdmissionCounters {
     /// Record an execution start against the class that started it (#99).
     #[inline]
     pub(crate) fn record_execution_started_for(&self, class: CapacityClass, locality: Locality) {
-        self.record_execution_started_at(locality);
-        self.execution_started_by_class[class_slot(class)].bump(1);
+        let shard = self.shard(locality);
+        bump(&shard.execution_started, 1);
+        bump(&shard.execution_started_by_class[class_slot(class)], 1);
     }
 
     /// Record a request that resolved for zero after admission and before
     /// execution start — a cancellation, or an abandoned pending state.
     #[inline]
     pub(crate) fn record_canceled_before_start_at(&self, locality: Locality) {
-        if let Some(shard) = self.shard_at(locality) {
-            shard.canceled_before_start.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        self.canceled_before_start.bump(1);
-    }
-
-    /// Record a request whose kernel was cleared to run.
-    #[inline]
-    pub(crate) fn record_execution_started_at(&self, locality: Locality) {
-        if let Some(shard) = self.shard_at(locality) {
-            shard.execution_started.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        self.execution_started.bump(1);
+        bump(&self.shard(locality).canceled_before_start, 1);
     }
 
     /// Record a commit that settled against overage because its lease lapsed.
@@ -428,16 +404,6 @@ impl AdmissionCounters {
         self.commit_refusals[refusal.index()].bump(1);
     }
 
-    #[inline]
-    fn shard_at(&self, locality: Locality) -> Option<&CounterShard> {
-        let shards = self.shards.as_ref()?;
-        Some(
-            &shards[locality.index(LocalSharding::new(
-                std::num::NonZeroUsize::new(shards.len()).expect("sharded counters are non-empty"),
-            ))],
-        )
-    }
-
     /// Record a refusal against its reason's slot.
     ///
     /// Public because not every refusal originates in
@@ -454,14 +420,20 @@ impl AdmissionCounters {
 
     #[inline]
     pub(crate) fn record_deny_at(&self, reason: &DenyReason, locality: Locality) {
-        if let Some(shards) = &self.shards {
-            let shard = &shards[locality.index(LocalSharding::new(
-                std::num::NonZeroUsize::new(shards.len()).expect("sharded counters are non-empty"),
-            ))];
-            shard.denials[reason.index()].fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        self.denials[reason.index()].bump(1);
+        bump(&self.shard(locality).denials[reason.index()], 1);
+    }
+
+    /// Units quoted by every admitted request on this instance, including the
+    /// overage ones (`record_admit_overage` counts through `record_admit`).
+    ///
+    /// A focused read, because its one caller wants this number and not the
+    /// twenty-odd in [`snapshot`](Self::snapshot): the balance estimate
+    /// subtracts it from what the ledger last reported, and building a whole
+    /// `CountersSnapshot` to reach one field would walk every denial slot as
+    /// well.
+    #[must_use]
+    pub fn units_admitted(&self) -> u64 {
+        sum(&self.shards, |shard| &shard.units_admitted)
     }
 
     /// Read every counter.
@@ -473,90 +445,39 @@ impl AdmissionCounters {
     /// microseconds apart does not survive the scrape interval that consumes
     /// them.
     #[must_use]
-    /// Units quoted by every admitted request on this instance, including the
-    /// overage ones (`record_admit_overage` counts through `record_admit`).
-    ///
-    /// A focused read, because its one caller wants this number and not the
-    /// twenty-odd in [`snapshot`](Self::snapshot): the balance estimate
-    /// subtracts it from what the ledger last reported, and building a whole
-    /// `CountersSnapshot` to reach one field would walk every denial slot as
-    /// well. Wrapping-summed across shards for the same reason `snapshot` is —
-    /// see the type docs on why a monitoring counter does not use checked
-    /// arithmetic.
-    pub fn units_admitted(&self) -> u64 {
-        match &self.shards {
-            Some(shards) => shards.iter().fold(0u64, |total, shard| {
-                total.wrapping_add(shard.units_admitted.load(Ordering::Relaxed))
-            }),
-            None => self.units_admitted.get(),
-        }
-    }
-
     pub fn snapshot(&self) -> CountersSnapshot {
-        if let Some(shards) = &self.shards {
-            let mut snapshot = CountersSnapshot {
-                admitted: 0,
-                units_admitted: 0,
-                // Not summed from the shards: the overage qualifier is one
-                // inline pair under every layout, because the path that bumps
-                // it is the one with no lease to shard.
-                admitted_overage: self.admitted_overage.get(),
-                units_admitted_overage: self.units_admitted_overage.get(),
-                denials: [0; DenyReason::COUNT],
-                execution_started: 0,
-                canceled_before_start: 0,
-                contexts_abandoned: self.contexts_abandoned.get(),
-                capacity_shed: self.capacity_shed.get(),
-                capacity_shed_by_class: std::array::from_fn(|slot| {
-                    self.capacity_shed_by_class[slot].get()
-                }),
-                execution_started_by_class: std::array::from_fn(|slot| {
-                    self.execution_started_by_class[slot].get()
-                }),
-                committed_at_overage: self.committed_at_overage.get(),
-                units_committed_at_overage: self.units_committed_at_overage.get(),
-                commit_refusals: std::array::from_fn(|slot| self.commit_refusals[slot].get()),
-            };
-            for shard in shards {
-                snapshot.admitted = snapshot
-                    .admitted
-                    .wrapping_add(shard.admitted.load(Ordering::Relaxed));
-                snapshot.units_admitted = snapshot
-                    .units_admitted
-                    .wrapping_add(shard.units_admitted.load(Ordering::Relaxed));
-                snapshot.execution_started = snapshot
-                    .execution_started
-                    .wrapping_add(shard.execution_started.load(Ordering::Relaxed));
-                snapshot.canceled_before_start = snapshot
-                    .canceled_before_start
-                    .wrapping_add(shard.canceled_before_start.load(Ordering::Relaxed));
-                for (total, counter) in snapshot.denials.iter_mut().zip(&shard.denials) {
-                    *total = total.wrapping_add(counter.load(Ordering::Relaxed));
-                }
-            }
-            return snapshot;
-        }
+        let shards = &self.shards;
         CountersSnapshot {
-            admitted: self.admitted.get(),
-            units_admitted: self.units_admitted.get(),
+            admitted: sum(shards, |shard| &shard.admitted),
+            units_admitted: sum(shards, |shard| &shard.units_admitted),
+            // Inline under every layout, because the path that bumps it is
+            // the one with no lease to shard.
             admitted_overage: self.admitted_overage.get(),
             units_admitted_overage: self.units_admitted_overage.get(),
-            denials: std::array::from_fn(|slot| self.denials[slot].get()),
-            execution_started: self.execution_started.get(),
-            canceled_before_start: self.canceled_before_start.get(),
+            denials: std::array::from_fn(|slot| sum(shards, |shard| &shard.denials[slot])),
+            execution_started: sum(shards, |shard| &shard.execution_started),
+            canceled_before_start: sum(shards, |shard| &shard.canceled_before_start),
             contexts_abandoned: self.contexts_abandoned.get(),
             capacity_shed: self.capacity_shed.get(),
             capacity_shed_by_class: std::array::from_fn(|slot| {
                 self.capacity_shed_by_class[slot].get()
             }),
             execution_started_by_class: std::array::from_fn(|slot| {
-                self.execution_started_by_class[slot].get()
+                sum(shards, |shard| &shard.execution_started_by_class[slot])
             }),
             committed_at_overage: self.committed_at_overage.get(),
             units_committed_at_overage: self.units_committed_at_overage.get(),
             commit_refusals: std::array::from_fn(|slot| self.commit_refusals[slot].get()),
         }
     }
+}
+
+/// The counters' own layout: at least as fine as the leases', at least as
+/// fine as the host's parallelism, and a power of two so every reduction is a
+/// mask.
+fn counter_layout(leases: LocalSharding, host: LocalSharding) -> LocalSharding {
+    let shards = leases.get().max(host.get()).next_power_of_two();
+    LocalSharding::new(std::num::NonZeroUsize::new(shards).expect("a power of two is non-zero"))
 }
 
 impl Default for AdmissionCounters {
@@ -690,10 +611,19 @@ mod tests {
     fn each_counter_occupies_its_own_cache_line() {
         assert_eq!(align_of::<Padded>(), 128);
         assert_eq!(size_of::<Padded>(), 128);
-        let counters = AdmissionCounters::new();
-        let first = std::ptr::from_ref(&counters.denials[0]).addr();
-        let second = std::ptr::from_ref(&counters.denials[1]).addr();
+        assert_eq!(align_of::<CounterShard>(), 128);
+        let counters = AdmissionCounters::with_layout(LocalSharding::new(
+            std::num::NonZeroUsize::new(2).unwrap(),
+        ));
+        let first = std::ptr::from_ref(&counters.commit_refusals[0]).addr();
+        let second = std::ptr::from_ref(&counters.commit_refusals[1]).addr();
         assert_eq!(second - first, 128, "adjacent slots must not share a line");
+        let first = std::ptr::from_ref(&counters.shards[0]).addr();
+        let second = std::ptr::from_ref(&counters.shards[1]).addr();
+        assert!(
+            second - first >= 128,
+            "adjacent shards must not share a line"
+        );
     }
 
     const ALL_REFUSALS: [CommitRefusal; CommitRefusal::COUNT] = [
@@ -747,38 +677,28 @@ mod tests {
     #[test]
     fn later_counters_are_appended_after_the_ones_they_break_down() {
         use std::mem::offset_of;
-        let head = offset_of!(AdmissionCounters, admitted);
-        assert_eq!(head, 0, "the first counter anchors the calibrated layout");
-        for (name, offset) in [
+        let head = offset_of!(AdmissionCounters, shards);
+        assert_eq!(head, 0, "the shard pointer anchors the calibrated layout");
+        let appended = offset_of!(AdmissionCounters, capacity_shed_by_class);
+        for (older, older_offset) in [
+            ("layout", offset_of!(AdmissionCounters, layout)),
             (
-                "capacity_shed_by_class",
-                offset_of!(AdmissionCounters, capacity_shed_by_class),
+                "admitted_overage",
+                offset_of!(AdmissionCounters, admitted_overage),
             ),
             (
-                "execution_started_by_class",
-                offset_of!(AdmissionCounters, execution_started_by_class),
+                "capacity_shed",
+                offset_of!(AdmissionCounters, capacity_shed),
+            ),
+            (
+                "commit_refusals",
+                offset_of!(AdmissionCounters, commit_refusals),
             ),
         ] {
-            for (older, older_offset) in [
-                ("admitted", head),
-                (
-                    "canceled_before_start",
-                    offset_of!(AdmissionCounters, canceled_before_start),
-                ),
-                (
-                    "capacity_shed",
-                    offset_of!(AdmissionCounters, capacity_shed),
-                ),
-                (
-                    "commit_refusals",
-                    offset_of!(AdmissionCounters, commit_refusals),
-                ),
-            ] {
-                assert!(
-                    offset > older_offset,
-                    "{name} was filed ahead of {older}, moving a counter calibrated where it is"
-                );
-            }
+            assert!(
+                appended > older_offset,
+                "capacity_shed_by_class was filed ahead of {older}, moving a counter calibrated where it is"
+            );
         }
     }
 
@@ -889,7 +809,7 @@ mod tests {
         counters.record_admit(CostUnits(10));
         counters.record_context_abandoned();
         counters.record_capacity_shed();
-        counters.record_execution_started_at(Locality::current());
+        counters.record_execution_started_for(CapacityClass::Assured, Locality::current());
         counters.record_canceled_before_start_at(Locality::current());
         counters.record_committed_at_overage(CostUnits(10));
         for refusal in ALL_REFUSALS {
@@ -918,7 +838,7 @@ mod tests {
         let sharding = LocalSharding::new(std::num::NonZeroUsize::new(8).unwrap());
         let counters = AdmissionCounters::with_sharding(sharding);
         for _ in 0..5 {
-            counters.record_execution_started_at(Locality::current());
+            counters.record_execution_started_for(CapacityClass::Assured, Locality::current());
             counters.record_canceled_before_start_at(Locality::current());
         }
         counters.record_capacity_shed();
@@ -932,20 +852,46 @@ mod tests {
     }
 
     #[test]
-    fn configured_sharding_selects_the_matching_counter_layout() {
+    fn the_counter_layout_covers_the_leases_and_the_host_as_a_power_of_two() {
+        let shards = |n: usize| LocalSharding::new(std::num::NonZeroUsize::new(n).unwrap());
+        for (leases, host, expected) in [
+            (1, 1, 1),
+            (1, 10, 16),
+            (8, 1, 8),
+            (6, 1, 8),
+            (8, 10, 16),
+            (32, 10, 32),
+        ] {
+            let layout = counter_layout(shards(leases), shards(host));
+            assert_eq!(layout.get(), expected, "leases {leases}, host {host}");
+        }
+        let counters = AdmissionCounters::with_sharding(LocalSharding::SINGLE);
+        assert_eq!(counters.shards.len(), counters.layout.get());
+        assert!(counters.layout.get().is_power_of_two());
         assert!(
-            AdmissionCounters::with_sharding(LocalSharding::SINGLE)
-                .shards
-                .is_none()
+            counters.layout.get()
+                >= std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
         );
-        let sharding = LocalSharding::new(std::num::NonZeroUsize::new(8).unwrap());
-        assert_eq!(
-            AdmissionCounters::with_sharding(sharding)
-                .shards
-                .as_ref()
-                .map(|shards| shards.len()),
-            Some(8)
-        );
+    }
+
+    /// The default lease layout must not put unrelated threads' tallies back
+    /// on one line: that is the cross-account contention #132 removed, and it
+    /// shows up only under concurrency, in no functional test.
+    #[test]
+    fn the_default_lease_layout_still_separates_localities() {
+        let counters = AdmissionCounters::with_layout(counter_layout(
+            LocalSharding::SINGLE,
+            LocalSharding::new(std::num::NonZeroUsize::new(2).unwrap()),
+        ));
+        // Threads take affinities from one process-wide sequence that other
+        // tests draw from concurrently, so no two are known to be adjacent.
+        // Sixty-four landing on one parity would need every interleaving
+        // thread to take exactly the alternate numbers.
+        let used: std::collections::HashSet<usize> = (0..64)
+            .map(|_| std::thread::spawn(Locality::current).join().unwrap())
+            .map(|locality| std::ptr::from_ref(counters.shard(locality)).addr())
+            .collect();
+        assert_eq!(used.len(), 2, "every locality landed on one shard");
     }
 
     /// Each reason must land in its own slot and leave the rest alone.

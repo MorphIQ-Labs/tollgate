@@ -1267,8 +1267,8 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `DenyReason::index` is an exhaustive match, making a slot
     per reason total by construction and a shared slot unrepresentable; a new
     variant fails to compile until it has one. Those slots are also *stable*:
-    `AdmissionCounters::denials` is exported through the public
-    `CountersSnapshot` as dense positions, so a reason's number is a contract
+    the denial tally is exported through the public `CountersSnapshot` as
+    dense positions, so a reason's number is a contract
     with whatever reads them. Reasons append at the next free slot and `COUNT`
     only grows; renumbering an existing one silently re-attributes a counter a
     consumer already reads, and stays internally consistent while doing it, so
@@ -1304,6 +1304,17 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `transition_counters_never_move_the_denied_total`,
     `a_sharded_layout_reports_the_same_transition_totals`, and
     `concurrency_guard_carries_the_exact_occupied_state`.
+
+    The tallies every request touches — admissions, quoted units, denials,
+    execution starts and pre-start cancellations — are partitioned per
+    locality under **every** lease layout, at least as finely as the lease
+    layout and the host's parallelism, and summed only when read. The shared
+    counter identity is one per map, so an unpartitioned tally would be a line
+    that unrelated accounts contend on; there is no inline variant to fall
+    back to (#132). *Tests:*
+    `the_counter_layout_covers_the_leases_and_the_host_as_a_power_of_two`,
+    `the_default_lease_layout_still_separates_localities`, and
+    `each_counter_occupies_its_own_cache_line`.
 
 21. **Every opaque identifier has one portable wire spelling.** `AccountId`,
     `KeyId`, `LeaseId`, `RequestId`, and `Principal` are exactly 32 lowercase

@@ -167,10 +167,10 @@
       "threshold_ns": 2500.0
     },
     {
-      "_comment": "#90 different-account baseline. Seven background requests and the foreground request use eight accounts, but the map-owned counter set still shares a line across them. The sustained fixture uses the same one-unit weighted quote as the existing contention pair so it cannot self-throttle. Measured 583ns; reported honestly so #99 can measure enabled capacity independently of this residual.",
+      "_comment": "#90 different-account baseline. Seven background requests and the foreground request use eight accounts. Until #132 the map-owned tallies were one set of lines on this layout, and those lines were most of this row: 772/749ns fell to 269/253ns when only the tallies were partitioned (interleaved filtered A/B under host load, not calibration). The fixture pins its threads against the tally layout so no two share a tally shard. The sustained fixture uses the same one-unit weighted quote as the existing contention pair so it cannot self-throttle. Measured 583ns; reported honestly so #99 can measure enabled capacity independently of this residual. After #132 a controlled-host full run measured 153.46ns (baseline 680.48ns); the 600ns threshold makes a return of the shared line fail the absolute check on any host, not only the controlled one.",
       "id": "admission/full_check_contended_8_distinct_accounts",
-      "target_ns": 700.0,
-      "threshold_ns": 3000.0
+      "target_ns": 200.0,
+      "threshold_ns": 600.0
     },
     {
       "_comment": "#90 different-account baseline with eight local lease shards, measured 201ns. The portable ratio below is the extra-lock witness: a global lookup lock serializes otherwise independent accounts. #123 pinned this fixture's thread-to-shard mapping for the same reason as the row above; the collision cost \u00d71.38 here (172ns against 237ns) because these threads share less per-shard state than eight threads on one account do.",
@@ -193,6 +193,12 @@
     {
       "_comment": "Added by #129 for #128's confirmed-exhaustion branch: the same strict refusal fixture, but the allocator has recorded authoritative empty-balance evidence, so the failed funding step is reclassified as `BalanceExhausted` and counted under its own denial index. The row above pays the same atomic load and finds no evidence. A filtered diagnostic run (not calibration) measured 55.49ns against the lease-exhausted row's 55.40ns; bounds mirror that row because the work differs only in the comparison result and the counter slot.",
       "id": "admission/full_check_balance_exhausted_strict",
+      "target_ns": 40.0,
+      "threshold_ns": 90.0
+    },
+    {
+      "_comment": "Added by #135 for #130's live-shortfall branch: the strict refusal fixture with a positive attested remainder (1 unit) below the quote, refused as `BalanceInsufficient`. Beyond the exhaustion row it pays the seqlock-guarded `(deadline, remaining)` pair read and the quote-against-remaining comparison. Bounds mirror the lease-exhausted row until the #132/#135 controlled-host series measures it.",
+      "id": "admission/full_check_balance_insufficient_strict",
       "target_ns": 40.0,
       "threshold_ns": 90.0
     },
@@ -461,16 +467,16 @@
       "max_ratio": 1.25
     },
     {
-      "_comment": "Enabling the gate under eight-way different-account contention, against the same workload without it. Measured x2.13 (uniform) and x2.14 (reserved) on the controlled host; a separate paired run put an unsharded pool at x2.83 against x2.11 sharded. The 4.0 bound is the cross-host allowance the other contention ratios use \u2014 a shared runner exposes contention differently \u2014 while still rejecting a gate that serialized the instance.",
+      "_comment": "Enabling the gate under eight-way different-account contention, against the same workload without it. Measured x2.13 (uniform) and x2.14 (reserved) on the controlled host; a separate paired run put an unsharded pool at x2.83 against x2.11 sharded. The 4.0 bound is the cross-host allowance the other contention ratios use \u2014 a shared runner exposes contention differently \u2014 while still rejecting a gate that serialized the instance. #132 removed the shared tally line from the denominator (680ns to 120-192ns on the controlled host), exposing the gate's own contended cost. Five trusted controlled-host full runs measured x6.05-x9.80 uniform and x6.20-x9.76 reserved; the spread is the denominator's (120-192ns, about 25% run to run), which is small enough now that its noise dominates the ratio. A gate that serialized the instance would approach same-account contention, about 3us or x20; x12 clears the measured spread by 22% and still rejects that.",
       "numerator": "capacity/full_check_contended_8_distinct_accounts_uniform",
       "denominator": "admission/full_check_contended_8_distinct_accounts",
-      "max_ratio": 4.0
+      "max_ratio": 12.0
     },
     {
-      "_comment": "The reserved gate under the same contention, against the same denominator. Measured x2.14 \u2014 reserved and uniform are one acquisition path, and this is what says so under load rather than only at rest.",
+      "_comment": "The reserved gate under the same contention, against the same denominator. Measured x2.14 \u2014 reserved and uniform are one acquisition path, and this is what says so under load rather than only at rest. #132 removed the shared tally line from the denominator (680ns to 120-192ns on the controlled host), exposing the gate's own contended cost. Five trusted controlled-host full runs measured x6.05-x9.80 uniform and x6.20-x9.76 reserved; the spread is the denominator's (120-192ns, about 25% run to run), which is small enough now that its noise dominates the ratio. A gate that serialized the instance would approach same-account contention, about 3us or x20; x12 clears the measured spread by 22% and still rejects that.",
       "numerator": "capacity/full_check_contended_8_distinct_accounts_reserved",
       "denominator": "admission/full_check_contended_8_distinct_accounts",
-      "max_ratio": 4.0
+      "max_ratio": 12.0
     },
     {
       "_comment": "#92 the fold is O(distinct classes), not O(table). Eight classes measured 3.56x one class, sub-linear because the fixed term and the call dominate. Six permits host variance and a future per-class check; a scan of the compiled table would miss this by orders of magnitude, which is the failure this ratio exists to catch.",
@@ -549,6 +555,12 @@
       "numerator": "admission/full_check_balance_exhausted_strict",
       "denominator": "admission/full_check_lease_exhausted_strict",
       "max_ratio": 1.2
+    },
+    {
+      "_comment": "#135: the live-shortfall read is a handful of loads and one comparison past the refusal the lease-exhausted row already pays, never a lookup, lock or allocation. x1.25 is provisional until the #132/#135 controlled-host series measures the same-run spread.",
+      "numerator": "admission/full_check_balance_insufficient_strict",
+      "denominator": "admission/full_check_lease_exhausted_strict",
+      "max_ratio": 1.25
     }
   ]
 }
