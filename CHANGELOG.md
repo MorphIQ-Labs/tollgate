@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.27.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.26.0...v0.27.0) - 2026-09-24
+
+### Fixed
+
+- *(allocator)* [**breaking**] forfeit unreleased leases at reclaim
+
 ## [0.26.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.25.1...v0.26.0) - 2026-09-23
 
 ### Fixed
