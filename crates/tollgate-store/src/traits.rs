@@ -372,8 +372,11 @@ impl GrantPolicy {
 pub struct ReclaimedLease {
     pub lease_id: LeaseId,
     pub account_id: AccountId,
-    /// Units credited back to the account: `granted - recorded usage`.
-    pub reclaimed: CostUnits,
+    /// Units recorded as provisional settlement loss: `granted - recorded
+    /// usage` at the sweep. Nothing is credited back, because a holder that
+    /// never released cannot prove any unit unspent (#136); usage for the
+    /// lease that arrives later converts loss into billed usage.
+    pub forfeited: CostUnits,
 }
 
 /// The production-sized upper bound for one expiry-reclaim transaction.
@@ -557,8 +560,16 @@ pub trait LeaseAllocator: Send + Sync {
     ) -> Result<Allocation, AllocateError>;
 
     /// Settle at most `limit` active leases whose TTL (plus the policy's
-    /// reclaim grace) has lapsed, crediting `granted - recorded usage` back
-    /// to each account (INVARIANTS.md #9). One call is one bounded atomic
+    /// reclaim grace) has lapsed and whose holder never released them.
+    ///
+    /// Nothing is credited back. Each lease's `granted - recorded usage` is
+    /// recorded as provisional settlement loss, exactly as a release claiming
+    /// nothing unspent would record it, because a holder that never released
+    /// cannot prove any unit unspent: it may have committed work it never
+    /// flushed (INVARIANTS.md #9, #136). Usage for the lease that arrives
+    /// later fits in that loss and converts it into billed usage.
+    ///
+    /// One call is one bounded atomic
     /// transaction; [`ReclaimBatch::is_saturated`] is verified evidence that
     /// the caller should immediately run another batch. It must be safe to
     /// run concurrently with everything else.
@@ -614,10 +625,10 @@ where
             Err(error) => {
                 let units: u128 = reclaimed
                     .iter()
-                    .map(|lease| u128::from(lease.reclaimed.get()))
+                    .map(|lease| u128::from(lease.forfeited.get()))
                     .sum();
                 return Err(StoreError(format!(
-                    "reclaim drain failed after {} leases totaling {units} units were committed: {error}",
+                    "reclaim drain failed after {} leases forfeiting {units} units were committed: {error}",
                     reclaimed.len()
                 )));
             }
@@ -1669,7 +1680,7 @@ mod tests {
                 .map(|id| ReclaimedLease {
                     lease_id: LeaseId(u128::try_from(id).unwrap()),
                     account_id: AccountId(1),
-                    reclaimed: CostUnits(1),
+                    forfeited: CostUnits(1),
                 })
                 .collect();
             ReclaimBatch::try_new(reclaimed, limit)

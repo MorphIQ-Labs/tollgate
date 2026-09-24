@@ -309,7 +309,7 @@ async fn maintenance_sweep<S: Backend>(
                 })?);
             let batch_units = batch.reclaimed().iter().try_fold(0u128, |total, lease| {
                 total
-                    .checked_add(u128::from(lease.reclaimed.get()))
+                    .checked_add(u128::from(lease.forfeited.get()))
                     .ok_or_else(|| StoreError("reclaim batch unit total overflow".into()))
             })?;
             let leases = self
@@ -383,12 +383,23 @@ async fn maintenance_sweep<S: Backend>(
                         "reclaim sweep recovered"
                     );
                 }
-                if progress.leases > 0 {
+                // A swept lease is one its holder never released, so its
+                // remainder was forfeited rather than returned (#136). Units
+                // forfeited are an operator signal: a crash, or a shutdown
+                // whose release deadline lapsed.
+                if progress.units > 0 {
+                    tracing::warn!(
+                        leases = %progress.leases,
+                        forfeited_units = %progress.units,
+                        batches = progress.batches,
+                        "swept unreleased leases; their remainders are forfeited as provisional loss"
+                    );
+                } else if progress.leases > 0 {
                     tracing::info!(
                         leases = %progress.leases,
-                        units = %progress.units,
+                        forfeited_units = %progress.units,
                         batches = progress.batches,
-                        "reclaimed expired leases"
+                        "swept unreleased leases with nothing left to forfeit"
                     );
                 }
             }
@@ -400,7 +411,7 @@ async fn maintenance_sweep<S: Backend>(
                             code = "storage",
                             consecutive_failures = report.failures,
                             reclaimed_leases = %progress.leases,
-                            reclaimed_units = %progress.units,
+                            forfeited_units = %progress.units,
                             completed_batches = progress.batches,
                             "reclaim sweep failed; completed batches stay committed and remaining expired leases stay stranded until it recovers"
                         );

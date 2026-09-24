@@ -566,21 +566,23 @@ async fn assert_shutdown_accounting(
         u64::try_from(reclaimed.len()).unwrap() <= report.uncertain_acquires,
         "only reported unanswered acquisitions may remain: {reclaimed:?}; {report:?}"
     );
-    let returned = reclaimed.iter().fold(CostUnits::ZERO, |sum, lease| {
+    let forfeited = reclaimed.iter().fold(CostUnits::ZERO, |sum, lease| {
         assert_eq!(lease.account_id, ACCOUNT);
-        sum.checked_add(lease.reclaimed).unwrap()
+        sum.checked_add(lease.forfeited).unwrap()
     });
     assert_eq!(
-        returned, before.active_lease_grants,
-        "unanswered grants funded no usage"
+        forfeited, before.active_lease_grants,
+        "unanswered grants funded no usage, and all of them are forfeited"
     );
+    // Nobody can prove an unanswered grant unspent, so it becomes loss rather
+    // than balance (#136).
     let after = store.conservation(ACCOUNT).unwrap();
     assert!(after.holds(), "{after:?}");
     assert_eq!(after.active_lease_grants, CostUnits::ZERO);
-    assert_eq!(after.balance, deposited.checked_sub(committed).unwrap());
+    assert_eq!(after.balance, before.balance);
     assert_eq!(store.usage_recorded(ACCOUNT), committed);
     assert_eq!(after.settled_usage, committed);
-    assert_eq!(after.settlement_loss, CostUnits::ZERO);
+    assert_eq!(after.settlement_loss, forfeited);
     assert_eq!(after.expired, CostUnits::ZERO);
     reclaimed
 }
@@ -763,7 +765,7 @@ async fn controlled_shutdown(mode: common::TransportMode) {
             assert_eq!(reclaimed.len(), usize::from(!deliver_result));
             if !deliver_result {
                 assert_eq!(reclaimed[0].lease_id, held.grant.lease_id);
-                assert_eq!(reclaimed[0].reclaimed, CostUnits(replacement));
+                assert_eq!(reclaimed[0].forfeited, CostUnits(replacement));
             }
             assert_eq!(
                 handle.report().uncertain_acquires,

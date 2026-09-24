@@ -59,9 +59,11 @@ def terminal : Phase → Bool
 /-- The billing statement reads the phase, never the receipt.
 
 This is the model of `Reservation::usage_event`. A fallback commit carries a
-`lease` receipt and a `committedOverage` phase; billing it against the receipt
-would name a lease the allocator is about to reclaim, and the sink rejects a
-leased event naming a reclaimed lease — losing the charge for work that ran. -/
+`lease` receipt and a `committedOverage` phase. The receipt returned to its
+lease, so the lease never funded the work: a leased bill would claim units the
+lease's settlement already accounted for, rejected against a release's credit
+(losing the charge for work that ran) or billed against a reclaim's forfeit it
+did not cause (#136). -/
 def usageSource : Phase → Option Source
   | .committedLease => some .leased
   | .committedOverage => some .overage
@@ -244,7 +246,7 @@ theorem a_fallback_in_flight_can_only_over_state_local_occupancy
 
 /-- A committed overage bills against no lease — whatever its receipt says.
 
-This is the theorem that rules out the reclaimed-lease straggler rejection.
+This is the theorem that rules out billing a fallback against a settled lease.
 Note that it takes no `receipt` hypothesis: the conclusion holds for a request
 admitted against a lease exactly as it does for one admitted as overage. -/
 theorem a_committed_overage_bills_against_no_lease (r : Request)

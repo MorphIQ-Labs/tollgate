@@ -987,22 +987,24 @@ impl LeaseAllocator for MemoryStore {
         // limit, but the structure is the defect, and it is one refactor away
         // from being reachable (#57).
         let mut reclaimed = Vec::with_capacity(expired.len());
-        // Each reclaimed lease is settled by the same rule a release uses, so
-        // a lease whose period has closed expires its remainder here too — a
-        // sweep is just the settlement the instance never got to (#97).
-        let mut settlements: Vec<(AccountId, Drawn, Timestamp, CostUnits)> =
-            Vec::with_capacity(expired.len());
+        // A holder that never released cannot prove any unit unspent: its
+        // lease accepted commits until `usable_until`, and whatever it had
+        // committed but not flushed died with it. So a sweep settles the lease
+        // as a release claiming nothing would: no credit, and the remainder
+        // recorded as provisional settlement loss (#136). Usage that arrives
+        // later still fits in that gap and converts loss into billed usage
+        // (see `ingest`), which is how a holder that outlived an outage is
+        // billed rather than dropped.
         for &lease_id in &expired {
             let lease = inner.leases.get(lease_id).expect("just listed");
-            let credit = lease
+            let forfeited = lease
                 .granted
                 .checked_sub(lease.used)
                 .expect("usage never exceeds grant");
-            settlements.push((lease.account_id, lease.funding, lease.period_start, credit));
             reclaimed.push(ReclaimedLease {
                 lease_id,
                 account_id: lease.account_id,
-                reclaimed: credit,
+                forfeited,
             });
         }
         let batch = ReclaimBatch::try_new(reclaimed, limit)?;
@@ -1011,20 +1013,17 @@ impl LeaseAllocator for MemoryStore {
             assert!(
                 inner
                     .leases
-                    .settle(entry.lease_id, Settled::Expired, entry.reclaimed),
+                    .settle(entry.lease_id, Settled::Expired, CostUnits::ZERO),
                 "reclaimable only yields active leases"
             );
-        }
-        for (account_id, funding, period_start, credit) in settlements {
-            // Applied one at a time against the live record rather than
-            // through an overlay: several leases of one account accumulate,
-            // and `credit_settlement` reads the record's current period to
-            // decide where each credit goes.
             let record = inner
                 .accounts
-                .get_mut(&account_id)
+                .get_mut(&entry.account_id)
                 .expect("lease account exists");
-            credit_settlement(record, funding, period_start, credit);
+            record.settlement_loss = record
+                .settlement_loss
+                .checked_add(entry.forfeited)
+                .expect("loss overflow");
         }
         // One line per sweep rather than one per batch: a drain calls this
         // until a batch comes back unsaturated, and that last call carries the

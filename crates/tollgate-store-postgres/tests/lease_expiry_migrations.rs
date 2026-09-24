@@ -148,12 +148,13 @@ async fn expiry_upgrade_preserves_accounting_and_fences_old_lease_queries() {
     let reclaimed = store.reclaim_expired(boundary).await.unwrap();
     assert_eq!(reclaimed.len(), 1);
     assert_eq!(reclaimed[0].lease_id, LeaseId(2));
-    assert_eq!(reclaimed[0].reclaimed, CostUnits(10));
+    assert_eq!(reclaimed[0].forfeited, CostUnits(10));
     let c = store.conservation(AccountId(1)).await.unwrap().unwrap();
     assert!(c.holds());
-    assert_eq!(c.balance, CostUnits(100));
+    // The unreleased upgraded lease is forfeited, not credited (#136).
+    assert_eq!(c.balance, CostUnits(90));
     assert_eq!(c.active_lease_grants, CostUnits::ZERO);
-    assert_eq!(c.settlement_loss, CostUnits::ZERO);
+    assert_eq!(c.settlement_loss, CostUnits(10));
     let legacy: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM tollgate_leases WHERE expiry_is_upper_bound")
             .fetch_one(&mut connection)

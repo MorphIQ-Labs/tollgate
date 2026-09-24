@@ -1081,11 +1081,12 @@ async fn shutdown_after_recovery_delivers_everything() {
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(25));
 }
 
-/// A lease-expiry straggler: events flushed after reclaim are rejected and
-/// reported, never silently absorbed (bounded billing loss, INVARIANTS.md #9
-/// documentation).
+/// A lease-expiry straggler (#136): a holder that outlived an outage flushes
+/// after its lease was swept, and the usage is billed against the forfeit
+/// rather than dropped. Usage beyond what was forfeited is still rejected and
+/// reported, never silently absorbed.
 #[tokio::test(start_paused = true)]
-async fn straggler_usage_after_reclaim_is_reported_rejected() {
+async fn a_survivor_flushes_after_reclaim_and_is_billed() {
     let store = store(10_000);
     let lease = store
         .acquire(
@@ -1102,10 +1103,18 @@ async fn straggler_usage_after_reclaim_is_reported_rejected() {
     let clock = Arc::new(ManualClock::new(t(121)));
     let (recorder, writer) = UsageWriter::spawn(store.clone(), clock, writer_config(8)).unwrap();
     recorder.try_reserve().unwrap().record(event(1, 10, &lease));
+    recorder
+        .try_reserve()
+        .unwrap()
+        .record(event(2, 991, &lease));
     settle().await;
     let stats = writer.shutdown().await.unwrap();
-    assert_eq!(stats.rejected, 1);
-    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits::ZERO);
+    assert_eq!(stats.accepted, 1);
+    assert_eq!(stats.rejected, 1, "991 exceeds the 990 still forfeited");
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(10));
+    let c = store.conservation(ACCOUNT).unwrap();
+    assert_eq!(c.settlement_loss, CostUnits(990));
+    assert!(c.holds(), "{c:?}");
 }
 
 // ---- shutdown drain (issue #32) -------------------------------------------

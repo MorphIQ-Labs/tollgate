@@ -1465,7 +1465,13 @@ async fn shutdown_reports_an_unanswered_consolidation_grant() {
         1,
         "only the unanswered replacement remains active"
     );
-    assert_eq!(store.balance(AccountId(1)), CostUnits(100));
+    // Nobody can prove the unanswered grant unspent, so it is forfeited
+    // rather than returned (#136).
+    assert_eq!(reclaimed[0].forfeited, CostUnits(60));
+    assert_eq!(store.balance(AccountId(1)), CostUnits(40));
+    let c = store.conservation(AccountId(1)).unwrap();
+    assert_eq!(c.settlement_loss, CostUnits(60));
+    assert!(c.holds(), "{c:?}");
 }
 
 #[tokio::test(start_paused = true)]
@@ -1489,7 +1495,8 @@ async fn ambiguous_consolidations_remain_visible_after_a_clean_shutdown() {
         assert_eq!(store.balance(AccountId(1)), CostUnits(40));
         let reclaimed = store.reclaim_expired(t(10_000)).await.unwrap();
         assert_eq!(reclaimed.len(), 1);
-        assert_eq!(store.balance(AccountId(1)), CostUnits(100));
+        assert_eq!(reclaimed[0].forfeited, CostUnits(60));
+        assert_eq!(store.balance(AccountId(1)), CostUnits(40));
     }
 }
 

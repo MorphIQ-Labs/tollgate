@@ -159,6 +159,14 @@ health; successful ping alone does not prove that maintenance writes can run.
 Completed progress fields survive a later failed batch. No backend details are
 formatted into these events.
 
+A successful sweep that settled leases logs `leases`, `forfeited_units` and
+`batches`. A swept lease is one its holder never released, so its remainder is
+forfeited as settlement loss rather than returned to the account (#136). The
+event is `warn` when `forfeited_units` is non-zero: an instance crashed, or its
+shutdown's release deadline lapsed. Late usage for a forfeited lease is still
+billed against the forfeit. The failure events carry `forfeited_units` for the
+batches that committed.
+
 An unexpected maintenance return, cancellation or unwinding panic emits an
 `error` with `operation=maintenance` and a static `reason`, then `serve` returns
 an I/O error and stops listening. Process supervision should restart it. A build
@@ -191,9 +199,11 @@ that unanswered capability still holds units in the backend. Retain a
 `account_reports(now)` after the join, alongside the shutdown report's abandoned
 leases, task failures and usage-drain counters. Uncertainty is a count of
 possible grants, not a unit amount or proof that each call committed. Such units
-remain in active grants until server maintenance reclaims them after expiry and
-grace; do not credit them manually or classify the liquidity difference alone
-as lost billing. Reconcile recorded usage and ledger conservation both before
+remain in active grants until server maintenance sweeps them after expiry and
+grace, when they are forfeited as settlement loss rather than returned (#136).
+Do not credit them manually: nobody can prove them unspent. Nor should you
+classify the liquidity difference alone as lost billing, because late usage for
+the lease still bills against the forfeit. Reconcile recorded usage and ledger conservation both before
 and after reclamation. Expiry does not erase the runtime's historical counters.
 
 ## Instance clients and Cloud Run
