@@ -487,6 +487,57 @@ fn staged_admission(
         .and_then(|context| context.admit(&[(PriceOp, items)], BenchUsageSlot, now))
 }
 
+/// Seven background threads admitting for eight distinct accounts in turn,
+/// each offset from the others, so at any moment the threads mostly hold
+/// different accounts but every account is written from every core over time.
+struct RotatingAccounts {
+    engine: Arc<AdmissionEngine<ArcSwapSnapshotMap>>,
+    stop: Arc<AtomicBool>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl RotatingAccounts {
+    fn spawn(engine: AdmissionEngine<ArcSwapSnapshotMap>) -> Self {
+        let now = Timestamp::from_second(1_755_600_000).unwrap();
+        let engine = Arc::new(engine);
+        let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(Barrier::new(8));
+        let workers = (1..8u128)
+            .map(|offset| {
+                let (engine, stop, ready) =
+                    (Arc::clone(&engine), Arc::clone(&stop), Arc::clone(&ready));
+                std::thread::spawn(move || {
+                    ready.wait();
+                    let mut next = offset;
+                    while !stop.load(Ordering::Relaxed) {
+                        next = (next + 1) % 8;
+                        admit_once(&engine, Principal(next), now);
+                    }
+                })
+            })
+            .collect();
+        ready.wait();
+        Self {
+            engine,
+            stop,
+            workers,
+        }
+    }
+
+    fn engine(&self) -> &AdmissionEngine<ArcSwapSnapshotMap> {
+        &self.engine
+    }
+}
+
+impl Drop for RotatingAccounts {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for worker in self.workers.drain(..) {
+            worker.join().unwrap();
+        }
+    }
+}
+
 /// Seven background admitters on the account under measurement, stopped and
 /// joined when the guard drops so one benchmark's load never leaks into the
 /// next one's numbers.
@@ -770,6 +821,24 @@ fn bench_full_check(c: &mut Criterion) {
         let contended = distinct_account_contended_engine(sharded);
         group.bench_function("full_check_contended_8_distinct_accounts_sharded", |b| {
             b.iter(|| admit_once(contended.engine(), black_box(Principal(0)), now))
+        });
+    }
+
+    // Eight distinct accounts, but every thread cycles through all of them,
+    // so each account's lines are written from a different core on most
+    // admissions — what a work-stealing runtime does to a connection's task
+    // (#138). The pinned row above keeps each account on one thread and so
+    // cannot see it: #138 measured 117 ns pinned against 1.04 us rotating.
+    // Not pinned against the tally layout on purpose: the point is that the
+    // *account* lines move, and the tallies are per-thread either way.
+    {
+        let rotating = RotatingAccounts::spawn(distinct_engine(LocalSharding::SINGLE));
+        let mut next = 0u128;
+        group.bench_function("full_check_contended_8_distinct_accounts_rotating", |b| {
+            b.iter(|| {
+                next = (next + 1) % 8;
+                admit_once(rotating.engine(), black_box(Principal(next)), now)
+            })
         });
     }
 
