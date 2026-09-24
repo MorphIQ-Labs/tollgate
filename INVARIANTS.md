@@ -596,9 +596,13 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
 
 8. **Accounting backpressure sheds.** When the usage queue is full, new work is
    refused with zero units charged. Usage events are never silently dropped
-   and enqueue never blocks unboundedly. Shutdown closes the queue (new
-   reservations refuse from that instant), then drains with real receives
-   until every outstanding permit resolves by sending or dropping, bounded by
+   and enqueue never blocks unboundedly. The queue is partitioned into lanes
+   by request locality, and "full" means every lane is full: a request whose
+   own lane is full takes a slot in another before it sheds, so the shed
+   point is exactly the configured `queue_capacity` (#137). Shutdown closes
+   every lane (new reservations refuse from that instant), then drains until
+   every lane is empty and every outstanding permit has resolved by sending
+   or dropping — a lane that is merely momentarily empty is not drained — bounded by
    the configured `shutdown_drain_deadline` — which governs the ingest calls
    the drain makes as well as its receives, so the bound is the drain's total
    wall clock. It flushes in configured-size batches, counts any event still
@@ -638,6 +642,9 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    `panic_after_partial_flush_counts_only_unflushed`,
    `running_totals_are_readable_and_match_the_final_report`,
    `queue_depth_rises_before_the_shed_and_sheds_are_counted`,
+   `the_shed_point_is_the_whole_queue_across_lanes`,
+   `the_drain_delivers_every_lane_and_reports_every_lanes_permits`,
+   `a_resolving_permit_in_any_lane_completes_the_drain`,
    `a_failing_sink_does_not_advance_the_last_ingest_time`,
    `rejected_events_are_visible_while_running`, and
    `metrics_report_accounting_health_while_running`.

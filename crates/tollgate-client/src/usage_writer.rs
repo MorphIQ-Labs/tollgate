@@ -1,15 +1,29 @@
 //! The batched usage writer.
 //!
-//! A bounded mpsc channel separates the request path from billing I/O. The
-//! request path reserves a channel slot *before* admitting work
-//! ([`UsageRecorder::try_reserve`]); a full channel is
+//! A bounded queue separates the request path from billing I/O. The request
+//! path reserves a slot *before* admitting work
+//! ([`UsageRecorder::try_reserve`]); a full queue is
 //! `DenyReason::AccountingBackpressure` — shed with zero units charged,
 //! never a silent drop, never an unbounded block (INVARIANTS.md #8). The
 //! permit outlives execution, and the shutdown drain below waits for it, so
 //! a post-commit send is either ingested or explicitly counted — never
 //! silently dropped (INVARIANTS.md #13).
 //!
-//! The writer task drains the channel into batches and ingests them through
+//! The queue is a set of lanes, each a bounded mpsc channel, chosen by the
+//! request thread's sticky locality and sized to split `queue_capacity`
+//! exactly (#137). A request reserves in its own lane and tries the others
+//! before shedding, so the shed point is the whole queue. Lanes keep one
+//! thread's sender count, semaphore, tail and entry counter off every other
+//! thread's lines; one shared channel put all of them, for every account, on
+//! the same few. Events within a lane keep their order; events that overflow
+//! into another lane are delivered in that lane's order.
+//!
+//! The writer never parks on a lane, so a send wakes nothing. It drains every
+//! lane on its flush tick — when a partial batch was due anyway — and earlier
+//! when a lane reaches its ring point, which rings a doorbell once per fill
+//! rather than once per event.
+//!
+//! The writer task drains the lanes into batches and ingests them through
 //! the [`UsageSink`](tollgate_store::UsageSink). Ingest is idempotent on
 //! request id (INVARIANTS.md #7), so retrying a whole batch after a backend
 //! error is always safe. A failing backend is retried with backoff forever
@@ -32,9 +46,10 @@
 //! events are lost in that path, which is why graceful code always calls
 //! `shutdown`.
 //!
-//! The final flush closes the channel (new reservations deny from that
-//! instant), then drains with real receives — not a momentarily-empty peek —
-//! until every outstanding permit resolves by sending or dropping, bounded
+//! The final flush closes every lane (new reservations deny from that
+//! instant), then drains until every lane reports disconnected — empty *and*
+//! every outstanding permit resolved by sending or dropping, never merely
+//! momentarily empty — waking on each permit that resolves, bounded
 //! by [`UsageWriterConfig::shutdown_drain_deadline`]. Permits still
 //! unresolved at the deadline are reported in [`WriterStats::unresolved`];
 //! their charges are locally committed but unbilled, bounded thereafter by
@@ -54,14 +69,15 @@
 //! within `expiry_safety_margin + reclaim_grace`, so a slow drain surfaces
 //! as `rejected` at the sink rather than silent loss.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use jiff::{SignedDuration, Timestamp};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
+use tokio::sync::{Notify, mpsc, watch};
 use tracing::Instrument as _;
 
-use tollgate_core::{DenyReason, UsageEvent};
+use tollgate_core::{DenyReason, LocalSharding, Locality, UsageEvent};
 use tollgate_store::Clock;
 use tollgate_store::{MAX_INGEST_BATCH, UsageSink};
 
@@ -193,8 +209,12 @@ pub struct WriterCounters {
     /// `i64::MIN` means "never": zero cannot be the sentinel, because the epoch
     /// itself is a legitimate timestamp that tests use routinely.
     last_ingest_ms: AtomicI64,
+    /// Charges the writer has given an outcome. Written only by the task.
+    settled: AtomicU64,
+    /// Each lane's count of charges that entered it (#137). Set once when the
+    /// writer spawns; a counter set nobody attached reads as holding nothing.
+    lanes: OnceLock<Arc<[LaneStats]>>,
     // Written from the request path, by as many cores as serve requests.
-    unaccounted: Contended,
     shed: Contended,
 }
 
@@ -212,7 +232,8 @@ impl WriterCounters {
             lost: AtomicU64::new(0),
             unresolved: AtomicU64::new(0),
             last_ingest_ms: AtomicI64::new(i64::MIN),
-            unaccounted: Contended::zero(),
+            settled: AtomicU64::new(0),
+            lanes: OnceLock::new(),
             shed: Contended::zero(),
         }
     }
@@ -270,15 +291,23 @@ impl WriterCounters {
         self.unresolved.store(permits, Ordering::Relaxed);
     }
 
-    /// One charge has entered the queue with no billing outcome yet.
-    fn enqueued(&self) {
-        self.unaccounted.bump(1);
-    }
-
     /// `events` charges have been given a billing outcome — delivered or
     /// reported lost — so they no longer count as unaccounted.
     fn settled(&self, events: u64) {
-        self.unaccounted.0.fetch_sub(events, Ordering::Relaxed);
+        self.settled.fetch_add(events, Ordering::Relaxed);
+    }
+
+    /// Charges in the queue with no billing outcome yet: every lane's entries
+    /// less everything the writer has settled. Each entry is counted before its
+    /// event is sent, and settled only after it is received, so the difference
+    /// never undercounts what a dying writer holds.
+    fn unaccounted(&self) -> u64 {
+        let entered = self.lanes.get().map_or(0, |lanes| {
+            lanes.iter().fold(0u64, |total, lane| {
+                total.wrapping_add(lane.enqueued.load(Ordering::Relaxed))
+            })
+        });
+        entered.saturating_sub(self.settled.load(Ordering::Relaxed))
     }
 
     /// A backpressure refusal, counted where it happens rather than by the
@@ -317,7 +346,7 @@ impl WriterCounters {
     fn health(&self, queue_depth: usize, queue_capacity: usize) -> WriterHealth {
         WriterHealth {
             stats: self.stats(),
-            unaccounted: self.unaccounted.get(),
+            unaccounted: self.unaccounted(),
             shed: self.shed.get(),
             queue_depth,
             queue_capacity,
@@ -367,11 +396,70 @@ impl WriterHealth {
     }
 }
 
+/// One lane's request-written state, on a cache line of its own (#137).
+#[repr(align(128))]
+#[derive(Debug)]
+struct LaneStats {
+    /// Charges that entered this lane. Read with every other lane's, less what
+    /// the writer settled, as the instance's unaccounted count.
+    enqueued: AtomicU64,
+    /// Set by the send that finds the lane at its ring point, cleared by the
+    /// writer before it drains the lane: one doorbell per fill, not per event.
+    rung: AtomicBool,
+}
+
+/// What the lanes and the writer share. Never cloned per request: a permit
+/// reaches it through its own lane, so no request touches this `Arc`'s count.
+#[derive(Debug)]
+struct Queue {
+    stats: Arc<[LaneStats]>,
+    /// Wakes the writer early: a lane reaching its ring point, a lane whose
+    /// last handle went away, and, while draining, every permit that resolves.
+    doorbell: Notify,
+    /// Set by the final flush before it closes the lanes. Read on every permit
+    /// release and never written again, so it costs a shared read, not a write.
+    draining: AtomicBool,
+    /// How full a lane gets before its send rings the doorbell.
+    ring_at: usize,
+    counters: Arc<WriterCounters>,
+}
+
+/// Rings the doorbell when a lane's last handle goes away. A field of its own,
+/// declared after the sender, so the ring comes *after* the sender drops and
+/// the woken writer sees the lane disconnected rather than merely empty.
+#[derive(Debug)]
+struct RingOnDrop(Arc<Queue>);
+
+impl Drop for RingOnDrop {
+    fn drop(&mut self) {
+        self.0.doorbell.notify_one();
+    }
+}
+
+/// One lane of the usage queue: a bounded channel a subset of request threads
+/// reserve in, on lines no other lane's threads write.
+#[repr(align(128))]
+#[derive(Debug)]
+struct Lane {
+    tx: mpsc::Sender<UsageEvent>,
+    index: usize,
+    queue: RingOnDrop,
+}
+
 /// Cheap-to-clone handle for request handlers.
+///
+/// The queue is partitioned into lanes by the request thread's sticky
+/// locality (#137). One shared channel put every request of every account on
+/// the same sender count, semaphore, tail and waker lines, and woke the writer
+/// once per event: eight threads measured 3.2 µs per reserve-and-record. A
+/// request reserves in its own lane and tries the others before shedding, so
+/// the shed point is still exactly `queue_capacity` — a partition, not a
+/// reservation.
 #[derive(Clone)]
 pub struct UsageRecorder {
-    tx: mpsc::Sender<UsageEvent>,
-    counters: Arc<WriterCounters>,
+    lanes: Arc<[Arc<Lane>]>,
+    layout: LocalSharding,
+    queue: Arc<Queue>,
 }
 
 impl UsageRecorder {
@@ -379,26 +467,41 @@ impl UsageRecorder {
     /// full queue denies here — before any units are reserved or any work
     /// runs.
     pub fn try_reserve(&self) -> Result<UsagePermit, DenyReason> {
-        match self.tx.clone().try_reserve_owned() {
-            Ok(permit) => Ok(UsagePermit {
-                permit,
-                counters: Arc::clone(&self.counters),
-            }),
-            Err(_) => {
-                self.counters.record_shed();
-                Err(DenyReason::AccountingBackpressure)
+        let count = self.lanes.len();
+        let mut index = Locality::current().index(self.layout);
+        for _ in 0..count {
+            let lane = &self.lanes[index];
+            match lane.tx.clone().try_reserve_owned() {
+                Ok(permit) => {
+                    return Ok(UsagePermit {
+                        permit: Some(permit),
+                        lane: Arc::clone(lane),
+                    });
+                }
+                // A full lane is not a full queue: another lane may have room.
+                Err(TrySendError::Full(_)) => {}
+                // Closed lanes close together, at shutdown.
+                Err(TrySendError::Closed(_)) => break,
+            }
+            index += 1;
+            if index == count {
+                index = 0;
             }
         }
+        self.queue.counters.record_shed();
+        Err(DenyReason::AccountingBackpressure)
     }
 
     /// Whether the writer task has exited and can no longer accept events.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.tx.is_closed()
+        self.lanes[0].tx.is_closed()
     }
 
     pub(crate) async fn closed(&self) {
-        self.tx.closed().await;
+        // Every lane closes together: the final flush closes them all, and the
+        // task holds every receiver.
+        self.lanes[0].tx.closed().await;
     }
 
     /// The writer's accounting health, readable at any time.
@@ -409,10 +512,13 @@ impl UsageRecorder {
     /// reach of the endpoint that needs to report them.
     #[must_use]
     pub fn health(&self) -> WriterHealth {
-        self.counters.health(
-            self.tx.max_capacity() - self.tx.capacity(),
-            self.tx.max_capacity(),
-        )
+        let (depth, capacity) = self.lanes.iter().fold((0, 0), |(depth, capacity), lane| {
+            (
+                depth + lane.tx.max_capacity() - lane.tx.capacity(),
+                capacity + lane.tx.max_capacity(),
+            )
+        });
+        self.queue.counters.health(depth, capacity)
     }
 }
 
@@ -420,17 +526,45 @@ impl UsageRecorder {
 /// [`record`](UsagePermit::record); dropping the permit (deny, cancel,
 /// zero-charge path) releases the slot.
 pub struct UsagePermit {
-    permit: mpsc::OwnedPermit<UsageEvent>,
-    counters: Arc<WriterCounters>,
+    /// `None` only after `record` has sent through it.
+    permit: Option<mpsc::OwnedPermit<UsageEvent>>,
+    lane: Arc<Lane>,
 }
 
 impl UsagePermit {
-    pub fn record(self, event: UsageEvent) {
+    pub fn record(mut self, event: UsageEvent) {
+        let permit = self
+            .permit
+            .take()
+            .expect("a permit is consumed only by record, which consumes the permit");
+        let queue = &self.lane.queue.0;
+        let stats = &queue.stats[self.lane.index];
         // Counted from the moment it enters the queue until the writer gives
         // it a billing outcome; a writer that dies in between is therefore
-        // able to say how many charges it was carrying.
-        self.counters.enqueued();
-        self.permit.send(event);
+        // able to say how many charges it was carrying. Counted before the
+        // send, so the writer can never settle an event that was not counted.
+        stats.enqueued.fetch_add(1, Ordering::Relaxed);
+        let tx = permit.send(event);
+        // No wake per event: the writer drains on its flush tick. A lane that
+        // reaches its ring point rings once, so a burst cannot outrun the tick.
+        if tx.max_capacity() - tx.capacity() >= queue.ring_at
+            && !stats.rung.load(Ordering::Relaxed)
+            && !stats.rung.swap(true, Ordering::AcqRel)
+        {
+            queue.doorbell.notify_one();
+        }
+    }
+}
+
+impl Drop for UsagePermit {
+    fn drop(&mut self) {
+        // Release the slot first, so a draining writer woken below finds it
+        // released rather than still outstanding.
+        drop(self.permit.take());
+        let queue = &self.lane.queue.0;
+        if queue.draining.load(Ordering::Acquire) {
+            queue.doorbell.notify_one();
+        }
     }
 }
 
@@ -513,9 +647,38 @@ pub struct UsageWriter {
     handle: Option<tokio::task::JoinHandle<WriterStats>>,
     counters: Arc<WriterCounters>,
     /// Only to read the queue's depth for [`UsageWriter::health`] — weak, so
-    /// this handle never keeps the channel open by itself.
-    queue: mpsc::WeakSender<UsageEvent>,
+    /// this handle never keeps a lane open by itself.
+    queue: Arc<[mpsc::WeakSender<UsageEvent>]>,
     queue_capacity: usize,
+}
+
+/// The fewest slots a lane is given.
+///
+/// A lane smaller than a burst turns the sibling fallback into the routine
+/// path, and events that overflow into another lane are delivered in that
+/// lane's order rather than their thread's. Within one lane a thread's events
+/// keep their order; a queue too small for two such lanes keeps one, exactly
+/// the single channel it replaced.
+const MIN_LANE_CAPACITY: usize = 64;
+
+/// How many lanes a queue of `capacity` slots gets: the host's parallelism as
+/// a power of two, so the locality reduction is a mask, but never so many that
+/// a lane falls below [`MIN_LANE_CAPACITY`].
+fn lane_count(capacity: usize) -> usize {
+    let parallelism = LocalSharding::available_parallelism()
+        .get()
+        .next_power_of_two();
+    let affordable = capacity / MIN_LANE_CAPACITY;
+    if affordable < 2 {
+        return 1;
+    }
+    // A power of two no larger than what the capacity affords.
+    parallelism.min(1 << affordable.ilog2())
+}
+
+/// `total` slots split exactly across `count` lanes; the sizes sum to `total`.
+fn lane_capacity(total: usize, count: usize, index: usize) -> usize {
+    total / count + usize::from(index < total % count)
 }
 
 impl UsageWriter {
@@ -525,12 +688,63 @@ impl UsageWriter {
         config: UsageWriterConfig,
     ) -> Result<(UsageRecorder, UsageWriter), UsageWriterConfigError> {
         config.validate()?;
-        let (tx, rx) = mpsc::channel(config.queue_capacity);
-        // A weak handle lets the drain count still-outstanding permits at
-        // the deadline without holding the channel open itself.
-        let weak = tx.downgrade();
+        Ok(Self::spawn_lanes(
+            sink,
+            clock,
+            config,
+            lane_count(config.queue_capacity),
+        ))
+    }
+
+    /// `spawn` with an explicit lane count, so the multi-lane paths can be
+    /// tested on any host. `config` is already validated and `count` is at
+    /// least one and at most `queue_capacity`.
+    fn spawn_lanes(
+        sink: Arc<dyn UsageSink>,
+        clock: Arc<dyn Clock>,
+        config: UsageWriterConfig,
+        count: usize,
+    ) -> (UsageRecorder, UsageWriter) {
+        let (senders, receivers): (Vec<_>, Vec<_>) = (0..count)
+            .map(|index| mpsc::channel(lane_capacity(config.queue_capacity, count, index)))
+            .unzip();
+        // Weak handles let the drain count still-outstanding permits at the
+        // deadline without holding any lane open itself.
+        let weak: Arc<[mpsc::WeakSender<UsageEvent>]> =
+            senders.iter().map(mpsc::Sender::downgrade).collect();
         let (shutdown, shutdown_rx) = watch::channel(false);
         let counters = Arc::new(WriterCounters::new());
+        let stats: Arc<[LaneStats]> = (0..count)
+            .map(|_| LaneStats {
+                enqueued: AtomicU64::new(0),
+                rung: AtomicBool::new(false),
+            })
+            .collect();
+        counters
+            .lanes
+            .set(Arc::clone(&stats))
+            .expect("a fresh counter set has no lanes yet");
+        let smallest_lane = config.queue_capacity / count;
+        let queue = Arc::new(Queue {
+            stats,
+            doorbell: Notify::new(),
+            draining: AtomicBool::new(false),
+            // Ring at a batch, or at half a small lane so a burst rings before
+            // the lane is full rather than only as it sheds.
+            ring_at: config.max_batch.min(smallest_lane / 2).max(1),
+            counters: Arc::clone(&counters),
+        });
+        let lanes: Arc<[Arc<Lane>]> = senders
+            .into_iter()
+            .enumerate()
+            .map(|(index, tx)| {
+                Arc::new(Lane {
+                    tx,
+                    index,
+                    queue: RingOnDrop(Arc::clone(&queue)),
+                })
+            })
+            .collect();
         let deadline = Arc::new(crate::ShutdownDeadline::default());
         let handle = tokio::spawn(
             run(
@@ -541,8 +755,11 @@ impl UsageWriter {
                     counters: Arc::clone(&counters),
                     deadline: Arc::clone(&deadline),
                 },
-                rx,
-                weak.clone(),
+                Lanes {
+                    rx: receivers,
+                    weak: Arc::clone(&weak),
+                    queue: Arc::clone(&queue),
+                },
                 shutdown_rx,
             )
             // One writer serves every account, so the span carries the
@@ -550,13 +767,17 @@ impl UsageWriter {
             .instrument(tracing::info_span!(
                 "usage_writer",
                 queue_capacity = config.queue_capacity,
+                lanes = count,
                 max_batch = config.max_batch
             )),
         );
-        Ok((
+        (
             UsageRecorder {
-                tx,
-                counters: Arc::clone(&counters),
+                lanes,
+                layout: LocalSharding::new(
+                    std::num::NonZeroUsize::new(count).expect("lane_count is at least one"),
+                ),
+                queue,
             },
             UsageWriter {
                 shutdown,
@@ -566,7 +787,7 @@ impl UsageWriter {
                 queue: weak,
                 queue_capacity: config.queue_capacity,
             },
-        ))
+        )
     }
 
     /// The writer's accounting health, readable at any time — the same numbers
@@ -575,9 +796,10 @@ impl UsageWriter {
     pub fn health(&self) -> WriterHealth {
         let depth = self
             .queue
-            .upgrade()
+            .iter()
+            .filter_map(mpsc::WeakSender::upgrade)
             .map(|tx| tx.max_capacity() - tx.capacity())
-            .unwrap_or(0);
+            .sum();
         self.counters.health(depth, self.queue_capacity)
     }
 
@@ -611,7 +833,7 @@ impl UsageWriter {
 
     fn died(&self, panicked: bool) -> WriterShutdownError {
         WriterShutdownError {
-            unaccounted: self.counters.unaccounted.get(),
+            unaccounted: self.counters.unaccounted(),
             panicked,
         }
     }
@@ -625,15 +847,6 @@ impl Drop for UsageWriter {
             handle.abort();
         }
     }
-}
-
-/// Why the fill loop stopped collecting.
-enum FillOutcome {
-    /// Batch full or flush interval lapsed: deliver and keep running.
-    Flush,
-    /// Shutdown observed (signal, dropped sender, or closed channel):
-    /// proceed to the bounded final flush.
-    Stop,
 }
 
 /// The writer's collaborators, fixed for the task's lifetime.
@@ -653,12 +866,50 @@ impl Writer {
     }
 }
 
-async fn run(
-    writer: Writer,
-    mut rx: mpsc::Receiver<UsageEvent>,
-    weak: mpsc::WeakSender<UsageEvent>,
-    mut shutdown: watch::Receiver<bool>,
-) -> WriterStats {
+/// The writer's half of the lanes.
+struct Lanes {
+    rx: Vec<mpsc::Receiver<UsageEvent>>,
+    weak: Arc<[mpsc::WeakSender<UsageEvent>]>,
+    queue: Arc<Queue>,
+}
+
+/// What one pass over the lanes found.
+enum Collected {
+    /// `batch` reached `max_batch`: deliver it before collecting more.
+    Full,
+    /// Every lane is empty for now. `disconnected` when no lane can ever yield
+    /// again: every handle is gone, or the lanes were closed and every permit
+    /// has resolved.
+    Empty { disconnected: bool },
+}
+
+impl Lanes {
+    /// Move whatever the lanes hold into `batch`, up to `max_batch`, without
+    /// waiting. A lane's doorbell flag is cleared *before* the lane is read, so
+    /// a send that lands after the read rings again rather than waiting a tick.
+    fn collect(&mut self, batch: &mut Vec<UsageEvent>, max_batch: usize) -> Collected {
+        let mut disconnected = true;
+        for (index, rx) in self.rx.iter_mut().enumerate() {
+            self.queue.stats[index].rung.store(false, Ordering::Release);
+            loop {
+                if batch.len() >= max_batch {
+                    return Collected::Full;
+                }
+                match rx.try_recv() {
+                    Ok(event) => batch.push(event),
+                    Err(TryRecvError::Empty) => {
+                        disconnected = false;
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+        Collected::Empty { disconnected }
+    }
+}
+
+async fn run(writer: Writer, mut lanes: Lanes, mut shutdown: watch::Receiver<bool>) -> WriterStats {
     let config = writer.config;
     let max_batch = config.max_batch;
     let mut batch: Vec<UsageEvent> = Vec::with_capacity(max_batch);
@@ -667,49 +918,57 @@ async fn run(
         // Level check at every loop boundary: a shutdown observed anywhere
         // below (including inside the retry backoff) lands here.
         if *shutdown.borrow() {
-            return final_flush(&writer, &mut rx, &weak, &mut batch).await;
+            return final_flush(&writer, &mut lanes, &mut batch).await;
         }
 
+        // The writer never parks on a lane's receiver, so a send finds no
+        // waker to wake (#137). It drains on this tick, which is when a
+        // partial batch was due anyway, and earlier only when a lane rings.
         let deadline = tokio::time::sleep(config.flush_interval);
         tokio::pin!(deadline);
-        let outcome = loop {
-            // `recv_many`'s limit is the number of events appended, not the
-            // final vector length. Restrict it to the remaining capacity so
-            // one ingest call can never exceed `max_batch`.
-            let remaining = max_batch - batch.len();
-            tokio::select! {
-                received = rx.recv_many(&mut batch, remaining) => {
-                    if received == 0 {
-                        break FillOutcome::Stop;
-                    }
-                    if batch.len() >= max_batch {
-                        break FillOutcome::Flush;
-                    }
-                }
-                _ = &mut deadline, if !batch.is_empty() => break FillOutcome::Flush,
+        let stop = loop {
+            let due = tokio::select! {
+                () = lanes.queue.doorbell.notified() => false,
+                () = &mut deadline => true,
                 changed = shutdown.changed() => {
                     // Err = sender dropped without shutdown(); treat both as
                     // stop so the task can never outlive its handle usefully.
                     if changed.is_err() || *shutdown.borrow() {
-                        break FillOutcome::Stop;
+                        break true;
                     }
+                    continue;
                 }
+            };
+            let disconnected = loop {
+                match lanes.collect(&mut batch, max_batch) {
+                    Collected::Full => {
+                        // Retry until delivered or shutdown interrupts; either
+                        // way the loop-top level check decides what happens next.
+                        flush_retrying(&writer, &mut batch, &mut shutdown).await;
+                        if *shutdown.borrow() || shutdown.has_changed().is_err() {
+                            break false;
+                        }
+                    }
+                    Collected::Empty { disconnected } => break disconnected,
+                }
+            };
+            if *shutdown.borrow() || shutdown.has_changed().is_err() {
+                break true;
+            }
+            if due && !batch.is_empty() {
+                flush_retrying(&writer, &mut batch, &mut shutdown).await;
+            }
+            // Every handle is gone: nothing can arrive, so stop as the channel's
+            // close used to (the recorder's lanes ring as they drop).
+            if disconnected {
+                break true;
+            }
+            if due {
+                break false;
             }
         };
-
-        match outcome {
-            FillOutcome::Stop => {
-                return final_flush(&writer, &mut rx, &weak, &mut batch).await;
-            }
-            FillOutcome::Flush => {
-                // Retry until delivered or shutdown interrupts; either way
-                // the loop-top level check decides what happens next.
-                flush_retrying(&writer, &mut batch, &mut shutdown).await;
-                if shutdown.has_changed().is_err() {
-                    // Sender gone: same stop path as above.
-                    return final_flush(&writer, &mut rx, &weak, &mut batch).await;
-                }
-            }
+        if stop {
+            return final_flush(&writer, &mut lanes, &mut batch).await;
         }
     }
 }
@@ -838,41 +1097,52 @@ async fn flush_retrying(
 /// drain can never block past its bound.
 async fn final_flush(
     writer: &Writer,
-    rx: &mut mpsc::Receiver<UsageEvent>,
-    weak: &mpsc::WeakSender<UsageEvent>,
+    lanes: &mut Lanes,
     batch: &mut Vec<UsageEvent>,
 ) -> WriterStats {
     let config = &writer.config;
     let max_batch = config.max_batch;
     // Refuse new reservations from this instant. Permits already handed out
-    // keep their slots and can still deliver into the drain below; a real
-    // recv (unlike try_recv, for which a reserved-but-unsent slot is
-    // indistinguishable from "done") yields None only once every one of
-    // them has sent or dropped.
-    rx.close();
+    // keep their slots and can still deliver into the drain below. A closed
+    // lane reports disconnected only once it is empty and every one of its
+    // permits has sent or dropped — never merely because it is momentarily
+    // empty — which is the done signal the single channel's `recv` gave.
+    // Every permit that resolves from here rings the doorbell, so the drain
+    // waits on it rather than polling.
+    lanes.queue.draining.store(true, Ordering::Release);
+    for rx in &mut lanes.rx {
+        rx.close();
+    }
     let deadline = writer.deadline.within(config.shutdown_drain_deadline);
-    let mut drained = false;
     let mut expired = false;
     loop {
-        while batch.len() < max_batch && !drained && !expired {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(event)) => batch.push(event),
-                Ok(None) => drained = true,
-                Err(_) => expired = true,
+        let drained = loop {
+            match lanes.collect(batch, max_batch) {
+                Collected::Full => flush_bounded(writer, batch, deadline).await,
+                Collected::Empty { disconnected } => break disconnected,
             }
-        }
-        // No post-deadline sweep is needed: `timeout_at` polls the receive
-        // first, so an event already queued is still delivered above even
-        // once the deadline has passed. `expired` therefore means the queue
-        // is empty and some permit is still outstanding — and each drained
-        // event resolves a permit, so the finite permit set bounds the loop.
-        if batch.is_empty() {
-            if expired {
-                writer.counters.set_unresolved(outstanding_permits(weak));
+        };
+        if drained || expired {
+            if !batch.is_empty() {
+                flush_bounded(writer, batch, deadline).await;
+            }
+            // A final sweep after the deadline has already collected anything
+            // that was queued, so what remains outstanding is permits.
+            if !drained {
+                writer
+                    .counters
+                    .set_unresolved(outstanding_permits(&lanes.weak));
             }
             return writer.counters.stats();
         }
-        flush_bounded(writer, batch, deadline).await;
+        // Each wake is a resolved permit, a dropped lane, or the deadline; the
+        // finite permit set bounds the loop. One more sweep follows an expiry.
+        if tokio::time::timeout_at(deadline, lanes.queue.doorbell.notified())
+            .await
+            .is_err()
+        {
+            expired = true;
+        }
     }
 }
 
@@ -958,10 +1228,12 @@ async fn ingest_checked(
 /// while some permit keeps the channel alive — which is when there is
 /// something to report — and the momentary strong sender is dropped
 /// immediately, so it cannot mask completion.
-fn outstanding_permits(weak: &mpsc::WeakSender<UsageEvent>) -> u64 {
-    weak.upgrade()
+fn outstanding_permits(lanes: &[mpsc::WeakSender<UsageEvent>]) -> u64 {
+    lanes
+        .iter()
+        .filter_map(mpsc::WeakSender::upgrade)
         .map(|tx| (tx.max_capacity() - tx.capacity()) as u64)
-        .unwrap_or(0)
+        .sum()
 }
 
 #[cfg(test)]
@@ -1084,5 +1356,222 @@ mod layout_tests {
     fn request_path_counters_are_isolated_on_supported_cache_lines() {
         assert_eq!(align_of::<Contended>(), 128);
         assert_eq!(size_of::<Contended>(), 128);
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tollgate_core::{AccountId, CostUnits, PolicyRevision, RequestId, UsageSource};
+    use tollgate_store::{IngestError, IngestReport};
+
+    /// Accepts everything and remembers which request ids it was given.
+    #[derive(Default)]
+    struct Recording(Mutex<Vec<u128>>);
+
+    #[async_trait::async_trait]
+    impl UsageSink for Recording {
+        async fn ingest(
+            &self,
+            events: &[UsageEvent],
+            _now: Timestamp,
+        ) -> Result<IngestReport, IngestError> {
+            self.0
+                .lock()
+                .unwrap()
+                .extend(events.iter().map(|event| event.request_id.0));
+            Ok(IngestReport {
+                accepted: events.len() as u64,
+                unattributed: Some(0),
+                ..IngestReport::default()
+            })
+        }
+    }
+
+    fn event(id: u128) -> UsageEvent {
+        UsageEvent::new(
+            RequestId(id),
+            AccountId(1),
+            UsageSource::Overage,
+            CostUnits(1),
+            Timestamp::from_second(100).unwrap(),
+            PolicyRevision::UNSTATED,
+            None,
+        )
+    }
+
+    fn config(queue_capacity: usize, max_batch: usize) -> UsageWriterConfig {
+        UsageWriterConfig {
+            queue_capacity,
+            max_batch,
+            flush_interval: Duration::from_secs(60),
+            retry_backoff: Duration::from_millis(10),
+            shutdown_drain_deadline: Duration::from_secs(5),
+            ingest_timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn spawn(
+        sink: &Arc<Recording>,
+        queue_capacity: usize,
+        max_batch: usize,
+        lanes: usize,
+    ) -> (UsageRecorder, UsageWriter) {
+        UsageWriter::spawn_lanes(
+            Arc::clone(sink) as Arc<dyn UsageSink>,
+            Arc::new(crate::ManualClock::new(
+                Timestamp::from_second(100).unwrap(),
+            )),
+            config(queue_capacity, max_batch),
+            lanes,
+        )
+    }
+
+    #[test]
+    fn lanes_partition_the_capacity_exactly_and_never_go_below_their_floor() {
+        for (total, count) in [(256, 4), (4_096, 16), (100, 3), (7, 7)] {
+            let sizes: Vec<usize> = (0..count).map(|i| lane_capacity(total, count, i)).collect();
+            assert_eq!(sizes.iter().sum::<usize>(), total, "{total}/{count}");
+            assert!(sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1);
+        }
+        assert_eq!(lane_count(1), 1);
+        assert_eq!(
+            lane_count(MIN_LANE_CAPACITY * 2 - 1),
+            1,
+            "one lane below two floors"
+        );
+        for capacity in [128, 4_096, 65_536] {
+            let count = lane_count(capacity);
+            assert!(count.is_power_of_two());
+            assert!(
+                capacity / count >= MIN_LANE_CAPACITY,
+                "{capacity} -> {count}"
+            );
+        }
+    }
+
+    /// A full lane is not a full queue: one thread, whose own lane fills first,
+    /// still reserves every slot of every lane, and the next request sheds at
+    /// exactly `queue_capacity` (INVARIANTS.md #8).
+    #[tokio::test(start_paused = true)]
+    async fn the_shed_point_is_the_whole_queue_across_lanes() {
+        let sink = Arc::new(Recording::default());
+        let (recorder, writer) = spawn(&sink, 256, 64, 4);
+        let permits: Vec<_> = (0..256).map(|_| recorder.try_reserve().unwrap()).collect();
+        assert_eq!(recorder.health().queue_depth, 256);
+        assert_eq!(recorder.health().queue_capacity, 256);
+        assert_eq!(
+            recorder.try_reserve().err(),
+            Some(DenyReason::AccountingBackpressure)
+        );
+        assert_eq!(recorder.health().shed, 1);
+        drop(permits);
+        assert_eq!(recorder.health().queue_depth, 0);
+        assert!(writer.shutdown().await.unwrap().unresolved == 0);
+    }
+
+    /// Events in every lane are delivered by the drain, and permits still held
+    /// in several lanes at the deadline are all reported unresolved.
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_delivers_every_lane_and_reports_every_lanes_permits() {
+        let sink = Arc::new(Recording::default());
+        let (recorder, writer) = spawn(&sink, 256, 256, 4);
+        // 200 records from one thread fill its lane and spill into the rest.
+        for id in 0..200 {
+            recorder.try_reserve().unwrap().record(event(id));
+        }
+        assert_eq!(recorder.health().unaccounted, 200);
+        let held: Vec<_> = (0..40).map(|_| recorder.try_reserve().unwrap()).collect();
+        let stats = writer.shutdown().await.unwrap();
+        let mut delivered = sink.0.lock().unwrap().clone();
+        delivered.sort_unstable();
+        assert_eq!(
+            delivered,
+            (0..200).collect::<Vec<_>>(),
+            "every lane drained"
+        );
+        assert_eq!(stats.accepted, 200);
+        assert_eq!(
+            stats.unresolved, 40,
+            "permits held across lanes are all reported"
+        );
+        assert_eq!(recorder.health().unaccounted, 0);
+        drop(held);
+    }
+
+    /// A permit that resolves during the drain wakes it: the drain returns as
+    /// soon as the last one does, not at its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_resolving_permit_in_any_lane_completes_the_drain() {
+        let sink = Arc::new(Recording::default());
+        let (recorder, writer) = spawn(&sink, 256, 64, 4);
+        let held: Vec<_> = (0..100).map(|_| recorder.try_reserve().unwrap()).collect();
+        let began = tokio::time::Instant::now();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            for (id, permit) in (0..).zip(held) {
+                permit.record(event(id));
+            }
+        });
+        let stats = writer.shutdown().await.unwrap();
+        release.await.unwrap();
+        assert_eq!(stats.accepted, 100);
+        assert_eq!(stats.unresolved, 0);
+        assert_eq!(
+            began.elapsed(),
+            Duration::from_millis(50),
+            "woken, not timed out"
+        );
+    }
+
+    /// A lane that reaches its ring point is delivered before the flush tick,
+    /// so a burst cannot back up to the shed point waiting for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_batch_is_delivered_before_the_tick() {
+        let sink = Arc::new(Recording::default());
+        let (recorder, writer) = spawn(&sink, 256, 16, 4);
+        for id in 0..16 {
+            recorder.try_reserve().unwrap().record(event(id));
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sink.0.lock().unwrap().len(), 16, "delivered without a tick");
+        assert_eq!(writer.shutdown().await.unwrap().accepted, 16);
+    }
+
+    /// Below the ring point nothing wakes the writer; the tick delivers.
+    #[tokio::test(start_paused = true)]
+    async fn a_partial_batch_waits_for_the_tick() {
+        let sink = Arc::new(Recording::default());
+        let (recorder, writer) = spawn(&sink, 256, 64, 4);
+        for id in 0..3 {
+            recorder.try_reserve().unwrap().record(event(id));
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(sink.0.lock().unwrap().is_empty(), "no wake per event");
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert_eq!(sink.0.lock().unwrap().len(), 3, "the tick delivered it");
+        assert_eq!(writer.shutdown().await.unwrap().accepted, 3);
+    }
+
+    /// Dropping every recorder handle stops the writer without a tick: the
+    /// lanes ring as their last handles go.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_recorder_stops_the_writer_promptly() {
+        let sink = Arc::new(Recording::default());
+        let (recorder, mut writer) = spawn(&sink, 256, 64, 4);
+        recorder.try_reserve().unwrap().record(event(1));
+        drop(recorder);
+        let handle = writer.handle.take().unwrap();
+        let stats = tokio::time::timeout(Duration::from_millis(1), handle)
+            .await
+            .expect("stopped before any tick")
+            .unwrap();
+        assert_eq!(stats.accepted, 1);
     }
 }
