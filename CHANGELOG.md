@@ -7,6 +7,20 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.28.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.27.0...v0.28.0) - 2026-09-24
+
+### Added
+
+- *(admission)* [**breaking**] #134 report per-account lease contention
+
+### Other
+
+- *(admission)* #138 attribute cross-account admit cost to line migration
+- *(client)* #137 partition the usage queue into lanes
+- *(gates)* #125 size the pinned contended rows to controlled-host envelopes
+- *(admission)* #134 correct why lease sharding is opt-in
+- *(admission)* [**breaking**] #132 shard outcome tallies under every layout
+
 ## [0.27.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.26.0...v0.27.0) - 2026-09-24
 
 ### Fixed
