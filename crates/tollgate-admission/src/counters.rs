@@ -169,8 +169,11 @@ impl CommitRefusal {
 /// cache line that unrelated tenants fight over: eight threads on eight
 /// distinct accounts measured 772 ns per admission against the inline
 /// counters and 181 ns with only the counters sharded (#132). Lease sharding
-/// stays opt-in because splitting a grant strands headroom; a monitoring
-/// total is a sum however it is split, so the counters carry no such cost.
+/// stays opt-in because it is paid per account — each account's state, lease
+/// counters and rate buckets multiply by the shard count — and because its
+/// rate buckets partition the account's burst. The tallies are one set per
+/// instance and a total is a sum however it is split, so sharding them costs a
+/// few kilobytes once and changes no answer.
 ///
 /// The shard count is the larger of the lease sharding and the host's
 /// parallelism, rounded up to a power of two so the locality reduction is
