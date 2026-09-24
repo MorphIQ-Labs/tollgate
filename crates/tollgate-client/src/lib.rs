@@ -69,7 +69,7 @@ pub use period_roller::{
 };
 pub use runtime::RuntimeFundingReport;
 pub use runtime::{
-    AccountPhase, AccountReport, InstanceRuntime, InstanceRuntimeConfig,
+    AccountPhase, AccountReport, ContentionReport, InstanceRuntime, InstanceRuntimeConfig,
     InstanceRuntimeConfigError, RuntimeHandle, RuntimeReadiness, RuntimeReport,
     RuntimeShutdownReport, RuntimeWriterError,
 };

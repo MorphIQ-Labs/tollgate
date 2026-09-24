@@ -396,6 +396,13 @@ struct LeaseShard {
     remaining: AtomicU64,
     low_water: u64,
     signalled: AtomicBool,
+    /// Debit compare-exchanges on `remaining` that lost to another writer.
+    ///
+    /// On this shard's own line, in padding it already had: the counter costs
+    /// no memory, and the only thread that writes it is one already contending
+    /// for this line. Added once per contended debit, never per failure, so a
+    /// contended debit adds one write rather than one per lost race.
+    contended: AtomicU64,
 }
 
 impl LeaseShard {
@@ -404,6 +411,16 @@ impl LeaseShard {
             remaining: AtomicU64::new(remaining),
             low_water,
             signalled: AtomicBool::new(false),
+            contended: AtomicU64::new(0),
+        }
+    }
+
+    /// Record `lost` failed exchanges, if any. The branch is the whole cost
+    /// of the signal on an uncontended debit.
+    #[inline]
+    fn note_contention(&self, lost: u64) {
+        if lost != 0 {
+            self.contended.fetch_add(lost, Ordering::Relaxed);
         }
     }
 }
@@ -471,6 +488,11 @@ struct LeaseInner {
     /// which publishes it, and read by the plane only at quiescence. Zero
     /// until a refusal, and never set by an expiry refusal, which rotates.
     refused_quote: AtomicU64,
+    /// How much of the shards' contention a [`LocalLease::take_unreported_contention`]
+    /// caller has already been handed. Raised with `fetch_max`, so a lease that
+    /// is taken out of its slot and reinstalled — which a refused consolidation
+    /// does — is never reported twice.
+    contention_reported: AtomicU64,
     /// Local end of life: `expires_at - safety margin`. Debits and commits
     /// stop here, *before* the server-stamped expiry, so clock skew between
     /// allocator and holder plus in-flight request time fit inside the
@@ -543,6 +565,7 @@ impl LocalLease {
                 low_water: low_water.get(),
                 refused: AtomicBool::new(false),
                 refused_quote: AtomicU64::new(0),
+                contention_reported: AtomicU64::new(0),
                 usable_until,
                 refill: OnceLock::new(),
                 grant,
@@ -584,6 +607,7 @@ impl LocalLease {
                 low_water: low_water.get(),
                 refused: AtomicBool::new(false),
                 refused_quote: AtomicU64::new(0),
+                contention_reported: AtomicU64::new(0),
                 usable_until,
             }),
         }
@@ -622,6 +646,63 @@ impl LocalLease {
         Arc::strong_count(&self.inner) == 1
     }
 
+    /// The largest quote this lease refused for want of units, or zero.
+    ///
+    /// Demand the refill plane has proof of: a consolidation may grow the
+    /// replacement to it when the account can fund it (#131). Exact only once
+    /// the lease has quiesced, the same condition [`Self::remaining`] needs.
+    #[must_use]
+    pub fn largest_refused_quote(&self) -> CostUnits {
+        CostUnits(self.inner.refused_quote.load(Ordering::Acquire))
+    }
+
+    /// Debits that lost a compare-exchange on a shard to another writer,
+    /// summed across shards, since this lease was created.
+    ///
+    /// Evidence that the account's funding line is being written from more
+    /// than one core at once, and a **lower bound** on contention rather than
+    /// a measure of its cost: only the debit loops can observe a lost race.
+    /// The rate bucket, reference counts and settlement use read-modify-write
+    /// operations that pay for a contended line without ever failing, and a
+    /// debit whose exchange lands between two rivals' records nothing. On a
+    /// load-linked/store-conditional target a spurious exchange failure also
+    /// counts; x86-64 and aarch64 with LSE atomics have none.
+    ///
+    /// A control-plane read that walks every shard. No decision reads it.
+    #[must_use]
+    pub fn contended_debits(&self) -> u64 {
+        self.inner
+            .balance
+            .as_slice()
+            .iter()
+            .fold(0u64, |total, shard| {
+                total.saturating_add(shard.contended.load(Ordering::Relaxed))
+            })
+    }
+
+    /// The contention recorded since the last call, handed out exactly once.
+    ///
+    /// A slot folds this into its account's running total when the lease
+    /// leaves it. Idempotent across removal and reinstallation of the same
+    /// lease: what was handed out is remembered on the lease itself, and a
+    /// concurrent or repeated call receives only what no earlier call did.
+    #[must_use]
+    pub fn take_unreported_contention(&self) -> u64 {
+        let total = self.contended_debits();
+        let reported = self
+            .inner
+            .contention_reported
+            .fetch_max(total, Ordering::AcqRel);
+        total.saturating_sub(reported)
+    }
+
+    /// The contention a slot has not yet been handed, without handing it out.
+    #[must_use]
+    pub fn unreported_contention(&self) -> u64 {
+        self.contended_debits()
+            .saturating_sub(self.inner.contention_reported.load(Ordering::Acquire))
+    }
+
     /// Units still spendable, aggregated across every shard.
     ///
     /// Exact for a single-counter lease, and for a sharded lease once it has
@@ -637,16 +718,6 @@ impl LocalLease {
     /// missed. Hence the clamp: the sum can exceed the grant, so it is
     /// saturated and bounded rather than asserted, and no reader of a live
     /// lease may treat the result as an exact balance.
-    /// The largest quote this lease refused for want of units, or zero.
-    ///
-    /// Demand the refill plane has proof of: a consolidation may grow the
-    /// replacement to it when the account can fund it (#131). Exact only once
-    /// the lease has quiesced, the same condition [`Self::remaining`] needs.
-    #[must_use]
-    pub fn largest_refused_quote(&self) -> CostUnits {
-        CostUnits(self.inner.refused_quote.load(Ordering::Acquire))
-    }
-
     #[must_use]
     pub fn remaining(&self) -> CostUnits {
         let remaining = self
@@ -789,8 +860,14 @@ impl LocalLease {
     fn try_whole(&self, shard_index: usize, want: u64) -> Option<LeaseDebit> {
         let shard = &self.inner.balance.as_slice()[shard_index];
         let mut current = shard.remaining.load(Ordering::Acquire);
+        // Counted in a register and recorded once on every exit, so an
+        // uncontended debit pays one untaken branch.
+        let mut lost = 0u64;
         loop {
-            let next = current.checked_sub(want)?;
+            let Some(next) = current.checked_sub(want) else {
+                shard.note_contention(lost);
+                return None;
+            };
             match shard.remaining.compare_exchange_weak(
                 current,
                 next,
@@ -798,13 +875,17 @@ impl LocalLease {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
+                    shard.note_contention(lost);
                     self.maybe_signal_refill(shard_index, next);
                     return Some(LeaseDebit {
                         shard: shard_index,
                         units: want,
                     });
                 }
-                Err(observed) => current = observed,
+                Err(observed) => {
+                    lost += 1;
+                    current = observed;
+                }
             }
         }
     }
@@ -813,8 +894,10 @@ impl LocalLease {
     fn take_up_to(&self, shard_index: usize, want: u64) -> u64 {
         let shard = &self.inner.balance.as_slice()[shard_index];
         let mut current = shard.remaining.load(Ordering::Acquire);
+        let mut lost = 0u64;
         loop {
             if current == 0 {
+                shard.note_contention(lost);
                 return 0;
             }
             let taken = current.min(want);
@@ -825,8 +908,14 @@ impl LocalLease {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return taken,
-                Err(observed) => current = observed,
+                Ok(_) => {
+                    shard.note_contention(lost);
+                    return taken;
+                }
+                Err(observed) => {
+                    lost += 1;
+                    current = observed;
+                }
             }
         }
     }
@@ -1189,6 +1278,102 @@ mod tests {
         let reservation = crate::Reservation::reserve(&l, CostUnits(u64::MAX), t(0)).unwrap();
         assert_eq!(reservation.cancel(), crate::CancelOutcome::ZeroCharged);
         assert_eq!(l.remaining(), CostUnits(u64::MAX));
+    }
+
+    /// No rival, no lost exchange: a debit that won its first compare-exchange
+    /// records nothing, on the single and the sharded layout alike. Limited to
+    /// targets whose weak exchange cannot fail spuriously; on a
+    /// load-linked/store-conditional target a spurious failure also counts.
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_feature = "lse")
+    ))]
+    #[test]
+    fn an_uncontended_debit_records_no_contention() {
+        for l in [lease(1_000, 1_000, 0), sharded_lease(1_000, 0, 4)] {
+            for _ in 0..100 {
+                let debit = l
+                    .try_reserve_at(CostUnits(3), t(0), Locality::current())
+                    .unwrap();
+                l.credit(&debit);
+            }
+            // Fragmented debits walk `take_up_to` instead of `try_whole`.
+            let fragmented = l
+                .try_reserve_at(CostUnits(1_000), t(0), Locality::current())
+                .unwrap();
+            l.credit(&fragmented);
+            assert_eq!(l.contended_debits(), 0);
+        }
+    }
+
+    /// Many writers on one line lose exchanges, and each loss is recorded on
+    /// the shard it was lost on without disturbing the balance.
+    #[test]
+    fn contended_debits_are_recorded_without_disturbing_the_balance() {
+        const THREADS: u64 = 8;
+        const DEBITS: u64 = 20_000;
+        let l = lease(THREADS * DEBITS, 1_000, 0);
+        // Retries are a race, so the stress repeats until one is seen. Eight
+        // threads on one line lose races within the first round on any
+        // multi-core host; the bound keeps a single-core host from hanging.
+        for _ in 0..50 {
+            std::thread::scope(|scope| {
+                for _ in 0..THREADS {
+                    scope.spawn(|| {
+                        for _ in 0..DEBITS {
+                            let debit = l
+                                .try_reserve_at(CostUnits(1), t(0), Locality::current())
+                                .unwrap();
+                            l.credit(&debit);
+                        }
+                    });
+                }
+            });
+            if l.contended_debits() > 0 {
+                break;
+            }
+        }
+        assert!(
+            l.contended_debits() > 0,
+            "eight writers on one line never lost a race"
+        );
+        assert_eq!(
+            l.remaining(),
+            CostUnits(THREADS * DEBITS),
+            "credits restored every debit"
+        );
+    }
+
+    /// The hand-out is exact and idempotent. A slot that takes the lease out,
+    /// reinstalls it, and takes it out again must not report the same
+    /// contention twice.
+    #[test]
+    fn unreported_contention_is_handed_out_exactly_once() {
+        let l = sharded_lease(100, 0, 2);
+        let shards = l.inner.balance.as_slice();
+        shards[0].note_contention(3);
+        shards[1].note_contention(4);
+        assert_eq!(l.contended_debits(), 7);
+        assert_eq!(l.unreported_contention(), 7);
+        assert_eq!(l.take_unreported_contention(), 7);
+        assert_eq!(
+            l.take_unreported_contention(),
+            0,
+            "reinstalled and taken again"
+        );
+        assert_eq!(l.unreported_contention(), 0);
+        shards[1].note_contention(2);
+        assert_eq!(l.unreported_contention(), 2);
+        assert_eq!(l.take_unreported_contention(), 2);
+        assert_eq!(
+            l.contended_debits(),
+            9,
+            "the lease's own total never resets"
+        );
+        // A handle cloned into another locality view shares the same record.
+        assert_eq!(l.clone().take_unreported_contention(), 0);
+        shards[0].note_contention(0);
+        assert_eq!(l.contended_debits(), 9, "recording zero writes nothing");
     }
 
     #[test]

@@ -82,6 +82,10 @@ pub struct LeaseSlot {
     /// Deadlines cannot serve as the sequence, because two publications may
     /// share one and bracket a third (see [`LeaseSlot::funding_evidence`]).
     evidence_sequence: AtomicU64,
+    /// Lost debit races handed over by leases that have left this slot: the
+    /// account's contention history, which outlives any one grant. Written on
+    /// the control plane only, at publication.
+    contention_retired: AtomicU64,
 }
 
 /// Control-plane publication state. The identity token prevents an older
@@ -221,6 +225,7 @@ impl LeaseSlot {
             evidence_until: AtomicI64::new(i64::MIN),
             evidence_remaining: AtomicU64::new(0),
             evidence_sequence: AtomicU64::new(0),
+            contention_retired: AtomicU64::new(0),
         })
     }
 
@@ -386,6 +391,40 @@ impl LeaseSlot {
     /// request's `Arc` traffic off the other localities' cache lines, and
     /// quiescence still sees through every alias to the shared inner state.
     fn publish(&self, next: Option<Arc<LocalLease>>) -> Option<Arc<LocalLease>> {
+        let replaced = self.swap_views(next);
+        // The outgoing lease's contention joins the account's history here,
+        // on the one path every rotation and removal takes. The lease itself
+        // remembers what it handed over, so reinstalling it later cannot count
+        // the same races twice.
+        if let Some(outgoing) = &replaced {
+            self.contention_retired
+                .fetch_add(outgoing.take_unreported_contention(), Ordering::Relaxed);
+        }
+        replaced
+    }
+
+    /// How many of this account's lease debits lost a compare-exchange to
+    /// another writer, across every lease the slot has held.
+    ///
+    /// The account-level contention signal (#134): nonzero means its funding
+    /// line was written from more than one core at the same moment. It is a
+    /// **lower bound** — see [`LocalLease::contended_debits`] for what cannot
+    /// be observed — and a read that races a rotation can transiently miss
+    /// the outgoing lease's newest races; it never counts one twice. Read it
+    /// as a rate between two reads, not as an absolute. Control plane only.
+    #[must_use]
+    pub fn contended_debits(&self) -> u64 {
+        // Retired first, current second: a rotation between the two reads
+        // then drops the outgoing lease's newest races rather than adding
+        // them to both terms.
+        let retired = self.contention_retired.load(Ordering::Relaxed);
+        retired.saturating_add(
+            self.load_observed()
+                .map_or(0, |lease| lease.unreported_contention()),
+        )
+    }
+
+    fn swap_views(&self, next: Option<Arc<LocalLease>>) -> Option<Arc<LocalLease>> {
         match &self.current {
             LeaseSlotCurrent::Single(current) => current.swap(next),
             LeaseSlotCurrent::Sharded { publish, views } => {
@@ -2075,6 +2114,69 @@ mod tests {
             },
             CostUnits::ZERO,
         ))
+    }
+
+    /// Drive eight writers through `lease` until at least one debit lost a
+    /// race. Bounded so a single-core host cannot hang the suite.
+    fn contend(lease: &LocalLease) {
+        let now = Timestamp::from_second(0).unwrap();
+        for _ in 0..50 {
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    scope.spawn(|| {
+                        for _ in 0..20_000 {
+                            lease.try_debit(CostUnits(1), now).unwrap();
+                        }
+                    });
+                }
+            });
+            if lease.contended_debits() > 0 {
+                return;
+            }
+        }
+        panic!("eight writers on one line never lost a race");
+    }
+
+    /// The account's contention outlives its leases, and a lease that leaves
+    /// and returns — a refused consolidation restores the old grant — is never
+    /// counted twice.
+    #[test]
+    fn account_contention_survives_rotation_without_double_counting() {
+        let slot = LeaseSlot::for_account(AccountId(1));
+        let first = identified_lease(LeaseId(1), u64::MAX / 2);
+        assert!(slot.replace(Arc::clone(&first)).is_none());
+        assert_eq!(slot.contended_debits(), 0);
+        contend(&first);
+        let seen = slot.contended_debits();
+        assert_eq!(
+            seen,
+            first.contended_debits(),
+            "the current lease is counted"
+        );
+
+        let second = identified_lease(LeaseId(2), u64::MAX / 2);
+        let outgoing = slot.replace(Arc::clone(&second)).unwrap();
+        assert_eq!(slot.contended_debits(), seen, "rotation keeps the history");
+
+        // Restore the first grant, as a refused consolidation does.
+        drop(slot.replace(outgoing));
+        assert_eq!(
+            slot.contended_debits(),
+            seen,
+            "reinstalling does not recount"
+        );
+
+        contend(&first);
+        let more = first.contended_debits();
+        assert!(more > seen);
+        assert_eq!(
+            slot.contended_debits(),
+            more,
+            "new races on a reinstalled lease count once"
+        );
+        drop(slot.take());
+        assert_eq!(slot.contended_debits(), more, "removal keeps the history");
+        assert_eq!(second.contended_debits(), 0);
     }
 
     proptest! {

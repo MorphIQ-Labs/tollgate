@@ -36,6 +36,38 @@ congruent modulo that count share every sharded structure they touch.
 The counter hands out `0, 1, 2, …`, so the condition holds exactly while the
 affinities handed out do not outnumber the shards.
 
+## Whether an account needs it
+
+Sharding helps an account whose funding line is written from several cores at
+the same moment. `RuntimeHandle::report()` carries a `contention` block that
+says which accounts that is happening to:
+
+```rust
+let contention = handle.report().contention;
+// `contention.contended_debits`: lease debits on this instance that lost a
+// compare-exchange to another core, since the process started.
+// `contention.hottest`: up to eight `(AccountId, count)` pairs, most first.
+```
+
+`LeaseSlot::contended_debits` reads the same count for one account. Both are
+control-plane reads; the request path only counts, in a register, and records
+once per debit that actually lost a race.
+
+Read it as a rate between two reports. A count that climbs steadily for one
+account is direct evidence that its admissions overlap across cores, and that
+account is the candidate for a sharded deployment. The count is a **lower
+bound**: only the lease-debit loop can observe a lost race, while the rate
+bucket, reference counts and settlement pay for a contended line without ever
+failing. So a zero does not prove the account costs nothing — ten connections
+on one account at about 93,000 admissions a second recorded zero on the
+controlled host while their end-to-end overhead was measurable — but a nonzero
+count is never noise on x86-64 or aarch64 with LSE atomics.
+
+What sharding costs in return is paid by *every* account on the instance:
+retained memory grows from about 4.0 KB per account unsharded to 14.6 KB at
+eight shards and 26.0 KB at sixteen, and each account's rate burst is
+partitioned across shard buckets.
+
 ## Choosing a shard count
 
 Start at the runtime's worker-thread count and validate on your own host.
