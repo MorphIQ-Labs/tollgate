@@ -161,10 +161,10 @@
       "threshold_ns": 280.0
     },
     {
-      "_comment": "#3, opt-in eight-shard topology under the same eight-thread load as admission/full_check_contended_8. Measured 446.4/618.0ns against that benchmark's 2.74/2.80us in the same runs \u2014 the contention the layout exists to remove. The portable acceptance bounds are the same-run ratios below; this absolute ceiling is a configuration/execution backstop. #123 pinned the fixture's thread-to-shard mapping: `Locality` is assigned on a thread's first access from a process-global counter, so which shard each contender landed on depended on how many threads earlier rows in the same process had consumed, and this row measured that lottery rather than the sharded path. One contender sharing the foreground thread's shard cost \u00d74.9 on a development host (176ns against 862ns, period 8, no overlap), which is why the row abstained with ci_width 0.294 instead of gating. The contenders now take the shards the foreground thread does not, and the fixture asserts that mapping before it is timed. Whether a *deployment*'s threads map as cleanly is #124, not this row.",
+      "_comment": "#3, opt-in eight-shard topology under the same eight-thread load as admission/full_check_contended_8. Measured 446.4/618.0ns against that benchmark's 2.74/2.80us in the same runs \u2014 the contention the layout exists to remove. The portable acceptance bounds are the same-run ratios below; this absolute ceiling is a configuration/execution backstop. #123 pinned the fixture's thread-to-shard mapping: `Locality` is assigned on a thread's first access from a process-global counter, so which shard each contender landed on depended on how many threads earlier rows in the same process had consumed, and this row measured that lottery rather than the sharded path. One contender sharing the foreground thread's shard cost \u00d74.9 on a development host (176ns against 862ns, period 8, no overlap), which is why the row abstained with ci_width 0.294 instead of gating. The contenders now take the shards the foreground thread does not, and the fixture asserts that mapping before it is timed. Whether a *deployment*'s threads map as cleanly is #124, not this row. #125: across eleven controlled-host full runs spanning #129 and #132 this row read 118-145ns. The 400ns threshold rejects the unpinned collision mode #123 removed (426-862ns) on any host.",
       "id": "admission/full_check_contended_8_sharded",
-      "target_ns": 700.0,
-      "threshold_ns": 2500.0
+      "target_ns": 150.0,
+      "threshold_ns": 400.0
     },
     {
       "_comment": "#90 different-account baseline. Seven background requests and the foreground request use eight accounts. Until #132 the map-owned tallies were one set of lines on this layout, and those lines were most of this row: 772/749ns fell to 269/253ns when only the tallies were partitioned (interleaved filtered A/B under host load, not calibration). The fixture pins its threads against the tally layout so no two share a tally shard. The sustained fixture uses the same one-unit weighted quote as the existing contention pair so it cannot self-throttle. Measured 583ns; reported honestly so #99 can measure enabled capacity independently of this residual. After #132 a controlled-host full run measured 153.46ns (baseline 680.48ns); the 600ns threshold makes a return of the shared line fail the absolute check on any host, not only the controlled one.",
@@ -173,10 +173,10 @@
       "threshold_ns": 600.0
     },
     {
-      "_comment": "#90 different-account baseline with eight local lease shards, measured 201ns. The portable ratio below is the extra-lock witness: a global lookup lock serializes otherwise independent accounts. #123 pinned this fixture's thread-to-shard mapping for the same reason as the row above; the collision cost \u00d71.38 here (172ns against 237ns) because these threads share less per-shard state than eight threads on one account do.",
+      "_comment": "#90 different-account baseline with eight local lease shards, measured 201ns. The portable ratio below is the extra-lock witness: a global lookup lock serializes otherwise independent accounts. #123 pinned this fixture's thread-to-shard mapping for the same reason as the row above; the collision cost \u00d71.38 here (172ns against 237ns) because these threads share less per-shard state than eight threads on one account do. #125: eleven controlled-host full runs read 118-159ns. The 400ns threshold rejects a return of the shared tally line or the unpinned collision mode on any host.",
       "id": "admission/full_check_contended_8_distinct_accounts_sharded",
-      "target_ns": 250.0,
-      "threshold_ns": 1000.0
+      "target_ns": 160.0,
+      "threshold_ns": 400.0
     },
     {
       "_comment": "Added with the request-path counters (#37) as the cheapest refusal there is: one map lookup and a return, so hashing was the largest share of it. Retightened by #9 \u2014 SipHash 20.0/19.8/19.9ns, foldhash 14.7/14.7ns.",

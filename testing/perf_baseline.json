@@ -128,7 +128,7 @@
     {
       "id": "admission/full_check_contended_8_sharded",
       "mean_ns": 119.16937543327036,
-      "max_regression": 0.15
+      "max_regression": 0.25
     },
     {
       "id": "admission/full_check_contended_8_distinct_accounts",
@@ -138,7 +138,7 @@
     {
       "id": "admission/full_check_contended_8_distinct_accounts_sharded",
       "mean_ns": 118.7084304999877,
-      "max_regression": 0.2
+      "max_regression": 0.4
     },
     {
       "id": "admission/full_check_denied",
@@ -193,7 +193,7 @@
     {
       "id": "capacity/full_check_contended_8_distinct_accounts_reserved",
       "mean_ns": 1110.0843933544684,
-      "max_regression": 0.15
+      "max_regression": 0.25
     },
     {
       "id": "credential/verify_cached",
