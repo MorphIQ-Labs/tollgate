@@ -185,7 +185,7 @@
       "threshold_ns": 40.0
     },
     {
-      "_comment": "Added by #1. The lease-exhausted path had no benchmark at all: `admit_once` uses a giant lease and cancels, so the quota step's failure branch never ran under measurement \u2014 and elastic mode adds a branch exactly there. This is the strict regression guard: the added match must cost a strict account nothing, and a refusal here is dearer than `full_check_denied` because it has already paid for the quote and the rate token. After #91 made disabled concurrency track both occupancies, five controlled-host means were 60.11, 55.98, 57.42, 56.44, and 56.00ns (median 56.44ns). #128 added one atomic load of the account's exhaustion deadline to this refusal: an interleaved A/B against the pre-#128 revision measured +2.5-2.8ns with the unknown-principal control unchanged, and #129's three recording runs measured 60.33-62.48ns. The baseline enforces the default 5% allowance on this row.",
+      "_comment": "Added by #1. The lease-exhausted path had no benchmark at all: `admit_once` uses a giant lease and cancels, so the quota step's failure branch never ran under measurement \u2014 and elastic mode adds a branch exactly there. This is the strict regression guard: the added match must cost a strict account nothing, and a refusal here is dearer than `full_check_denied` because it has already paid for the quote and the rate token. After #91 made disabled concurrency track both occupancies, five controlled-host means were 60.11, 55.98, 57.42, 56.44, and 56.00ns (median 56.44ns). #128 added one atomic load of the account's exhaustion deadline to this refusal: an interleaved A/B against the pre-#128 revision measured +2.5-2.8ns with the unknown-principal control unchanged, and #129's three recording runs measured 60.33-62.48ns. Across 16 trusted controlled-host runs (#129 to #137) it read 58.8-63.4ns and tripped the default 5% allowance in three separate series, so the baseline carries 10%.",
       "id": "admission/full_check_lease_exhausted_strict",
       "target_ns": 40.0,
       "threshold_ns": 90.0
@@ -363,6 +363,30 @@
       "id": "admission/commit_usage_leased_key_split",
       "target_ns": 180,
       "threshold_ns": 400
+    },
+    {
+      "_comment": "#137: take a usage-queue slot and give it back unused, the zero-charge path. Measured 26.5-29.2ns before and after the lanes.",
+      "id": "usage_queue/reserve_release",
+      "target_ns": 30.0,
+      "threshold_ns": 100.0
+    },
+    {
+      "_comment": "#137: take a slot and send the event. Measured 105-126ns before the lanes and 105-107ns after; the writer no longer parks on the channel, so a send wakes nothing.",
+      "id": "usage_queue/reserve_record",
+      "target_ns": 110.0,
+      "threshold_ns": 300.0
+    },
+    {
+      "_comment": "#137: the same zero-charge path with seven threads doing it too. One shared channel measured 848-858ns here (x32 the uncontended path): sender count, semaphore and entry counter were lines every request of every account wrote. Per-locality lanes measured 31.4-33.4ns. The 200ns threshold fails a returning shared line on any host.",
+      "id": "usage_queue/reserve_release_contended_8",
+      "target_ns": 40.0,
+      "threshold_ns": 200.0
+    },
+    {
+      "_comment": "#137: take a slot and send while seven threads reserve and release. The background threads do not record: eight recording threads outrun the one writer and shed, which would price the writer's drain rate. Measured 217-231ns before and 232-241ns after the lanes on an oversubscribed host (eight bench threads plus two runtime workers on ten cores); in the example service at ten connections the same send fell from 557-559ns to 281-301ns. Its recording series read 195.7-334.5ns, and it cannot tell one channel from lanes (217-231 vs 232-241ns), so the baseline carries a wide 0.8 allowance and the 800ns threshold is its guard; the contended-reservation row and its ratio are the lanes' witnesses.",
+      "id": "usage_queue/reserve_record_contended_8",
+      "target_ns": 250.0,
+      "threshold_ns": 800.0
     }
   ],
   "ratios": [
@@ -561,6 +585,12 @@
       "numerator": "admission/full_check_balance_insufficient_strict",
       "denominator": "admission/full_check_lease_exhausted_strict",
       "max_ratio": 1.25
+    },
+    {
+      "_comment": "#137: what the lanes are for. Seven other threads reserving must not make a reservation slower: measured x1.1-x1.2 with lanes, x32 with one shared channel. x3 is portable and rejects any line shared across threads.",
+      "numerator": "usage_queue/reserve_release_contended_8",
+      "denominator": "usage_queue/reserve_release",
+      "max_ratio": 3.0
     }
   ]
 }

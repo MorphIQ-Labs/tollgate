@@ -65,6 +65,7 @@ cargo bench --locked -p tollgate-admission --bench admission_hot_path
 # does. Adding a manifest entry without a run here is how that happens (#2).
 cargo bench --locked -p tollgate-auth --bench credential_verification
 cargo bench --locked -p tollgate-client --bench managed_credentials
+cargo bench --locked -p tollgate-client --bench usage_queue
 
 # Read the environment here rather than in the gate binary: there is no
 # portable way to ask std for a load average or a CPU model, and capturing the
