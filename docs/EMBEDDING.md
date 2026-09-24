@@ -198,6 +198,36 @@ Contract:
 - **Its error mapping.** RFC-7807 shapes and which `DenyReason` becomes which
   status are product decisions.
 
+## Keeping an account on one core
+
+Admission writes a handful of per-account cache lines — the rate bucket, the
+concurrency gauges, the lease counter, and the reference counts of the account
+state and lease — and each is fast only while it stays in the cache of the core
+that last wrote it. A work-stealing runtime moves a connection's task between
+worker threads, so an account's next request often runs on a different core
+and pulls every one of those lines across first.
+
+On the controlled host, eight threads admitting for eight distinct accounts
+cost about 115 ns per admission when each account stays on one thread and
+about 1 µs when the threads cycle through the accounts
+(`admission/full_check_contended_8_distinct_accounts` and its `_rotating`
+twin). In the example service at ten connections the in-handler `admit` grew
+from about 200 ns to about 500 ns for this reason alone (#138). Nothing in the
+library is shared between those accounts; the cost is the account's own lines
+moving.
+
+The library does not choose where your tasks run, so this is yours to decide.
+It matters when admission is a meaningful share of your request cost:
+
+- **A thread-per-core runtime** — one single-threaded runtime per core, each
+  accepting its own connections (for example through `SO_REUSEPORT`) — keeps a
+  connection's requests on one core for its whole life.
+- **Connection affinity** keeps an account's traffic on few connections, so its
+  requests land on few cores. Many connections for one account spread it back
+  out whatever the runtime does.
+- A default multi-threaded runtime is correct and usually fine; it pays this
+  migration on some fraction of requests, which is what the example measures.
+
 ## Related
 
 - `docs/DESIGN.md` § "Staged admission interface (#96)" — the rationale, and the

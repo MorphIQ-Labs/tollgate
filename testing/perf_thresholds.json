@@ -173,6 +173,12 @@
       "threshold_ns": 600.0
     },
     {
+      "_comment": "#140: eight distinct accounts, every thread cycling through all of them, so each account's lines are written from a different core on most admissions: what a work-stealing runtime does to a connection's task (#138). The pinned row above measured 114-118ns in the same runs; this one 0.97-1.18us. Ablations put ~290ns of it on the two concurrency gauges and the governor bucket together, and the rest on the reference counts, lease debit and credit the request's ownership requires.",
+      "id": "admission/full_check_contended_8_distinct_accounts_rotating",
+      "target_ns": 1200.0,
+      "threshold_ns": 3000.0
+    },
+    {
       "_comment": "#90 different-account baseline with eight local lease shards, measured 201ns. The portable ratio below is the extra-lock witness: a global lookup lock serializes otherwise independent accounts. #123 pinned this fixture's thread-to-shard mapping for the same reason as the row above; the collision cost \u00d71.38 here (172ns against 237ns) because these threads share less per-shard state than eight threads on one account do. #125: eleven controlled-host full runs read 118-159ns. The 400ns threshold rejects a return of the shared tally line or the unpinned collision mode on any host.",
       "id": "admission/full_check_contended_8_distinct_accounts_sharded",
       "target_ns": 160.0,
@@ -591,6 +597,12 @@
       "numerator": "usage_queue/reserve_release_contended_8",
       "denominator": "usage_queue/reserve_release",
       "max_ratio": 3.0
+    },
+    {
+      "_comment": "#140: how many per-account lines an admission migrates. Rotating over pinned measured x8.4-x9.5; each additional per-account line written per admission adds roughly x0.6-x0.8 (70-100ns on the controlled host), so x12 rejects a change that adds several without failing on the host's own spread.",
+      "numerator": "admission/full_check_contended_8_distinct_accounts_rotating",
+      "denominator": "admission/full_check_contended_8_distinct_accounts",
+      "max_ratio": 12.0
     }
   ]
 }
