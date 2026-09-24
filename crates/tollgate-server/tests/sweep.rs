@@ -723,8 +723,9 @@ async fn serve_briefly(
     server.await.unwrap().unwrap();
 }
 
-/// The server actually runs the sweep: an expired lease's units come back
-/// without anyone asking.
+/// The server actually runs the sweep: an unreleased lease is settled without
+/// anyone asking, its remainder forfeited rather than returned (#136), and an
+/// operator is told how much.
 #[tokio::test]
 async fn the_server_reclaims_expired_leases_on_its_interval() {
     let inner = store_with_expired_lease();
@@ -748,23 +749,25 @@ async fn the_server_reclaims_expired_leases_on_its_interval() {
     drop(guard);
 
     assert!(state.calls.load(Ordering::Acquire) > 0, "the sweep ran");
+    assert_eq!(inner.balance(ACCOUNT), CostUnits(600), "nothing returns");
     assert_eq!(
-        inner.balance(ACCOUNT),
-        CostUnits(1_000),
-        "lease {} units returned to the account",
+        inner.conservation(ACCOUNT).unwrap().settlement_loss,
+        grant.units,
+        "the swept lease's {} units are forfeited",
         grant.units
     );
 
-    // The units moving is one half; an operator seeing that they moved is the
-    // other. Ticks that reclaim nothing stay silent, so the count of these
-    // events is the count of real reclaims — never noise, never absent.
+    // The settlement is one half; an operator seeing what was forfeited is the
+    // other. A forfeit is a warning: a holder never released. Ticks that
+    // reclaim nothing stay silent, so the count of these events is the count
+    // of real reclaims — never noise, never absent.
     let reclaims: Vec<_> = captor
         .0
         .lock()
         .unwrap()
         .iter()
         .filter(|event| {
-            event.level == Level::INFO && event.fields.iter().any(|(key, _)| key == "leases")
+            event.level == Level::WARN && event.fields.iter().any(|(key, _)| key == "leases")
         })
         .cloned()
         .collect();
@@ -776,8 +779,8 @@ async fn the_server_reclaims_expired_leases_on_its_interval() {
     let fields = &reclaims[0].fields;
     assert!(
         fields.contains(&("leases".to_string(), "1".to_string()))
-            && fields.contains(&("units".to_string(), "400".to_string())),
-        "the event must say what came back: {fields:?}"
+            && fields.contains(&("forfeited_units".to_string(), "400".to_string())),
+        "the event must say what was forfeited: {fields:?}"
     );
     assert!(
         !captor
@@ -787,6 +790,79 @@ async fn the_server_reclaims_expired_leases_on_its_interval() {
             .iter()
             .any(|event| event.fields.iter().any(|(key, _)| key == "after_failures")),
         "a sweep that never failed must not announce a recovery"
+    );
+}
+
+/// A swept lease whose usage accounted for every unit forfeits nothing: that
+/// is an ordinary settlement, reported at `info` rather than as a warning.
+/// Ticks that settle nothing stay silent at every level.
+#[tokio::test]
+async fn a_sweep_with_nothing_to_forfeit_reports_at_info_and_idle_ticks_stay_silent() {
+    let inner = store_with_expired_lease();
+    let grant = inner
+        .acquire(ACCOUNT, CostUnits(400), SignedDuration::from_secs(1), t(0))
+        .await
+        .unwrap()
+        .grant;
+    let spent = tollgate_core::UsageEvent::new(
+        tollgate_core::RequestId(1),
+        ACCOUNT,
+        tollgate_core::UsageSource::Leased {
+            lease_id: grant.lease_id,
+            fencing_token: grant.fencing_token,
+        },
+        grant.units,
+        t(0),
+        tollgate_core::PolicyRevision::UNSTATED,
+        None,
+    );
+    let report = tollgate_store::UsageSink::ingest(&*inner, &[spent], t(0))
+        .await
+        .unwrap();
+    assert_eq!(report.accepted, 1);
+
+    let state = Arc::new(SweepState::default());
+    let store = flaky(Arc::clone(&inner), &state);
+    let (captor, guard) = capture();
+    serve_briefly(
+        Arc::clone(&store),
+        Arc::clone(&state),
+        Arc::new(tollgate_store::ManualClock::new(t(120))),
+    )
+    .await;
+    drop(guard);
+
+    assert!(
+        state.cycles.load(Ordering::Acquire) >= 2,
+        "idle ticks followed the one that settled the lease"
+    );
+    assert_eq!(
+        inner.conservation(ACCOUNT).unwrap().settlement_loss,
+        CostUnits::ZERO
+    );
+    let sweeps: Vec<_> = captor
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.fields.iter().any(|(key, _)| key == "forfeited_units"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        sweeps.len(),
+        1,
+        "only the settling tick reports: {sweeps:?}"
+    );
+    assert_eq!(sweeps[0].level, Level::INFO);
+    assert!(
+        sweeps[0]
+            .fields
+            .contains(&("forfeited_units".to_string(), "0".to_string()))
+            && sweeps[0]
+                .fields
+                .contains(&("leases".to_string(), "1".to_string())),
+        "{:?}",
+        sweeps[0].fields
     );
 }
 
@@ -830,7 +906,15 @@ async fn one_scheduled_sweep_drains_every_saturated_batch() {
         1,
         "saturated batches do not count as additional cycles"
     );
-    assert_eq!(inner.balance(ACCOUNT), CostUnits(1_000));
+    assert_eq!(
+        inner.balance(ACCOUNT),
+        CostUnits(1_000 - u64::try_from(lease_count).unwrap()),
+        "every swept lease is forfeited, none returned"
+    );
+    assert_eq!(
+        inner.conservation(ACCOUNT).unwrap().settlement_loss,
+        CostUnits(u64::try_from(lease_count).unwrap())
+    );
 
     let _ = stop_tx.send(());
     server.await.unwrap().unwrap();
@@ -894,7 +978,7 @@ async fn a_failed_later_batch_reports_already_committed_progress() {
             DEFAULT_RECLAIM_BATCH_LIMIT.get().to_string()
         )));
         assert!(warning.fields.contains(&(
-            "reclaimed_units".to_string(),
+            "forfeited_units".to_string(),
             DEFAULT_RECLAIM_BATCH_LIMIT.get().to_string()
         )));
         assert!(

@@ -239,7 +239,7 @@ that exposes a reset time can use the budget period end.
 to show as a balance: unreported usage can only lower it. A quote within it is
 not a promise of admission. Such a quote keeps the lease refusal's transient
 advice (`LeaseUnavailable`, `LeaseExpired`, `LeaseExhausted`), because funds
-held by another instance can return through release, settlement or expiry. Usage
+held by another instance can return when that instance releases its lease. Usage
 is batched, so evidence can lag consumption until billing has recorded it and
 the background manager has talked to the allocator again. Do not turn an
 estimated remaining balance or a snapshot's old budget view into a funding
@@ -332,3 +332,36 @@ prices.
 - `ConsolidateRequest` gains an optional `needed` field, omitted when zero. Old
   servers ignore it and keep the earlier sizing; old clients omit it. No
   rollout order or migration is needed.
+
+## Crashes and forfeited leases
+
+Only a release returns a lease's unspent units. An instance that dies without
+a graceful shutdown (SIGKILL, host loss, OOM, preemption without drain) never
+releases. Its committed-but-unflushed usage also dies with it, so nobody can
+prove any of its units unspent. After `expires_at + reclaim_grace`, server
+maintenance sweeps such a lease and forfeits its whole unaccounted remainder
+as settlement loss: nothing is credited back, and executed work cannot become
+spendable again (INVARIANTS.md #9, #136). The same applies to a lease a
+graceful shutdown abandoned because its release deadline lapsed.
+
+- **Cost:** a hard kill forfeits the unspent remainder of every lease the
+  instance held, parked ones included. Size `target_grant` and `lease_ttl`
+  with that in mind: smaller, shorter grants forfeit less and rotate more.
+- **Late usage is still billed.** An instance that outlives a control-plane
+  outage past its lease's grace flushes its backlog afterwards, and those
+  events bill against the forfeit instead of being rejected. Usage beyond what
+  was forfeited is rejected and reported.
+- **Graceful drain matters.** `InstanceRuntime::shutdown` releases every
+  quiesced lease, which returns its units. Give `shutdown_release_deadline`
+  enough room for your control plane.
+
+### Contract changes (#136)
+
+- `ReclaimedLease.reclaimed` is renamed `forfeited`, in Rust and in the JSON
+  that `POST /v1/leases/reclaim` returns, because its meaning changed: units
+  recorded as loss, not units credited.
+- The server's sweep event reports `forfeited_units` (was `units`, or
+  `reclaimed_units` on failure) and is `warn` when it is non-zero.
+- No schema change or migration is needed. Leases swept before the upgrade
+  keep their recorded credit and still reject stragglers, which is correct
+  because they were credited.

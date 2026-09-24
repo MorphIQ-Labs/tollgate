@@ -208,7 +208,7 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    carries none. No request-path I/O, allocation or blocking lock is added.
 
    Witnesses: `an_insufficient_balance_recovers_when_another_instance_returns_its_lease`,
-   `an_insufficient_balance_recovers_when_another_instances_lease_is_reclaimed`,
+   `a_reclaimed_lease_forfeits_its_funding_instead_of_restoring_it`,
    `exhaustion_requires_recorded_consumption_and_survives_lease_expiry`,
    `exhaustion_evidence_names_the_stored_period_and_rollover_restores_funding`,
    `zero_requested_units_never_produce_exhaustion_evidence`,
@@ -324,7 +324,8 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    *Tests:* `newer_lease_does_not_invalidate_older_active_capability`,
    `wrong_token_release_leaves_lease_reclaimable`, and
    `usage_rejects_mismatched_lease_capability` (store suites);
-   `expired_lease_units_reclaimed`, `straggler_usage_after_release_is_billed`,
+   `reclaim_forfeits_an_unreleased_remainder_as_provisional_loss`,
+   `straggler_usage_after_release_is_billed`,
    and `fenced_release_clears_the_slot`;
    `acquire_surfaces_nonpositive_stored_fence` and
    `release_and_ingest_surface_nonpositive_stored_fence` (Postgres suite; the
@@ -518,7 +519,8 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    reference-counted lease view before releasing the exact aggregate. Shutdown
    waits inside its own budget and *abandons* what has not quiesced by the
    deadline: releasing units a request may still spend cannot be undone, while
-   abandoning them only defers their return to TTL reclaim (#9). The lifecycle
+   abandoning them forfeits their remainder at TTL reclaim (#9), a bounded
+   cost that can never over-spend. The lifecycle
    order in #13 asks an embedder to quiesce before shutting down; this no
    longer depends on that, the predicate being the one the steady-state pass
    already applies (#62). A lease leaves this instance's books only by being
@@ -640,22 +642,47 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    `rejected_events_are_visible_while_running`, and
    `metrics_report_accounting_health_while_running`.
 
-9. **Crash leak is bounded by TTL.** A crashed lease holder strands its unspent
-   units only until the lease TTL expires, after which the allocator reclaims
-   them. Each reclaim transaction is bounded; the server fixes one expiry
+9. **A crashed holder can never over-spend.** A lease its holder never
+   released is settled by the expiry sweep after `expires_at + grace`, and
+   the sweep credits nothing back: the whole `granted - recorded usage` is
+   recorded as provisional settlement loss, exactly as a release claiming
+   nothing unspent would record it (#136). No unit can be proven unspent
+   without a release. A lease accepts commits until `usable_until`, and a
+   holder killed with a non-empty usage queue executed work the ledger never
+   saw, so crediting the remainder would let that work be spent twice. Usage
+   for the lease that arrives later, from a holder that outlived an outage,
+   converts loss into billed usage and can never exceed it. The ledger
+   equation is unchanged, because loss is already one of its terms. The cost
+   is bounded by what the holder held: a crash or a shutdown whose release
+   deadline lapsed forfeits the unspent remainder of its outstanding grants.
+   Only a release returns units. Enforcement: the allocator owns settlement
+   in both backends, and no caller can request a credit. Each reclaim
+   transaction is bounded; the server fixes one expiry
    cutoff and drains saturated batches immediately, so bounding lock scope
    never caps the legitimate backlog that returns. A bounded batch is also the
    *oldest due* leases and stops at the first one that is not due, identically
    in both backends — and on PostgreSQL the batch's read work is bounded by the
    batch rather than by the backlog, because the sweep orders by the expiry
    index's own columns so the `LIMIT` stops the walk (#65). *Tests:*
-   `expired_lease_units_reclaimed`,
+   `reclaim_forfeits_an_unreleased_remainder_as_provisional_loss`,
+   `straggler_usage_after_reclaim_is_billed_against_the_forfeit`,
+   `a_reclaimed_lease_forfeits_its_funding_instead_of_restoring_it`,
    `expired_backlog_is_reclaimed_in_bounded_batches` and
    `a_bounded_reclaim_page_settles_the_oldest_due_leases_first` (store suites),
    `the_expiry_sweep_stops_at_its_batch_instead_of_sorting_the_backlog` and
    `a_bounded_rollover_page_crosses_the_oldest_boundaries_first` (PostgreSQL
    plan and page order), plus
-   `one_scheduled_sweep_drains_every_saturated_batch` (server suite).
+   `one_scheduled_sweep_drains_every_saturated_batch` and
+   `the_server_reclaims_expired_leases_on_its_interval` (server suite, which
+   also witnesses the forfeit warning), and
+   `a_sweep_with_nothing_to_forfeit_reports_at_info_and_idle_ticks_stay_silent`
+   (server suite), and the crash witnesses
+   `a_killed_holders_unflushed_usage_is_not_credited_back`,
+   `a_kill_during_an_outage_with_a_full_backlog_forfeits_everything_held` and
+   `a_survivor_flushes_after_reclaim_and_is_billed` (client suite).
+   *Proof:* `Conservation.forfeit_credits_nothing`,
+   `forfeit_preserves_conservation` and
+   `straggler_moves_loss_to_usage_conserves`.
 
    Routine publication preserves ownership of the displaced grant. `LeaseSlot`
    exposes only `replace` and `take`, both returning a must-use handle; no
@@ -806,7 +833,7 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `negative_account_column_fails_balance_and_usage_reads`,
     `negative_lease_sum_fails_conservation_read`,
     `acquire_surfaces_negative_stored_balance`,
-    `reclaim_refuses_negative_credit`,
+    `reclaim_refuses_a_negative_remainder`,
     `straggler_exceeding_recorded_loss_fails_ingest`, and
     `checked_ledger_columns_reject_negative_writes` (Postgres suite only; the
     memory backend makes negative state unrepresentable via `u64`, so it has
@@ -826,10 +853,11 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     the charge settles against overage and the lease receipt is returned. The
     bill it emits therefore names **no lease capability**, and that follows
     from the terminal phase rather than the funding receipt. This is not a
-    stylistic choice — the sink rejects a leased event whose lease has been
-    reclaimed, and a lapsed lease is precisely one about to be reclaimed, so
-    billing a fallback against its receipt would silently drop the charge for
-    work that ran. Under `Strict` the lapse still releases for zero and the
+    stylistic choice — the receipt returned to the lease, so the lease never
+    funded that work, and a leased bill would claim units its settlement
+    already accounted for: rejected against a release's credit, silently
+    dropping the charge for work that ran, or billed against a reclaim's
+    forfeit (9) the fallback did not cause. Under `Strict` the lapse still releases for zero and the
     kernel must not run.
     *Tests:* `reservation::tests::{commit_after_window_closes_releases_for_zero,
     safety_margin_closes_window_before_expiry,
@@ -837,7 +865,7 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     a_strict_lapse_at_execution_start_releases_for_zero_and_yields_no_event}`,
     `engine::tests::a_strict_expiry_at_execution_start_produces_no_committed_guard`,
     `reclaim_waits_for_grace_and_release_works_within_it` and
-    `a_commit_time_fallback_is_ingested_as_overage_after_its_lease_is_reclaimed`
+    `a_commit_time_fallback_is_ingested_as_overage_after_its_lease_settles`
     (both store suites).
     *Proof:* `formal/lean/Tollgate/CommitFallback.lean`.
 
@@ -1108,7 +1136,7 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     enumeration stayed unbounded after its cancellation was fixed (#59). What
     a bound could not complete is
     reported — a lease left unreleased is `LeaseManagerReport::abandoned` and
-    settles at TTL reclaim (#9); an undelivered batch is `WriterStats::lost` —
+    is forfeited at TTL reclaim (#9); an undelivered batch is `WriterStats::lost` —
     never silently assumed done.
     *Tests:* `hung_ingest_cannot_stall_shutdown`,
     `hung_ingest_times_out_into_the_retry_path`,
@@ -1741,12 +1769,13 @@ exists to detect corrupt state and must not be able to launder it.
 
     **Leases drain, then expire.** An active lease at a boundary keeps serving
     to its own TTL: there is no admission gap, and the request path still
-    reads no clock for policy. The boundary is applied at settlement instead —
-    release and the reclaim sweep both — where a lease funded by a period
-    older than the account's credits its unspent *allowance* half to `expired`
-    rather than to the balance. The top-up half returns to its bucket either
-    way. Usage is unaffected, so a straggling event bills against the period
-    its lease was granted in.
+    reads no clock for policy. The boundary is applied at release instead,
+    where a lease funded by a period older than the account's credits its
+    unspent *allowance* half to `expired` rather than to the balance. The
+    top-up half returns to its bucket either way. The reclaim sweep credits
+    nothing at all (9), so it cannot resurrect a closed period's allowance:
+    its remainder is forfeited as loss. Usage is unaffected, so a straggling
+    event bills against the period its lease was granted in.
 
     **What an instance is told is a projection, never an authority.** A
     published snapshot carries a [`BudgetView`] — what the account could still
@@ -1773,7 +1802,7 @@ exists to detect corrupt state and must not be able to launder it.
     `a_lease_from_the_closed_period_expires_its_unspent_allowance`,
     `a_lease_funded_by_a_top_up_is_unaffected_by_a_boundary`,
     `a_split_funded_lease_charges_the_allowance_half_first`,
-    `reclaim_expires_a_closed_period_lease_it_sweeps`,
+    `reclaim_never_resurrects_a_closed_period_lease_it_sweeps`,
     `the_rollover_pass_is_bounded_and_saturation_says_there_is_more`, and
     `the_allowance_split_cannot_exceed_what_it_is_part_of` (both store suites
     but the last, which is the PostgreSQL schema's half);

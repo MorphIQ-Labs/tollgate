@@ -132,6 +132,38 @@ theorem settle_preserves_conservation
         Bool.false_eq_true, if_true, if_false] at *
       omega
 
+/-- #136: the expiry sweep settles a lease its holder never released. Nothing
+is credited, because no unit can be proven unspent: the whole unaccounted
+remainder is recorded as provisional loss. Whatever the period, the balance is
+untouched, so executed-but-unflushed work can never become spendable again. -/
+def forfeit (l : Ledger) (used lost : Nat) (samePeriod : Bool) : Ledger :=
+  settle l used 0 0 lost samePeriod
+
+theorem forfeit_credits_nothing (l : Ledger) (used lost : Nat) (samePeriod : Bool) :
+    (forfeit l used lost samePeriod).balance = l.balance ∧
+      (forfeit l used lost samePeriod).expired = l.expired := by
+  cases samePeriod <;> simp [forfeit, settle, Ledger.balance]
+
+theorem forfeit_preserves_conservation (l : Ledger) (used lost : Nat) (samePeriod : Bool)
+    (outstanding : used + lost ≤ l.activeGrants) (h : l.holds) :
+    (forfeit l used lost samePeriod).holds := by
+  unfold forfeit
+  exact settle_preserves_conservation l used 0 0 lost samePeriod (by omega) h
+
+/-- Usage for a settled lease that arrives after its settlement, a straggler,
+moves units from provisional loss to billed usage. It can never exceed the
+loss, which is what makes a forfeited lease billable without over-billing. -/
+def straggle (l : Ledger) (units : Nat) : Ledger :=
+  { l with loss := l.loss - units, settledUsage := l.settledUsage + units }
+
+theorem straggler_moves_loss_to_usage_conserves (l : Ledger) (units : Nat)
+    (fits : units ≤ l.loss) (h : l.holds) :
+    (straggle l units).holds ∧ (straggle l units).balance = l.balance := by
+  refine ⟨?_, rfl⟩
+  unfold Ledger.holds Ledger.funded Ledger.held Ledger.balance at *
+  simp only [straggle]
+  omega
+
 /-- Consolidation's floor is the spendable credit from settlement. Expired
 allowance has no contribution, even when the replacement draws a new period's
 allowance. These are natural-number bounds; backend tests cover SQL and u64. -/

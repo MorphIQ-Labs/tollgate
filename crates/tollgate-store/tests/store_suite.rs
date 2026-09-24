@@ -325,9 +325,12 @@ async fn usage_rejects_mismatched_lease_capability() {
     assert!(store.conservation(OTHER).unwrap().holds());
 }
 
-/// INVARIANTS.md #9: a crashed holder's unspent units return at TTL.
+/// INVARIANTS.md #9 (#136): a holder that never released cannot prove any
+/// unit unspent, so its lease's remainder is forfeited at TTL as provisional
+/// settlement loss. Nothing returns to the balance: executed-but-unflushed
+/// work cannot become spendable again.
 #[tokio::test]
-async fn expired_lease_units_reclaimed() {
+async fn reclaim_forfeits_an_unreleased_remainder_as_provisional_loss() {
     let store = store_with_balance(full_grant_policy(), 1_000).await;
     let lease = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
@@ -346,23 +349,60 @@ async fn expired_lease_units_reclaimed() {
     // Not yet expired: sweep is a no-op.
     assert!(store.reclaim_expired(t(59)).await.unwrap().is_empty());
 
-    // TTL lapses: the unspent 380 come back; the spent 120 stay billed.
+    // TTL lapses: the 380 the holder never accounted for are forfeited.
     let reclaimed = store.reclaim_expired(t(60)).await.unwrap();
-    assert_eq!(reclaimed[0].reclaimed, CostUnits(380));
-    assert_eq!(store.balance(ACCOUNT), CostUnits(880));
+    assert_eq!(reclaimed[0].forfeited, CostUnits(380));
+    assert_eq!(store.balance(ACCOUNT), CostUnits(500), "nothing returns");
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(120));
+    assert_eq!(
+        store.conservation(ACCOUNT).unwrap().settlement_loss,
+        CostUnits(380)
+    );
+    assert_conserved(&store);
+}
 
-    // Straggler usage for the settled lease is rejected, not double-counted.
-    let report = store
-        .ingest(&[usage(&lease, 3, 10, 61)], t(61))
+/// #136: usage the holder committed but had not flushed at the sweep, from a
+/// holder that outlived an outage, fits in the forfeit and is billed. It can
+/// never exceed what was forfeited.
+#[tokio::test]
+async fn straggler_usage_after_reclaim_is_billed_against_the_forfeit() {
+    let store = store_with_balance(full_grant_policy(), 1_000).await;
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
+        .await
+        .unwrap()
+        .grant;
+    store
+        .ingest(&[usage(&lease, 1, 120, 10)], t(10))
         .await
         .unwrap();
-    assert_eq!(report.rejected, 1);
+    store.reclaim_expired(t(60)).await.unwrap();
+
+    let report = store
+        .ingest(&[usage(&lease, 2, 300, 50)], t(61))
+        .await
+        .unwrap();
+    assert_eq!(report.accepted, 1, "billed, not dropped");
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(420));
+    let over = store
+        .ingest(&[usage(&lease, 3, 81, 55)], t(62))
+        .await
+        .unwrap();
+    assert_eq!(over.rejected, 1, "80 forfeited units remain, not 81");
+    let exact = store
+        .ingest(&[usage(&lease, 4, 80, 55)], t(62))
+        .await
+        .unwrap();
+    assert_eq!(exact.accepted, 1);
+    let c = store.conservation(ACCOUNT).unwrap();
+    assert_eq!(c.settlement_loss, CostUnits::ZERO);
+    assert_eq!(c.settled_usage, CostUnits(500));
+    assert_eq!(store.balance(ACCOUNT), CostUnits(500));
     assert_conserved(&store);
 }
 
 /// INVARIANTS.md #9: an outage-sized backlog is split into bounded atomic
-/// settlements without capping how much legitimate quota eventually returns.
+/// settlements without capping how many leases eventually settle.
 #[tokio::test]
 async fn expired_backlog_is_reclaimed_in_bounded_batches() {
     const OTHER: AccountId = AccountId(2);
@@ -422,10 +462,19 @@ async fn expired_backlog_is_reclaimed_in_bounded_batches() {
         .collect();
     reclaimed_ids.sort_by_key(|lease_id| lease_id.0);
     assert_eq!(reclaimed_ids, expected_ids);
-    assert_eq!(store.balance(ACCOUNT), CostUnits(175));
-    assert_eq!(store.balance(OTHER), CostUnits(350));
+    // Every remainder is forfeited, none credited (#136).
+    assert_eq!(store.balance(ACCOUNT), CostUnits::ZERO);
+    assert_eq!(store.balance(OTHER), CostUnits::ZERO);
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(25));
     assert_eq!(store.usage_recorded(OTHER), CostUnits(50));
+    assert_eq!(
+        store.conservation(ACCOUNT).unwrap().settlement_loss,
+        CostUnits(175)
+    );
+    assert_eq!(
+        store.conservation(OTHER).unwrap().settlement_loss,
+        CostUnits(350)
+    );
     assert_conserved(&store);
     let other_conservation = store.conservation(OTHER).unwrap();
     assert!(
@@ -504,8 +553,12 @@ async fn a_bounded_reclaim_page_settles_the_oldest_due_leases_first() {
         "the walk stops at the lease that is not yet due"
     );
 
-    // The survivor keeps its units until its own expiry passes.
+    // The survivor stays unsettled until its own expiry passes.
     assert_eq!(store.balance(AccountId(1)), CostUnits::ZERO);
+    assert_eq!(
+        store.conservation(AccountId(1)).unwrap().settlement_loss,
+        CostUnits::ZERO
+    );
     let last = store.reclaim_expired_batch(t(700), limit).await.unwrap();
     assert_eq!(
         last.reclaimed()
@@ -514,7 +567,11 @@ async fn a_bounded_reclaim_page_settles_the_oldest_due_leases_first() {
             .collect::<Vec<_>>(),
         vec![leases[3].lease_id]
     );
-    assert_eq!(store.balance(AccountId(1)), CostUnits(100));
+    assert_eq!(store.balance(AccountId(1)), CostUnits::ZERO);
+    assert_eq!(
+        store.conservation(AccountId(1)).unwrap().settlement_loss,
+        CostUnits(100)
+    );
     assert_conserved(&store);
 }
 
@@ -524,7 +581,7 @@ fn reclaim_batch_rejects_backend_results_over_the_limit() {
         .map(|id| ReclaimedLease {
             lease_id: tollgate_core::LeaseId(id),
             account_id: ACCOUNT,
-            reclaimed: CostUnits(1),
+            forfeited: CostUnits(1),
         })
         .collect();
     assert!(ReclaimBatch::try_new(reclaimed, NonZeroUsize::new(2).unwrap()).is_err());
@@ -1082,7 +1139,7 @@ async fn reclaim_waits_for_grace_and_release_works_within_it() {
     assert!(store.reclaim_expired(t(159)).await.unwrap().is_empty());
     let reclaimed = store.reclaim_expired(t(160)).await.unwrap();
     assert_eq!(reclaimed[0].lease_id, lease2.lease_id);
-    assert_eq!(reclaimed[0].reclaimed, CostUnits(400));
+    assert_eq!(reclaimed[0].forfeited, CostUnits(400));
     assert_conserved(&store);
 }
 
@@ -2415,51 +2472,70 @@ async fn overage_accounting_overflow_is_surfaced() {
 /// reason [`Reservation::usage_event`] reads the terminal phase rather than
 /// the funding receipt.
 ///
-/// A fallback happens *because* the lease's usability window lapsed, so the
-/// allocator reclaims that lease shortly afterwards. The two events below are
-/// the same charge for the same work, differing only in what they name as
-/// their source. The overage-sourced one — what the fallback actually emits —
-/// is billed and funds itself. The leased-sourced one — what attributing the
-/// charge to the receipt would have emitted — is rejected as a straggler
-/// against a settled lease, silently losing the charge for work that ran.
+/// A fallback happens *because* the lease's usability window lapsed, and the
+/// receipt it held returns to the lease: the lease never funded that work. So
+/// the bill names no lease capability. A leased-sourced bill for the same work
+/// would claim lease units the settlement already accounted for: credited by
+/// a release, where it is rejected and the charge is lost, or forfeited at
+/// reclaim (#136), where it would bill the work against loss it did not cause.
+/// The overage-sourced bill is accepted and funds itself either way.
 #[tokio::test]
-async fn a_commit_time_fallback_is_ingested_as_overage_after_its_lease_is_reclaimed() {
+async fn a_commit_time_fallback_is_ingested_as_overage_after_its_lease_settles() {
     let store = store_with_balance(full_grant_policy(), 1_000).await;
-    let lease = store
+    let released = store
         .acquire(ACCOUNT, CostUnits(500), TTL, t(0))
         .await
         .unwrap()
         .grant;
-
-    // The window lapses and the allocator credits the whole remainder back.
-    let reclaimed = store.reclaim_expired(t(60)).await.unwrap();
-    assert_eq!(reclaimed[0].reclaimed, CostUnits(500));
+    // A live holder returns the whole grant, the fallback's receipt included.
+    store
+        .release(
+            released.lease_id,
+            released.fencing_token,
+            released.units,
+            t(59),
+        )
+        .await
+        .unwrap();
 
     // The counterfactual first, so the accepted case below is a *reason*
     // rather than a coincidence: billing this charge against its receipt
     // loses it outright.
     let receipt_sourced = store
-        .ingest(&[usage(&lease, 1, 30, 61)], t(61))
+        .ingest(&[usage(&released, 1, 30, 61)], t(61))
         .await
         .unwrap();
     assert_eq!(
         (receipt_sourced.accepted, receipt_sourced.rejected),
         (0, 1),
-        "a leased event naming a reclaimed lease is a straggler"
+        "a leased event naming a fully credited lease has nowhere to fit"
     );
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits::ZERO);
 
     // What the fallback actually emits: no lease capability, so nothing to
-    // straggle against, and the two ledger columns move together.
-    let phase_sourced = store
-        .ingest(&[overage_usage(ACCOUNT, 2, 30, 61)], t(61))
+    // straggle against, and the two ledger columns move together. The same
+    // holds after a reclaim.
+    let swept = store
+        .acquire(ACCOUNT, CostUnits(500), TTL, t(61))
         .await
-        .unwrap();
-    assert_eq!((phase_sourced.accepted, phase_sourced.rejected), (1, 0));
+        .unwrap()
+        .grant;
+    store.reclaim_expired(t(121)).await.unwrap();
+    for (request, at) in [(2, 61), (3, 122)] {
+        let phase_sourced = store
+            .ingest(&[overage_usage(ACCOUNT, request, 30, at)], t(at))
+            .await
+            .unwrap();
+        assert_eq!((phase_sourced.accepted, phase_sourced.rejected), (1, 0));
+    }
 
     let after = store.conservation(ACCOUNT).unwrap();
-    assert_eq!(after.settled_usage, CostUnits(30), "the work is billed");
-    assert_eq!(after.overage_recorded, CostUnits(30), "and it is funded");
+    assert_eq!(after.settled_usage, CostUnits(60), "the work is billed");
+    assert_eq!(after.overage_recorded, CostUnits(60), "and it is funded");
+    assert_eq!(
+        after.settlement_loss, swept.units,
+        "the swept lease's forfeit is untouched by the fallback's bill"
+    );
     assert!(after.holds(), "conservation violated: {after:?}");
     assert_conserved(&store);
 }
@@ -3210,11 +3286,12 @@ async fn a_split_funded_lease_charges_the_allowance_half_first() {
     assert!(conservation.holds(), "{conservation:?}");
 }
 
-/// Reclaim is the other settlement path, and the boundary rule has to live in
-/// both: a lease nobody released must not resurrect its period's allowance
-/// through the sweep.
+/// Reclaim is the other settlement path: a lease nobody released must not
+/// resurrect its period's allowance through the sweep. It credits nothing at
+/// all (#136), so its remainder is forfeited as loss rather than expired, and
+/// only the new period's allowance is spendable.
 #[tokio::test]
-async fn reclaim_expires_a_closed_period_lease_it_sweeps() {
+async fn reclaim_never_resurrects_a_closed_period_lease_it_sweeps() {
     let store = store_with_balance(full_grant_policy(), 0).await;
     store
         .set_budget_schedule(ACCOUNT, Some(monthly(500)))
@@ -3238,9 +3315,19 @@ async fn reclaim_expires_a_closed_period_lease_it_sweeps() {
     assert_eq!(
         store.balance(ACCOUNT),
         CostUnits(500),
-        "the swept units belonged to the closed period"
+        "only the new period's allowance is spendable"
     );
-    assert_eq!(store.conservation(ACCOUNT).unwrap().expired, CostUnits(500));
+    let c = store.conservation(ACCOUNT).unwrap();
+    assert_eq!(
+        c.expired,
+        CostUnits(300),
+        "the rollover expired what it held"
+    );
+    assert_eq!(
+        c.settlement_loss,
+        CostUnits(200),
+        "the sweep forfeited the rest"
+    );
     assert_conserved(&store);
 }
 
@@ -3655,8 +3742,9 @@ async fn consolidation_after_a_budget_reduction_uses_only_restored_credit_as_flo
 }
 
 /// The same strictness on the sweep's side of the settlement path: a lease
-/// that expired by its own TTL, inside the account's current period, is
-/// reclaimed to the balance rather than written off.
+/// that expired by its own TTL, inside the account's current period, expires
+/// nothing. Its remainder is forfeited as provisional loss (#136), never
+/// booked as the period's expiry.
 #[tokio::test]
 async fn a_lease_reclaimed_inside_its_own_period_expires_nothing() {
     let store = store_with_balance(full_grant_policy(), 0).await;
@@ -3676,11 +3764,10 @@ async fn a_lease_reclaimed_inside_its_own_period_expires_nothing() {
         .unwrap();
 
     assert_eq!(batch.len(), 1);
-    assert_eq!(
-        store.conservation(ACCOUNT).unwrap().expired,
-        CostUnits::ZERO
-    );
-    assert_eq!(store.balance(ACCOUNT), CostUnits(500));
+    let c = store.conservation(ACCOUNT).unwrap();
+    assert_eq!(c.expired, CostUnits::ZERO);
+    assert_eq!(c.settlement_loss, CostUnits(200));
+    assert_eq!(store.balance(ACCOUNT), CostUnits(300));
     assert_conserved(&store);
 }
 
@@ -4489,13 +4576,14 @@ async fn nanosecond_lease_boundaries_preserve_release_reclaim_and_consolidation(
         let reclaimed = store.reclaim_expired(deadline).await.unwrap();
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0].lease_id, lease.lease_id);
-        assert_eq!(reclaimed[0].reclaimed, CostUnits(10));
+        assert_eq!(reclaimed[0].forfeited, CostUnits(10));
         assert!(store.reclaim_expired(deadline).await.unwrap().is_empty());
         let c = store.conservation(ACCOUNT).unwrap();
         assert!(c.holds());
-        assert_eq!(c.balance, CostUnits(100));
+        // The unreleased lease is forfeited at the exact deadline (#136).
+        assert_eq!(c.balance, CostUnits(90));
         assert_eq!(c.active_lease_grants, CostUnits::ZERO);
-        assert_eq!(c.settlement_loss, CostUnits::ZERO);
+        assert_eq!(c.settlement_loss, CostUnits(10));
     }
 }
 
@@ -4815,9 +4903,11 @@ async fn an_insufficient_balance_recovers_when_another_instance_returns_its_leas
     assert_conserved(&store);
 }
 
-/// Reclaim can restore the same funding without a top-up or a period change.
+/// Only a release restores another instance's units. A lease its holder
+/// never released is forfeited at reclaim (#136): the funding it held is gone,
+/// and the ledger now attests exhaustion rather than a lease gap (#130).
 #[tokio::test]
-async fn an_insufficient_balance_recovers_when_another_instances_lease_is_reclaimed() {
+async fn a_reclaimed_lease_forfeits_its_funding_instead_of_restoring_it() {
     let store = store_with_balance(full_grant_policy(), 100).await;
     let held = store
         .acquire(ACCOUNT, CostUnits(100), TTL, t(0))
@@ -4836,13 +4926,14 @@ async fn an_insufficient_balance_recovers_when_another_instances_lease_is_reclai
         .await
         .unwrap();
     assert_eq!(reclaimed.reclaimed().len(), 1);
-    assert_eq!(reclaimed.reclaimed()[0].reclaimed, held.units);
-    let recovered = store
-        .acquire(ACCOUNT, CostUnits(100), TTL, t(62))
-        .await
-        .unwrap()
-        .grant;
-    assert_eq!(recovered.units, held.units);
+    assert_eq!(reclaimed.reclaimed()[0].forfeited, held.units);
+    assert_eq!(
+        store
+            .acquire(ACCOUNT, CostUnits(100), TTL, t(62))
+            .await
+            .unwrap_err(),
+        AllocateError::BalanceExhausted(tollgate_core::BalanceExhaustion { period_end: None })
+    );
     assert_conserved(&store);
 }
 

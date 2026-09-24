@@ -759,8 +759,7 @@ pub(crate) const LIVE_KEY_COUNT_SQL: &str = "SELECT count(*) FROM tollgate_crede
        AND (not_after_floor_us IS NULL OR not_after_submicro_ns IS NULL
             OR (not_after_floor_us, not_after_submicro_ns) > ($2, $3))";
 
-const RECLAIM_DUE_LEASES_SQL: &str =
-    "SELECT lease_id, account_id, granted, used, from_allowance, period_start_us
+const RECLAIM_DUE_LEASES_SQL: &str = "SELECT lease_id, account_id, granted, used
      FROM tollgate_leases
      WHERE state = 0 AND (expires_at_floor_us, expires_at_submicro_ns) <= ($1, $2)
      ORDER BY expires_at_floor_us, expires_at_submicro_ns
@@ -1146,82 +1145,12 @@ struct LockedLeaseRow {
     period_start_us: i64,
 }
 
-/// One expired lease's settlement, before the account's current period is
-/// known.
-///
-/// Named rather than a tuple for the reason [`LockedLeaseRow`] is: the sweep
-/// carries four same-typed numbers per lease, and a positional tuple would let
-/// any two of them swap without a compiler error.
-struct LeaseSettlement {
-    account: Vec<u8>,
-    /// Unspent units returning to the top-up bucket, which no boundary
-    /// touches.
-    to_topup: i64,
-    /// The whole unspent credit. What is not `to_topup` is the allowance half,
-    /// and the account's period decides where that lands.
-    credit: i64,
-    period_start_us: i64,
-}
-
-/// One account's share of a sweep, split the way the ledger columns are.
-#[derive(Default)]
-struct AccountCredit {
-    /// Added to `balance`: the top-up half always, plus the allowance half of
-    /// any lease still inside the account's current period.
-    spendable: i64,
-    /// The part of `spendable` that is allowance, so `allowance_balance`
-    /// tracks the same units `balance` just gained.
-    to_allowance: i64,
-    /// The allowance half of leases funded by a period that has since closed.
-    expiring: i64,
-}
-
 /// Settlement evidence from the account update inside the current transaction.
 /// Consolidation uses the credit that survived the period boundary as its floor.
 struct ReleasedCredit {
     account: AccountId,
     restored: CostUnits,
     preserves_funding: bool,
-}
-
-impl AccountCredit {
-    /// Fold one lease's settlement in, deciding the allowance half against the
-    /// account's current period.
-    ///
-    /// Checked, and refused rather than wrapped: these sums are paid into a
-    /// ledger, so an overflow is corruption to report, not a number to
-    /// truncate (INVARIANTS.md #11).
-    fn add(
-        &mut self,
-        settlement: &LeaseSettlement,
-        account_period_us: i64,
-    ) -> Result<(), StoreError> {
-        let overflow = || StoreError("reclaim credit sum overflow".into());
-        let to_allowance = settlement
-            .credit
-            .checked_sub(settlement.to_topup)
-            .ok_or_else(overflow)?;
-        self.spendable = self
-            .spendable
-            .checked_add(settlement.to_topup)
-            .ok_or_else(overflow)?;
-        if settlement.period_start_us < account_period_us {
-            self.expiring = self
-                .expiring
-                .checked_add(to_allowance)
-                .ok_or_else(overflow)?;
-        } else {
-            self.spendable = self
-                .spendable
-                .checked_add(to_allowance)
-                .ok_or_else(overflow)?;
-            self.to_allowance = self
-                .to_allowance
-                .checked_add(to_allowance)
-                .ok_or_else(overflow)?;
-        }
-        Ok(())
-    }
 }
 
 /// Lock one lease row for a settlement transition.
@@ -1620,46 +1549,37 @@ impl LeaseAllocator for PostgresStore {
                 .await
                 .map_err(storage)?;
 
+            // A holder that never released cannot prove any unit unspent, so
+            // nothing is credited: each remainder becomes provisional
+            // settlement loss, which later usage for the lease converts into
+            // billed usage (#136). `credited` stays zero so that usage fits.
             let mut reclaimed = Vec::with_capacity(rows.len());
             let mut lease_ids = Vec::with_capacity(rows.len());
-            let mut lease_credits = Vec::with_capacity(rows.len());
-            let mut settlements = Vec::with_capacity(rows.len());
+            let mut forfeits: std::collections::BTreeMap<Vec<u8>, i64> =
+                std::collections::BTreeMap::new();
             for row in rows {
                 let lease_bytes: Vec<u8> = row.get(0);
                 let account_bytes: Vec<u8> = row.get(1);
                 let granted = row.get::<i64, _>(2);
                 let used = row.get::<i64, _>(3);
-                let from_allowance = row.get::<i64, _>(4);
-                let credit = granted.checked_sub(used).ok_or_else(|| {
+                // Validate the whole batch before either set-wise UPDATE: a
+                // negative remainder is corruption, and recording it would
+                // shrink the account's loss rather than account for a lease.
+                let forfeited = granted.checked_sub(used).ok_or_else(|| {
                     StoreError(format!(
-                        "reclaim credit overflow: granted {granted}, used {used}"
+                        "reclaim remainder overflow: granted {granted}, used {used}"
                     ))
                 })?;
-                // Validate the whole batch before either set-wise UPDATE: a
-                // negative credit is corruption, and paying it would debit the
-                // account rather than returning quota.
-                let credit_units = to_units(credit, "reclaim credit")?;
-                let from_topup = granted
-                    .checked_sub(from_allowance)
-                    .filter(|t| *t >= 0)
-                    .ok_or_else(|| {
-                        StoreError(format!(
-                            "lease allowance funding {from_allowance} exceeds its grant {granted}"
-                        ))
-                    })?;
-                settlements.push(LeaseSettlement {
-                    account: account_bytes.clone(),
-                    // Allowance first, exactly as `release` charges it.
-                    to_topup: from_topup.min(credit),
-                    credit,
-                    period_start_us: row.get::<i64, _>(5),
-                });
+                let forfeited_units = to_units(forfeited, "reclaim remainder")?;
+                let total = forfeits.entry(account_bytes.clone()).or_default();
+                *total = total
+                    .checked_add(forfeited)
+                    .ok_or_else(|| StoreError("reclaim loss sum overflow".into()))?;
                 lease_ids.push(lease_bytes.clone());
-                lease_credits.push(credit);
                 reclaimed.push(ReclaimedLease {
                     lease_id: LeaseId(id_from(&lease_bytes)),
                     account_id: AccountId(id_from(&account_bytes)),
-                    reclaimed: credit_units,
+                    forfeited: forfeited_units,
                 });
             }
 
@@ -1668,28 +1588,19 @@ impl LeaseAllocator for PostgresStore {
                 return Ok(batch);
             }
 
-            let mut account_ids: Vec<Vec<u8>> = settlements
-                .iter()
-                .map(|settlement| settlement.account.clone())
-                .collect();
-            account_ids.sort_unstable();
-            account_ids.dedup();
+            let (account_ids, account_forfeits): (Vec<_>, Vec<_>) = forfeits.into_iter().unzip();
             let expected_lease_rows = u64::try_from(lease_ids.len())
                 .map_err(|_| StoreError("reclaim lease row count exceeds u64 range".into()))?;
             let expected_account_rows = u64::try_from(account_ids.len())
                 .map_err(|_| StoreError("reclaim account row count exceeds u64 range".into()))?;
 
             // A set-wise UPDATE does not promise row-lock order. Lock every
-            // affected account explicitly in byte-sorted order first, matching
-            // release and ingest's lease-then-account order and preventing
-            // concurrent multi-account sweeps from forming a deadlock cycle.
-            //
-            // The lock is also what makes `period_start_us` safe to read here
-            // and aggregate against: a rollover cannot commit between this
-            // read and the credit below, so a lease is expired or returned
-            // against the period the account is actually in (#97).
+            // affected account explicitly in byte-sorted order first (the
+            // BTreeMap above), matching release and ingest's lease-then-account
+            // order and preventing concurrent multi-account sweeps from
+            // forming a deadlock cycle.
             let locked_accounts = sqlx::query(
-                "SELECT account_id, period_start_us FROM tollgate_accounts
+                "SELECT account_id FROM tollgate_accounts
                  WHERE account_id = ANY($1) ORDER BY account_id FOR UPDATE",
             )
             .bind(&account_ids)
@@ -1703,42 +1614,13 @@ impl LeaseAllocator for PostgresStore {
                     account_ids.len()
                 )));
             }
-            let periods: std::collections::BTreeMap<Vec<u8>, i64> = locked_accounts
-                .iter()
-                .map(|row| (row.get::<Vec<u8>, _>(0), row.get::<i64, _>(1)))
-                .collect();
-
-            let mut credits: std::collections::BTreeMap<Vec<u8>, AccountCredit> =
-                std::collections::BTreeMap::new();
-            for settlement in settlements {
-                let account_period = *periods.get(&settlement.account).ok_or_else(|| {
-                    StoreError(format!(
-                        "reclaim locked no account row for {:#034x}",
-                        id_from(&settlement.account)
-                    ))
-                })?;
-                let credit = credits.entry(settlement.account.clone()).or_default();
-                credit.add(&settlement, account_period)?;
-            }
-
-            let (account_ids, account_credits): (Vec<_>, Vec<_>) = credits.into_iter().unzip();
-            let (spendable, expiring): (Vec<_>, Vec<_>) = account_credits
-                .iter()
-                .map(|credit| (credit.spendable, credit.expiring))
-                .unzip();
-            let to_allowance: Vec<_> = account_credits
-                .iter()
-                .map(|credit| credit.to_allowance)
-                .collect();
 
             let updated_leases = sqlx::query(
-                "UPDATE tollgate_leases AS lease
-                 SET state = $3, credited = delta.credit
-                 FROM UNNEST($1::bytea[], $2::bigint[]) AS delta(lease_id, credit)
-                 WHERE lease.lease_id = delta.lease_id AND lease.state = $4",
+                "UPDATE tollgate_leases
+                 SET state = $2, credited = 0
+                 WHERE lease_id = ANY($1) AND state = $3",
             )
             .bind(&lease_ids)
-            .bind(&lease_credits)
             .bind(STATE_EXPIRED)
             .bind(STATE_ACTIVE)
             .execute(&mut *tx)
@@ -1754,17 +1636,12 @@ impl LeaseAllocator for PostgresStore {
 
             let updated_accounts = sqlx::query(
                 "UPDATE tollgate_accounts AS account
-                 SET balance = account.balance + delta.spendable,
-                     allowance_balance = account.allowance_balance + delta.to_allowance,
-                     expired = account.expired + delta.expiring
-                 FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[], $4::bigint[])
-                     AS delta(account_id, spendable, to_allowance, expiring)
+                 SET settlement_loss = account.settlement_loss + delta.forfeited
+                 FROM UNNEST($1::bytea[], $2::bigint[]) AS delta(account_id, forfeited)
                  WHERE account.account_id = delta.account_id",
             )
             .bind(&account_ids)
-            .bind(&spendable)
-            .bind(&to_allowance)
-            .bind(&expiring)
+            .bind(&account_forfeits)
             .execute(&mut *tx)
             .await
             .map_err(storage)?;
