@@ -880,6 +880,24 @@ pub struct Metrics {
     pub refill: Option<Refill>,
     /// Snapshot-distribution health.
     pub snapshots: Option<Snapshots>,
+    /// Lease debits that lost a race to another core (#134): which accounts,
+    /// if any, are hot enough here to be worth sharding. Cumulative lower
+    /// bounds; compare two scrapes.
+    pub contention: Option<Contention>,
+}
+
+/// Per-account funding-line contention on this instance.
+#[derive(Debug, Serialize)]
+pub struct Contention {
+    pub contended_debits: u64,
+    /// At most eight accounts, most contended first.
+    pub hottest: Vec<HotAccount>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HotAccount {
+    pub account: String,
+    pub contended_debits: u64,
 }
 
 /// What the refill task has done. The counter that matters here is
@@ -1068,6 +1086,18 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Json<Metrics> {
                 publication_failures: stats.publication_failures,
                 unresolved: stats.unresolved,
             }
+        }),
+        contention: report.as_ref().map(|report| Contention {
+            contended_debits: report.contention.contended_debits,
+            hottest: report
+                .contention
+                .hottest
+                .iter()
+                .map(|&(account, contended_debits)| HotAccount {
+                    account: account.to_string(),
+                    contended_debits,
+                })
+                .collect(),
         }),
     })
 }

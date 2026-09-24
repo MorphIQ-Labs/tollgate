@@ -321,6 +321,25 @@ impl SlotRegistry {
             .collect()
     }
 
+    /// Every retained account's slot, copied out so a caller can walk them
+    /// without holding the registry.
+    ///
+    /// Unordered: the only consumer sorts by a total order before anything
+    /// reaches an output.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the contention report sorts by (count, account) before any output"
+    )]
+    pub(crate) fn slots(&self) -> Vec<(AccountId, Arc<LeaseSlot>)> {
+        self.inner
+            .lock()
+            .expect("slot registry poisoned")
+            .slots
+            .iter()
+            .map(|(&account, slot)| (account, Arc::clone(slot)))
+            .collect()
+    }
+
     pub(crate) fn retained_slots(&self) -> usize {
         self.inner
             .lock()

@@ -175,6 +175,57 @@ pub struct RuntimeReport {
     /// inferred from latency. `ShardOccupancy::is_crowded` is the question;
     /// `docs/LOCAL_SHARDING.md` is what to do about the answer.
     pub sharding: ShardOccupancy,
+    /// Lease debits that lost a race to another core, per account (#134).
+    ///
+    /// Which accounts, if any, are hot enough on this instance that their
+    /// funding line is written from several cores at once — the condition
+    /// opt-in lease sharding exists for (`docs/LOCAL_SHARDING.md`). Cumulative
+    /// since the process started, so read it as a rate between reports.
+    pub contention: ContentionReport,
+}
+
+/// How contended this instance's account funding lines have been.
+///
+/// Counts are lower bounds: see [`LocalLease::contended_debits`] for what a
+/// lost-race counter cannot see.
+///
+/// [`LocalLease::contended_debits`]: tollgate_core::LocalLease::contended_debits
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentionReport {
+    /// Lost debit races across every retained account.
+    pub contended_debits: u64,
+    /// The most-contended accounts, most contended first, ties by account id;
+    /// at most [`ContentionReport::HOTTEST`] and only accounts with a nonzero
+    /// count. Bounded so the report never grows with the account table.
+    pub hottest: Vec<(AccountId, u64)>,
+}
+
+impl ContentionReport {
+    /// How many accounts [`hottest`](Self::hottest) names at most.
+    pub const HOTTEST: usize = 8;
+
+    fn collect(slots: Vec<(AccountId, Arc<tollgate_admission::LeaseSlot>)>) -> Self {
+        Self::rank(
+            slots
+                .into_iter()
+                .map(|(account, slot)| (account, slot.contended_debits())),
+        )
+    }
+
+    fn rank(counts: impl Iterator<Item = (AccountId, u64)>) -> Self {
+        let mut counted: Vec<(AccountId, u64)> = counts.filter(|&(_, count)| count > 0).collect();
+        let contended_debits = counted
+            .iter()
+            .fold(0u64, |total, &(_, count)| total.saturating_add(count));
+        // A total order, so the registry's hash order never reaches the
+        // report: most contended first, then by account.
+        counted.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        counted.truncate(Self::HOTTEST);
+        Self {
+            contended_debits,
+            hottest: counted,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -420,6 +471,7 @@ impl RuntimeHandle {
             snapshots: self.shared.snapshot_counters.snapshot(),
             accounting: self.shared.recorder.health(),
             sharding: self.shared.slots.sharding().occupancy(),
+            contention: ContentionReport::collect(self.shared.slots.slots()),
         };
         for o in observations.values() {
             report.counter_overflow |= o.overflow;
@@ -1035,6 +1087,53 @@ mod health_tests {
         assert!(
             !plane_healthy(&receiver),
             "the last value still reads true; the closed channel is the evidence"
+        );
+    }
+}
+
+#[cfg(test)]
+mod contention_tests {
+    use super::*;
+
+    /// Most contended first, ties by account, zero counts omitted, capped at
+    /// `HOTTEST`, and the total counts every account — including the ones the
+    /// cap drops.
+    #[test]
+    fn contention_report_ranks_by_count_then_account() {
+        let counts =
+            (0..20u128).map(|account| (AccountId(account), u64::try_from(account % 4).unwrap()));
+        let report = ContentionReport::rank(counts);
+        assert_eq!(
+            report.contended_debits,
+            (0..20u64).map(|a| a % 4).sum::<u64>()
+        );
+        assert_eq!(report.hottest.len(), ContentionReport::HOTTEST);
+        assert_eq!(
+            report.hottest,
+            [
+                (AccountId(3), 3),
+                (AccountId(7), 3),
+                (AccountId(11), 3),
+                (AccountId(15), 3),
+                (AccountId(19), 3),
+                (AccountId(2), 2),
+                (AccountId(6), 2),
+                (AccountId(10), 2),
+            ]
+        );
+        assert_eq!(
+            ContentionReport::rank(std::iter::empty()),
+            ContentionReport {
+                contended_debits: 0,
+                hottest: Vec::new()
+            },
+            "an uncontended instance names no account"
+        );
+        assert_eq!(
+            ContentionReport::rank([(AccountId(1), u64::MAX), (AccountId(2), 5)].into_iter())
+                .contended_debits,
+            u64::MAX,
+            "the total saturates"
         );
     }
 }
