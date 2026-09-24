@@ -2992,6 +2992,26 @@ mod funding_deadline_tests {
                 }
             }
             let _stop = StopOnDrop(&stop);
+            // On a loaded host the reader can finish its whole loop before
+            // either writer is first scheduled, so the liveness check below
+            // would measure the scheduler. Wait, boundedly, for a first
+            // publication; that read is held to the pairing rule as well.
+            let started = std::time::Instant::now();
+            let (until, remaining) = loop {
+                if let Some(pair) = slot.evidence_pair(i64::MIN + 1) {
+                    break pair;
+                }
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(30),
+                    "no writer published within thirty seconds"
+                );
+                std::thread::yield_now();
+            };
+            assert_eq!(
+                until,
+                second(remaining),
+                "a deadline was paired with another publication's remaining"
+            );
             let mut accepted = 0u32;
             for _ in 0..200_000 {
                 if let Some((until, remaining)) = slot.evidence_pair(i64::MIN + 1) {

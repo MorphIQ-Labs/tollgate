@@ -26,8 +26,8 @@ use tollgate_admission::{
     PublishableSnapshotUpdate, SnapshotMap,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, BalanceExhaustion, CostTable, CostUnits,
-    EnforcementMode, FencingToken, Generation, KeyId, LeaseGrant, LeaseId, LocalLease,
+    AccountId, AccountSnapshot, AccountStatus, BalanceExhaustion, BalanceShortfall, CostTable,
+    CostUnits, EnforcementMode, FencingToken, Generation, KeyId, LeaseGrant, LeaseId, LocalLease,
     LocalSharding, Locality, OpIndex, PermissionBits, PublishableSnapshot, RequestId,
     ResolvedLimits, UsageEvent, UsageSlot,
 };
@@ -601,13 +601,28 @@ fn spawn_contenders_with(
     let now = Timestamp::from_second(1_755_600_000).unwrap();
     let principals: Vec<Principal> = principals.into_iter().collect();
 
-    let foreground = Locality::current().index(sharding);
-    align_next_locality_after(sharding, foreground);
+    // Pinned against the engine's tally layout, which shards under every
+    // lease layout (#132) and always at least as finely as the structure the
+    // fixture spreads across: aligning there aligns both. Left to the lease
+    // layout alone, the single-counter rows would put the foreground thread
+    // on a contender's tally shard seven times in sixteen — #123's lottery,
+    // moved to a different structure.
+    let tallies = engine.counters().local_sharding();
+    assert_eq!(
+        tallies.get() % sharding.get(),
+        0,
+        "the tally layout must refine the {}-shard layout the fixture spreads across",
+        sharding.get()
+    );
+    let foreground = Locality::current();
+    align_next_locality_after(tallies, foreground.index(tallies));
+    let foreground_tally = foreground.index(tallies);
+    let foreground = foreground.index(sharding);
 
     let engine = Arc::new(engine);
     let stop = Arc::new(AtomicBool::new(false));
     let ready = Arc::new(Barrier::new(principals.len() + 1));
-    let occupied = Arc::new(Mutex::new(vec![foreground]));
+    let occupied = Arc::new(Mutex::new(vec![(foreground, foreground_tally)]));
     let workers: Vec<_> = principals
         .into_iter()
         .map(|principal| {
@@ -620,11 +635,11 @@ fn spawn_contenders_with(
                 // Taken here rather than inside the loop so the number this
                 // thread reports is the one it then runs on: `Locality` is
                 // assigned once per thread and never moves.
-                let shard = Locality::current().index(sharding);
+                let locality = Locality::current();
                 occupied
                     .lock()
                     .expect("no contender panics holding this")
-                    .push(shard);
+                    .push((locality.index(sharding), locality.index(tallies)));
                 ready.wait();
                 while !stop.load(Ordering::Relaxed) {
                     work(&engine, principal, now);
@@ -643,11 +658,23 @@ fn spawn_contenders_with(
         workers,
     };
 
-    let mut occupied = occupied
+    let pairs = occupied
         .lock()
         .expect("every contender released this before the barrier")
         .clone();
-    let threads = occupied.len();
+    let threads = pairs.len();
+    let mut tally_shards: Vec<usize> = pairs.iter().map(|&(_, tally)| tally).collect();
+    tally_shards.sort_unstable();
+    tally_shards.dedup();
+    assert_eq!(
+        tally_shards.len(),
+        threads.min(tallies.get()),
+        "{threads} contended-fixture threads on {} tally shard(s) must occupy {} of them, \
+         not {tally_shards:?}",
+        tallies.get(),
+        threads.min(tallies.get()),
+    );
+    let mut occupied: Vec<usize> = pairs.iter().map(|&(shard, _)| shard).collect();
     occupied.sort_unstable();
     occupied.dedup();
     // As widely as the layout allows: one shard each while there are shards
@@ -729,9 +756,10 @@ fn bench_full_check(c: &mut Criterion) {
         });
     }
 
-    // Eight simultaneous requests spread across eight accounts. The current
-    // engine-global AdmissionCounters still bounce one cache line here; #99
-    // moves them behind the map and must improve this preserved baseline.
+    // Eight simultaneous requests spread across eight accounts. Until #132
+    // the engine-wide tallies were one set of lines on this layout, and
+    // unrelated accounts contended on them here; they now shard under every
+    // lease layout, so what remains is per-request work, not a shared line.
     {
         let contended = distinct_account_contended_engine(LocalSharding::SINGLE);
         group.bench_function("full_check_contended_8_distinct_accounts", |b| {
@@ -779,16 +807,7 @@ fn bench_full_check(c: &mut Criterion) {
     // the allocator has confirmed the account is empty. The strict row above
     // pays the one atomic load and finds no evidence; this one finds it, so
     // the reclassification and its distinct denial counter are measured too.
-    let confirmed = exhausted_engine(EnforcementMode::Strict);
-    for i in 0..512u128 {
-        let MapEntry::Present(state) = confirmed.map().get(&Principal(i)).unwrap() else {
-            unreachable!("exhausted_engine installs every principal")
-        };
-        state
-            .lease
-            .funding_attempt()
-            .shortfall(BalanceExhaustion { period_end: None }.into());
-    }
+    let confirmed = attested_engine(BalanceExhaustion { period_end: None }.into());
     // A fixture that silently fell through to `LeaseExhausted` would measure
     // the row above under a second name.
     assert_eq!(
@@ -798,6 +817,26 @@ fn bench_full_check(c: &mut Criterion) {
     group.bench_function("full_check_balance_exhausted_strict", |b| {
         b.iter(|| {
             let denied = staged_admission(&confirmed, black_box(Principal(97)), 64, now);
+            black_box(denied.unwrap_err())
+        })
+    });
+
+    // #130 reads a live `(deadline, remaining)` pair when the allocator has
+    // attested a positive remainder too small for the quote, and refuses with
+    // `BalanceInsufficient`. The row above is the zero-remaining case; this is
+    // the seqlock-guarded pair read and the quote-against-remaining branch
+    // (#135). The same assertion keeps it from measuring a neighbour.
+    let insufficient = attested_engine(BalanceShortfall {
+        remaining: CostUnits(1),
+        period_end: None,
+    });
+    assert!(matches!(
+        staged_admission(&insufficient, Principal(97), 64, now).unwrap_err(),
+        tollgate_core::DenyReason::BalanceInsufficient { .. }
+    ));
+    group.bench_function("full_check_balance_insufficient_strict", |b| {
+        b.iter(|| {
+            let denied = staged_admission(&insufficient, black_box(Principal(97)), 64, now);
             black_box(denied.unwrap_err())
         })
     });
@@ -1000,6 +1039,20 @@ fn exhausted_engine(mode: EnforcementMode) -> AdmissionEngine<ArcSwapSnapshotMap
             .map()
             .install(Principal(i), Arc::clone(&snapshot), slot)
             .unwrap();
+    }
+    engine
+}
+
+/// The strict refusal fixture with the allocator's attested shortfall
+/// published to every principal's slot, after install, because a first
+/// install's funding observation clears any earlier evidence.
+fn attested_engine(evidence: BalanceShortfall) -> AdmissionEngine<ArcSwapSnapshotMap> {
+    let engine = exhausted_engine(EnforcementMode::Strict);
+    for i in 0..512u128 {
+        let MapEntry::Present(state) = engine.map().get(&Principal(i)).unwrap() else {
+            unreachable!("exhausted_engine installs every principal")
+        };
+        state.lease.funding_attempt().shortfall(evidence);
     }
     engine
 }
