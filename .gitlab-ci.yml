@@ -219,6 +219,11 @@ test:
   stage: test
   interruptible: true
   cache: *cargo-build-cache
+  # The slim image has no git, and tollgate-repo-check's tag-release tests
+  # (#142) drive git in a scratch repository. Install it rather than skip them:
+  # a correctness check that silently does not run is no check at all.
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends git
   script:
     - cargo test --locked --workspace --all-features
 
@@ -252,6 +257,11 @@ test-no-default-features:
   stage: test
   interruptible: true
   cache: *cargo-build-cache
+  # The slim image has no git, and tollgate-repo-check's tag-release tests
+  # (#142) drive git in a scratch repository. Install it rather than skip them:
+  # a correctness check that silently does not run is no check at all.
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends git
   script:
     - |
       dependency_tree="$(cargo tree --locked -p tollgate-server --no-default-features)"

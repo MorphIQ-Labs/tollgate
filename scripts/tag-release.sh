@@ -37,9 +37,15 @@ if git rev-parse -q --verify "refs/tags/$tag" >/dev/null 2>&1 \
 fi
 
 # The release commit is the squashed second parent of the merge commit under
-# the group-enforced merge method. Find that merge on the first-parent history
-# rather than tagging CI_COMMIT_SHA: another merge can land while the release
-# pipeline waits for a runner, and its checkout must not become the release.
+# the group-enforced merge method. Tag *it*, not the merge and not
+# CI_COMMIT_SHA (#142). Its tree is exactly the tree the CHANGELOG section was
+# written from and the release merge request's pipeline tested. The merge can
+# also carry commits that reached the default branch after preparation — v0.29.0
+# did: its tag contained a fix that its section omitted and 0.29.1's section
+# listed — and `prepare-release` already attributes those to the next release.
+# Tagging the release commit makes the tag's contents and its notes the same
+# thing by construction. The merge is still required on the first-parent
+# history, so only a release that actually landed is tagged.
 release_commit=$(git log --no-merges --format='%H %s' HEAD | awk -v wanted="chore: release $tag" '
   {
     hash = $1
@@ -75,18 +81,22 @@ if [ -z "$(printf '%s' "$notes" | tr -d '[:space:]')" ]; then
   exit 1
 fi
 
+# One variable for the dry run, the tag and the release, so the tested output
+# and what is published cannot name different commits.
+tag_target=$release_commit
+
 if [ "$DRY_RUN" = "1" ]; then
-  echo "tag-release: would release $tag at $release_ref"
+  echo "tag-release: would release $tag at $tag_target (landed by $release_ref)"
   exit 0
 fi
 
 git config user.email "release-bot@noreply.$CI_SERVER_HOST"
 git config user.name "release-bot"
 git remote set-url origin "https://oauth2:${RELEASE_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
-git tag -a "$tag" -m "$tag" "$release_ref"
+git tag -a "$tag" -m "$tag" "$tag_target"
 git push origin "refs/tags/$tag"
 
-jq -n --arg tag "$tag" --arg ref "$release_ref" --arg desc "$notes" \
+jq -n --arg tag "$tag" --arg ref "$tag_target" --arg desc "$notes" \
   '{tag_name:$tag, ref:$ref, description:$desc}' \
 | curl --fail-with-body -sS -X POST \
     -H "PRIVATE-TOKEN: $RELEASE_TOKEN" -H "Content-Type: application/json" \
