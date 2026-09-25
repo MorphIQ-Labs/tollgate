@@ -1140,6 +1140,69 @@ mod tests {
         engine
     }
 
+    /// An account's concurrency-gauge races reach its slot's contention total
+    /// (#139): eight threads admitting for one account lose gauge exchanges,
+    /// and the slot counts more than the lease alone recorded.
+    #[test]
+    fn concurrency_gauge_contention_reaches_the_account_total() {
+        // No rate limit, so every admission reaches the gauges.
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        drop(slot.replace(lease(u64::MAX / 2)));
+        let mut unlimited = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
+        unlimited.limits = ResolvedLimits::new(64);
+        engine
+            .map()
+            .install(Principal(1), Arc::new(unlimited), slot)
+            .unwrap();
+        let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
+            panic!()
+        };
+        let slot = Arc::clone(&state.lease);
+        let lease = slot.load().unwrap();
+        let gauges = || slot.contended_exchanges() - lease.contended_debits();
+        for _ in 0..50 {
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    scope.spawn(|| {
+                        for _ in 0..20_000 {
+                            let _ = engine.admit_one(request(1), t(0)).unwrap().cancel();
+                        }
+                    });
+                }
+            });
+            if gauges() > 0 {
+                break;
+            }
+        }
+        assert!(
+            gauges() > 0,
+            "eight admitting threads never lost a gauge race"
+        );
+        assert_eq!(
+            state.account_concurrency_in_flight(),
+            0,
+            "every permit released"
+        );
+    }
+
+    /// An uncontended admission records no gauge contention.
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_feature = "lse")
+    ))]
+    #[test]
+    fn an_uncontended_admission_records_no_contention() {
+        let engine = engine_with(AccountStatus::Active, Some(1_000_000));
+        for _ in 0..100 {
+            let _ = engine.admit_one(request(1), t(0)).unwrap().cancel();
+        }
+        let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
+            panic!()
+        };
+        assert_eq!(state.lease.contended_exchanges(), 0);
+    }
+
     #[test]
     fn authoritative_exhaustion_classifies_only_failed_local_funding() {
         for units in [None, Some(0), Some(100)] {

@@ -861,7 +861,7 @@ async fn metrics_report_refill_and_snapshot_health() {
     // #134: exported whether or not anything is hot. No request has run, so
     // no debit can have lost a race and no account is named.
     let contention = &body["contention"];
-    assert_eq!(contention["contended_debits"], 0, "{contention}");
+    assert_eq!(contention["contended_exchanges"], 0, "{contention}");
     assert_eq!(contention["hottest"].as_array().unwrap().len(), 0);
 
     runtime.shutdown().await;
