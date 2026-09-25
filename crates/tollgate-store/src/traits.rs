@@ -1431,6 +1431,51 @@ impl std::fmt::Display for KeyError {
 
 impl std::error::Error for KeyError {}
 
+/// Refusals from binding or withdrawing a snapshot by the credential it was
+/// issued as (#143).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeySnapshotError {
+    /// No such credential, or it belongs to another account. One answer for
+    /// both, as revocation gives: a foreign `key_id` discloses nothing.
+    UnknownCredential,
+    /// The credential was revoked. Revocation is terminal (INVARIANTS.md
+    /// #27), so it is never granted positive authorization again; withdrawal
+    /// remains allowed.
+    Retired {
+        key_id: KeyId,
+    },
+    /// Publication refused as [`AdminStore::publish_snapshot`] would refuse it.
+    Publish(PublishSnapshotError),
+    Storage(StoreError),
+}
+
+impl std::fmt::Display for KeySnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeySnapshotError::UnknownCredential => f.write_str("no such credential"),
+            KeySnapshotError::Retired { key_id } => {
+                write!(f, "credential {key_id} is revoked")
+            }
+            KeySnapshotError::Publish(e) => write!(f, "{e}"),
+            KeySnapshotError::Storage(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for KeySnapshotError {}
+
+impl From<PublishSnapshotError> for KeySnapshotError {
+    fn from(error: PublishSnapshotError) -> Self {
+        Self::Publish(error)
+    }
+}
+
+impl From<StoreError> for KeySnapshotError {
+    fn from(error: StoreError) -> Self {
+        Self::Storage(error)
+    }
+}
+
 impl From<StoreError> for KeyError {
     fn from(error: StoreError) -> Self {
         Self::Storage(error)
@@ -1579,6 +1624,35 @@ pub trait KeyDirectory: crate::KeySource {
         key_id: KeyId,
         now: Timestamp,
     ) -> Result<crate::AdminReceipt<Revocation>, KeyError>;
+
+    /// Publish `snapshot` for the principal of `account`'s credential `key`,
+    /// resolved inside the store (#143).
+    ///
+    /// An operator holds `(account, key)`; the principal is digest material
+    /// and never leaves the server. Resolution, the retirement check and the
+    /// publication are one indivisible step, so a concurrent revocation
+    /// either precedes it — and the publish is refused as
+    /// [`KeySnapshotError::Retired`] — or follows it.
+    ///
+    /// `snapshot` must state `key_id == Some(key)`; anything else is
+    /// [`PublishSnapshotError::CredentialMismatch`]. Every other rule is
+    /// [`AdminStore::publish_snapshot`]'s, including the generation no-op.
+    async fn publish_key_snapshot(
+        &self,
+        account: AccountId,
+        key: KeyId,
+        snapshot: PublishableSnapshot,
+    ) -> Result<crate::AdminReceipt<()>, KeySnapshotError>;
+
+    /// Withdraw the snapshot of `account`'s credential `key`, tombstoning it
+    /// as [`AdminStore::remove_snapshot`] does. Allowed for a revoked
+    /// credential: revocation does not withdraw its snapshot, and withdrawal
+    /// is the safe direction.
+    async fn remove_key_snapshot(
+        &self,
+        account: AccountId,
+        key: KeyId,
+    ) -> Result<crate::AdminReceipt<()>, KeySnapshotError>;
 }
 
 #[cfg(test)]

@@ -104,6 +104,11 @@ pub trait CredentialVerifier {
 /// persists is a digest. A caller therefore has one opportunity to deliver it,
 /// and losing it means revoking the credential and issuing another, never
 /// asking for the same secret again.
+///
+/// **The secret is the presented form.** [`MintedKey::secret`] must be the
+/// exact bytes the owner will present and the digest covers: visible ASCII
+/// text, disclosed without re-encoding. An issuer that digests one form and
+/// hands out another mints credentials no verifier accepts as presented.
 pub trait CredentialIssuer {
     /// Mint a credential for `key_id`, chosen by the caller.
     ///

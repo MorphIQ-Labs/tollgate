@@ -1692,6 +1692,26 @@ exists to detect corrupt state and must not be able to launder it.
     projection may cross the instance-only secured control-plane link (32);
     it cannot invent liveness absent from the selected ledger revision.
 
+    The disclosed secret is the credential as presented: `HmacRegistry::mint`
+    mints 64 lowercase hexadecimal characters and digests exactly those bytes,
+    and issuance discloses them without re-encoding. An embedder issuer whose
+    secret is not presentable text is refused before its record is stored.
+    *Tests:* `a_minted_credential_verifies_as_the_text_it_is_disclosed_as`,
+    `an_issuer_minting_an_unpresentable_secret_is_refused_before_storage`, and
+    `the_binary_issues_from_a_manifest_configured_issuer`.
+
+    Binding a policy by credential cannot resurrect a retired one either.
+    `KeyDirectory::publish_key_snapshot` resolves the principal, refuses a
+    revoked credential and publishes in one store operation: MemoryStore under
+    its shared mutex, PostgreSQL holding the credential row `FOR SHARE`
+    against revocation's `FOR UPDATE`. So a racing revocation either precedes
+    the publish, which is then refused, or follows it. Withdrawal by credential
+    remains allowed, because revocation does not withdraw a snapshot.
+    *Tests:* `a_retired_credential_is_never_granted_a_snapshot_but_can_be_withdrawn`
+    (shared backend scenario), `key_bound_publication_and_revocation_serialize`
+    (PostgreSQL), and `a_retired_key_cannot_be_granted_a_snapshot_but_can_be_withdrawn`
+    (HTTP).
+
     Both credential issuance methods serialize on the owning account before
     inserting a credential. PostgreSQL owns this order in one shared transaction
     implementation; MemoryStore holds its shared mutex. With an existing
@@ -2030,6 +2050,24 @@ exists to detect corrupt state and must not be able to launder it.
     atomically rotates roots, identity and provider. Handshake count/time and
     total HTTP call time (including credential retrieval) are bounded off-path.
 
+    The manifest's optional customer-credential issuer is validated with the
+    rest of the generation: exactly 64 lowercase hexadecimal characters, keyed
+    as those bytes, and distinct from every bearer token, or the load fails. It
+    is fixed at `SecurityLoader::start` for the process lifetime. A later
+    generation naming a different issuer still publishes its TLS and role
+    changes, never replaces the live issuer, and reports the pending change
+    through `SecurityLoader::issuer_change_pending` and one warning per distinct
+    staged value, so a stray issuer edit cannot freeze certificate or bearer
+    rotation. Neither the secret nor its fingerprint is logged or returned.
+    Witnesses: `issuer_secret_files_must_be_exactly_64_lowercase_hex_characters`,
+    `an_issuer_secret_equal_to_a_bearer_is_refused`,
+    `the_manifest_issuer_keys_on_the_file_text`,
+    `an_issuer_change_is_deferred_without_blocking_other_rotation`,
+    `an_invalid_issuer_on_reload_keeps_the_live_generation`,
+    `the_binary_issues_from_a_manifest_configured_issuer`,
+    `the_binary_without_an_issuer_answers_issuance_unsupported`, and
+    `the_binary_refuses_an_invalid_issuer_before_listening`.
+
     Enforcement: private handler extractors, `ServerSecurity`, `SecureListener`,
     `SecurityLoader`, and the generation-owning `HttpRequest`. Exact-model proof:
     `formal/lean/Tollgate/ControlPlane.lean` proves role separation and agreement
@@ -2079,7 +2117,10 @@ exists to detect corrupt state and must not be able to launder it.
     schedule columns. Credential administration uses `KeyDirectory`'s audited
     methods; issuance reports absence to an unrevoked credential, and retirement
     reports the actual prior retirement state. Receipts include the owning
-    account and non-secret key ID, never a digest or principal. Expiry is
+    account and non-secret key ID, never a digest or principal. Binding or
+    withdrawing a policy by credential reports snapshot state under the
+    resource `{account}/keys/{key}/snapshot`; the store resolves the principal
+    and it never reaches a receipt, response or audit event. Expiry is
     independent of the retirement flag. Repeated retirement returns equal states.
     Both credential listings reject malformed or oversized queries as structured
     client errors before a backend read.
@@ -2110,7 +2151,8 @@ exists to detect corrupt state and must not be able to launder it.
     `queued_budget_updates_report_the_locked_predecessor` (PostgreSQL),
     `credential_receipts_identify_issuance_and_concurrent_revocation` (both stores),
     `credential_auditing_refuses_a_corrupt_owner_without_retiring_it` (PostgreSQL),
-    `credential_audits_name_the_key_and_actual_lifecycle_transition`, and
+    `credential_audits_name_the_key_and_actual_lifecycle_transition`,
+    `key_snapshot_audits_name_the_key_and_never_the_principal`, and
     `both_credential_listings_validate_queries_before_backend_reads`.
     `ControlPlane` additionally proves generic replacement predecessor composition
     and credential retirement identity preservation, idempotency and terminality;
@@ -2182,7 +2224,11 @@ exists to detect corrupt state and must not be able to launder it.
 35. **Credential activity derives from canonical accepted commitments.** A
     pinned snapshot supplies its optional key ID when commitment constructs
     the usage event. Store publication validates a stated key's principal and
-    account binding; custom snapshot producers remain trusted. Ingest checks
+    account binding; custom snapshot producers remain trusted. Publication by
+    credential resolves the principal from the account's own key record inside
+    the same store operation and requires the snapshot to state that key, so an
+    operator never supplies a principal and cannot bind one account's policy to
+    another's credential. Ingest checks
     account ownership and derives activity only from newly accepted events.
     Duplicate request IDs cannot replace their original identity or timestamp.
     Activity advances by maximum at microsecond precision and remains outside
@@ -2217,6 +2263,8 @@ exists to detect corrupt state and must not be able to launder it.
     `missing_unknown_and_wrong_account_attribution_preserve_billing`,
     `retired_activity_never_changes_the_credential_revision`,
     `publication_checks_the_stated_credential_binding`,
+    `key_bound_publication_resolves_the_principal_in_the_store`,
+    `key_bound_publication_is_bound_to_the_account_and_key`,
     `concurrent_activity_commits_converge_to_the_maximum`,
     `activity_uses_durable_microsecond_precision`,
     `activity_reads_preserve_every_requested_key_and_its_state`, and
@@ -2230,8 +2278,12 @@ exists to detect corrupt state and must not be able to launder it.
     `attribution_and_existing_outcome_counters_saturate_visibly`,
     `attribution_coverage_reports_transitions_without_repeating_incidents`,
     and the uncertain-retry/drain scenarios in `usage_attribution`; the HTTP
-    `usage_acknowledgements_require_complete_bounded_valid_evidence` and
-    `invalid_published_key_binding_has_a_structured_code`; the wire-limit,
+    `usage_acknowledgements_require_complete_bounded_valid_evidence`,
+    `invalid_published_key_binding_has_a_structured_code`,
+    `a_key_snapshot_is_bound_to_the_account_in_the_path` and
+    `a_key_snapshot_naming_another_key_is_refused`; PostgreSQL's
+    `key_bound_publication_and_status_changes_never_deadlock`, which witnesses the
+    credential, account, snapshot lock order; the wire-limit,
     attributed embedding allocation and three full-stack transport witnesses.
 
 

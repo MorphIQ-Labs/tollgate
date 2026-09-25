@@ -393,3 +393,134 @@ async fn a_failed_batch_preserves_activity_and_canonical_events() {
     scenarios::a_failed_batch_preserves_activity_and_canonical_events(&*store, i64::MAX as u64)
         .await;
 }
+
+#[tokio::test]
+async fn key_bound_publication_resolves_the_principal_in_the_store() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store().await else { return };
+    scenarios::setup(&*store).await;
+    scenarios::key_bound_publication_resolves_the_principal_in_the_store(&*store).await;
+}
+
+#[tokio::test]
+async fn key_bound_publication_is_bound_to_the_account_and_key() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store().await else { return };
+    scenarios::setup(&*store).await;
+    scenarios::key_bound_publication_is_bound_to_the_account_and_key(&*store).await;
+}
+
+#[tokio::test]
+async fn a_retired_credential_is_never_granted_a_snapshot_but_can_be_withdrawn() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store().await else { return };
+    scenarios::setup(&*store).await;
+    scenarios::a_retired_credential_is_never_granted_a_snapshot_but_can_be_withdrawn(&*store).await;
+}
+
+/// A key-bound publication holds the credential row `FOR SHARE`, so it and a
+/// revocation serialize: the publish commits first or is refused as retired,
+/// and neither side fails with a lock error (#143).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn key_bound_publication_and_revocation_serialize() {
+    use tollgate_core::{AccountId, KeyId, Principal};
+    use tollgate_store::{KeyRecord, KeySnapshotError, SnapshotSource};
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store().await else { return };
+    scenarios::setup(&*store).await;
+    let (mut published, mut refused) = (0, 0);
+    for i in 0..40u128 {
+        let key = KeyId(10_000 + i);
+        let principal = Principal(20_000 + i);
+        let mut digest = [0x42; 32];
+        digest[..16].copy_from_slice(&principal.0.to_be_bytes());
+        store
+            .insert_key(KeyRecord {
+                key_id: key,
+                account_id: AccountId(1),
+                principal,
+                digest,
+                not_after: None,
+            })
+            .await
+            .unwrap();
+        let (publish, revoke) = tokio::join!(
+            store.publish_key_snapshot(
+                AccountId(1),
+                key,
+                scenarios::snapshot(Some(key), AccountId(1), 1)
+            ),
+            store.revoke_key(key, jiff::Timestamp::UNIX_EPOCH),
+        );
+        revoke.expect("revocation never fails on a lock");
+        match publish {
+            Ok(_) => {
+                published += 1;
+                assert!(matches!(
+                    store.snapshot(principal).await.unwrap(),
+                    tollgate_store::SnapshotResolution::Present(_)
+                ));
+            }
+            Err(KeySnapshotError::Retired { key_id }) => {
+                refused += 1;
+                assert_eq!(key_id, key);
+                assert!(matches!(
+                    store.snapshot(principal).await.unwrap(),
+                    tollgate_store::SnapshotResolution::Unknown
+                ));
+            }
+            Err(other) => panic!("neither order may fail otherwise: {other}"),
+        }
+    }
+    eprintln!("published before revocation {published}, refused after {refused}");
+}
+
+/// The key-bound path locks credential, then account, then snapshot. A status
+/// change holds the account and then snapshot rows and never a credential, so
+/// the two complete in either order without deadlock, and the published
+/// status always ends up agreeing with the ledger (#143, #51).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn key_bound_publication_and_status_changes_never_deadlock() {
+    use tollgate_core::{AccountId, AccountStatus, KeyId, Principal};
+    use tollgate_store::{
+        AdminStore, KeySnapshotError, PublishSnapshotError, SnapshotResolution, SnapshotSource,
+    };
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store().await else { return };
+    scenarios::setup(&*store).await;
+    for i in 0..40u64 {
+        let status = if i % 2 == 0 {
+            AccountStatus::Suspended
+        } else {
+            AccountStatus::Active
+        };
+        let current = if i % 2 == 0 {
+            AccountStatus::Active
+        } else {
+            AccountStatus::Suspended
+        };
+        let mut submitted = scenarios::snapshot(Some(KeyId(1)), AccountId(1), i + 1)
+            .as_snapshot()
+            .clone();
+        submitted.status = current;
+        let submitted =
+            tollgate_core::PublishableSnapshot::try_new(std::sync::Arc::new(submitted)).unwrap();
+        let (change, publish) = tokio::join!(
+            AdminStore::set_account_status(&*store, AccountId(1), status),
+            store.publish_key_snapshot(AccountId(1), KeyId(1), submitted),
+        );
+        change.expect("a status change never fails on a lock");
+        match publish {
+            Ok(_) | Err(KeySnapshotError::Publish(PublishSnapshotError::StatusMismatch { .. })) => {
+            }
+            Err(other) => panic!("unexpected refusal: {other}"),
+        }
+        if let SnapshotResolution::Present(snapshot) = store.snapshot(Principal(101)).await.unwrap()
+        {
+            assert_eq!(
+                snapshot.status, status,
+                "the published status follows the ledger"
+            );
+        }
+    }
+}

@@ -75,12 +75,13 @@ valid generation.
     "subjects": [
       {"subject": "123456789012345678901", "identity": "ferro-risk", "role": "instance"}
     ]
-  }
+  },
+  "issuer": {"secret_file": "issuer.secret"}
 }
 ```
 
 The subject above is illustrative; replace it with the service account's numeric
-unique ID. `google`, `tls`, and `client_ca` are optional; `bearers` and
+unique ID. `google`, `tls`, `client_ca` and `issuer` are optional; `bearers` and
 `certificates` default to empty lists. An empty role map intentionally denies all
 protected operations. Keep the TLS block when withdrawing all identities from
 an encrypted listener.
@@ -90,7 +91,7 @@ Use separate instance and operator identities. Roles are disjoint:
 | Role | Routes under `/v1` |
 | --- | --- |
 | `instance` | `POST /leases/{acquire,release,consolidate,reclaim}`, `GET /snapshots`, `GET /snapshots/{principal}`, `GET /keys`, `POST /usage/ingest` |
-| `operator` | `POST /admin/accounts`, `POST /admin/accounts/{id}/{deposit,status,capacity-class}`, `PUT /admin/snapshots/{principal}`, `DELETE /admin/snapshots/{principal}` |
+| `operator` | `POST /admin/accounts`, `GET /admin/accounts/{id}`, `POST /admin/accounts/{id}/{deposit,status,capacity-class}`, `PUT /admin/accounts/{id}/budget`, `POST`/`GET /admin/accounts/{id}/keys`, `DELETE /admin/accounts/{id}/keys/{key}`, `PUT`/`DELETE /admin/accounts/{id}/keys/{key}/snapshot`, `PUT /admin/snapshots/{principal}`, `DELETE /admin/snapshots/{principal}` |
 
 `GET /keys` serves customer credential digests from the store's `KeyDirectory`.
 That key space is separate from this server's control-plane bearer credentials,
@@ -104,7 +105,41 @@ is accepted. Generate at least 256 random bits and store them using a secret
 manager or protected mounted file. Only HMAC digests remain in the loaded static
 verifier. Identities are non-secret audit names, limited to 128 ASCII identifier
 characters. Raw tokens, authorization headers, private keys, and JWT bodies are
-not logged.
+not logged. Snapshot publication logs the affected principal at `debug`, so do
+not run `RUST_LOG=debug` in production: principals are digest material that no
+administrative response or audit event discloses.
+
+### Credential issuer
+
+The optional `issuer` entry lets this server mint customer credentials:
+`POST /admin/accounts/{id}/keys` answers `501 issuance-unsupported` without it.
+See [account administration](ACCOUNT_ADMINISTRATION.md) for the routes.
+
+- **Format.** The file holds exactly 64 lowercase hexadecimal characters, with
+  one optional trailing newline (`openssl rand -hex 32`). Anything else,
+  including uppercase, rejects the configuration.
+- **The HMAC key is those 64 characters as bytes**, not their decoded value.
+  Give every verifier (`tollgate_client::KeyManager::spawn`) the same 64
+  characters without the newline, so one stored value configures both sides.
+  Uppercase is refused because under this rule it would be a different key.
+- **Distinct authority.** The issuer secret must differ from every bearer token
+  in the manifest; a match rejects the configuration. It is unrelated to the
+  per-start registry that verifies control-plane bearers.
+- **Fixed for the process lifetime.** The issuer is read when the server starts.
+  A reload whose manifest names a different issuer — changed, added or removed —
+  still applies TLS, bearer, certificate and Google changes, keeps the running
+  issuer, and logs `reason="issuer-change-requires-restart"` once per distinct
+  staged value. An invalid issuer file fails the reload like any other malformed
+  file, and the previous generation stays live.
+- Neither the secret nor anything derived from it is logged, returned or audited.
+
+**Rotating the issuer secret invalidates every credential issued under the old
+one**, because a credential verifies only under the secret that minted it and a
+verifier holds exactly one (see [credential projection](CREDENTIAL_PROJECTION.md)).
+There is no multi-secret overlap. To rotate: write the new secret, restart the
+server, restart every verifier with the same new value, then re-issue each
+account's credentials and revoke the old ones. Plan the rotation as a credential
+reissue, not a transparent reload.
 
 The server accepts a single `Authorization: Bearer …` header, bounded to 16 KiB.
 Bearer verification uses `tollgate-auth::CredentialVerifier`. The configured role
@@ -283,7 +318,8 @@ handshakes use the configuration current at connection acceptance. Existing TLS
 connections do not renegotiate the server certificate; clients needing immediate
 server-trust withdrawal must replace their transport. Enabling or disabling TLS
 requires a listener restart, so a reload cannot expose an encrypted service as
-plaintext.
+plaintext. Changing the credential issuer requires a server restart; a reload
+defers it without blocking the rest (see [credential issuer](#credential-issuer)).
 
 Usage ingestion treats authentication failures as retryable. Rotation can pause
 billing delivery but must not turn a valid usage batch into a terminal refusal.

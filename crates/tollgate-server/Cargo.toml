@@ -19,6 +19,8 @@ tollgate-auth = { path = "../tollgate-auth", version = "=0.29.3" }
 arc-swap = { workspace = true }
 getrandom = { workspace = true }
 sha2 = { workspace = true }
+# Issuer/bearer distinctness compares secrets without a data-dependent early exit.
+subtle = { workspace = true }
 zeroize = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }

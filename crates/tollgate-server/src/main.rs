@@ -1,7 +1,9 @@
 //! tollgate-server binary: env-driven config with backend selection.
 //!
 //! `TOLLGATE_SECURITY_CONFIG` — required identity/TLS JSON manifest, reloaded
-//! every five seconds. See `docs/CONTROL_PLANE_SECURITY.md`.
+//! every five seconds. Its optional `issuer` entry enables customer-credential
+//! issuance, fixed for the process lifetime. See
+//! `docs/CONTROL_PLANE_SECURITY.md`.
 //! `TOLLGATE_BIND` (default `127.0.0.1:8080`) — listen address. Non-loopback
 //! listeners require TLS; every protected route requires an identity.
 //! `TOLLGATE_STORE` — `memory` (default; ephemeral, dev/demo only) or, when
@@ -54,7 +56,7 @@ fn main() -> std::io::Result<()> {
         match arg.to_str() {
             Some("--help" | "-h") => {
                 println!(
-                    "tollgate-server {}\nUsage: tollgate-server [--help | --version] [--]\nConfiguration: TOLLGATE_SECURITY_CONFIG (required JSON manifest), TOLLGATE_BIND (default 127.0.0.1:8080), TOLLGATE_STORE ({COMPILED_BACKENDS}), TOLLGATE_PG_URL, TOLLGATE_RECLAIM_INTERVAL_SECS (default 5).\nSee docs/CONTROL_PLANE_SECURITY.md. Credentials reload every five seconds.",
+                    "tollgate-server {}\nUsage: tollgate-server [--help | --version] [--]\nConfiguration: TOLLGATE_SECURITY_CONFIG (required JSON manifest), TOLLGATE_BIND (default 127.0.0.1:8080), TOLLGATE_STORE ({COMPILED_BACKENDS}), TOLLGATE_PG_URL, TOLLGATE_RECLAIM_INTERVAL_SECS (default 5).\nThe manifest's optional issuer.secret_file enables credential issuance; it applies at start only.\nSee docs/CONTROL_PLANE_SECURITY.md. Credentials reload every five seconds.",
                     env!("CARGO_PKG_VERSION")
                 );
                 return Ok(());
@@ -116,6 +118,13 @@ async fn run_server() -> std::io::Result<()> {
         .map_err(std::io::Error::other)?
         .ok_or_else(|| std::io::Error::other("initial security configuration missing"))?;
     let security = loader.start(loaded).map_err(std::io::Error::other)?;
+    // Taken before the loader moves into the reloader, which never replaces it.
+    let issuer = loader.issuer();
+    let issuance = if issuer.is_some() {
+        "enabled"
+    } else {
+        "disabled"
+    };
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     if !security.encrypted()
         && !tollgate_server::transport::is_loopback(listener.local_addr()?.ip())
@@ -154,6 +163,7 @@ async fn run_server() -> std::io::Result<()> {
             tracing::info!(
                 %bind,
                 backend = "memory",
+                issuance,
                 "tollgate-server listening (ephemeral, dev/demo only; memory grows with \
                  lifetime request count — not a soak or load-test target)"
             );
@@ -164,13 +174,9 @@ async fn run_server() -> std::io::Result<()> {
                         .expect("default grant policy is valid"),
                     clock: Arc::clone(&clock),
                     security: Arc::clone(&security),
-                    // This binary issues no customer credentials: the registry
-                    // `config.rs` builds digests control-plane bearer tokens
-                    // under a secret regenerated every start, which is the
-                    // wrong authority and the wrong lifetime for credentials a
-                    // customer keeps. Issuance therefore answers 501 here until
-                    // a deployment supplies a durable one (#121).
-                    issuer: None,
+                    // The manifest's durable `issuer`, never the per-start
+                    // control-plane bearer registry; absent answers 501.
+                    issuer,
                 },
                 reclaim,
                 shutdown,
@@ -196,20 +202,16 @@ async fn run_server() -> std::io::Result<()> {
                     );
                     std::process::exit(2);
                 });
-            tracing::info!(%bind, backend = "postgres", "tollgate-server listening");
+            tracing::info!(%bind, backend = "postgres", issuance, "tollgate-server listening");
             serve(
                 listener,
                 ServerState {
                     store,
                     clock: Arc::clone(&clock),
                     security: Arc::clone(&security),
-                    // This binary issues no customer credentials: the registry
-                    // `config.rs` builds digests control-plane bearer tokens
-                    // under a secret regenerated every start, which is the
-                    // wrong authority and the wrong lifetime for credentials a
-                    // customer keeps. Issuance therefore answers 501 here until
-                    // a deployment supplies a durable one (#121).
-                    issuer: None,
+                    // The manifest's durable `issuer`, never the per-start
+                    // control-plane bearer registry; absent answers 501.
+                    issuer,
                 },
                 reclaim,
                 shutdown,

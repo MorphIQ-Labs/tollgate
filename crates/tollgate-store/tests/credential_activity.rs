@@ -180,3 +180,28 @@ async fn a_failed_batch_preserves_activity_and_canonical_events() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn key_bound_publication_resolves_the_principal_in_the_store() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    support::credential_activity::setup(&*store).await;
+    support::credential_activity::key_bound_publication_resolves_the_principal_in_the_store(
+        &*store,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn key_bound_publication_is_bound_to_the_account_and_key() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    support::credential_activity::setup(&*store).await;
+    support::credential_activity::key_bound_publication_is_bound_to_the_account_and_key(&*store)
+        .await;
+}
+
+#[tokio::test]
+async fn a_retired_credential_is_never_granted_a_snapshot_but_can_be_withdrawn() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    support::credential_activity::setup(&*store).await;
+    support::credential_activity::a_retired_credential_is_never_granted_a_snapshot_but_can_be_withdrawn(&*store).await;
+}

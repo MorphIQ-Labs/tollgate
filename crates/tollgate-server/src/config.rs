@@ -8,7 +8,8 @@ use std::time::Duration;
 use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tollgate_auth::{CredentialVerifier, HmacRegistry};
+use subtle::ConstantTimeEq;
+use tollgate_auth::{CredentialIssuer, CredentialVerifier, HmacRegistry};
 use zeroize::Zeroizing;
 
 use crate::google::GoogleVerifier;
@@ -24,6 +25,16 @@ struct Manifest {
     #[serde(default)]
     certificates: Vec<CertificateFile>,
     google: Option<GoogleConfig>,
+    issuer: Option<IssuerFile>,
+}
+
+/// Customer-credential issuance authority. Distinct from every bearer: the
+/// operator who administers accounts and the secret that mints credentials
+/// must not collapse into one value.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssuerFile {
+    secret_file: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -63,17 +74,62 @@ struct GoogleSubject {
 
 /// Loader state retains Google keys for at most one hour after a successful
 /// fetch. Failures retry after five minutes and never extend that deadline.
+///
+/// The credential issuer is fixed when the loader starts. A later manifest
+/// naming a different issuer (added, removed or changed) still installs its
+/// transport and control-plane credentials, but the live issuer is kept and
+/// the change is reported as pending until restart: credentials already issued
+/// verify only where verifiers hold the secret that minted them, so switching
+/// authority under running verifiers would strand every new credential.
 pub struct SecurityLoader {
     path: PathBuf,
     keys: Option<(Vec<u8>, Timestamp)>,
     next_key_attempt: tokio::time::Instant,
     digest: Option<[u8; 32]>,
+    issuer: Option<Arc<HmacRegistry>>,
+    issuer_fingerprint: Option<[u8; 32]>,
+    pending_issuer: Option<Option<[u8; 32]>>,
 }
 
 pub struct LoadedSecurity {
     policy: SecurityPolicy,
     tls: Option<TlsConfig>,
+    issuer: Option<IssuerSecret>,
     digest: [u8; 32],
+}
+
+/// Exactly 64 lowercase hexadecimal characters. The HMAC key is those
+/// characters as bytes, not their decoded value, so the one value an operator
+/// stores configures the issuer and every verifier identically.
+struct IssuerSecret(Zeroizing<[u8; ISSUER_SECRET_LEN]>);
+
+const ISSUER_SECRET_LEN: usize = 64;
+
+impl IssuerSecret {
+    fn parse(bytes: &[u8]) -> Result<Self, SecurityError> {
+        let text = bytes
+            .strip_suffix(b"\n")
+            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+            .unwrap_or(bytes);
+        let secret: [u8; ISSUER_SECRET_LEN] = text
+            .try_into()
+            .ok()
+            .filter(|text: &[u8; ISSUER_SECRET_LEN]| {
+                text.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            })
+            .ok_or(SecurityError(
+                "issuer secret must be exactly 64 lowercase hexadecimal characters",
+            ))?;
+        Ok(Self(Zeroizing::new(secret)))
+    }
+
+    /// Compared, never logged: identifies a secret without retaining it.
+    fn fingerprint(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"tollgate-issuer-v1");
+        digest.update(self.0.as_slice());
+        digest.finalize().into()
+    }
 }
 
 impl SecurityLoader {
@@ -83,25 +139,68 @@ impl SecurityLoader {
             keys: None,
             next_key_attempt: tokio::time::Instant::now(),
             digest: None,
+            issuer: None,
+            issuer_fingerprint: None,
+            pending_issuer: None,
         }
     }
 
     /// Mark only after installation succeeds. A failed replacement must remain
     /// eligible for retry even if the source files have not changed again.
+    ///
+    /// This is the only place the credential issuer is set.
     pub fn start(&mut self, loaded: LoadedSecurity) -> Result<Arc<ServerSecurity>, SecurityError> {
         let security = ServerSecurity::new(loaded.policy, loaded.tls)?;
+        self.issuer_fingerprint = loaded.issuer.as_ref().map(IssuerSecret::fingerprint);
+        self.issuer = loaded
+            .issuer
+            .map(|secret| Arc::new(HmacRegistry::new(secret.0.as_slice())));
+        self.pending_issuer = None;
         self.digest = Some(loaded.digest);
         Ok(security)
     }
 
+    /// Replaces transport and control-plane credentials. A differing issuer is
+    /// never applied; it is reported once per distinct staged value and
+    /// remains visible through [`Self::issuer_change_pending`].
     pub fn install(
         &mut self,
         loaded: LoadedSecurity,
         security: &ServerSecurity,
     ) -> Result<(), SecurityError> {
         security.replace(loaded.policy, loaded.tls)?;
+        let staged = loaded.issuer.as_ref().map(IssuerSecret::fingerprint);
+        if staged == self.issuer_fingerprint {
+            if self.pending_issuer.take().is_some() {
+                tracing::info!(
+                    reason = "issuer-change-withdrawn",
+                    "staged credential issuer matches the live one again"
+                );
+            }
+        } else if self.pending_issuer != Some(staged) {
+            self.pending_issuer = Some(staged);
+            tracing::warn!(
+                reason = "issuer-change-requires-restart",
+                "credential issuer unchanged; restart to apply the staged issuer"
+            );
+        }
         self.digest = Some(loaded.digest);
         Ok(())
+    }
+
+    /// The durable customer-credential issuer from the manifest's `issuer`
+    /// entry, fixed at [`Self::start`]. `None` before start or when the
+    /// manifest configures none; issuance then answers `501`.
+    pub fn issuer(&self) -> Option<Arc<dyn CredentialIssuer + Send + Sync>> {
+        self.issuer
+            .as_ref()
+            .map(|issuer| Arc::clone(issuer) as Arc<dyn CredentialIssuer + Send + Sync>)
+    }
+
+    /// True while the most recently installed manifest names a different
+    /// issuer than the live one. Only a restart applies it.
+    pub fn issuer_change_pending(&self) -> bool {
+        self.pending_issuer.is_some()
     }
 
     pub async fn load(&mut self, now: Timestamp) -> Result<Option<LoadedSecurity>, SecurityError> {
@@ -159,6 +258,23 @@ impl SecurityLoader {
             mapped.push((principal, identity));
         }
         policy = policy.with_bearer(registry, mapped)?;
+        let issuer = match manifest.issuer {
+            Some(issuer) => {
+                let bytes = read(&directory.join(issuer.secret_file)).await?;
+                record_digest(&mut digest, bytes.as_slice());
+                let secret = IssuerSecret::parse(&bytes)?;
+                let collides = tokens
+                    .iter()
+                    .any(|token| bool::from(token.as_bytes().ct_eq(secret.0.as_slice())));
+                if collides {
+                    return Err(SecurityError(
+                        "issuer secret must differ from every bearer credential",
+                    ));
+                }
+                Some(secret)
+            }
+            None => None,
+        };
         for certificate in manifest.certificates {
             let pem = read(&directory.join(certificate.certificate)).await?;
             record_digest(&mut digest, pem.as_slice());
@@ -238,6 +354,7 @@ impl SecurityLoader {
         Ok(Some(LoadedSecurity {
             policy,
             tls,
+            issuer,
             digest,
         }))
     }

@@ -41,9 +41,9 @@ pub use traits::{
     AccountConfig, AccountView, AdminStore, AllocateError, Allocation, BudgetError, Conservation,
     CreateAccountError, CredentialActivity, CredentialActivityState, DEFAULT_RECLAIM_BATCH_LIMIT,
     DEFAULT_ROLLOVER_BATCH_LIMIT, GrantPolicy, GrantPolicyError, IngestError, IngestReport,
-    KeyDirectory, KeyError, KeyRecord, KeySummary, LeaseAllocator, MAX_INGEST_BATCH,
-    PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation,
-    RolledAccount, RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource,
-    StatusChange, StoreError, StoreHealth, UsageSink, drain_reclaim_expired,
+    KeyDirectory, KeyError, KeyRecord, KeySnapshotError, KeySummary, LeaseAllocator,
+    MAX_INGEST_BATCH, PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease,
+    Revocation, RolledAccount, RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution,
+    SnapshotSource, StatusChange, StoreError, StoreHealth, UsageSink, drain_reclaim_expired,
     pushes_exceed_capacity,
 };
