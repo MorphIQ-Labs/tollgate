@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.28.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.28.0...v0.28.1) - 2026-09-24
+
+### Other
+
+- *(admission)* #140 gate per-account line migration, keep the layout
+
 ## [0.28.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.27.0...v0.28.0) - 2026-09-24
 
 ### Added
