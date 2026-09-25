@@ -56,7 +56,7 @@ pub enum TrackedPrincipals {
     ///
     /// Falls back to `seed` for a source that cannot enumerate, so an
     /// embedder whose adapter predates
-    /// [`SnapshotSource::principals`](tollgate_store::SnapshotSource::principals)
+    /// [`tollgate_store::SnapshotSource::principals`]
     /// keeps the old behaviour rather than silently tracking nothing.
     All {
         /// Tracked until the first successful enumeration, and the permanent
@@ -108,7 +108,7 @@ pub struct SnapshotManagerConfig {
     /// `refresh_interval`.
     ///
     /// It applies only when the source *said* "revoked at generation N". An
-    /// absent row is [`NegativeKind::Unknown`] and takes `unknown_ttl`, however
+    /// absent row is an unknown principal and takes `unknown_ttl`, however
     /// long this instance has served that principal: a tombstone is a durable
     /// statement, an absence is not.
     pub revoked_ttl: SignedDuration,

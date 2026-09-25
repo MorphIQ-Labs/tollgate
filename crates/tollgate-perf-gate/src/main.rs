@@ -1,9 +1,12 @@
 //! Compares Criterion benchmark means against a threshold manifest.
 //!
 //! Usage:
-//!   check_benchmark_thresholds [--ratios-only] [--baseline <baseline.json>]
-//!     [--samples <dir>] [--record <baseline.json>] [--history <history.json>]
-//!     <manifest.json> <criterion-root> <report.json> <freshness-marker>
+//!
+//! ```text
+//! check_benchmark_thresholds [--ratios-only] [--baseline <baseline.json>]
+//!   [--samples <dir>] [--record <baseline.json>] [--history <history.json>]
+//!   <manifest.json> <criterion-root> <report.json> <freshness-marker>
+//! ```
 //!
 //! Mirrors ferro-risk's gate semantics:
 //! - `target_ns` is aspirational, `threshold_ns` is the failing bound;

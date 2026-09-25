@@ -23,6 +23,7 @@ Workspace crates live in `crates/`. `tollgate-auth` owns the credential step: `C
 git config core.hooksPath .githooks
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 cargo test --workspace --all-features
 ./scripts/check_advisories.sh
 
