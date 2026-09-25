@@ -86,7 +86,18 @@ pub struct LeaseSlot {
     /// account's contention history, which outlives any one grant. Written on
     /// the control plane only, at publication.
     contention_retired: AtomicU64,
+    /// Lost exchanges on the account's concurrency gauges (#139), which live
+    /// in the admission state rather than here; recorded only when nonzero.
+    /// On a line of its own: it is written exactly when the account's threads
+    /// contend, and an unpadded field could share a line with `current`, which
+    /// every request reads.
+    contention_gauges: PaddedCount,
 }
+
+/// A counter on a cache line of its own.
+#[repr(align(128))]
+#[derive(Debug, Default)]
+struct PaddedCount(AtomicU64);
 
 /// Control-plane publication state. The identity token prevents an older
 /// allocator response from undoing a later grant or funding snapshot.
@@ -226,6 +237,7 @@ impl LeaseSlot {
             evidence_remaining: AtomicU64::new(0),
             evidence_sequence: AtomicU64::new(0),
             contention_retired: AtomicU64::new(0),
+            contention_gauges: PaddedCount::default(),
         })
     }
 
@@ -403,25 +415,38 @@ impl LeaseSlot {
         replaced
     }
 
-    /// How many of this account's lease debits lost a compare-exchange to
-    /// another writer, across every lease the slot has held.
+    /// How many of this account's admission exchanges lost a compare-exchange
+    /// to another writer: lease debits across every lease the slot has held
+    /// (#134), overage debits, and principal and account concurrency-gauge
+    /// acquisitions (#139).
     ///
-    /// The account-level contention signal (#134): nonzero means its funding
-    /// line was written from more than one core at the same moment. It is a
+    /// The account-level contention signal: nonzero means one of the account's
+    /// admission lines was written from more than one core at the same moment. It is a
     /// **lower bound** — see [`LocalLease::contended_debits`] for what cannot
     /// be observed — and a read that races a rotation can transiently miss
     /// the outgoing lease's newest races; it never counts one twice. Read it
     /// as a rate between two reads, not as an absolute. Control plane only.
     #[must_use]
-    pub fn contended_debits(&self) -> u64 {
+    pub fn contended_exchanges(&self) -> u64 {
         // Retired first, current second: a rotation between the two reads
         // then drops the outgoing lease's newest races rather than adding
         // them to both terms.
         let retired = self.contention_retired.load(Ordering::Relaxed);
-        retired.saturating_add(
-            self.load_observed()
-                .map_or(0, |lease| lease.unreported_contention()),
-        )
+        retired
+            .saturating_add(
+                self.load_observed()
+                    .map_or(0, |lease| lease.unreported_contention()),
+            )
+            .saturating_add(self.overage.contended_debits())
+            .saturating_add(self.contention_gauges.0.load(Ordering::Relaxed))
+    }
+
+    /// Record `lost` exchanges from a retry loop outside the lease, if any.
+    #[inline]
+    pub(crate) fn note_contention(&self, lost: u64) {
+        if lost != 0 {
+            self.contention_gauges.0.fetch_add(lost, Ordering::Relaxed);
+        }
     }
 
     fn swap_views(&self, next: Option<Arc<LocalLease>>) -> Option<Arc<LocalLease>> {
@@ -650,7 +675,10 @@ impl GaugePermit {
 struct ConcurrencyCounter(AtomicU32);
 
 impl ConcurrencyCounter {
-    fn try_increment(&self, limit: Option<std::num::NonZeroU32>) -> bool {
+    /// `lost` gains one for every compare-exchange another writer won (#139).
+    /// A register the caller owns, so an uncontended increment writes nothing
+    /// more than it did.
+    fn try_increment(&self, limit: Option<std::num::NonZeroU32>, lost: &mut u64) -> bool {
         let mut current = self.0.load(Ordering::Relaxed);
         loop {
             if limit.is_some_and(|limit| current >= limit.get()) {
@@ -664,7 +692,10 @@ impl ConcurrencyCounter {
                 .compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::Relaxed)
             {
                 Ok(_) => return true,
-                Err(observed) => current = observed,
+                Err(observed) => {
+                    *lost += 1;
+                    current = observed;
+                }
             }
         }
     }
@@ -811,12 +842,13 @@ impl ConcurrencyGauge {
         &self,
         limit: Option<std::num::NonZeroU32>,
         locality: Locality,
+        lost: &mut u64,
     ) -> Option<GaugePermit> {
         loop {
             match self.phase.load(Ordering::SeqCst) {
                 CONCURRENCY_SHARDED if limit.is_none() => {
                     let (index, counter) = self.shards.select(locality);
-                    if !counter.try_increment(None) {
+                    if !counter.try_increment(None, lost) {
                         return None;
                     }
                     if self.phase.load(Ordering::SeqCst) == CONCURRENCY_SHARDED {
@@ -843,18 +875,18 @@ impl ConcurrencyGauge {
                     let Some(limit) = limit else {
                         return self
                             .central
-                            .try_increment(None)
+                            .try_increment(None, lost)
                             .then_some(GaugePermit::CENTRAL);
                     };
                     let headroom = limit.get().saturating_sub(self.shards.total());
                     return std::num::NonZeroU32::new(headroom)
-                        .is_some_and(|headroom| self.central.try_increment(Some(headroom)))
+                        .is_some_and(|headroom| self.central.try_increment(Some(headroom), lost))
                         .then_some(GaugePermit::CENTRAL);
                 }
                 CONCURRENCY_CENTRAL => {
                     return self
                         .central
-                        .try_increment(limit)
+                        .try_increment(limit, lost)
                         .then_some(GaugePermit::CENTRAL);
                 }
                 _ => unreachable!("concurrency phase is internal"),
@@ -1147,22 +1179,30 @@ impl AccountAdmissionState {
         locality: Locality,
     ) -> Result<ConcurrencyGuard, (DenyReason, Arc<Self>)> {
         let principal_limit = state.snapshot.limits.principal_max_concurrent_requests();
+        // Lost exchanges on either gauge are the account's contention (#139),
+        // recorded on its slot once, and only when there were any.
+        let mut lost = 0u64;
 
-        let Some(principal_permit) = state
-            .principal_gauge
-            .0
-            .try_acquire(principal_limit, locality)
+        let Some(principal_permit) =
+            state
+                .principal_gauge
+                .0
+                .try_acquire(principal_limit, locality, &mut lost)
         else {
+            state.lease.note_contention(lost);
             return Err((DenyReason::ConcurrencyLimited, state));
         };
-        let Some(account_permit) = state
-            .limiter
-            .concurrency
-            .try_acquire(account_limit, locality)
+        let Some(account_permit) =
+            state
+                .limiter
+                .concurrency
+                .try_acquire(account_limit, locality, &mut lost)
         else {
+            state.lease.note_contention(lost);
             state.principal_gauge.0.release(principal_permit);
             return Err((DenyReason::ConcurrencyLimited, state));
         };
+        state.lease.note_contention(lost);
 
         Ok(ConcurrencyGuard {
             state,
@@ -2145,9 +2185,9 @@ mod tests {
         let slot = LeaseSlot::for_account(AccountId(1));
         let first = identified_lease(LeaseId(1), u64::MAX / 2);
         assert!(slot.replace(Arc::clone(&first)).is_none());
-        assert_eq!(slot.contended_debits(), 0);
+        assert_eq!(slot.contended_exchanges(), 0);
         contend(&first);
-        let seen = slot.contended_debits();
+        let seen = slot.contended_exchanges();
         assert_eq!(
             seen,
             first.contended_debits(),
@@ -2156,12 +2196,16 @@ mod tests {
 
         let second = identified_lease(LeaseId(2), u64::MAX / 2);
         let outgoing = slot.replace(Arc::clone(&second)).unwrap();
-        assert_eq!(slot.contended_debits(), seen, "rotation keeps the history");
+        assert_eq!(
+            slot.contended_exchanges(),
+            seen,
+            "rotation keeps the history"
+        );
 
         // Restore the first grant, as a refused consolidation does.
         drop(slot.replace(outgoing));
         assert_eq!(
-            slot.contended_debits(),
+            slot.contended_exchanges(),
             seen,
             "reinstalling does not recount"
         );
@@ -2170,12 +2214,16 @@ mod tests {
         let more = first.contended_debits();
         assert!(more > seen);
         assert_eq!(
-            slot.contended_debits(),
+            slot.contended_exchanges(),
             more,
             "new races on a reinstalled lease count once"
         );
         drop(slot.take());
-        assert_eq!(slot.contended_debits(), more, "removal keeps the history");
+        assert_eq!(
+            slot.contended_exchanges(),
+            more,
+            "removal keeps the history"
+        );
         assert_eq!(second.contended_debits(), 0);
     }
 
@@ -2317,12 +2365,12 @@ mod tests {
             for _ in 0..existing {
                 permits.push(
                     gauge
-                        .try_acquire(None, Locality::current())
+                        .try_acquire(None, Locality::current(), &mut 0)
                         .expect("the unbounded representation has room"),
                 );
             }
 
-            let during_handoff = gauge.try_acquire(Some(limit), Locality::current());
+            let during_handoff = gauge.try_acquire(Some(limit), Locality::current(), &mut 0);
             prop_assert_eq!(during_handoff.is_some(), limit.get() > existing);
             if let Some(permit) = during_handoff {
                 prop_assert!(permit.shard_index().is_none());
@@ -2332,14 +2380,14 @@ mod tests {
             // A caller that carries no ceiling of its own is never denied by
             // another policy's activation.
             let unbounded = gauge
-                .try_acquire(None, Locality::current())
+                .try_acquire(None, Locality::current(), &mut 0)
                 .expect("the handoff does not close unlimited admission");
             gauge.release(unbounded);
             for permit in permits {
                 gauge.release(permit);
             }
             let after_drain = gauge
-                .try_acquire(Some(limit), Locality::current())
+                .try_acquire(Some(limit), Locality::current(), &mut 0)
                 .expect("a nonzero ceiling admits after old occupancy drains");
             gauge.release(after_drain);
             prop_assert_eq!(gauge.in_flight(), 0);
@@ -2746,7 +2794,7 @@ mod tests {
         // handoff and the gauge stays draining.
         let draining = limiter
             .concurrency
-            .try_acquire(None, Locality::current())
+            .try_acquire(None, Locality::current(), &mut 0)
             .expect("unbounded tracking admits");
         assert!(draining.shard_index().is_some());
 
@@ -2848,7 +2896,9 @@ mod tests {
                 let maximum_seen = Arc::clone(&maximum_seen);
                 scope.spawn(move || {
                     for _ in 0..2_000 {
-                        if let Some(permit) = gauge.try_acquire(Some(limit), Locality::current()) {
+                        if let Some(permit) =
+                            gauge.try_acquire(Some(limit), Locality::current(), &mut 0)
+                        {
                             maximum_seen.fetch_max(gauge.in_flight(), Ordering::Relaxed);
                             std::thread::yield_now();
                             gauge.release(permit);
@@ -2867,7 +2917,11 @@ mod tests {
         let gauge = ConcurrencyGauge::new(LocalSharding::SINGLE, true);
         gauge.central.0.store(u32::MAX, Ordering::Relaxed);
 
-        assert!(gauge.try_acquire(None, Locality::current()).is_none());
+        assert!(
+            gauge
+                .try_acquire(None, Locality::current(), &mut 0)
+                .is_none()
+        );
         assert_eq!(gauge.in_flight(), u32::MAX);
     }
 
@@ -2876,7 +2930,7 @@ mod tests {
         let sharding = LocalSharding::new(std::num::NonZeroUsize::new(8).unwrap());
         let gauge = ConcurrencyGauge::new(sharding, false);
         let old = gauge
-            .try_acquire(None, Locality::current())
+            .try_acquire(None, Locality::current(), &mut 0)
             .expect("unbounded tracking admits");
         assert!(old.shard_index().is_some());
 
@@ -2884,7 +2938,7 @@ mod tests {
         assert_eq!(gauge.phase.load(Ordering::SeqCst), CONCURRENCY_DRAINING);
         assert!(
             gauge
-                .try_acquire(Some(NonZeroU32::MIN), Locality::current())
+                .try_acquire(Some(NonZeroU32::MIN), Locality::current(), &mut 0)
                 .is_none(),
             "the shard permit already occupies a ceiling of one"
         );
@@ -2892,7 +2946,7 @@ mod tests {
         gauge.release(old);
         assert_eq!(gauge.phase.load(Ordering::SeqCst), CONCURRENCY_CENTRAL);
         let central = gauge
-            .try_acquire(Some(NonZeroU32::MIN), Locality::current())
+            .try_acquire(Some(NonZeroU32::MIN), Locality::current(), &mut 0)
             .expect("the drained handoff activates the central ceiling");
         assert!(central.shard_index().is_none());
         gauge.release(central);
@@ -2909,7 +2963,7 @@ mod tests {
         let sharding = LocalSharding::new(std::num::NonZeroUsize::new(8).unwrap());
         let gauge = ConcurrencyGauge::new(sharding, false);
         let slow = gauge
-            .try_acquire(None, Locality::current())
+            .try_acquire(None, Locality::current(), &mut 0)
             .expect("unbounded tracking admits");
 
         gauge.configure_limit(true);
@@ -2917,7 +2971,7 @@ mod tests {
 
         let limit = NonZeroU32::new(3).unwrap();
         let mut admitted = Vec::new();
-        while let Some(permit) = gauge.try_acquire(Some(limit), Locality::current()) {
+        while let Some(permit) = gauge.try_acquire(Some(limit), Locality::current(), &mut 0) {
             assert!(permit.shard_index().is_none());
             admitted.push(permit);
             assert!(admitted.len() < 8, "the handoff must still bound admission");
@@ -2932,7 +2986,7 @@ mod tests {
         // A principal still on the older, unlimited policy is not denied by
         // the account's activation either.
         let unlimited = gauge
-            .try_acquire(None, Locality::current())
+            .try_acquire(None, Locality::current(), &mut 0)
             .expect("no ceiling, no denial");
         gauge.release(unlimited);
 
@@ -2944,7 +2998,7 @@ mod tests {
         );
         assert!(
             gauge
-                .try_acquire(Some(limit), Locality::current())
+                .try_acquire(Some(limit), Locality::current(), &mut 0)
                 .is_some_and(|permit| {
                     gauge.release(permit);
                     true
@@ -2970,7 +3024,7 @@ mod tests {
                 let denials = Arc::clone(&denials);
                 scope.spawn(move || {
                     for _ in 0..5_000 {
-                        match gauge.try_acquire(None, Locality::current()) {
+                        match gauge.try_acquire(None, Locality::current(), &mut 0) {
                             Some(permit) => gauge.release(permit),
                             None => {
                                 denials.fetch_add(1, Ordering::Relaxed);

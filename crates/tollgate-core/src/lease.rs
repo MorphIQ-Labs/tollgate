@@ -71,6 +71,10 @@ pub struct AccountOverage {
     spent: AtomicU64,
     committed: AtomicU64,
     commit_publications: AtomicUsize,
+    /// Debit compare-exchanges on `spent` that lost to another writer (#139).
+    /// Beside `spent`, so the only thread that writes it is one already
+    /// contending for that line; added once per contended debit.
+    contended: AtomicU64,
 }
 
 /// Evidence that an overage commit publication is visible to cap observers.
@@ -116,7 +120,16 @@ impl AccountOverage {
             spent: AtomicU64::new(0),
             committed: AtomicU64::new(0),
             commit_publications: AtomicUsize::new(0),
+            contended: AtomicU64::new(0),
         }
+    }
+
+    /// Overage debits that lost a compare-exchange to another writer, since
+    /// the account's counter was created. A lower bound, for the reasons
+    /// [`LocalLease::contended_debits`] gives. A control-plane read.
+    #[must_use]
+    pub fn contended_debits(&self) -> u64 {
+        self.contended.load(Ordering::Relaxed)
     }
 
     #[must_use]
@@ -151,6 +164,13 @@ impl AccountOverage {
     pub(crate) fn try_debit(&self, units: CostUnits, cap: CostUnits) -> Result<(), DenyReason> {
         let want = units.get();
         let mut current = self.spent.load(Ordering::Acquire);
+        // Counted in a register and recorded once on every exit.
+        let mut lost = 0u64;
+        let note = |lost: u64| {
+            if lost != 0 {
+                self.contended.fetch_add(lost, Ordering::Relaxed);
+            }
+        };
         loop {
             let refused = || {
                 // A zero-delta RMW, rather than a load, places this observer
@@ -182,9 +202,11 @@ impl AccountOverage {
                 }
             };
             let Some(next) = current.checked_add(want) else {
+                note(lost);
                 return Err(refused());
             };
             if next > cap.get() {
+                note(lost);
                 return Err(refused());
             }
             match self.spent.compare_exchange_weak(
@@ -193,8 +215,14 @@ impl AccountOverage {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(()),
-                Err(observed) => current = observed,
+                Ok(_) => {
+                    note(lost);
+                    return Ok(());
+                }
+                Err(observed) => {
+                    lost += 1;
+                    current = observed;
+                }
             }
         }
     }
@@ -1374,6 +1402,58 @@ mod tests {
         assert_eq!(l.clone().take_unreported_contention(), 0);
         shards[0].note_contention(0);
         assert_eq!(l.contended_debits(), 9, "recording zero writes nothing");
+    }
+
+    /// The overage counter records lost debit races (#139) and nothing when
+    /// uncontended, without disturbing `spent`.
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_feature = "lse")
+    ))]
+    #[test]
+    fn an_uncontended_overage_debit_records_no_contention() {
+        let overage = AccountOverage::new(AccountId(1));
+        for _ in 0..100 {
+            overage.try_debit(CostUnits(1), CostUnits(1_000)).unwrap();
+        }
+        // Refusals exit the loop on another path.
+        assert!(
+            overage
+                .try_debit(CostUnits(1_000), CostUnits(1_000))
+                .is_err()
+        );
+        assert_eq!(overage.contended_debits(), 0);
+    }
+
+    #[test]
+    fn contended_overage_debits_are_recorded_without_disturbing_spend() {
+        const THREADS: u64 = 8;
+        const DEBITS: u64 = 20_000;
+        let overage = AccountOverage::new(AccountId(1));
+        let mut rounds = 0;
+        while overage.contended_debits() == 0 && rounds < 50 {
+            rounds += 1;
+            std::thread::scope(|scope| {
+                for _ in 0..THREADS {
+                    scope.spawn(|| {
+                        for _ in 0..DEBITS {
+                            overage
+                                .try_debit(CostUnits(1), CostUnits(u64::MAX))
+                                .unwrap();
+                        }
+                    });
+                }
+            });
+        }
+        assert!(
+            overage.contended_debits() > 0,
+            "eight writers on one line never lost a race"
+        );
+        assert_eq!(
+            overage.spent.load(Ordering::Relaxed),
+            rounds * THREADS * DEBITS,
+            "every debit counted exactly once"
+        );
     }
 
     #[test]

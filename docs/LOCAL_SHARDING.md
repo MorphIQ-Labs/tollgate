@@ -44,21 +44,22 @@ says which accounts that is happening to:
 
 ```rust
 let contention = handle.report().contention;
-// `contention.contended_debits`: lease debits on this instance that lost a
+// `contention.contended_exchanges`: admission exchanges on this instance —
+// lease and overage debits, concurrency-gauge acquisitions — that lost a
 // compare-exchange to another core, since the process started.
 // `contention.hottest`: up to eight `(AccountId, count)` pairs, most first.
 ```
 
-`LeaseSlot::contended_debits` reads the same count for one account. Both are
+`LeaseSlot::contended_exchanges` reads the same count for one account. Both are
 control-plane reads; the request path only counts, in a register, and records
 once per debit that actually lost a race.
 
 Read it as a rate between two reports. A count that climbs steadily for one
 account is direct evidence that its admissions overlap across cores, and that
 account is the candidate for a sharded deployment. The count is a **lower
-bound**: only the lease-debit loop can observe a lost race, while the rate
-bucket, reference counts and settlement pay for a contended line without ever
-failing. So a zero does not prove the account costs nothing — ten connections
+bound**: only the retry loops — lease and overage debits, concurrency-gauge
+acquisitions — can observe a lost race, while the rate bucket, reference counts
+and settlement pay for a contended line without ever failing. So a zero does not prove the account costs nothing — ten connections
 on one account at about 93,000 admissions a second recorded zero on the
 controlled host while their end-to-end overhead was measurable — but a nonzero
 count is never noise on x86-64 or aarch64 with LSE atomics.
