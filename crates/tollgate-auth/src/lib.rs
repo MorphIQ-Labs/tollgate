@@ -69,6 +69,6 @@ mod hmac_registry;
 mod session;
 mod verifier;
 
-pub use hmac_registry::HmacRegistry;
+pub use hmac_registry::{EntropyUnavailable, HmacRegistry, MintedKey};
 pub use session::SessionCredential;
 pub use verifier::{CredentialIssuer, CredentialVerifier, Verified};

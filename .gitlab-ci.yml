@@ -175,7 +175,10 @@ clippy:
   script:
     - rustc --version
     - cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-    - RUSTDOCFLAGS="-D warnings" cargo doc --locked -p tollgate-core -p tollgate-admission --all-features --no-deps
+    # Every crate, not a chosen few: documenting only core and admission let
+    # broken links and an unnameable public type in auth, client and perf-gate
+    # through unnoticed.
+    - RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
 
 # Cargo.lock makes this a reproducible whole-tree scan. Run it on both merge
 # requests and the default branch so a newly published advisory blocks the next

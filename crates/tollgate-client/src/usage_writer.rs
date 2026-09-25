@@ -24,7 +24,7 @@
 //! rather than once per event.
 //!
 //! The writer task drains the lanes into batches and ingests them through
-//! the [`UsageSink`](tollgate_store::UsageSink). Ingest is idempotent on
+//! the [`UsageSink`]. Ingest is idempotent on
 //! request id (INVARIANTS.md #7), so retrying a whole batch after a backend
 //! error is always safe. A failing backend is retried with backoff forever
 //! while the channel backs up and sheds upstream — memory stays bounded at

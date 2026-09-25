@@ -48,7 +48,7 @@ pub struct MintedKey {
     /// The principal it authenticates as: the digest's leading 128 bits.
     pub principal: Principal,
     /// HMAC-SHA256 of the secret under the server secret. This is what a
-    /// [`KeyDirectory`](tollgate_store::KeyDirectory) stores.
+    /// `tollgate_store::KeyDirectory` stores.
     pub digest: [u8; 32],
     /// The raw credential. Hand it to its owner and drop it; it cannot be
     /// derived again from anything retained.
