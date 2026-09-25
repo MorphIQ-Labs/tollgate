@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.29.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.29.0...v0.29.1) - 2026-09-25
+
+### Fixed
+
+- *(auth)* export the types CredentialIssuer names; rustdoc the whole workspace
+
 ## [0.29.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.28.1...v0.29.0) - 2026-09-25
 
 ### Added
