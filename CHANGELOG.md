@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.29.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.28.1...v0.29.0) - 2026-09-25
+
+### Added
+
+- *(admission)* [**breaking**] #139 count contention in the overage and gauge loops
+
 ## [0.28.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.28.0...v0.28.1) - 2026-09-24
 
 ### Other
