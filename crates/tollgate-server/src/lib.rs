@@ -17,6 +17,9 @@
 //! - `POST /v1/admin/accounts`, `POST /v1/admin/accounts/{id}/deposit`,
 //!   `POST /v1/admin/accounts/{id}/status`,
 //!   `POST /v1/admin/accounts/{id}/capacity-class`,
+//!   `POST/GET /v1/admin/accounts/{id}/keys`,
+//!   `DELETE /v1/admin/accounts/{id}/keys/{key}`,
+//!   `PUT/DELETE /v1/admin/accounts/{id}/keys/{key}/snapshot` (#143),
 //!   `PUT/DELETE /v1/admin/snapshots/{principal}` — administration.
 //! - `GET /livez`, `GET /readyz` — probes.
 //!
@@ -162,6 +165,12 @@ fn router_with_maintenance<S: Backend>(
         .route(
             "/accounts/{account}/keys/{key}",
             axum::routing::delete(revoke_account_key::<S>),
+        )
+        .route(
+            "/accounts/{account}/keys/{key}/snapshot",
+            put(publish_key_snapshot::<S>)
+                .delete(remove_key_snapshot::<S>)
+                .layer(DefaultBodyLimit::max(MAX_SNAPSHOT_BODY_BYTES)),
         )
         .route("/accounts/{account}/deposit", post(deposit::<S>))
         .route("/accounts/{account}/status", post(set_status::<S>))
@@ -887,7 +896,22 @@ async fn issue_key<S: Backend>(
             balance_shortfall: None,
         }
     })?;
-    let secret = hex_encode(&minted.secret);
+    // Disclosed exactly as minted: the text is what the digest covers, so
+    // the credential the owner presents is the credential that verifies.
+    // An embedder's issuer that breaks that contract is refused before the
+    // record is stored, so no unpresentable credential ever exists.
+    let secret = std::str::from_utf8(&minted.secret)
+        .ok()
+        .filter(|text| !text.is_empty() && text.bytes().all(|b| b.is_ascii_graphic()))
+        .ok_or_else(|| ApiError {
+            status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            code: "issuer-misconfigured",
+            title: "the configured issuer minted a credential that cannot be presented".into(),
+            generation: None,
+            balance_exhaustion: None,
+            balance_shortfall: None,
+        })?
+        .to_owned();
 
     let record = KeyRecord {
         key_id: minted.key_id,
@@ -997,6 +1021,55 @@ async fn revoke_account_key<S: Backend>(
     }))
 }
 
+/// Publish the policy for one of an account's credentials (#143).
+///
+/// The operator names the credential by the handles it already holds; the
+/// store resolves its principal, which never appears in a request, response
+/// or audit. The snapshot is bound to the key in the path: an unstated
+/// `key_id` is filled in. One naming a different credential is left as
+/// stated, and the store refuses it rather than this handler rewriting it.
+async fn publish_key_snapshot<S: Backend>(
+    operator: OperatorIdentity,
+    State(state): State<ServerState<S>>,
+    ApiPath((account, key)): ApiPath<(AccountId, KeyId)>,
+    ApiJson(request): ApiJson<PublishSnapshotRequest>,
+) -> Result<StatusCode, ApiError> {
+    let mut snapshot = request.snapshot;
+    if snapshot.key_id.is_none() {
+        Arc::make_mut(&mut snapshot).key_id = Some(key);
+    }
+    let snapshot = PublishableSnapshot::try_new(snapshot)?;
+    operator
+        .run(
+            "publish_key_snapshot",
+            format!("{account}/keys/{key}/snapshot"),
+            state.clock.as_ref(),
+            state.store.publish_key_snapshot(account, key, snapshot),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Withdraw the policy bound to one of an account's credentials (#143).
+///
+/// Revocation does not withdraw it, so this is part of revoking a key; it is
+/// allowed for a revoked credential for exactly that reason.
+async fn remove_key_snapshot<S: Backend>(
+    operator: OperatorIdentity,
+    State(state): State<ServerState<S>>,
+    ApiPath((account, key)): ApiPath<(AccountId, KeyId)>,
+) -> Result<StatusCode, ApiError> {
+    operator
+        .run(
+            "remove_key_snapshot",
+            format!("{account}/keys/{key}/snapshot"),
+            state.clock.as_ref(),
+            state.store.remove_key_snapshot(account, key),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Both credential feeds validate input before any backend read.
 fn credential_page_limit(limit: Option<usize>) -> Result<std::num::NonZeroUsize, ApiError> {
     std::num::NonZeroUsize::new(limit.unwrap_or(DEFAULT_KEY_PAGE_LIMIT.get()))
@@ -1016,21 +1089,6 @@ fn credential_page_limit(limit: Option<usize>) -> Result<std::num::NonZeroUsize,
 
 fn one() -> std::num::NonZeroUsize {
     std::num::NonZeroUsize::new(1).expect("one is nonzero")
-}
-
-/// Lowercase hex, for handing a secret to its owner exactly once.
-///
-/// Written out rather than pulled in: this is four lines against a dependency
-/// on the request path's crate graph, and the secret's encoding is something
-/// the wire contract should be able to state without consulting one.
-fn hex_encode(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        out.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
-    }
-    out
 }
 
 async fn set_capacity_class<S: Backend>(

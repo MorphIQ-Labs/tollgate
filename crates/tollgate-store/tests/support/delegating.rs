@@ -37,9 +37,10 @@ use tollgate_core::{
 use tollgate_store::{
     AccountConfig, AccountView, AdminReceipt, AdminStore, AllocateError, Allocation, BudgetError,
     CreateAccountError, CredentialActivity, IngestError, IngestReport, KeyDirectory, KeyError,
-    KeyPage, KeyRecord, KeySource, KeySummary, LeaseAllocator, PublishSnapshotError, ReclaimBatch,
-    ReclaimedLease, Revocation, RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution,
-    SnapshotSource, StatusChange, StoreError, StoreHealth, UsageSink, drain_reclaim_expired,
+    KeyPage, KeyRecord, KeySnapshotError, KeySource, KeySummary, LeaseAllocator,
+    PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation, RolloverBatch, SetStatusError,
+    SnapshotPush, SnapshotResolution, SnapshotSource, StatusChange, StoreError, StoreHealth,
+    UsageSink, drain_reclaim_expired,
 };
 
 /// A hook's future. Owned and `'static`: nothing borrowed from the wrapper
@@ -851,6 +852,23 @@ where
         }
     }
 
+    async fn publish_key_snapshot(
+        &self,
+        account: AccountId,
+        key: KeyId,
+        snapshot: PublishableSnapshot,
+    ) -> Result<AdminReceipt<()>, KeySnapshotError> {
+        KeyDirectory::publish_key_snapshot(&*self.inner, account, key, snapshot).await
+    }
+
+    async fn remove_key_snapshot(
+        &self,
+        account: AccountId,
+        key: KeyId,
+    ) -> Result<AdminReceipt<()>, KeySnapshotError> {
+        KeyDirectory::remove_key_snapshot(&*self.inner, account, key).await
+    }
+
     async fn active_keys(&self, now: Timestamp) -> Result<Vec<KeyRecord>, StoreError> {
         match &self.active_keys {
             Some(hook) => hook(Arc::clone(&self.inner), now).await,
@@ -1108,6 +1126,23 @@ impl KeyDirectory for RejectingStore {
         _now: Timestamp,
     ) -> Result<AdminReceipt<Revocation>, KeyError> {
         unreachable!("{}: KeyDirectory::revoke_key_audited", self.reason)
+    }
+
+    async fn publish_key_snapshot(
+        &self,
+        _account: AccountId,
+        _key: KeyId,
+        _snapshot: PublishableSnapshot,
+    ) -> Result<AdminReceipt<()>, KeySnapshotError> {
+        unreachable!("{}: KeyDirectory::publish_key_snapshot", self.reason)
+    }
+
+    async fn remove_key_snapshot(
+        &self,
+        _account: AccountId,
+        _key: KeyId,
+    ) -> Result<AdminReceipt<()>, KeySnapshotError> {
+        unreachable!("{}: KeyDirectory::remove_key_snapshot", self.reason)
     }
 
     async fn active_keys(&self, _now: Timestamp) -> Result<Vec<KeyRecord>, StoreError> {

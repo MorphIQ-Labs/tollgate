@@ -148,11 +148,17 @@ publication barrier: onboarding becomes usable after **both** projections are
 available and the account is funded.
 
 Supply the HMAC secret used by the customer key issuer from the deployment's
-secret store. It must contain at least 32 bytes. This secret is separate from
+secret store. It must contain at least 32 bytes. When the issuer is the stock
+`tollgate-server` configured through its manifest's `issuer` entry, the secret
+is exactly that file's 64 hexadecimal characters as bytes, without the trailing
+newline — not their decoded value (see
+[credential issuer](CONTROL_PLANE_SECURITY.md#credential-issuer)). This secret is separate from
 the instance's control-plane bearer identity and is never fetched through this
 endpoint. The manager exposes only `KeyVerifier`, which implements
-`CredentialVerifier`; it cannot mint keys or install an unbounded table. Use it
-with `SessionCredential::authenticate(credential, &verifier, now)` before staged
+`CredentialVerifier`; it cannot mint keys or install an unbounded table. Hand it
+the credential exactly as presented — the 64 characters issuance disclosed,
+after stripping only the transport framing such as `Bearer ` — never a decoded
+form. Use it with `SessionCredential::authenticate(credential, &verifier, now)` before staged
 admission. Keep session state scoped to the same authenticated connection or
 session as before. Every request still checks current snapshot authorization.
 
@@ -211,7 +217,8 @@ eviction. Do not expose authenticated traffic when only one readiness component
 is healthy. Tune the freshness and snapshot windows to the revocation tolerance.
 
 Customer key rotation can overlap old and new records; new principals also
-need published snapshots. The HMAC secret itself is fixed for a manager's
+need published snapshots, which an operator binds by account and key ID without
+handling the principal (see [account administration](ACCOUNT_ADMINISTRATION.md#binding-a-policy)). The HMAC secret itself is fixed for a manager's
 lifetime: coordinated issuer/verifier replacement is required to change it.
 The API does not introduce a multi-secret rotation scheme. Control-plane
 service-account or bearer rotation remains independent and uses `HttpStore`'s

@@ -52,10 +52,11 @@ use tollgate_core::{
 use tollgate_store::{
     AccountConfig, AccountView, AdminReceipt, AdminState, AdminStore, AllocateError, Allocation,
     BudgetError, Conservation, CreateAccountError, GrantPolicy, IngestError, IngestReport,
-    KeyDirectory, KeyError, KeyRecord, KeySummary, LeaseAllocator, PUSH_CHANNEL_CAPACITY,
-    PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation, RolledAccount, RolloverBatch,
-    SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource, StatusChange, StoreError,
-    StoreHealth, UsageSink, pushes_exceed_capacity, validate_key_page_limit,
+    KeyDirectory, KeyError, KeyRecord, KeySnapshotError, KeySummary, LeaseAllocator,
+    PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation,
+    RolledAccount, RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource,
+    StatusChange, StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
+    validate_key_page_limit,
 };
 
 const STATE_ACTIVE: i16 = 0;
@@ -242,6 +243,55 @@ impl KeyDirectory for PostgresStore {
         }
         .await;
         finish_transaction(tx, result).await
+    }
+
+    async fn publish_key_snapshot(
+        &self,
+        account: AccountId,
+        key: KeyId,
+        snapshot: PublishableSnapshot,
+    ) -> Result<AdminReceipt<()>, KeySnapshotError> {
+        let generation = i64::try_from(snapshot.generation.0).map_err(|_| {
+            StoreError("snapshot generation exceeds PostgreSQL BIGINT range".into())
+        })?;
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let result = async {
+            let (principal, revoked) = lock_account_key(&mut tx, account, key).await?;
+            if revoked {
+                return Err(KeySnapshotError::Retired { key_id: key });
+            }
+            if snapshot.key_id != Some(key) {
+                return Err(PublishSnapshotError::CredentialMismatch { key_id: key }.into());
+            }
+            let published = publish_in_tx(&mut tx, principal, generation, snapshot).await?;
+            Ok((principal, published))
+        }
+        .await;
+        let (principal, (written, published, before, after)) =
+            finish_transaction(tx, result).await?;
+        if written {
+            self.push_to_subscribers(SnapshotPush {
+                principal,
+                resolution: SnapshotResolution::Present(published),
+            });
+        }
+        Ok(AdminReceipt::new((), before, after))
+    }
+
+    async fn remove_key_snapshot(
+        &self,
+        account: AccountId,
+        key: KeyId,
+    ) -> Result<AdminReceipt<()>, KeySnapshotError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let result = async {
+            let (principal, _revoked) = lock_account_key(&mut tx, account, key).await?;
+            Ok::<_, KeySnapshotError>((principal, remove_in_tx(&mut tx, principal).await?))
+        }
+        .await;
+        let (principal, receipt) = finish_transaction(tx, result).await?;
+        self.announce_removal(principal, &receipt);
+        Ok(receipt)
     }
 
     async fn active_keys(&self, now: Timestamp) -> Result<Vec<KeyRecord>, StoreError> {
@@ -1027,6 +1077,18 @@ impl PostgresStore {
             subscribers,
             "snapshot pushed to subscribers"
         );
+    }
+
+    /// Push a tombstone only when a committed removal changed something.
+    fn announce_removal(&self, principal: Principal, receipt: &AdminReceipt<()>) {
+        if receipt.before != receipt.after
+            && let AdminState::Snapshot { generation, .. } = receipt.after
+        {
+            self.push_to_subscribers(SnapshotPush {
+                principal,
+                resolution: SnapshotResolution::Revoked { generation },
+            });
+        }
     }
 
     // ---- reconciliation / test surface (mirrors MemoryStore) ---------
@@ -2974,83 +3036,7 @@ impl AdminStore for PostgresStore {
         })?;
 
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        let result = async {
-            if let Some(key_id) = snapshot.key_id {
-                let matches: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM tollgate_credential_keys
-                     WHERE key_id = $1 AND principal = $2 AND account_id = $3)",
-                )
-                .bind(id_bytes(key_id.0))
-                .bind(id_bytes(principal.0))
-                .bind(id_bytes(snapshot.account_id.0))
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(storage)?;
-                if !matches {
-                    return Err(PublishSnapshotError::CredentialMismatch { key_id });
-                }
-            }
-            // The ledger decides an account's status; a publish may carry it
-            // but not change it, or the two records `set_account_status`
-            // unified could be pulled apart again one principal at a time
-            // (#51). FOR SHARE, not FOR UPDATE: this only has to hold the
-            // status still, and a status change takes FOR UPDATE on the same
-            // row, so the two serialize without publishes blocking each other.
-            //
-            // The budget columns ride along on the read that was already being
-            // taken, under the same lock, so the view stamped below is the
-            // ledger as of this publication rather than a second read that
-            // could straddle a lease or a rollover (#97).
-            let ledger = sqlx::query(
-                "SELECT status, deposited, overage_recorded, usage_recorded, settlement_loss,
-                        expired, budget_allowance, budget_period, budget_rollover, period_start_us,
-                        capacity_class
-                 FROM tollgate_accounts WHERE account_id = $1 FOR SHARE",
-            )
-            .bind(id_bytes(snapshot.account_id.0))
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(storage)?;
-
-            // An account the ledger does not hold publishes unchanged: this
-            // adds no account-existence requirement to publication, and an
-            // unstamped snapshot reports no budget rather than a zero.
-            // Unconditional, including the `None` arm: a snapshot arrives here
-            // having crossed a wire, where nothing stops a publisher putting a
-            // balance in the JSON. Overwriting always is what makes the store
-            // the field's only writer, rather than only usually.
-            let view = match &ledger {
-                Some(row) => {
-                    let ledger = decode_status(row.get::<String, _>(0))?;
-                    if ledger != snapshot.status {
-                        return Err(PublishSnapshotError::StatusMismatch {
-                            ledger,
-                            submitted: snapshot.status,
-                        });
-                    }
-                    // The capacity class is the same kind of fact and gets the
-                    // same guard (#99): the ledger owns it, a publish may
-                    // carry it, and only `set_capacity_class` may change it.
-                    let ledger_class = decode_capacity_class(row.get::<String, _>(10))?;
-                    if ledger_class != snapshot.capacity_class {
-                        return Err(PublishSnapshotError::CapacityClassMismatch {
-                            ledger: ledger_class,
-                            submitted: snapshot.capacity_class,
-                        });
-                    }
-                    Some(budget_view(row)?)
-                }
-                None => None,
-            };
-            let published = snapshot.with_budget(view);
-            let value = serde_json::to_value(StoredSnapshotRef::from(published.as_snapshot()))
-                .map_err(|e| StoreError(format!("snapshot encode: {e}")))?;
-
-            let (written, before, after) =
-                write_snapshot_audited(&mut tx, principal, generation, value).await?;
-            Ok((written, published, before, after))
-        }
-        .await;
+        let result = publish_in_tx(&mut tx, principal, generation, snapshot).await;
 
         let (written, published, before, after) = finish_transaction(tx, result).await?;
         if written {
@@ -3067,41 +3053,169 @@ impl AdminStore for PostgresStore {
 
     async fn remove_snapshot(&self, principal: Principal) -> Result<AdminReceipt<()>, StoreError> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        let result = async {
-            let before = snapshot_audit_row(&mut tx, principal).await?;
-            let after = match before {
-                AdminState::Snapshot {
-                    generation,
-                    revoked: false,
-                } => {
-                    sqlx::query(
-                        "UPDATE tollgate_snapshots SET deleted = TRUE WHERE principal = $1",
-                    )
-                    .bind(id_bytes(principal.0))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(storage)?;
-                    AdminState::Snapshot {
-                        generation,
-                        revoked: true,
-                    }
-                }
-                state => state,
-            };
-            Ok(AdminReceipt::new((), before, after))
-        }
-        .await;
+        let result = remove_in_tx(&mut tx, principal).await;
         let receipt = finish_transaction(tx, result).await?;
-        if receipt.before != receipt.after
-            && let AdminState::Snapshot { generation, .. } = receipt.after
-        {
-            self.push_to_subscribers(SnapshotPush {
-                principal,
-                resolution: SnapshotResolution::Revoked { generation },
-            });
-        }
+        self.announce_removal(principal, &receipt);
         Ok(receipt)
     }
+}
+
+/// Resolve `account`'s credential `key` to its principal and retirement,
+/// holding the credential row `FOR SHARE` until the transaction ends (#143).
+///
+/// `FOR SHARE` conflicts with `revoke_key_audited`'s `FOR UPDATE`, so a
+/// key-bound publication and a revocation serialize: the publish either sees
+/// the retirement and is refused, or commits first.
+///
+/// **Lock order: credential, then account, then snapshot.** A cycle needs a
+/// path that holds an account lock and then waits on a credential row lock.
+/// None does:
+/// - `revoke_key_audited` locks only the credential row, never an account.
+/// - `insert_credential` takes the account `FOR UPDATE`, then inserts a *new*
+///   credential row; it never locks an existing one.
+/// - `ingest` locks accounts `FOR UPDATE`, then reads credentials with a plain
+///   `SELECT` and writes activity rows whose foreign key takes only
+///   `FOR KEY SHARE`, which `FOR SHARE` does not block.
+/// - Every other account-locking path — `set_account_status`,
+///   `set_capacity_class`, `set_budget_schedule`, `deposit`, rollover,
+///   reclaim and lease acquisition — touches account, lease, usage and
+///   snapshot rows only; `tollgate_credential_keys` appears in none of them.
+///
+/// After the credential row, this path takes the account and snapshot rows in
+/// the same order `publish_snapshot` and `set_account_status` do.
+async fn lock_account_key(
+    tx: &mut Transaction<'_, Postgres>,
+    account: AccountId,
+    key: KeyId,
+) -> Result<(Principal, bool), KeySnapshotError> {
+    let row = sqlx::query(
+        "SELECT principal, revoked_at_us IS NOT NULL
+         FROM tollgate_credential_keys WHERE key_id = $1 AND account_id = $2 FOR SHARE",
+    )
+    .bind(id_bytes(key.0))
+    .bind(id_bytes(account.0))
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage)?
+    .ok_or(KeySnapshotError::UnknownCredential)?;
+    let principal: Vec<u8> = row.get(0);
+    let principal: [u8; 16] = principal
+        .try_into()
+        .map_err(|_| StoreError("credential principal is not 16 bytes".into()))?;
+    Ok((Principal(u128::from_be_bytes(principal)), row.get(1)))
+}
+
+/// A publication's checks and write inside the caller's transaction: the
+/// stated credential binding (#35), the ledger status and capacity-class
+/// guards (#51, #99), the budget stamp (#97), and the generation-ordered
+/// write. Returns whether a row was written, the stamped snapshot to push
+/// after commit, and the audited predecessor and successor.
+async fn publish_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    principal: Principal,
+    generation: i64,
+    snapshot: PublishableSnapshot,
+) -> Result<(bool, PublishableSnapshot, AdminState, AdminState), PublishSnapshotError> {
+    if let Some(key_id) = snapshot.key_id {
+        let matches: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM tollgate_credential_keys
+                 WHERE key_id = $1 AND principal = $2 AND account_id = $3)",
+        )
+        .bind(id_bytes(key_id.0))
+        .bind(id_bytes(principal.0))
+        .bind(id_bytes(snapshot.account_id.0))
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(storage)?;
+        if !matches {
+            return Err(PublishSnapshotError::CredentialMismatch { key_id });
+        }
+    }
+    // The ledger decides an account's status; a publish may carry it
+    // but not change it, or the two records `set_account_status`
+    // unified could be pulled apart again one principal at a time
+    // (#51). FOR SHARE, not FOR UPDATE: this only has to hold the
+    // status still, and a status change takes FOR UPDATE on the same
+    // row, so the two serialize without publishes blocking each other.
+    //
+    // The budget columns ride along on the read that was already being
+    // taken, under the same lock, so the view stamped below is the
+    // ledger as of this publication rather than a second read that
+    // could straddle a lease or a rollover (#97).
+    let ledger = sqlx::query(
+        "SELECT status, deposited, overage_recorded, usage_recorded, settlement_loss,
+                    expired, budget_allowance, budget_period, budget_rollover, period_start_us,
+                    capacity_class
+             FROM tollgate_accounts WHERE account_id = $1 FOR SHARE",
+    )
+    .bind(id_bytes(snapshot.account_id.0))
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage)?;
+
+    // An account the ledger does not hold publishes unchanged: this
+    // adds no account-existence requirement to publication, and an
+    // unstamped snapshot reports no budget rather than a zero.
+    // Unconditional, including the `None` arm: a snapshot arrives here
+    // having crossed a wire, where nothing stops a publisher putting a
+    // balance in the JSON. Overwriting always is what makes the store
+    // the field's only writer, rather than only usually.
+    let view = match &ledger {
+        Some(row) => {
+            let ledger = decode_status(row.get::<String, _>(0))?;
+            if ledger != snapshot.status {
+                return Err(PublishSnapshotError::StatusMismatch {
+                    ledger,
+                    submitted: snapshot.status,
+                });
+            }
+            // The capacity class is the same kind of fact and gets the
+            // same guard (#99): the ledger owns it, a publish may
+            // carry it, and only `set_capacity_class` may change it.
+            let ledger_class = decode_capacity_class(row.get::<String, _>(10))?;
+            if ledger_class != snapshot.capacity_class {
+                return Err(PublishSnapshotError::CapacityClassMismatch {
+                    ledger: ledger_class,
+                    submitted: snapshot.capacity_class,
+                });
+            }
+            Some(budget_view(row)?)
+        }
+        None => None,
+    };
+    let published = snapshot.with_budget(view);
+    let value = serde_json::to_value(StoredSnapshotRef::from(published.as_snapshot()))
+        .map_err(|e| StoreError(format!("snapshot encode: {e}")))?;
+
+    let (written, before, after) = write_snapshot_audited(tx, principal, generation, value).await?;
+    Ok((written, published, before, after))
+}
+
+/// Tombstone a live snapshot inside the caller's transaction, keeping its
+/// generation as the watermark.
+async fn remove_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    principal: Principal,
+) -> Result<AdminReceipt<()>, StoreError> {
+    let before = snapshot_audit_row(tx, principal).await?;
+    let after = match before {
+        AdminState::Snapshot {
+            generation,
+            revoked: false,
+        } => {
+            sqlx::query("UPDATE tollgate_snapshots SET deleted = TRUE WHERE principal = $1")
+                .bind(id_bytes(principal.0))
+                .execute(&mut **tx)
+                .await
+                .map_err(storage)?;
+            AdminState::Snapshot {
+                generation,
+                revoked: true,
+            }
+        }
+        state => state,
+    };
+    Ok(AdminReceipt::new((), before, after))
 }
 
 /// Holding the snapshot row while both observing and replacing it makes the

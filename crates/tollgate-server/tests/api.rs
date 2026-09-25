@@ -821,18 +821,67 @@ async fn an_instance_credential_cannot_read_an_account() {
     );
 }
 
-/// An issuer for tests: the real `HmacRegistry`, behind the seam.
-fn issuing_state() -> (Arc<MemoryStore>, axum::Router) {
+/// The issuer secret the conformance cases configure (#143). Test-only.
+const ISSUER_SECRET: &str = "143a143a143a143a143a143a143a143a143a143a143a143a143a143a143a143a";
+
+/// An issuer for tests, built the way the stock binary builds one: a security
+/// manifest's `issuer` entry through `SecurityLoader::load`, `start` and
+/// `issuer` (#143), not a registry constructed beside the configuration path.
+async fn manifest_issuer() -> Option<Arc<dyn tollgate_auth::CredentialIssuer + Send + Sync>> {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("security.json");
+    std::fs::write(directory.path().join("issuer.secret"), ISSUER_SECRET).unwrap();
+    std::fs::write(
+        &path,
+        json!({"issuer": {"secret_file": "issuer.secret"}}).to_string(),
+    )
+    .unwrap();
+    let mut loader = tollgate_server::config::SecurityLoader::new(&path);
+    let loaded = loader.load(t(0)).await.unwrap().unwrap();
+    let _ = loader.start(loaded).unwrap();
+    loader.issuer()
+}
+
+async fn issuing_state() -> (Arc<MemoryStore>, axum::Router) {
     let store = MemoryStore::new(GrantPolicy::default()).unwrap();
     let router = router(ServerState {
         security: common::security(),
         store: Arc::clone(&store),
         clock: Arc::new(ManualClock::new(t(0))),
-        issuer: Some(Arc::new(tollgate_auth::HmacRegistry::new(
-            b"fixture-issuance-secret-121-only",
-        ))),
+        issuer: Some(
+            manifest_issuer()
+                .await
+                .expect("the manifest names an issuer"),
+        ),
     });
     (store, router)
+}
+
+/// A snapshot body for the key-bound route (#143). `key_id` is left unstated
+/// unless given: the route binds it to the key in the path.
+fn key_snapshot(account: u128, generation: u64, key: Option<u128>) -> Value {
+    let mut snapshot = tollgate_core::AccountSnapshot::builder(
+        AccountId(account),
+        tollgate_core::Generation(generation),
+        AccountStatus::Active,
+        t(3_600),
+        tollgate_core::PermissionBits(0),
+        tollgate_core::ResolvedLimits::new(1),
+        Arc::new(tollgate_core::CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+    )
+    .build();
+    snapshot.key_id = key.map(tollgate_core::KeyId);
+    json!({ "snapshot": snapshot })
+}
+
+/// The principal an instance learns from its own key projection — the only
+/// place a principal is served. Operators never need it.
+async fn projected_principal(app: &axum::Router) -> String {
+    let (status, page) = call(app, "GET", &api("/keys"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let keys = page["keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 1, "one live credential in the projection");
+    keys[0]["principal"].as_str().unwrap().to_owned()
 }
 
 async fn make_account(store: &MemoryStore, id: u128) {
@@ -858,7 +907,7 @@ async fn make_account(store: &MemoryStore, id: u128) {
 /// an HMAC.
 #[tokio::test]
 async fn a_credential_secret_is_disclosed_once_and_a_retry_is_a_conflict() {
-    let (store, app) = issuing_state();
+    let (store, app) = issuing_state().await;
     make_account(&store, 1).await;
 
     let body = json!({"key_id": id(7), "max_active_keys": 3});
@@ -927,7 +976,7 @@ async fn a_credential_secret_is_disclosed_once_and_a_retry_is_a_conflict() {
 /// The bound is enforced through HTTP, and refuses rather than exceeding.
 #[tokio::test]
 async fn issuance_refuses_past_the_active_key_bound() {
-    let (store, app) = issuing_state();
+    let (store, app) = issuing_state().await;
     make_account(&store, 1).await;
 
     for key in 1..=2u128 {
@@ -962,7 +1011,7 @@ async fn issuance_refuses_past_the_active_key_bound() {
 /// a mistyped or guessed id must not retire someone else's credential.
 #[tokio::test]
 async fn revocation_is_bound_to_the_account_in_the_path() {
-    let (store, app) = issuing_state();
+    let (store, app) = issuing_state().await;
     make_account(&store, 1).await;
     make_account(&store, 2).await;
 
@@ -1028,7 +1077,7 @@ async fn revocation_is_bound_to_the_account_in_the_path() {
 /// produces exactly one of each and either alone would look like a quirk.
 #[tokio::test]
 async fn a_full_key_page_offers_a_cursor_and_a_short_one_does_not() {
-    let (store, app) = issuing_state();
+    let (store, app) = issuing_state().await;
     make_account(&store, 1).await;
     for key in 1..=3u128 {
         let (status, _) = call(
@@ -1116,7 +1165,7 @@ async fn setting_a_budget_over_http_reports_what_it_replaced() {
 /// half of the conformance list at the end of that document.
 #[tokio::test]
 async fn the_documented_provisioning_sequence_is_repeatable() {
-    let (_store, app) = issuing_state();
+    let (_store, app) = issuing_state().await;
     let account = api(&format!("/admin/accounts/{}", id(1)));
 
     // 1. Create, suspended and unfunded.
@@ -1188,6 +1237,27 @@ async fn the_documented_provisioning_sequence_is_repeatable() {
     );
     assert_eq!(resent["code"], "credential-exists");
     assert!(resent.get("secret").is_none(), "and carries no secret");
+
+    // 6. Bind the credential's policy by the handles the operator holds,
+    //    twice: the repeat is a generation no-op, not an error.
+    let binding = api(&format!(
+        "/admin/accounts/{}/keys/{}/snapshot",
+        id(1),
+        id(42)
+    ));
+    let mut policy = key_snapshot(1, 1, None);
+    policy["snapshot"]["capacity_class"] = json!("BestEffort");
+    for _ in 0..2 {
+        let (status, _) = call(&app, "PUT", &binding, Some(policy.clone())).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    // 7. The instance serves it under the credential's principal.
+    let principal = projected_principal(&app).await;
+    let (status, served) = call(&app, "GET", &api(&format!("/snapshots/{principal}")), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(served["key_id"], id(42));
+    assert_eq!(served["generation"], 1);
 
     // The account the document describes: active, scheduled, one live key.
     let (_, view) = call(&app, "GET", &account, None).await;
@@ -1355,7 +1425,7 @@ async fn both_credential_listings_validate_queries_before_backend_reads() {
 async fn credential_audits_name_the_key_and_actual_lifecycle_transition() {
     use tollgate_core::KeyId;
     use tollgate_store::{AdminState, KeyDirectory};
-    let (store, app) = issuing_state();
+    let (store, app) = issuing_state().await;
     make_account(&store, 1).await;
     let path = api(&format!("/admin/accounts/{}/keys", id(1)));
     let capture = common::EventCapture::default();
@@ -1447,5 +1517,251 @@ async fn credential_audits_name_the_key_and_actual_lifecycle_transition() {
     assert!(!rendered.contains(&secret));
     assert!(!rendered.contains(&digest));
     assert!(!rendered.contains("principal"));
-    assert!(!rendered.contains("fixture-issuance-secret-121-only"));
+    assert!(!rendered.contains(ISSUER_SECRET));
+}
+
+/// Binding by key is bound to the account in the path, as revocation is: a
+/// foreign or unknown `key_id` answers 404 and publishes nothing (#143).
+#[tokio::test]
+async fn a_key_snapshot_is_bound_to_the_account_in_the_path() {
+    let (store, app) = issuing_state().await;
+    make_account(&store, 1).await;
+    make_account(&store, 2).await;
+    let (status, _) = call(
+        &app,
+        "POST",
+        &api(&format!("/admin/accounts/{}/keys", id(1))),
+        Some(json!({"key_id": id(7), "max_active_keys": 1})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    for (account, key) in [(2, 7), (1, 8)] {
+        let path = api(&format!(
+            "/admin/accounts/{}/keys/{}/snapshot",
+            id(account),
+            id(key)
+        ));
+        let (status, problem) =
+            call(&app, "PUT", &path, Some(key_snapshot(account, 1, None))).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "account {account}, key {key}"
+        );
+        assert_eq!(problem["code"], "unknown-credential");
+        let (status, problem) = call(&app, "DELETE", &path, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(problem["code"], "unknown-credential");
+    }
+    let (_, catalogue) = call(&app, "GET", &api("/snapshots"), None).await;
+    assert_eq!(
+        catalogue["principals"],
+        json!([]),
+        "nothing was published: {catalogue}"
+    );
+}
+
+/// A snapshot naming a different credential, or another account, is refused
+/// rather than rewritten; one naming the path's key is accepted (#143).
+#[tokio::test]
+async fn a_key_snapshot_naming_another_key_is_refused() {
+    let (store, app) = issuing_state().await;
+    make_account(&store, 1).await;
+    make_account(&store, 2).await;
+    call(
+        &app,
+        "POST",
+        &api(&format!("/admin/accounts/{}/keys", id(1))),
+        Some(json!({"key_id": id(7), "max_active_keys": 1})),
+    )
+    .await;
+    let path = api(&format!(
+        "/admin/accounts/{}/keys/{}/snapshot",
+        id(1),
+        id(7)
+    ));
+    for body in [key_snapshot(1, 1, Some(8)), key_snapshot(2, 1, None)] {
+        let (status, problem) = call(&app, "PUT", &path, Some(body)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(problem["code"], "invalid-credential-binding");
+    }
+    let (status, _) = call(&app, "PUT", &path, Some(key_snapshot(1, 1, Some(7)))).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "stating the path's own key is fine"
+    );
+}
+
+/// Revocation is terminal: a retired credential is never granted a snapshot
+/// again, and withdrawing its snapshot is the second half of revoking it
+/// (#143, INVARIANTS.md #27).
+#[tokio::test]
+async fn a_retired_key_cannot_be_granted_a_snapshot_but_can_be_withdrawn() {
+    let (store, app) = issuing_state().await;
+    make_account(&store, 1).await;
+    let keys = api(&format!("/admin/accounts/{}/keys", id(1)));
+    call(
+        &app,
+        "POST",
+        &keys,
+        Some(json!({"key_id": id(7), "max_active_keys": 1})),
+    )
+    .await;
+    let principal = projected_principal(&app).await;
+    let binding = format!("{keys}/{}/snapshot", id(7));
+    let (status, _) = call(&app, "PUT", &binding, Some(key_snapshot(1, 1, None))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _) = call(&app, "DELETE", &format!("{keys}/{}", id(7)), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, problem) = call(&app, "PUT", &binding, Some(key_snapshot(1, 2, None))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(problem["code"], "credential-retired");
+    let (status, served) = call(&app, "GET", &api(&format!("/snapshots/{principal}")), None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "revocation alone leaves the snapshot in place"
+    );
+    assert_eq!(served["generation"], 1);
+
+    let (status, _) = call(&app, "DELETE", &binding, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, problem) = call(&app, "GET", &api(&format!("/snapshots/{principal}")), None).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(problem["code"], "revoked-principal");
+}
+
+/// Key-bound snapshot audits name `{account}/keys/{key}/snapshot` and the
+/// actual transition; no principal reaches a response or the audit target.
+#[tokio::test]
+async fn key_snapshot_audits_name_the_key_and_never_the_principal() {
+    use tollgate_store::AdminState;
+    let (store, app) = issuing_state().await;
+    make_account(&store, 1).await;
+    call(
+        &app,
+        "POST",
+        &api(&format!("/admin/accounts/{}/keys", id(1))),
+        Some(json!({"key_id": id(7), "max_active_keys": 1})),
+    )
+    .await;
+    let principal = projected_principal(&app).await;
+    let binding = api(&format!(
+        "/admin/accounts/{}/keys/{}/snapshot",
+        id(1),
+        id(7)
+    ));
+    let capture = common::EventCapture::default();
+    let mut bodies = Vec::new();
+    capture
+        .during(async {
+            for (method, body) in [
+                ("PUT", Some(key_snapshot(1, 1, None))),
+                ("PUT", Some(key_snapshot(1, 1, None))),
+                ("DELETE", None),
+            ] {
+                let (status, response) = call(&app, method, &binding, body).await;
+                assert_eq!(status, StatusCode::NO_CONTENT);
+                bodies.push(response);
+            }
+        })
+        .await;
+    let audit: Vec<_> = capture
+        .events()
+        .into_iter()
+        .filter(|event| event.target == "tollgate::audit")
+        .collect();
+    let confirmed: Vec<_> = audit
+        .iter()
+        .filter(|event| {
+            event
+                .fields
+                .get("outcome")
+                .is_some_and(|o| o == "confirmed")
+        })
+        .collect();
+    let live = AdminState::Snapshot {
+        generation: tollgate_core::Generation(1),
+        revoked: false,
+    };
+    let tombstone = AdminState::Snapshot {
+        generation: tollgate_core::Generation(1),
+        revoked: true,
+    };
+    assert_eq!(confirmed.len(), 3);
+    for (event, (action, before, after)) in confirmed.iter().zip([
+        ("publish_key_snapshot", AdminState::Absent, live),
+        ("publish_key_snapshot", live, live),
+        ("remove_key_snapshot", live, tombstone),
+    ]) {
+        assert_eq!(event.fields["action"], action);
+        assert_eq!(
+            event.fields["resource"],
+            format!("{}/keys/{}/snapshot", id(1), id(7))
+        );
+        assert_eq!(event.fields["before"], format!("{before:?}"));
+        assert_eq!(event.fields["after"], format!("{after:?}"));
+    }
+    let rendered = format!("{audit:?}{bodies:?}");
+    assert!(!rendered.contains(&principal), "{rendered}");
+    assert!(!rendered.contains(ISSUER_SECRET));
+}
+
+/// An embedder's issuer must mint the presented form (#143). One that hands
+/// out bytes no header can carry is refused before its record is stored, so
+/// no credential exists that its owner could never present.
+#[tokio::test]
+async fn an_issuer_minting_an_unpresentable_secret_is_refused_before_storage() {
+    use tollgate_store::KeyDirectory;
+    struct Minting(&'static [u8]);
+    impl tollgate_auth::CredentialIssuer for Minting {
+        fn mint(
+            &self,
+            key_id: tollgate_core::KeyId,
+        ) -> Result<tollgate_auth::MintedKey, tollgate_auth::EntropyUnavailable> {
+            Ok(tollgate_auth::MintedKey {
+                key_id,
+                principal: Principal(7),
+                digest: [7; 32],
+                secret: self.0.to_vec().into(),
+            })
+        }
+    }
+    // Not text; empty; text a header cannot carry verbatim. Then one that is
+    // presentable, so the refusals are about the secret and nothing else.
+    for (secret, presentable) in [
+        (&[0x00, 0xff, 0x10][..], false),
+        (b"", false),
+        (b"two words", false),
+        (b"presentable-fixture-credential", true),
+    ] {
+        let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+        let app = router(ServerState {
+            security: common::security(),
+            store: Arc::clone(&store),
+            clock: Arc::new(ManualClock::new(t(0))),
+            issuer: Some(Arc::new(Minting(secret))),
+        });
+        make_account(&store, 1).await;
+        let (status, body) = call(
+            &app,
+            "POST",
+            &api(&format!("/admin/accounts/{}/keys", id(1))),
+            Some(json!({"key_id": id(7), "max_active_keys": 1})),
+        )
+        .await;
+        let stored = store.active_keys(t(0)).await.unwrap();
+        if presentable {
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(body["secret"], "presentable-fixture-credential");
+            assert_eq!(stored.len(), 1);
+        } else {
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{secret:?}");
+            assert_eq!(body["code"], "issuer-misconfigured");
+            assert!(body.get("secret").is_none());
+            assert!(stored.is_empty(), "nothing was stored for {secret:?}");
+        }
+    }
 }

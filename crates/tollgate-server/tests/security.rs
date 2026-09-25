@@ -47,6 +47,25 @@ async fn every_control_plane_route_requires_its_own_role_before_decoding() {
             "/v1/admin/accounts/invalid/capacity-class",
             Role::Operator,
         ),
+        ("GET", "/v1/admin/accounts/invalid", Role::Operator),
+        ("PUT", "/v1/admin/accounts/invalid/budget", Role::Operator),
+        ("POST", "/v1/admin/accounts/invalid/keys", Role::Operator),
+        ("GET", "/v1/admin/accounts/invalid/keys", Role::Operator),
+        (
+            "DELETE",
+            "/v1/admin/accounts/invalid/keys/invalid",
+            Role::Operator,
+        ),
+        (
+            "PUT",
+            "/v1/admin/accounts/invalid/keys/invalid/snapshot",
+            Role::Operator,
+        ),
+        (
+            "DELETE",
+            "/v1/admin/accounts/invalid/keys/invalid/snapshot",
+            Role::Operator,
+        ),
         ("PUT", "/v1/admin/snapshots/invalid", Role::Operator),
         ("DELETE", "/v1/admin/snapshots/invalid", Role::Operator),
     ] {

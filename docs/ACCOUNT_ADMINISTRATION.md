@@ -80,6 +80,11 @@ it, and the request is refused with `409 account-closed`.
 **5. Issue a credential.** See below. Do this last: a credential that exists
 before the account is active authenticates into denials.
 
+**6. Bind its policy.** `PUT /v1/admin/accounts/{account}/keys/{key}/snapshot`
+publishes the snapshot the credential authorizes against. See
+[binding a policy](#binding-a-policy). Until this step the credential
+authenticates, but no snapshot authorizes it.
+
 ## Issuing a credential
 
 `POST /v1/admin/accounts/{account}/keys`
@@ -94,6 +99,11 @@ before the account is active authenticates into denials.
 ```json
 { "key_id": "…", "secret": "…hex…", "not_after": "2027-01-01T00:00:00Z" }
 ```
+
+**`secret` is the credential exactly as it is presented**: 64 lowercase
+hexadecimal characters, which the owner sends verbatim — for example as
+`Authorization: Bearer <secret>`. Do not decode it. The stored digest covers
+these characters, and a verifier is handed the same bytes.
 
 **The caller chooses `key_id`, and that choice is the retry contract.** Generate
 an unguessable one — a v4 UUID — and keep it until the call is acknowledged.
@@ -156,11 +166,49 @@ included in the audit receipt.
 another account answers `404 unknown-credential` and revokes nothing. You
 cannot retire another customer's credential by guessing or mistyping an id.
 
+**Revoking a key is two calls.** Revocation retires the credential but leaves
+its bound snapshot in place. That is safe for authorization, because a revoked
+credential leaves the key projection and fails authentication. It is still a stale
+positive grant, so follow every revocation with
+`DELETE /v1/admin/accounts/{account}/keys/{key}/snapshot`.
+
 Revocation is terminal and generation-ordered. It is **not** instant across a
 fleet: serving instances hold a projection and converge at their next refresh.
 See the [credential projection](CREDENTIAL_PROJECTION.md) runbook for that
 window. Treat revocation as "no new sessions promptly", not "every in-flight
 request stops now".
+
+### Binding a policy
+
+`PUT /v1/admin/accounts/{account}/keys/{key}/snapshot` with
+`{"snapshot": { … }}` → `204`. `DELETE` on the same path withdraws it → `204`.
+
+You name the credential by the handles you already hold. The server resolves
+its principal from its own key record, and the principal never appears in a
+request, response or audit. The principal routes
+(`PUT`/`DELETE /v1/admin/snapshots/{principal}`) remain for embedders that
+derive principals themselves.
+
+- **Bound to the key in the path.** Leave the snapshot's `key_id` unset and the
+  server fills it in, or state the path's key. A snapshot that names a different
+  key, or another account, answers `422 invalid-credential-binding` and
+  publishes nothing.
+- **Bound to the account in the path.** Another account's `key_id` answers
+  `404 unknown-credential`, as revocation does.
+- **The ledger owns status and capacity class.** A snapshot must carry the
+  account's current values (`409 snapshot-status-mismatch`,
+  `409 snapshot-capacity-class-mismatch`). The server stamps the budget.
+- **Retired credentials are never granted a policy again.** `PUT` on a revoked
+  key answers `409 credential-retired`. `DELETE` still works, and is how you
+  finish revoking it. An expired but unrevoked key may still be published.
+- **Generations only move forward.** A publish at or below the stored generation
+  answers `204` and changes nothing: the audit receipt records equal
+  `before` and `after`. After a withdrawal, only a strictly higher generation
+  republishes. Increase the generation on every policy change.
+
+Audit resources identify `{account}/keys/{key}/snapshot`, with actions
+`publish_key_snapshot` and `remove_key_snapshot`. Receipts record the snapshot's
+generation and whether it is withdrawn, and never a principal.
 
 ## Reading an account
 
@@ -223,8 +271,14 @@ Every failure is RFC 7807 with a stable `code`. Retry behaviour by class:
 | `credential-exists` | 409 | this `key_id` is recorded | no — your call worked |
 | `active-key-limit` | 409 | at the supplied bound | no — revoke first |
 | `unknown-credential` | 404 | not this account's credential | no |
+| `credential-retired` | 409 | a revoked credential cannot be bound to a policy | no — issue a new one |
+| `invalid-credential-binding` | 422 | the snapshot names another key or account | no — fix the body |
+| `invalid-snapshot-limits` | 422 | the snapshot's limits cannot be enforced | no — fix the body |
+| `snapshot-status-mismatch` | 409 | the snapshot's status disagrees with the ledger | no — use the status route |
+| `snapshot-capacity-class-mismatch` | 409 | the snapshot's class disagrees with the ledger | no — use the class route |
 | `issuance-unsupported` | 501 | this deployment does not issue | no — see below |
 | `entropy-unavailable` | 503 | no credential entropy | yes, with backoff |
+| `issuer-misconfigured` | 500 | an embedder's issuer minted a secret that is not presentable text; nothing was stored | no — fix the issuer |
 | `storage` | 503 | backend unavailable | yes, with backoff |
 
 State conflicts return 409: those requests are well-formed. Invalid bodies and
@@ -234,13 +288,25 @@ error body or a log line.
 ## Deployment
 
 **Issuance requires a configured credential issuer.** The `tollgate-server`
-binary ships without one and answers `501 issuance-unsupported`. This is
-deliberate rather than unfinished: an instance that only verifies should not
-hold the capability to create credentials, and the registry the server builds
-for control-plane bearer tokens uses a secret regenerated at every start — the
-wrong authority and the wrong lifetime for a credential a customer keeps. A
-deployment that administers accounts supplies a durable issuer through
-`ServerState::issuer`. **Every other route on this page works without one.**
+binary issues only when its security manifest names one:
+`"issuer": {"secret_file": "issuer.secret"}`. See
+[credential issuer](CONTROL_PLANE_SECURITY.md#credential-issuer) for the format,
+validation, reload and rotation rules. Without it, issuance answers
+`501 issuance-unsupported`. That default is deliberate: an instance that only
+verifies should not hold the capability to create credentials. The registry the
+server builds for control-plane bearers is never used for issuance, because its
+secret is regenerated at every start — the wrong authority and the wrong
+lifetime for a credential a customer keeps. Embedders that build their own
+server still pass any `CredentialIssuer` through `ServerState::issuer`, for
+example an HSM- or KMS-backed one. **Every other route on this page works
+without an issuer.**
+
+**Credentials are digested as presented.** Releases before this one disclosed
+the secret as hex but digested the 32 bytes it encodes, so a credential they
+issued verified only for a caller that hex-decoded the presented value. A
+verifier that forwards the presented text, like the reference embedder, refused
+every such credential. Credentials issued now verify as presented. Re-issue any
+credential minted by an earlier `tollgate-server` and revoke the old one.
 
 **Migration `0019`** adds `(account_id, key_id)` to the credential table for
 the account-scoped listing. Additive and forward-only: no data change, safe to
@@ -253,6 +319,13 @@ well as projecting them. `HttpStore` implements `KeySource` but not
 authority behind one — so it cannot back a server. No in-tree backend is
 affected.
 
+**`KeyDirectory` requires `publish_key_snapshot` and `remove_key_snapshot`.**
+Key-bound binding must resolve the principal, check retirement and publish in
+one indivisible step, so a backend implements it rather than a caller composing
+reads. This is breaking for implementations outside this repository;
+`MemoryStore` and `PostgresStore` implement both. No migration: the lookup uses
+the `(account_id, key_id)` index from `0019`.
+
 ## Conformance
 
 A consumer adapter should pin an exact Tollgate release tag and verify, against
@@ -264,8 +337,14 @@ that tag, that:
 3. a listing contains no `secret`, `digest` or `principal` field;
 4. revoking another account's `key_id` answers `404` and leaves it live;
 5. `settled_usage` stays zero while a lease is outstanding, and the funding
-   equation holds across the grant.
+   equation holds across the grant;
+6. a policy binds by `(account_id, key_id)` without the caller handling a
+   principal; another account's key answers `404`; a revoked key answers
+   `409 credential-retired`, and revoking a key is followed by withdrawing its
+   policy.
 
-`crates/tollgate-server/tests/api.rs` exercises 1–5 against the in-process
-router and is the executable reference for the expected status codes and
-bodies.
+`crates/tollgate-server/tests/api.rs` exercises 1–6 against the in-process
+router, with the issuer built through the same manifest path the binary uses.
+It is the executable reference for the expected status codes and bodies.
+`crates/tollgate-server/tests/backend_features.rs` runs issuance, verification,
+binding and revocation against the stock binary.

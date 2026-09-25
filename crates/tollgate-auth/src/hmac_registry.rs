@@ -50,8 +50,11 @@ pub struct MintedKey {
     /// HMAC-SHA256 of the secret under the server secret. This is what a
     /// `tollgate_store::KeyDirectory` stores.
     pub digest: [u8; 32],
-    /// The raw credential. Hand it to its owner and drop it; it cannot be
-    /// derived again from anything retained.
+    /// The credential: 64 lowercase hexadecimal characters, exactly the bytes
+    /// the digest covers. It is what is disclosed, what a customer presents
+    /// (for example after `Bearer `), and what a verifier is handed, with no
+    /// encoding step anywhere between them. Hand it to its owner and drop it;
+    /// it cannot be derived again from anything retained.
     pub secret: Zeroizing<Vec<u8>>,
 }
 
@@ -165,9 +168,21 @@ impl HmacRegistry {
     ///
     /// Fails only if the operating system cannot supply entropy, which is not
     /// a condition to paper over with a weaker source.
+    ///
+    /// The credential is minted in its textual form, and the digest covers
+    /// that text. A credential disclosed as text but digested as the bytes it
+    /// encodes verifies only for a caller that decodes it first, and every
+    /// caller that forwards what it was presented — a `Bearer` header, as the
+    /// reference embedder does — would be refused with no error anywhere.
     pub fn mint(&self, key_id: KeyId) -> Result<MintedKey, EntropyUnavailable> {
-        let mut secret = Zeroizing::new(vec![0u8; SECRET_BYTES]);
-        getrandom::fill(secret.as_mut_slice()).map_err(|_| EntropyUnavailable)?;
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut entropy = Zeroizing::new([0u8; SECRET_BYTES]);
+        getrandom::fill(entropy.as_mut_slice()).map_err(|_| EntropyUnavailable)?;
+        let mut secret = Zeroizing::new(Vec::with_capacity(SECRET_BYTES * 2));
+        for byte in entropy.iter() {
+            secret.push(DIGITS[usize::from(byte >> 4)]);
+            secret.push(DIGITS[usize::from(byte & 0x0f)]);
+        }
         let (principal, digest) = self.digest_credential(&secret);
         Ok(MintedKey {
             key_id,
@@ -309,6 +324,34 @@ mod tests {
     }
 
     use super::*;
+
+    /// The minted credential is its presented form: 64 lowercase hex
+    /// characters, verified exactly as disclosed and not after decoding.
+    #[test]
+    fn a_minted_credential_verifies_as_the_text_it_is_disclosed_as() {
+        let registry = HmacRegistry::new(b"fixture-presented-form-secret-143");
+        let key = registry.mint(KeyId(1)).unwrap();
+        assert_eq!(key.secret.len(), 64);
+        assert!(
+            key.secret
+                .iter()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        );
+        registry.install([(key.principal, key.digest, None)]);
+        assert_eq!(
+            registry.verify(&key.secret).map(|v| v.principal),
+            Some(key.principal)
+        );
+        let decoded: Vec<u8> = key
+            .secret
+            .chunks(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        assert!(
+            registry.verify(&decoded).is_none(),
+            "the decoded bytes are not the credential"
+        );
+    }
 
     fn registry() -> HmacRegistry {
         let registry = HmacRegistry::new(b"server-secret");

@@ -342,3 +342,214 @@ pub async fn a_failed_batch_preserves_activity_and_canonical_events(
     let retry = store.ingest(&[event(2, Some(1), 20)], t(50)).await.unwrap();
     assert_eq!((retry.accepted, retry.duplicate), (1, 0));
 }
+
+fn generation_of(resolution: tollgate_store::SnapshotResolution) -> Option<(u64, bool)> {
+    use tollgate_store::SnapshotResolution;
+    match resolution {
+        SnapshotResolution::Present(snapshot) => Some((snapshot.generation.0, false)),
+        SnapshotResolution::Revoked { generation } => Some((generation.0, true)),
+        SnapshotResolution::Unknown => None,
+    }
+}
+
+fn snapshot_state(generation: u64, revoked: bool) -> tollgate_store::AdminState {
+    tollgate_store::AdminState::Snapshot {
+        generation: Generation(generation),
+        revoked,
+    }
+}
+
+/// An operator names a credential by `(account, key)`; the store resolves
+/// its principal and applies every rule the principal route applies (#143).
+pub async fn key_bound_publication_resolves_the_principal_in_the_store(store: &impl Backend) {
+    use tollgate_store::{AdminState, SnapshotResolution};
+    let mut pushes = store.subscribe();
+    let receipt = store
+        .publish_key_snapshot(
+            AccountId(1),
+            KeyId(1),
+            snapshot(Some(KeyId(1)), AccountId(1), 1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (receipt.before, receipt.after),
+        (AdminState::Absent, snapshot_state(1, false))
+    );
+    let push = pushes.try_recv().expect("a publication is pushed");
+    assert_eq!(
+        push.principal,
+        Principal(101),
+        "bound to the key's own principal"
+    );
+    assert!(matches!(push.resolution, SnapshotResolution::Present(_)));
+    assert_eq!(
+        generation_of(store.snapshot(Principal(101)).await.unwrap()),
+        Some((1, false))
+    );
+
+    // A replay at or below the stored generation is a silent no-op (#15).
+    let replay = store
+        .publish_key_snapshot(
+            AccountId(1),
+            KeyId(1),
+            snapshot(Some(KeyId(1)), AccountId(1), 1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.before, replay.after);
+    assert!(pushes.try_recv().is_err());
+
+    let removed = store
+        .remove_key_snapshot(AccountId(1), KeyId(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        (removed.before, removed.after),
+        (snapshot_state(1, false), snapshot_state(1, true))
+    );
+    assert!(matches!(
+        pushes
+            .try_recv()
+            .expect("a withdrawal is pushed")
+            .resolution,
+        SnapshotResolution::Revoked { .. }
+    ));
+    let again = store
+        .remove_key_snapshot(AccountId(1), KeyId(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        (again.before, again.after),
+        (snapshot_state(1, true), snapshot_state(1, true))
+    );
+    assert!(
+        pushes.try_recv().is_err(),
+        "an unchanged tombstone is not re-announced"
+    );
+
+    // The tombstone keeps its generation: only a strictly newer one revives.
+    let stale = store
+        .publish_key_snapshot(
+            AccountId(1),
+            KeyId(1),
+            snapshot(Some(KeyId(1)), AccountId(1), 1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.before, stale.after);
+    store
+        .publish_key_snapshot(
+            AccountId(1),
+            KeyId(1),
+            snapshot(Some(KeyId(1)), AccountId(1), 2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        generation_of(store.snapshot(Principal(101)).await.unwrap()),
+        Some((2, false))
+    );
+}
+
+/// A foreign or unknown key, and a snapshot not stating the path's key or
+/// account, publish nothing and push nothing.
+pub async fn key_bound_publication_is_bound_to_the_account_and_key(store: &impl Backend) {
+    use tollgate_store::KeySnapshotError;
+    let mut pushes = store.subscribe();
+    for (account, key) in [(2, 1), (1, 404), (1, 3)] {
+        assert_eq!(
+            store
+                .publish_key_snapshot(
+                    AccountId(account),
+                    KeyId(key),
+                    snapshot(Some(KeyId(key)), AccountId(account), 1)
+                )
+                .await
+                .unwrap_err(),
+            KeySnapshotError::UnknownCredential,
+            "account {account}, key {key}"
+        );
+        assert_eq!(
+            store
+                .remove_key_snapshot(AccountId(account), KeyId(key))
+                .await
+                .unwrap_err(),
+            KeySnapshotError::UnknownCredential
+        );
+    }
+    for stated in [
+        snapshot(None, AccountId(1), 1),
+        snapshot(Some(KeyId(2)), AccountId(1), 1),
+        snapshot(Some(KeyId(1)), AccountId(2), 1),
+    ] {
+        assert_eq!(
+            store
+                .publish_key_snapshot(AccountId(1), KeyId(1), stated)
+                .await
+                .unwrap_err(),
+            KeySnapshotError::Publish(PublishSnapshotError::CredentialMismatch {
+                key_id: KeyId(1)
+            })
+        );
+    }
+    assert!(pushes.try_recv().is_err());
+    for principal in [101, 102, 103] {
+        assert_eq!(
+            generation_of(store.snapshot(Principal(principal)).await.unwrap()),
+            None
+        );
+    }
+}
+
+/// Revocation is terminal (INVARIANTS.md #27): a retired credential is never
+/// granted a snapshot again, but its snapshot can still be withdrawn. Expiry
+/// is not retirement.
+pub async fn a_retired_credential_is_never_granted_a_snapshot_but_can_be_withdrawn(
+    store: &impl Backend,
+) {
+    use tollgate_store::KeySnapshotError;
+    store
+        .publish_key_snapshot(
+            AccountId(1),
+            KeyId(1),
+            snapshot(Some(KeyId(1)), AccountId(1), 1),
+        )
+        .await
+        .unwrap();
+    store.revoke_key(KeyId(1), t(1)).await.unwrap();
+    assert_eq!(
+        store
+            .publish_key_snapshot(
+                AccountId(1),
+                KeyId(1),
+                snapshot(Some(KeyId(1)), AccountId(1), 2)
+            )
+            .await
+            .unwrap_err(),
+        KeySnapshotError::Retired { key_id: KeyId(1) }
+    );
+    assert_eq!(
+        generation_of(store.snapshot(Principal(101)).await.unwrap()),
+        Some((1, false))
+    );
+    let removed = store
+        .remove_key_snapshot(AccountId(1), KeyId(1))
+        .await
+        .unwrap();
+    assert_eq!(removed.after, snapshot_state(1, true));
+
+    // Key 2 expired at t(5) but was never revoked.
+    store
+        .publish_key_snapshot(
+            AccountId(1),
+            KeyId(2),
+            snapshot(Some(KeyId(2)), AccountId(1), 1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        generation_of(store.snapshot(Principal(102)).await.unwrap()),
+        Some((1, false))
+    );
+}

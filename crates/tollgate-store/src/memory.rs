@@ -58,10 +58,11 @@ use crate::leases::{LeaseRecord, Leases, Settled};
 pub use crate::traits::{AccountConfig, Conservation, StatusChange};
 use crate::traits::{
     AdminStore, AllocateError, Allocation, BudgetError, CreateAccountError, GrantPolicy,
-    GrantPolicyError, IngestError, IngestReport, KeyDirectory, KeyError, KeyRecord, KeySummary,
-    LeaseAllocator, PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease,
-    Revocation, RolledAccount, RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution,
-    SnapshotSource, StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
+    GrantPolicyError, IngestError, IngestReport, KeyDirectory, KeyError, KeyRecord,
+    KeySnapshotError, KeySummary, LeaseAllocator, PUSH_CHANNEL_CAPACITY, PublishSnapshotError,
+    ReclaimBatch, ReclaimedLease, Revocation, RolledAccount, RolloverBatch, SetStatusError,
+    SnapshotPush, SnapshotResolution, SnapshotSource, StoreError, StoreHealth, UsageSink,
+    pushes_exceed_capacity,
 };
 
 /// An account's balance, split by what expires and what does not (#97).
@@ -541,17 +542,13 @@ impl MemoryStore {
     }
 
     fn remove_snapshot_audited(&self, principal: Principal) -> AdminReceipt<()> {
-        let receipt = {
-            let mut inner = self.lock();
-            let before = snapshot_audit(inner.snapshots.get(&principal));
-            if let Some(SnapshotRecord::Present(snapshot)) = inner.snapshots.get(&principal) {
-                let generation = snapshot.generation;
-                inner
-                    .snapshots
-                    .insert(principal, SnapshotRecord::Revoked(generation));
-            }
-            AdminReceipt::new((), before, snapshot_audit(inner.snapshots.get(&principal)))
-        };
+        let receipt = remove_locked(&mut self.lock(), principal);
+        self.announce_removal(principal, &receipt);
+        receipt
+    }
+
+    /// Push a tombstone only when the removal changed something.
+    fn announce_removal(&self, principal: Principal, receipt: &AdminReceipt<()>) {
         if receipt.before != receipt.after
             && let AdminState::Snapshot { generation, .. } = receipt.after
         {
@@ -560,7 +557,6 @@ impl MemoryStore {
                 resolution: SnapshotResolution::Revoked { generation },
             });
         }
-        receipt
     }
 
     // ---- reconciliation / test surface -------------------------------
@@ -1109,6 +1105,33 @@ fn publish_locked(
         .snapshots
         .insert(principal, SnapshotRecord::Present(snapshot.clone()));
     Ok(Some(snapshot))
+}
+
+/// Tombstone a live snapshot, keeping its generation as the watermark, and
+/// report the predecessor and result under the caller's guard.
+fn remove_locked(inner: &mut Inner, principal: Principal) -> AdminReceipt<()> {
+    let before = snapshot_audit(inner.snapshots.get(&principal));
+    if let Some(SnapshotRecord::Present(snapshot)) = inner.snapshots.get(&principal) {
+        let generation = snapshot.generation;
+        inner
+            .snapshots
+            .insert(principal, SnapshotRecord::Revoked(generation));
+    }
+    AdminReceipt::new((), before, snapshot_audit(inner.snapshots.get(&principal)))
+}
+
+/// Resolve `account`'s credential `key` to its stored record under the
+/// caller's guard: the principal never leaves the store (#143).
+fn account_key(
+    inner: &Inner,
+    account: AccountId,
+    key: KeyId,
+) -> Result<&StoredKey, KeySnapshotError> {
+    inner
+        .keys
+        .get(&key)
+        .filter(|stored| stored.record.account_id == account)
+        .ok_or(KeySnapshotError::UnknownCredential)
 }
 
 /// Which account-owned fact a republication is carrying.
@@ -1851,6 +1874,52 @@ impl KeyDirectory for MemoryStore {
         self.revoke_key_audited(key_id, now)
             .await
             .map(|receipt| receipt.outcome)
+    }
+
+    async fn publish_key_snapshot(
+        &self,
+        account: AccountId,
+        key: KeyId,
+        snapshot: PublishableSnapshot,
+    ) -> Result<crate::AdminReceipt<()>, KeySnapshotError> {
+        // One guard across resolution, the retirement check and publication,
+        // so a revocation cannot land between them.
+        let (principal, published, before, after) = {
+            let mut inner = self.lock();
+            let stored = account_key(&inner, account, key)?;
+            if stored.revoked_at.is_some() {
+                return Err(KeySnapshotError::Retired { key_id: key });
+            }
+            let principal = stored.record.principal;
+            if snapshot.key_id != Some(key) {
+                return Err(PublishSnapshotError::CredentialMismatch { key_id: key }.into());
+            }
+            let before = snapshot_audit(inner.snapshots.get(&principal));
+            let published = publish_locked(&mut inner, principal, snapshot)?;
+            let after = snapshot_audit(inner.snapshots.get(&principal));
+            (principal, published, before, after)
+        };
+        if let Some(snapshot) = published {
+            self.push_to_subscribers(SnapshotPush {
+                principal,
+                resolution: SnapshotResolution::Present(snapshot),
+            });
+        }
+        Ok(AdminReceipt::new((), before, after))
+    }
+
+    async fn remove_key_snapshot(
+        &self,
+        account: AccountId,
+        key: KeyId,
+    ) -> Result<crate::AdminReceipt<()>, KeySnapshotError> {
+        let (principal, receipt) = {
+            let mut inner = self.lock();
+            let principal = account_key(&inner, account, key)?.record.principal;
+            (principal, remove_locked(&mut inner, principal))
+        };
+        self.announce_removal(principal, &receipt);
+        Ok(receipt)
     }
 
     async fn revoke_key_audited(

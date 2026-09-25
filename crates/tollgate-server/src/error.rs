@@ -292,6 +292,29 @@ impl From<tollgate_store::KeyError> for ApiError {
     }
 }
 
+impl From<tollgate_store::KeySnapshotError> for ApiError {
+    fn from(e: tollgate_store::KeySnapshotError) -> Self {
+        use tollgate_store::KeySnapshotError;
+        let (status, code) = match &e {
+            // The answer revocation gives for a foreign or unknown key.
+            KeySnapshotError::UnknownCredential => (StatusCode::NOT_FOUND, "unknown-credential"),
+            // 409: well-formed, but the credential is terminally retired and is
+            // never granted positive authorization again (INVARIANTS.md #27).
+            KeySnapshotError::Retired { .. } => (StatusCode::CONFLICT, "credential-retired"),
+            KeySnapshotError::Publish(inner) => return inner.clone().into(),
+            KeySnapshotError::Storage(inner) => return inner.clone().into(),
+        };
+        ApiError {
+            status,
+            code,
+            title: e.to_string(),
+            generation: None,
+            balance_exhaustion: None,
+            balance_shortfall: None,
+        }
+    }
+}
+
 impl From<tollgate_store::BudgetError> for ApiError {
     fn from(e: tollgate_store::BudgetError) -> Self {
         match e {
