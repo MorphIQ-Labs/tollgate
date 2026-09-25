@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.29.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.29.2...v0.29.3) - 2026-09-25
+
+### Fixed
+
+- *(release)* #142 tag the release commit, not the release merge
+
 ## [0.29.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.29.1...v0.29.2) - 2026-09-25
 
 ### Added
