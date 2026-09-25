@@ -65,7 +65,7 @@ const UNTRUSTED_EXIT: u8 = 3;
 /// baseline had in fact never been enforced once, locally or in CI, and twelve
 /// days of drift accumulated behind a green verdict.
 const UNENFORCED_EXIT: u8 = 4;
-const USAGE: &str = "usage: check_benchmark_thresholds [--ratios-only] [--baseline <baseline.json>] [--samples <dir>] [--record <baseline.json>] [--history <history.json>] <manifest.json> <criterion-root> <report.json> <freshness-marker>";
+const USAGE: &str = "usage: check_benchmark_thresholds [--ratios-only] [--baseline <baseline.json>] [--samples <dir>] [--run-history <dir>] [--record <baseline.json>] [--history <history.json>] <manifest.json> <criterion-root> <report.json> <freshness-marker>";
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,6 +75,10 @@ enum GateMode {
 }
 
 #[derive(Debug, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "parsed once per process from the command line; boxing buys nothing"
+)]
 enum Command {
     Run {
         manifest_path: PathBuf,
@@ -92,6 +96,9 @@ enum Command {
         /// with no history and therefore no trust verdict at all, so the
         /// reviewer needs a way to carry one between runs.
         history_path: Option<PathBuf>,
+        /// A bounded window of past readable runs, kept across series, from
+        /// which `--record` derives each row's allowance (#141).
+        run_history_path: Option<PathBuf>,
         mode: GateMode,
     },
     Help,
@@ -683,6 +690,7 @@ fn parse_args<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Result<Command, String> 
     let mut record_path = None;
     let mut samples_path = None;
     let mut history_path = None;
+    let mut run_history_path = None;
     let mut positional = Vec::new();
     let mut index = 0;
     while index < option_end {
@@ -701,6 +709,7 @@ fn parse_args<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Result<Command, String> 
             "--record" => &mut record_path,
             "--samples" => &mut samples_path,
             "--history" => &mut history_path,
+            "--run-history" => &mut run_history_path,
             value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
             _ => {
                 positional.push(args[index].clone());
@@ -745,6 +754,7 @@ fn parse_args<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Result<Command, String> 
             record_path,
             samples_path,
             history_path,
+            run_history_path,
             mode,
         }),
         _ => Err(USAGE.to_owned()),
@@ -1057,11 +1067,167 @@ impl Drop for StagedFile {
 /// is precisely how the checked-in file came to hold rows from four different
 /// runs, and how thirteen benchmarks the gate runs ended up with no recorded
 /// mean at all.
+/// How many past runs the run history keeps. Enough for several recording
+/// series on comparable code, bounded so the directory cannot grow without
+/// limit on a host that runs the gate every day.
+const HISTORY_WINDOW: usize = 40;
+/// The fewest pooled runs, across at least [`MIN_SPREAD_REVISIONS`]
+/// revisions, from which a row's spread is believed.
+const MIN_SPREAD_RUNS: usize = 6;
+const MIN_SPREAD_REVISIONS: usize = 2;
+/// A run more than this far above its revision's median is an excursion:
+/// listed, never absorbed into an allowance. Chosen against the observed
+/// envelopes: every legitimate spread on the controlled host through #139 sat
+/// under x1.45, and the one-off readings above it (x2.4, x2.6) were single runs.
+const EXCURSION_RATIO: f64 = 1.5;
+/// Headroom above the worst believed run.
+const SPREAD_MARGIN: f64 = 0.03;
+/// An allowance above this is a weak per-row gate; the report says so.
+const WIDE_ALLOWANCE: f64 = 0.30;
+
+/// A row's allowance as its own recorded spread implies (#141).
+#[derive(Clone, Debug, PartialEq)]
+struct DerivedAllowance {
+    allowance: f64,
+    runs: usize,
+    revisions: usize,
+    excursions: Vec<f64>,
+}
+
+/// Round an allowance up to the next 0.05, ignoring floating-point residue
+/// that would otherwise push an exact multiple a whole step higher.
+fn round_allowance_up(raw: f64) -> f64 {
+    ((raw * 20.0) - 1e-9).ceil() / 20.0
+}
+
+/// Each row's allowance from the run history, or nothing where the history
+/// cannot yet support one.
+///
+/// Runs are grouped by revision and each is divided by its own revision's
+/// median, so a code change between revisions — which moves a row's level,
+/// not its noise — drops out, and what is pooled is run-to-run spread on one
+/// build. Only runs on this host, environment and profile count: the
+/// revision is the one thing allowed to differ. Excursions above
+/// [`EXCURSION_RATIO`] are reported rather than absorbed, and a row needs
+/// [`MIN_SPREAD_RUNS`] believed runs across [`MIN_SPREAD_REVISIONS`]
+/// revisions before its spread is trusted at all.
+fn derive_allowances<'a>(
+    history: &[Sample],
+    context: &RecordContext,
+    ids: impl Iterator<Item = &'a str>,
+) -> BTreeMap<String, DerivedAllowance> {
+    let comparable: Vec<&Sample> = history
+        .iter()
+        .filter(|sample| {
+            sample.context.host == context.host && sample.context.profile == context.profile
+        })
+        .collect();
+    let mut derived = BTreeMap::new();
+    for id in ids {
+        let mut by_revision: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+        for sample in &comparable {
+            if let Some(&value) = sample.means.get(id) {
+                by_revision
+                    .entry(sample.context.revision.as_str())
+                    .or_default()
+                    .push(value);
+            }
+        }
+        let mut ratios = Vec::new();
+        let mut revisions = 0;
+        for values in by_revision.into_values().filter(|values| values.len() >= 2) {
+            let Some(median) = median_of(values.clone()) else {
+                continue;
+            };
+            revisions += 1;
+            ratios.extend(values.iter().map(|value| value / median));
+        }
+        let (excursions, believed): (Vec<f64>, Vec<f64>) = ratios
+            .into_iter()
+            .partition(|ratio| *ratio > EXCURSION_RATIO);
+        if believed.len() < MIN_SPREAD_RUNS || revisions < MIN_SPREAD_REVISIONS {
+            continue;
+        }
+        let worst = believed.iter().copied().fold(1.0_f64, f64::max);
+        derived.insert(
+            id.to_owned(),
+            DerivedAllowance {
+                allowance: round_allowance_up(worst - 1.0 + SPREAD_MARGIN)
+                    .max(default_max_regression()),
+                runs: believed.len(),
+                revisions,
+                excursions,
+            },
+        );
+    }
+    derived
+}
+
+/// Every retained run in `dir`, whatever its revision, each counted once.
+/// Unreadable or legacy files are skipped with a notice: history informs an
+/// allowance, and a damaged file must not block a recording.
+fn load_history(dir: &Path) -> Vec<Sample> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut runs: BTreeMap<String, Sample> = BTreeMap::new();
+    for path in entries.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let parsed = std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| {
+                serde_json::from_str::<StoredSample>(&text).map_err(|e| e.to_string())
+            });
+        match parsed {
+            Ok(StoredSample::Current(sample)) if sample.validate().is_ok() => {
+                runs.entry(sample.run_id.clone()).or_insert(sample);
+            }
+            Ok(_) => eprintln!(
+                "perf-gate: skipping run history {}: legacy or invalid",
+                path.display()
+            ),
+            Err(error) => eprintln!(
+                "perf-gate: skipping run history {}: {error}",
+                path.display()
+            ),
+        }
+    }
+    runs.into_values().collect()
+}
+
+/// Keep the newest `window` runs in `dir`, by run id, and remove the rest.
+fn prune_history(dir: &Path, window: usize) -> Result<usize, String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+    let mut runs: Vec<(u128, PathBuf)> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter_map(|path| {
+            let id = path
+                .file_name()?
+                .to_str()?
+                .strip_prefix("run-")?
+                .strip_suffix(".json")?
+                .parse()
+                .ok()?;
+            Some((id, path))
+        })
+        .collect();
+    runs.sort_unstable_by_key(|(id, _)| *id);
+    let excess = runs.len().saturating_sub(window);
+    for (_, path) in runs.drain(..excess) {
+        std::fs::remove_file(&path).map_err(|e| format!("cannot prune {}: {e}", path.display()))?;
+    }
+    Ok(excess)
+}
+
 fn recorded_baseline(
     context: &RecordContext,
     previous: Option<&Baseline>,
     manifest: &Manifest,
     samples: &[BTreeMap<String, f64>],
+    derived: &BTreeMap<String, DerivedAllowance>,
     recorded_at: String,
 ) -> Result<Baseline, String> {
     if samples.len() < MIN_RECORD_SAMPLES {
@@ -1091,6 +1257,7 @@ fn recorded_baseline(
         previous,
         manifest,
         &measured,
+        derived,
         recorded_at,
         samples.len(),
     )
@@ -1101,6 +1268,7 @@ fn recorded_baseline_from(
     previous: Option<&Baseline>,
     manifest: &Manifest,
     measured: &BTreeMap<String, f64>,
+    derived: &BTreeMap<String, DerivedAllowance>,
     recorded_at: String,
     samples: usize,
 ) -> Result<Baseline, String> {
@@ -1129,10 +1297,13 @@ fn recorded_baseline_from(
             Some(&mean_ns) => benchmarks.push(BaselineEntry {
                 id: entry.id.clone(),
                 mean_ns,
+                // The carried allowance is a floor, never lowered by what the
+                // history implies: narrowing stays a deliberate edit (#141).
                 max_regression: carried
                     .get(entry.id.as_str())
                     .copied()
-                    .unwrap_or_else(default_max_regression),
+                    .unwrap_or_else(default_max_regression)
+                    .max(derived.get(&entry.id).map_or(0.0, |d| d.allowance)),
             }),
             None => missing.push(entry.id.as_str()),
         }
@@ -1157,6 +1328,52 @@ fn recorded_baseline_from(
     })
 }
 
+/// Say which allowances the history widened, and which excursions it set
+/// aside, so a recording's changes are read rather than discovered.
+fn report_derived(
+    previous: Option<&Baseline>,
+    recorded: &Baseline,
+    derived: &BTreeMap<String, DerivedAllowance>,
+) {
+    let before: BTreeMap<&str, f64> = previous
+        .map(|previous| {
+            previous
+                .benchmarks
+                .iter()
+                .map(|entry| (entry.id.as_str(), entry.max_regression))
+                .collect()
+        })
+        .unwrap_or_default();
+    for entry in &recorded.benchmarks {
+        let Some(evidence) = derived.get(&entry.id) else {
+            continue;
+        };
+        let was = before
+            .get(entry.id.as_str())
+            .copied()
+            .unwrap_or_else(default_max_regression);
+        if entry.max_regression > was {
+            println!(
+                "perf-gate: {} allowance {was:.2} -> {:.2} from {} runs over {} revisions",
+                entry.id, entry.max_regression, evidence.runs, evidence.revisions
+            );
+        }
+        if !evidence.excursions.is_empty() {
+            println!(
+                "perf-gate: {} set aside {} excursion(s) above x{EXCURSION_RATIO}: {}",
+                entry.id,
+                evidence.excursions.len(),
+                evidence
+                    .excursions
+                    .iter()
+                    .map(|ratio| format!("x{ratio:.2}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+}
+
 /// Stage, validate, then promote — so a failed record leaves the previous
 /// last-known-good baseline exactly where it was.
 fn write_baseline(staged: StagedFile, path: &Path, baseline: &Baseline) -> Result<(), String> {
@@ -1178,6 +1395,7 @@ fn record_baseline(
     context: &RecordContext,
     manifest: &Manifest,
     samples_dir: &Path,
+    run_history_dir: Option<&Path>,
 ) -> Result<usize, String> {
     let staged = StagedFile::create(path.with_extension("json.staged"))?;
     let previous: Option<Baseline> = match std::fs::read_to_string(path) {
@@ -1198,13 +1416,23 @@ fn record_baseline(
     }
     let samples = load_samples(samples_dir, context)?;
     let means: Vec<_> = samples.into_iter().map(|sample| sample.means).collect();
+    let derived = run_history_dir.map_or_else(BTreeMap::new, |dir| {
+        let history = load_history(dir);
+        derive_allowances(
+            &history,
+            context,
+            manifest.benchmarks.iter().map(|entry| entry.id.as_str()),
+        )
+    });
     let baseline = recorded_baseline(
         context,
         previous.as_ref(),
         manifest,
         &means,
+        &derived,
         jiff::Timestamp::now().to_string(),
     )?;
+    report_derived(previous.as_ref(), &baseline, &derived);
     write_baseline(staged, path, &baseline)?;
     Ok(baseline.samples)
 }
@@ -1478,6 +1706,22 @@ struct Report {
     trust: Trust,
     policy: TrustPolicy,
     run: RunContext,
+    /// Rows whose recorded allowance exceeds [`WIDE_ALLOWANCE`]: their
+    /// per-row comparison is weak, and a same-run ratio or absolute threshold
+    /// is what actually guards them (#141).
+    wide_allowances: Vec<String>,
+}
+
+/// The baselined rows whose allowance is too wide to discriminate much.
+fn wide_allowances(baseline: Option<&Baseline>) -> Vec<String> {
+    baseline.map_or_else(Vec::new, |baseline| {
+        baseline
+            .benchmarks
+            .iter()
+            .filter(|entry| entry.max_regression > WIDE_ALLOWANCE)
+            .map(|entry| format!("{} ({:.2})", entry.id, entry.max_regression))
+            .collect()
+    })
 }
 
 /// Previous means, keyed by benchmark id.
@@ -1502,6 +1746,7 @@ fn main() -> ExitCode {
         record_path,
         samples_dir,
         history_override,
+        run_history_dir,
         mode,
     ) = match parse_args(&args) {
         Ok(Command::Run {
@@ -1513,6 +1758,7 @@ fn main() -> ExitCode {
             record_path,
             samples_path,
             history_path,
+            run_history_path,
             mode,
         }) => (
             manifest_path,
@@ -1523,6 +1769,7 @@ fn main() -> ExitCode {
             record_path,
             samples_path,
             history_path,
+            run_history_path,
             mode,
         ),
         Ok(Command::Help) => {
@@ -1751,7 +1998,15 @@ fn main() -> ExitCode {
         trust: trust.clone(),
         policy: manifest.trust,
         run: RunContext::capture(),
+        wide_allowances: wide_allowances(baseline.as_ref().filter(|_| baseline_enforced)),
     };
+    if !report.wide_allowances.is_empty() {
+        println!(
+            "perf-gate: {} rows carry allowances above {WIDE_ALLOWANCE:.2}, weak per-row gates: {}",
+            report.wide_allowances.len(),
+            report.wide_allowances.join(", ")
+        );
+    }
     if let Some(parent) = report_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -1835,6 +2090,30 @@ fn main() -> ExitCode {
             };
             write_sample(dir, &sample)
         })();
+        if let (Ok(()), Some(history)) = (&deposited, run_history_dir.as_ref()) {
+            // The same run, kept across series for `--record` to read its
+            // spread from; `--fresh-samples` clears the samples, never this.
+            let retained = (|| {
+                let context = record_context.as_ref().map_err(Clone::clone)?;
+                let sample = Sample {
+                    run_id: marker_mtime
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map_err(|e| e.to_string())?
+                        .as_nanos()
+                        .to_string(),
+                    context: context.clone(),
+                    recorded_at: jiff::Timestamp::try_from(marker_mtime)
+                        .map_err(|e| e.to_string())?
+                        .to_string(),
+                    means: current.clone(),
+                };
+                write_sample(history, &sample)?;
+                prune_history(history, HISTORY_WINDOW)
+            })();
+            if let Err(error) = retained {
+                eprintln!("perf-gate: not retaining run history: {error}; gate verdict unchanged");
+            }
+        }
         match deposited {
             Ok(()) => println!(
                 "perf-gate: retained this benchmark run in {} (retries count once)",
@@ -1853,7 +2132,13 @@ fn main() -> ExitCode {
             let dir = samples_dir
                 .as_deref()
                 .ok_or("--record requires --samples <dir>")?;
-            record_baseline(record_path, &context, &manifest, dir)
+            record_baseline(
+                record_path,
+                &context,
+                &manifest,
+                dir,
+                run_history_dir.as_deref(),
+            )
         });
         match recorded {
             Ok(samples) => println!(
@@ -1979,6 +2264,7 @@ mod tests {
                 record_path: None,
                 samples_path: None,
                 history_path: None,
+                run_history_path: None,
                 mode: GateMode::RatiosOnly,
             })
         );
@@ -1999,6 +2285,7 @@ mod tests {
                 record_path: None,
                 samples_path: None,
                 history_path: None,
+                run_history_path: None,
                 mode: GateMode::Full,
             })
         );
@@ -2079,6 +2366,7 @@ mod tests {
                 record_path: Some(PathBuf::from("baseline.json")),
                 samples_path: Some(PathBuf::from("samples")),
                 history_path: Some(PathBuf::from("history.json")),
+                run_history_path: None,
                 mode: GateMode::Full,
             })
         );
@@ -2123,6 +2411,7 @@ mod tests {
             None,
             &recording_manifest(&["a"]),
             &vec![means(&[("a", 100.0)]); 3],
+            &BTreeMap::new(),
             "now".to_owned(),
         )
         .unwrap();
@@ -2295,6 +2584,7 @@ mod tests {
             None,
             &manifest,
             &partial,
+            &BTreeMap::new(),
             "2026-09-10T00:00:00Z".to_owned(),
         )
         .expect_err("a partial record is the defect, not a convenience");
@@ -2309,6 +2599,7 @@ mod tests {
             None,
             &manifest,
             &complete,
+            &BTreeMap::new(),
             "2026-09-10T00:00:00Z".to_owned(),
         )
         .expect("every row measured in every sample");
@@ -2335,6 +2626,7 @@ mod tests {
                 None,
                 &manifest,
                 &samples,
+                &BTreeMap::new(),
                 "now".to_owned(),
             )
             .expect_err("a baseline describes where a benchmark usually lands");
@@ -2346,6 +2638,7 @@ mod tests {
                 None,
                 &manifest,
                 &vec![sample; MIN_RECORD_SAMPLES],
+                &BTreeMap::new(),
                 "now".to_owned(),
             )
             .is_ok()
@@ -2368,6 +2661,7 @@ mod tests {
             None,
             &manifest,
             &samples,
+            &BTreeMap::new(),
             "now".to_owned(),
         )
         .unwrap();
@@ -2426,6 +2720,7 @@ mod tests {
             None,
             &manifest,
             &samples,
+            &BTreeMap::new(),
             "now".to_owned(),
         )
         .expect_err("b was not measured by every sample");
@@ -2517,6 +2812,7 @@ mod tests {
             Some(&previous),
             &manifest,
             &vec![means(&[("a", 2.0), ("b", 3.0)]); 3],
+            &BTreeMap::new(),
             "now".to_owned(),
         )
         .unwrap();
@@ -2549,6 +2845,7 @@ mod tests {
             Some(&previous),
             &manifest,
             &vec![means(&[("a", 2.0)]); 3],
+            &BTreeMap::new(),
             "now".to_owned(),
         )
         .expect_err("a run on one host must not replace another host's contract");
@@ -2574,6 +2871,7 @@ mod tests {
             None,
             &recording_manifest(&["a"]),
             &vec![means(&[("a", 2.0)]); 3],
+            &BTreeMap::new(),
             "now".to_owned(),
         )
         .unwrap();
@@ -2619,6 +2917,7 @@ mod tests {
             None,
             &recording_manifest(&["a"]),
             &vec![means(&[("a", 2.0)]); 3],
+            &BTreeMap::new(),
             "now".to_owned(),
         )
         .unwrap();
@@ -2664,6 +2963,7 @@ mod tests {
                 None,
                 &manifest,
                 &[full.clone(), partial, full],
+                &BTreeMap::new(),
                 "now".to_owned(),
             )
             .is_err()
@@ -3305,6 +3605,7 @@ mod tests {
             None,
             &recording_manifest(&["a"]),
             &vec![means(&[("a", 100.0)]); 3],
+            &BTreeMap::new(),
             "now".to_owned(),
         )
         .unwrap();
@@ -3947,5 +4248,245 @@ mod tests {
         let estimates: Estimates =
             serde_json::from_str(r#"{"mean":{"point_estimate":100.0}}"#).expect("parses");
         assert!(estimates.mean.confidence_interval.is_none());
+    }
+
+    // ---- derived allowances (#141) ----------------------------------------
+
+    fn revision(n: u8) -> String {
+        format!("{n:040x}")
+    }
+
+    fn history_run(run: u32, revision: &str, value: f64) -> Sample {
+        let mut context = recording_context();
+        context.revision = revision.to_owned();
+        Sample {
+            run_id: run.to_string(),
+            context,
+            recorded_at: "2026-09-25T00:00:00Z".to_owned(),
+            means: means(&[("row", value)]),
+        }
+    }
+
+    fn history(runs: &[(u8, f64)]) -> Vec<Sample> {
+        (0u32..)
+            .zip(runs)
+            .map(|(run, &(rev, value))| history_run(run, &revision(rev), value))
+            .collect()
+    }
+
+    fn derive(runs: &[(u8, f64)]) -> Option<DerivedAllowance> {
+        derive_allowances(&history(runs), &recording_context(), ["row"].into_iter()).remove("row")
+    }
+
+    /// A code change between revisions moves a row's level, not its noise:
+    /// two quiet revisions a factor of two apart derive the default.
+    #[test]
+    fn a_level_change_between_revisions_is_not_spread() {
+        let derived = derive(&[
+            (1, 100.0),
+            (1, 101.0),
+            (1, 99.0),
+            (2, 200.0),
+            (2, 202.0),
+            (2, 198.0),
+        ])
+        .unwrap();
+        assert_eq!(derived.allowance, 0.05);
+        assert_eq!((derived.runs, derived.revisions), (6, 2));
+    }
+
+    /// Spread is the worst run over its own revision's median, plus the
+    /// margin, rounded up to the next 0.05 — and an exact multiple is not
+    /// pushed a step higher by floating-point residue.
+    #[test]
+    fn spread_is_the_worst_run_over_its_revision_median() {
+        let derived = derive(&[
+            (1, 100.0),
+            (1, 100.0),
+            (1, 110.0),
+            (2, 50.0),
+            (2, 51.0),
+            (2, 58.0),
+        ])
+        .unwrap();
+        // 58 / 51 = x1.137 -> 0.137 + 0.03 -> 0.20
+        assert_eq!(derived.allowance, 0.20);
+        assert_eq!(round_allowance_up(0.10), 0.10);
+        assert_eq!(round_allowance_up(0.07 + 0.03), 0.10);
+        assert_eq!(round_allowance_up(0.1000001), 0.15);
+    }
+
+    /// One run far above its revision's median is set aside and listed,
+    /// never absorbed into the allowance.
+    #[test]
+    fn an_excursion_is_listed_not_absorbed() {
+        let derived = derive(&[
+            (1, 100.0),
+            (1, 100.0),
+            (1, 102.0),
+            (1, 250.0),
+            (2, 100.0),
+            (2, 101.0),
+            (2, 99.0),
+        ])
+        .unwrap();
+        assert_eq!(derived.excursions.len(), 1);
+        assert!(derived.excursions[0] > 2.0);
+        // The median of 100, 100, 102, 250 is 101: the worst believed run is
+        // x1.01 over it, plus the margin, 0.05 — the excursion adds nothing.
+        assert_eq!(derived.allowance, 0.05);
+    }
+
+    /// Too little history derives nothing, so the carried allowance stands.
+    #[test]
+    fn thin_history_derives_nothing() {
+        assert_eq!(
+            derive(&[
+                (1, 100.0),
+                (1, 130.0),
+                (1, 99.0),
+                (1, 101.0),
+                (1, 98.0),
+                (1, 97.0)
+            ]),
+            None,
+            "one revision"
+        );
+        assert_eq!(
+            derive(&[(1, 100.0), (1, 130.0), (2, 99.0), (2, 101.0), (3, 98.0)]),
+            None,
+            "five runs"
+        );
+        assert_eq!(
+            derive(&[
+                (1, 100.0),
+                (2, 130.0),
+                (3, 99.0),
+                (4, 101.0),
+                (5, 98.0),
+                (6, 97.0)
+            ]),
+            None,
+            "no revision has two runs"
+        );
+    }
+
+    /// Only this host, environment and profile count; the revision is the one
+    /// thing that may differ.
+    #[test]
+    fn history_from_another_host_is_ignored() {
+        let mut runs = history(&[
+            (1, 100.0),
+            (1, 101.0),
+            (1, 99.0),
+            (2, 100.0),
+            (2, 101.0),
+            (2, 99.0),
+        ]);
+        for run in &mut runs[..3] {
+            run.context.host.id = "another-host".to_owned();
+        }
+        assert!(
+            derive_allowances(&runs, &recording_context(), ["row"].into_iter()).is_empty(),
+            "three runs on one revision remain"
+        );
+    }
+
+    /// The carried allowance is a floor: history can widen a row, never
+    /// narrow it.
+    #[test]
+    fn derived_allowances_widen_but_never_narrow() {
+        let manifest = recording_manifest(&["wide", "narrow", "none"]);
+        let context = recording_context();
+        let mut previous = recorded_baseline(
+            &context,
+            None,
+            &manifest,
+            &vec![means(&[("wide", 1.0), ("narrow", 1.0), ("none", 1.0)]); 3],
+            &BTreeMap::new(),
+            "then".to_owned(),
+        )
+        .unwrap();
+        for entry in &mut previous.benchmarks {
+            if entry.id == "narrow" {
+                entry.max_regression = 0.30;
+            }
+        }
+        let derived: BTreeMap<String, DerivedAllowance> = ["wide", "narrow"]
+            .into_iter()
+            .map(|id| {
+                (
+                    id.to_owned(),
+                    DerivedAllowance {
+                        allowance: 0.20,
+                        runs: 6,
+                        revisions: 2,
+                        excursions: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        let recorded = recorded_baseline(
+            &context,
+            Some(&previous),
+            &manifest,
+            &vec![means(&[("wide", 1.0), ("narrow", 1.0), ("none", 1.0)]); 3],
+            &derived,
+            "now".to_owned(),
+        )
+        .unwrap();
+        let allowance = |id: &str| {
+            recorded
+                .benchmarks
+                .iter()
+                .find(|entry| entry.id == id)
+                .unwrap()
+                .max_regression
+        };
+        assert_eq!(allowance("wide"), 0.20, "widened by the history");
+        assert_eq!(allowance("narrow"), 0.30, "never narrowed");
+        assert_eq!(allowance("none"), 0.05, "no evidence, the default");
+        assert_eq!(wide_allowances(Some(&recorded)), Vec::<String>::new());
+        let mut wider = recorded;
+        wider.benchmarks[0].max_regression = 0.55;
+        assert_eq!(
+            wide_allowances(Some(&wider)),
+            vec![format!("{} (0.55)", wider.benchmarks[0].id)]
+        );
+    }
+
+    /// The history keeps its newest runs by run id and removes the oldest,
+    /// leaving anything that is not a run file alone.
+    #[test]
+    fn run_history_keeps_its_newest_window() {
+        let dir = std::env::temp_dir().join(format!("perf-gate-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for id in [5u32, 1, 3, 2, 4] {
+            write_sample(&dir, &history_run(id, &revision(1), 100.0)).unwrap();
+        }
+        std::fs::write(dir.join("notes.txt"), "kept").unwrap();
+        assert_eq!(prune_history(&dir, 3).unwrap(), 2);
+        let mut kept: Vec<String> = load_history(&dir).into_iter().map(|s| s.run_id).collect();
+        kept.sort();
+        assert_eq!(kept, ["3", "4", "5"]);
+        assert!(dir.join("notes.txt").exists());
+        assert_eq!(prune_history(&dir, 3).unwrap(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn run_history_is_an_option_taken_once() {
+        let base = ["m.json", "c", "r.json", "f"];
+        let with = |extra: &[&str]| {
+            parse_args(&extra.iter().chain(base.iter()).copied().collect::<Vec<_>>())
+        };
+        match with(&["--run-history", "h"]).unwrap() {
+            Command::Run {
+                run_history_path, ..
+            } => assert_eq!(run_history_path, Some(PathBuf::from("h"))),
+            other => panic!("{other:?}"),
+        }
+        assert!(with(&["--run-history", "h", "--run-history", "i"]).is_err());
+        assert!(with(&["--run-history"]).is_err());
     }
 }

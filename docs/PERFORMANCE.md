@@ -161,8 +161,9 @@ baseline says where a benchmark usually lands and one run cannot. It refuses a r
 gate would not read, a row that is missing from any sample, a partial manifest,
 a dirty worktree, provenance it was not given, and a host that does not match
 the file it would replace. It stages and validates before promoting, so a
-refusal leaves the previous baseline intact. Widened per-row `max_regression`
-values carry forward, and the file records how many runs its medians came from.
+refusal leaves the previous baseline intact. Per-row `max_regression` values
+carry forward, widened by the run history where it shows more spread (below),
+and the file records how many runs its medians came from.
 
 Each sample retains the revision, host ID, target architecture, CPU, OS,
 compiler and Criterion profile. All must match the recording context; other
@@ -179,6 +180,34 @@ missing recording provenance or sample-write failures produce a diagnostic
 without changing the normal verdict. `--ratios-only` does not deposit samples.
 Recording still requires complete, readable measurements and valid provenance;
 invoking the binary directly with `--record` also requires `--samples <dir>`.
+
+### Allowances come from the run history
+
+Every run that deposits a sample also keeps it in `target/perf-history`
+(`--run-history`), a window of the newest 40 runs that `--fresh-samples` never
+clears. `--record` derives each row's `max_regression` from that window instead
+of leaving it at whatever was last typed in:
+
+- Only runs on this host, environment and profile count; the revision may
+  differ.
+- Runs are grouped by revision, and each is divided by its own revision's
+  median, so a code change between revisions — which moves a row's level, not
+  its noise — drops out. What is pooled is run-to-run spread on one build.
+- A run more than ×1.5 its revision's median is an **excursion**: listed in the
+  recording's output, never absorbed.
+- The allowance is the worst believed ratio, less one, plus 0.03, rounded up
+  to the next 0.05, and at least the 0.05 default. It needs six believed runs
+  across two revisions, or the row keeps its carried allowance.
+- It **never narrows** a carried allowance. Lowering one stays a deliberate
+  edit made before recording, with the evidence in the merge request.
+
+The recording prints every allowance it widened and every excursion it set
+aside. Every full run lists the rows carrying an allowance above 0.30 as weak
+per-row gates, in its output and in the report's `wide_allowances`: such a row
+is guarded by a same-run ratio or an absolute threshold, and a reviewer should
+look there rather than at its baseline comparison. A new row with no history
+starts at the default and is sized by the first recording that has evidence for
+it.
 
 The recording destination supplies the host check and carried regression
 bounds even when `--baseline` is absent or points to another file. `--baseline`

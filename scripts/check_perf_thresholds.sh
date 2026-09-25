@@ -25,7 +25,11 @@ BASELINE="testing/perf_baseline.json"
 # A build artifact, like the criterion output it summarises: samples describe
 # this host and are never checked in.
 SAMPLES="target/perf-samples"
-gate_args=(--baseline "$BASELINE" --samples "$SAMPLES")
+# A bounded window of past readable runs, kept across calibration series, from
+# which --record derives each row's allowance (#141). --fresh-samples clears
+# the samples of the series being recorded, never this.
+HISTORY="target/perf-history"
+gate_args=(--baseline "$BASELINE" --samples "$SAMPLES" --run-history "$HISTORY")
 if [ "${1:-}" = "--ratios-only" ]; then
     REPORT="reports/perf_ratio_gate_report.json"
     gate_args=(--ratios-only "${gate_args[@]}")
