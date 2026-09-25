@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.30.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.29.3...v0.30.0) - 2026-09-25
+
+### Added
+
+- *(server)* [**breaking**] #143 manifest-configured credential issuer and key-bound snapshots
+
 ## [0.29.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.29.2...v0.29.3) - 2026-09-25
 
 ### Fixed
