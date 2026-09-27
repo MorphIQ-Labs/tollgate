@@ -47,3 +47,9 @@ pub use traits::{
     SnapshotSource, StatusChange, StoreError, StoreHealth, UsageSink, drain_reclaim_expired,
     pushes_exceed_capacity,
 };
+
+// Compiles and runs the README's examples as doctests without adding them to
+// the rendered documentation, so the README cannot drift from the API.
+#[doc = include_str!("../README.md")]
+#[cfg(doctest)]
+pub struct ReadmeDoctests;

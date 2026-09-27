@@ -1,6 +1,7 @@
 [package]
 name = "tollgate-admission"
 description = "Per-request admission pipeline: snapshot lookup, permission and staleness checks, weighted local rate limiting, and lease reservation — with zero inline I/O."
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

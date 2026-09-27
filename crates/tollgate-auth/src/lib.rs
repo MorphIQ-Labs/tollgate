@@ -1,8 +1,9 @@
 //! Credential verification for latency-critical services.
 //!
-//! Tollgate's admission path costs about 107 ns. Verifying a credential to
-//! reach it costs 800 ns to 2 µs — seven to twenty times everything the rest
-//! of the stack does. A library that tunes the 107 ns while leaving the 2 µs
+//! On the development host (Apple M1 Pro), Tollgate's admission path costs
+//! about 107 ns. Verifying a credential to reach it costs 800 ns to 2 µs —
+//! seven to twenty times everything the rest of the stack does. Absolute
+//! values are host-dependent; the ratio is the point. A library that tunes the 107 ns while leaving the 2 µs
 //! to each embedder is tuning the wrong end, so this crate owns the
 //! credential step too.
 //!
@@ -72,3 +73,9 @@ mod verifier;
 pub use hmac_registry::{EntropyUnavailable, HmacRegistry, MintedKey};
 pub use session::SessionCredential;
 pub use verifier::{CredentialIssuer, CredentialVerifier, Verified};
+
+// Compiles and runs the README's examples as doctests without adding them to
+// the rendered documentation, so the README cannot drift from the API.
+#[doc = include_str!("../README.md")]
+#[cfg(doctest)]
+pub struct ReadmeDoctests;
