@@ -1,0 +1,110 @@
+# Release automation: prepare, tag, publish.
+#
+# prepare  After every push to main, `prepare-release.sh` opens or refreshes
+#          the `chore/release` pull request from the conventional commits since
+#          the last release. It runs as the release GitHub App: a pull request
+#          opened with this workflow's own GITHUB_TOKEN would never trigger the
+#          required checks, so it could never merge.
+# tag      When that pull request lands, `tag-release.sh` tags the release
+#          commit and creates the GitHub release from its CHANGELOG section.
+# publish  Publishes the crates for a tag cut in this run, from that tag's own
+#          commit. A manual run can name a tag to retry a failed publish.
+#
+# Every step is idempotent. Third-party actions are pinned to commit SHAs.
+
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish_tag:
+        description: "Retry publishing this existing tag (e.g. v0.31.0); empty to only prepare and tag"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: release / prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+      - name: Release bot identity
+        id: bot
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          id=$(gh api "/users/${SLUG}%5Bbot%5D" --jq .id)
+          echo "name=${SLUG}[bot]" >> "$GITHUB_OUTPUT"
+          echo "email=${id}+${SLUG}[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Tags and full history: the last release is found by its tag.
+          fetch-depth: 0
+          persist-credentials: false
+      - run: ./scripts/prepare-release.sh
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_BOT_NAME: ${{ steps.bot.outputs.name }}
+          RELEASE_BOT_EMAIL: ${{ steps.bot.outputs.email }}
+
+  tag:
+    name: release / tag
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      released: ${{ steps.tag.outputs.released }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: tag
+        run: ./scripts/tag-release.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BOT_NAME: github-actions[bot]
+          RELEASE_BOT_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+
+  publish:
+    name: release / publish
+    needs: tag
+    if: needs.tag.outputs.released != '' || inputs.publish_tag != ''
+    runs-on: ubuntu-24.04
+    environment: crates-io
+    env:
+      # Whether the bootstrap token exists; secrets cannot appear in `if`.
+      BOOTSTRAP_TOKEN_SET: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+    permissions:
+      contents: read
+      # crates.io Trusted Publishing exchanges this identity for a
+      # short-lived token; no long-lived token is stored once it is set up.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.tag.outputs.released || inputs.publish_tag }}
+      - name: Trusted Publishing token
+        id: auth
+        # Until the crates exist on crates.io, Trusted Publishing cannot be
+        # configured, and the first release uses the CARGO_REGISTRY_TOKEN
+        # environment secret instead.
+        if: env.BOOTSTRAP_TOKEN_SET != 'true'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - run: ./scripts/publish-crates.sh
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
