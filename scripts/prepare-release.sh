@@ -306,40 +306,60 @@ if [ "$release_branch_current" = "1" ]; then
 else
   # The default branch requires signed commits, and a commit pushed with git
   # by the App is unsigned, so its pull request could never merge. A commit
-  # the App creates through the API is signed by GitHub instead. Point the
-  # release branch at the default branch's tip, then commit the release
-  # files onto it in one API call that fails if the branch moved meanwhile.
+  # the App creates through the API is signed by GitHub instead.
+  #
+  # The API only appends to an existing branch, so the commit is built on a
+  # staging branch cut from the default branch's tip, and the release branch
+  # moves to it only once it exists. The release branch is never left equal
+  # to the default branch: GitHub closes a pull request whose head has no
+  # commits left, which is how a failed run once closed the open release
+  # pull request.
   base=$(git rev-parse HEAD)
-  if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$RELEASE_BRANCH" >/dev/null 2>&1; then
-    gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/$RELEASE_BRANCH" \
-      -f sha="$base" -F force=true >/dev/null
-  else
-    gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
-      -f ref="refs/heads/$RELEASE_BRANCH" -f sha="$base" >/dev/null
-  fi
+  staging="$RELEASE_BRANCH-staging-${GITHUB_RUN_ID:-local}"
+  gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+    -f ref="refs/heads/$staging" -f sha="$base" >/dev/null
+  trap 'gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$staging" >/dev/null 2>&1 || true' EXIT
 
   # Only the files this script edits, and only those it changed. `git add -A`
   # once swept in whatever else the job left in the working tree — a cargo
   # home inside the checkout committed 330 files of restored registry cache
   # alongside a three-line version bump.
-  additions='[]'
+  #
+  # Contents travel through files, never through arguments: the encoded
+  # Cargo.lock alone approaches the kernel's 128 KiB limit on one argument,
+  # and the first run failed with "Argument list too long".
+  work=$(mktemp -d)
+  printf '[]' > "$work/additions.json"
   for path in $( { echo CHANGELOG.md; echo Cargo.lock; git ls-files '*Cargo.toml'; } \
       | xargs git diff --name-only HEAD -- ); do
-    additions=$(printf '%s' "$additions" | jq --arg path "$path" \
-      --arg contents "$(base64 -w0 < "$path")" '. + [{path: $path, contents: $contents}]')
+    base64 -w0 < "$path" > "$work/contents"
+    jq --arg path "$path" --rawfile contents "$work/contents" \
+      '. + [{path: $path, contents: $contents}]' "$work/additions.json" > "$work/next.json"
+    mv "$work/next.json" "$work/additions.json"
   done
 
-  jq -n --arg repo "$GITHUB_REPOSITORY" --arg branch "$RELEASE_BRANCH" \
+  commit=$(jq -n --arg repo "$GITHUB_REPOSITORY" --arg branch "$staging" \
         --arg headline "chore: release v$next" --arg base "$base" \
-        --argjson additions "$additions" '{
+        --slurpfile additions "$work/additions.json" '{
     query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
     variables: { input: {
       branch: { repositoryNameWithOwner: $repo, branchName: $branch },
       message: { headline: $headline },
       expectedHeadOid: $base,
-      fileChanges: { additions: $additions }
+      fileChanges: { additions: $additions[0] }
     } }
-  }' | gh api graphql --input - --jq '"prepare-release: committed \(.data.createCommitOnBranch.commit.oid) to '"$RELEASE_BRANCH"'"'
+  }' | gh api graphql --input - --jq '.data.createCommitOnBranch.commit.oid')
+  rm -rf "$work"
+  [ -n "$commit" ] || { echo "prepare-release: the release commit was not created" >&2; exit 1; }
+
+  if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$RELEASE_BRANCH" >/dev/null 2>&1; then
+    gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/$RELEASE_BRANCH" \
+      -f sha="$commit" -F force=true >/dev/null
+  else
+    gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+      -f ref="refs/heads/$RELEASE_BRANCH" -f sha="$commit" >/dev/null
+  fi
+  echo "prepare-release: committed $commit to $RELEASE_BRANCH"
 fi
 
 # --- create the pull request, or refresh the open one ---------------------
