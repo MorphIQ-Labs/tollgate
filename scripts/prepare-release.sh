@@ -34,8 +34,7 @@
 # leaves an identical proposal commit untouched and only force-updates the
 # release branch when the generated release files have actually changed.
 #
-# Depends on git, gh and a POSIX awk — the same set `tag-release.sh` needs,
-# deliberately. No gawk extensions, no python: the release path must not acquire
+# Depends on git, gh, jq, base64 and a POSIX awk, deliberately. No gawk extensions, no python: the release path must not acquire
 # an interpreter the release image does not already carry.
 #
 # Set PREPARE_RELEASE_DRY_RUN=1 to print the computed version and notes without
@@ -53,7 +52,6 @@ if [ "$DRY_RUN" != "1" ]; then
   : "${GH_TOKEN:?GH_TOKEN must be the release App installation token}"
   : "${GITHUB_REPOSITORY:?}"
   : "${DEFAULT_BRANCH:?}"
-  : "${RELEASE_BOT_NAME:?}" "${RELEASE_BOT_EMAIL:?}"
 fi
 
 server_url="${GITHUB_SERVER_URL:-https://github.com}"
@@ -293,6 +291,8 @@ mv CHANGELOG.md.next CHANGELOG.md
 # identical proposal: besides being needless churn, that write can turn a
 # transient push failure into a red recovery run. Fetch into
 # FETCH_HEAD so this comparison does not depend on a local tracking ref.
+git remote set-url origin "https://x-access-token:${GH_TOKEN}@${server_host}/${GITHUB_REPOSITORY}.git"
+
 release_branch_current=0
 if git fetch -q --no-tags origin "refs/heads/$RELEASE_BRANCH" 2>/dev/null; then
   if git diff --quiet FETCH_HEAD -- \
@@ -301,24 +301,45 @@ if git fetch -q --no-tags origin "refs/heads/$RELEASE_BRANCH" 2>/dev/null; then
   fi
 fi
 
-git config user.name "$RELEASE_BOT_NAME"
-git config user.email "$RELEASE_BOT_EMAIL"
-git remote set-url origin "https://x-access-token:${GH_TOKEN}@${server_host}/${GITHUB_REPOSITORY}.git"
-
 if [ "$release_branch_current" = "1" ]; then
   echo "prepare-release: $RELEASE_BRANCH already matches v$next; leaving its commit unchanged"
 else
-  git checkout -B "$RELEASE_BRANCH"
+  # The default branch requires signed commits, and a commit pushed with git
+  # by the App is unsigned, so its pull request could never merge. A commit
+  # the App creates through the API is signed by GitHub instead. Point the
+  # release branch at the default branch's tip, then commit the release
+  # files onto it in one API call that fails if the branch moved meanwhile.
+  base=$(git rev-parse HEAD)
+  if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$RELEASE_BRANCH" >/dev/null 2>&1; then
+    gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/$RELEASE_BRANCH" \
+      -f sha="$base" -F force=true >/dev/null
+  else
+    gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+      -f ref="refs/heads/$RELEASE_BRANCH" -f sha="$base" >/dev/null
+  fi
 
-  # Stage only the files this script edits. `git add -A` sweeps in whatever else
-  # the job left in the working tree — a cargo home inside the checkout once
-  # committed 330 files of restored registry cache alongside a three-line
-  # version bump.
-  git add CHANGELOG.md Cargo.lock
-  git ls-files -z '*Cargo.toml' | xargs -0 git add --
+  # Only the files this script edits, and only those it changed. `git add -A`
+  # once swept in whatever else the job left in the working tree — a cargo
+  # home inside the checkout committed 330 files of restored registry cache
+  # alongside a three-line version bump.
+  additions='[]'
+  for path in $( { echo CHANGELOG.md; echo Cargo.lock; git ls-files '*Cargo.toml'; } \
+      | xargs git diff --name-only HEAD -- ); do
+    additions=$(printf '%s' "$additions" | jq --arg path "$path" \
+      --arg contents "$(base64 -w0 < "$path")" '. + [{path: $path, contents: $contents}]')
+  done
 
-  git commit -q -m "chore: release v$next"
-  git push -q --force origin "refs/heads/$RELEASE_BRANCH"
+  jq -n --arg repo "$GITHUB_REPOSITORY" --arg branch "$RELEASE_BRANCH" \
+        --arg headline "chore: release v$next" --arg base "$base" \
+        --argjson additions "$additions" '{
+    query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
+    variables: { input: {
+      branch: { repositoryNameWithOwner: $repo, branchName: $branch },
+      message: { headline: $headline },
+      expectedHeadOid: $base,
+      fileChanges: { additions: $additions }
+    } }
+  }' | gh api graphql --input - --jq '"prepare-release: committed \(.data.createCommitOnBranch.commit.oid) to '"$RELEASE_BRANCH"'"'
 fi
 
 # --- create the pull request, or refresh the open one ---------------------

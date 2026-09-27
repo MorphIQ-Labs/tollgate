@@ -4,7 +4,8 @@
 #          the `chore/release` pull request from the conventional commits since
 #          the last release. It runs as the release GitHub App: a pull request
 #          opened with this workflow's own GITHUB_TOKEN would never trigger the
-#          required checks, so it could never merge.
+#          required checks, so it could never merge. It commits through the
+#          API, which GitHub signs; main requires signed commits.
 # tag      When that pull request lands, `tag-release.sh` tags the release
 #          commit and creates the GitHub release from its CHANGELOG section.
 # publish  Publishes the crates for a tag cut in this run, from that tag's own
@@ -41,15 +42,6 @@ jobs:
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-      - name: Release bot identity
-        id: bot
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-          SLUG: ${{ steps.app.outputs.app-slug }}
-        run: |
-          id=$(gh api "/users/${SLUG}%5Bbot%5D" --jq .id)
-          echo "name=${SLUG}[bot]" >> "$GITHUB_OUTPUT"
-          echo "email=${id}+${SLUG}[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Tags and full history: the last release is found by its tag.
@@ -59,8 +51,6 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          RELEASE_BOT_NAME: ${{ steps.bot.outputs.name }}
-          RELEASE_BOT_EMAIL: ${{ steps.bot.outputs.email }}
 
   tag:
     name: release / tag
