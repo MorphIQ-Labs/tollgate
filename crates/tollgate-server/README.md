@@ -45,7 +45,8 @@ covers operator actions.
   [`tollgate-store-postgres`](https://crates.io/crates/tollgate-store-postgres).
   Without it, the server builds with no database dependency.
 - `test-support`: test-only APIs of the PostgreSQL backend (destructive
-  fixture reset, query-plan inspection). Not for production builds.
+  fixture reset, query-plan inspection). Not for production builds, and not
+  covered by semantic versioning: it may change in any release.
 
 ## Contract
 

@@ -1,6 +1,6 @@
-# Virtual workspace manifest. Every member inherits version/edition/license and
-# the private-registry publication guard from [workspace.package]. Distribution
-# remains by git tag; release-plz is configured in git-only mode.
+# Virtual workspace manifest. Every member inherits version, edition and license
+# from [workspace.package]. The library crates set `publish = true` and ship to
+# crates.io in lockstep; tooling and examples inherit `publish = false`.
 [workspace]
 resolver = "3"
 members = [
@@ -45,7 +45,10 @@ proc-macro2 = "1"
 criterion = "0.5"
 proptest = "1.7"
 tempfile = "3"
-tollgate-alloc-count = { path = "crates/tollgate-alloc-count", version = "=0.30.0" }
+# Path only, never a version: it is a dev-dependency of published crates, and
+# `cargo publish` strips a path-only dev-dependency but would require a
+# versioned one to exist on crates.io. The crate itself is never published.
+tollgate-alloc-count = { path = "crates/tollgate-alloc-count" }
 # Axum/tower test scaffolding: `oneshot` against a built router, and the body
 # collector that reads its response. Dev-only in every member that takes them.
 http-body-util = "0.1"

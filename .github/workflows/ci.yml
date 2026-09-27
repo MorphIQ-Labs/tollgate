@@ -74,6 +74,22 @@ jobs:
             printf 'Generated or ignored files are tracked:\n%s\n' "$tracked_ignored" >&2
             exit 1
           fi
+      - name: Every published crate ships the root license texts, unchanged
+        # crates.io packages each crate alone, so the license texts are copied
+        # into each crate directory (symlinks would trip the source walkers,
+        # which fail closed on any symlink). This keeps the copies identical.
+        run: |
+          status=0
+          for manifest in $(git grep -l '^publish = true' -- 'crates/*/Cargo.toml'); do
+            dir=$(dirname "$manifest")
+            for license in LICENSE-MIT LICENSE-APACHE; do
+              if ! cmp -s "$license" "$dir/$license"; then
+                printf '%s/%s is missing or differs from the root %s\n' "$dir" "$license" "$license" >&2
+                status=1
+              fi
+            done
+          done
+          exit "$status"
       - name: No manifest carries a publish registry list
         # GL-46 was a registry *list* from which tooling derived
         # `cargo package --registry <name>`; the name resolved nowhere and
@@ -168,6 +184,22 @@ jobs:
       - run: cargo install --locked cargo-deny --version "$(cat .cargo/deny-version)"
       - run: cargo deny --locked check licenses
 
+  # Packages every publishable crate exactly as crates.io would receive it and
+  # builds each from its package, against the others' local packages. A crate
+  # that cannot publish (a missing file, an unpublishable dependency, an
+  # invalid manifest) fails here, not in a release.
+  package:
+    name: check / package
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: workspace
+          save-if: false
+      - run: cargo publish --locked --workspace --dry-run
+
   # rust-toolchain.toml pins the development toolchain. Select the declared
   # minimum explicitly so this job cannot silently build with the newer pin.
   msrv:
@@ -184,7 +216,7 @@ jobs:
 
   test:
     name: test / test
-    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, msrv]
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -200,7 +232,7 @@ jobs:
   # controlled-host calibration and stays local.
   allocation-assertions:
     name: test / allocation-assertions
-    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, msrv]
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -220,7 +252,7 @@ jobs:
   # Postgres backend is disabled; the tree check makes that claim executable.
   test-no-default-features:
     name: test / test-no-default-features
-    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, msrv]
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -246,7 +278,7 @@ jobs:
   # runs for real here. TOLLGATE_REQUIRE_PG makes a silent skip fail red.
   test-postgres:
     name: test / test-postgres
-    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, msrv]
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     services:
@@ -275,7 +307,7 @@ jobs:
 
   bench-compile:
     name: test / bench-compile
-    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, msrv]
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -290,7 +322,7 @@ jobs:
   # No workload, timed measurement, or threshold verdict runs here.
   load-failure-reporting:
     name: test / load-failure-reporting
-    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, msrv]
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:

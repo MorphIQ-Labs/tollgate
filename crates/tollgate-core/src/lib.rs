@@ -19,8 +19,9 @@
 //! or releases for zero charge — producing a [`UsageEvent`] only when
 //! committed. See `INVARIANTS.md` at the workspace root.
 //!
-//! Tollgate distributes the workspace as one git-tagged unit under the
-//! canonical `v{version}` release series; this crate is not published alone.
+//! Tollgate releases the workspace as one unit: every published crate carries
+//! the same version, and the crates depend on each other at exactly that
+//! version.
 
 pub mod budget;
 pub mod cost_table;

@@ -7,7 +7,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+publish = true
+keywords = ["authentication", "api-key", "hmac", "session", "credentials"]
+categories = ["authentication", "web-programming"]
 
 [lints]
 workspace = true

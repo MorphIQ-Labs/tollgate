@@ -27,7 +27,8 @@ reconciliation query checks it on a live database.
 ## Features
 
 - `test-support`: destructive fixture reset and query-plan inspection, for
-  tests. Not for production builds.
+  tests. Not for production builds, and not covered by semantic versioning: it
+  may change in any release.
 
 ## Documentation
 
