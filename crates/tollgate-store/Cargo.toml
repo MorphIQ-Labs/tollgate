@@ -1,6 +1,7 @@
 [package]
 name = "tollgate-store"
 description = "Storage abstraction for tollgate: LeaseAllocator, SnapshotSource, and UsageSink traits, plus the in-memory reference implementation."
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -64,3 +64,9 @@ pub use state::{
 };
 #[doc(inline)]
 pub use tollgate_core::CancelHandle;
+
+// Compiles and runs the README's examples as doctests without adding them to
+// the rendered documentation, so the README cannot drift from the API.
+#[doc = include_str!("../README.md")]
+#[cfg(doctest)]
+pub struct ReadmeDoctests;

@@ -1,6 +1,7 @@
 [package]
 name = "tollgate-core"
 description = "Zero-I/O, clock-free domain layer for quota admission and accounting: cost tables, account snapshots, fenced local leases, and the reservation state machine."
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,6 +1,7 @@
 [package]
 name = "tollgate-client"
 description = "Instance-side quota runtime: background lease refill into the admission layer's LeaseSlot, and a bounded, batched, shed-on-overflow usage writer."
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
