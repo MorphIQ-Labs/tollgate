@@ -7,6 +7,23 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.30.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.30.0...v0.30.1) - 2026-09-27
+
+### Fixed
+
+- *(release)* build the release commit safely at real size (#9)
+- *(release)* create the release commit through the API so it is signed (#8)
+
+### Other
+
+- release on GitHub: prepare, tag, publish (#6)
+- make the seven library crates publishable to crates.io (#5)
+- describe the GitHub process, and add a security policy (#4)
+- a README for every published crate (#3)
+- move the gates to GitHub Actions (#2)
+- publish the design record
+- prepare the public release
+
 ## [0.30.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.29.3...v0.30.0) - 2026-09-25
 
 ### Added
