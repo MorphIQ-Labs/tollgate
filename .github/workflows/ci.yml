@@ -9,6 +9,11 @@
 #
 # Every gate runs on every pull request, whatever branch it targets: whether a
 # gate runs is a property of the change, not of its routing (GL-106).
+#
+# Stages, as `needs`: check -> test -> assurance. A stage starts only when
+# every job of the one before has passed, so a formatting error stops the run
+# before the mutation gate spends its time. Later jobs then show as skipped;
+# the failed job is itself a required check and blocks the pull request.
 # `scripts/check_ci_rules.sh` enforces that against this file.
 #
 # Third-party actions are pinned to full commit SHAs; the comment names the
@@ -35,6 +40,7 @@ env:
 
 jobs:
   commit-convention:
+    name: check / commit-convention
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -53,6 +59,7 @@ jobs:
           fi
 
   repository-hygiene:
+    name: check / repository-hygiene
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -90,6 +97,7 @@ jobs:
       - run: ./scripts/check_seam_contract.sh
 
   secret-scan:
+    name: check / secret-scan
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -108,6 +116,7 @@ jobs:
             --log-opts="$BASE..HEAD"
 
   fmt:
+    name: check / fmt
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -115,6 +124,7 @@ jobs:
       - run: cargo fmt --check
 
   clippy:
+    name: check / clippy
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -135,6 +145,7 @@ jobs:
   # requests and on main, so a newly published advisory blocks the next change
   # and also withdraws a just-merged revision from release.
   audit:
+    name: check / audit
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -147,6 +158,7 @@ jobs:
   # The graph may ship under MIT OR Apache-2.0 only while every dependency is
   # available under a permissive license; deny.toml is that allowlist.
   licenses:
+    name: check / licenses
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -159,6 +171,7 @@ jobs:
   # rust-toolchain.toml pins the development toolchain. Select the declared
   # minimum explicitly so this job cannot silently build with the newer pin.
   msrv:
+    name: check / msrv
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     env:
@@ -170,6 +183,8 @@ jobs:
       - run: cargo check --locked --workspace --all-features --all-targets
 
   test:
+    name: test / test
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, msrv]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -184,6 +199,8 @@ jobs:
   # shared runner. Allocation is a structural contract; latency needs
   # controlled-host calibration and stays local.
   allocation-assertions:
+    name: test / allocation-assertions
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, msrv]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -202,6 +219,8 @@ jobs:
   # The service library remains backend-generic when the binary's optional
   # Postgres backend is disabled; the tree check makes that claim executable.
   test-no-default-features:
+    name: test / test-no-default-features
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, msrv]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -226,6 +245,8 @@ jobs:
   # The env-gated Postgres suite, which skips on machines without a database,
   # runs for real here. TOLLGATE_REQUIRE_PG makes a silent skip fail red.
   test-postgres:
+    name: test / test-postgres
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, msrv]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     services:
@@ -253,6 +274,8 @@ jobs:
       - run: cargo test --locked -p tollgate-server --all-features --test credential_expiry
 
   bench-compile:
+    name: test / bench-compile
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, msrv]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -266,6 +289,8 @@ jobs:
   # Fixed I/O and protocol failures, with the real load tool's panic policy.
   # No workload, timed measurement, or threshold verdict runs here.
   load-failure-reporting:
+    name: test / load-failure-reporting
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, msrv]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -283,6 +308,8 @@ jobs:
 
   # Blocking assurance gate: the Lean model must build.
   formal:
+    name: assurance / formal
+    needs: [test, allocation-assertions, test-no-default-features, test-postgres, bench-compile, load-failure-reporting]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -303,6 +330,8 @@ jobs:
   # Blocking assurance gate: diff-scoped mutation testing, including the
   # Postgres backend.
   mutation:
+    name: assurance / mutation
+    needs: [test, allocation-assertions, test-no-default-features, test-postgres, bench-compile, load-failure-reporting]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
