@@ -1,7 +1,7 @@
 # Invariant reference checks
 
 Run `./scripts/check_invariant_witnesses.sh` from a checkout. The same command
-runs in the blocking `repository-hygiene` job on every merge request. It builds
+runs in the blocking `repository-hygiene` job on every pull request. It builds
 only the small `tollgate-repo-check` tool; it does not compile the workspace,
 execute tests, run mutation testing, start PostgreSQL, or measure performance.
 The binary accepts an optional repository path, `--help`, `--version`, and `--`.

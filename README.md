@@ -109,7 +109,7 @@ running measurements. The gate tools retain their documented positional inputs.
 ## Supported Rust toolchains
 
 The workspace declares Rust 1.89 as its minimum supported Rust version
-(MSRV). Every merge request checks the locked workspace, including all
+(MSRV). Every pull request checks the locked workspace, including all
 features and targets, with Rust 1.89.0 so dependency updates cannot silently
 raise that floor.
 
@@ -121,7 +121,7 @@ to the declared minimum and the dedicated `msrv` job must land together.
 ## Performance measurements
 
 Timed Criterion and production-profile loopback load tests run locally.
-Performance-sensitive merge requests and releases carry the reports and their
+Performance-sensitive pull requests and releases carry the reports and their
 host/revision provenance. CI compiles the benchmarks and checks allocation
 counts; remote timing does not decide whether a change can merge. See
 [the local performance workflow](docs/PERFORMANCE.md).
@@ -174,6 +174,8 @@ for inclusion in Tollgate by you, as defined in the Apache-2.0 license, shall be
 dual licensed as above, without any additional terms or conditions.
 
 Tollgate is a product of MorphIQ Labs, a trade name of Prophetizo LLC.
+
+Report security issues privately; see [`SECURITY.md`](SECURITY.md).
 
 `cargo deny --locked check licenses` (the `licenses` CI job) gates the dependency graph against
 [`deny.toml`](deny.toml): every dependency must be available under a permissive
