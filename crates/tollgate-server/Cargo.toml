@@ -1,6 +1,7 @@
 [package]
 name = "tollgate-server"
 description = "Control-plane HTTP service: fenced lease allocation, snapshot distribution, idempotent usage ingest, and account administration over any store backend."
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

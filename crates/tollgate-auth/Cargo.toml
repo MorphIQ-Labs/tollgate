@@ -1,6 +1,7 @@
 [package]
 name = "tollgate-auth"
 description = "Credential verification for latency-critical services: digests at rest, and a session-scoped cache that removes the per-request digest without widening the revocation window."
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

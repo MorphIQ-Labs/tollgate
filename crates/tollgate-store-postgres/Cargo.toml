@@ -1,6 +1,7 @@
 [package]
 name = "tollgate-store-postgres"
 description = "PostgreSQL backend for tollgate: transactional fenced lease allocation, idempotent usage ingest, and snapshot storage implementing the tollgate-store traits."
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
