@@ -3,7 +3,7 @@
 //! A denial returns a [`DenyReason`] to its caller and is then gone: an
 //! instance serving no traffic and one refusing every request look identical
 //! from outside. The control plane closes that gap with structured events,
-//! but this plane cannot — INVARIANTS.md #5 forbids I/O, locks and clock
+//! but this plane cannot — INVARIANTS.md GL-5 forbids I/O, locks and clock
 //! reads on the request path, and a logging call is all three. What remains
 //! affordable is a counter: no allocation, no formatting, and a shard index
 //! that is a mask fixed at engine construction.
@@ -24,7 +24,7 @@ use tollgate_core::{CapacityClass, CommitError, CostUnits, DenyReason, LocalShar
 /// How many execution-capacity classes exist, and their stable label order.
 ///
 /// Two, and the labels are the enum tags alone — the whole bounded-cardinality
-/// rule for capacity metrics (#99). A dense pair rather than a
+/// rule for capacity metrics (GL-99). A dense pair rather than a
 /// `DenyReason`-shaped table, for the reason `CommitRefusal` gives.
 pub const CAPACITY_CLASS_COUNT: usize = 2;
 
@@ -90,7 +90,7 @@ impl Padded {
 /// These are counted separately from `denials` on purpose. A request refused
 /// here was already counted under `admitted`, and bumping the pre-admission
 /// denial total a second time would make one request both an admission and a
-/// member of the same flat refusal sum (INVARIANTS.md #20).
+/// member of the same flat refusal sum (INVARIANTS.md GL-20).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitRefusal {
     /// The funding lease's window lapsed and no overage fallback applied.
@@ -154,7 +154,7 @@ impl CommitRefusal {
 ///
 /// Counters are monotonic and wrap at [`u64::MAX`]. Unlike cost and lease
 /// arithmetic — which is checked, because a wrapped charge is a wrong bill
-/// (INVARIANTS.md #11) — a wrapped monitoring counter is not a correctness
+/// (INVARIANTS.md GL-11) — a wrapped monitoring counter is not a correctness
 /// event, and rate-of-change is how counters are read anyway. At a billion
 /// admissions a second the `admitted` counter would need roughly 584 years to
 /// reach the wrap; adding a branch on the request path to guard against it
@@ -168,7 +168,7 @@ impl CommitRefusal {
 /// instance serves every account in the map, so an unsharded tally is a
 /// cache line that unrelated tenants fight over: eight threads on eight
 /// distinct accounts measured 772 ns per admission against the inline
-/// counters and 181 ns with only the counters sharded (#132). Lease sharding
+/// counters and 181 ns with only the counters sharded (GL-132). Lease sharding
 /// stays opt-in because it is paid per account — each account's state, lease
 /// counters and rate buckets multiply by the shard count — and because its
 /// rate buckets partition the account's burst. The tallies are one set per
@@ -184,7 +184,7 @@ impl CommitRefusal {
 /// contexts, commit refusals — which stay inline because their paths either
 /// already serialize on a shared compare-exchange or run far below the
 /// admission rate. `repr(C)` keeps their declaration order the layout, so a
-/// new counter cannot silently rearrange the rest (#99 measured a 3.5%
+/// new counter cannot silently rearrange the rest (GL-99 measured a 3.5%
 /// `full_check` swing from a rearrangement alone); append new fields after
 /// every field that predates them.
 #[derive(Debug)]
@@ -199,7 +199,7 @@ pub struct AdmissionCounters {
     committed_at_overage: Padded,
     units_committed_at_overage: Padded,
     commit_refusals: [Padded; CommitRefusal::COUNT],
-    /// The per-class breakdown of capacity sheds (#99). Inline: a shed is a
+    /// The per-class breakdown of capacity sheds (GL-99). Inline: a shed is a
     /// bounded exception. The per-class *starts* shard with the start total,
     /// because every executed request bumps one.
     capacity_shed_by_class: [Padded; CAPACITY_CLASS_COUNT],
@@ -350,7 +350,7 @@ impl AdmissionCounters {
     /// nor a denial. It is counted anyway because the alternative is silence:
     /// an instance authenticating a flood of requests that never reach stage
     /// two would otherwise be indistinguishable from one serving none, which
-    /// is exactly the blindness INVARIANTS.md #20 exists to prevent.
+    /// is exactly the blindness INVARIANTS.md GL-20 exists to prevent.
     #[inline]
     pub fn record_context_abandoned(&self) {
         self.contexts_abandoned.bump(1);
@@ -360,20 +360,20 @@ impl AdmissionCounters {
     ///
     /// Pending funding existed and was released for zero. Counted here rather
     /// than in `denials` because the request was already counted under
-    /// `admitted`; #99 adds the per-class breakdown on top of this total.
+    /// `admitted`; GL-99 adds the per-class breakdown on top of this total.
     #[inline]
     pub fn record_capacity_shed(&self) {
         self.record_capacity_shed_for(CapacityClass::Assured);
     }
 
-    /// Record a shed against the class whose work was refused (#99).
+    /// Record a shed against the class whose work was refused (GL-99).
     #[inline]
     pub(crate) fn record_capacity_shed_for(&self, class: CapacityClass) {
         self.capacity_shed.bump(1);
         self.capacity_shed_by_class[class_slot(class)].bump(1);
     }
 
-    /// Record an execution start against the class that started it (#99).
+    /// Record an execution start against the class that started it (GL-99).
     #[inline]
     pub(crate) fn record_execution_started_for(&self, class: CapacityClass, locality: Locality) {
         let shard = self.shard(locality);
@@ -412,7 +412,7 @@ impl AdmissionCounters {
     /// Public because not every refusal originates in
     /// [`RequestContext::admit`](crate::RequestContext::admit):
     /// `AccountingBackpressure` is decided by the embedder *before* admission
-    /// (INVARIANTS.md #8 sheds on a full usage queue), so a service that
+    /// (INVARIANTS.md GL-8 sheds on a full usage queue), so a service that
     /// sheds there records it here. A slot that could only ever read zero
     /// because nothing can reach it would be worse than absent — it would
     /// read as "this never happens".
@@ -522,9 +522,9 @@ pub struct CountersSnapshot {
     /// consumed them: no pending funding, no admission outcome.
     pub contexts_abandoned: u64,
     /// Admitted requests refused by the execution-capacity gate, released for
-    /// zero. #99 adds the per-class breakdown.
+    /// zero. GL-99 adds the per-class breakdown.
     pub capacity_shed: u64,
-    /// Sheds and starts split by class (#99), in [`CAPACITY_CLASS_NAMES`]
+    /// Sheds and starts split by class (GL-99), in [`CAPACITY_CLASS_NAMES`]
     /// order. Each sums to the total beside it; neither replaces it, so a
     /// reader never has to add two numbers to get one.
     pub capacity_shed_by_class: [u64; CAPACITY_CLASS_COUNT],
@@ -583,7 +583,7 @@ impl CountersSnapshot {
         self.commit_refusals.iter().sum()
     }
 
-    /// Execution starts paired with their class labels, in slot order (#99).
+    /// Execution starts paired with their class labels, in slot order (GL-99).
     pub fn execution_started_by_class_name(
         &self,
     ) -> impl Iterator<Item = (&'static str, u64)> + '_ {
@@ -593,7 +593,7 @@ impl CountersSnapshot {
             .zip(self.execution_started_by_class.iter().copied())
     }
 
-    /// Capacity sheds paired with their class labels, in slot order (#99).
+    /// Capacity sheds paired with their class labels, in slot order (GL-99).
     pub fn capacity_shed_by_class_name(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
         CAPACITY_CLASS_NAMES
             .iter()
@@ -672,7 +672,7 @@ mod tests {
     /// A counter added later sits after every counter that predates it.
     ///
     /// `repr(C)` makes the declaration order binding; this makes *appending*
-    /// binding. Both are needed, and the failure mode is silent: #99's two
+    /// binding. Both are needed, and the failure mode is silent: GL-99's two
     /// per-class arrays were first filed beside the totals they break down,
     /// which moved the counters a request touches on every admission and cost
     /// `admission/full_check` 3.5% while executing no new code on that path.
@@ -878,7 +878,7 @@ mod tests {
     }
 
     /// The default lease layout must not put unrelated threads' tallies back
-    /// on one line: that is the cross-account contention #132 removed, and it
+    /// on one line: that is the cross-account contention GL-132 removed, and it
     /// shows up only under concurrency, in no functional test.
     #[test]
     fn the_default_lease_layout_still_separates_localities() {
@@ -918,7 +918,7 @@ mod tests {
     }
 
     /// Admissions accumulate units; denials must add none, since a refusal
-    /// charges zero (INVARIANTS.md #5).
+    /// charges zero (INVARIANTS.md GL-5).
     #[test]
     fn admissions_accumulate_units_and_denials_do_not() {
         let counters = AdmissionCounters::new();

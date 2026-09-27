@@ -47,7 +47,7 @@ pub enum AllocateError {
     UnknownLease,
     /// The fencing token does not match the lease record named by `lease_id`.
     /// Token ordering across different active leases is irrelevant
-    /// (INVARIANTS.md #4).
+    /// (INVARIANTS.md GL-4).
     Fenced,
     /// The lease exists but is no longer active (already released, expired,
     /// or reclaimed).
@@ -151,14 +151,14 @@ pub struct AccountConfig {
     pub initial_balance: CostUnits,
     /// The account's administrative status at birth. Anything but
     /// [`AccountStatus::Active`] refuses leases while keeping the ledger, and
-    /// `Closed` is terminal from creation onwards (INVARIANTS.md #22).
+    /// `Closed` is terminal from creation onwards (INVARIANTS.md GL-22).
     ///
     /// An [`AccountStatus`] rather than a bool so creation and
     /// [`AdminStore::set_account_status`] speak one vocabulary about one
     /// column; the bool could not express `Closed`, which is what let
-    /// terminality be a convention instead of a check (#51).
+    /// terminality be a convention instead of a check (GL-51).
     pub status: AccountStatus,
-    /// The account's execution-capacity class at birth (#99).
+    /// The account's execution-capacity class at birth (GL-99).
     ///
     /// Present at creation for the reason `status` is: creation and
     /// [`AdminStore::set_capacity_class`] speak one vocabulary about one
@@ -198,7 +198,7 @@ pub struct Conservation {
     pub settled_usage: CostUnits,
     pub settlement_loss: CostUnits,
     /// Units that were funded but will never be spent, because the period
-    /// that funded them ended (#97).
+    /// that funded them ended (GL-97).
     ///
     /// A resting place on the right of the equation, beside `settlement_loss`
     /// and for the same reason: both are units the account was funded with
@@ -220,7 +220,7 @@ impl Conservation {
     /// `false`, never a wrap or a panic: this function exists to *detect*
     /// corrupt ledger state, so arithmetic that could not represent the state
     /// must report a violation rather than quietly produce a total that
-    /// happens to match (INVARIANTS.md #11).
+    /// happens to match (INVARIANTS.md GL-11).
     #[must_use]
     pub fn holds(&self) -> bool {
         let Some(funded) = self.deposited.checked_add(self.overage_recorded) else {
@@ -262,7 +262,7 @@ pub struct GrantPolicy {
     /// `expires_at - safety margin` (their side of the protocol), so work
     /// committed inside the usability window has `margin + grace` to be
     /// flushed and billed before settlement could reject it. Releases are
-    /// also accepted through the grace window (review finding #1).
+    /// also accepted through the grace window (review finding GL-1).
     pub reclaim_grace: SignedDuration,
 }
 
@@ -342,8 +342,8 @@ impl GrantPolicy {
     ///
     /// `balance` already includes the credit the exchange restores, and
     /// `floor` is that credit: the ordinary answer may not shrink the holding
-    /// (#109). `needed` is the largest quote the returned lease refused, and
-    /// the answer grows to it when `balance` can fund it (#131). The shrink
+    /// (GL-109). `needed` is the largest quote the returned lease refused, and
+    /// the answer grows to it when `balance` can fund it (GL-131). The shrink
     /// cap stops one holder hoarding a small balance ahead of demand; a quote
     /// the holder already failed to fund is demand, and the request that
     /// proved it spends it. A quote `balance` cannot fund grows nothing,
@@ -374,7 +374,7 @@ pub struct ReclaimedLease {
     pub account_id: AccountId,
     /// Units recorded as provisional settlement loss: `granted - recorded
     /// usage` at the sweep. Nothing is credited back, because a holder that
-    /// never released cannot prove any unit unspent (#136); usage for the
+    /// never released cannot prove any unit unspent (GL-136); usage for the
     /// lease that arrives later converts loss into billed usage.
     pub forfeited: CostUnits,
 }
@@ -508,7 +508,7 @@ pub trait LeaseAllocator: Send + Sync {
     /// re-grants 29 under the default policy), and in the gap between the two
     /// calls another instance can take them. Neither is recoverable by the
     /// holder, which is why the exchange belongs to the component that owns
-    /// both the policy and the transaction (INVARIANTS.md #1, #6).
+    /// both the policy and the transaction (INVARIANTS.md GL-1, GL-6).
     ///
     /// **The grant is never smaller than the credit actually restored.**
     /// Allowance funded by a closed period expires at settlement; only its
@@ -566,7 +566,7 @@ pub trait LeaseAllocator: Send + Sync {
     /// recorded as provisional settlement loss, exactly as a release claiming
     /// nothing unspent would record it, because a holder that never released
     /// cannot prove any unit unspent: it may have committed work it never
-    /// flushed (INVARIANTS.md #9, #136). Usage for the lease that arrives
+    /// flushed (INVARIANTS.md GL-9, GL-136). Usage for the lease that arrives
     /// later fits in that loss and converts it into billed usage.
     ///
     /// One call is one bounded atomic
@@ -599,7 +599,7 @@ pub trait LeaseAllocator: Send + Sync {
 /// the wrapper's own `reclaim_expired_batch` override, and so discards any
 /// failure that override injects — and copying this loop, which is how two
 /// copies drift apart. Calling this keeps one body and re-dispatches every
-/// batch through `allocator`, whatever `allocator` is (#83).
+/// batch through `allocator`, whatever `allocator` is (GL-83).
 ///
 /// `#[doc(hidden)]` marks it cross-crate-visible for that purpose rather than
 /// part of the documented surface, as [`Reservation::reserve_at_locality`] is
@@ -665,7 +665,7 @@ pub const PUSH_CHANNEL_CAPACITY: usize = 256;
 
 /// Whether pushing `principals` updates at once will out-run the push channel.
 ///
-/// A status change republishes every live snapshot of an account (#51), so a
+/// A status change republishes every live snapshot of an account (GL-51), so a
 /// wide account can exceed the channel in one operation. Past this point every
 /// subscriber lags and resyncs its whole tracked set — correct, and bounded by
 /// the client's `max_concurrent_fetches`, but expensive enough that an
@@ -708,10 +708,10 @@ pub trait SnapshotSource: Send + Sync {
 
     /// Every principal this source knows, including revoked ones — a
     /// tombstone is still a principal an instance must track, so that it
-    /// knows the revocation (INVARIANTS.md #15).
+    /// knows the revocation (INVARIANTS.md GL-15).
     ///
     /// For instances that serve any customer rather than a configured slice
-    /// (#48). Pushes alone cannot answer this: they carry deltas from the
+    /// (GL-48). Pushes alone cannot answer this: they carry deltas from the
     /// moment of subscribing, so a cold instance has no way to learn the set
     /// that already exists.
     ///
@@ -730,13 +730,13 @@ pub trait SnapshotSource: Send + Sync {
 
 /// Liveness of the backing store, for readiness probes: a server must not
 /// report ready while its source of truth is unreachable (review finding
-/// #11).
+/// GL-11).
 #[async_trait]
 pub trait StoreHealth: Send + Sync {
     async fn ping(&self) -> Result<(), StoreError>;
 }
 
-/// Refusals from account creation (review finding #7): creation is never
+/// Refusals from account creation (review finding GL-7): creation is never
 /// destructive and never silently idempotent — recreating an existing
 /// account is a surfaced error in every backend, because an overwrite would
 /// reset balances/fencing under live leases and a silent no-op would hide
@@ -796,7 +796,7 @@ pub struct RolledAccount {
     /// The new period's allowance, deposited by this pass.
     pub deposited: CostUnits,
     /// Unspent allowance from the period that just closed. Manual top-ups are
-    /// never included: they persist across a boundary (#97).
+    /// never included: they persist across a boundary (GL-97).
     pub expired: CostUnits,
 }
 
@@ -860,7 +860,7 @@ impl RolloverBatch {
     }
 }
 
-/// Refusals from setting or rolling a budget schedule (#97).
+/// Refusals from setting or rolling a budget schedule (GL-97).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BudgetError {
     /// No such account. Never a silent no-op: an operator setting a schedule
@@ -886,7 +886,7 @@ impl From<StoreError> for BudgetError {
     }
 }
 
-/// Refusals from an account-status transition (#51).
+/// Refusals from an account-status transition (GL-51).
 ///
 /// Deliberately not an [`AllocateError`]: that enum's `NAMES`/`COUNT`/`index`
 /// are the width of `LeaseCounters`' per-reason tally, and a status refusal
@@ -923,7 +923,7 @@ impl From<StoreError> for SetStatusError {
     }
 }
 
-/// Refusals from publishing a snapshot (#51).
+/// Refusals from publishing a snapshot (GL-51).
 ///
 /// `publish_snapshot` used to return a bare [`StoreError`], which left it free
 /// to write a status contradicting the ledger and recreate the divergence
@@ -943,7 +943,7 @@ pub enum PublishSnapshotError {
         submitted: AccountStatus,
     },
     /// The snapshot's execution-capacity class disagrees with the account
-    /// ledger (#99). The class is an account-owned fact changed through
+    /// ledger (GL-99). The class is an account-owned fact changed through
     /// [`AdminStore::set_capacity_class`], which republishes; a publish may
     /// carry the current class but may not change it. Two writers for one
     /// fact is the divergence the status guard above already exists to
@@ -989,7 +989,7 @@ impl From<StoreError> for PublishSnapshotError {
     }
 }
 
-/// One account's administrative state, for an operator read (#121).
+/// One account's administrative state, for an operator read (GL-121).
 ///
 /// Assembled from types that already exist rather than a parallel vocabulary,
 /// so the HTTP surface reports the same terms the ledger reasons in and a
@@ -1003,7 +1003,7 @@ impl From<StoreError> for PublishSnapshotError {
 /// currently out, `settled_usage` is what was actually consumed,
 /// `settlement_loss` and `expired` are what will never be. A surface that
 /// reported only a balance would let a customer read depletion as spend, which
-/// is exactly what #121 asks not to do.
+/// is exactly what GL-121 asks not to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountView {
     pub account_id: AccountId,
@@ -1046,7 +1046,7 @@ pub trait AdminStore: Send + Sync {
     /// the ledger's status, and a republication of every *live* snapshot of
     /// that account carrying the new status at `generation + 1`.
     ///
-    /// This is the whole operator action. Before #51 the ledger flag and the
+    /// This is the whole operator action. Before GL-51 the ledger flag and the
     /// published `AccountStatus` were two records with two propagation paths
     /// and nothing checking them against each other, so "deactivate" returned
     /// success while the request path kept admitting.
@@ -1057,14 +1057,14 @@ pub trait AdminStore: Send + Sync {
     /// - [`AccountStatus::Closed`] is terminal
     ///   ([`SetStatusError::AccountClosed`]); `Closed` → `Closed` is a no-op.
     /// - Revoked principals are never republished: resurrecting a tombstone
-    ///   is what INVARIANTS.md #15 forbids, and revocation stays a separate
+    ///   is what INVARIANTS.md GL-15 forbids, and revocation stays a separate
     ///   per-credential mechanism.
     /// - Snapshots already at the target status are not rewritten, so a
     ///   repeat converges and bumps no generation.
     /// - Outstanding leases are **not** reclaimed. Lease acquisition refuses
     ///   at once, but admission stops only when the new snapshot installs —
     ///   one `SnapshotManager` refresh interval, and already-debited units
-    ///   settle at release or TTL reclaim (#9).
+    ///   settle at release or TTL reclaim (GL-9).
     async fn set_account_status(
         &self,
         account: AccountId,
@@ -1074,12 +1074,12 @@ pub trait AdminStore: Send + Sync {
     /// Set an existing account's execution-capacity class, in one
     /// transaction: the ledger's class, and a republication of every *live*
     /// snapshot of that account carrying the new class at `generation + 1`
-    /// (#99).
+    /// (GL-99).
     ///
     /// The same operator action, and the same ownership argument, as
     /// [`set_account_status`](Self::set_account_status): the class is one
     /// fact with one writer. A control plane that published it per credential
-    /// instead would recreate exactly the divergence #51 abolished — some of
+    /// instead would recreate exactly the divergence GL-51 abolished — some of
     /// an account's principals assured and some best-effort, with nothing
     /// checking them against each other, and a request's treatment depending
     /// on which credential it arrived with.
@@ -1089,7 +1089,7 @@ pub trait AdminStore: Send + Sync {
     /// - A closed account is [`SetStatusError::AccountClosed`]. Reclassifying
     ///   a terminally closed account is meaningless and the refusal changes
     ///   nothing, exactly as it does for a status change.
-    /// - Revoked principals are never republished (INVARIANTS.md #15).
+    /// - Revoked principals are never republished (INVARIANTS.md GL-15).
     /// - Snapshots already at the target class are not rewritten, so a repeat
     ///   converges and bumps no generation.
     /// - Nothing about funding changes. The class decides whether an instance
@@ -1123,7 +1123,7 @@ pub trait AdminStore: Send + Sync {
     /// every other administrative mutation: an operator surface has to be able
     /// to report what a call actually committed, and a bare `Ok` cannot say
     /// whether a schedule was introduced, replaced, or was already what the
-    /// caller asked for (#121). A repeat returns equal before/after states,
+    /// caller asked for (GL-121). A repeat returns equal before/after states,
     /// which is how the convention expresses an idempotent no-op.
     async fn set_budget_schedule(
         &self,
@@ -1173,7 +1173,7 @@ pub trait AdminStore: Send + Sync {
         principal: Principal,
     ) -> Result<crate::AdminReceipt<()>, StoreError>;
 
-    /// One account's administrative state, or `None` if no such account (#121).
+    /// One account's administrative state, or `None` if no such account (GL-121).
     ///
     /// The read an operator surface needs and the traits did not have. Both
     /// backends already expose `conservation` as an inherent method, but with
@@ -1195,7 +1195,7 @@ pub struct IngestReport {
     /// Newly recorded events.
     pub accepted: u64,
     /// Events whose `request_id` was already recorded (idempotent replay —
-    /// INVARIANTS.md #7).
+    /// INVARIANTS.md GL-7).
     pub duplicate: u64,
     /// Events refused: unknown lease, lease-capability mismatch, or no
     /// remaining accounting capacity, or units outside the backend's storage
@@ -1330,7 +1330,7 @@ pub enum Revocation {
 ///
 /// `UsageWriterConfig::validate` refuses a `max_batch` above this, so the
 /// misconfiguration is a startup error rather than a permanently-rejected
-/// batch discovered in production (#61).
+/// batch discovered in production (GL-61).
 pub const MAX_INGEST_BATCH: usize = 4_096;
 
 /// Why an ingest attempt failed, and whether replaying it unchanged could
@@ -1342,7 +1342,7 @@ pub const MAX_INGEST_BATCH: usize = 4_096;
 /// blip. A refused batch is a *fact about the batch*: retrying it unchanged
 /// gets the same answer forever, and every event queued behind it waits for a
 /// recovery that cannot come — a permanent, deterministic error laundered
-/// into an unbounded billing and availability outage (#61).
+/// into an unbounded billing and availability outage (GL-61).
 ///
 /// [`From<StoreError>`] yields [`Unavailable`](Self::Unavailable), so a
 /// backend that does not classify keeps the retry-forever behaviour it had.
@@ -1401,7 +1401,7 @@ pub enum KeyError {
     /// This is also the retry answer. A caller that supplies the `key_id` and
     /// loses the response resends the same one and is told the credential
     /// exists — which is the truth, and which discloses no secret. That is why
-    /// issuance must never become an upsert (#121).
+    /// issuance must never become an upsert (GL-121).
     AlreadyExists,
     /// The account already holds `limit` live credentials, so issuing another
     /// would exceed the bound the caller supplied.
@@ -1432,14 +1432,14 @@ impl std::fmt::Display for KeyError {
 impl std::error::Error for KeyError {}
 
 /// Refusals from binding or withdrawing a snapshot by the credential it was
-/// issued as (#143).
+/// issued as (GL-143).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeySnapshotError {
     /// No such credential, or it belongs to another account. One answer for
     /// both, as revocation gives: a foreign `key_id` discloses nothing.
     UnknownCredential,
     /// The credential was revoked. Revocation is terminal (INVARIANTS.md
-    /// #27), so it is never granted positive authorization again; withdrawal
+    /// GL-27), so it is never granted positive authorization again; withdrawal
     /// remains allowed.
     Retired {
         key_id: KeyId,
@@ -1482,7 +1482,7 @@ impl From<StoreError> for KeyError {
     }
 }
 
-/// One credential as an *administrator* sees it (#121).
+/// One credential as an *administrator* sees it (GL-121).
 ///
 /// Deliberately not a [`KeyRecord`]. A record carries `digest` — the HMAC the
 /// verifier compares against — and `principal`, documented there as "the
@@ -1554,7 +1554,7 @@ pub trait KeyDirectory: crate::KeySource {
     ///
     /// Revocation is durable and terminal: a retired credential is never
     /// resurrected, for the same reason a snapshot tombstone is not
-    /// (INVARIANTS.md #15).
+    /// (INVARIANTS.md GL-15).
     async fn revoke_key(&self, key_id: KeyId, now: Timestamp) -> Result<Revocation, KeyError>;
 
     /// Unbounded operator read of every credential valid at `now`. Serving
@@ -1563,7 +1563,7 @@ pub trait KeyDirectory: crate::KeySource {
     async fn active_keys(&self, now: Timestamp) -> Result<Vec<KeyRecord>, StoreError>;
 
     /// One account's credentials, ordered by `key_id`, for an operator
-    /// listing (#121).
+    /// listing (GL-121).
     ///
     /// Distinct from [`active_keys`](Self::active_keys), which is the
     /// fleet-wide, digest-bearing projection an *instance* pulls: this is
@@ -1582,7 +1582,7 @@ pub trait KeyDirectory: crate::KeySource {
     ) -> Result<Vec<KeySummary>, StoreError>;
 
     /// Record a credential only if the account holds fewer than `max_active`
-    /// live ones, counting and inserting indivisibly (#121).
+    /// live ones, counting and inserting indivisibly (GL-121).
     ///
     /// The bound is supplied per call rather than stored: what counts as a
     /// reasonable number of credentials belongs to the application's plan, not
@@ -1626,7 +1626,7 @@ pub trait KeyDirectory: crate::KeySource {
     ) -> Result<crate::AdminReceipt<Revocation>, KeyError>;
 
     /// Publish `snapshot` for the principal of `account`'s credential `key`,
-    /// resolved inside the store (#143).
+    /// resolved inside the store (GL-143).
     ///
     /// An operator holds `(account, key)`; the principal is digest material
     /// and never leaves the server. Resolution, the retirement check and the
@@ -1761,7 +1761,7 @@ mod tests {
         }
     }
 
-    /// #131: under the default divisor of 2, a 60-unit balance re-granted as
+    /// GL-131: under the default divisor of 2, a 60-unit balance re-granted as
     /// 30 forever, however often a 51-unit quote was refused.
     #[test]
     fn consolidation_grows_only_to_a_fundable_needed_quote() {
@@ -1777,7 +1777,7 @@ mod tests {
         assert_eq!(
             size(1_000, 60, 30, 0),
             Some(CostUnits(30)),
-            "the #109 floor"
+            "the GL-109 floor"
         );
         assert_eq!(
             size(1_000, 60, 30, 51),
@@ -1946,7 +1946,7 @@ mod tests {
 
     /// The left side is checked too. Overflowing the funding sum answers
     /// `false` rather than wrapping to a total that might coincidentally match
-    /// the right side (INVARIANTS.md #11).
+    /// the right side (INVARIANTS.md GL-11).
     #[test]
     fn overflowing_the_funding_sum_is_a_violation_not_a_wrap() {
         let overflowing = Conservation {
@@ -1964,7 +1964,7 @@ mod tests {
     /// An allowance that expired at a period boundary left the balance without
     /// being spent, so the equation only closes if `expired` is on the right
     /// side — and the same ledger without the term must fail by exactly the
-    /// units that expired, or the field would be decorative (#97).
+    /// units that expired, or the field would be decorative (GL-97).
     #[test]
     fn expiry_accounts_for_an_allowance_that_was_never_spent() {
         let rolled = Conservation {
@@ -2085,7 +2085,7 @@ mod tests {
     /// largest successful case and train an operator to ignore it. Mutation
     /// testing found this untested — the comparison could be flipped to `<`,
     /// `<=` or `>=` and every scenario stayed green, because nothing observed
-    /// the warning at all (#51).
+    /// the warning at all (GL-51).
     #[test]
     fn the_push_capacity_warning_fires_only_above_the_channel() {
         assert!(

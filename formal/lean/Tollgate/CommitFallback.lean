@@ -63,7 +63,7 @@ This is the model of `Reservation::usage_event`. A fallback commit carries a
 lease, so the lease never funded the work: a leased bill would claim units the
 lease's settlement already accounted for, rejected against a release's credit
 (losing the charge for work that ran) or billed against a reclaim's forfeit it
-did not cause (#136). -/
+did not cause (GL-136). -/
 def usageSource : Phase → Option Source
   | .committedLease => some .leased
   | .committedOverage => some .overage

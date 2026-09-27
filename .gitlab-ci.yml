@@ -8,8 +8,8 @@
 #
 # Every job carries `dependencies: []`. No job consumes another job's artifacts,
 # and left implicit GitLab makes each later-stage job download every
-# earlier-stage artifact. a sibling workspace lost its entire test stage to a 403 that
-# way, fetching whitepaper PDFs nothing reads. `dependencies` controls downloads
+# earlier-stage artifact. A sibling workspace lost its entire test stage to a
+# 403 that way, fetching documents nothing reads. `dependencies` controls downloads
 # only; mutation assurance still publishes its report.
 #
 # Cache: Cargo sources and target artifacts are keyed by Cargo.lock plus the
@@ -130,7 +130,7 @@ repository-hygiene:
         exit 1
       fi
     - |
-      # #46 was a registry *list* — `publish = ["private-registry"]` — from which
+      # GL-46 was a registry *list* — `publish = ["<private-registry>"]` — from which
       # tooling derives `cargo package --registry <name>`; the name resolved
       # nowhere and every main pipeline failed. The plain `publish = false` is a
       # different thing and is required: it is what refuses a stray
@@ -138,22 +138,22 @@ repository-hygiene:
       # inheriting it would evade a workspace-only check.
       publish_lists="$(git grep -n '^[[:space:]]*publish[[:space:]]*=[[:space:]]*\[' -- '*Cargo.toml' || true)"
       if [ -n "$publish_lists" ]; then
-        printf 'Cargo manifests must not carry a publish registry list (see AGENTS.md, issue #46):\n%s\n' "$publish_lists" >&2
+        printf 'Cargo manifests must not carry a publish registry list (see AGENTS.md, issue GL-46):\n%s\n' "$publish_lists" >&2
         exit 1
       fi
     # Runs here, in `check`, and not in `assurance`: it guards the assurance
     # stage's own rules, so it must run in a pipeline where those rules have
-    # already decided whether that stage exists (#106).
+    # already decided whether that stage exists (GL-106).
     - ./scripts/check_ci_rules.sh
     - ./scripts/check_invariant_witnesses.sh
     # The two backend suites must drive the same contract under one test name.
     # `MemoryStore` has inherent helpers shadowing its `AdminStore` methods and
-    # `PostgresStore` has none, so the drift is silent and recurring (#43, #85).
+    # `PostgresStore` has none, so the drift is silent and recurring (GL-43, GL-85).
     - ./scripts/check_backend_parity.sh
     # The staged admission seam's contract says an implementing issue amends it
     # before publishing a different seam. That rule had no backstop and drifted:
     # `estimate_remaining` shipped on three stages declared in none of them, and
-    # the engine's own `new`/`map` were never in a block at all (#126).
+    # the engine's own `new`/`map` were never in a block at all (GL-126).
     - ./scripts/check_seam_contract.sh
 
 fmt:
@@ -197,6 +197,24 @@ audit:
   script:
     - ./scripts/check_advisories.sh
 
+# The graph may ship under MIT OR Apache-2.0 only while every dependency is
+# available under a permissive license; deny.toml is that allowlist. Same rules
+# as `audit`: a dependency bump that pulls in a copyleft-only crate blocks the
+# merge request, and the default branch is rechecked before release.
+licenses:
+  dependencies: []
+  stage: check
+  interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - when: never
+  before_script:
+    - export PATH="$CARGO_INSTALL_ROOT/bin:$PATH"
+    - cargo install --locked cargo-deny --version "$(cat .cargo/deny-version)" --root "$CARGO_INSTALL_ROOT"
+  script:
+    - cargo deny --locked check licenses
+
 # `rust-toolchain.toml` pins the development toolchain and overrides a
 # container's default toolchain. Select the declared minimum explicitly so
 # this job cannot silently install and test with the newer pinned compiler.
@@ -220,7 +238,7 @@ test:
   interruptible: true
   cache: *cargo-build-cache
   # The slim image has no git, and tollgate-repo-check's tag-release tests
-  # (#142) drive git in a scratch repository. Install it rather than skip them:
+  # (GL-142) drive git in a scratch repository. Install it rather than skip them:
   # a correctness check that silently does not run is no check at all.
   before_script:
     - apt-get update && apt-get install -y --no-install-recommends git
@@ -258,7 +276,7 @@ test-no-default-features:
   interruptible: true
   cache: *cargo-build-cache
   # The slim image has no git, and tollgate-repo-check's tag-release tests
-  # (#142) drive git in a scratch repository. Install it rather than skip them:
+  # (GL-142) drive git in a scratch repository. Install it rather than skip them:
   # a correctness check that silently does not run is no check at all.
   before_script:
     - apt-get update && apt-get install -y --no-install-recommends git
@@ -392,13 +410,13 @@ prepare-release:
 # request; this cuts the tag and the GitLab release when it lands.
 #
 # Replaces release-plz. Not because release-plz failed here — it worked — but
-# because it cannot work in the server project, a sibling workspace or a sibling workspace
-# (`cargo package` needs every dependency to resolve on crates.io, and internal
+# because it cannot work in the group's workspaces with unpublished internal
+# dependencies (`cargo package` needs every dependency to resolve on crates.io, and internal
 # crates never publish), and one release model across the group beats a working
 # exception. It also cost 9.5 minutes a pipeline to produce what this does in
 # seconds.
 #
-# #46's lesson survives the swap: the failure it describes was latent because the
+# GL-46's lesson survives the swap: the failure it describes was latent because the
 # release job runs only on main. This job has no configuration for a merge
 # request to get wrong — the version comes from the manifest and the notes from
 # the changelog — and `repository-hygiene` still rejects a manifest registry list

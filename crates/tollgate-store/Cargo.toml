@@ -4,7 +4,7 @@ description = "Storage abstraction for tollgate: LeaseAllocator, SnapshotSource,
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-authors.workspace = true
+license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
@@ -19,13 +19,13 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 # Wire-contract tests only: `wire.rs` decides what goes on the network, so what
-# it serializes is checked rather than asserted (#20).
+# it serializes is checked rather than asserted (GL-20).
 serde_json = { workspace = true }
 # Event-capture tests only, matching tollgate-client: a library emits, and only
 # a test or an application installs a subscriber to observe it.
 tracing-subscriber = { workspace = true }
 # State/representation contract properties: account-status agreement after
-# arbitrary transitions (#51) and exact positive wire TTL round trips (#76).
+# arbitrary transitions (GL-51) and exact positive wire TTL round trips (GL-76).
 proptest = { workspace = true }
 
 [features]

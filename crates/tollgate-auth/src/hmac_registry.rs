@@ -5,7 +5,7 @@
 //! credential lifecycle lives in a `KeyDirectory` (`tollgate-store`), and the
 //! control plane installs the active set here the way it installs account
 //! snapshots into a `SnapshotMap`. That split is why verification can stay
-//! I/O-free on the request path (INVARIANTS.md #5, #6) while issuance and
+//! I/O-free on the request path (INVARIANTS.md GL-5, GL-6) while issuance and
 //! revocation remain transactional and fleet-wide.
 
 use std::collections::HashMap;

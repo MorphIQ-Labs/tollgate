@@ -4,7 +4,7 @@
 //! live `tollgate-server`. Pluggability made executable: the client code is
 //! identical, only the `Arc<dyn LeaseAllocator>`/`Arc<dyn UsageSink>` differ.
 //!
-//! The workspace denies discarding a fallible call (issue #36), because that
+//! The workspace denies discarding a fallible call (issue GL-36), because that
 //! is how production failures went unseen. This harness's oneshot teardown
 //! signals are the exception the rule is not aimed at: the test's assertions
 //! are what fail if shutdown misbehaves, and a receiver that has already gone
@@ -100,7 +100,7 @@ fn snapshot() -> Arc<AccountSnapshot> {
             ),
         )
         // A stated revision, so the end-to-end path carries a real value
-        // rather than the zero an omission would also produce (#94).
+        // rather than the zero an omission would also produce (GL-94).
         .policy_revision(REVISION)
         .build(),
     )
@@ -327,7 +327,7 @@ async fn http_negative_ttl_refetches_without_push() {
     server.await.unwrap().unwrap();
 }
 
-/// #109: the fold has to survive the transport, and as *one* request. Split
+/// GL-109: the fold has to survive the transport, and as *one* request. Split
 /// into a release and an acquire over HTTP it would reopen exactly the gap the
 /// operation closes — another instance taking the returned units, and the
 /// grant policy sizing the replacement below what was handed back. Pinned here
@@ -575,7 +575,7 @@ async fn assert_shutdown_accounting(
         "unanswered grants funded no usage, and all of them are forfeited"
     );
     // Nobody can prove an unanswered grant unspent, so it becomes loss rather
-    // than balance (#136).
+    // than balance (GL-136).
     let after = store.conservation(ACCOUNT).unwrap();
     assert!(after.holds(), "{after:?}");
     assert_eq!(after.active_lease_grants, CostUnits::ZERO);
@@ -645,7 +645,7 @@ async fn controlled_shutdown(mode: common::TransportMode) {
             // 104 deposited -> 52 granted -> 51 billed, leaving 53 unspent.
             // A crossing acquires 26 beside the old lease. A refusal folds its
             // one-unit tail into a replacement grown to the refused 51-unit
-            // quote (#131). A lost reply leaves 53 less the replacement.
+            // quote (GL-131). A lost reply leaves 53 less the replacement.
             config.leases.low_water = match operation {
                 GrantOperation::Acquire => CostUnits(51),
                 GrantOperation::Consolidate => CostUnits::ZERO,
@@ -867,7 +867,7 @@ async fn full_stack(mode: common::TransportMode) {
     assert_eq!(fetched.generation, Generation(1));
     // The revision survived store -> HTTP -> client. The server decodes into
     // an `AccountSnapshot` and reserializes, so a field it did not carry would
-    // be stripped exactly here (#94).
+    // be stripped exactly here (GL-94).
     assert_eq!(fetched.policy_revision, REVISION);
     assert!(matches!(
         http.snapshot(Principal(999)).await.unwrap(),
@@ -931,7 +931,7 @@ async fn full_stack(mode: common::TransportMode) {
                     drop(committed);
                 }
                 // Spending an account down ends in lease refusals and, once the
-                // allocator has attested what is left, funding refusals (#130).
+                // allocator has attested what is left, funding refusals (GL-130).
                 // All are zero-charge.
                 Err(
                     DenyReason::LeaseUnavailable
@@ -995,7 +995,7 @@ async fn full_stack(mode: common::TransportMode) {
     .await;
 }
 
-/// #48 over the transport that needs it most. `HttpStore::subscribe` is a
+/// GL-48 over the transport that needs it most. `HttpStore::subscribe` is a
 /// closed channel — cross-process push is a deferred seam — so the periodic
 /// refresh is the *only* way a new customer reaches an HTTP-transport
 /// instance, and `GET /v1/snapshots` is the only way it learns the set exists.
@@ -1089,7 +1089,7 @@ fn at(seconds: i64) -> Timestamp {
     Timestamp::from_second(seconds).unwrap()
 }
 
-/// Issue #61, end to end: a batch the server refuses for size comes back
+/// Issue GL-61, end to end: a batch the server refuses for size comes back
 /// classified terminal, so the writer will drop it rather than retry forever.
 ///
 /// This is the round trip the wedge actually lived on. The unit tests either
@@ -1128,7 +1128,7 @@ async fn an_oversized_batch_comes_back_refused_not_retryable() {
     // Past the declared body limit, and *measured* past it rather than
     // estimated. This previously divided the limit by a hardcoded 163-byte
     // guess, under a comment claiming no reliance on a number that would rot
-    // if a field were added — and then #94 added a field, taking the body from
+    // if a field were added — and then GL-94 added a field, taking the body from
     // 8% over the limit to 64% over. Being far over is not harmlessly safer:
     // the server rejects and closes while the client is still writing, so the
     // clean 413 this test asserts becomes a connection reset often enough to
@@ -1178,7 +1178,7 @@ async fn an_oversized_batch_comes_back_refused_not_retryable() {
     server.await.unwrap();
 }
 
-/// Issue #61: 408 and 429 are the 4xx statuses that describe the moment, not
+/// Issue GL-61: 408 and 429 are the 4xx statuses that describe the moment, not
 /// the payload, so they stay retryable.
 ///
 /// They are the entire reason the classification is not simply
@@ -1352,7 +1352,7 @@ async fn shortfall_evidence_round_trips_over_http() {
     server.await.unwrap().unwrap();
 }
 
-/// #131 over the wire: the refused quote reaches the server's allocator, and
+/// GL-131 over the wire: the refused quote reaches the server's allocator, and
 /// the default shrinking policy grows the replacement to it.
 #[tokio::test]
 async fn consolidation_needed_round_trips_over_http() {

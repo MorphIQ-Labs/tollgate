@@ -1,7 +1,7 @@
 import Init.Omega
 
 /-!
-The two-pool execution-capacity model (#99).
+The two-pool execution-capacity model (GL-99).
 
 An instance divides its execution capacity into a shared pool and a reserve
 kept for assured work. Best-effort work may take only from shared; assured work
@@ -126,7 +126,7 @@ def releaseReserve (s : State) (held : 0 < s.reserveInFlight) : State :=
 /-! ## Conservation -/
 
 /-- Live permits never exceed configured total capacity, in any reachable
-state. This is the first of #99's invariants, and it holds by construction:
+state. This is the first of GL-99's invariants, and it holds by construction:
 the two bound fields are carried, so a state that violated it could not exist. -/
 theorem in_flight_never_exceeds_total (s : State) : s.inFlight ≤ s.total := by
   have shared := s.sharedBounded
@@ -161,7 +161,7 @@ theorem acquire_preserves_capacity
 
 /-- **Best-effort work cannot reduce assured headroom below the reserve.**
 
-The second of #99's invariants. Best-effort work reaches only the shared pool,
+The second of GL-99's invariants. Best-effort work reaches only the shared pool,
 so however much of it is in flight, the reserve's free units remain available
 to assured work. -/
 theorem best_effort_cannot_touch_the_reserve (s : State) :
@@ -228,7 +228,7 @@ theorem best_effort_headroom_excludes_the_reserve (shared reserve : Nat) :
 
 /-- The three runtime modes, and what each configures.
 
-`Disabled` is `none`: no pools, no bound, and — the property #99 asks for —
+`Disabled` is `none`: no pools, no bound, and — the property GL-99 asks for —
 no state for classification to change. `Uniform` is a shared pool with no
 reserve, so class changes no outcome. Only `Reserved` gives the reserve a
 nonzero size. -/

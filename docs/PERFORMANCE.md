@@ -25,7 +25,7 @@ Criterion uses the release profile with `codegen-units = 1`, pinned as
 `[profile.bench]` in the workspace manifest. The default sixteen units are not
 reproducible across unrelated change: rustc repartitions a crate as its code
 grows and cross-unit inlining moves with it, so a row's measurement shifts
-while its own source stands still. That is what #114 was --
+while its own source stands still. That is what GL-114 was --
 `admission/snapshot_lookup_moka` read 66.92ns before a feature commit and
 88.19ns after it, with `get_at`, the cache builder, `StoredEntry`, `MapEntry`
 and the hasher byte-identical across the pair; one codegen unit put the same
@@ -225,11 +225,11 @@ Then validate with a fresh full run that exits 0 with `enforced: true`, and put
 both the recalibration and that validating report in the merge request.
 
 Leave the host idle between runs — several minutes, not seconds. Back-to-back
-full-suite runs on Apple Silicon degrade: in the #114 measurements the first
+full-suite runs on Apple Silicon degrade: in the GL-114 measurements the first
 run after an idle gap was clean while the two immediately following it both
 came back `unreadable`, with ten of fifty-eight rows exceeding the confidence
 -interval bound. Judge a run by the report, not by how quiet the machine looked
-when it started: one #114 run began at 73% idle under a load average of 2.62,
+when it started: one GL-114 run began at 73% idle under a load average of 2.62,
 finished at 88% idle, was marked `trusted` with only two unstable rows, and
 still put nineteen rows over their bound on a `drift` of ×1.048. Idle and load
 average are context; `drift` and `trust` are the verdict.
@@ -258,6 +258,6 @@ The decision follows release !177's inconsistent ratios on unchanged source:
 one run failed reserved/uniform capacity; the next passed that comparison and
 failed disabled-capacity/admission. Separately tagged runner registrations also
 reported the same host identity. Infrastructure investigation remains tracked in
-#113; remote timing must not be restored without a separately reviewed design
+GL-113; remote timing must not be restored without a separately reviewed design
 and evidence of repeatable measurement conditions. See `docs/DESIGN.md` for the
 incident evidence and decision history.

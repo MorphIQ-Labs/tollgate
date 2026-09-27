@@ -1,7 +1,7 @@
 import Init.Omega
 
 /-!
-Control-plane authorization and administrative receipts (#98).
+Control-plane authorization and administrative receipts (GL-98).
 Credential authenticity is an input: these proofs do not establish TLS, RSA,
 HMAC, clock accuracy, or a Rust refinement. A request reads one immutable
 policy generation; ArcSwap publication supplies that implementation boundary.

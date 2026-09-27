@@ -4,7 +4,7 @@ Exact arithmetic model for snapshot batch-limit validation.
 Scope: unbounded natural-number costs, weights, item counts, and bursts. The
 model proves that validating the largest registered per-item weight at the
 batch cap bounds every registered operation at every permitted item count, and
-(#92) that the same worst case bounds a *heterogeneous* workload whose classes
+(GL-92) that the same worst case bounds a *heterogeneous* workload whose classes
 each stay under that weight and whose item counts sum within the cap. This is
 what lets publication keep validating one number — fixed plus the largest
 registered weight times the cap — after quoting became a sum over classes.

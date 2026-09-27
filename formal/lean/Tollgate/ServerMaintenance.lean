@@ -1,5 +1,5 @@
 /-!
-Server maintenance readiness (#71). Each pass publication is atomic; stop is
+Server maintenance readiness (GL-71). Each pass publication is atomic; stop is
 an independent, terminal bit; channel closure witnesses task exit. This model
 proves the predicate over observations, not scheduler fairness, backend progress,
 network delivery, or Tokio's memory model. Rust tests separately exercise task

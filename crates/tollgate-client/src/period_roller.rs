@@ -1,4 +1,4 @@
-//! Periodic allowance maintenance for direct-store embeddings (#107).
+//! Periodic allowance maintenance for direct-store embeddings (GL-107).
 //!
 //! The store owns calendar arithmetic, transactionality and idempotency. This
 //! task owns only scheduling: one frozen cutoff per bounded pass, bounded

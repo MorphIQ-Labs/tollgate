@@ -360,7 +360,7 @@ fn snapshot_state(generation: u64, revoked: bool) -> tollgate_store::AdminState 
 }
 
 /// An operator names a credential by `(account, key)`; the store resolves
-/// its principal and applies every rule the principal route applies (#143).
+/// its principal and applies every rule the principal route applies (GL-143).
 pub async fn key_bound_publication_resolves_the_principal_in_the_store(store: &impl Backend) {
     use tollgate_store::{AdminState, SnapshotResolution};
     let mut pushes = store.subscribe();
@@ -388,7 +388,7 @@ pub async fn key_bound_publication_resolves_the_principal_in_the_store(store: &i
         Some((1, false))
     );
 
-    // A replay at or below the stored generation is a silent no-op (#15).
+    // A replay at or below the stored generation is a silent no-op (GL-15).
     let replay = store
         .publish_key_snapshot(
             AccountId(1),
@@ -502,7 +502,7 @@ pub async fn key_bound_publication_is_bound_to_the_account_and_key(store: &impl 
     }
 }
 
-/// Revocation is terminal (INVARIANTS.md #27): a retired credential is never
+/// Revocation is terminal (INVARIANTS.md GL-27): a retired credential is never
 /// granted a snapshot again, but its snapshot can still be withdrawn. Expiry
 /// is not retirement.
 pub async fn a_retired_credential_is_never_granted_a_snapshot_but_can_be_withdrawn(

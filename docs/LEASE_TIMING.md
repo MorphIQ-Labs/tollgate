@@ -105,4 +105,4 @@ Mutation and formal gates run in CI.
 No request-path code, measured benchmark path, timing threshold or baseline
 changes. The control plane retains its existing transaction count and bounded
 reclaim batches. Migration backfill and index creation scale with stored rows;
-the account-order reclaim sorting concern was fixed separately, in #65.
+the account-order reclaim sorting concern was fixed separately, in GL-65.

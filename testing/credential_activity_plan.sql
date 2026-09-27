@@ -1,4 +1,4 @@
--- Reproduce #105's bounded lookup evidence with psql -X -v ON_ERROR_STOP=1
+-- Reproduce GL-105's bounded lookup evidence with psql -X -v ON_ERROR_STOP=1
 -- -f testing/credential_activity_plan.sql against a migrated test database.
 -- Session-local tables copy the real indexes without revision triggers or
 -- foreign keys. No durable data is changed. The predicate and requested-list

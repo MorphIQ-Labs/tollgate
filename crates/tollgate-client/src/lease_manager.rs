@@ -4,7 +4,7 @@
 //! The manager polls its account's [`LeaseSlot`] and keeps it stocked:
 //!
 //! - empty or expired slot → acquire and install (recovery from cold start,
-//!   INVARIANTS.md #10's readiness signal comes from observing the slot);
+//!   INVARIANTS.md GL-10's readiness signal comes from observing the slot);
 //! - live lease at or below low-water → acquire a *replacement* and install
 //!   it. The superseded lease is **not** released immediately: in-flight
 //!   reservations may still hold it. It is parked instead, and released back
@@ -17,7 +17,7 @@
 //!   rotation, and TTL reclaim remains the backstop.
 //! - allocator refusal with an expired/empty slot → the slot is cleared and
 //!   stays cleared: requests deny (`LeaseUnavailable`), fail-closed, while
-//!   the manager keeps retrying in the background (INVARIANTS.md #5).
+//!   the manager keeps retrying in the background (INVARIANTS.md GL-5).
 //!
 //! Graceful shutdown releases the current lease's remaining units. The
 //! embedding service must stop admitting and flush its usage writer *before*
@@ -25,7 +25,7 @@
 //! events land on a settled lease and be rejected.
 //!
 //! Every allocator call is wall-clock bounded and the shutdown carries a
-//! total budget (INVARIANTS.md #18), so a backend that hangs rather than
+//! total budget (INVARIANTS.md GL-18), so a backend that hangs rather than
 //! answering cannot park the refill loop or stall shutdown. Leases the budget
 //! could not return are counted in [`LeaseManagerReport::abandoned`] and
 //! settle at TTL reclaim.
@@ -34,12 +34,12 @@
 //! what the loop's two latency promises are made of. A steady-state release
 //! pass carries one `store_call_timeout` across every parked lease and each
 //! call within it is additionally capped by that budget, so neither refill
-//! latency (#6) nor shutdown latency (#18) grows with the number of parked
+//! latency (GL-6) nor shutdown latency (GL-18) grows with the number of parked
 //! leases. Both long awaits in the loop body — the release pass and
 //! `acquire` — are raced against the shutdown watch, so the signal is acted
-//! on where it arrives rather than at the next loop top (issue #78).
+//! on where it arrives rather than at the next loop top (issue GL-78).
 //!
-//! What a release refusal *means* differs by variant (issue #42): a storage
+//! What a release refusal *means* differs by variant (issue GL-42): a storage
 //! error or timeout is retried next tick, a settled lease is dropped, a
 //! fenced release also clears the slot because the store rejected a
 //! capability copied from the grant and local lease identity can no longer be
@@ -74,7 +74,7 @@ pub struct LeaseManagerConfig {
     /// commits at `expires_at - margin`. Size it to cover worst-case
     /// allocator/holder clock skew plus the longest request the service
     /// executes; the allocator's reclaim grace covers the other side
-    /// (review finding #1).
+    /// (review finding GL-1).
     pub expiry_safety_margin: SignedDuration,
     /// How often the slot is inspected. Refill latency is bounded by this
     /// plus one allocator round-trip — all off the request path.
@@ -85,7 +85,7 @@ pub struct LeaseManagerConfig {
     pub store_call_timeout: std::time::Duration,
     /// Total budget for returning leases at shutdown, across every parked
     /// lease. Leases still unreleased when it expires are reported and left
-    /// to TTL reclaim (INVARIANTS.md #9). Must be positive.
+    /// to TTL reclaim (INVARIANTS.md GL-9). Must be positive.
     pub shutdown_release_deadline: std::time::Duration,
 }
 
@@ -191,7 +191,7 @@ impl LeaseManagerConfig {
 /// water, answered by the loop below.
 ///
 /// Lock-free by construction, because [`RefillSignal::request_refill`] runs on
-/// the request path (INVARIANTS.md #5, #6). `AtomicWaker` is the primitive
+/// the request path (INVARIANTS.md GL-5, GL-6). `AtomicWaker` is the primitive
 /// built for exactly this handoff; tokio's `Notify` was rejected because
 /// `notify_one` takes an internal mutex whenever a waiter is parked, which is
 /// the normal state of this task.
@@ -230,7 +230,7 @@ impl RefillRequests {
             // Re-check after registering. A request landing between the first
             // check and the registration would otherwise be waited on
             // forever — the poll interval would eventually cover it, but the
-            // whole point of #10 is not to wait for that.
+            // whole point of GL-10 is not to wait for that.
             if self.pending.swap(false, Ordering::Acquire) {
                 std::task::Poll::Ready(())
             } else {
@@ -246,7 +246,7 @@ impl RefillRequests {
 /// [`LeaseManagerReport`] says what happened *at shutdown*, which leaves the
 /// running instance silent: whether refill is keeping up, and why the
 /// allocator is refusing when it does, were visible only as `tracing` events
-/// with nothing to threshold on (#4). These counters are the scrapeable half.
+/// with nothing to threshold on (GL-4). These counters are the scrapeable half.
 ///
 /// Written only by the refill task, so unlike the usage writer's counters they
 /// need no cache-line padding: one writer cannot contend with itself.
@@ -385,14 +385,14 @@ pub struct LeaseStats {
     /// Leases the allocator no longer holds open for this instance.
     pub released: u64,
     /// Leases the shutdown budget could not return; their units come back at
-    /// TTL reclaim (INVARIANTS.md #9). Like the writer's `lost`, this can only
+    /// TTL reclaim (INVARIANTS.md GL-9). Like the writer's `lost`, this can only
     /// move at shutdown — it is a confirmation, not an early warning.
     pub abandoned: u64,
     /// Rotations that folded a refused lease's unspent units into their
     /// replacement, counted apart from `acquired` because each one records
     /// that this instance *did* refuse work the account could fund. A rising
     /// rate is the signal that `target_grant` is undersized against the
-    /// largest quote the service prices (#109).
+    /// largest quote the service prices (GL-109).
     pub consolidated: u64,
     /// Consolidations that could not run because the refused lease still had
     /// a reservation in flight, so the slot kept serving it. Retried on the
@@ -553,7 +553,7 @@ impl LeaseManager {
         // Borrow the handle so cancellation still runs Drop's abort.
         match self.handle.as_mut() {
             // A task that died reports nothing it can substantiate; the flag
-            // says so rather than a zero that reads like a clean run (#41).
+            // says so rather than a zero that reads like a clean run (GL-41).
             Some(handle) => handle.await.unwrap_or(died),
             None => died,
         }
@@ -564,7 +564,7 @@ impl Drop for LeaseManager {
     fn drop(&mut self) {
         // Dropped without shutdown(): abort rather than leave a detached
         // task spinning against a dead watch channel. Held leases settle by
-        // TTL reclaim (INVARIANTS.md #9) — graceful code calls shutdown().
+        // TTL reclaim (INVARIANTS.md GL-9) — graceful code calls shutdown().
         if let Some(handle) = self.handle.take() {
             handle.abort();
         }
@@ -603,7 +603,7 @@ async fn run(
             _ = tick.tick() => {}
             // Falls through to the level check below like every other arm —
             // deliberately doing nothing here. An arm that returned or
-            // continued early would reintroduce review finding #2, where a
+            // continued early would reintroduce review finding GL-2, where a
             // shutdown observed concurrently is consumed and never acted on.
             () = refill.requested() => {}
             changed = shutdown.changed() => {
@@ -625,7 +625,7 @@ async fn run(
         let now = clock.now();
         // One budget for the pass, so a wedged backend costs this tick one
         // store call's worth of wall clock whatever `parked.len()` is, and
-        // the refill below is not queued behind it (#6, #78).
+        // the refill below is not queued behind it (GL-6, GL-78).
         let pass_deadline = tokio::time::Instant::now() + config.store_call_timeout;
         if release_quiesced(
             &allocator,
@@ -684,7 +684,7 @@ async fn run(
                 // fund, so the units it still holds are the ones the next
                 // grant needs. Acquiring beside it would ask for a grant
                 // sized against a balance those units are missing from, and
-                // install the smaller answer (#109).
+                // install the smaller answer (GL-109).
                 RefillVerdict::Refused => Rotation::Consolidate,
             },
         };
@@ -697,7 +697,7 @@ async fn run(
         // tries again. The signal is raced against the call for the same
         // reason it is raced inside the release pass — an acquire abandoned
         // here settles nothing, and the slot it would have filled is one the
-        // shutdown phase is about to drain anyway (#78).
+        // shutdown phase is about to drain anyway (GL-78).
         if paused.load(Ordering::Acquire) || *shutdown.borrow() {
             continue;
         }
@@ -792,19 +792,19 @@ async fn run(
     //
     // The comment that used to stand here said every lease had quiesced,
     // because callers flush usage and stop admitting first. That is the
-    // documented lifecycle (INVARIANTS.md #13), but `parked` at this moment
+    // documented lifecycle (INVARIANTS.md GL-13), but `parked` at this moment
     // holds — by construction — exactly the leases the last pass determined
     // were *not* quiesced, and reading `remaining()` on one of those reads a
     // number that is not final. A request task still holding a view can debit
     // after the release credits the account, and total committed usage then
-    // exceeds the allocation with a usage event to prove it (#1, #62).
+    // exceeds the allocation with a usage event to prove it (GL-1, GL-62).
     //
     // Caller discipline is the enforcement tier the standards call drift-prone,
     // and the predicate that makes it unnecessary already exists in
     // `release_quiesced`. So it is applied here too: a lease still holding an
     // outside view is waited for inside the shutdown budget, and abandoned
     // rather than released if it never quiesces. Abandoning returns the units
-    // at TTL reclaim (#9); releasing units that may still be spent is the one
+    // at TTL reclaim (GL-9); releasing units that may still be spent is the one
     // outcome that cannot be undone.
     if let Some(lease) = slot.take() {
         parked.push(lease);
@@ -836,7 +836,7 @@ async fn run(
         }
         // One budget across every lease, and no single call may outlast the
         // per-call timeout inside it. Whatever the budget cannot cover is
-        // reported abandoned and settles at TTL reclaim (INVARIANTS.md #9).
+        // reported abandoned and settles at TTL reclaim (INVARIANTS.md GL-9).
         let call_deadline = deadline.min(tokio::time::Instant::now() + config.store_call_timeout);
         match tokio::time::timeout_at(
             call_deadline,
@@ -920,13 +920,13 @@ fn release_failure(error: &AllocateError) -> ReleaseFailure {
 /// capped below the actual grant so a fresh tail grant does not rotate again
 /// without serving any work. That cap is also why a refusal has to be its own
 /// signal: it puts a shrunken grant *above* its own mark, where no crossing
-/// can ever occur (#109).
+/// can ever occur (GL-109).
 ///
 /// Each fresh lease gets its own unrung flags. A single-counter lease
 /// therefore rings once for the whole rotation; a sharded one rings at most
 /// once per shard between aggregate checks, which is what
 /// `LocalLease::refill_due_or_rearm` clears whenever the aggregate shows an
-/// early crossing was premature (INVARIANTS.md #6).
+/// early crossing was premature (INVARIANTS.md GL-6).
 fn install_lease(
     grant: LeaseGrant,
     config: &LeaseManagerConfig,
@@ -960,7 +960,7 @@ enum Rotation {
     /// rotation invisible to requests.
     Acquire,
     /// Fold the live lease's unspent units into its replacement, because it
-    /// refused work rather than merely approached its mark (#109).
+    /// refused work rather than merely approached its mark (GL-109).
     Consolidate,
 }
 
@@ -997,7 +997,7 @@ fn consolidation_failure(error: &AllocateError) -> ConsolidationFailure {
         // Legitimate near a period's end and the reason consolidation was
         // attempted at all: the account has nothing left to add. Not the
         // integrity fault the same code means for a *release*, which never
-        // draws a grant (#109).
+        // draws a grant (GL-109).
         AllocateError::InsufficientBalance
         | AllocateError::BalanceExhausted(_)
         | AllocateError::BalanceInsufficient(_)
@@ -1235,15 +1235,15 @@ enum ReleasePass {
 /// One budget across the pass is what keeps this off both latency paths. With
 /// a per-call bound only, a pass against a wedged backend cost
 /// `parked.len() * store_call_timeout`, which the refill that rang the
-/// low-water doorbell waited behind (#6) and which a shutdown signal could
-/// not interrupt until the next loop top (#18) — issue #78, where six parked
+/// low-water doorbell waited behind (GL-6) and which a shutdown signal could
+/// not interrupt until the next loop top (GL-18) — issue GL-78, where six parked
 /// leases turned a stated 10s shutdown budget into ~75s.
 ///
 /// A lease that consumes budget without settling yields its place: it goes
 /// behind the leases this pass never reached, so a single permanently hung
 /// lease cannot starve the rest of the queue pass after pass.
 ///
-/// The allocator's answer decides what the refusal *means* (issue #42):
+/// The allocator's answer decides what the refusal *means* (issue GL-42):
 /// storage errors and timeouts keep the lease parked for the next tick; a
 /// settled lease is dropped; a fenced release also closes the slot, because
 /// rejection of the grant's own lease-scoped capability means local identity
@@ -1344,7 +1344,7 @@ async fn release_quiesced(
                         "store rejected this lease's capability; clearing the slot so this instance stops serving");
                     // The current slot is a different funded grant. Keep it
                     // parked until its own request readers quiesce; dropping
-                    // it here silently stranded its units (#62).
+                    // it here silently stranded its units (GL-62).
                     if let Some(current) = slot.take() {
                         retry.push(current);
                     }
@@ -1720,7 +1720,7 @@ mod tests {
         assert_eq!(stats.acquired_units, 500);
     }
 
-    /// #131: the allocator can grow the replacement only to demand it is
+    /// GL-131: the allocator can grow the replacement only to demand it is
     /// told about, so the plane forwards the largest quote the lease refused.
     #[tokio::test(start_paused = true)]
     async fn consolidation_carries_the_refused_quote() {
@@ -1749,7 +1749,7 @@ mod tests {
         }
     }
 
-    /// #130: the tail of an account is re-granted by the consolidation floor,
+    /// GL-130: the tail of an account is re-granted by the consolidation floor,
     /// so no refusal ever arrives. The grant's own evidence is what lets
     /// admission refuse a quote the whole account cannot fund.
     #[tokio::test(start_paused = true)]
@@ -2130,7 +2130,7 @@ mod tests {
     }
 
     /// Genuinely settled: the store is not holding these open, so dropping
-    /// them is correct and nothing else changes (issue #42).
+    /// them is correct and nothing else changes (issue GL-42).
     #[tokio::test]
     async fn settled_refusals_drop_silently() {
         for refusal in [Refusal::LeaseNotActive, Refusal::UnknownLease] {
@@ -2156,7 +2156,7 @@ mod tests {
 
     /// The store rejected the capability copied from this grant, so local
     /// lease identity is no longer trustworthy and spending must stop
-    /// (issue #42).
+    /// (issue GL-42).
     #[tokio::test]
     async fn fenced_release_clears_the_slot() {
         let scripted = ScriptedAllocator::new([(LeaseId(3), Refusal::Fenced)]);
@@ -2174,7 +2174,7 @@ mod tests {
         // The slot's lease is a different, live, funded one — this loop walks
         // `parked`, and the slot holds whatever the last rotation installed.
         // It must stay on the books: clearing the slot is how the instance
-        // stops serving, not how its units stop existing (#62).
+        // stops serving, not how its units stop existing (GL-62).
         //
         // The previous spelling asserted only that `parked` was empty, which
         // conflated "the fenced lease is not retried" with "nothing else is
@@ -2194,7 +2194,7 @@ mod tests {
     }
 
     /// The store rejected the claim as an accounting bug; continuing to spend
-    /// on divergent local counts is not safe (issue #42).
+    /// on divergent local counts is not safe (issue GL-42).
     #[tokio::test]
     async fn invalid_release_fails_readiness() {
         let scripted = ScriptedAllocator::new([(LeaseId(3), Refusal::InvalidRelease)]);
@@ -2215,7 +2215,7 @@ mod tests {
     }
 
     /// A wedged backend cannot park the refill loop: the call is bounded and
-    /// the lease stays parked for the next tick (issue #34).
+    /// the lease stays parked for the next tick (issue GL-34).
     #[tokio::test(start_paused = true)]
     async fn hung_release_times_out_and_reparks() {
         let scripted = ScriptedAllocator::new([(LeaseId(5), Refusal::Hang)]);
@@ -2239,7 +2239,7 @@ mod tests {
         );
     }
 
-    /// Issue #78: the pass carries one budget, so its cost does not scale
+    /// Issue GL-78: the pass carries one budget, so its cost does not scale
     /// with the parked count. Six hung leases under a one-call budget cost
     /// one call's wall clock, not six.
     #[tokio::test(start_paused = true)]
@@ -2262,7 +2262,7 @@ mod tests {
         assert_eq!(parked.len(), 6, "every lease is still parked, none dropped");
     }
 
-    /// Issue #78: a lease that consumes the budget without settling goes
+    /// Issue GL-78: a lease that consumes the budget without settling goes
     /// behind the ones the pass never reached, so it cannot starve them.
     #[tokio::test(start_paused = true)]
     async fn a_lease_that_eats_the_budget_yields_its_place() {
@@ -2284,7 +2284,7 @@ mod tests {
         assert_eq!(scripted.released(), [], "nothing settled under a hung head");
     }
 
-    /// Issue #78: the signal is observed inside a hung release, and every
+    /// Issue GL-78: the signal is observed inside a hung release, and every
     /// lease — the one in flight included — stays parked for the shutdown
     /// release phase to attempt under its own budget.
     #[tokio::test(start_paused = true)]

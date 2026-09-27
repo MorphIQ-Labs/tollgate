@@ -8,7 +8,7 @@
 //! lines every time.
 //!
 //! Whether they land on lines *no other thread writes* is a separate claim,
-//! and this module does not make it (#124). Affinities come from one
+//! and this module does not make it (GL-124). Affinities come from one
 //! process-global counter shared by every component and every thread that
 //! reaches one, and [`Locality::index`] reduces them onto each component's own
 //! shard count — so two threads whose numbers are congruent modulo that count
@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub struct LocalSharding {
     shards: NonZeroUsize,
     /// How to reduce a locality onto these shards, decided once here rather
-    /// than at each lookup (#111).
+    /// than at each lookup (GL-111).
     ///
     /// `shards - 1` when the count is a power of two, so the reduction is a
     /// mask; [`NOT_A_MASK`](Self::NOT_A_MASK) otherwise, so it is a modulo.
@@ -176,7 +176,7 @@ impl Locality {
     /// number: every affinity the control plane takes displaces a
     /// request-serving thread onto a shard one of its peers already holds, and
     /// `SnapshotManager` observing its own publications is exactly how that
-    /// happened (#124).
+    /// happened (GL-124).
     ///
     /// It aliases shard zero under every layout, deliberately. A reader that
     /// wants the generation, the validity bound or the presence of an entry
@@ -256,7 +256,7 @@ mod tests {
     }
 
     /// The stored reduction computes the same index the modulo always did,
-    /// for every shard count and on both arms (#111).
+    /// for every shard count and on both arms (GL-111).
     ///
     /// The mask is an optimisation of `% shards`, so the definition it has to
     /// agree with is `% shards` — stated here against the arithmetic rather

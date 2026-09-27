@@ -124,8 +124,8 @@ if printf '%s\n' "$subjects" | grep -qE '^feat(\([^)]*\))?!?:'; then feat=1; fi
 # The manifest is not always the truth about what was last released. If a tag
 # is higher than the manifest version, the manifest is stale and bumping from it
 # would propose a version that is already tagged — which `tag-release` would
-# then refuse forever. a sibling workspace arrived from GitHub exactly like this:
-# manifest 0.1.0, tags through v0.1.2. Bump from whichever is higher.
+# then refuse forever. A repository imported with its tags arrives exactly like
+# this: manifest 0.1.0, tags through v0.1.2. Bump from whichever is higher.
 tag_version=${last_tag#v}
 if [ -n "$tag_version" ]; then
   base=$(printf '%s\n%s\n' "$current" "$tag_version" | sort -V | tail -n 1)

@@ -16,8 +16,8 @@ postgres = { max-threads = 1 }
 [[profile.mutants.overrides]]
 filter = 'package(tollgate-store-postgres) | (package(tollgate-server) & (binary(lease_ttl) | binary(credential_expiry)) & test(postgres))'
 test-group = 'postgres'
-# The 10s cap above is a *hang* detector, and it was set (#14, 2026-08-22)
-# before this suite's slowest legitimate test existed (#12, 2026-08-23).
+# The 10s cap above is a *hang* detector, and it was set (GL-14, 2026-08-22)
+# before this suite's slowest legitimate test existed (GL-12, 2026-08-23).
 # `the_account_filter_is_answered_by_an_index_not_by_discarding_rows` seeds
 # ~1525 leases through sequential `acquire` calls so the planner sees a table
 # shape that makes an index scan the cheaper plan; the row counts are what the

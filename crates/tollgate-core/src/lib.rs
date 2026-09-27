@@ -9,7 +9,7 @@
 //! - **Fail closed.** Unknown, expired, exhausted, or overflowing states deny;
 //!   nothing here ever falls back to a slower path, because there is no slower
 //!   path to fall back to.
-//! - **Checked arithmetic only.** Cost math never wraps (INVARIANTS.md #11).
+//! - **Checked arithmetic only.** Cost math never wraps (INVARIANTS.md GL-11).
 //! - **Domain-agnostic.** Cost units, operations, and permissions are generic;
 //!   consumers (e.g. FerroRisk) map their own vocabulary onto them at startup.
 //!

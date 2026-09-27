@@ -1,4 +1,4 @@
-//! Scheduling evidence for #107; calendar and ledger rules remain store-owned.
+//! Scheduling evidence for GL-107; calendar and ledger rules remain store-owned.
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};

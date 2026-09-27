@@ -6,7 +6,7 @@
 //! Usage: `load_gate [--evidence] <thresholds.json> <report.json>`
 //!
 //! Each client is a raw blocking `TcpStream` speaking minimal HTTP/1.1, so the
-//! measurement mirrors ferro-risk's persistent-loopback gate and adds no
+//! measurement is a persistent-loopback gate and adds no
 //! client-library noise. Percentiles and aggregate throughput are computed
 //! over the measured requests only (warmup excluded). Absolute latency and
 //! throughput gate on the controlled host; each admitted-vs-baseline ratio is
@@ -66,7 +66,7 @@ struct Thresholds {
     #[serde(deserialize_with = "deserialize_required_option")]
     min_concurrent_throughput_requests_per_second: Option<f64>,
     /// Distinct-account admitted p50 against its like-for-like baseline, at
-    /// the same connection count (#99). `null` where it has not been
+    /// the same connection count (GL-99). `null` where it has not been
     /// calibrated, which reports as *disabled* rather than as passing.
     #[serde(deserialize_with = "deserialize_required_option")]
     max_distinct_account_p50_overhead_ratio: Option<f64>,
@@ -77,7 +77,7 @@ struct Thresholds {
     /// How much less often assured work must be shed than best-effort work,
     /// as a ratio of the two shed fractions.
     ///
-    /// The comparative form is the one that matches the invariant. #30 says
+    /// The comparative form is the one that matches the invariant. GL-30 says
     /// best-effort work cannot consume the assured *reserve* — not that
     /// assured work is never shed. Five assured connections contending for two
     /// reachable units shed each other sometimes, and that is correct
@@ -267,7 +267,7 @@ struct Report {
     absolute_latency: AbsoluteLatencyReport,
     throughput: ThroughputReport,
     concurrent_same_account: ConcurrentReport,
-    /// #99's two witnesses.
+    /// GL-99's two witnesses.
     concurrent_distinct_accounts: ConcurrentReport,
     mixed_saturation: MixedReport,
     passed: bool,
@@ -457,7 +457,7 @@ fn percentile(sorted: &[u64], q: f64) -> f64 {
 
 /// Which accounts a scenario serves, and which one each connection speaks as.
 ///
-/// The gate served exactly one account until #99, so every connection was the
+/// The gate served exactly one account until GL-99, so every connection was the
 /// same principal and cross-account contention was explicitly out of scope.
 /// Two of the witnesses this change adds are about precisely that, and a third
 /// needs two *classes* — which, because the class is account-owned, is also
@@ -779,7 +779,7 @@ async fn measure(
 
     let samples = async {
         if admission {
-            // Wait for readiness: the lease slot must be stocked (#10).
+            // Wait for readiness: the lease slot must be stocked (GL-10).
             client::wait_ready(address, std::time::Duration::from_secs(5)).await?;
         }
         run_clients(address, admission, connections, warmup, measured, workload).await
@@ -1071,7 +1071,7 @@ async fn run(
         }
     };
 
-    // #99's two witnesses. Distinct accounts first: it is the same
+    // GL-99's two witnesses. Distinct accounts first: it is the same
     // concurrency the scenario above runs, with the one thing changed that the
     // pricing example could not vary until now.
     let distinct = Workload::distinct_accounts(concurrent_connections);
@@ -1814,7 +1814,7 @@ mod tests {
         assert!(!all_scenarios_passed(false, true, Some(true), good));
         assert!(!all_scenarios_passed(false, false, Some(true), good));
 
-        // #99's two witnesses are conjoined here, not merely reported. A
+        // GL-99's two witnesses are conjoined here, not merely reported. A
         // scenario that is measured, written into the report, and then left
         // out of the verdict is a gate that cannot fail.
         assert!(!all_scenarios_passed(true, true, Some(false), good));
@@ -2142,7 +2142,7 @@ mod tests {
 
         // Assured shed a *little* is still the guarantee holding. Five assured
         // connections contending for two reachable units shed each other, and
-        // #30 forbids best-effort consuming the reserve, not assured work ever
+        // GL-30 forbids best-effort consuming the reserve, not assured work ever
         // being refused. A first draft of this gate asserted zero assured
         // sheds and failed a real run on 1.08% that no invariant forbids.
         let contended = mixed_passed(&thresholds, mixed(4, 20), control, ungated_at(100.0));
@@ -2312,7 +2312,7 @@ mod tests {
         assert_eq!(json["concurrent_same_account"]["connections"], 4);
         assert_eq!(json["concurrent_same_account"]["p50_overhead_ratio"], 1.2);
         assert_eq!(json["passed"], true);
-        // #99's witnesses reach the artifact, so a reader can see the reserve
+        // GL-99's witnesses reach the artifact, so a reader can see the reserve
         // doing its job without re-running anything.
         assert_eq!(json["concurrent_distinct_accounts"]["connections"], 4);
         assert_eq!(json["mixed_saturation"]["best_effort"]["shed"], 20);

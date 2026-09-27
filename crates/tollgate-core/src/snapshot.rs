@@ -26,7 +26,7 @@ pub enum AccountStatus {
     /// Temporarily disabled; denies but may return.
     Suspended,
     /// Terminally disabled. One-way: an account enters `Closed` from any
-    /// status and leaves it never (INVARIANTS.md #22).
+    /// status and leaves it never (INVARIANTS.md GL-22).
     Closed,
 }
 
@@ -51,7 +51,7 @@ impl AccountStatus {
     }
 }
 
-/// Which execution-capacity class an account's work belongs to (#99).
+/// Which execution-capacity class an account's work belongs to (GL-99).
 ///
 /// A separate axis from [`EnforcementMode`], and the two must not be
 /// conflated. Enforcement mode answers whether an account can *fund* a
@@ -94,7 +94,7 @@ impl CapacityClass {
     /// admin wire DTO all compare these strings, so they all read from here.
     /// It is also the metric label: capacity counters distinguish the classes
     /// by these two tags and nothing else, which is what keeps their
-    /// cardinality bounded (#99).
+    /// cardinality bounded (GL-99).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -120,7 +120,7 @@ impl CapacityClass {
 /// absolute. Unknown principals, stale snapshots, cost overflow and accounting
 /// backpressure deny under every mode; only *lease cannot fund this request*
 /// is negotiable, because only that condition says something about funding
-/// rather than about validity (INVARIANTS.md #1, #5).
+/// rather than about validity (INVARIANTS.md GL-1, GL-5).
 ///
 /// **The cap is per service instance.** The counter it bounds is a local
 /// atomic, like every other local mechanism here, so a fleet of `N` instances
@@ -554,7 +554,7 @@ impl From<ResolvedLimits> for WireResolvedLimits {
 #[non_exhaustive]
 pub struct AccountSnapshot {
     pub status: AccountStatus,
-    /// Which execution-capacity class this account's work belongs to (#99).
+    /// Which execution-capacity class this account's work belongs to (GL-99).
     ///
     /// Declared beside `status` because the capacity gate reads it on the same
     /// cache line admission already touches, and because it costs nothing to
@@ -571,7 +571,7 @@ pub struct AccountSnapshot {
     pub capacity_class: CapacityClass,
     pub permissions: PermissionBits,
     /// Hard staleness bound: past this instant the snapshot denies
-    /// (INVARIANTS.md #5) until the control plane delivers a successor.
+    /// (INVARIANTS.md GL-5) until the control plane delivers a successor.
     pub valid_until: Timestamp,
     /// What this account does when its lease cannot fund a quote. Declared
     /// among the stage-one fields because funding reads it on the same cache
@@ -591,7 +591,7 @@ pub struct AccountSnapshot {
     /// The credential this snapshot was compiled for, when key-scoped.
     pub key_id: Option<KeyId>,
     pub limits: ResolvedLimits,
-    /// What the control plane last said about the account's budget (#97), or
+    /// What the control plane last said about the account's budget (GL-97), or
     /// `None` when it said nothing — an older control plane, or a publication
     /// that did not go through a store.
     ///
@@ -614,7 +614,7 @@ pub struct AccountSnapshot {
     #[cfg_attr(feature = "serde", serde(default))]
     pub budget: Option<BudgetView>,
     /// The consuming application's identity for the product policy compiled
-    /// into this snapshot (#94). See [`PolicyRevision`].
+    /// into this snapshot (GL-94). See [`PolicyRevision`].
     ///
     /// Tollgate carries it and never reads it, so it is declared last, well
     /// clear of the cache line admission touches. Distinct from `generation`:
@@ -658,7 +658,7 @@ impl AccountSnapshotBuilder {
         self
     }
 
-    /// Set the account's execution-capacity class (#99).
+    /// Set the account's execution-capacity class (GL-99).
     ///
     /// Optional, and omitting it leaves [`CapacityClass::Assured`]. The class
     /// is an account-owned fact: the control plane derives it from the ledger
@@ -670,7 +670,7 @@ impl AccountSnapshotBuilder {
         self
     }
 
-    /// Name the product policy this snapshot was compiled from (#94).
+    /// Name the product policy this snapshot was compiled from (GL-94).
     ///
     /// Optional, and omitting it leaves [`PolicyRevision::UNSTATED`] — a
     /// publisher that has no revision to state says nothing rather than
@@ -707,7 +707,7 @@ impl AccountSnapshotBuilder {
 ///
 /// The validation domain is the full `u64` configuration space. Arithmetic
 /// is checked in the same `CostTable` implementation the request path uses;
-/// overflow is a refusal, never a wrapped low quote (INVARIANTS #11/#16).
+/// overflow is a refusal, never a wrapped low quote (INVARIANTS GL-11/#16).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotValidationError {
     /// The carried compatibility pair cannot be represented by governor.
@@ -880,7 +880,7 @@ impl PublishableSnapshot {
     /// would need a fallible signature. An account-wide mode change goes
     /// through publication, not through here.
     ///
-    /// This is what an account-wide status change needs (#22): the ledger and
+    /// This is what an account-wide status change needs (GL-22): the ledger and
     /// every live snapshot move together, and re-deriving a proof that cannot
     /// have changed would only invite an `expect` at each call site.
     /// Attach the ledger's budget view, carrying the publication proof over.
@@ -897,7 +897,7 @@ impl PublishableSnapshot {
     /// deserializing one — which is exactly why the argument is an `Option`
     /// and a publish calls this *unconditionally*. An account the ledger does
     /// not hold clears the field rather than leaving it, so a submitted value
-    /// can never survive publication. One fact, one writer — the rule #51
+    /// can never survive publication. One fact, one writer — the rule GL-51
     /// established for status, applied to a number that moves far faster.
     #[must_use]
     pub fn with_budget(&self, budget: Option<BudgetView>) -> Self {
@@ -921,7 +921,7 @@ impl PublishableSnapshot {
     }
 
     /// The same publication proof at a new execution-capacity class and
-    /// generation (#99).
+    /// generation (GL-99).
     ///
     /// Infallible for the reason [`restamped`](Self::restamped) is, and the
     /// reason is worth stating rather than inferring from the signature:
@@ -970,7 +970,7 @@ impl AccountSnapshot {
     ///
     /// `status` is deliberately required: inferring `Active` for an omitted
     /// administrative state would turn incomplete control-plane data into an
-    /// authorization grant instead of failing closed (INVARIANTS.md #5).
+    /// authorization grant instead of failing closed (INVARIANTS.md GL-5).
     #[must_use]
     pub fn builder(
         account_id: AccountId,
@@ -1024,7 +1024,7 @@ mod tests {
     /// The ledger column, the JSONB predicate and the wire DTO all compare
     /// these strings, so `as_str` and serde must agree exactly. If they ever
     /// diverge, a status change silently rewrites the wrong set of snapshots
-    /// — the failure this whole mechanism exists to prevent (#51).
+    /// — the failure this whole mechanism exists to prevent (GL-51).
     #[test]
     #[cfg(feature = "serde")]
     fn account_status_text_matches_its_serde_spelling() {
@@ -1067,7 +1067,7 @@ mod tests {
         assert!(!CapacityClass::BestEffort.may_use_assured_reserve());
     }
 
-    /// A snapshot from a control plane that predates #99 carries no class, and
+    /// A snapshot from a control plane that predates GL-99 carries no class, and
     /// must decode as `Assured` rather than failing — the reader-first half of
     /// the rollout.
     #[cfg(feature = "serde")]
@@ -1192,7 +1192,7 @@ mod tests {
         assert_eq!(decoded.budget, None);
     }
 
-    /// A control plane that predates #94 publishes no revision, and its
+    /// A control plane that predates GL-94 publishes no revision, and its
     /// snapshots must keep working. The absent key decodes to "unstated"
     /// rather than to a decode error, which is the whole reader-first half of
     /// the rollout.

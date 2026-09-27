@@ -1,8 +1,7 @@
 //! The reservation state machine: `pending → committed-at-execution-start`
 //! or `pending → released`.
 //!
-//! The charging rules this encodes (mirroring ferro-risk's `ChargePhase`
-//! invariants, service/INVARIANTS.md 5–8 there):
+//! The charging rules this encodes (INVARIANTS.md states them as contract):
 //!
 //! - Admission debits the lease immediately, but the charge is only *pending*.
 //! - Execution start commits the full quoted charge — for success, domain
@@ -10,7 +9,7 @@
 //! - Anything that ends the request before execution (validation failure,
 //!   client cancellation, shedding, drop) releases the units for zero charge.
 //! - Commit and cancel race on one atomic compare-exchange: exactly one wins
-//!   (INVARIANTS.md #3 here). A canceller that loses learns the committed
+//!   (INVARIANTS.md GL-3 here). A canceller that loses learns the committed
 //!   charge; a committer that loses must not execute.
 //! - Under `Elastic`, a lease whose usability window lapsed between admission
 //!   and execution start settles against overage instead of refusing — still
@@ -35,7 +34,7 @@ use crate::usage::{UsageEvent, UsageSource};
 // stays the immutable funding *receipt*: it routes refunds, owns the lease
 // window and capability, and supplies the initial phase value — but it is not
 // the billing statement, because a leased reservation whose window lapses at
-// execution start can settle against overage instead (INVARIANTS.md #3).
+// execution start can settle against overage instead (INVARIANTS.md GL-3).
 //
 //     PENDING_LEASE ─┬→ COMMITTED_LEASE
 //                    ├→ COMMITTED_OVERAGE   (Elastic commit-time fallback)
@@ -191,7 +190,7 @@ impl ChargeSource {
 /// [`Reservation::reserve_overage`]; resolved by exactly one of
 /// [`commit_at_execution_start`](Reservation::commit_at_execution_start),
 /// [`cancel`](Reservation::cancel), or drop (which releases a pending
-/// reservation — INVARIANTS.md #2).
+/// reservation — INVARIANTS.md GL-2).
 ///
 /// The charging rules are identical whichever funded it: zero charge before
 /// execution, full charge from execution start, and one compare-exchange
@@ -226,7 +225,7 @@ impl Reservation {
     /// only to clone it again would put two refcount operations on the shared
     /// lease back onto every admission — in the shipped `LocalSharding::SINGLE`
     /// layout, on the one cache line every thread serving the account touches
-    /// (#79). This is the owned half of the same split `request_entry_from`
+    /// (GL-79). This is the owned half of the same split `request_entry_from`
     /// and `request_entry_at` draw one layer down, in the snapshot map.
     ///
     /// [`reserve`](Reservation::reserve) keeps the borrowing signature, and
@@ -280,7 +279,7 @@ impl Reservation {
     ///
     /// Reserve-time truth, and deliberately so: it decides the
     /// `admitted_overage` qualifier at the stage that admitted the request
-    /// (INVARIANTS.md #20). It is *not* the billing statement — a leased
+    /// (INVARIANTS.md GL-20). It is *not* the billing statement — a leased
     /// admission whose window lapsed at execution start settles against
     /// overage without ever having been an overage admission. The billing
     /// statement is [`UsageEvent::source`], which reads the terminal phase.
@@ -465,7 +464,7 @@ impl Reservation {
     }
 
     /// The billing record, available only once committed. `request_id` is the
-    /// idempotency key (INVARIANTS.md #7); emitting the same event twice is
+    /// idempotency key (INVARIANTS.md GL-7); emitting the same event twice is
     /// therefore harmless downstream.
     /// The billing statement reads the *phase*, not the receipt, and that is
     /// load-bearing rather than stylistic. A commit-time fallback happens
@@ -478,7 +477,7 @@ impl Reservation {
     /// serve. The terminal phase is the funding statement.
     ///
     /// `policy_revision` is the consuming application's identity for the
-    /// policy that priced this request (#94), taken from the pinned snapshot.
+    /// policy that priced this request (GL-94), taken from the pinned snapshot.
     /// It is a parameter rather than reservation state on purpose: the
     /// reservation is a request-path value and would carry 32 bytes for a
     /// field only the commit reads, and passing it here keeps the event built
@@ -550,7 +549,7 @@ impl Drop for Reservation {
 /// A reservation shared between the thread that will execute the work and an
 /// asynchronous waiter that may cancel it first.
 ///
-/// This is the one object #93 adds, and it exists because the consumer topology
+/// This is the one object GL-93 adds, and it exists because the consumer topology
 /// requires it: an executor races its timeout/disconnect path (on the async
 /// side) against its worker's actual execution start (on a pool thread), and
 /// both need to reach the same charge state. It replaces the
@@ -637,7 +636,7 @@ impl Reservation {
     /// Move this reservation into a shared object and hand back a cancel
     /// handle for the asynchronous side.
     ///
-    /// This is the single allocation #93 permits, and it is opt-in: an inline
+    /// This is the single allocation GL-93 permits, and it is opt-in: an inline
     /// executor never calls it and its admission path stays allocation-free. A
     /// consumer that needs a timeout/worker race pays one `Arc` for it; one
     /// that moves an unsplit value to its worker has deliberately chosen to
@@ -782,7 +781,7 @@ mod tests {
 
     /// `units()` is how a caller learns what a pending reservation will charge
     /// before deciding to commit it, and no test called it — it could report
-    /// zero for any reservation with the suite green (#43). A caller checking
+    /// zero for any reservation with the suite green (GL-43). A caller checking
     /// the quote before execution would have been told everything is free.
     ///
     /// Asserted against what the reservation actually does with those units,
@@ -876,7 +875,7 @@ mod tests {
         );
     }
 
-    /// Review finding #1 regression: a reservation opened inside the
+    /// Review finding GL-1 regression: a reservation opened inside the
     /// usability window cannot commit after the window closes — it releases
     /// for zero charge instead, so reclaimed-and-re-granted capacity can
     /// never be double-worked.
@@ -1206,7 +1205,7 @@ mod tests {
         );
     }
 
-    /// INVARIANTS.md #3: commit and cancel race — exactly one wins, and the
+    /// INVARIANTS.md GL-3: commit and cancel race — exactly one wins, and the
     /// lease balance reflects the winner.
     #[test]
     fn commit_cancel_race_one_winner() {

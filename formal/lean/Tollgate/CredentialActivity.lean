@@ -1,7 +1,7 @@
 import Init.Omega
 
 /-!
-#105: one credential's projection of accepted canonical usage. Timestamps are
+GL-105: one credential's projection of accepted canonical usage. Timestamps are
 integer microseconds, including negative values. Attribution and acceptance
 are inputs already classified by the backend. A repeated request ID never
 provides fresh evidence, even when its payload changes.

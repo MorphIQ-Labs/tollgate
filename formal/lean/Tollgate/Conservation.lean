@@ -3,7 +3,7 @@ Exact model of the per-account conservation equation and the transitions that
 must preserve it. This mirrors `Conservation::holds` in
 `crates/tollgate-store/src/traits.rs` and the ledger writes in both backends.
 
-The equation, restated by issue #1:
+The equation, restated by issue GL-1:
 
     deposited + overage
       = allowanceBalance + topupBalance + activeGrants + settledUsage + loss + expired
@@ -14,7 +14,7 @@ those units now sit: unspent balance, capacity out on lease, units consumed,
 units written off at settlement, and units a closed budget period took away.
 
 The balance is two buckets, because a periodic allowance expires and a manual
-top-up does not (#97). A single balance could only expire both or neither: the
+top-up does not (GL-97). A single balance could only expire both or neither: the
 whole point of `topupBalance` is that no transition here ever moves it to
 `expired`.
 
@@ -42,7 +42,7 @@ structure Ledger where
   /-- Units paid for. Moves on account creation, deposit, and each period's
   allowance. -/
   deposited : Nat
-  /-- Units extended on credit under elastic enforcement (#1). The second
+  /-- Units extended on credit under elastic enforcement (GL-1). The second
   funding term, and the reason the equation still closes when spend outruns
   what was paid for. -/
   overage : Nat
@@ -50,13 +50,13 @@ structure Ledger where
   is left of this and nothing else. -/
   allowanceBalance : Nat
   /-- Unspent units from manual deposits. No transition in this file moves it
-  to `expired`; that is the whole content of "top-ups persist" (#97). -/
+  to `expired`; that is the whole content of "top-ups persist" (GL-97). -/
   topupBalance : Nat
   activeGrants : Nat
   settledUsage : Nat
   loss : Nat
   /-- Units funded by a period that has closed: neither spendable nor billable,
-  and with nowhere else to rest. The sink term #97 adds. -/
+  and with nowhere else to rest. The sink term GL-97 adds. -/
   expired : Nat
   deriving DecidableEq, Repr
 
@@ -82,7 +82,7 @@ theorem deposit_preserves_conservation (l : Ledger) (units : Nat) (h : l.holds) 
 
 /-- Acquiring a lease moves units from the two balance buckets to outstanding
 grants. The whole grant is debited at allocation, which is what makes central
-allocation bound spend (INVARIANTS.md #1).
+allocation bound spend (INVARIANTS.md GL-1).
 
 Spend order is allowance first, but the proof does not need it: the split is a
 parameter here, and conservation closes for any split that sums to the grant.
@@ -107,7 +107,7 @@ theorem acquire_preserves_conservation
 sweep -- splits its grant four ways: what was billed, what returns to each
 balance bucket, and the provisional settlement loss between them.
 
-`samePeriod` is the whole of the "drain then expire" decision (#97). An active
+`samePeriod` is the whole of the "drain then expire" decision (GL-97). An active
 lease at a period boundary keeps serving to its own TTL; the boundary is
 applied here, when it settles. Only the allowance half is affected: the top-up
 half returns to its bucket either way, which is what makes a manual credit
@@ -132,7 +132,7 @@ theorem settle_preserves_conservation
         Bool.false_eq_true, if_true, if_false] at *
       omega
 
-/-- #136: the expiry sweep settles a lease its holder never released. Nothing
+/-- GL-136: the expiry sweep settles a lease its holder never released. Nothing
 is credited, because no unit can be proven unspent: the whole unaccounted
 remainder is recorded as provisional loss. Whatever the period, the balance is
 untouched, so executed-but-unflushed work can never become spendable again. -/
@@ -185,7 +185,7 @@ theorem consolidation_grant_respects_restored_balance
         balance + consolidationCredit toAllowance toTopup samePeriod := by
   omega
 
-/-- #131: the consolidation grant may grow to `needed`, the largest quote the
+/-- GL-131: the consolidation grant may grow to `needed`, the largest quote the
 returned lease refused, only when the restored balance funds it. `available`
 is the ledger balance plus the restored credit; `sized` is the ordinary answer,
 the policy grant raised to the credit floor. -/
@@ -214,7 +214,7 @@ theorem expired_allowance_cannot_enlarge_consolidation
   simp [consolidationCredit]
 
 /-- Releasing a lease inside its own period: the shape the ledger had before
-budgets, kept under its own name because INVARIANTS.md #4 cites it. -/
+budgets, kept under its own name because INVARIANTS.md GL-4 cites it. -/
 def release (l : Ledger) (_granted used unspent lost : Nat) : Ledger :=
   settle l used unspent 0 lost true
 
@@ -228,7 +228,7 @@ theorem release_preserves_conservation
   omega
 
 /-- Reclaiming an expired lease credits the whole remainder back, so nothing is
-left in provisional loss for it (INVARIANTS.md #9). -/
+left in provisional loss for it (INVARIANTS.md GL-9). -/
 def reclaim (l : Ledger) (granted used : Nat) : Ledger :=
   settle l used (granted - used) 0 0 true
 
@@ -324,7 +324,7 @@ theorem straggler_preserves_conservation
   simp only [Ledger.holds, Ledger.funded, Ledger.held, Ledger.balance, ingestStraggler] at *
   omega
 
-/-- Overage: the transition #1 adds. It belongs to no lease, so it settles the
+/-- Overage: the transition GL-1 adds. It belongs to no lease, so it settles the
 moment it is recorded -- and it moves *two* columns, funding on the left and
 billing on the right, in one transaction. -/
 def ingestOverage (l : Ledger) (units : Nat) : Ledger :=
@@ -379,7 +379,7 @@ theorem an_accepted_debit_stays_within_the_cap
   · exact absurd accepted (by simp)
 
 /-- A refused debit claims nothing, so a refusal cannot advance the counter and
-a caller cannot be charged for work it was denied (INVARIANTS.md #2). -/
+a caller cannot be charged for work it was denied (INVARIANTS.md GL-2). -/
 theorem a_refused_debit_claims_nothing (spent cap units : Nat) (over : cap < spent + units) :
     debit spent cap units = none := by
   unfold debit

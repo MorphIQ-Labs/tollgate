@@ -1,5 +1,5 @@
 //! What the session cache saves, and what the digest choice underneath it
-//! costs (#2).
+//! costs (GL-2).
 //!
 //! Two questions worth answering with numbers rather than intuition:
 //!

@@ -2,7 +2,7 @@
 //! because they must agree.
 //!
 //! The index exists so the reclaim sweep and `conservation` cost what the live
-//! population costs rather than what the process has ever done (#23). A
+//! population costs rather than what the process has ever done (GL-23). A
 //! derived structure like that is normally maintained by whoever mutates the
 //! table, and this one must not be: the three transition points are spread
 //! across `acquire`, `release` and the sweep, and the drift is silent and
@@ -52,7 +52,7 @@ pub(crate) struct LeaseRecord {
     /// describes.
     credited: CostUnits,
     /// Which balance buckets this grant drew from, so settlement returns each
-    /// half where it came from rather than guessing (#97).
+    /// half where it came from rather than guessing (GL-97).
     pub(crate) funding: crate::memory::Drawn,
     /// The account's period at the moment of the grant. A lease whose period
     /// has since closed credits its unspent units to `expired` rather than to
@@ -110,13 +110,13 @@ impl LeaseRecord {
 pub(crate) struct Leases {
     records: HashMap<LeaseId, LeaseRecord>,
     /// Active leases ordered by expiry, so the sweep can stop at the first one
-    /// that is not due instead of filtering the whole table — the shape #22
+    /// that is not due instead of filtering the whole table — the shape GL-22
     /// used for the snapshot manager's deadline indexes.
     active_by_expiry: BTreeSet<(Timestamp, LeaseId)>,
     /// Lease records examined by [`Leases::reclaimable`] and
     /// [`Leases::active_of`] since construction.
     ///
-    /// The bound #23 claims is about *work*, and only a count of records
+    /// The bound GL-23 claims is about *work*, and only a count of records
     /// actually looked at can distinguish "the sweep walks the live set" from
     /// "the sweep walks everything and the live set happens to be small".
     #[cfg(test)]

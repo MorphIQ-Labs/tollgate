@@ -194,7 +194,7 @@ async fn invalid_history_blocks_validation_but_leaves_write_guards_and_can_be_re
         // is that repair lets the catalogue reach the latest migration, not
         // which number that happens to be — and a literal here fails on every
         // migration added afterwards, for a reason unrelated to what the test
-        // is about (#121 was the one that tripped it).
+        // is about (GL-121 was the one that tripped it).
         let head = sqlx::migrate!("./migrations")
             .migrations
             .iter()

@@ -45,7 +45,7 @@ fn init_tracing() {
 
 /// The sweep cadence, or `None` if the configured value cannot run a sweep.
 /// A zero interval would spin the reclaim loop without ever waiting, so it is
-/// refused at startup rather than accepted into a busy loop (INVARIANTS #16).
+/// refused at startup rather than accepted into a busy loop (INVARIANTS GL-16).
 fn reclaim_interval(secs: u64) -> Option<std::time::Duration> {
     (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }

@@ -32,13 +32,13 @@ to be wrong. Correct them here rather than in place.
 > The sweep path was already fine — `tollgate_leases_expiry` covers it.
 
 It covered the `WHERE`. It did not cover the `ORDER BY`, and that is what
-decided the plan. Until #65 the expiry sweep ordered by `(account_id,
+decided the plan. Until GL-65 the expiry sweep ordered by `(account_id,
 lease_id)`, which no index answers, so PostgreSQL read and sorted every expired
 row to return one bounded page — the `LIMIT` could not stop an index walk, and a
 drain's read work was quadratic in the backlog it existed to clear. The index
 named in that sentence was right all along; the query was not.
 
-Fixed in #65 by ordering the sweep on `(expires_at_floor_us,
+Fixed in GL-65 by ordering the sweep on `(expires_at_floor_us,
 expires_at_submicro_ns)` — the index's own columns — with
 `the_expiry_sweep_stops_at_its_batch_instead_of_sorting_the_backlog` pinning the
-plan. See `docs/DESIGN.md`, "The sweep's ORDER BY defeated its own index (#65)".
+plan. See `docs/DESIGN.md`, "The sweep's ORDER BY defeated its own index (GL-65)".

@@ -38,6 +38,14 @@ A backend behavior change must update both the memory and PostgreSQL implementat
 4. In the description, describe behavioral impact, list the validation performed, and call out invariant, migration, API, or threshold changes, with benchmark evidence for performance-sensitive work. Close the issues it resolves with `Closes #N`.
 5. Resolve every discussion; `main` accepts no direct pushes.
 
+## Issue references
+
+References written `GL-N`, in code, documentation, and commit messages, and
+`!N` merge-request references, point to the project's former GitLab tracker,
+which is not public. The reasoning each one records is in the surrounding
+text or in [`docs/DESIGN.md`](docs/DESIGN.md). Plain `#N` references are
+issues in this repository.
+
 ## Reporting a vulnerability
 
 Do not open a public issue. Contact the maintainers privately.

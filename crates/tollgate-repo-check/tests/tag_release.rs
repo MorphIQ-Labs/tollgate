@@ -1,4 +1,4 @@
-//! `scripts/tag-release.sh` tags the commit its notes describe (#142).
+//! `scripts/tag-release.sh` tags the commit its notes describe (GL-142).
 //!
 //! v0.29.0 was prepared on the release branch, then a fix merged to the
 //! default branch, then the stale release merge request landed on top. The

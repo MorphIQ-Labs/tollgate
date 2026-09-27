@@ -1,6 +1,6 @@
 /-!
 Exact model of the observer-visible overage occupancy and its commit
-publication protocol (INVARIANTS.md #1 and #3).
+publication protocol (INVARIANTS.md GL-1 and GL-3).
 
 `spent` includes pending and committed reservations. `committed` includes only
 irrevocable reservations. The Rust implementation must update a reservation's

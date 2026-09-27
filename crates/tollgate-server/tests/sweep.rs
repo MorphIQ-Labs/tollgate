@@ -1,4 +1,4 @@
-//! The reclaim sweep is INVARIANTS.md #9's server half: the only thing that
+//! The reclaim sweep is INVARIANTS.md GL-9's server half: the only thing that
 //! returns units stranded by a crashed holder.
 //!
 //! The store's own reclaim is covered by both backend suites; what is tested
@@ -471,7 +471,7 @@ type SweepStore = DelegatingStore<MemoryStore>;
 /// drain re-enters the hook below — which is what carries an injected failure
 /// out to the `/reclaim` route. A hand-written delegation would naturally
 /// forward `reclaim_expired` to the inner store instead, and the failure would
-/// vanish with no compile error (#83).
+/// vanish with no compile error (GL-83).
 fn flaky(inner: Arc<MemoryStore>, state: &Arc<SweepState>) -> Arc<SweepStore> {
     let (batch, rollover, ping) = (Arc::clone(state), Arc::clone(state), Arc::clone(state));
     Arc::new(
@@ -724,7 +724,7 @@ async fn serve_briefly(
 }
 
 /// The server actually runs the sweep: an unreleased lease is settled without
-/// anyone asking, its remainder forfeited rather than returned (#136), and an
+/// anyone asking, its remainder forfeited rather than returned (GL-136), and an
 /// operator is told how much.
 #[tokio::test]
 async fn the_server_reclaims_expired_leases_on_its_interval() {

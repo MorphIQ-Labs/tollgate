@@ -1,4 +1,4 @@
-//! The declared wire limits, pinned against the types they describe (#61).
+//! The declared wire limits, pinned against the types they describe (GL-61).
 //!
 //! `MAX_INGEST_BODY_BYTES` is derived from `MAX_USAGE_EVENT_BYTES` and
 //! `MAX_INGEST_BATCH`. If a field is added to `UsageEvent` and that constant

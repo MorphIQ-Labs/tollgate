@@ -25,7 +25,7 @@ pub use tollgate_core::Principal;
 ///
 /// A `None` lease is the cold-start / lost-lease state. Under
 /// [`EnforcementMode::Strict`] it denies (`LeaseUnavailable`), keeping
-/// INVARIANTS.md #5 and #10 honest; under `Elastic` it is one of the states
+/// INVARIANTS.md GL-5 and GL-10 honest; under `Elastic` it is one of the states
 /// the overage counter answers for.
 ///
 /// Every mutation returns the displaced lease through [`Self::replace`] or
@@ -86,7 +86,7 @@ pub struct LeaseSlot {
     /// account's contention history, which outlives any one grant. Written on
     /// the control plane only, at publication.
     contention_retired: AtomicU64,
-    /// Lost exchanges on the account's concurrency gauges (#139), which live
+    /// Lost exchanges on the account's concurrency gauges (GL-139), which live
     /// in the admission state rather than here; recorded only when nonzero.
     /// On a line of its own: it is written exactly when the account's threads
     /// contend, and an unpadded field could share a line with `current`, which
@@ -417,8 +417,8 @@ impl LeaseSlot {
 
     /// How many of this account's admission exchanges lost a compare-exchange
     /// to another writer: lease debits across every lease the slot has held
-    /// (#134), overage debits, and principal and account concurrency-gauge
-    /// acquisitions (#139).
+    /// (GL-134), overage debits, and principal and account concurrency-gauge
+    /// acquisitions (GL-139).
     ///
     /// The account-level contention signal: nonzero means one of the account's
     /// admission lines was written from more than one core at the same moment. It is a
@@ -495,7 +495,7 @@ impl LeaseSlot {
     /// accounting and their grant. A background task that reads through
     /// `load` on a thread that never serves a request spends an affinity on
     /// that answer, and every affinity spent moves a request-serving thread one
-    /// step closer to sharing a shard with a peer (#124).
+    /// step closer to sharing a shard with a peer (GL-124).
     #[must_use]
     pub fn load_observed(&self) -> Option<Arc<LocalLease>> {
         self.load_at(Locality::OBSERVER)
@@ -559,7 +559,7 @@ impl Buckets {
                         // about its siblings — the remainder of a partition
                         // leaves them up to one unit larger. Keep looking,
                         // and report this only if no shard can take the
-                        // request now or later (INVARIANTS.md #5).
+                        // request now or later (INVARIANTS.md GL-5).
                         Err(error) => insufficient = Some(error),
                     }
                 }
@@ -675,7 +675,7 @@ impl GaugePermit {
 struct ConcurrencyCounter(AtomicU32);
 
 impl ConcurrencyCounter {
-    /// `lost` gains one for every compare-exchange another writer won (#139).
+    /// `lost` gains one for every compare-exchange another writer won (GL-139).
     /// A register the caller owns, so an uncontended increment writes nothing
     /// more than it did.
     fn try_increment(&self, limit: Option<std::num::NonZeroU32>, lost: &mut u64) -> bool {
@@ -1092,7 +1092,7 @@ pub struct AccountAdmissionState {
     pub lease: Arc<LeaseSlot>,
     /// The instance's admitted-unit total at the instant this snapshot was
     /// installed, so the balance estimate can subtract only what has been
-    /// spent *since* the ledger reported it (#97).
+    /// spent *since* the ledger reported it (GL-97).
     ///
     /// Captured here rather than reset on the counter because the counter is
     /// account-wide, monotonic, and shared by every principal and every
@@ -1151,7 +1151,7 @@ impl AccountAdmissionState {
     /// direction for a number a customer acts on.
     ///
     /// It is never an authorization input. Admission denies from the lease and
-    /// the ledger (INVARIANTS.md #1), never from this — a stale estimate that
+    /// the ledger (INVARIANTS.md GL-1), never from this — a stale estimate that
     /// could deny would turn a refresh delay into an outage.
     #[must_use]
     pub fn estimate_remaining(&self) -> Option<CostUnits> {
@@ -1179,7 +1179,7 @@ impl AccountAdmissionState {
         locality: Locality,
     ) -> Result<ConcurrencyGuard, (DenyReason, Arc<Self>)> {
         let principal_limit = state.snapshot.limits.principal_max_concurrent_requests();
-        // Lost exchanges on either gauge are the account's contention (#139),
+        // Lost exchanges on either gauge are the account's contention (GL-139),
         // recorded on its slot once, and only when there were any.
         let mut lost = 0u64;
 
@@ -1244,7 +1244,7 @@ impl ConcurrencyGuard {
     /// the one value every admitted request holds exactly once, and it holds
     /// the state the counters live on — so making the tally exact costs no
     /// extra allocation, no extra `Arc`, and no second ownership story
-    /// (INVARIANTS.md #20).
+    /// (INVARIANTS.md GL-20).
     pub(crate) fn mark_terminal_recorded(&mut self) {
         self.terminal_recorded = true;
     }
@@ -1352,7 +1352,7 @@ fn shard_ceiling_for(burst: u32, maximum_weight: std::num::NonZeroU32) -> usize 
 ///
 /// The advertised limits are *account* limits: every principal (API key) of
 /// an account must draw from one bucket, or N keys would multiply the
-/// account's allowance N-fold (review finding #4). Reinstalling snapshots
+/// account's allowance N-fold (review finding GL-4). Reinstalling snapshots
 /// with unchanged parameters keeps each existing dimension's bucket and
 /// consumed tokens. A genuine dimension change builds only that dimension's
 /// replacement; every principal loads the resulting account authority on its
@@ -1390,7 +1390,7 @@ struct WeakRegistry<K, V> {
     swept_at: usize,
     /// Entries walked across every sweep so far.
     ///
-    /// The amortised bound is the whole point of #8, and it is a claim about
+    /// The amortised bound is the whole point of GL-8, and it is a claim about
     /// total *work*, not sweep count: many tiny sweeps of a registry that
     /// keeps emptying are cheap, while one sweep per install over a registry
     /// full of live accounts is the quadratic. Only the entries-walked total
@@ -1419,7 +1419,7 @@ impl<K: Eq + Hash, V> WeakRegistry<K, V> {
     /// the last sweep to be worth walking.
     ///
     /// Sweeping on every lookup made a bulk install O(N·A): every one of N
-    /// entries walked all A accounts (#8). Since the sweep reclaims memory and
+    /// entries walked all A accounts (GL-8). Since the sweep reclaims memory and
     /// nothing else — a dead `Weak` upgrades to `None`, which the lookup below
     /// already handles by building a fresh limiter — it can be deferred freely.
     /// Doubling keeps dead entries within a constant factor of live ones and
@@ -1581,7 +1581,7 @@ fn build_limiter(rate: u32, burst: u32) -> AccountRateLimiter {
     // schedule whose burst cannot hold a request is refused upstream in
     // `RequestContext::admit`, comparing the quote against
     // `rate_burst_units` in full width — so a burst above u32::MAX admits by
-    // the same comparison it was configured with (#40). `narrow` supplies the
+    // the same comparison it was configured with (GL-40). `narrow` supplies the
     // `max(1)` these conversions rely on because governor requires a nonzero
     // quota, not to repair a configured value.
     //
@@ -1690,7 +1690,7 @@ pub enum SnapshotUpdate {
         generation: Generation,
     },
     /// An absent row, which carries no generation and asserts nothing about
-    /// any (#53).
+    /// any (GL-53).
     Unknown {
         principal: Principal,
         until: Timestamp,
@@ -1716,7 +1716,7 @@ pub enum PublishableSnapshotUpdate {
         generation: Generation,
     },
     /// An absent row, which carries no generation and asserts nothing about
-    /// any (#53).
+    /// any (GL-53).
     Unknown {
         principal: Principal,
         until: Timestamp,
@@ -1773,7 +1773,7 @@ impl PublishableSnapshotUpdate {
 /// the one the request path actually dispatches through — and
 /// `tests/map_defaults.rs` pins what each default does when it *is* inherited.
 /// This is the same rule `tollgate-store`'s `drain_reclaim_expired` records for
-/// `LeaseAllocator::reclaim_expired` (#83, #120).
+/// `LeaseAllocator::reclaim_expired` (GL-83, GL-120).
 pub trait SnapshotMap: Send + Sync {
     /// Control-plane visibility probe. Cache implementations should avoid
     /// changing request-frequency bookkeeping for a background refresh.
@@ -1878,7 +1878,7 @@ pub trait SnapshotMap: Send + Sync {
     /// `until`.
     ///
     /// The generation is not optional: a revocation always carries one, and it
-    /// is what refuses a replayed snapshot at or below it (INVARIANTS.md #15).
+    /// is what refuses a replayed snapshot at or below it (INVARIANTS.md GL-15).
     fn install_revoked(
         &self,
         principal: Principal,
@@ -1891,7 +1891,7 @@ pub trait SnapshotMap: Send + Sync {
     ///
     /// Deliberately takes no generation, because an absence has none to give —
     /// the 404 path cannot supply one, and inventing one from what this
-    /// instance last saw is #53. It therefore leaves any existing watermark
+    /// instance last saw is GL-53. It therefore leaves any existing watermark
     /// exactly as it was rather than raising or re-tagging it.
     fn install_unknown(
         &self,
@@ -1904,7 +1904,7 @@ pub trait SnapshotMap: Send + Sync {
     /// reordered control-plane messages.
     ///
     /// Eviction keeps the watermark, but keeping it no longer means the
-    /// principal cannot be reinstalled at the same generation: since #53 a
+    /// principal cannot be reinstalled at the same generation: since GL-53 a
     /// watermark left by a *positive* refuses only strictly older snapshots, so
     /// re-fetching the evicted generation repairs the entry. That is
     /// deliberate — it is what lets a bounded map recover from capacity
@@ -1923,7 +1923,7 @@ pub trait SnapshotMap: Send + Sync {
     /// Install a batch in one logical write. The default loops over
     /// [`install`](SnapshotMap::install); copy-on-write implementations
     /// override it to pay their clone cost once per batch instead of once
-    /// per entry (review finding #9 — loading N principals individually is
+    /// per entry (review finding GL-9 — loading N principals individually is
     /// O(N²) on a whole-map-clone structure).
     fn install_many(
         &self,
@@ -2493,7 +2493,7 @@ mod tests {
     }
 
     /// A control-plane read of the slot answers the same question from any
-    /// view, and must not claim an affinity to ask it (#124).
+    /// view, and must not claim an affinity to ask it (GL-124).
     ///
     /// `load` resolves `Locality::current()`, which *assigns* on a thread's
     /// first access. The runtime's health reporting, lease rotation and
@@ -2733,7 +2733,7 @@ mod tests {
     /// can load a ceiling the occupancy state is not yet tracking. Ordering
     /// is the whole contract here: enforcement that arrives after publication
     /// leaves a window in which the published ceiling is unenforceable, which
-    /// is INVARIANTS.md #25's failure mode rather than a slow start.
+    /// is INVARIANTS.md GL-25's failure mode rather than a slow start.
     #[test]
     fn publishing_a_ceiling_arms_the_gauge_before_the_policy_is_readable() {
         let unlimited = ResolvedLimits::new(1);
@@ -3048,7 +3048,7 @@ mod tests {
 
     /// The guard is held for a request's whole lifetime, so what it carries is
     /// a deliberate choice rather than a convenience. It is the occupied state
-    /// plus its two permits, and — since #93 — the pinned locality and the
+    /// plus its two permits, and — since GL-93 — the pinned locality and the
     /// one-bit record of whether a later phase already tallied this request's
     /// terminal outcome.
     ///
@@ -3056,7 +3056,7 @@ mod tests {
     /// guard is the only value every admitted request holds exactly once: it
     /// is what makes "exactly one terminal counter per admitted request" true
     /// by construction, including for a pending state that is simply abandoned
-    /// (INVARIANTS.md #20). Carrying the locality keeps that tally in the same
+    /// (INVARIANTS.md GL-20). Carrying the locality keeps that tally in the same
     /// counter shard the admission used, which re-reading the thread-local in
     /// `Drop` would not after a worker hop.
     #[test]

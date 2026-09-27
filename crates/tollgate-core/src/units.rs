@@ -6,7 +6,7 @@ use core::fmt;
 /// compute-unit vocabulary (FerroRisk's FCUs, another product's credits).
 ///
 /// All arithmetic is checked: overflow returns `None` and callers must treat
-/// it as a denial (INVARIANTS.md #11). There are deliberately no `Add`/`Mul`
+/// it as a denial (INVARIANTS.md GL-11). There are deliberately no `Add`/`Mul`
 /// operator impls, because operators hide the overflow decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -100,7 +100,7 @@ mod tests {
     }
 
     /// The `From` impl carried no test, so it could be replaced by one
-    /// returning zero without a failure anywhere (#43). That is not a cosmetic
+    /// returning zero without a failure anywhere (GL-43). That is not a cosmetic
     /// survivor: every `.into()` in a caller's cost schedule would silently
     /// become free, and free work is admitted, charged nothing, and
     /// reconciles cleanly.

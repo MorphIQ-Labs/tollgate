@@ -160,7 +160,7 @@ impl BudgetSchedule {
 }
 
 /// What an instance is told about its account's budget, carried by the
-/// snapshot (#97).
+/// snapshot (GL-97).
 ///
 /// A *projection of the ledger at publication*, not a live balance: the
 /// request path performs no I/O, so this is the last thing the control plane

@@ -9,7 +9,7 @@
 //! them under the opt-in eight-shard layout, so the manifest gates the
 //! default and prices the option separately rather than confusing the two.
 //! The `distinct_accounts` pair separates account-local contention from the
-//! engine-global counter line that #99 will remove. `full_check_denied`
+//! engine-global counter line that GL-99 will remove. `full_check_denied`
 //! measures the refusal path, which none of the others take.
 
 use std::hint::black_box;
@@ -598,7 +598,7 @@ fn spawn_contenders(
     spawn_contenders_with(engine, sharding, principals, admit_once)
 }
 
-/// The background load is a parameter because #99's capacity fixtures need
+/// The background load is a parameter because GL-99's capacity fixtures need
 /// their contenders to go through the gate too: measuring a gated foreground
 /// request against ungated background threads would price the gate's
 /// uncontended path and call it contention. The existing `admit_once`
@@ -621,7 +621,7 @@ fn spawn_contenders(
 /// counter, so it is not adjacent to the contenders spawned here.
 ///
 /// Left to chance that made two rows measure the lottery rather than the
-/// sharded path (#123). Whether one contender happened to share the
+/// sharded path (GL-123). Whether one contender happened to share the
 /// foreground thread's shard moved `full_check_contended_8_sharded` between
 /// 176 ns and 862 ns on a 24-core x86_64 host — a 4.9x step with no overlap,
 /// recurring with period 8 as the counter's offset walked — and the
@@ -634,7 +634,7 @@ fn spawn_contenders(
 /// on the shards the foreground thread does not occupy, and the mapping they
 /// actually realized is asserted before anything is timed. Pinning it is the
 /// point: these rows exist to price the opt-in layout working as designed,
-/// and question 2 of #123 — whether a deployment's threads map as cleanly —
+/// and question 2 of GL-123 — whether a deployment's threads map as cleanly —
 /// is a property of the deployment, not something a benchmark can average
 /// its way to. Asserting it is the same discipline `sweep` applies to the
 /// at-capacity maps: a fixture that silently stopped being the thing the row
@@ -653,10 +653,10 @@ fn spawn_contenders_with(
     let principals: Vec<Principal> = principals.into_iter().collect();
 
     // Pinned against the engine's tally layout, which shards under every
-    // lease layout (#132) and always at least as finely as the structure the
+    // lease layout (GL-132) and always at least as finely as the structure the
     // fixture spreads across: aligning there aligns both. Left to the lease
     // layout alone, the single-counter rows would put the foreground thread
-    // on a contender's tally shard seven times in sixteen — #123's lottery,
+    // on a contender's tally shard seven times in sixteen — GL-123's lottery,
     // moved to a different structure.
     let tallies = engine.counters().local_sharding();
     assert_eq!(
@@ -807,7 +807,7 @@ fn bench_full_check(c: &mut Criterion) {
         });
     }
 
-    // Eight simultaneous requests spread across eight accounts. Until #132
+    // Eight simultaneous requests spread across eight accounts. Until GL-132
     // the engine-wide tallies were one set of lines on this layout, and
     // unrelated accounts contended on them here; they now shard under every
     // lease layout, so what remains is per-request work, not a shared line.
@@ -827,8 +827,8 @@ fn bench_full_check(c: &mut Criterion) {
     // Eight distinct accounts, but every thread cycles through all of them,
     // so each account's lines are written from a different core on most
     // admissions — what a work-stealing runtime does to a connection's task
-    // (#138). The pinned row above keeps each account on one thread and so
-    // cannot see it: #138 measured 117 ns pinned against 1.04 us rotating.
+    // (GL-138). The pinned row above keeps each account on one thread and so
+    // cannot see it: GL-138 measured 117 ns pinned against 1.04 us rotating.
     // Not pinned against the tally layout on purpose: the point is that the
     // *account* lines move, and the tallies are per-thread either way.
     {
@@ -842,7 +842,7 @@ fn bench_full_check(c: &mut Criterion) {
         });
     }
 
-    // The deny path, which nothing measured before #37 — both benches above
+    // The deny path, which nothing measured before GL-37 — both benches above
     // set limits high enough that only the admit path runs. An unknown
     // principal is the cheapest refusal there is: one map lookup and a
     // return, with no quote, no rate token and no lease debit to hide behind.
@@ -855,7 +855,7 @@ fn bench_full_check(c: &mut Criterion) {
         })
     });
 
-    // The lease-exhausted path, which nothing measured before #1: `admit_once`
+    // The lease-exhausted path, which nothing measured before GL-1: `admit_once`
     // deliberately uses a giant lease and cancels, so the quota step's failure
     // branch never ran under a benchmark. Elastic mode adds a branch there, so
     // it would otherwise land on the one path the perf gate does not watch.
@@ -872,7 +872,7 @@ fn bench_full_check(c: &mut Criterion) {
         })
     });
 
-    // #128 classifies a failed local funding step as `BalanceExhausted` when
+    // GL-128 classifies a failed local funding step as `BalanceExhausted` when
     // the allocator has confirmed the account is empty. The strict row above
     // pays the one atomic load and finds no evidence; this one finds it, so
     // the reclassification and its distinct denial counter are measured too.
@@ -890,11 +890,11 @@ fn bench_full_check(c: &mut Criterion) {
         })
     });
 
-    // #130 reads a live `(deadline, remaining)` pair when the allocator has
+    // GL-130 reads a live `(deadline, remaining)` pair when the allocator has
     // attested a positive remainder too small for the quote, and refuses with
     // `BalanceInsufficient`. The row above is the zero-remaining case; this is
     // the seqlock-guarded pair read and the quote-against-remaining branch
-    // (#135). The same assertion keeps it from measuring a neighbour.
+    // (GL-135). The same assertion keeps it from measuring a neighbour.
     let insufficient = attested_engine(BalanceShortfall {
         remaining: CostUnits(1),
         period_end: None,
@@ -922,7 +922,7 @@ fn bench_full_check(c: &mut Criterion) {
         })
     });
 
-    // The two #91 mechanism witnesses keep the rest of the pipeline
+    // The two GL-91 mechanism witnesses keep the rest of the pipeline
     // identical and disable the weighted bucket, isolating the added mutable
     // state. The request bucket is uncontended; the concurrency gauge uses the
     // same sustained eight-thread harness as the existing contention gates.
@@ -950,7 +950,7 @@ fn bench_full_check(c: &mut Criterion) {
     group.finish();
 }
 
-/// Execution capacity (#99), gated as its own `capacity` group.
+/// Execution capacity (GL-99), gated as its own `capacity` group.
 ///
 /// The group exists so a product that selects `Disabled` is never charged for
 /// a feature it did not enable, and so the enabled modes are priced
@@ -959,7 +959,7 @@ fn bench_full_check(c: &mut Criterion) {
 /// `disabled` is deliberately `admission/full_check` plus one call to
 /// `acquire_capacity`, on the same engine and the same fixture. `full_check`
 /// does not reach the gate at all, so it is a genuine denominator rather than
-/// a second measurement of the same path — the trap #102 removed. The
+/// a second measurement of the same path — the trap GL-102 removed. The
 /// manifest ratio between them is what holds `Disabled` to costing nothing.
 fn bench_capacity(c: &mut Criterion) {
     let mut group = c.benchmark_group("capacity");
@@ -1042,7 +1042,7 @@ fn bench_capacity(c: &mut Criterion) {
     // independent axes: the map partitions per-account state, while the gate
     // is one instance-global pool every request of every account touches, so
     // sharding it is not an opt-in layout but the configuration it is meant
-    // to run in — the reason #99 sharded it at all. The unsharded pool is
+    // to run in — the reason GL-99 sharded it at all. The unsharded pool is
     // measured too, and recorded in `docs/DESIGN.md` as what the sharding
     // buys rather than gated as a topology nobody should deploy.
     for (label, mode) in [
@@ -1126,7 +1126,7 @@ fn attested_engine(evidence: BalanceShortfall) -> AdmissionEngine<ArcSwapSnapsho
     engine
 }
 
-/// Control-plane write amplification (review finding #9): loading 512
+/// Control-plane write amplification (review finding GL-9): loading 512
 /// principals one-by-one on a copy-on-write map vs one bulk install.
 /// Measured for visibility; not part of the threshold gate (control-plane
 /// cost, not request-path cost).
@@ -1168,7 +1168,7 @@ fn bench_bulk_install(c: &mut Criterion) {
 
     // The two above share one account, so the limiter registry holds a single
     // entry and its dead-entry sweep is O(1) — they isolate map-clone cost and
-    // cannot see the registry rescan at all (#8). These give every principal
+    // cannot see the registry rescan at all (GL-8). These give every principal
     // its own account, so the registry holds N entries and a per-lookup sweep
     // costs O(N) each time. Both sizes are measured: the point is the shape of
     // the curve, since the defect is quadratic rather than merely slow.

@@ -3,7 +3,7 @@
 //! Deliberately **not** part of `testing/perf_thresholds.json`: that manifest
 //! gates request-path latency on a controlled host, and this is control-plane
 //! work whose absolute numbers are host-dependent. The point here is the
-//! *shape* of the curve, not the value — before #22 the sweep recomputed
+//! *shape* of the curve, not the value — before GL-22 the sweep recomputed
 //! readiness by scanning every resolution once per completed fetch, so cost
 //! grew with the square of the principal count.
 //!
@@ -31,8 +31,8 @@ use tollgate_store::{GrantPolicy, MemoryStore};
 ///
 /// Installing into the real `ArcSwapSnapshotMap` is itself super-linear in a
 /// bulk load — its per-account limiter registry rescans every account on each
-/// install (issue #8) — and that cost swamps everything else here. Since the
-/// question is how the *manager's sweep* scales, the map is stubbed out; #8
+/// install (issue GL-8) — and that cost swamps everything else here. Since the
+/// question is how the *manager's sweep* scales, the map is stubbed out; GL-8
 /// is measured by its own issue, not conflated with this one.
 #[derive(Debug, Default)]
 struct NullMap {
@@ -123,7 +123,7 @@ fn source(principals: usize) -> Arc<MemoryStore> {
 /// A *churned* catalogue: a live minority among tombstones, which is what a
 /// service accumulates over years of signups and cancellations.
 ///
-/// The all-live fixture above cannot show #52's problem at all — every entry
+/// The all-live fixture above cannot show GL-52's problem at all — every entry
 /// costs a fetch and every entry is one an instance can serve, so cost and
 /// value scale together. Here they come apart: the catalogue is `principals`
 /// entries and only `live` of them are serviceable.
@@ -142,7 +142,7 @@ fn config(principals: usize) -> SnapshotManagerConfig {
 }
 
 /// The same cadence with the tracked set discovered rather than configured
-/// (#48), so the two benchmarks differ only in where the set comes from.
+/// (GL-48), so the two benchmarks differ only in where the set comes from.
 fn discovering_config() -> SnapshotManagerConfig {
     config_for(TrackedPrincipals::All { seed: Vec::new() })
 }

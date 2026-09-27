@@ -11,7 +11,7 @@
 //!   `POST /v1/leases/consolidate`, `POST /v1/leases/reclaim` — fenced lease
 //!   lifecycle.
 //! - `GET /v1/keys` — revisioned active credential pages (instance authority only).
-//! - `GET /v1/snapshots` — the principal catalogue (#48).
+//! - `GET /v1/snapshots` — the principal catalogue (GL-48).
 //! - `GET /v1/snapshots/{principal}` — compiled snapshot fetch.
 //! - `POST /v1/usage/ingest` — idempotent usage batches.
 //! - `POST /v1/admin/accounts`, `POST /v1/admin/accounts/{id}/deposit`,
@@ -19,7 +19,7 @@
 //!   `POST /v1/admin/accounts/{id}/capacity-class`,
 //!   `POST/GET /v1/admin/accounts/{id}/keys`,
 //!   `DELETE /v1/admin/accounts/{id}/keys/{key}`,
-//!   `PUT/DELETE /v1/admin/accounts/{id}/keys/{key}/snapshot` (#143),
+//!   `PUT/DELETE /v1/admin/accounts/{id}/keys/{key}/snapshot` (GL-143),
 //!   `PUT/DELETE /v1/admin/snapshots/{principal}` — administration.
 //! - `GET /livez`, `GET /readyz` — probes.
 //!
@@ -70,7 +70,7 @@ pub struct ServerState<S> {
     pub store: Arc<S>,
     pub clock: Arc<dyn Clock>,
     pub security: Arc<ServerSecurity>,
-    /// Who may mint credentials, if this deployment issues them at all (#121).
+    /// Who may mint credentials, if this deployment issues them at all (GL-121).
     ///
     /// `None` is a deliberate answer, not an omission: an instance that only
     /// verifies has no business holding the capability to create credentials,
@@ -98,7 +98,7 @@ pub trait Backend:
     + UsageSink
     + AdminStore
     + KeySource
-    // A server administers credentials as well as projecting them (#121), so
+    // A server administers credentials as well as projecting them (GL-121), so
     // its backend must be the credential *directory* and not only a source.
     // `HttpStore` implements `KeySource` but not this — correctly: it is a
     // client of a server, never the authority behind one.
@@ -200,7 +200,7 @@ fn router_with_maintenance<S: Backend>(
 }
 
 /// Serve until `shutdown` resolves, running the maintenance sweep every
-/// `reclaim_interval` in the background (INVARIANTS.md #9's server half).
+/// `reclaim_interval` in the background (INVARIANTS.md GL-9's server half).
 pub async fn serve<S: Backend>(
     listener: tokio::net::TcpListener,
     state: ServerState<S>,
@@ -281,14 +281,14 @@ pub async fn serve<S: Backend>(
 /// Reclaim expired leases and roll due budget periods forever, on the
 /// configured interval.
 ///
-/// This is INVARIANTS.md #9's server half, and it is the only thing that
+/// This is INVARIANTS.md GL-9's server half, and it is the only thing that
 /// returns units stranded by a crashed holder. A store can serve `ping` and
 /// fail maintenance, so each outcome is published to readiness and reported
 /// independently. Silence about success would
 /// leave "the sweep is running but finding nothing" and "the sweep stopped"
 /// indistinguishable.
 ///
-/// The rollover pass (#97) shares this tick rather than owning a timer,
+/// The rollover pass (GL-97) shares this tick rather than owning a timer,
 /// because it needs the same three things and gets them here already: a frozen
 /// cutoff, a bounded drain, and a failure that is reported rather than
 /// swallowed. It is also the only trigger — without it a schedule is a stored
@@ -393,7 +393,7 @@ async fn maintenance_sweep<S: Backend>(
                     );
                 }
                 // A swept lease is one its holder never released, so its
-                // remainder was forfeited rather than returned (#136). Units
+                // remainder was forfeited rather than returned (GL-136). Units
                 // forfeited are an operator signal: a crash, or a shutdown
                 // whose release deadline lapsed.
                 if progress.units > 0 {
@@ -537,7 +537,7 @@ async fn roll_due_periods<S: Backend>(
     std::ops::ControlFlow::Continue(())
 }
 
-/// Ready only when the backing store answers (review finding #11): a server
+/// Ready only when the backing store answers (review finding GL-11): a server
 /// whose source of truth or maintenance is unavailable must not attract traffic.
 async fn readyz<S: Backend>(
     State(state): State<ServerState<S>>,
@@ -638,7 +638,7 @@ async fn fetch_snapshot<S: Backend>(
 }
 
 /// The principal catalogue, for instances that track every customer rather
-/// than a configured slice (#48).
+/// than a configured slice (GL-48).
 ///
 /// A backend that cannot enumerate answers 501 rather than an empty list: an
 /// empty catalogue and an unsupported one lead an instance to opposite
@@ -763,7 +763,7 @@ async fn set_status<S: Backend>(
 ) -> Result<Json<SetStatusResponse>, ApiError> {
     // 200 with the blast radius, not 204: the ledger half is one row, but the
     // snapshot half is however many credentials the account has, and an
-    // operator has no other way to learn which (#51).
+    // operator has no other way to learn which (GL-51).
     let change = operator
         .run(
             "set_account_status",
@@ -779,7 +779,7 @@ async fn set_status<S: Backend>(
 }
 
 /// One account's administrative state, for an operator or an application
-/// backend acting for its customer (#121).
+/// backend acting for its customer (GL-121).
 ///
 /// A read, so it takes no audit receipt: the receipt convention describes
 /// committed *outcomes*, and this commits nothing. It is still operator-only —
@@ -817,7 +817,7 @@ async fn account<S: Backend>(
     }))
 }
 
-/// Set or clear an account's periodic allowance (#121).
+/// Set or clear an account's periodic allowance (GL-121).
 ///
 /// Audited through the receipt convention, so the response reports what the
 /// call actually replaced rather than echoing the request back. A repeat is a
@@ -1021,7 +1021,7 @@ async fn revoke_account_key<S: Backend>(
     }))
 }
 
-/// Publish the policy for one of an account's credentials (#143).
+/// Publish the policy for one of an account's credentials (GL-143).
 ///
 /// The operator names the credential by the handles it already holds; the
 /// store resolves its principal, which never appears in a request, response
@@ -1050,7 +1050,7 @@ async fn publish_key_snapshot<S: Backend>(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Withdraw the policy bound to one of an account's credentials (#143).
+/// Withdraw the policy bound to one of an account's credentials (GL-143).
 ///
 /// Revocation does not withdraw it, so this is part of revoking a key; it is
 /// allowed for a revoked credential for exactly that reason.
@@ -1099,7 +1099,7 @@ async fn set_capacity_class<S: Backend>(
 ) -> Result<Json<SetStatusResponse>, ApiError> {
     // 200 with the blast radius, for the reason `set_status` returns one: the
     // ledger half is one row and the snapshot half is however many credentials
-    // the account has (#99).
+    // the account has (GL-99).
     let change = operator
         .run(
             "set_capacity_class",

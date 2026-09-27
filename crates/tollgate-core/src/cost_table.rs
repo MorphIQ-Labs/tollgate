@@ -46,7 +46,7 @@ pub enum QuoteError {
     EmptyWorkload,
     /// The operation's index was never registered in this table.
     UnknownOperation { index: usize },
-    /// `fixed + per_item * items` exceeded `u64` (INVARIANTS.md #11).
+    /// `fixed + per_item * items` exceeded `u64` (INVARIANTS.md GL-11).
     Overflow,
 }
 
@@ -104,11 +104,11 @@ impl CostTable {
     /// Answers the one-class case by direct index, which is what the module
     /// header promises: two array loads and checked integer arithmetic.
     ///
-    /// #91 replaced that with a delegation to [`CostTable::quote_workload`],
+    /// GL-91 replaced that with a delegation to [`CostTable::quote_workload`],
     /// and `cost_table/quote` went 1.70 → 2.25 ns (+32%). Nothing caught it:
     /// the row's recorded baseline had been taken one commit earlier in the
     /// same issue and was never re-recorded, so the gate compared the new code
-    /// against a number the new code no longer described (#114). Embedders
+    /// against a number the new code no longer described (GL-114). Embedders
     /// pricing a single class call this; the admission engine folds its own
     /// workload and needs the permission bits only the fold returns, so it
     /// keeps [`CostTable::quote_workload`] and is unaffected either way.
@@ -320,7 +320,7 @@ mod tests {
     // which error they answer with.
     //
     // `quote` takes the direct index rather than folding a one-element
-    // workload, because delegating cost it 32% (#114). That is only safe while
+    // workload, because delegating cost it 32% (GL-114). That is only safe while
     // the two cannot diverge, and "they share `weight_at` and `quote_weight`"
     // is an argument, not a check — this is the check.
     proptest::proptest! {
@@ -414,7 +414,7 @@ mod tests {
     /// The two accessors are how an embedder reads a compiled schedule back —
     /// to display pricing, or to reconcile a charge — and nothing asserted
     /// they report the schedule that is actually applied. Both mutated to
-    /// `CostUnits(0)` without a single failure (#43).
+    /// `CostUnits(0)` without a single failure (GL-43).
     ///
     /// So this asserts agreement rather than the stored values alone: what
     /// `fixed_request()` reports is the fixed component a quote charges, and

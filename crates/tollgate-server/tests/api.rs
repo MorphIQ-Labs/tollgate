@@ -256,7 +256,7 @@ async fn admin_snapshot_roundtrip_and_probes() {
     assert_eq!(status, StatusCode::OK);
 
     // Recreating an existing account is a surfaced conflict, never a silent
-    // overwrite or no-op (review finding #7).
+    // overwrite or no-op (review finding GL-7).
     let (status, problem) = call(
         &router,
         "POST",
@@ -385,7 +385,7 @@ async fn admin_preserves_new_limit_fields_over_http() {
 }
 
 /// A revision published over HTTP comes back over HTTP, in canonical form
-/// (#94) — and a document that omits it is served as unstated rather than
+/// (GL-94) — and a document that omits it is served as unstated rather than
 /// refused.
 ///
 /// The server is a *reader* in this rollout: it decodes into an
@@ -585,7 +585,7 @@ async fn admin_refuses_weighted_rate_outside_governors_u32_domain() {
 }
 
 /// The admin status endpoint speaks the `AccountStatus` vocabulary, and the
-/// wire break is loud in both directions (#51).
+/// wire break is loud in both directions (GL-51).
 ///
 /// The last assertion is the one worth having: `{"active": false}` used to be
 /// a valid suspension, and now that the same call also republishes every
@@ -628,7 +628,7 @@ async fn account_status_endpoint_speaks_the_status_vocabulary() {
     assert_eq!(problem["code"], "account-closed");
 
     // An unknown account is still a 404, whichever status is asked for --
-    // the contract #27 pinned, carried across the rename.
+    // the contract GL-27 pinned, carried across the rename.
     let (status, problem) = call(
         &router,
         "POST",
@@ -655,7 +655,7 @@ async fn account_status_endpoint_speaks_the_status_vocabulary() {
     assert_eq!(problem["code"], "invalid-json");
 }
 
-/// Issue #61: an over-limit ingest body is refused as `batch-too-large`, not
+/// Issue GL-61: an over-limit ingest body is refused as `batch-too-large`, not
 /// as malformed JSON, and by a limit this crate declares rather than one axum
 /// supplies.
 ///
@@ -701,7 +701,7 @@ async fn an_oversized_ingest_body_is_refused_as_batch_too_large() {
 }
 
 /// The operator account read reports funding and billing as different things
-/// (#121).
+/// (GL-121).
 ///
 /// The distinction the issue asks the surface to preserve: a balance falls
 /// when units go out on a lease that has not settled, and that is not spend.
@@ -821,12 +821,12 @@ async fn an_instance_credential_cannot_read_an_account() {
     );
 }
 
-/// The issuer secret the conformance cases configure (#143). Test-only.
+/// The issuer secret the conformance cases configure (GL-143). Test-only.
 const ISSUER_SECRET: &str = "143a143a143a143a143a143a143a143a143a143a143a143a143a143a143a143a";
 
 /// An issuer for tests, built the way the stock binary builds one: a security
 /// manifest's `issuer` entry through `SecurityLoader::load`, `start` and
-/// `issuer` (#143), not a registry constructed beside the configuration path.
+/// `issuer` (GL-143), not a registry constructed beside the configuration path.
 async fn manifest_issuer() -> Option<Arc<dyn tollgate_auth::CredentialIssuer + Send + Sync>> {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("security.json");
@@ -857,7 +857,7 @@ async fn issuing_state() -> (Arc<MemoryStore>, axum::Router) {
     (store, router)
 }
 
-/// A snapshot body for the key-bound route (#143). `key_id` is left unstated
+/// A snapshot body for the key-bound route (GL-143). `key_id` is left unstated
 /// unless given: the route binds it to the key in the path.
 fn key_snapshot(account: u128, generation: u64, key: Option<u128>) -> Value {
     let mut snapshot = tollgate_core::AccountSnapshot::builder(
@@ -899,7 +899,7 @@ async fn make_account(store: &MemoryStore, id: u128) {
 }
 
 /// A secret is disclosed once, and resending the request does not disclose it
-/// again (#121).
+/// again (GL-121).
 ///
 /// The caller chooses the `key_id`, so a lost response is recoverable *as a
 /// fact* — "your credential exists" — without the server reissuing or
@@ -1005,7 +1005,7 @@ async fn issuance_refuses_past_the_active_key_bound() {
 }
 
 /// A credential belonging to another account cannot be revoked through this
-/// account's path (#121).
+/// account's path (GL-121).
 ///
 /// The isolation an application backend administering one customer depends on:
 /// a mistyped or guessed id must not retire someone else's credential.
@@ -1159,7 +1159,7 @@ async fn setting_a_budget_over_http_reports_what_it_replaced() {
 
 /// The provisioning sequence `docs/ACCOUNT_ADMINISTRATION.md` publishes, run
 /// end to end — and run twice, because every step it documents is described as
-/// safe to repeat (#121).
+/// safe to repeat (GL-121).
 ///
 /// A runbook nothing executes is a runbook that drifts. This is the executable
 /// half of the conformance list at the end of that document.
@@ -1521,7 +1521,7 @@ async fn credential_audits_name_the_key_and_actual_lifecycle_transition() {
 }
 
 /// Binding by key is bound to the account in the path, as revocation is: a
-/// foreign or unknown `key_id` answers 404 and publishes nothing (#143).
+/// foreign or unknown `key_id` answers 404 and publishes nothing (GL-143).
 #[tokio::test]
 async fn a_key_snapshot_is_bound_to_the_account_in_the_path() {
     let (store, app) = issuing_state().await;
@@ -1562,7 +1562,7 @@ async fn a_key_snapshot_is_bound_to_the_account_in_the_path() {
 }
 
 /// A snapshot naming a different credential, or another account, is refused
-/// rather than rewritten; one naming the path's key is accepted (#143).
+/// rather than rewritten; one naming the path's key is accepted (GL-143).
 #[tokio::test]
 async fn a_key_snapshot_naming_another_key_is_refused() {
     let (store, app) = issuing_state().await;
@@ -1595,7 +1595,7 @@ async fn a_key_snapshot_naming_another_key_is_refused() {
 
 /// Revocation is terminal: a retired credential is never granted a snapshot
 /// again, and withdrawing its snapshot is the second half of revoking it
-/// (#143, INVARIANTS.md #27).
+/// (GL-143, INVARIANTS.md GL-27).
 #[tokio::test]
 async fn a_retired_key_cannot_be_granted_a_snapshot_but_can_be_withdrawn() {
     let (store, app) = issuing_state().await;
@@ -1709,7 +1709,7 @@ async fn key_snapshot_audits_name_the_key_and_never_the_principal() {
     assert!(!rendered.contains(ISSUER_SECRET));
 }
 
-/// An embedder's issuer must mint the presented form (#143). One that hands
+/// An embedder's issuer must mint the presented form (GL-143). One that hands
 /// out bytes no header can carry is refused before its record is stored, so
 /// no credential exists that its owner could never present.
 #[tokio::test]

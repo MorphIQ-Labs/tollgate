@@ -75,7 +75,7 @@ impl Verified {
 ///   cache miss just as it would without one.
 /// - **No I/O, no blocking, no locks held across it.** A miss runs on the
 ///   request path, so this inherits the request path's rules (INVARIANTS.md
-///   #5, #6). A verifier needing a database belongs behind a snapshot, not
+///   GL-5, GL-6). A verifier needing a database belongs behind a snapshot, not
 ///   here.
 /// - **Identity only.** Returning a `Principal` says who presented the
 ///   credential and nothing about what they may do. Status, permissions, rate
@@ -90,7 +90,7 @@ pub trait CredentialVerifier {
     fn verify(&self, credential: &[u8]) -> Option<Verified>;
 }
 
-/// Minting the credentials a [`CredentialVerifier`] will later accept (#121).
+/// Minting the credentials a [`CredentialVerifier`] will later accept (GL-121).
 ///
 /// Separate from verification on purpose, and not merged into it. Every
 /// deployment verifies; only one that administers accounts over HTTP needs to
@@ -188,7 +188,7 @@ mod tests {
     }
 
     /// The boundary is exclusive: at the expiry instant the answer is spent,
-    /// matching how the rest of the stack treats `usable_until` (INVARIANTS #12).
+    /// matching how the rest of the stack treats `usable_until` (INVARIANTS GL-12).
     #[test]
     fn a_bounded_answer_expires_at_its_instant_not_after_it() {
         let until = Timestamp::from_second(60).unwrap();

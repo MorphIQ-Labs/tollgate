@@ -4,14 +4,14 @@
 //! path reserves a slot *before* admitting work
 //! ([`UsageRecorder::try_reserve`]); a full queue is
 //! `DenyReason::AccountingBackpressure` — shed with zero units charged,
-//! never a silent drop, never an unbounded block (INVARIANTS.md #8). The
+//! never a silent drop, never an unbounded block (INVARIANTS.md GL-8). The
 //! permit outlives execution, and the shutdown drain below waits for it, so
 //! a post-commit send is either ingested or explicitly counted — never
-//! silently dropped (INVARIANTS.md #13).
+//! silently dropped (INVARIANTS.md GL-13).
 //!
 //! The queue is a set of lanes, each a bounded mpsc channel, chosen by the
 //! request thread's sticky locality and sized to split `queue_capacity`
-//! exactly (#137). A request reserves in its own lane and tries the others
+//! exactly (GL-137). A request reserves in its own lane and tries the others
 //! before shedding, so the shed point is the whole queue. Lanes keep one
 //! thread's sender count, semaphore, tail and entry counter off every other
 //! thread's lines; one shared channel put all of them, for every account, on
@@ -25,13 +25,13 @@
 //!
 //! The writer task drains the lanes into batches and ingests them through
 //! the [`UsageSink`]. Ingest is idempotent on
-//! request id (INVARIANTS.md #7), so retrying a whole batch after a backend
+//! request id (INVARIANTS.md GL-7), so retrying a whole batch after a backend
 //! error is always safe. A failing backend is retried with backoff forever
 //! while the channel backs up and sheds upstream — memory stays bounded at
 //! one in-flight batch plus the channel.
 //!
 //! Every ingest is wall-clock bounded by
-//! [`UsageWriterConfig::ingest_timeout`] (INVARIANTS.md #18): a sink that
+//! [`UsageWriterConfig::ingest_timeout`] (INVARIANTS.md GL-18): a sink that
 //! hangs rather than erroring is indistinguishable from one that is merely
 //! slow, and neither may park the task. A timed-out call is a failed
 //! attempt — during shutdown it counts toward `lost`, never toward success.
@@ -39,7 +39,7 @@
 //! Shutdown is level-triggered: every loop consults the watch's *current*
 //! value, never only its edge notification, so a shutdown signalled during a
 //! retry backoff still reaches the bounded final flush (this was review
-//! finding #2 — the original edge-triggered design could consume the
+//! finding GL-2 — the original edge-triggered design could consume the
 //! notification inside the retry loop and then wait forever for a second one
 //! that never came). Dropping the [`UsageWriter`] handle without calling
 //! [`shutdown`](UsageWriter::shutdown) aborts the task outright — enqueued
@@ -53,19 +53,19 @@
 //! by [`UsageWriterConfig::shutdown_drain_deadline`]. Permits still
 //! unresolved at the deadline are reported in [`WriterStats::unresolved`];
 //! their charges are locally committed but unbilled, bounded thereafter by
-//! TTL reclaim (INVARIANTS.md #9).
+//! TTL reclaim (INVARIANTS.md GL-9).
 //!
 //! Every charge that enters the queue is counted until the writer gives it a
 //! billing outcome, in a counter held outside the task. A writer that dies
 //! instead of reporting therefore still says how many committed charges it
 //! was carrying: [`shutdown`](UsageWriter::shutdown) yields
 //! [`WriterShutdownError`], never a zeroed [`WriterStats`] that would read
-//! exactly like a clean run (INVARIANTS.md #8).
+//! exactly like a clean run (INVARIANTS.md GL-8).
 //!
 //! Lifecycle order the embedder must follow: stop admitting, quiesce the
 //! request tasks holding permits or committed `Committed` guards, `shutdown()`
 //! this writer, and only then shut the lease manager down — events must land
-//! while their lease is live (INVARIANTS.md #12). Size the drain deadline
+//! while their lease is live (INVARIANTS.md GL-12). Size the drain deadline
 //! within `expiry_safety_margin + reclaim_grace`, so a slow drain surfaces
 //! as `rejected` at the sink rather than silent loss.
 
@@ -118,7 +118,7 @@ impl std::error::Error for UsageWriterConfigError {}
 
 impl UsageWriterConfig {
     /// Every field is a contract, so none of them is silently repaired
-    /// (INVARIANTS.md #16): a zero capacity or batch size has no sensible
+    /// (INVARIANTS.md GL-16): a zero capacity or batch size has no sensible
     /// coercion, a zero backoff hot-spins against a failing sink, and a zero
     /// deadline or timeout reports failure without waiting at all.
     pub fn validate(&self) -> Result<(), UsageWriterConfigError> {
@@ -183,9 +183,9 @@ impl Contended {
 /// The tally used to be a `WriterStats` local on the task's stack, materialised
 /// only when the task exited — so a process that crashed, was killed, or simply
 /// kept running reported nothing, and `lost` was observable only after the one
-/// kind of shutdown where loss is least likely (#38). Living out here it is
+/// kind of shutdown where loss is least likely (GL-38). Living out here it is
 /// readable at any time, and it survives the task's death exactly as the
-/// unaccounted count always has (INVARIANTS.md #8).
+/// unaccounted count always has (INVARIANTS.md GL-8).
 ///
 /// These are also the *only* copy: [`UsageWriter::shutdown`] returns a snapshot
 /// of these counters rather than a parallel tally, so the running totals and the
@@ -211,7 +211,7 @@ pub struct WriterCounters {
     last_ingest_ms: AtomicI64,
     /// Charges the writer has given an outcome. Written only by the task.
     settled: AtomicU64,
-    /// Each lane's count of charges that entered it (#137). Set once when the
+    /// Each lane's count of charges that entered it (GL-137). Set once when the
     /// writer spawns; a counter set nobody attached reads as holding nothing.
     lanes: OnceLock<Arc<[LaneStats]>>,
     // Written from the request path, by as many cores as serve requests.
@@ -375,7 +375,7 @@ pub struct WriterHealth {
     pub stats: WriterStats,
     /// Charges in the queue with no billing outcome yet.
     pub unaccounted: u64,
-    /// Requests refused for want of queue capacity (INVARIANTS.md #8).
+    /// Requests refused for want of queue capacity (INVARIANTS.md GL-8).
     pub shed: u64,
     /// Slots currently held by queued events and outstanding permits.
     pub queue_depth: usize,
@@ -396,7 +396,7 @@ impl WriterHealth {
     }
 }
 
-/// One lane's request-written state, on a cache line of its own (#137).
+/// One lane's request-written state, on a cache line of its own (GL-137).
 #[repr(align(128))]
 #[derive(Debug)]
 struct LaneStats {
@@ -449,7 +449,7 @@ struct Lane {
 /// Cheap-to-clone handle for request handlers.
 ///
 /// The queue is partitioned into lanes by the request thread's sticky
-/// locality (#137). One shared channel put every request of every account on
+/// locality (GL-137). One shared channel put every request of every account on
 /// the same sender count, semaphore, tail and waker lines, and woke the writer
 /// once per event: eight threads measured 3.2 µs per reserve-and-record. A
 /// request reserves in its own lane and tries the others before shedding, so
@@ -581,7 +581,7 @@ impl tollgate_core::UsageSlot for UsagePermit {
 ///
 /// Deliberately not [`Default`]: a zeroed report must never be conjurable
 /// from a failure (`unwrap_or_default` on a dead task's `JoinError` is the
-/// bug this type's history records — issue #41). Use [`WriterStats::ZERO`]
+/// bug this type's history records — issue GL-41). Use [`WriterStats::ZERO`]
 /// when a starting value is genuinely meant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriterStats {
@@ -598,7 +598,7 @@ pub struct WriterStats {
     pub lost: u64,
     /// Permits (in-flight requests or committed guards) that neither sent
     /// nor dropped before the drain deadline. Their charges are locally
-    /// committed but unbilled; TTL reclaim bounds them (INVARIANTS.md #9).
+    /// committed but unbilled; TTL reclaim bounds them (INVARIANTS.md GL-9).
     pub unresolved: u64,
 }
 
@@ -809,7 +809,7 @@ impl UsageWriter {
     /// A writer task that died instead of reporting yields
     /// [`WriterShutdownError`] carrying the charges it was still holding —
     /// never a zeroed [`WriterStats`], which would be indistinguishable from
-    /// a clean shutdown (INVARIANTS.md #8).
+    /// a clean shutdown (INVARIANTS.md GL-8).
     pub async fn shutdown(mut self) -> Result<WriterStats, WriterShutdownError> {
         crate::signal(&self.shutdown, true, "usage-writer shutdown");
         let Some(handle) = self.handle.as_mut() else {
@@ -922,7 +922,7 @@ async fn run(writer: Writer, mut lanes: Lanes, mut shutdown: watch::Receiver<boo
         }
 
         // The writer never parks on a lane's receiver, so a send finds no
-        // waker to wake (#137). It drains on this tick, which is when a
+        // waker to wake (GL-137). It drains on this tick, which is when a
         // partial batch was due anyway, and earlier only when a lane rings.
         let deadline = tokio::time::sleep(config.flush_interval);
         tokio::pin!(deadline);
@@ -1025,10 +1025,10 @@ async fn flush_retrying(
             // forever, and every event queued behind it waits for a recovery
             // that cannot come. Counted lost and dropped, so the queue drains
             // and later events bill — a permanent configuration or contract
-            // error must not become an unbounded billing outage (#61).
+            // error must not become an unbounded billing outage (GL-61).
             //
             // `lost` is the honest word for it: these events entered the queue
-            // and will never reach the ledger. INVARIANTS #8 asks that they be
+            // and will never reach the ledger. INVARIANTS GL-8 asks that they be
             // counted rather than silently dropped, not that they be delivered
             // by a sink that refuses them.
             Ok(Err(refused)) if !refused.is_retryable() => {
@@ -1181,15 +1181,15 @@ async fn flush_bounded(
                 // deadline by up to `2 * retry_backoff`, because the comment
                 // claiming otherwise was attached to the *timeout* arm while
                 // this one — an ordinary store error, and the common case —
-                // slept unconditionally (#63).
+                // slept unconditionally (GL-63).
                 //
                 // That overrun is not merely a slow shutdown. The drain's
                 // budget is sized inside `expiry_safety_margin + reclaim_grace`
-                // (#12), so overrunning it releases leases past the window
+                // (GL-12), so overrunning it releases leases past the window
                 // that keeps a straggler billable: events that do land arrive
                 // against a lease the allocator has re-granted, and are
                 // refused. Bounding by attempt *count* alone is not a bound
-                // (#18).
+                // (GL-18).
                 tokio::time::sleep_until(
                     deadline.min(tokio::time::Instant::now() + config.retry_backoff),
                 )
@@ -1454,7 +1454,7 @@ mod lane_tests {
 
     /// A full lane is not a full queue: one thread, whose own lane fills first,
     /// still reserves every slot of every lane, and the next request sheds at
-    /// exactly `queue_capacity` (INVARIANTS.md #8).
+    /// exactly `queue_capacity` (INVARIANTS.md GL-8).
     #[tokio::test(start_paused = true)]
     async fn the_shed_point_is_the_whole_queue_across_lanes() {
         let sink = Arc::new(Recording::default());

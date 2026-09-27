@@ -1,4 +1,4 @@
-# Nondeterministic APIs this codebase must not reach for (#100, G14.determinism).
+# Nondeterministic APIs this codebase must not reach for (GL-100, G14.determinism).
 #
 # Derived from this architecture, not copied: the request path "reads no
 # wall/business clock for policy decisions" and "callers pass `jiff` timestamps
@@ -33,7 +33,7 @@ disallowed-methods = [
   # This is not theoretical here. `MemoryStore::principals` returned
   # `snapshots.keys()` straight to its caller while `PostgresStore` answered
   # `ORDER BY principal`, and the suite's assertion sorted before comparing, so
-  # the two backends disagreed invisibly (#100).
+  # the two backends disagreed invisibly (GL-100).
   { path = "std::collections::HashMap::iter", reason = "iteration order comes from the hash seed; collect into a BTreeMap, or sort, when the order reaches an output" },
   { path = "std::collections::HashMap::iter_mut", reason = "same as HashMap::iter when the traversal order affects what is written" },
   { path = "std::collections::HashMap::keys", reason = "iteration order comes from the hash seed; sort before returning a key set to a caller" },

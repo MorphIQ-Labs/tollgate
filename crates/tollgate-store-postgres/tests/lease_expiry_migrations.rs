@@ -151,7 +151,7 @@ async fn expiry_upgrade_preserves_accounting_and_fences_old_lease_queries() {
     assert_eq!(reclaimed[0].forfeited, CostUnits(10));
     let c = store.conservation(AccountId(1)).await.unwrap().unwrap();
     assert!(c.holds());
-    // The unreleased upgraded lease is forfeited, not credited (#136).
+    // The unreleased upgraded lease is forfeited, not credited (GL-136).
     assert_eq!(c.balance, CostUnits(90));
     assert_eq!(c.active_lease_grants, CostUnits::ZERO);
     assert_eq!(c.settlement_loss, CostUnits(10));

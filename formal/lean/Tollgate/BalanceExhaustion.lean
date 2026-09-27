@@ -1,5 +1,5 @@
 /-!
-Exact ledger and publication model for #128 and #130. All units are natural
+Exact ledger and publication model for GL-128 and GL-130. All units are natural
 numbers. The ledger lock and checked finite-width decoding must establish the
 equation before using these results. Unreported usage remains in outstanding
 funding; a zero allocatable balance alone cannot establish exhaustion, and the
@@ -53,7 +53,7 @@ theorem flooring_cannot_extend (floor exact now : Int)
     (conservative : floor ≤ exact) (live : now < floor) : now < exact := by
   omega
 
-/-! ### Shortfall (#130)
+/-! ### Shortfall (GL-130)
 
 Ledger remaining is `funded - recorded`. Consumption not yet reported can only
 lower what is truly left, so remaining is an upper bound, and a quote above it

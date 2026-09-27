@@ -41,7 +41,7 @@ pub enum AdminState {
     /// values — allowance, period, rollover — and the row's own CHECK treats
     /// them as all-or-nothing, so auditing one without the others would record
     /// a state the ledger cannot hold. `None` is "no schedule", which is a
-    /// different fact from an allowance of zero (#121).
+    /// different fact from an allowance of zero (GL-121).
     Budget {
         schedule: Option<tollgate_core::BudgetSchedule>,
     },

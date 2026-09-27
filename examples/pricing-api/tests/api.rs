@@ -26,7 +26,7 @@ use tollgate_store::{AllocateError, SnapshotSource};
 
 /// Every test router needs a connection to authenticate against, because the
 /// price route takes `ConnectInfo<PricingConnection>` — that requirement is
-/// deliberate (#2), and `price_route_requires_connection_context` is the test
+/// deliberate (GL-2), and `price_route_requires_connection_context` is the test
 /// that keeps it from being quietly optional.
 async fn build_test_app(deposit: u64, admission_enabled: bool) -> (axum::Router, AppRuntime) {
     let (router, runtime) = build_app(deposit, admission_enabled).await;
@@ -36,7 +36,7 @@ async fn build_test_app(deposit: u64, admission_enabled: bool) -> (axum::Router,
     )
 }
 
-/// The same, for the enforcement-mode tests #1 added.
+/// The same, for the enforcement-mode tests GL-1 added.
 async fn build_test_app_with_mode(
     deposit: u64,
     admission_enabled: bool,
@@ -167,7 +167,7 @@ async fn authorized_request_prices_and_charges() {
     assert_eq!(store.usage_recorded(DEMO_ACCOUNT), CostUnits(64));
 }
 
-/// #94's acceptance criterion: the response metadata and the usage record
+/// GL-94's acceptance criterion: the response metadata and the usage record
 /// refer to the same policy revision.
 ///
 /// This is the whole point of the field and nothing else proves it. A
@@ -296,7 +296,7 @@ async fn price_route_requires_connection_context() {
     runtime.shutdown().await;
 }
 
-/// Issue #2: caching proves only credential identity. Authorization remains a
+/// Issue GL-2: caching proves only credential identity. Authorization remains a
 /// fresh snapshot-map decision on every request, so revocation still reaches
 /// an already-authenticated persistent connection through the normal push
 /// path.
@@ -367,7 +367,7 @@ async fn exhausted_quota_returns_429_and_never_overspends() {
             StatusCode::OK => ok += 1,
             StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => denied += 1,
             // Once usage has settled and a refusal has consolidated the tail,
-            // the ledger attests the 47 units left cannot fund 51 (#130).
+            // the ledger attests the 47 units left cannot fund 51 (GL-130).
             StatusCode::PAYMENT_REQUIRED => {
                 assert_eq!(body["code"], "balance-insufficient", "{body}");
                 denied += 1;
@@ -382,7 +382,7 @@ async fn exhausted_quota_returns_429_and_never_overspends() {
     assert!(store.usage_recorded(DEMO_ACCOUNT).get() <= 200);
 }
 
-/// #131 over HTTP: the example halves grants, so 60 units grant 30 and a
+/// GL-131 over HTTP: the example halves grants, so 60 units grant 30 and a
 /// 51-unit request is refused once. The refusal-driven consolidation grows the
 /// lease to the refused quote, and the same request is then admitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -420,7 +420,7 @@ async fn a_quote_above_half_the_balance_is_funded_after_one_refusal() {
     assert_eq!(store.usage_recorded(DEMO_ACCOUNT), CostUnits(51));
 }
 
-/// #130 over HTTP: funding left, but less than the quote, is 402 and not
+/// GL-130 over HTTP: funding left, but less than the quote, is 402 and not
 /// retryable at that quote; a top-up admits the same request again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_quote_above_remaining_funding_is_payment_required_until_a_top_up() {
@@ -527,7 +527,7 @@ async fn an_elastic_account_serves_past_its_deposit_and_bills_the_overage() {
                 capacity_unavailable += 1;
             }
             // Once the credit is spent, the account's own funding decides:
-            // none left, or less than one 51-unit quote (#130). Which one
+            // none left, or less than one 51-unit quote (GL-130). Which one
             // depends on how far usage has settled when the refusal lands.
             StatusCode::PAYMENT_REQUIRED => {
                 assert!(
@@ -674,7 +674,7 @@ async fn elastic_readiness_serves_before_the_first_grant_and_recovers_after_fund
     assert_elastic_bill(&store, 200, 22, 21);
 }
 
-/// Issue #37: an instance that is refusing everything must not look like one
+/// Issue GL-37: an instance that is refusing everything must not look like one
 /// serving nothing. The counters are the request path's only voice, so the
 /// scrape has to distinguish the two — and attribute each refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -724,7 +724,7 @@ async fn metrics_separate_admissions_from_each_kind_of_refusal() {
 
     // The later phases are exported too, and they partition `admitted`
     // exactly. Both requests ran their kernel to completion, so nothing was
-    // cancelled, shed, or refused at execution start (INVARIANTS.md #20).
+    // cancelled, shed, or refused at execution start (INVARIANTS.md GL-20).
     assert_eq!(after["execution_started"], 2);
     assert_eq!(after["canceled_before_start"], 0);
     assert_eq!(after["capacity_shed"], 0);
@@ -753,7 +753,7 @@ async fn metrics_separate_admissions_from_each_kind_of_refusal() {
     runtime.shutdown().await;
 }
 
-/// Issue #38: the accounting numbers were returned once, from a graceful
+/// Issue GL-38: the accounting numbers were returned once, from a graceful
 /// shutdown — the one case where loss is least likely. They are readable
 /// while the service runs now, and they agree with the admission counters
 /// about backpressure, so the two views cannot drift into contradicting each
@@ -815,7 +815,7 @@ async fn metrics_report_accounting_health_while_running() {
     runtime.shutdown().await;
 }
 
-/// Issue #4's counter set is only complete once the refill and snapshot
+/// Issue GL-4's counter set is only complete once the refill and snapshot
 /// planes are scrapeable too: both were visible as `tracing` events with
 /// nothing to threshold on. The `unresolved` gauge in particular is what
 /// disambiguates an `unknown_principal` spike — distribution failure, or
@@ -858,7 +858,7 @@ async fn metrics_report_refill_and_snapshot_health() {
          readiness bit are computed from one pass"
     );
 
-    // #134: exported whether or not anything is hot. No request has run, so
+    // GL-134: exported whether or not anything is hot. No request has run, so
     // no debit can have lost a race and no account is named.
     let contention = &body["contention"];
     assert_eq!(contention["contended_exchanges"], 0, "{contention}");
@@ -871,7 +871,7 @@ async fn metrics_report_refill_and_snapshot_health() {
 async fn not_ready_until_lease_arrives() {
     let (router, runtime) = build_test_app(100_000, true).await;
     // Immediately after boot the slot may be empty: readiness must reflect
-    // it rather than serving guaranteed denials (INVARIANTS.md #10). We only
+    // it rather than serving guaranteed denials (INVARIANTS.md GL-10). We only
     // assert the transition completes.
     wait_ready(&router).await;
     assert_eq!(ready(&router).await, StatusCode::OK);
@@ -886,7 +886,7 @@ async fn readiness_falls_when_background_planes_stop() {
     assert_eq!(ready(&router).await, StatusCode::SERVICE_UNAVAILABLE);
 }
 
-/// The baseline configuration had no test at all until #16 rewrote the code
+/// The baseline configuration had no test at all until GL-16 rewrote the code
 /// that distinguishes it: the load gate was its only exercise, and that lane
 /// is manual and non-gating. Transport and kernel only — no credential
 /// required, because there is no admission to present one to.
@@ -907,7 +907,7 @@ async fn baseline_prices_without_admission() {
     assert_eq!(store.usage_recorded(DEMO_ACCOUNT), CostUnits::ZERO);
 }
 
-/// #16's acceptance criterion: readiness must not depend on machinery that was
+/// GL-16's acceptance criterion: readiness must not depend on machinery that was
 /// never installed. No lease is ever stocked here, and no background task
 /// exists whose death could change the answer — so 200 before shutdown and
 /// 200 after it, the exact counterpart of
@@ -923,7 +923,7 @@ async fn baseline_is_ready_before_any_lease() {
 /// `accounting`, `refill` and `snapshots` are three views of one plane, so
 /// they are absent together or present together. That correlation used to be
 /// five parallel `Option`s in `AppState`, provable only by reading every
-/// construction site; #16 made it one `Option`, and this is its witness.
+/// construction site; GL-16 made it one `Option`, and this is its witness.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn baseline_metrics_omit_the_uninstalled_planes() {
     let (router, runtime) = build_test_app(100_000, false).await;
@@ -956,7 +956,7 @@ async fn baseline_metrics_omit_the_uninstalled_planes() {
     runtime.shutdown().await;
 }
 
-/// #99 end to end: two accounts of different classes serve one instance, and
+/// GL-99 end to end: two accounts of different classes serve one instance, and
 /// each start is attributed to the class that made it.
 ///
 /// The pool arithmetic is proved by unit tests and the shedding by the load

@@ -1,4 +1,4 @@
-//! #136, end to end: an instance killed without a graceful shutdown loses its
+//! GL-136, end to end: an instance killed without a graceful shutdown loses its
 //! committed-but-unflushed usage queue. Its leases are then settled by expiry
 //! reclaim, and the work it executed must not become spendable again.
 //!
@@ -230,7 +230,7 @@ fn assert_nothing_returns(store: &MemoryStore, committed: u64) {
     assert_eq!(forfeited, CostUnits(GRANT), "the whole unaccounted grant");
     assert_eq!(after.settlement_loss, CostUnits(GRANT));
     assert_eq!(after.active_lease_grants, CostUnits::ZERO);
-    // Before #136 this was `DEPOSIT - GRANT + GRANT`: the whole deposit
+    // Before GL-136 this was `DEPOSIT - GRANT + GRANT`: the whole deposit
     // spendable again, although `committed` units of it had been executed.
     assert!(
         after.balance.get() + committed <= DEPOSIT,

@@ -4,7 +4,7 @@
 //! and "fails the build" are two claims and only one of them is about text.
 //! Nothing invoked the binary before, which the mutation gate caught: the
 //! whole of `run` could be replaced with `Ok(true)` — a gate that never fails
-//! — and every test still passed (#85).
+//! — and every test still passed (GL-85).
 //!
 //! `CARGO_BIN_EXE_*` is set by Cargo for integration tests, so this runs the
 //! binary that was actually built rather than guessing at a path.

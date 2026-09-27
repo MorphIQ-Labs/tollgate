@@ -1,7 +1,7 @@
-//! Identical backend scenarios for the operator account read (#121).
+//! Identical backend scenarios for the operator account read (GL-121).
 //!
 //! Shared rather than mirrored, for the reason `account_keys.rs` is: a shared
-//! scenario cannot drift, and drift inside mirrored bodies is what #85 found.
+//! scenario cannot drift, and drift inside mirrored bodies is what GL-85 found.
 use jiff::{SignedDuration, Timestamp};
 use tollgate_core::{
     AccountId, AccountStatus, BudgetSchedule, CapacityClass, CostUnits, Period, Rollover,
@@ -88,7 +88,7 @@ pub async fn the_view_reports_what_was_administered(store: &impl Backend) {
 
 /// Units out on an unsettled lease are grants, not usage.
 ///
-/// The distinction #121 asks the surface to preserve: a customer reading only
+/// The distinction GL-121 asks the surface to preserve: a customer reading only
 /// a falling balance would call this spend, and it is not — nothing has been
 /// billed until the lease settles.
 pub async fn funding_out_on_lease_is_not_reported_as_usage(store: &impl Backend) {

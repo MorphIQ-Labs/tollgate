@@ -1,7 +1,7 @@
 import Init.Omega
 
 /-!
-Lease expiry precision (#117). Instants and grace are exact integer nanoseconds.
+Lease expiry precision (GL-117). Instants and grace are exact integer nanoseconds.
 These theorems establish encoding order, cutoff safety and conservative legacy
 migration. They do not prove SQL transaction isolation, driver encoding, Jiff's
 finite domain or the migration implementation; Rust and PostgreSQL tests are

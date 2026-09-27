@@ -26,7 +26,7 @@ use crate::{PublicationError, RefreshBatch, Refreshed};
 
 /// The hasher every `Principal`-keyed map in this crate uses.
 ///
-/// Non-cryptographic on purpose (#9): SipHash's flooding resistance costs
+/// Non-cryptographic on purpose (GL-9): SipHash's flooding resistance costs
 /// 15–20 ns of every request-path lookup and defends against an attack
 /// `Principal`'s own contract rules out. The argument is a property of how the
 /// key is derived, not of this crate — see [`Principal`]'s documentation,
@@ -516,7 +516,7 @@ macro_rules! publication_methods {
 ///   recorded on the controlled host, and the manifest's same-run ratios
 ///   price moka's at-capacity surcharge against an arc-swap control, which
 ///   is what separates that surcharge from the memory hierarchy both maps
-///   pay for the same working-set growth (#119).
+///   pay for the same working-set growth (GL-119).
 /// * A bounded map can evict an entry the control plane still believes is
 ///   published. That is not a defect — it is what `SnapshotMap::needs_refresh`
 ///   and the generation history below exist to repair.
@@ -837,7 +837,7 @@ mod tests {
     /// bucket index from the low bits and the control byte from the top seven.
     /// A hasher can look fine on one and be degenerate on the other.
     ///
-    /// This is what rules out the identity fold #9 floats as an alternative.
+    /// This is what rules out the identity fold GL-9 floats as an alternative.
     /// Truncated-HMAC principals carry entropy everywhere, so identity would
     /// pass on them — but sequential principals, which this crate's own tests
     /// and any integer-id embedder produce, would leave the top seven bits
@@ -1062,7 +1062,7 @@ mod tests {
         assert_eq!(generation_of(&map, &p), Some(5));
         // Same generation is also a no-op (idempotent replay) -- and it must
         // be observed as *the same entry*, not merely the same generation.
-        // Since #53 the equal-generation rule turns on `visible`, and a
+        // Since GL-53 the equal-generation rule turns on `visible`, and a
         // regression that dropped it would still leave generation 5 here while
         // rebuilding the entry, which on this map is a clone of the whole map
         // per republish. Identity is what makes that detectable.
@@ -1085,7 +1085,7 @@ mod tests {
         // installs record through. Stage two tallies against `state.counters`
         // while the observability surface reads `map.counters()`; two
         // instances would leave an engine reporting zeros while work flowed
-        // (INVARIANTS.md #20). Asserted behaviourally, so a fresh default
+        // (INVARIANTS.md GL-20). Asserted behaviourally, so a fresh default
         // standing in for the accessor cannot satisfy it.
         let slot = DenyReason::UnknownPrincipal.index();
         let before = map.counters().snapshot().denials[slot];
@@ -1110,7 +1110,7 @@ mod tests {
         // This used to assert that a generation-1 push "cannot resurrect the
         // revoked principal" after an unversioned negative — but nothing had
         // revoked it. The assertion passed on the positive's own watermark
-        // being treated as a tombstone, which is exactly the conflation #53
+        // being treated as a tombstone, which is exactly the conflation GL-53
         // removed. Ordering is the real property here; revocation is asserted
         // below, against an actual revocation.
         map.install_unknown(p, t(100)).unwrap();
@@ -1120,7 +1120,7 @@ mod tests {
         assert!(matches!(map.get(&p), Some(MapEntry::NegativeUntil { .. })));
 
         // And the principal returns at the generation it already had: an
-        // absence is not a statement that generation 6 is dead (#53).
+        // absence is not a statement that generation 6 is dead (GL-53).
         map.install(p, snapshot(6), LeaseSlot::for_account(AccountId(1)))
             .unwrap();
         assert_eq!(generation_of(&map, &p), Some(6));
@@ -1137,7 +1137,7 @@ mod tests {
         assert!(matches!(map.get(&p), Some(MapEntry::NegativeUntil { .. })));
 
         // A real revocation *does* refuse its own generation back -- the half
-        // that must not loosen (INVARIANTS.md #15).
+        // that must not loosen (INVARIANTS.md GL-15).
         map.install(p, snapshot(7), LeaseSlot::for_account(AccountId(1)))
             .unwrap();
         assert!(
@@ -1157,7 +1157,7 @@ mod tests {
             .unwrap();
         assert_eq!(generation_of(&map, &p), Some(8));
 
-        // The other half of `remove`, which nothing pinned before #53 and
+        // The other half of `remove`, which nothing pinned before GL-53 and
         // which the change above alters: with the watermark left by a
         // *positive* (8, from the install just above), re-installing the
         // evicted generation repairs the entry. That is what lets a bounded
@@ -1412,7 +1412,7 @@ mod tests {
     }
 
     /// The other two bulk methods on the `Arc` delegation had no witness, and
-    /// both could be replaced by no-ops with the whole suite green (#43).
+    /// both could be replaced by no-ops with the whole suite green (GL-43).
     ///
     /// That is not a cosmetic gap. `impl<T: SnapshotMap + ?Sized> SnapshotMap
     /// for Arc<T>` is what `SnapshotManager`'s own `Arc<dyn SnapshotMap>`
@@ -1620,7 +1620,7 @@ mod tests {
         Arc::new(snapshot)
     }
 
-    /// Issue #8 moved the dead-entry sweep off the per-lookup path, so the
+    /// Issue GL-8 moved the dead-entry sweep off the per-lookup path, so the
     /// registry no longer reclaims on every call. It must still reclaim: an
     /// unbounded registry would defeat the bounded snapshot cache it sits
     /// beside. Nothing asserted this before, which is what made deferring the
@@ -1652,7 +1652,7 @@ mod tests {
         );
     }
 
-    /// The quadratic #8 describes needs *live* accounts: a registry that keeps
+    /// The quadratic GL-8 describes needs *live* accounts: a registry that keeps
     /// emptying is cheap to walk however often you do it. With a thousand
     /// accounts all still present, sweeping per install would walk on the
     /// order of a thousand entries a thousand times.
@@ -1796,7 +1796,7 @@ mod tests {
         }
     }
 
-    /// Review finding #4: the advertised limit is an *account* limit — every
+    /// Review finding GL-4: the advertised limit is an *account* limit — every
     /// principal of an account shares one limiter, so extra API keys cannot
     /// multiply the allowance.
     #[test]

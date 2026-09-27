@@ -21,17 +21,17 @@ members = [
 version = "0.30.0"
 edition = "2024"
 rust-version = "1.89"
-authors = ["MorphIQ Labs"]
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/MorphIQ-Labs/tollgate"
 # Refuses a stray `cargo publish` whatever tooling is driving. This is the plain
 # `false`, never a registry list: a list makes release-plz run
 # `cargo package --registry <name>`, which is what broke every main pipeline in
-# #46. release-plz still tags private packages under `git_only = true`
-# (0.3.152, PR #2603), so the guard costs nothing here.
+# GL-46. release-plz still tags private packages under `git_only = true`
+# (0.3.152, PR GL-2603), so the guard costs nothing here.
 publish = false
 
 [workspace.dependencies]
-# Time: jiff, not chrono/time — matches ferro-risk. The core crate takes
+# Time: jiff, not chrono/time. The core crate takes
 # timestamps as arguments and never reads a clock itself.
 jiff = "0.2"
 serde = { version = "1.0", features = ["derive", "rc"] }
@@ -65,14 +65,14 @@ uuid = { version = "1", features = ["v4"] }
 # crate exists to replace: a plain loop is dead-store-eliminable.
 zeroize = "1"
 async-trait = "0.1"
-# The refill wake (#10). A single-purpose, dependency-free leaf crate already
+# The refill wake (GL-10). A single-purpose, dependency-free leaf crate already
 # in the lockfile via hyper, so taking it directly compiles nothing new. It is
 # deliberately not tokio's `Notify`: the signal is raised from inside a lease
 # debit, on the request path, and `notify_one` takes an internal mutex when a
 # waiter is parked — which is exactly our case, since the refill task is
 # normally waiting.
 atomic-waker = "1.1"
-# The request path's map hasher (#9). `Principal` is a fingerprint of an
+# The request path's map hasher (GL-9). `Principal` is a fingerprint of an
 # already-verified credential, so its bits cannot be steered by a caller and
 # SipHash's flooding resistance buys nothing there. foldhash is a
 # zero-dependency leaf crate already compiled into tollgate-admission's own
@@ -87,7 +87,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 getrandom = "0.3"
 hmac = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-# Control-plane TLS and signed service identities (#98). No native TLS/OpenSSL.
+# Control-plane TLS and signed service identities (GL-98). No native TLS/OpenSSL.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs"] }
@@ -105,7 +105,7 @@ subtle = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Discarding a fallible call is how every silent failure in issue #36 got
+# Discarding a fallible call is how every silent failure in issue GL-36 got
 # written: `let _ = fallible()` reads as deliberate and reviews as harmless.
 # The library crates deny it, so the next one must either handle the error or
 # say — in an `#[allow]` with a reason — why there is nothing to say.
@@ -119,9 +119,9 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 let_underscore_must_use = "deny"
-# #19's enforcement says an `#[allow]` is acceptable "unless" it states why.
+# GL-19's enforcement says an `#[allow]` is acceptable "unless" it states why.
 # That was a convention a reviewer had to notice; this makes it mechanical, the
-# way the deny above already makes discarding a fallible call mechanical (#82).
+# way the deny above already makes discarding a fallible call mechanical (GL-82).
 allow_attributes_without_reason = "deny"
 
 # Deployment profile for load-gate runs and production builds; kept separate so
@@ -130,7 +130,7 @@ allow_attributes_without_reason = "deny"
 # so the profile they are taken under has to be reproducible across changes that
 # do not touch the measured path. The default release profile is not: at
 # `codegen-units = 16` rustc repartitions a crate whenever its code grows, and
-# cross-unit inlining decisions move with it. #114 was that effect and nothing
+# cross-unit inlining decisions move with it. GL-114 was that effect and nothing
 # else -- `admission/snapshot_lookup_moka` read 66.92ns at `1a3a260` and 88.19ns
 # at `f6aaa28` with its lookup path byte-identical, while one codegen unit put
 # the same two revisions at 55.84ns and 56.40ns. One unit also measures what is

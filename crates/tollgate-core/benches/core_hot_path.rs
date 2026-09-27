@@ -421,7 +421,7 @@ fn bench_reservation(c: &mut Criterion) {
     let lease = big_lease();
     let mut group = c.benchmark_group("reservation");
 
-    // The opt-in shared cancel state (#93): split, then commit through the
+    // The opt-in shared cancel state (GL-93): split, then commit through the
     // shared reservation as a worker thread would. One `Arc` and one extra
     // indirection over the unsplit `lease/reserve_commit` path, which stays
     // the allocation-free comparison a consumer gets when it does not need a
@@ -439,7 +439,7 @@ fn bench_reservation(c: &mut Criterion) {
             (shared, handle)
         })
     });
-    // The contended half of #93's "uncontended and contended" requirement: a
+    // The contended half of GL-93's "uncontended and contended" requirement: a
     // worker committing while a waiter cancels, over the same phase word.
     // `commit_cancel_race_control_2` is the raw-atomic control it is measured
     // against.

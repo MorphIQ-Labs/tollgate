@@ -1,5 +1,5 @@
-//! Behavior tests for the lease manager and usage writer (INVARIANTS.md #5,
-//! #6, #8, #9's client half).
+//! Behavior tests for the lease manager and usage writer (INVARIANTS.md GL-5,
+//! GL-6, GL-8, GL-9's client half).
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -126,7 +126,7 @@ async fn refill_installs_lease_on_cold_start() {
     manager.shutdown().await;
 }
 
-/// Issue #10: refill used to begin only when the poll timer fired, so a burst
+/// Issue GL-10: refill used to begin only when the poll timer fired, so a burst
 /// could drain a lease between ticks and deny against an account that is
 /// funded. The poll interval here is a minute — far longer than the test runs
 /// — so a tick cannot explain the rotation. Only the crossing debit can.
@@ -169,7 +169,7 @@ async fn refill_begins_on_the_crossing_debit_not_the_next_tick() {
     manager.shutdown().await;
 }
 
-/// The user-visible bug, and the witness for INVARIANTS.md #6: sustained
+/// The user-visible bug, and the witness for INVARIANTS.md GL-6: sustained
 /// spending against a funded account must not start denying just because a
 /// rotation fell due between ticks.
 #[tokio::test(start_paused = true)]
@@ -445,7 +445,7 @@ fn writer_config(capacity: usize) -> UsageWriterConfig {
     }
 }
 
-/// Issue #4: the refill task's numbers existed only as `tracing` events with
+/// Issue GL-4: the refill task's numbers existed only as `tracing` events with
 /// nothing to threshold on, and a shutdown report nobody sees while the
 /// process runs. A refusal must be attributable to its reason — that is what
 /// separates "the account is out of balance" from "the allocator is down".
@@ -510,7 +510,7 @@ async fn refill_counters_record_grants_and_releases() {
     assert_eq!(counters.snapshot().abandoned, 0);
 }
 
-/// Issue #38: the accounting numbers used to exist only as a local on the
+/// Issue GL-38: the accounting numbers used to exist only as a local on the
 /// writer task's stack, so a process that kept running — or died — reported
 /// nothing. They are now readable at any time, and `shutdown` reports the very
 /// same counters, so the running totals and the final report cannot disagree.
@@ -928,7 +928,7 @@ async fn writer_retries_through_outage_without_losing_events() {
     assert_eq!(stats.lost, 0);
 }
 
-/// Review finding #3 regression: a panic between commit and response must
+/// Review finding GL-3 regression: a panic between commit and response must
 /// still bill — the queue permit is the usage slot bound at admission, and
 /// `Committed`'s drop emits into it during unwind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1012,7 +1012,7 @@ async fn a_panicking_kernel_under_catch_unwind_still_bills() {
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(51));
 }
 
-/// Review finding #2 regression: shutdown during an *ongoing* outage must
+/// Review finding GL-2 regression: shutdown during an *ongoing* outage must
 /// still terminate via the bounded final flush, not hang in the retry loop.
 #[tokio::test(start_paused = true)]
 async fn shutdown_during_outage_terminates_and_reports_loss() {
@@ -1081,7 +1081,7 @@ async fn shutdown_after_recovery_delivers_everything() {
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(25));
 }
 
-/// A lease-expiry straggler (#136): a holder that outlived an outage flushes
+/// A lease-expiry straggler (GL-136): a holder that outlived an outage flushes
 /// after its lease was swept, and the usage is billed against the forfeit
 /// rather than dropped. Usage beyond what was forfeited is still rejected and
 /// reported, never silently absorbed.
@@ -1117,14 +1117,14 @@ async fn a_survivor_flushes_after_reclaim_and_is_billed() {
     assert!(c.holds(), "{c:?}");
 }
 
-// ---- shutdown drain (issue #32) -------------------------------------------
+// ---- shutdown drain (issue GL-32) -------------------------------------------
 //
 // A permit reserved before shutdown must resolve — by sending or dropping —
 // before the writer returns, bounded by the drain deadline; a deadline expiry
 // is reported in `unresolved`, never a clean flush.
 
 /// Shutdown refuses new reservations from the instant it begins, while a
-/// permit reserved earlier still delivers into the drain (INVARIANTS.md #8).
+/// permit reserved earlier still delivers into the drain (INVARIANTS.md GL-8).
 #[tokio::test(start_paused = true)]
 async fn reserve_fails_once_shutdown_begins() {
     let store = store(10_000);
@@ -1158,7 +1158,7 @@ async fn reserve_fails_once_shutdown_begins() {
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(25));
 }
 
-/// The #32 defect: a permit that records only after shutdown has begun must
+/// The GL-32 defect: a permit that records only after shutdown has begun must
 /// be ingested, not silently dropped with zero reported loss.
 #[tokio::test(start_paused = true)]
 async fn shutdown_waits_for_outstanding_permit() {
@@ -1191,7 +1191,7 @@ async fn shutdown_waits_for_outstanding_permit() {
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(25));
 }
 
-/// INVARIANTS.md #13 across shutdown: a committed guard dropped after
+/// INVARIANTS.md GL-13 across shutdown: a committed guard dropped after
 /// shutdown begins still bills.
 #[tokio::test(start_paused = true)]
 async fn shutdown_waits_for_committed_guard() {
@@ -1354,7 +1354,7 @@ async fn drain_deadline_reports_every_unresolved_permit() {
     assert_eq!(stats.unresolved, 2);
 }
 
-// ---- a dead writer never reports zero loss (issue #41) --------------------
+// ---- a dead writer never reports zero loss (issue GL-41) --------------------
 
 /// A sink that panics once it has been called `panic_after` times.
 /// Panics once its budget of clean calls runs out.
@@ -1379,7 +1379,7 @@ fn panicking_sink(
     )
 }
 
-/// The #41 defect: a writer that dies holding committed charges must say so,
+/// The GL-41 defect: a writer that dies holding committed charges must say so,
 /// not return a zeroed report indistinguishable from a clean shutdown.
 #[tokio::test(start_paused = true)]
 async fn panicked_writer_reports_unaccounted_charges() {
@@ -1466,7 +1466,7 @@ async fn panic_after_partial_flush_counts_only_unflushed() {
     );
 }
 
-// ---- wall-clock bounds on a wedged backend (issue #34) --------------------
+// ---- wall-clock bounds on a wedged backend (issue GL-34) --------------------
 
 /// A sink whose `ingest` never resolves — a backend that is hung rather than
 /// erroring, which retry *counts* alone cannot bound.
@@ -1478,7 +1478,7 @@ fn hanging_sink() -> Arc<DelegatingStore<RejectingStore>> {
     )
 }
 
-/// The #34 defect: a hung ingest parked the writer task forever, and with it
+/// The GL-34 defect: a hung ingest parked the writer task forever, and with it
 /// every later shutdown step. The drain must terminate and report.
 #[tokio::test(start_paused = true)]
 async fn hung_ingest_cannot_stall_shutdown() {
@@ -1606,7 +1606,7 @@ fn hanging_acquire() -> Arc<DelegatingStore<RejectingStore>> {
     )
 }
 
-/// INVARIANTS.md #18, issue #78: the shutdown signal is observed inside a
+/// INVARIANTS.md GL-18, issue GL-78: the shutdown signal is observed inside a
 /// hung `acquire`, not after it. The release pass is the louder half of that
 /// finding, but `acquire` is the loop's other long await and a signal
 /// arriving inside it was equally invisible until the next loop top.
@@ -1648,7 +1648,7 @@ async fn shutdown_during_a_hung_acquire_is_not_delayed_by_it() {
     );
 }
 
-/// INVARIANTS.md #18: an allocator that hangs rather than answering is
+/// INVARIANTS.md GL-18: an allocator that hangs rather than answering is
 /// bounded by `store_call_timeout`. It is counted apart from every refusal,
 /// because it is not a domain answer — treating it as one would assert the
 /// lease was not granted, which this client cannot know.
@@ -1702,11 +1702,11 @@ fn hanging_release(store: &Arc<MemoryStore>) -> Arc<DelegatingStore<MemoryStore>
     )
 }
 
-/// INVARIANTS.md #6, issue #78: a refill must not queue behind the release
+/// INVARIANTS.md GL-6, issue GL-78: a refill must not queue behind the release
 /// pass. With leases parked against a backend whose `release` hangs, the old
 /// loop paid `parked.len()` sequential timeouts before it issued `acquire`,
 /// which put refill latency back on a floor that grew with the parked count —
-/// the very floor #6 exists to remove.
+/// the very floor GL-6 exists to remove.
 #[tokio::test(start_paused = true)]
 async fn a_refill_does_not_wait_behind_the_release_pass() {
     let store = store(100_000);
@@ -1800,7 +1800,7 @@ async fn shutdown_reports_released_leases() {
 }
 
 /// A hung release cannot stall shutdown, and what it could not return is
-/// reported rather than assumed settled (INVARIANTS.md #18).
+/// reported rather than assumed settled (INVARIANTS.md GL-18).
 #[tokio::test(start_paused = true)]
 async fn hung_release_cannot_stall_shutdown() {
     let store = store(10_000);
@@ -1821,7 +1821,7 @@ async fn hung_release_cannot_stall_shutdown() {
 
     // In-flight readers retain each superseded grant while the slot rotates.
     // Once they finish, every parked grant reaches the hanging backend. This
-    // is the shape #78 bounds: the old loop paid `parked.len()` sequential
+    // is the shape GL-78 bounds: the old loop paid `parked.len()` sequential
     // timeouts before it could even inspect the shutdown signal.
     let mut readers = Vec::new();
     for tick in 1..=5 {
@@ -1869,7 +1869,7 @@ async fn hung_release_cannot_stall_shutdown() {
     assert_eq!(stats.released, 0);
 }
 
-/// INVARIANTS.md #16: no writer field is silently repaired.
+/// INVARIANTS.md GL-16: no writer field is silently repaired.
 #[tokio::test]
 async fn invalid_writer_config_is_rejected() {
     let zero = std::time::Duration::ZERO;
@@ -1907,7 +1907,7 @@ async fn invalid_writer_config_is_rejected() {
     }
 }
 
-/// INVARIANTS.md #16, manager half: the two new bounds are contracts too.
+/// INVARIANTS.md GL-16, manager half: the two new bounds are contracts too.
 #[test]
 fn invalid_lease_manager_timeouts_are_rejected() {
     let mut config = manager_config();
@@ -1919,7 +1919,7 @@ fn invalid_lease_manager_timeouts_are_rejected() {
     assert!(config.validate().is_err());
 }
 
-/// Issue #62, INVARIANTS #1 and #6: shutdown must not release a lease an
+/// Issue GL-62, INVARIANTS GL-1 and GL-6: shutdown must not release a lease an
 /// in-flight request can still spend.
 ///
 /// `parked` at shutdown holds, by construction, the leases the last pass
@@ -1928,7 +1928,7 @@ fn invalid_lease_manager_timeouts_are_rejected() {
 /// account is credited, the request then debits and commits, and total
 /// committed usage exceeds the allocation with a usage event to prove it.
 ///
-/// The documented lifecycle says an embedder quiesces first (#13), but that is
+/// The documented lifecycle says an embedder quiesces first (GL-13), but that is
 /// caller discipline — the tier the standards call drift-prone — and the
 /// predicate that makes it unnecessary already existed in the same file.
 ///
@@ -1975,7 +1975,7 @@ async fn shutdown_abandons_a_lease_an_in_flight_request_still_holds() {
     assert!(in_flight.try_debit(CostUnits(50), t(0)).is_ok());
 }
 
-/// Issue #63, INVARIANTS #8: the drain deadline is the drain's total wall
+/// Issue GL-63, INVARIANTS GL-8: the drain deadline is the drain's total wall
 /// clock, backoffs included.
 ///
 /// `final_flush_backs_off_only_between_attempts` pins the backoff *count*, but
@@ -1988,7 +1988,7 @@ async fn shutdown_abandons_a_lease_an_in_flight_request_still_holds() {
 /// Overrunning here is not merely a slow shutdown. The lease manager releases
 /// after the writer drains, so the overrun spends the margin that keeps a
 /// straggler billable: events that do land arrive against a lease the
-/// allocator has re-granted and are refused — the outcome #12's budget exists
+/// allocator has re-granted and are refused — the outcome GL-12's budget exists
 /// to prevent.
 #[tokio::test(start_paused = true)]
 async fn the_final_flush_backoff_cannot_overrun_the_drain_deadline() {
@@ -2065,7 +2065,7 @@ fn always_refuses_sink(attempts: &Arc<AtomicUsize>) -> Arc<DelegatingStore<Rejec
     )
 }
 
-/// Issue #61: a batch the sink will never accept must not block every later
+/// Issue GL-61: a batch the sink will never accept must not block every later
 /// event behind it.
 ///
 /// The writer retried any failed batch forever, which is right for an outage
@@ -2077,7 +2077,7 @@ fn always_refuses_sink(attempts: &Arc<AtomicUsize>) -> Arc<DelegatingStore<Rejec
 ///
 /// Two assertions, and the second is the one that matters: the batch is
 /// attempted *once*, and a later event still bills.
-/// Issue #61, INVARIANTS #16: a `max_batch` the ingest endpoint would refuse
+/// Issue GL-61, INVARIANTS GL-16: a `max_batch` the ingest endpoint would refuse
 /// is a startup error, not a discovery made in production.
 ///
 /// `validate` previously checked only that it was non-zero, so an embedder
@@ -2243,7 +2243,7 @@ async fn cancelling_lease_shutdown_aborts_the_owned_release_task() {
     assert!(!*health.borrow(), "cancelled refill task must retain false");
 }
 
-/// Issue #109: near the end of an allowance the allocator shrinks the grant,
+/// Issue GL-109: near the end of an allowance the allocator shrinks the grant,
 /// and `install_lease` caps low water below it, so the tail lease sits *above*
 /// its own mark. Nothing crosses, and before this change a refused debit said
 /// nothing either — the instance answered `LeaseExhausted` until the TTL while
@@ -2401,8 +2401,8 @@ async fn refill_publishes_exhaustion_and_a_topup_clears_it() {
     manager.shutdown().await;
 }
 
-/// #131 end to end with `GrantPolicy::default()`: 60 units grant 30, and
-/// before #131 every refusal-driven consolidation re-granted 30, so a 51-unit
+/// GL-131 end to end with `GrantPolicy::default()`: 60 units grant 30, and
+/// before GL-131 every refusal-driven consolidation re-granted 30, so a 51-unit
 /// quote the account could fund was refused until the period ended.
 #[tokio::test(start_paused = true)]
 async fn a_shrinking_policy_funds_a_quote_above_half_the_balance() {
@@ -2450,7 +2450,7 @@ async fn a_shrinking_policy_funds_a_quote_above_half_the_balance() {
     manager.shutdown().await;
 }
 
-/// #130 end to end: one unit left and a quote of 252. The refusal-driven
+/// GL-130 end to end: one unit left and a quote of 252. The refusal-driven
 /// consolidation re-grants the tail, whose evidence says the account cannot
 /// fund the quote; a top-up reaches the slot through the next refusal.
 #[tokio::test(start_paused = true)]

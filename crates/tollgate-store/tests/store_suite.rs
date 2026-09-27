@@ -1,4 +1,4 @@
-//! The backend correctness suite (INVARIANTS.md #1, #4, #7, #9).
+//! The backend correctness suite (INVARIANTS.md GL-1, GL-4, GL-7, GL-9).
 //!
 //! Written against [`MemoryStore`] as the reference; the Postgres backend
 //! must pass the same scenarios (its test file mirrors these by name).
@@ -176,7 +176,7 @@ async fn adaptive_grant_shrinks_near_exhaustion() {
     assert_conserved(&store);
 }
 
-/// INVARIANTS.md #1 at the allocator level: a concurrent acquire storm can
+/// INVARIANTS.md GL-1 at the allocator level: a concurrent acquire storm can
 /// never hand out more units than the account holds — grants sum to exactly
 /// the deposited balance once drained.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -208,7 +208,7 @@ async fn no_double_spend_across_instances() {
     assert_conserved(&store);
 }
 
-/// INVARIANTS.md #4: allocation order is not an account-wide validity epoch.
+/// INVARIANTS.md GL-4: allocation order is not an account-wide validity epoch.
 /// Both simultaneously active leases retain their own capabilities.
 #[tokio::test]
 async fn newer_lease_does_not_invalidate_older_active_capability() {
@@ -325,7 +325,7 @@ async fn usage_rejects_mismatched_lease_capability() {
     assert!(store.conservation(OTHER).unwrap().holds());
 }
 
-/// INVARIANTS.md #9 (#136): a holder that never released cannot prove any
+/// INVARIANTS.md GL-9 (GL-136): a holder that never released cannot prove any
 /// unit unspent, so its lease's remainder is forfeited at TTL as provisional
 /// settlement loss. Nothing returns to the balance: executed-but-unflushed
 /// work cannot become spendable again.
@@ -361,7 +361,7 @@ async fn reclaim_forfeits_an_unreleased_remainder_as_provisional_loss() {
     assert_conserved(&store);
 }
 
-/// #136: usage the holder committed but had not flushed at the sweep, from a
+/// GL-136: usage the holder committed but had not flushed at the sweep, from a
 /// holder that outlived an outage, fits in the forfeit and is billed. It can
 /// never exceed what was forfeited.
 #[tokio::test]
@@ -401,7 +401,7 @@ async fn straggler_usage_after_reclaim_is_billed_against_the_forfeit() {
     assert_conserved(&store);
 }
 
-/// INVARIANTS.md #9: an outage-sized backlog is split into bounded atomic
+/// INVARIANTS.md GL-9: an outage-sized backlog is split into bounded atomic
 /// settlements without capping how many leases eventually settle.
 #[tokio::test]
 async fn expired_backlog_is_reclaimed_in_bounded_batches() {
@@ -462,7 +462,7 @@ async fn expired_backlog_is_reclaimed_in_bounded_batches() {
         .collect();
     reclaimed_ids.sort_by_key(|lease_id| lease_id.0);
     assert_eq!(reclaimed_ids, expected_ids);
-    // Every remainder is forfeited, none credited (#136).
+    // Every remainder is forfeited, none credited (GL-136).
     assert_eq!(store.balance(ACCOUNT), CostUnits::ZERO);
     assert_eq!(store.balance(OTHER), CostUnits::ZERO);
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(25));
@@ -483,7 +483,7 @@ async fn expired_backlog_is_reclaimed_in_bounded_batches() {
     );
 }
 
-/// INVARIANTS.md #9: a bounded batch settles the *oldest due* leases, and
+/// INVARIANTS.md GL-9: a bounded batch settles the *oldest due* leases, and
 /// stops at the first one that is not due.
 ///
 /// `expired_backlog_is_reclaimed_in_bounded_batches` can see neither property:
@@ -492,7 +492,7 @@ async fn expired_backlog_is_reclaimed_in_bounded_batches() {
 /// yet due, and the owning account ids run *opposite* to expiry order — so a
 /// backend paging by account rather than by expiry returns a different page
 /// and fails, instead of silently settling different leases from the reference
-/// backend (#65).
+/// backend (GL-65).
 #[tokio::test]
 async fn a_bounded_reclaim_page_settles_the_oldest_due_leases_first() {
     let store = store_with_balance(full_grant_policy(), 100).await;
@@ -587,7 +587,7 @@ fn reclaim_batch_rejects_backend_results_over_the_limit() {
     assert!(ReclaimBatch::try_new(reclaimed, NonZeroUsize::new(2).unwrap()).is_err());
 }
 
-/// INVARIANTS.md #7: replaying a batch never double-bills.
+/// INVARIANTS.md GL-7: replaying a batch never double-bills.
 #[tokio::test]
 async fn usage_replay_is_idempotent() {
     let store = store_with_balance(full_grant_policy(), 1_000).await;
@@ -612,7 +612,7 @@ async fn usage_replay_is_idempotent() {
     assert_conserved(&store);
 }
 
-/// INVARIANTS.md #7: a successful mixed batch classifies every event once
+/// INVARIANTS.md GL-7: a successful mixed batch classifies every event once
 /// while applying only accepted deltas across active and settled leases.
 #[tokio::test]
 async fn mixed_usage_batch_preserves_partial_acceptance() {
@@ -682,7 +682,7 @@ async fn mixed_usage_batch_preserves_partial_acceptance() {
         repeated,
         usage(&active, 5, 15, 6),
         // Two overage events in the same batch as every other class, because
-        // INVARIANTS.md #7 is about a *mixed* batch classifying each input
+        // INVARIANTS.md GL-7 is about a *mixed* batch classifying each input
         // exactly once: one on a real account, one naming an account the
         // ledger has never heard of.
         overage_usage(ACCOUNT, 8, 25, 6),
@@ -754,7 +754,7 @@ async fn graceful_release_returns_unspent() {
     );
 }
 
-/// #109: consolidation is `release` then `acquire` in one transaction, and
+/// GL-109: consolidation is `release` then `acquire` in one transaction, and
 /// the whole reason it is not those two calls is that the exchange must never
 /// hand back less than it took. Under the default `shrink_divisor` of 2 the
 /// separated form does exactly that: 29 unspent returned into a balance of 29
@@ -844,7 +844,7 @@ async fn consolidation_folds_the_tail_grant_and_the_ledger_into_one_lease() {
     assert_conserved(&store);
 }
 
-/// #131: under the default divisor of 2, 30 held and 30 in the ledger
+/// GL-131: under the default divisor of 2, 30 held and 30 in the ledger
 /// re-granted as 30 however often a 51-unit quote was refused. A refused
 /// quote the restored balance can fund is demand, and the exchange grows to it.
 #[tokio::test]
@@ -869,7 +869,11 @@ async fn consolidation_grows_to_a_proven_quote_under_a_shrinking_policy() {
         .await
         .unwrap()
         .grant;
-    assert_eq!(same.units, CostUnits(30), "without demand, the #109 floor");
+    assert_eq!(
+        same.units,
+        CostUnits(30),
+        "without demand, the GL-109 floor"
+    );
     let grown = store
         .consolidate(
             same.lease_id,
@@ -994,7 +998,7 @@ async fn a_refused_consolidation_leaves_the_original_lease_spendable() {
 }
 
 /// A stale or unknown capability consolidates nothing, exactly as it releases
-/// nothing (INVARIANTS.md #4). The account's balance must not move on the
+/// nothing (INVARIANTS.md GL-4). The account's balance must not move on the
 /// strength of a token the ledger does not recognise.
 #[tokio::test]
 async fn consolidating_without_the_lease_capability_moves_no_units() {
@@ -1089,7 +1093,7 @@ async fn a_consolidation_with_an_invalid_ttl_settles_nothing() {
     assert_conserved(&store);
 }
 
-/// Review finding #1, store half: reclaim waits out the grace window past
+/// Review finding GL-1, store half: reclaim waits out the grace window past
 /// expiry, so work committed inside the holder's usability window (which
 /// ends *before* expiry) has margin + grace to be flushed and billed; a
 /// graceful release arriving during the grace window is honored, not
@@ -1183,7 +1187,7 @@ async fn straggler_usage_after_release_is_billed() {
     assert_eq!(report.rejected, 1);
 }
 
-/// Review finding #7: recreating an account is refused and touches nothing —
+/// Review finding GL-7: recreating an account is refused and touches nothing —
 /// balance, ledger totals, and the fencing sequence survive intact.
 #[tokio::test]
 async fn recreate_account_is_refused_and_nondestructive() {
@@ -1225,13 +1229,13 @@ async fn recreate_account_is_refused_and_nondestructive() {
 #[tokio::test]
 async fn a_non_active_account_refuses_leases() {
     // Both non-Active statuses refuse, under one deny reason: no client acts
-    // on the distinction (#51).
+    // on the distinction (GL-51).
     for status in [AccountStatus::Suspended, AccountStatus::Closed] {
         let store = store_with_balance(GrantPolicy::default(), 1_000).await;
         // Through `AdminStore`, matching the PostgreSQL mirror. The two had
         // drifted: this side called the inherent method, so the trait
         // implementation could be replaced by `Ok(())` — suspending an account
-        // and still serving it — with the whole suite green (#43).
+        // and still serving it — with the whole suite green (GL-43).
         AdminStore::set_account_status(&*store, ACCOUNT, status)
             .await
             .unwrap();
@@ -1296,11 +1300,11 @@ async fn creating_a_suspended_account_denies_from_birth() {
     );
 }
 
-/// #48's enumeration seam, and the detail the whole removal-vs-revocation
+/// GL-48's enumeration seam, and the detail the whole removal-vs-revocation
 /// distinction rests on: a revoked principal stays in the catalogue. Its
 /// tombstone *is* the record of the revocation, so an instance must keep
 /// tracking it — dropping it would make it indistinguishable from a principal
-/// that never existed, which is the resurrection INVARIANTS.md #15 forbids.
+/// that never existed, which is the resurrection INVARIANTS.md GL-15 forbids.
 #[tokio::test]
 async fn enumerating_principals_includes_revoked_ones() {
     let store = store_with_balance(full_grant_policy(), 1_000).await;
@@ -1341,7 +1345,7 @@ async fn enumerating_principals_includes_revoked_ones() {
 
 /// `max_ttl` is the allocator's hard cap on how long any one lease may hold
 /// units, which is what bounds the time a crashed holder can strand them
-/// (INVARIANTS.md #9). Nothing asserted the clamp: a request for an hour
+/// (INVARIANTS.md GL-9). Nothing asserted the clamp: a request for an hour
 /// against a five-minute policy could have been honoured in full.
 #[tokio::test]
 async fn a_ttl_beyond_the_policy_maximum_is_clamped() {
@@ -1384,7 +1388,7 @@ async fn a_ttl_beyond_the_policy_maximum_is_clamped() {
 
 /// Funding an account is the only way quota enters the system, and neither
 /// suite exercised it: `deposit` could return `Ok(())` without moving a single
-/// unit and nothing failed (#43). A silently ignored top-up means an account
+/// unit and nothing failed (GL-43). A silently ignored top-up means an account
 /// that was paid for keeps being denied.
 #[tokio::test]
 async fn depositing_funds_the_account_and_the_ledger_agrees() {
@@ -1460,7 +1464,7 @@ async fn snapshot_publish_fetch_and_push() {
     assert_eq!(pushed.generation, Generation(3));
 
     // Generation monotonicity (backend parity with Postgres — review
-    // finding #5): a replayed older publish neither replaces the row nor
+    // finding GL-5): a replayed older publish neither replaces the row nor
     // pushes an update.
     let mut older = (*snapshot).clone();
     older.generation = Generation(2);
@@ -1559,12 +1563,12 @@ fn legacy_limit_wire_defaults_new_dimensions_without_changing_weighted_rate() {
     assert_eq!(limits.principal_max_concurrent_requests(), None);
 }
 
-// ---- unified account suspension (#51) -------------------------------------
+// ---- unified account suspension (GL-51) -------------------------------------
 //
-// The reference implementation of INVARIANTS.md #22. Every scenario drives
+// The reference implementation of INVARIANTS.md GL-22. Every scenario drives
 // `AdminStore` rather than an inherent helper: this pair of suites has already
 // caught one divergence where the memory trait body could have been `Ok(())`
-// with everything green (#43), and a status change that quietly did nothing is
+// with everything green (GL-43), and a status change that quietly did nothing is
 // exactly the failure being fixed.
 
 /// A snapshot for `account`, so a test can give one account several
@@ -1593,7 +1597,7 @@ async fn status_of(store: &MemoryStore, principal: Principal) -> (AccountStatus,
 /// ledger stops granting leases *and* every live snapshot of the account
 /// carries the new status, at a higher generation.
 ///
-/// Before #51 the first happened and the second did not, so an operator who
+/// Before GL-51 the first happened and the second did not, so an operator who
 /// deactivated an account watched it keep serving.
 #[tokio::test]
 async fn suspending_an_account_stops_leases_and_republishes_its_snapshots() {
@@ -1703,7 +1707,7 @@ async fn suspension_republishes_only_the_suspended_accounts_snapshots() {
 }
 
 /// Revocation stays a separate mechanism. Republishing a tombstone would
-/// resurrect a revoked credential, which INVARIANTS.md #15 forbids, so a
+/// resurrect a revoked credential, which INVARIANTS.md GL-15 forbids, so a
 /// status change must leave it revoked *at its original generation* — a bump
 /// would shadow a later legitimate republish.
 #[tokio::test]
@@ -1836,7 +1840,7 @@ async fn a_closed_account_cannot_be_reactivated() {
 /// no generation and emits no push. Generation churn on every retry would
 /// invalidate every instance's cache for no change.
 /// The class is one fact with one writer, and the operator action moves both
-/// records (#99). Exactly the ownership `set_account_status` established: a
+/// records (GL-99). Exactly the ownership `set_account_status` established: a
 /// control plane publishing it per credential would leave some of an account's
 /// principals assured and some best-effort, with a request's treatment
 /// depending on which credential it arrived with.
@@ -1921,7 +1925,7 @@ async fn repeating_a_capacity_class_change_publishes_nothing_new() {
     );
 }
 
-/// Reclassifying must not resurrect a tombstone (INVARIANTS.md #15) — the same
+/// Reclassifying must not resurrect a tombstone (INVARIANTS.md GL-15) — the same
 /// rule a status change follows, and the reason `plan_republish` skips revoked
 /// records rather than filtering by account alone.
 #[tokio::test]
@@ -2088,7 +2092,7 @@ async fn an_account_can_be_born_best_effort() {
 /// rule is proved once for both; what this adds is that the class change's own
 /// ledger write is inside that atomicity rather than beside it. Writing the
 /// column and then republishing would leave a best-effort account with assured
-/// snapshots behind an overflow — the divergence INVARIANTS.md #22 forbids,
+/// snapshots behind an overflow — the divergence INVARIANTS.md GL-22 forbids,
 /// reached from inside the mechanism that exists to prevent it.
 #[tokio::test]
 async fn a_capacity_class_change_that_cannot_republish_moves_neither_record() {
@@ -2313,7 +2317,7 @@ async fn publishing_a_snapshot_that_contradicts_the_ledger_is_refused() {
 /// A snapshot already at `Generation(u64::MAX)` cannot be republished, and the
 /// tempting shape — write the ledger, then loop the snapshots — would leave the
 /// account suspended with `Active` snapshots behind that overflow. That is the
-/// divergence INVARIANTS.md #22 forbids, reachable from inside the mechanism
+/// divergence INVARIANTS.md GL-22 forbids, reachable from inside the mechanism
 /// meant to prevent it, so the transition plans every write before applying
 /// any.
 #[tokio::test]
@@ -2404,7 +2408,7 @@ async fn overage_usage_for_an_unknown_account_is_rejected() {
 }
 
 /// `request_id` is the only idempotency axis and is independent of how the
-/// units were funded, which is what lets INVARIANTS.md #7 survive the leaseless
+/// units were funded, which is what lets INVARIANTS.md GL-7 survive the leaseless
 /// event unchanged.
 #[tokio::test]
 async fn an_overage_replay_is_idempotent() {
@@ -2424,7 +2428,7 @@ async fn an_overage_replay_is_idempotent() {
     assert_conserved(&store);
 }
 
-/// INVARIANTS.md #11 for the funding term: a total that cannot be represented
+/// INVARIANTS.md GL-11 for the funding term: a total that cannot be represented
 /// is surfaced, never wrapped and never quietly dropped. Both columns move
 /// together or neither does, so an overflow in either is the same refusal.
 ///
@@ -2477,7 +2481,7 @@ async fn overage_accounting_overflow_is_surfaced() {
 /// the bill names no lease capability. A leased-sourced bill for the same work
 /// would claim lease units the settlement already accounted for: credited by
 /// a release, where it is rejected and the charge is lost, or forfeited at
-/// reclaim (#136), where it would bill the work against loss it did not cause.
+/// reclaim (GL-136), where it would bill the work against loss it did not cause.
 /// The overage-sourced bill is accepted and funds itself either way.
 #[tokio::test]
 async fn a_commit_time_fallback_is_ingested_as_overage_after_its_lease_settles() {
@@ -2606,7 +2610,7 @@ async fn settlement_is_unaffected_by_an_account_carrying_overage() {
 }
 
 // ---------------------------------------------------------------------------
-// Credential lifecycle (#104). Mirrored scenario for scenario in the Postgres
+// Credential lifecycle (GL-104). Mirrored scenario for scenario in the Postgres
 // suite: a backend that holds credentials must agree with this one about what
 // "active" means, or two instances projecting from different backends would
 // verify different credential sets.
@@ -2751,7 +2755,7 @@ async fn two_credentials_cannot_share_a_principal() {
 }
 
 // ---------------------------------------------------------------------------
-// Failed operations move nothing (#57). `MemoryStore` is the executable
+// Failed operations move nothing (GL-57). `MemoryStore` is the executable
 // reference for `PostgresStore`'s transactions, so an operation that returns
 // `Err` must leave the ledger exactly as it found it. The Postgres suite
 // mirrors these by name; the magnitudes differ because the backends' ceilings
@@ -2858,7 +2862,7 @@ async fn a_failed_ingest_batch_leaves_the_ledger_untouched() {
     }
 }
 
-/// Issue #58: a publish and a status transition racing each other must not
+/// Issue GL-58: a publish and a status transition racing each other must not
 /// leave the two records disagreeing.
 ///
 /// The check and the write were two lock acquisitions, so a suspension could
@@ -2959,7 +2963,7 @@ async fn a_publish_racing_a_suspension_never_leaves_the_records_disagreeing() {
     }
 }
 
-// --- Periodic budgets (#97) -------------------------------------------------
+// --- Periodic budgets (GL-97) -------------------------------------------------
 //
 // Boundaries are named for the months they start, because that is what the
 // scenarios are about. Real dates rather than epoch arithmetic: a fresh
@@ -3288,7 +3292,7 @@ async fn a_split_funded_lease_charges_the_allowance_half_first() {
 
 /// Reclaim is the other settlement path: a lease nobody released must not
 /// resurrect its period's allowance through the sweep. It credits nothing at
-/// all (#136), so its remainder is forfeited as loss rather than expired, and
+/// all (GL-136), so its remainder is forfeited as loss rather than expired, and
 /// only the new period's allowance is spendable.
 #[tokio::test]
 async fn reclaim_never_resurrects_a_closed_period_lease_it_sweeps() {
@@ -3350,7 +3354,7 @@ async fn clearing_a_schedule_leaves_the_balance_alone() {
 
 /// Every scheduled account comes due at the same instant — that is what a
 /// calendar boundary is — so the pass is bounded and its caller drains it.
-/// Which accounts a bounded pass rolls is decided, not left to the map (#100).
+/// Which accounts a bounded pass rolls is decided, not left to the map (GL-100).
 ///
 /// The reference backend used to iterate `accounts` and break at the limit, so
 /// with more accounts due than one batch takes, two runs over identical state
@@ -3584,7 +3588,7 @@ async fn a_lease_released_inside_its_own_period_expires_nothing() {
 /// a lease's own period expires nothing, so the whole allowance half funds the
 /// replacement. Only the cross-boundary case was witnessed, which left the
 /// boundary comparison free to move — a `<=` there would have quietly expired
-/// the allowance of every consolidation, which is every one #109 performs.
+/// the allowance of every consolidation, which is every one GL-109 performs.
 #[tokio::test]
 async fn consolidating_inside_a_lease_own_period_expires_nothing() {
     let store = store_with_balance(full_grant_policy(), 0).await;
@@ -3628,7 +3632,7 @@ async fn consolidating_inside_a_lease_own_period_expires_nothing() {
 }
 
 /// A consolidation is a settlement, so it obeys the boundary rule the same way
-/// a release does (#97): the allowance half of a lease funded by a period that
+/// a release does (GL-97): the allowance half of a lease funded by a period that
 /// has since closed expires instead of returning. The replacement grant is
 /// therefore sized against what the credit *restores*, never against the
 /// unspent units nominally handed back — assuming the latter would let a
@@ -3636,7 +3640,7 @@ async fn consolidating_inside_a_lease_own_period_expires_nothing() {
 #[tokio::test]
 async fn consolidating_across_a_boundary_regrants_only_what_the_credit_restores() {
     // A lease long enough to straddle the boundary is the whole scenario:
-    // an active lease keeps serving to its own TTL across a rollover (#97).
+    // an active lease keeps serving to its own TTL across a rollover (GL-97).
     const LONG: SignedDuration = SignedDuration::from_secs(60 * 24 * 3_600);
     let store = store_with_balance(
         GrantPolicy {
@@ -3743,7 +3747,7 @@ async fn consolidation_after_a_budget_reduction_uses_only_restored_credit_as_flo
 
 /// The same strictness on the sweep's side of the settlement path: a lease
 /// that expired by its own TTL, inside the account's current period, expires
-/// nothing. Its remainder is forfeited as provisional loss (#136), never
+/// nothing. Its remainder is forfeited as provisional loss (GL-136), never
 /// booked as the period's expiry.
 #[tokio::test]
 async fn a_lease_reclaimed_inside_its_own_period_expires_nothing() {
@@ -3771,7 +3775,7 @@ async fn a_lease_reclaimed_inside_its_own_period_expires_nothing() {
     assert_conserved(&store);
 }
 
-/// The policy revision survives publication and refetch unchanged (#94).
+/// The policy revision survives publication and refetch unchanged (GL-94).
 ///
 /// The memory backend stores the typed value, so this ought to be free — which
 /// is exactly why it is asserted. "Free" is an assumption about a code path,
@@ -4580,7 +4584,7 @@ async fn nanosecond_lease_boundaries_preserve_release_reclaim_and_consolidation(
         assert!(store.reclaim_expired(deadline).await.unwrap().is_empty());
         let c = store.conservation(ACCOUNT).unwrap();
         assert!(c.holds());
-        // The unreleased lease is forfeited at the exact deadline (#136).
+        // The unreleased lease is forfeited at the exact deadline (GL-136).
         assert_eq!(c.balance, CostUnits(90));
         assert_eq!(c.active_lease_grants, CostUnits::ZERO);
         assert_eq!(c.settlement_loss, CostUnits(10));
@@ -4805,7 +4809,7 @@ async fn grants_report_ledger_remaining_including_outstanding_leases() {
     assert_conserved(&store);
 }
 
-/// #130: one unit left and a quote of 252. The consolidation floor re-grants
+/// GL-130: one unit left and a quote of 252. The consolidation floor re-grants
 /// the tail, so only the grant's evidence can say the quote is unfundable;
 /// another instance's acquire is refused with the same attested remainder.
 #[tokio::test]
@@ -4904,8 +4908,8 @@ async fn an_insufficient_balance_recovers_when_another_instance_returns_its_leas
 }
 
 /// Only a release restores another instance's units. A lease its holder
-/// never released is forfeited at reclaim (#136): the funding it held is gone,
-/// and the ledger now attests exhaustion rather than a lease gap (#130).
+/// never released is forfeited at reclaim (GL-136): the funding it held is gone,
+/// and the ledger now attests exhaustion rather than a lease gap (GL-130).
 #[tokio::test]
 async fn a_reclaimed_lease_forfeits_its_funding_instead_of_restoring_it() {
     let store = store_with_balance(full_grant_policy(), 100).await;

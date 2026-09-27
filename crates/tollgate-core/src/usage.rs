@@ -3,7 +3,7 @@
 //! Leases *bound* spend; usage events *are* what gets billed. Reconciliation
 //! compares the two ledgers and steady-state drift is zero (INVARIANTS.md,
 //! ledger-roles note). Events are idempotent on `request_id`, so batched
-//! writers may retry whole batches freely (INVARIANTS.md #7).
+//! writers may retry whole batches freely (INVARIANTS.md GL-7).
 
 use std::sync::{
     Arc,
@@ -110,7 +110,7 @@ pub enum UsageSource {
     /// Spent from a lease. The sink requires the stored
     /// `(lease_id, account_id, fencing_token)` triple to match before the
     /// event may change either ledger; token age relative to another active
-    /// lease is irrelevant (INVARIANTS.md #4).
+    /// lease is irrelevant (INVARIANTS.md GL-4).
     Leased {
         lease_id: LeaseId,
         fencing_token: FencingToken,
@@ -170,7 +170,7 @@ pub struct UsageEvent {
     ///
     /// The only field of this struct that is independent of how the units were
     /// funded, which is what lets overage replay under the same rule as any
-    /// other event (INVARIANTS.md #7).
+    /// other event (INVARIANTS.md GL-7).
     pub request_id: RequestId,
     pub account_id: AccountId,
     /// What funded the units, and the evidence the sink validates.
@@ -178,7 +178,7 @@ pub struct UsageEvent {
     pub units: CostUnits,
     pub occurred_at: Timestamp,
     /// The consuming application's policy identity, copied from the pinned
-    /// snapshot that priced this request (#94).
+    /// snapshot that priced this request (GL-94).
     ///
     /// Carried so a billing record can be traced to the exact product policy
     /// that produced it. Tollgate never reads it, and an event from a
@@ -247,7 +247,7 @@ mod revision_wire_tests {
         )
     }
 
-    /// A peer that predates #94 sends no revision, and its events must ingest
+    /// A peer that predates GL-94 sends no revision, and its events must ingest
     /// rather than fail. The absent key decodes to "unstated" — a value, not
     /// an error — which is what makes the additive rollout safe in both
     /// directions.

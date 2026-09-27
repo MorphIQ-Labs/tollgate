@@ -5,7 +5,7 @@
 //! every binary to handle `--help`, `--version` and `--` before validating
 //! anything, and a rule nothing exercises is a rule that drifts. The mutation
 //! gate said so first — every mutant of the inline parsing survived, because
-//! nothing could observe it (#85).
+//! nothing could observe it (GL-85).
 
 use std::ffi::OsStr;
 use std::path::PathBuf;

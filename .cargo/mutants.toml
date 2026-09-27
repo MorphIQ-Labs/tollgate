@@ -17,7 +17,7 @@ exclude_re = [
   # that separates them, so a test claiming to would be asserting on the
   # branch rather than on behaviour. The clamp itself *was* unwitnessed, and
   # now is: `a_ttl_beyond_the_policy_maximum_is_clamped`, in both backend
-  # suites. Memory was baselined by #43 and PostgreSQL by #50.
+  # suites. Memory was baselined by GL-43 and PostgreSQL by GL-50.
   "replace > with >= in <impl LeaseAllocator for MemoryStore>::acquire",
   "replace > with >= in <impl LeaseAllocator for PostgresStore>::acquire",
   # `SnapshotMap`'s compatibility default spells the same value as
@@ -27,7 +27,7 @@ exclude_re = [
   # distinguish these two bodies.
   "replace SnapshotMap::local_sharding -> LocalSharding with Default::default\\(\\)",
   # `Connected::connect_info` must create the default empty per-connection
-  # cache (INVARIANTS.md #23). Replacing the explicit `Self::default()` with
+  # cache (INVARIANTS.md GL-23). Replacing the explicit `Self::default()` with
   # inferred `Default::default()` calls the same implementation and returns
   # the same type; no request or connection can distinguish the spellings.
   "replace <impl Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>> for PricingConnection>::connect_info -> Self with Default::default\\(\\)",

@@ -1,4 +1,4 @@
-//! The memory backend reports what it is holding (#23).
+//! The memory backend reports what it is holding (GL-23).
 //!
 //! `MemoryStore` never forgets a usage event — it is the idempotency index —
 //! so its footprint grows with lifetime request count. That is documented, and

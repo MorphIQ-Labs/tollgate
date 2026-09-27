@@ -8,7 +8,7 @@
 //! nothing in the compiler or the test run says so.
 //!
 //! This is not a name diff. A name diff compares the *sets* of tests and would
-//! have reported these suites as healthy: every divergence #85 fixed sat
+//! have reported these suites as healthy: every divergence GL-85 fixed sat
 //! **inside** a test both suites already had. It is also why the renamed pairs
 //! (`snapshot_publish_fetch_and_push` against
 //! `snapshot_publish_fetch_and_generation_monotonicity`) are not treated as

@@ -2,7 +2,7 @@
 //!
 //! Every deny is local and fail-closed: none of these variants may ever be
 //! "handled" by falling through to synchronous I/O on the request path
-//! (INVARIANTS.md #5). The variants carry enough data for a service to render
+//! (INVARIANTS.md GL-5). The variants carry enough data for a service to render
 //! a stable machine-readable error without further lookups.
 //!
 //! A reason lands in the same change as the code that produces it. The enum is
@@ -104,10 +104,10 @@ pub enum DenyReason {
         overage_cap: CostUnits,
     },
     /// Cost arithmetic overflowed. A quote that cannot be represented is
-    /// refused rather than wrapped (INVARIANTS.md #11).
+    /// refused rather than wrapped (INVARIANTS.md GL-11).
     CostOverflow,
     /// The usage-accounting queue is full; admitting more work would either
-    /// drop billing events or block. Shedding here is INVARIANTS.md #8.
+    /// drop billing events or block. Shedding here is INVARIANTS.md GL-8.
     AccountingBackpressure,
     /// Pending overage reservations currently occupy enough of the account's
     /// cap to refuse this request, but cancellation or drop can return that
@@ -137,7 +137,7 @@ pub enum DenyReason {
     /// leaves no interval between admission and start for it to happen in.
     FundingExpiredAtStart,
     /// This instance has no execution capacity to start the request with
-    /// (#99). The account is valid, funded, and within every limit of its
+    /// (GL-99). The account is valid, funded, and within every limit of its
     /// own — the instance simply cannot afford to begin the work now.
     ///
     /// Deliberately not aliased to `RateLimited`, `LeaseExhausted`, or
