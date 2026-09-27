@@ -1,0 +1,369 @@
+# Tollgate CI — Rust correctness, dependency advisories and licenses, backend
+# parity, performance compilation, mutation assurance, machine-checked proofs,
+# and a secret scan.
+#
+# The toolchain comes from rust-toolchain.toml; rustup installs exactly that
+# pin, so CI and local builds cannot drift. Timed Criterion and loopback load
+# checks run locally; reports are reviewed with the pull request. CI retains
+# benchmark compilation and deterministic allocation assertions.
+#
+# Every gate runs on every pull request, whatever branch it targets: whether a
+# gate runs is a property of the change, not of its routing (GL-106).
+#
+# Stages, as `needs`: check -> test -> assurance. A stage starts only when
+# every job of the one before has passed, so a formatting error stops the run
+# before the mutation gate spends its time. Later jobs then show as skipped;
+# the failed job is itself a required check and blocks the pull request.
+# `scripts/check_ci_rules.sh` enforces that against this file.
+#
+# Third-party actions are pinned to full commit SHAs; the comment names the
+# release. Tool versions come from .cargo/*-version and formal/lean/lean-toolchain.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "3"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  commit-convention:
+    name: check / commit-convention
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Pull request title is a conventional commit
+        # The title arrives through the environment, never interpolated into
+        # the script, so a crafted title cannot inject shell.
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          types='build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test'
+          if printf '%s' "$TITLE" | grep -qE "^($types)(\([a-z0-9._/-]+\))?!?: .+"; then
+            printf 'conventional title: %s\n' "$TITLE"
+          else
+            printf 'Pull request title is not a conventional commit: %s\n' "$TITLE" >&2
+            exit 1
+          fi
+
+  repository-hygiene:
+    name: check / repository-hygiene
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: false
+      - name: No generated or ignored files are tracked
+        run: |
+          tracked_ignored="$(git ls-files -ci --exclude-standard)"
+          if [ -n "$tracked_ignored" ]; then
+            printf 'Generated or ignored files are tracked:\n%s\n' "$tracked_ignored" >&2
+            exit 1
+          fi
+      - name: No manifest carries a publish registry list
+        # GL-46 was a registry *list* from which tooling derived
+        # `cargo package --registry <name>`; the name resolved nowhere and
+        # every main pipeline failed. Reject the list form in any manifest.
+        run: |
+          publish_lists="$(git grep -n '^[[:space:]]*publish[[:space:]]*=[[:space:]]*\[' -- '*Cargo.toml' || true)"
+          if [ -n "$publish_lists" ]; then
+            printf 'Cargo manifests must not carry a publish registry list (see AGENTS.md, GL-46):\n%s\n' "$publish_lists" >&2
+            exit 1
+          fi
+      # Runs here and not with the assurance jobs: it guards their own
+      # triggers, so it must run where those triggers have already decided
+      # whether the assurance jobs exist (GL-106).
+      - run: ./scripts/check_ci_rules.sh
+      - run: ./scripts/check_invariant_witnesses.sh
+      # The two backend suites must drive the same contract under one test
+      # name; the drift is silent and recurring (GL-43, GL-85).
+      - run: ./scripts/check_backend_parity.sh
+      # The staged admission seam's contract must name every published seam
+      # method before it ships (GL-126).
+      - run: ./scripts/check_seam_contract.sh
+
+  secret-scan:
+    name: check / secret-scan
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: gitleaks over the pull request's commits
+        # The container is pinned by digest (gitleaks v8.30.1). Known test
+        # fixtures are allowlisted by path in .gitleaks.toml.
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo:ro" \
+            zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            git /repo --config /repo/.gitleaks.toml --redact --no-banner \
+            --log-opts="$BASE..HEAD"
+
+  fmt:
+    name: check / fmt
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: cargo fmt --check
+
+  clippy:
+    name: check / clippy
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The sole cache writer; every other build job restores read-only.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: workspace
+      - run: rustc --version
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      # Every crate, not a chosen few: documenting only core and admission let
+      # broken links and an unnameable public type through unnoticed.
+      - run: cargo doc --locked --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # Cargo.lock makes this a reproducible whole-tree scan. It runs on pull
+  # requests and on main, so a newly published advisory blocks the next change
+  # and also withdraws a just-merged revision from release.
+  audit:
+    name: check / audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: tools
+      - run: cargo install --locked --no-default-features cargo-audit --version "$(cat .cargo/audit-version)"
+      - run: ./scripts/check_advisories.sh
+
+  # The graph may ship under MIT OR Apache-2.0 only while every dependency is
+  # available under a permissive license; deny.toml is that allowlist.
+  licenses:
+    name: check / licenses
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: tools
+      - run: cargo install --locked cargo-deny --version "$(cat .cargo/deny-version)"
+      - run: cargo deny --locked check licenses
+
+  # rust-toolchain.toml pins the development toolchain. Select the declared
+  # minimum explicitly so this job cannot silently build with the newer pin.
+  msrv:
+    name: check / msrv
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    env:
+      RUSTUP_TOOLCHAIN: "1.89.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install 1.89.0 --profile minimal
+      - run: rustc --version && cargo --version
+      - run: cargo check --locked --workspace --all-features --all-targets
+
+  test:
+    name: test / test
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, msrv]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: workspace
+          save-if: false
+      - run: cargo test --locked --workspace --all-features
+
+  # Scoped allocation counts and the one-lookup witness are deterministic on a
+  # shared runner. Allocation is a structural contract; latency needs
+  # controlled-host calibration and stays local.
+  allocation-assertions:
+    name: test / allocation-assertions
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, msrv]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: workspace
+          save-if: false
+      - run: ./scripts/check_allocations.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: allocation-report
+          path: reports/allocation_report.json
+
+  # The service library remains backend-generic when the binary's optional
+  # Postgres backend is disabled; the tree check makes that claim executable.
+  test-no-default-features:
+    name: test / test-no-default-features
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, msrv]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: workspace
+          save-if: false
+      - name: tollgate-server without default features has no Postgres
+        run: |
+          dependency_tree="$(cargo tree --locked -p tollgate-server --no-default-features)"
+          printf '%s\n' "$dependency_tree"
+          if printf '%s\n' "$dependency_tree" | grep -Eq 'tollgate-store-postgres|sqlx'; then
+            printf 'tollgate-server without default features must not depend on Postgres or sqlx\n' >&2
+            exit 1
+          fi
+      # Workspace feature unification can enable core's optional serde support;
+      # check the standalone crate before the combined workspace suite.
+      - run: cargo test --locked -p tollgate-core --no-default-features
+      - run: cargo test --locked --workspace --no-default-features
+
+  # The env-gated Postgres suite, which skips on machines without a database,
+  # runs for real here. TOLLGATE_REQUIRE_PG makes a silent skip fail red.
+  test-postgres:
+    name: test / test-postgres
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, msrv]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tollgate
+          POSTGRES_PASSWORD: tollgate
+          POSTGRES_DB: tollgate
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tollgate" --health-interval 2s
+          --health-timeout 5s --health-retries 30
+    env:
+      TOLLGATE_PG_URL: postgres://tollgate:tollgate@localhost:5432/tollgate
+      TOLLGATE_REQUIRE_PG: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: workspace
+          save-if: false
+      - run: cargo test --locked -p tollgate-store-postgres
+      - run: cargo test --locked -p tollgate-server --all-features --test lease_ttl
+      - run: cargo test --locked -p tollgate-server --all-features --test credential_expiry
+
+  bench-compile:
+    name: test / bench-compile
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, msrv]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: workspace
+          save-if: false
+      - run: cargo bench --locked --workspace --no-run
+
+  # Fixed I/O and protocol failures, with the real load tool's panic policy.
+  # No workload, timed measurement, or threshold verdict runs here.
+  load-failure-reporting:
+    name: test / load-failure-reporting
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, msrv]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: workspace
+          save-if: false
+      - run: cargo run --locked --profile production -p pricing-api --example load_gate_failure_probe
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: load-failure-fixtures
+          path: reports/load-failure-fixtures
+
+  # Blocking assurance gate: the Lean model must build.
+  formal:
+    name: assurance / formal
+    needs: [test, allocation-assertions, test-no-default-features, test-postgres, bench-compile, load-failure-reporting]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.elan
+            formal/lean/.lake
+          key: lean-${{ hashFiles('formal/lean/lean-toolchain', 'formal/lean/lake-manifest.json') }}
+      - name: Install elan at a pinned commit
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/leanprover/elan/464c9d28395000a2a0128e07081e4956d50eced2/elan-init.sh \
+            | sh -s -- -y --default-toolchain "$(cat formal/lean/lean-toolchain)"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - run: ./scripts/check_formal.sh
+
+  # Blocking assurance gate: diff-scoped mutation testing, including the
+  # Postgres backend.
+  mutation:
+    name: assurance / mutation
+    needs: [test, allocation-assertions, test-no-default-features, test-postgres, bench-compile, load-failure-reporting]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tollgate
+          POSTGRES_PASSWORD: tollgate
+          POSTGRES_DB: tollgate
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tollgate" --health-interval 2s
+          --health-timeout 5s --health-retries 30
+    env:
+      TOLLGATE_PG_URL: postgres://tollgate:tollgate@localhost:5432/tollgate
+      TOLLGATE_REQUIRE_PG: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Diff-scoped selection needs the merge base with the target branch.
+          fetch-depth: 0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mutation
+      - run: cargo install --locked cargo-mutants --version "$(cat .cargo/mutants-version)"
+      - run: cargo install --locked cargo-nextest --version "$(cat .cargo/nextest-version)"
+      - run: ./scripts/check_mutations.sh --diff "$BASE"
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: mutation-report
+          path: reports/mutations

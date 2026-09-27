@@ -1,0 +1,21 @@
+# Secret scanning (gitleaks) for this repository: the default rules, plus an
+# allowlist for test fixtures that are credential-shaped by design. Values are
+# allowlisted, not whole files, so a real secret added beside a fixture is
+# still reported.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Credential-shaped test fixtures and documented demo values"
+regexes = [
+  # The documented demo key of examples/pricing-api.
+  '''demo-key-[0-9]+''',
+  # Redaction tests plant values named fixture-* and assert they never leak.
+  '''fixture-[a-z0-9-]+''',
+]
+paths = [
+  # Synthetic Google ID tokens (subject 1234567890, *.example.test audiences)
+  # for the control-plane identity verifier's accept/reject cases.
+  '''crates/tollgate-server/tests/fixtures/google-tokens\.json''',
+]
