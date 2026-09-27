@@ -199,6 +199,9 @@ jobs:
           shared-key: workspace
           save-if: false
       - run: cargo publish --locked --workspace --dry-run
+      # The release's own publish script, against the same manifests: its
+      # stated order must match the publishable crates.
+      - run: PUBLISH_DRY_RUN=1 ./scripts/publish-crates.sh
 
   # rust-toolchain.toml pins the development toolchain. Select the declared
   # minimum explicitly so this job cannot silently build with the newer pin.

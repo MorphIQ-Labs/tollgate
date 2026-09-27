@@ -1,7 +1,5 @@
 #!/bin/sh
-# Reference release-preparation script. Copy to `scripts/prepare-release.sh`.
-#
-# This is the half of release-plz that `tag-release` does not replace.
+# Release preparation: the half of release-plz that `tag-release` does not replace.
 # `tag-release` tags whatever version the manifest already declares; something
 # has to advance that version, and until this script existed nothing did. A
 # repository would accumulate commits on the default branch while the release
@@ -12,7 +10,7 @@
 # The model, matching what release-plz did here:
 #
 #   * one long-lived release branch, updated from the default branch whenever
-#     the generated proposal changes, so the open release merge request always
+#     the generated proposal changes, so the open release pull request always
 #     reflects the current tip rather than whatever the first run happened to
 #     see;
 #   * the version derived from the conventional-commit subjects since the last
@@ -36,7 +34,7 @@
 # leaves an identical proposal commit untouched and only force-updates the
 # release branch when the generated release files have actually changed.
 #
-# Depends on git, curl, jq and a POSIX awk — the same set `tag-release.sh` needs,
+# Depends on git, gh and a POSIX awk — the same set `tag-release.sh` needs,
 # deliberately. No gawk extensions, no python: the release path must not acquire
 # an interpreter the release image does not already carry.
 #
@@ -49,16 +47,18 @@ RELEASE_BRANCH="${RELEASE_BRANCH:-chore/release}"
 DRY_RUN="${PREPARE_RELEASE_DRY_RUN:-0}"
 
 if [ "$DRY_RUN" != "1" ]; then
-  : "${CI_SERVER_HOST:?}"
-  : "${CI_PROJECT_PATH:?}"
-  : "${CI_PROJECT_ID:?}"
-  : "${CI_API_V4_URL:?}"
-  : "${CI_DEFAULT_BRANCH:?}"
-  : "${RELEASE_TOKEN:?}"
+  # GH_TOKEN is the release App's installation token: a pull request opened
+  # with the workflow's own GITHUB_TOKEN would never trigger the required
+  # checks, so it could never merge.
+  : "${GH_TOKEN:?GH_TOKEN must be the release App installation token}"
+  : "${GITHUB_REPOSITORY:?}"
+  : "${DEFAULT_BRANCH:?}"
+  : "${RELEASE_BOT_NAME:?}" "${RELEASE_BOT_EMAIL:?}"
 fi
 
-server_host="${CI_SERVER_HOST:-gitlab.com}"
-project_path="${CI_PROJECT_PATH:-}"
+server_url="${GITHUB_SERVER_URL:-https://github.com}"
+server_host="${server_url#https://}"
+project_path="${GITHUB_REPOSITORY:-}"
 
 [ -f CHANGELOG.md ] || {
   echo "prepare-release: CHANGELOG.md is required; add a root changelog before enabling releases" >&2
@@ -88,6 +88,8 @@ if ! git rev-parse -q --verify "refs/tags/v$current" >/dev/null 2>&1; then
     {
       hash = $1
       sub(/^[^ ]+ /, "")
+      # A squash merge appends the pull request number: " (#N)".
+      sub(/ \(#[0-9]+\)$/, "")
       if ($0 == wanted) { print hash; exit }
     }
   ')
@@ -289,7 +291,7 @@ mv CHANGELOG.md.next CHANGELOG.md
 # A recovery schedule commonly sees the same default-branch tip as the
 # post-merge run. Do not manufacture a new commit timestamp and force-push an
 # identical proposal: besides being needless churn, that write can turn a
-# transient GitLab pre-receive failure into a red recovery pipeline. Fetch into
+# transient push failure into a red recovery run. Fetch into
 # FETCH_HEAD so this comparison does not depend on a local tracking ref.
 release_branch_current=0
 if git fetch -q --no-tags origin "refs/heads/$RELEASE_BRANCH" 2>/dev/null; then
@@ -299,9 +301,9 @@ if git fetch -q --no-tags origin "refs/heads/$RELEASE_BRANCH" 2>/dev/null; then
   fi
 fi
 
-git config user.email "release-bot@noreply.$CI_SERVER_HOST"
-git config user.name "release-bot"
-git remote set-url origin "https://oauth2:${RELEASE_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+git config user.name "$RELEASE_BOT_NAME"
+git config user.email "$RELEASE_BOT_EMAIL"
+git remote set-url origin "https://x-access-token:${GH_TOKEN}@${server_host}/${GITHUB_REPOSITORY}.git"
 
 if [ "$release_branch_current" = "1" ]; then
   echo "prepare-release: $RELEASE_BRANCH already matches v$next; leaving its commit unchanged"
@@ -309,9 +311,9 @@ else
   git checkout -B "$RELEASE_BRANCH"
 
   # Stage only the files this script edits. `git add -A` sweeps in whatever else
-  # the job left in the working tree — CARGO_HOME is inside CI_PROJECT_DIR in
-  # these projects, so the first run committed 330 files of restored registry
-  # cache alongside a three-line version bump.
+  # the job left in the working tree — a cargo home inside the checkout once
+  # committed 330 files of restored registry cache alongside a three-line
+  # version bump.
   git add CHANGELOG.md Cargo.lock
   git ls-files -z '*Cargo.toml' | xargs -0 git add --
 
@@ -319,28 +321,22 @@ else
   git push -q --force origin "refs/heads/$RELEASE_BRANCH"
 fi
 
-# --- create the merge request, or refresh the open one --------------------
-api="$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests"
-existing=$(curl --fail-with-body -sS -H "PRIVATE-TOKEN: $RELEASE_TOKEN" \
-  "$api?state=opened&source_branch=$RELEASE_BRANCH" | jq -r '.[0].iid // empty')
+# --- create the pull request, or refresh the open one ---------------------
+existing=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --head "$RELEASE_BRANCH" \
+  --json number --jq '.[0].number // empty')
 
 body="Prepared by \`prepare-release\` from the conventional commits since $range_start.
 
-Merging this bumps the workspace to **$next**; \`tag-release\` then cuts \`v$next\` and the GitLab release from the CHANGELOG section below.
+Merging this bumps the workspace to **$next**; \`tag-release\` then cuts \`v$next\`, the GitHub release from the CHANGELOG section below, and publishes the crates.
 
 $entries"
 
 if [ -n "$existing" ]; then
-  jq -n --arg t "chore: release v$next" --arg d "$body" '{title:$t, description:$d}' \
-  | curl --fail-with-body -sS -X PUT -H "PRIVATE-TOKEN: $RELEASE_TOKEN" \
-      -H "Content-Type: application/json" --data @- "$api/$existing" >/dev/null
-  echo "prepare-release: refreshed !$existing to v$next"
+  printf '%s' "$body" | gh pr edit "$existing" --repo "$GITHUB_REPOSITORY" \
+    --title "chore: release v$next" --body-file - >/dev/null
+  echo "prepare-release: refreshed #$existing to v$next"
 else
-  jq -n --arg s "$RELEASE_BRANCH" --arg tb "$CI_DEFAULT_BRANCH" \
-        --arg t "chore: release v$next" --arg d "$body" \
-    '{source_branch:$s, target_branch:$tb, title:$t, description:$d,
-      squash:true, remove_source_branch:false}' \
-  | curl --fail-with-body -sS -X POST -H "PRIVATE-TOKEN: $RELEASE_TOKEN" \
-      -H "Content-Type: application/json" --data @- "$api" \
-  | jq -r '"prepare-release: opened !\(.iid)"'
+  printf '%s' "$body" | gh pr create --repo "$GITHUB_REPOSITORY" \
+    --base "$DEFAULT_BRANCH" --head "$RELEASE_BRANCH" \
+    --title "chore: release v$next" --body-file -
 fi
