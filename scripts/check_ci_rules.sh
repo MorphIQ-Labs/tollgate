@@ -13,7 +13,7 @@
 # to notice.
 set -eu
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 CONFIG="$ROOT/.github/workflows/ci.yml"
 WORKFLOWS="$ROOT/.github/workflows"
 
