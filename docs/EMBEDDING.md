@@ -14,20 +14,22 @@ section says which of its choices are the contract and which are its own.
 
 ## Depending on Tollgate
 
-Crates are unpublished and distributed by git tag. Depend on a tag, never a
-branch: the workspace releases as one unit, and its internal dependencies are
-pinned to exact versions, so a mixed set will not resolve.
+The crates are published to crates.io and release as one unit: every crate
+carries the same version, and they depend on each other at exactly that
+version, so Cargo resolves a consistent set. Depend on the same `0.x` series
+for each:
 
 ```toml
 [dependencies]
-tollgate-core = { git = "https://github.com/MorphIQ-Labs/tollgate.git", tag = "v0.23.1" }
-tollgate-admission = { git = "https://github.com/MorphIQ-Labs/tollgate.git", tag = "v0.23.1" }
+tollgate-core = "0.30"
+tollgate-admission = "0.30"
 # Only if you want the managed runtime — see "Two ways in" below.
-tollgate-client = { git = "https://github.com/MorphIQ-Labs/tollgate.git", tag = "v0.23.1" }
+tollgate-client = "0.30"
 ```
 
-Pin the tag your conformance run was recorded against, and move it
-deliberately.
+Under `0.x`, a breaking change moves the minor version, so a caret requirement
+never crosses one. Pin the exact version your conformance run was recorded
+against (`"=0.30.1"`), and move it deliberately.
 
 ## Two ways in
 

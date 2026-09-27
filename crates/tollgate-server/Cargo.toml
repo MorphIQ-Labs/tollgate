@@ -7,7 +7,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+publish = true
+keywords = ["quota", "metering", "billing", "control-plane", "tls"]
+categories = ["web-programming::http-server", "authentication"]
 
 [features]
 default = ["postgres"]
@@ -41,7 +43,10 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 # Test-only self edge: ordinary test commands opt in without production builds doing so.
-tollgate-server = { path = ".", version = "=0.30.0", default-features = false, features = ["test-support"] }
+# Path only: a self dev-dependency that turns on test-support for this crate's
+# own tests. `cargo publish` strips it; a versioned one would have to exist on
+# crates.io first.
+tollgate-server = { path = ".", default-features = false, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 rcgen = { workspace = true }

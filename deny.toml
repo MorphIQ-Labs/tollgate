@@ -22,6 +22,6 @@ allow = [
 confidence-threshold = 0.9
 
 [licenses.private]
-# Workspace members are publish = false; their own license is checked by the
-# manifests, not here.
+# Unpublished workspace members (tooling and examples) are not license-checked
+# here; the published crates' own MIT OR Apache-2.0 is on the allowlist.
 ignore = true

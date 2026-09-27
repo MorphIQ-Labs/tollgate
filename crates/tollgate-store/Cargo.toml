@@ -7,7 +7,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+publish = true
+keywords = ["quota", "ledger", "billing", "metering", "storage"]
+categories = ["database", "data-structures"]
 
 [dependencies]
 tollgate-core = { path = "../tollgate-core", version = "=0.30.0" }
@@ -36,3 +38,7 @@ wire = ["dep:serde", "tollgate-core/serde"]
 
 [lints]
 workspace = true
+
+# docs.rs documents every optional feature.
+[package.metadata.docs.rs]
+all-features = true

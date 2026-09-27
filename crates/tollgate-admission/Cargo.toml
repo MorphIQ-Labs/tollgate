@@ -7,7 +7,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+publish = true
+keywords = ["quota", "rate-limiting", "admission-control", "metering", "lock-free"]
+categories = ["concurrency", "web-programming"]
 
 [dependencies]
 tollgate-core = { path = "../tollgate-core", version = "=0.30.0" }
