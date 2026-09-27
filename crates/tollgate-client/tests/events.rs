@@ -1,4 +1,4 @@
-//! Failures reach an operator (issue #36).
+//! Failures reach an operator (issue GL-36).
 //!
 //! The control plane retries forever by design, so a failing backend is not
 //! an error anyone returns — without an event it is indistinguishable from an

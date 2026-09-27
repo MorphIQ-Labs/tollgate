@@ -502,7 +502,7 @@ mod tests {
     /// The mode's whole purpose, stated as a readiness property: an elastic
     /// account with headroom keeps its instance in rotation on exactly the
     /// states a strict one is withdrawn for, and leaves rotation when the
-    /// headroom is gone (INVARIANTS.md #10).
+    /// headroom is gone (INVARIANTS.md GL-10).
     #[test]
     fn readiness_counts_overage_headroom_for_an_elastic_account() {
         let now = Timestamp::now();

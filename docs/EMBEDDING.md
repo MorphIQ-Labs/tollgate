@@ -4,7 +4,7 @@ For a service putting Tollgate's staged admission pipeline in front of its own
 work. It states the contract: the request order, what you implement, what you
 cannot, and how to shut down without losing usage.
 
-It is not the rationale. `docs/DESIGN.md` § "Staged admission interface (#96)"
+It is not the rationale. `docs/DESIGN.md` § "Staged admission interface (GL-96)"
 says *why* the seam has this shape and is the document an interface change
 amends first. It is also not the provisioning API — creating accounts, setting
 budgets and issuing credentials is `docs/ACCOUNT_ADMINISTRATION.md`.
@@ -136,7 +136,7 @@ you verify are the same bytes by construction.
 allocation-free, but a panic that escapes a worker thread can leak the guard
 rather than drop it, and a leaked guard emits nothing. `catch_unwind` (or your
 executor's equivalent) is yours to place. Under `panic = "abort"` this does not
-apply, and INVARIANTS #13 states the process-loss boundary instead.
+apply, and INVARIANTS GL-13 states the process-loss boundary instead.
 
 **Shutdown ordering** — see below.
 
@@ -212,7 +212,7 @@ cost about 115 ns per admission when each account stays on one thread and
 about 1 µs when the threads cycle through the accounts
 (`admission/full_check_contended_8_distinct_accounts` and its `_rotating`
 twin). In the example service at ten connections the in-handler `admit` grew
-from about 200 ns to about 500 ns for this reason alone (#138). Nothing in the
+from about 200 ns to about 500 ns for this reason alone (GL-138). Nothing in the
 library is shared between those accounts; the cost is the account's own lines
 moving.
 
@@ -230,20 +230,20 @@ It matters when admission is a meaningful share of your request cost:
 
 ## Related
 
-- `docs/DESIGN.md` § "Staged admission interface (#96)" — the rationale, and the
+- `docs/DESIGN.md` § "Staged admission interface (GL-96)" — the rationale, and the
   document an interface change amends first.
 - `docs/ACCOUNT_ADMINISTRATION.md` — provisioning accounts, budgets and
   credentials over HTTP, with a conformance list for that surface.
 - `docs/CREDENTIAL_PROJECTION.md` — authenticating customer keys in an
   HTTP-backed deployment.
 - `docs/USAGE_ACCOUNTING.md` — what happens to the events you emit.
-- `docs/DESIGN.md` § "Instance-local admission sharding (#3)" — the opt-in
+- `docs/DESIGN.md` § "Instance-local admission sharding (GL-3)" — the opt-in
   layout, once same-account contention warrants it. It is off by default and
   costs nothing until you enable it.
 - `INVARIANTS.md` — the testable contract. Three of them are reachable from
-  outside, which is why they appear above: #8 *accounting backpressure sheds*
-  (why the slot is reserved before the body), #12 *no commit outside the
-  usability window* (why leases are released last), and #13 *a committed charge
+  outside, which is why they appear above: GL-8 *accounting backpressure sheds*
+  (why the slot is reserved before the body), GL-12 *no commit outside the
+  usability window* (why leases are released last), and GL-13 *a committed charge
   is always emitted* (whose process-loss boundary is what your panic boundary
   keeps you inside).
 
@@ -298,7 +298,7 @@ next consolidation carries fresh evidence. Refundable pending elastic
 reservations and an in-flight overage commit retain their transient and
 `AfterInFlight` advice, because they can recover without new funding.
 
-### Contract changes (#130)
+### Contract changes (GL-130)
 
 - `LeaseAllocator::acquire` and `consolidate` return
   `tollgate_store::Allocation { grant, funding }` instead of a bare
@@ -326,7 +326,7 @@ or migration:
 - New clients discard malformed or zero-remaining extensions, and grant evidence
   below the grant's own units, rather than letting them refuse fundable quotes.
 
-The exhaustion code from #128, `balance-exhausted`, still wants clients updated
+The exhaustion code from GL-128, `balance-exhausted`, still wants clients updated
 before servers: a client older than that code reads it as an unknown storage
 error.
 
@@ -345,13 +345,13 @@ lease, and the allocator grows the replacement to that quote when the account's
 restored balance can fund it. The first such request is refused with transient
 `LeaseExhausted` advice, and a retry after the consolidation is funded. Growth
 is at most one refused quote. A quote the account cannot fund does not grow the
-grant; #130's evidence answers it instead.
+grant; GL-130's evidence answers it instead.
 
 Consolidation is the safety net, not the steady state. A rising `consolidated`
 count means `target_grant` is undersized against the largest quote the service
 prices.
 
-### Contract changes (#131)
+### Contract changes (GL-131)
 
 - `LeaseAllocator::consolidate` takes `needed: CostUnits` after `requested`:
   the largest quote the returned lease refused. Custom allocators should size
@@ -371,7 +371,7 @@ releases. Its committed-but-unflushed usage also dies with it, so nobody can
 prove any of its units unspent. After `expires_at + reclaim_grace`, server
 maintenance sweeps such a lease and forfeits its whole unaccounted remainder
 as settlement loss: nothing is credited back, and executed work cannot become
-spendable again (INVARIANTS.md #9, #136). The same applies to a lease a
+spendable again (INVARIANTS.md GL-9, GL-136). The same applies to a lease a
 graceful shutdown abandoned because its release deadline lapsed.
 
 - **Cost:** a hard kill forfeits the unspent remainder of every lease the
@@ -385,7 +385,7 @@ graceful shutdown abandoned because its release deadline lapsed.
   quiesced lease, which returns its units. Give `shutdown_release_deadline`
   enough room for your control plane.
 
-### Contract changes (#136)
+### Contract changes (GL-136)
 
 - `ReclaimedLease.reclaimed` is renamed `forfeited`, in Rust and in the JSON
   that `POST /v1/leases/reclaim` returns, because its meaning changed: units

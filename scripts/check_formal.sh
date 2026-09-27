@@ -2,7 +2,7 @@
 # Fails if any Lean proof carries an unchecked placeholder, then builds the
 # library so every remaining theorem is machine-checked.
 #
-# INVARIANTS.md cites these proofs as evidence for #15 and #16, and the
+# INVARIANTS.md cites these proofs as evidence for GL-15 and GL-16, and the
 # standard is to never claim more assurance than the checked artifacts
 # establish — so a gate that can pass over a `sorry` silently downgrades that
 # evidence rather than failing.
@@ -20,7 +20,7 @@ PROOF_DIR="$ROOT/formal/lean"
 # coincidence. Past `ARG_MAX` find makes several calls, so a batch containing a
 # `sorry` (grep 0) alongside one that does not (grep 1) left find non-zero —
 # the `if` read false and the gate walked straight past the placeholder into
-# `lake build`, which accepts `sorry` with a warning and exits 0 (#60).
+# `lake build`, which accepts `sorry` with a warning and exits 0 (GL-60).
 # Testing grep's own status removes the composition entirely.
 scan_placeholders() {
   grep -rnE '(^|[^[:alnum:]_])(sorry|admit)([^[:alnum:]_]|$)' \

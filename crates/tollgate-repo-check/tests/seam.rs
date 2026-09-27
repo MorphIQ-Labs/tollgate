@@ -61,7 +61,7 @@ const RESERVATION: &str = r"
 /// A contract naming every method the fixtures publish.
 fn contract(extra: &str) -> String {
     format!(
-        "## Staged admission interface (#96, 2026-08-28)\n\n```rust\n\
+        "## Staged admission interface (GL-96, 2026-08-28)\n\n```rust\n\
          pub fn begin();\npub fn quote();\npub fn commit();\npub fn units();\n\
          pub fn cancel();\n```\n{extra}\n\n## Next section\n\nUnrelated.\n"
     )
@@ -222,7 +222,7 @@ fn a_longer_name_containing_the_method_does_not_declare_it() {
 /// CI reads the status, not the text, so "reports drift" and "fails the build"
 /// are two claims and only one of them is about output. The parity checker's
 /// `tests/binary.rs` exists for exactly this reason: its whole `run` could be
-/// replaced with `Ok(true)` and every library test still passed (#85).
+/// replaced with `Ok(true)` and every library test still passed (GL-85).
 mod binary {
     use std::process::Command;
 

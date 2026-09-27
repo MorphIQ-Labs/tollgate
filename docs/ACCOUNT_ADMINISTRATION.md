@@ -9,7 +9,7 @@ policy values — an allowance in `CostUnits`, a credential limit — rather tha
 its own vocabulary.
 
 This is the supported alternative to reaching into Tollgate's tables or
-re-implementing credential and budget authority in a second service (#121).
+re-implementing credential and budget authority in a second service (GL-121).
 
 ## Authority and transport
 

@@ -1,4 +1,4 @@
-# Credential projection evidence (#108)
+# Credential projection evidence (GL-108)
 
 Measured on 2026-09-09 on `mistral`, Apple M1 Pro, Darwin 25.6.0, Rust 1.97.1.
 Crates use the ordinary Criterion release profile; loopback load uses
@@ -96,7 +96,7 @@ These are query-plan observations, not a latency promise for arbitrary expiry
 distributions or remote databases.
 
 Those PostgreSQL observations used the pre-0018 expiry schema. The runnable
-fixture now uses exact timestamp pairs; #118 does not claim a fresh timing
+fixture now uses exact timestamp pairs; GL-118 does not claim a fresh timing
 measurement or reuse these historical query timings as validation of that
 schema. Its correctness evidence covers both page predicates and the complete
 HTTP/session boundary without changing the measured request-path code.

@@ -51,7 +51,7 @@ fi
 # rather than merely exempted here — an exemption that cannot fail would
 # witness nothing:
 #
-#   tollgate_opt_in       #93's shared cancel state; exactly one allocation,
+#   tollgate_opt_in       GL-93's shared cancel state; exactly one allocation,
 #                         checked below, so its cost cannot drift upward.
 #   dependency_amortized  a dependency's own housekeeping, which Tollgate does
 #                         not own and the dependency does not promise to avoid

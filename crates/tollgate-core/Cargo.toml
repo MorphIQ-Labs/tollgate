@@ -4,11 +4,11 @@ description = "Zero-I/O, clock-free domain layer for quota admission and account
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-authors.workspace = true
+license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# Deliberately minimal, mirroring the consumer's policy crate: the hot-path crate must
+# Deliberately minimal: the hot-path crate must
 # never grow an I/O, async, or clock dependency. Time enters as arguments.
 [dependencies]
 jiff = { workspace = true }

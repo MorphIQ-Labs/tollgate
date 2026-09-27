@@ -2,7 +2,7 @@ import Init.Omega
 import Tollgate.SnapshotCache
 
 /-!
-Bounded snapshot-history reconstruction (#67).
+Bounded snapshot-history reconstruction (GL-67).
 
 This model separates visible eviction (SnapshotCache) from reclaiming a retained
 incarnation. Natural-number identities model checked Rust u64 allocation: Rust

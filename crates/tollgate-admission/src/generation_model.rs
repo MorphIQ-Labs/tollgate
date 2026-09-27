@@ -8,14 +8,14 @@
 //! The central distinction is [`Watermark`]'s: a generation this instance
 //! merely *observed* is not the same fact as a generation the source
 //! *published a revocation at*, and only the second may refuse an equal
-//! generation. Collapsing the two is #53 — a principal whose row briefly went
+//! generation. Collapsing the two is GL-53 — a principal whose row briefly went
 //! absent could never be restored, because the absence inherited the
 //! generation of the positive it replaced and then refused it back.
 //!
 //! **Public on purpose.** `SnapshotManager` applies the same rule one layer up,
 //! before it ever reaches a map, so it calls these functions rather than
 //! keeping a second copy of the comparison. Two copies that must agree is how
-//! #53 stayed invisible: the client's gate short-circuited first, and fixing
+//! GL-53 stayed invisible: the client's gate short-circuited first, and fixing
 //! the map alone would have changed nothing.
 
 use tollgate_core::Generation;
@@ -27,7 +27,7 @@ use tollgate_core::Generation;
 ///
 /// - [`Watermark::Revoked`] is a statement the source published — "this
 ///   generation is dead". A positive *at* it must be refused, or a replayed
-///   snapshot resurrects a revoked credential (INVARIANTS.md #15).
+///   snapshot resurrects a revoked credential (INVARIANTS.md GL-15).
 /// - [`Watermark::Positive`] is only what this instance last saw. It orders
 ///   snapshots so a delayed older one cannot roll the account back, but it
 ///   asserts nothing about the generation being dead — so the same generation
@@ -118,7 +118,7 @@ pub fn accept_revoked(
 /// nothing here to raise, lower, or re-tag. In particular an absence landing
 /// on a [`Watermark::Positive`] leaves it a `Positive`: turning it into a
 /// `Revoked` would assert a revocation nobody published, and would strand the
-/// principal at its own generation (#53).
+/// principal at its own generation (GL-53).
 pub fn accept_unknown(current: Option<Watermark>) -> (Option<Watermark>, bool) {
     (current, true)
 }
@@ -128,7 +128,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// The case #53 was: observe a generation, lose the row, see the same
+    /// The case GL-53 was: observe a generation, lose the row, see the same
     /// generation again. Nothing was revoked, so nothing may refuse it.
     #[test]
     fn a_generation_survives_an_absence_and_returns_unchanged() {
@@ -147,7 +147,7 @@ mod tests {
     }
 
     /// The case that must NOT loosen: a real revocation refuses its own
-    /// generation back, which is INVARIANTS.md #15.
+    /// generation back, which is INVARIANTS.md GL-15.
     #[test]
     fn a_revocation_refuses_its_own_generation_back() {
         let (revoked, _) = accept_revoked(Some(Watermark::Positive(Generation(5))), Generation(5));
@@ -223,7 +223,7 @@ mod tests {
         }
 
         /// An absence never converts an observation into a revocation, at any
-        /// generation. This is the property whose failure is #53.
+        /// generation. This is the property whose failure is GL-53.
         #[test]
         fn an_absence_never_makes_a_generation_dead(
             observed in any::<u64>(),

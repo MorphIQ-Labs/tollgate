@@ -2,7 +2,7 @@ use std::{env, process::ExitCode};
 
 use tollgate_repo_check::cli::{Invocation, parse};
 
-const USAGE: &str = "Usage: check_seam_contract [--] [REPOSITORY]\n\nReports public methods on the staged admission seam that `docs/DESIGN.md`\n\u{a7} \"Staged admission interface (#96)\" never names. Defaults to the current\ndirectory.\n\nThis is a name check, not a signature check: it catches a method published\ninto the seam with the contract never opened, not a signature that changed\nunder a name the section already carries.";
+const USAGE: &str = "Usage: check_seam_contract [--] [REPOSITORY]\n\nReports public methods on the staged admission seam that `docs/DESIGN.md`\n\u{a7} \"Staged admission interface (GL-96)\" never names. Defaults to the current\ndirectory.\n\nThis is a name check, not a signature check: it catches a method published\ninto the seam with the contract never opened, not a signature that changed\nunder a name the section already carries.";
 
 fn run() -> Result<bool, String> {
     let root = match parse(env::args_os().skip(1), "check_seam_contract", USAGE)? {
@@ -28,7 +28,7 @@ fn run() -> Result<bool, String> {
         eprintln!("  {undeclared}");
     }
     eprintln!(
-        "\nAmend `docs/DESIGN.md` \u{a7} \"Staged admission interface (#96)\" first -- that is the\n\
+        "\nAmend `docs/DESIGN.md` \u{a7} \"Staged admission interface (GL-96)\" first -- that is the\n\
          section's own rule, and it exists so a consumer is not left adapting to a seam the\n\
          contract never described. Declaring the method in a code block is the usual answer;\n\
          naming it in prose as deliberately outside the seam is the other one, and is why\n\

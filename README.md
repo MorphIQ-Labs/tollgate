@@ -26,6 +26,8 @@ permission bits — never plan names, FCUs, or SQL.
 
 Contract: [`INVARIANTS.md`](INVARIANTS.md). Architecture and findings:
 [`docs/DESIGN.md`](docs/DESIGN.md).
+The techniques Tollgate composes are published as prior art, without patent
+claims: [technique disclosures](docs/DISCLOSURES.md).
 
 Putting Tollgate in front of your own service: [embedding
 guide](docs/EMBEDDING.md) — the supported request order, what you implement,
@@ -124,7 +126,7 @@ host/revision provenance. CI compiles the benchmarks and checks allocation
 counts; remote timing does not decide whether a change can merge. See
 [the local performance workflow](docs/PERFORMANCE.md).
 
-The September 9 #105 run on an Apple M1 Pro measured full admission at about
+The September 9 GL-105 run on an Apple M1 Pro measured full admission at about
 134 ns and the separate owned admission/commit/emission fixtures at 118–126 ns.
 Those fixtures have different workloads and their times are not additive.
 Cached managed credential authentication measured about 38 ns; HMAC verification
@@ -161,3 +163,18 @@ thresholds require deliberate calibration evidence.
   emitted, what normal looks like, and what to do about each reading are in
   [Observability](docs/DESIGN.md#observability), along with the reconciliation
   query for checking the two ledgers agree on a live system.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in Tollgate by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
+
+Tollgate is a product of MorphIQ Labs, a trade name of Prophetizo LLC.
+
+`cargo deny --locked check licenses` (the `licenses` CI job) gates the dependency graph against
+[`deny.toml`](deny.toml): every dependency must be available under a permissive
+license.

@@ -420,7 +420,7 @@ async fn a_retired_credential_is_never_granted_a_snapshot_but_can_be_withdrawn()
 
 /// A key-bound publication holds the credential row `FOR SHARE`, so it and a
 /// revocation serialize: the publish commits first or is refused as retired,
-/// and neither side fails with a lock error (#143).
+/// and neither side fails with a lock error (GL-143).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn key_bound_publication_and_revocation_serialize() {
     use tollgate_core::{AccountId, KeyId, Principal};
@@ -478,7 +478,7 @@ async fn key_bound_publication_and_revocation_serialize() {
 /// The key-bound path locks credential, then account, then snapshot. A status
 /// change holds the account and then snapshot rows and never a credential, so
 /// the two complete in either order without deadlock, and the published
-/// status always ends up agreeing with the ledger (#143, #51).
+/// status always ends up agreeing with the ledger (GL-143, GL-51).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn key_bound_publication_and_status_changes_never_deadlock() {
     use tollgate_core::{AccountId, AccountStatus, KeyId, Principal};

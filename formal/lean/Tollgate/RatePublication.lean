@@ -1,6 +1,6 @@
 /-!
-Exact model of accepted account-policy publication (INVARIANTS.md #5, #15,
-and #25).
+Exact model of accepted account-policy publication (INVARIANTS.md GL-5, GL-15,
+and GL-25).
 
 `Policy` represents the complete account-wide rate and concurrency policy.
 `Authorities` separates the mutable weighted and request-count buckets so a

@@ -1,12 +1,12 @@
 //! Instance-side quota runtime.
 //!
-//! Background tasks run *off* the request path (INVARIANTS.md #6): a
+//! Background tasks run *off* the request path (INVARIANTS.md GL-6): a
 //! [`LeaseManager`] task keeps an account's [`LeaseSlot`] stocked from a
 //! [`LeaseAllocator`], and a [`UsageWriter`] task drains a bounded channel of
 //! usage events into a [`UsageSink`] in idempotent batches. The request path
 //! touches published state (lock-free loads) and the channel (permit
 //! reservation) — when the channel is full, admission sheds *before* work is
-//! accepted (INVARIANTS.md #8) via [`UsageRecorder::try_reserve`].
+//! accepted (INVARIANTS.md GL-8) via [`UsageRecorder::try_reserve`].
 //!
 //! Timestamps come from a [`Clock`] so every behavior is testable with a
 //! manual clock; production uses [`SystemClock`].
@@ -39,7 +39,7 @@
 //! [`UsageWriter::shutdown`] (which refuses new reservations, then drains
 //! outstanding permits under its configured deadline and reports anything
 //! unresolved), and only then shut the [`LeaseManager`] down — usage events
-//! must land while their lease is live (INVARIANTS.md #12).
+//! must land while their lease is live (INVARIANTS.md GL-12).
 //!
 //! [`LeaseAllocator`]: tollgate_store::LeaseAllocator
 //! [`UsageSink`]: tollgate_store::UsageSink
@@ -119,7 +119,7 @@ impl ShutdownDeadline {
 /// A `watch` send fails only when every receiver has been dropped, which
 /// means the observer this signal was for is already gone. That is never
 /// actionable by itself — the caller's own report carries the outcome — but
-/// it is a breadcrumb, and discarding it silently is the habit issue #36
+/// it is a breadcrumb, and discarding it silently is the habit issue GL-36
 /// exists to break.
 pub(crate) fn signal(tx: &tokio::sync::watch::Sender<bool>, value: bool, signal: &'static str) {
     if tx.send(value).is_err() {

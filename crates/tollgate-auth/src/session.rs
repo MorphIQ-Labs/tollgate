@@ -101,7 +101,7 @@ impl SessionCredential {
     ///
     /// `now` is supplied by the caller rather than read here, because this
     /// runs on the request path and the request path does not read clocks
-    /// (INVARIANTS.md #5).
+    /// (INVARIANTS.md GL-5).
     ///
     /// `None` means the session presented nothing, and clears any prior proof.
     ///

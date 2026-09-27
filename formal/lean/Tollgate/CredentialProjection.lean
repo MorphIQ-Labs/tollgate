@@ -1,7 +1,7 @@
 import Init.Omega
 
 /-!
-Read-only credential projection (#108). Times and durations are exact integer
+Read-only credential projection (GL-108). Times and durations are exact integer
 ticks, with positive maxAge. One publisher selects a complete validated source
 table. Verification authenticity, coherent backend reads, atomic publication,
 accurate clocks, and the caller checking evidence at its supplied time are
@@ -148,7 +148,7 @@ theorem mixed_revisions_preserve_the_predecessor (previous candidate : Table)
     coherentRefresh previous first last candidate = previous := by
   simp [coherentRefresh, different]
 
--- #118: legacy microseconds discarded precision toward zero. Credential
+-- GL-118: legacy microseconds discarded precision toward zero. Credential
 -- authority uses the earliest compatible instant, intersected with the
 -- timestamp domain. SQL migration and finite Rust decoding are separate
 -- implementation witnesses; these are exact integer nanoseconds.

@@ -1,4 +1,4 @@
-//! SnapshotManager behavior (review finding #5): initial load gates
+//! SnapshotManager behavior (review finding GL-5): initial load gates
 //! readiness, pushes propagate, refresh recovers, and revocation reaches
 //! running instances.
 
@@ -333,7 +333,7 @@ fn no_pushes() -> tokio::sync::broadcast::Receiver<SnapshotPush> {
 /// Both answers are *stated*. `principals` has a default body -- the `Ok(None)`
 /// sentinel -- and these doubles used to get it by omission, which is the same
 /// silence that made wrappers elsewhere lie about a catalogue they did have
-/// (#83). Saying it is the difference between the two.
+/// (GL-83). Saying it is the difference between the two.
 fn bare_source(reason: &'static str) -> DelegatingStore<RejectingStore> {
     rejecting(reason)
         .on_subscribe(|_| no_pushes())
@@ -517,7 +517,7 @@ async fn readiness_falls_when_snapshot_expires_during_outage() {
     manager.shutdown().await;
 }
 
-/// Issue #4: `ready` answers one bit, which is the right shape for a probe
+/// Issue GL-4: `ready` answers one bit, which is the right shape for a probe
 /// and the wrong shape for diagnosis — it cannot say whether one principal is
 /// unresolved or a thousand, nor whether the source has been failing all
 /// morning. The counters are what distinguish those, and `unresolved` is
@@ -688,7 +688,7 @@ async fn shutdown_cancels_in_flight_snapshot_fetches() {
 
 /// A source that panics kills only its own fetch task: the manager keeps
 /// sweeping and still reports a clean stop. The panic is not swallowed — it
-/// surfaces as an event (issue #36) — but it must not be mistaken for the
+/// surfaces as an event (issue GL-36) — but it must not be mistaken for the
 /// manager itself dying, which is what `task_died` is for.
 #[tokio::test]
 async fn a_panicking_fetch_does_not_kill_the_manager() {
@@ -724,7 +724,7 @@ async fn a_panicking_fetch_does_not_kill_the_manager() {
     );
 }
 
-/// INVARIANTS.md #16: no config field is silently repaired.
+/// INVARIANTS.md GL-16: no config field is silently repaired.
 #[test]
 fn a_zero_fetch_timeout_is_rejected() {
     let config = SnapshotManagerConfig {
@@ -787,7 +787,7 @@ async fn mismatched_local_sharding_is_rejected_before_tasks_start() {
     );
 }
 
-// ---- dynamic principal discovery (#48) ------------------------------------
+// ---- dynamic principal discovery (GL-48) ------------------------------------
 
 const LATER_PRINCIPAL: Principal = Principal(8);
 
@@ -830,7 +830,7 @@ fn admit_as(fixture: &Fixture, principal: Principal) -> Result<(), DenyReason> {
         })
 }
 
-/// The point of #48: a principal published *after* the instance started is
+/// The point of GL-48: a principal published *after* the instance started is
 /// served without a restart. Before this, the tracked set was fixed at
 /// construction and a newly provisioned customer was denied until a redeploy.
 #[tokio::test(start_paused = true)]
@@ -899,7 +899,7 @@ async fn a_fixed_instance_ignores_principals_it_was_not_configured_with() {
 
 /// Revocation and removal-from-the-catalogue are different things, and
 /// conflating them is how a revoked principal gets resurrected
-/// (INVARIANTS.md #15).
+/// (INVARIANTS.md GL-15).
 ///
 /// `remove_snapshot` leaves a tombstone, so the principal stays *enumerated*
 /// and therefore stays tracked. It is denied because its resolution is
@@ -935,7 +935,7 @@ async fn a_revoked_principal_stays_tracked_and_cannot_be_resurrected() {
         "the tombstone's watermark outranks the replay"
     );
 
-    // Nor at the tombstone's *own* generation. This is the case #53 must not
+    // Nor at the tombstone's *own* generation. This is the case GL-53 must not
     // loosen: an absence lets its generation back because nothing declared it
     // dead, but a revocation declared exactly this one dead. Nothing pinned
     // equality here before — every recovery test stepped strictly over the
@@ -986,7 +986,7 @@ fn one_unanswerable_source(good: Arc<AccountSnapshot>) -> Arc<DelegatingStore<Re
 
 /// Readiness under `All` means "I can serve someone", not "I can serve
 /// everyone": one principal the source cannot answer for must not hold an
-/// otherwise healthy instance out of rotation (INVARIANTS.md #10). Under
+/// otherwise healthy instance out of rotation (INVARIANTS.md GL-10). Under
 /// `Fixed` the strict all-resolved reading is kept, and this same source
 /// leaves that instance unready — the two readings are asserted against one
 /// fixture so the difference is the rule, not the setup.
@@ -1123,13 +1123,13 @@ fn hangs_on_enumeration_source(
     )
 }
 
-/// Issue #59: an enumeration that never answers is abandoned at
+/// Issue GL-59: an enumeration that never answers is abandoned at
 /// `enumeration_timeout`, so the loop keeps sweeping.
 ///
-/// #78 raced this call against the shutdown watch, which stopped a wedged
+/// GL-78 raced this call against the shutdown watch, which stopped a wedged
 /// enumeration holding shutdown open — but nothing else escaped it. During
 /// ordinary operation the loop stayed parked in `discover`, stopped sweeping,
-/// and never recovered. That is the shape #103 fixed for fetches, on the one
+/// and never recovered. That is the shape GL-103 fixed for fetches, on the one
 /// source call it did not cover.
 ///
 /// The counter is the evidence the loop kept running: a manager parked inside
@@ -1179,7 +1179,7 @@ async fn a_hung_enumeration_is_abandoned_so_the_loop_keeps_sweeping() {
     fixture.manager.shutdown().await;
 }
 
-/// INVARIANTS.md #16: no config field is silently repaired.
+/// INVARIANTS.md GL-16: no config field is silently repaired.
 #[test]
 fn a_zero_enumeration_timeout_is_rejected() {
     let config = SnapshotManagerConfig {
@@ -1198,7 +1198,7 @@ fn a_zero_enumeration_timeout_is_rejected() {
     );
 }
 
-/// INVARIANTS.md #18, issue #78's sibling: no snapshot-source call carries a
+/// INVARIANTS.md GL-18, issue GL-78's sibling: no snapshot-source call carries a
 /// wall-clock timeout — the manager bounds them by cancellation — so every
 /// loop-body await must be raced against the shutdown watch. Enumeration was
 /// the one that was not, which let a source that hangs on `principals()`
@@ -1260,7 +1260,7 @@ fn hangs_on_one_source(
     )
 }
 
-/// Issue #103: a fetch that never resolves is abandoned at `fetch_timeout`,
+/// Issue GL-103: a fetch that never resolves is abandoned at `fetch_timeout`,
 /// so the sweep returns and the loop keeps running. Before this, one hung
 /// fetch left `refresh_all_cancellable` waiting on a `JoinSet` that could
 /// never empty: no tick, push, or control wakeup was processed again for the
@@ -1350,7 +1350,7 @@ fn unknown_then_hangs_source(calls: &Arc<AtomicUsize>) -> Arc<DelegatingStore<Re
     )
 }
 
-/// Issue #103 meets issue #53: an abandoned fetch must land in the failed set
+/// Issue GL-103 meets issue GL-53: an abandoned fetch must land in the failed set
 /// that re-arms `next_refetch`, exactly as a refusal does.
 ///
 /// `back_off` only moves a principal already holding a negative resolution,
@@ -1358,7 +1358,7 @@ fn unknown_then_hangs_source(calls: &Arc<AtomicUsize>) -> Arc<DelegatingStore<Re
 /// why this needs its own fixture rather than an extra assertion on the
 /// abandonment test. Marking the abandoned principal completed instead leaves
 /// its deadline in the past, the control wakeup re-fires at zero delay, and
-/// the manager refetches at source latency: the shape #53 measured at 410
+/// the manager refetches at source latency: the shape GL-53 measured at 410
 /// fetches in 600 ms.
 ///
 /// Real time and a real clock, like `readiness_falls_if_refresh_hangs_across_snapshot_expiry`:
@@ -1377,7 +1377,7 @@ async fn an_abandoned_fetch_is_throttled_like_a_refusal() {
             principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
             // Long, so the periodic sweep is not what drives the retries:
             // a negative principal is skipped by `due_for_sweep`, and the
-            // control wakeup is the path #53 was measured on.
+            // control wakeup is the path GL-53 was measured on.
             refresh_interval: std::time::Duration::from_secs(10),
             unknown_ttl: SignedDuration::from_millis(50),
             revoked_ttl: SignedDuration::from_secs(3_600),
@@ -1556,7 +1556,7 @@ async fn a_discovering_instance_with_nothing_resolvable_is_unready() {
     );
 }
 
-// ---- churned catalogues (#52) ---------------------------------------------
+// ---- churned catalogues (GL-52) ---------------------------------------------
 
 /// A source that counts fetches per principal and can be flipped between
 /// serving and revoking, so a test can watch what a sweep actually asks for.
@@ -1625,7 +1625,7 @@ fn churn_config(revoked_ttl: SignedDuration) -> SnapshotManagerConfig {
 /// **The one that matters.** Withdrawing a principal must still propagate
 /// within `refresh_interval`, however long `revoked_ttl` is — a live principal
 /// is always swept, so revocation never rides the tombstone schedule. If this
-/// is wrong, #52 traded away the wrong direction.
+/// is wrong, GL-52 traded away the wrong direction.
 #[tokio::test(start_paused = true)]
 async fn revocation_still_propagates_within_the_refresh_interval() {
     let (source, pulls) = CountingSource::new();
@@ -1679,7 +1679,7 @@ async fn the_sweep_does_not_refetch_tombstones() {
 ///
 /// `Unknown` is not a withdrawal. A source that is restarting, failing over,
 /// or serving a lagging replica reports principals it has served for years as
-/// absent, and an earlier cut of #52 keyed the TTL on the locally remembered
+/// absent, and an earlier cut of GL-52 keyed the TTL on the locally remembered
 /// generation, so exactly those principals inherited the hour-long
 /// reinstatement TTL. With the sweep no longer covering negatives and
 /// `subscribe` closed on the HTTP transport, nothing else would have repaired
@@ -1735,7 +1735,7 @@ async fn a_live_principal_that_goes_absent_recovers_on_the_unknown_ttl() {
     // The source comes back with the *same* snapshot it always had. Nothing
     // changed while the row was missing, so nothing bumped the generation --
     // that is what a transient absence looks like, and it must be enough to
-    // restore the principal (#53). Requiring a higher generation here would
+    // restore the principal (GL-53). Requiring a higher generation here would
     // mean a customer stays denied until someone happens to republish.
     source.set(MutableMode::Present(snapshot(1, PermissionBits::bit(0))));
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -1797,7 +1797,7 @@ async fn a_reinstated_principal_comes_back_on_the_revoked_ttl() {
     );
 
     // Above the tombstone's generation: reinstatement is a *higher* publish,
-    // and INVARIANTS #15 refuses anything at or below it.
+    // and INVARIANTS GL-15 refuses anything at or below it.
     source.set(MutableMode::Present(snapshot(10, PermissionBits::bit(0))));
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         while !matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(_))) {
@@ -1882,13 +1882,13 @@ async fn a_stale_positive_cannot_drop_readiness() {
     manager.shutdown().await;
 }
 
-/// #53 on the **push** path: a principal that goes absent and is then
+/// GL-53 on the **push** path: a principal that goes absent and is then
 /// reinstated by a push at its original generation must come back.
 ///
 /// The sweep half is pinned by
 /// `a_live_principal_that_goes_absent_recovers_on_the_unknown_ttl`. This is its
 /// counterpart, and it exists because mutation probing showed the push site's
-/// `visible` read could be replaced with `true` — reinstating #53 on the path
+/// `visible` read could be replaced with `true` — reinstating GL-53 on the path
 /// most deployments actually use — with the whole suite still green.
 #[tokio::test]
 async fn a_push_reinstates_an_absent_principal_at_its_own_generation() {
@@ -2172,10 +2172,10 @@ async fn same_generation_refresh_repairs_a_visible_cache_eviction() {
 
 /// Records the size of every reservation a refresh pass makes.
 ///
-/// Still hand-written after #83: `SnapshotMap` belongs to `tollgate-admission`,
+/// Still hand-written after GL-83: `SnapshotMap` belongs to `tollgate-admission`,
 /// so a delegating double for it is a second shared module in a second crate
 /// for one call site. Its seven inherited defaults are all written over `Self`
-/// methods this double does override, so nothing is bypassed. #120 tracks it. The pass must
+/// methods this double does override, so nothing is bypassed. GL-120 tracks it. The pass must
 /// reserve at the retention budget: reserving one principal at a time would
 /// still resolve the catalogue, but it would pay a reservation, a publication
 /// and a concurrency window per principal instead of per budget-sized chunk.

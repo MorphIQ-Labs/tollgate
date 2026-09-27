@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Tollgate pre-commit hook — the group-canonical shape
-# (the template repository templates/pre-commit.reference.sh).
+# Tollgate pre-commit hook.
 #
 # Enable once per clone:
 #

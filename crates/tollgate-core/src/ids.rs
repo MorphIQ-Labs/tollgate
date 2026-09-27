@@ -198,7 +198,7 @@ id128!(
 /// The ordering supplies an audit trail; it is not an account-wide validity
 /// epoch. A newer token does not invalidate an older active lease. Stores
 /// require this token to match the record named by the accompanying lease ID
-/// (and account ID for usage ingest; INVARIANTS.md #4).
+/// (and account ID for usage ingest; INVARIANTS.md GL-4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(transparent))]
@@ -238,7 +238,7 @@ impl fmt::Display for Generation {
 /// # Not a generation
 ///
 /// [`Generation`] orders publication: it decides which snapshot is newer and
-/// which is stale, and admission enforces it (INVARIANTS.md #15, #26). This
+/// which is stale, and admission enforces it (INVARIANTS.md GL-15, GL-26). This
 /// identifies the *inputs* compiled into a publication and carries no order at
 /// all. Two generations can share a revision (the same policy republished after
 /// a status change), and one generation carries exactly one revision. Neither
@@ -259,7 +259,7 @@ impl fmt::Display for Generation {
 /// # Wire form
 ///
 /// Exactly 64 lowercase hexadecimal digits, under the same strict rule the
-/// 128-bit identifiers use (INVARIANTS.md #21). Strictness matters more here
+/// 128-bit identifiers use (INVARIANTS.md GL-21). Strictness matters more here
 /// than elsewhere: the consumer compares these for equality to select its own
 /// metadata, and two spellings of one revision would silently look like two
 /// policies.

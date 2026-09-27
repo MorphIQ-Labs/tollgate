@@ -4,7 +4,7 @@ description = "Instance-side quota runtime: background lease refill into the adm
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-authors.workspace = true
+license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
@@ -25,7 +25,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-# The indexed resolution set (#22) must answer exactly what the scans it
+# The indexed resolution set (GL-22) must answer exactly what the scans it
 # replaced answered; a property test against a naive reference is the only way
 # to cover the interleavings the fixed tests do not reach.
 proptest = { workspace = true }

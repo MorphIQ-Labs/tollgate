@@ -147,7 +147,7 @@ impl ApiError {
 
     /// The backend cannot answer this at all, as opposed to answering
     /// "nothing" — a distinction a caller must be able to act on differently
-    /// (#48).
+    /// (GL-48).
     pub fn not_implemented(code: &'static str, title: impl Into<String>) -> Self {
         ApiError {
             status: StatusCode::NOT_IMPLEMENTED,
@@ -168,7 +168,7 @@ impl From<JsonRejection> for ApiError {
         // serialised correctly. The two are told apart by status rather than
         // by matching axum's rejection variants, because the nesting that
         // produces a 413 is an internal detail of the extractor and the status
-        // is the part of that behaviour axum documents (#61).
+        // is the part of that behaviour axum documents (GL-61).
         //
         // Distinct codes matter beyond the message: a client can retry a
         // transient failure, and must never retry this one unchanged — an
@@ -299,7 +299,7 @@ impl From<tollgate_store::KeySnapshotError> for ApiError {
             // The answer revocation gives for a foreign or unknown key.
             KeySnapshotError::UnknownCredential => (StatusCode::NOT_FOUND, "unknown-credential"),
             // 409: well-formed, but the credential is terminally retired and is
-            // never granted positive authorization again (INVARIANTS.md #27).
+            // never granted positive authorization again (INVARIANTS.md GL-27).
             KeySnapshotError::Retired { .. } => (StatusCode::CONFLICT, "credential-retired"),
             KeySnapshotError::Publish(inner) => return inner.clone().into(),
             KeySnapshotError::Storage(inner) => return inner.clone().into(),
@@ -344,7 +344,7 @@ impl From<SetStatusError> for ApiError {
             },
             // 409, not 422: the request is well-formed and the operator is
             // not at fault for asking. The account is simply in a state no
-            // transition leaves (INVARIANTS.md #22).
+            // transition leaves (INVARIANTS.md GL-22).
             SetStatusError::AccountClosed => ApiError {
                 status: StatusCode::CONFLICT,
                 code: "account-closed",
@@ -380,7 +380,7 @@ impl From<PublishSnapshotError> for ApiError {
             // 409 for the reason the status mismatch is: the request is
             // well-formed and the operator is not at fault — the account
             // simply owns this fact, and it is changed through its own
-            // endpoint (#99).
+            // endpoint (GL-99).
             PublishSnapshotError::CapacityClassMismatch { .. } => ApiError {
                 status: StatusCode::CONFLICT,
                 code: "snapshot-capacity-class-mismatch",
@@ -419,7 +419,7 @@ impl From<IngestError> for ApiError {
             // total that cannot absorb these units will not absorb them on a
             // replay either. 422 rather than 503, so a client can tell a
             // refusal it must not repeat from an outage it should wait out —
-            // which is the distinction #61 is about, made at both ends of the
+            // which is the distinction GL-61 is about, made at both ends of the
             // wire rather than only at the transport.
             IngestError::Refused(_) => ApiError {
                 status: StatusCode::UNPROCESSABLE_ENTITY,

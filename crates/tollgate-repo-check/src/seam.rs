@@ -1,6 +1,6 @@
 //! The staged admission seam must not publish what its contract does not declare.
 //!
-//! `docs/DESIGN.md` § "Staged admission interface (#96)" is the reviewed
+//! `docs/DESIGN.md` § "Staged admission interface (GL-96)" is the reviewed
 //! destination for the types a service embeds against, and it states its own
 //! amendment rule: an implementing issue that needs to diverge changes that
 //! section first, rather than silently publishing a different seam. The rule
@@ -8,7 +8,7 @@
 //! interfaces.
 //!
 //! It drifted anyway. `estimate_remaining` shipped on three stages and was
-//! declared in none of them (#126), and nothing said so — a consumer reading
+//! declared in none of them (GL-126), and nothing said so — a consumer reading
 //! the contract would have found three published methods missing, with no way
 //! to tell whether that meant *not part of the seam*, *not yet designed*, or
 //! *nobody amended the section*.
@@ -51,7 +51,7 @@ use syn::visit::{self, Visit};
 
 /// The heading that opens the contract, matched by prefix so the section's
 /// date can change without breaking the check.
-const SECTION: &str = "## Staged admission interface (#96";
+const SECTION: &str = "## Staged admission interface (GL-96";
 
 /// The types the section declares, and the file each is published from.
 ///

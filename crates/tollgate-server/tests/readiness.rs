@@ -1,7 +1,7 @@
-//! Readiness tells the truth about the store behind it (INVARIANTS.md #10).
+//! Readiness tells the truth about the store behind it (INVARIANTS.md GL-10).
 //!
 //! A server whose source of truth is unreachable must not attract traffic,
-//! and — since #36 — must also say *why* rather than only answering 503.
+//! and — since GL-36 — must also say *why* rather than only answering 503.
 
 mod common;
 

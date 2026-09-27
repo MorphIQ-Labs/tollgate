@@ -73,7 +73,7 @@ valid generation.
   "google": {
     "audience": "https://tollgate.example.net",
     "subjects": [
-      {"subject": "123456789012345678901", "identity": "ferro-risk", "role": "instance"}
+      {"subject": "123456789012345678901", "identity": "pricing-api", "role": "instance"}
     ]
   },
   "issuer": {"secret_file": "issuer.secret"}
@@ -196,7 +196,7 @@ formatted into these events.
 
 A successful sweep that settled leases logs `leases`, `forfeited_units` and
 `batches`. A swept lease is one its holder never released, so its remainder is
-forfeited as settlement loss rather than returned to the account (#136). The
+forfeited as settlement loss rather than returned to the account (GL-136). The
 event is `warn` when `forfeited_units` is non-zero: an instance crashed, or its
 shutdown's release deadline lapsed. Late usage for a forfeited lease is still
 billed against the forfeit. The failure events carry `forfeited_units` for the
@@ -235,7 +235,7 @@ that unanswered capability still holds units in the backend. Retain a
 leases, task failures and usage-drain counters. Uncertainty is a count of
 possible grants, not a unit amount or proof that each call committed. Such units
 remain in active grants until server maintenance sweeps them after expiry and
-grace, when they are forfeited as settlement loss rather than returned (#136).
+grace, when they are forfeited as settlement loss rather than returned (GL-136).
 Do not credit them manually: nobody can prove them unspent. Nor should you
 classify the liquidity difference alone as lost billing, because late usage for
 the lease still bills against the forfeit. Reconcile recorded usage and ledger conservation both before
@@ -286,9 +286,9 @@ never extend identity validity. Expired or unknown keys fail closed until a
 valid refresh succeeds. Internet access to Google's signing-key endpoint and
 accurate server time are deployment prerequisites for this mode.
 
-For the intended split, the Cloud Run client in `the client project` connects over TLS
-to a directly encrypted server endpoint in `the server project`, with PostgreSQL
-behind the server. A VM or GKE deployment can expose this TLS listener. Cloud Run's
+The supported topology has Cloud Run clients connecting over TLS to a directly
+encrypted server endpoint, with PostgreSQL behind the server. A VM or GKE
+deployment can expose this TLS listener. Cloud Run's
 usual server-side HTTP container termination is not an exemption from the
 non-loopback plaintext rule; this feature does not provide a forwarded-identity
 or trusted-proxy bypass.

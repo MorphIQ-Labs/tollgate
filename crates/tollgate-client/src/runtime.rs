@@ -165,7 +165,7 @@ pub struct RuntimeReport {
     pub refill: Option<LeaseStats>,
     pub snapshots: SnapshotStats,
     pub accounting: WriterHealth,
-    /// What this instance's shard layout is carrying (#124).
+    /// What this instance's shard layout is carrying (GL-124).
     ///
     /// Sharding buys one thing — a request-serving thread writing to lines no
     /// peer writes — and that holds only while the affinities handed out do not
@@ -176,7 +176,7 @@ pub struct RuntimeReport {
     /// `docs/LOCAL_SHARDING.md` is what to do about the answer.
     pub sharding: ShardOccupancy,
     /// Admission exchanges that lost a race to another core, per account:
-    /// lease and overage debits and concurrency-gauge acquisitions (#134, #139).
+    /// lease and overage debits and concurrency-gauge acquisitions (GL-134, GL-139).
     ///
     /// Which accounts, if any, are hot enough on this instance that their
     /// funding line is written from several cores at once — the condition

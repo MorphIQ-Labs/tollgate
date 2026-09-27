@@ -48,7 +48,7 @@ impl RequestContext {
     }
 
     /// The consuming application's identity for the policy governing this
-    /// request (#94).
+    /// request (GL-94).
     ///
     /// Pinned with everything else: a revision republished after this stage
     /// belongs to the next request, not this one. That is what lets a
@@ -159,7 +159,7 @@ impl Drop for RequestContext {
         // decode. No pending funding exists and no admission outcome was
         // decided, so this is neither an admission nor a denial. Counting it
         // is what keeps an instance that authenticates a flood it never admits
-        // distinguishable from one serving nothing (INVARIANTS.md #20).
+        // distinguishable from one serving nothing (INVARIANTS.md GL-20).
         state.counters.record_context_abandoned();
     }
 }
@@ -269,8 +269,8 @@ impl<S: UsageSlot> Pending<S> {
     ) -> Result<ReadyToStart<S, G::Permit>, (DenyReason, Released)> {
         // Built from the same immutable snapshot that authorized and priced
         // this request, so the class cannot come from caller input and cannot
-        // change between admission and the gate's decision (#99, and the
-        // generation pinning of INVARIANTS.md #26).
+        // change between admission and the gate's decision (GL-99, and the
+        // generation pinning of INVARIANTS.md GL-26).
         let snapshot = &self.concurrency.state().snapshot;
         let evidence =
             CapacityEvidence::new(snapshot.capacity_class, snapshot.generation, self.locality);
@@ -287,7 +287,7 @@ impl<S: UsageSlot> Pending<S> {
                 let mut pending = self;
                 // Against the class whose work was refused, so an operator can
                 // see whether the reserve is doing its job or the instance is
-                // simply too small (#99).
+                // simply too small (GL-99).
                 pending
                     .counters()
                     .record_capacity_shed_for(pending.concurrency.state().snapshot.capacity_class);
@@ -522,7 +522,7 @@ pub struct Released;
 /// unrelated asynchronous wait, and drop it inside that boundary.
 ///
 /// Under the `production` profile (`panic=abort`) unwinding does not exist, so
-/// none of this applies and INVARIANTS.md #13 keeps its stated boundary: a
+/// none of this applies and INVARIANTS.md GL-13 keeps its stated boundary: a
 /// spent lease with no billing event requires losing the whole process.
 ///
 /// That guarantee is worth nothing if the guard can be dropped at the point it
@@ -584,7 +584,7 @@ impl<S: UsageSlot, P: CapacityPermit> Committed<S, P> {
         self.request_id
     }
 
-    /// The policy revision this charge is billed under (#94).
+    /// The policy revision this charge is billed under (GL-94).
     ///
     /// Read from the usage event this guard will emit, not from the snapshot
     /// again. A consumer returns this in its response metadata, so taking it
@@ -764,7 +764,7 @@ fn admit_priced(
     //    A weight beyond the bucket's whole burst can never pass, however
     //    long the caller waits — that is a schedule whose batch cap admits
     //    a quote its burst cannot hold, and it is reported as such rather
-    //    than as throttling (#40). Deciding it here, in full width against
+    //    than as throttling (GL-40). Deciding it here, in full width against
     //    the configured burst, is what keeps the u32 conversion below
     //    honest: the weight is known to fit the bucket before it is
     //    narrowed, so narrowing can no longer disguise an unadmittable
@@ -842,7 +842,7 @@ fn admit_priced(
     //    batch, an unpriced operation, a cost overflow, an empty rate
     //    bucket — every one of those still denies with zero charge under
     //    either mode, because none of them is a statement about funding
-    //    (INVARIANTS.md #1, #5).
+    //    (INVARIANTS.md GL-1, GL-5).
     let reservation = match reserve_from_lease(concurrency.state(), quote.total, now, locality) {
         Ok(reservation) => reservation,
         Err(denied) => match reserve_from_overage(concurrency.state(), quote.total, denied) {
@@ -920,7 +920,7 @@ fn reserve_from_lease(
         .load_at(locality)
         .ok_or(DenyReason::LeaseUnavailable)?;
     // Moved, not borrowed: `load_at` already owns this handle, and the
-    // reservation is where it lives from here (#79).
+    // reservation is where it lives from here (GL-79).
     Reservation::reserve_at_locality(lease, units, now, locality)
 }
 
@@ -1056,7 +1056,7 @@ mod tests {
         )
     }
 
-    /// The same fixture carrying a stated policy revision (#94).
+    /// The same fixture carrying a stated policy revision (GL-94).
     fn snapshot_with_revision(revision: PolicyRevision) -> Arc<AccountSnapshot> {
         let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
         snapshot.policy_revision = revision;
@@ -1141,7 +1141,7 @@ mod tests {
     }
 
     /// An account's concurrency-gauge races reach its slot's contention total
-    /// (#139): eight threads admitting for one account lose gauge exchanges,
+    /// (GL-139): eight threads admitting for one account lose gauge exchanges,
     /// and the slot counts more than the lease alone recorded.
     #[test]
     fn concurrency_gauge_contention_reaches_the_account_total() {
@@ -1443,7 +1443,7 @@ mod tests {
         }
     }
 
-    /// #130: an account with funding, but less than a quote, refuses that
+    /// GL-130: an account with funding, but less than a quote, refuses that
     /// quote as not retryable and keeps admitting quotes that fit. A quote
     /// here is 50 fixed + 1 per item.
     #[test]
@@ -1846,7 +1846,7 @@ mod tests {
     /// one per view, the layout every neighbour in this struct uses — each
     /// locality would have carried its own full cap, and an eight-shard
     /// instance would extend `8 x overage_cap` while every doc, metric, and
-    /// INVARIANTS #1 still said `overage_cap`. A single-threaded test cannot
+    /// INVARIANTS GL-1 still said `overage_cap`. A single-threaded test cannot
     /// see that: one thread has one locality, and one locality's private
     /// counter refuses at the cap exactly like a shared one. So the requests
     /// have to arrive from different threads, which is where `Locality`
@@ -1993,7 +1993,7 @@ mod tests {
         assert_eq!(state.lease.load().unwrap().remaining(), CostUnits(949));
     }
 
-    /// INVARIANTS.md #20: an overage admission is counted under `admitted`
+    /// INVARIANTS.md GL-20: an overage admission is counted under `admitted`
     /// like any other, *and* under its own qualifier. Readers of `admitted`
     /// must not have to add two numbers to get the total.
     #[test]
@@ -2079,7 +2079,7 @@ mod tests {
     /// mode safe without an account-level operator action: one shared counter
     /// means N credentials cannot multiply an account's credit the way N
     /// per-principal limiters would have multiplied its rate (review finding
-    /// #4). What divergence costs is that lowering a cap does not bind until
+    /// GL-4). What divergence costs is that lowering a cap does not bind until
     /// every principal of the account is republished — the same of every other
     /// per-principal policy value, `ResolvedLimits` included.
     #[test]
@@ -2222,7 +2222,7 @@ mod tests {
         }
     }
 
-    // --- Instance-visible balance (#97) -------------------------------------
+    // --- Instance-visible balance (GL-97) -------------------------------------
     //
     // A quote here is 50 fixed + 1 per item, so `request(n)` costs `50 + n`.
 
@@ -2352,7 +2352,7 @@ mod tests {
     }
 
     /// The estimate is a report, never an input. Admission denies from the
-    /// lease and the ledger (INVARIANTS.md #1); if a stale published zero
+    /// lease and the ledger (INVARIANTS.md GL-1); if a stale published zero
     /// could refuse, a refresh delay would become an outage.
     #[test]
     fn an_exhausted_estimate_does_not_deny() {
@@ -2394,8 +2394,8 @@ mod tests {
     /// A real gate with no capacity left, which is what a shed looks like in
     /// production.
     ///
-    /// #93 needed a `RefusingGate` double because `NoGate` is infallible and
-    /// the traits are sealed, so nothing could reach the shed path. #99 makes
+    /// GL-93 needed a `RefusingGate` double because `NoGate` is infallible and
+    /// the traits are sealed, so nothing could reach the shed path. GL-99 makes
     /// the double unnecessary: a `Uniform` gate of one unit, with that unit
     /// held, refuses for the real reason through the real code.
     fn saturated_gate() -> (ExecutionCapacityGate, ExecutionPermit) {
@@ -2477,7 +2477,7 @@ mod tests {
     /// Every admitted request reaches exactly one terminal counter, and none
     /// of them touches the pre-admission denial total.
     ///
-    /// This is the arithmetic INVARIANTS.md #20 asks for: `admitted` is the
+    /// This is the arithmetic INVARIANTS.md GL-20 asks for: `admitted` is the
     /// total, and `execution_started + canceled_before_start + capacity_shed +
     /// refused_at_start` accounts for all of it. A request counted as both an
     /// admission and a denial is the contradictory identity the invariant
@@ -2731,7 +2731,7 @@ mod tests {
     ///
     /// A republication that changes only the revision is a *newer generation*
     /// carrying different application identity; a request already begun keeps
-    /// the one it pinned (INVARIANTS.md #26), and the next request sees the
+    /// the one it pinned (INVARIANTS.md GL-26), and the next request sees the
     /// new one. This is the test that would fail if either value were ever
     /// derived from the other.
     #[test]
@@ -3823,7 +3823,7 @@ mod tests {
         engine
     }
 
-    /// Issue #40: a batch cap that admits a quote larger than the whole burst
+    /// Issue GL-40: a batch cap that admits a quote larger than the whole burst
     /// is a misconfigured schedule. Reporting it as throttling invites a retry
     /// that can never succeed.
     #[test]
@@ -3922,7 +3922,7 @@ mod tests {
     /// principal installed first left a sibling with a heavier cost table
     /// unable to spend its largest quote in any shard — reported as
     /// `UnpriceableUnderLimits` for a request the account's burst can hold,
-    /// and admitted before the split existed (INVARIANTS.md #5).
+    /// and admitted before the split existed (INVARIANTS.md GL-5).
     #[test]
     fn a_shared_split_bucket_never_wedges_a_principal_the_burst_can_hold() {
         let sharding = LocalSharding::new(std::num::NonZeroUsize::new(8).unwrap());
@@ -4101,7 +4101,7 @@ mod tests {
 
         // AccountingBackpressure is decided before admission by the embedder,
         // so the engine cannot raise it — recording it is the caller's job,
-        // and the slot exists for exactly that (INVARIANTS.md #8).
+        // and the slot exists for exactly that (INVARIANTS.md GL-8).
         let engine = engine_with(AccountStatus::Active, Some(10_000));
         engine
             .counters()

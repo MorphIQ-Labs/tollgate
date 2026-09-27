@@ -1,7 +1,7 @@
 import Init.Omega
 
 /-!
-Abstract per-account supervisor ownership (#95). A retiring task is still
+Abstract per-account supervisor ownership (GL-95). A retiring task is still
 owned until its join; reactivation cannot create a second owner. Time and
 backend outcomes are abstract inputs. The model proves transition safety,
 not scheduler fairness or a Rust refinement. Paused-time integration tests

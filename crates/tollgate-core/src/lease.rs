@@ -8,7 +8,7 @@
 //! database transaction amortizes across thousands of requests. Central
 //! allocation bounds spend; the grant's lease-scoped capability prevents
 //! release or usage from being attributed to a different lease
-//! (INVARIANTS.md #1, #4).
+//! (INVARIANTS.md GL-1, GL-4).
 
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -24,7 +24,7 @@ use crate::units::CostUnits;
 /// An allocator's record of one lease: `units` were debited from
 /// `account_id`'s balance and belong exclusively to the holder until
 /// `expires_at`, after which the allocator reclaims whatever the holder did
-/// not spend (INVARIANTS.md #9).
+/// not spend (INVARIANTS.md GL-9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LeaseGrant {
@@ -47,7 +47,7 @@ pub struct LeaseGrant {
 /// reservation-phase/occupancy transition, so a cap refusal never advertises
 /// irrevocable units as refundable. The ledger settles the difference by
 /// treating overage as a second funding term, so per-account conservation
-/// still closes exactly (INVARIANTS.md #1, #3).
+/// still closes exactly (INVARIANTS.md GL-1, GL-3).
 ///
 /// **The cap is a parameter, not a field.** It arrives from the snapshot the
 /// request has already read, which means two things: a republished cap takes
@@ -71,7 +71,7 @@ pub struct AccountOverage {
     spent: AtomicU64,
     committed: AtomicU64,
     commit_publications: AtomicUsize,
-    /// Debit compare-exchanges on `spent` that lost to another writer (#139).
+    /// Debit compare-exchanges on `spent` that lost to another writer (GL-139).
     /// Beside `spent`, so the only thread that writes it is one already
     /// contending for that line; added once per contended debit.
     contended: AtomicU64,
@@ -147,7 +147,7 @@ impl AccountOverage {
     ///
     /// Read by readiness: an elastic account with headroom here is admissible
     /// even when its lease is empty or absent, which is the whole point of the
-    /// mode (INVARIANTS.md #10).
+    /// mode (INVARIANTS.md GL-10).
     #[must_use]
     pub fn headroom(&self, cap: CostUnits) -> CostUnits {
         CostUnits(cap.get().saturating_sub(self.spent.load(Ordering::Acquire)))
@@ -159,7 +159,7 @@ impl AccountOverage {
     /// Fails closed on both boundaries: a total that exceeds the cap and a
     /// total that cannot be represented are the same refusal, because a
     /// wrapped total would read as a tiny spend and reopen the cap
-    /// (INVARIANTS.md #11).
+    /// (INVARIANTS.md GL-11).
     #[inline]
     pub(crate) fn try_debit(&self, units: CostUnits, cap: CostUnits) -> Result<(), DenyReason> {
         let want = units.get();
@@ -379,7 +379,7 @@ impl Drop for TentativeOverage<'_> {
 ///
 /// **Contract:** [`request_refill`](RefillSignal::request_refill) is invoked
 /// from inside a debit, on the request path. It must not block, wait on a
-/// lock, allocate, or perform I/O (INVARIANTS.md #5, #6). A single-counter
+/// lock, allocate, or perform I/O (INVARIANTS.md GL-5, GL-6). A single-counter
 /// lease calls it at most once. A sharded lease calls it at most once per
 /// shard between aggregate checks; an early shard signal is re-armed if the
 /// aggregate has not reached low water yet.
@@ -396,7 +396,7 @@ pub trait RefillSignal: Send + Sync + core::fmt::Debug {
 /// anything; `Refused` says it already refused work the account could fund,
 /// which is a statement about the grant's size rather than its depletion and
 /// needs the holder's unspent units folded back in before the next one is
-/// sized (INVARIANTS.md #1, #6).
+/// sized (INVARIANTS.md GL-1, GL-6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefillVerdict {
     /// The lease is serving and has asked for nothing.
@@ -512,7 +512,7 @@ struct LeaseInner {
     /// when a low-water crossing already spent this lease's shard flags.
     refused: AtomicBool,
     /// The largest quote this lease refused for want of units: the demand a
-    /// consolidation may grow to (#131). Raised before the doorbell's swap,
+    /// consolidation may grow to (GL-131). Raised before the doorbell's swap,
     /// which publishes it, and read by the plane only at quiescence. Zero
     /// until a refusal, and never set by an expiry refusal, which rotates.
     refused_quote: AtomicU64,
@@ -677,7 +677,7 @@ impl LocalLease {
     /// The largest quote this lease refused for want of units, or zero.
     ///
     /// Demand the refill plane has proof of: a consolidation may grow the
-    /// replacement to it when the account can fund it (#131). Exact only once
+    /// replacement to it when the account can fund it (GL-131). Exact only once
     /// the lease has quiesced, the same condition [`Self::remaining`] needs.
     #[must_use]
     pub fn largest_refused_quote(&self) -> CostUnits {
@@ -831,7 +831,7 @@ impl LocalLease {
             // The same silence as the exhaustion exit below, for the same
             // reason: a lease that can no longer serve must say so rather
             // than wait to be discovered. Rotation keeps the poll interval as
-            // its backstop for a lease no request touches (INVARIANTS.md #6).
+            // its backstop for a lease no request touches (INVARIANTS.md GL-6).
             self.signal_refusal();
             return Err(DenyReason::LeaseExpired);
         }
@@ -960,7 +960,7 @@ impl LocalLease {
     ///
     /// A refusal is the one lease event that *proves* the grant can no longer
     /// serve the work being offered, so it is the one event the refill plane
-    /// most needs and, before #109, the only one it was never told about.
+    /// most needs and, before GL-109, the only one it was never told about.
     /// Low water cannot stand in for it: the mark counts units and the
     /// refusal is about a quote, so a lease holding more units than its mark
     /// can refuse every request until its TTL while the account has the
@@ -1152,7 +1152,7 @@ mod tests {
 
     /// A total that cannot be represented is the same refusal as one that
     /// exceeds the cap: never a wrap to a small spend, which would reopen the
-    /// cap (INVARIANTS.md #11).
+    /// cap (INVARIANTS.md GL-11).
     #[test]
     fn an_unrepresentable_total_refuses_rather_than_wrapping() {
         let o = overage();
@@ -1404,7 +1404,7 @@ mod tests {
         assert_eq!(l.contended_debits(), 9, "recording zero writes nothing");
     }
 
-    /// The overage counter records lost debit races (#139) and nothing when
+    /// The overage counter records lost debit races (GL-139) and nothing when
     /// uncontended, without disturbing `spent`.
     #[cfg(any(
         target_arch = "x86_64",
@@ -1692,7 +1692,7 @@ mod tests {
         assert_eq!(signal.count(), 1, "landing exactly on low water crosses it");
     }
 
-    /// #109: the refusal is the one lease event that *proves* the grant can
+    /// GL-109: the refusal is the one lease event that *proves* the grant can
     /// no longer serve the work offered, and it was the one event the refill
     /// plane was never told about. A low-water crossing cannot stand in for
     /// it: this lease is comfortably above its mark and still cannot fund the
@@ -1728,7 +1728,7 @@ mod tests {
         );
     }
 
-    /// #131: a consolidation may grow only to demand the lease has proven, so
+    /// GL-131: a consolidation may grow only to demand the lease has proven, so
     /// the refusal records its quote, keeps the largest across a storm, and an
     /// expiry refusal records nothing because it rotates rather than folds.
     #[test]
@@ -1777,7 +1777,7 @@ mod tests {
     /// A refusal outranks a crossing because the two ask for different things
     /// and only one is still preventable. Rotating *alongside* a lease that
     /// already refused work would size the next grant against a balance this
-    /// lease's unspent units are missing from (#109).
+    /// lease's unspent units are missing from (GL-109).
     #[test]
     fn a_refusal_outranks_a_low_water_crossing() {
         let l = lease(100, 1_000, 90);
@@ -1798,7 +1798,7 @@ mod tests {
     /// The expiry refusal was silent for the same reason the exhaustion one
     /// was, and is the same defect. Rollover keeps the poll interval as its
     /// backstop for a lease no request touches; a lease requests *are*
-    /// reaching now says so on the first one (INVARIANTS.md #6).
+    /// reaching now says so on the first one (INVARIANTS.md GL-6).
     #[test]
     fn an_expired_lease_reports_its_refusal_rather_than_waiting_for_the_tick() {
         let signal = Arc::new(CountingSignal::default());
@@ -1871,7 +1871,7 @@ mod tests {
     ///
     /// This test used to assert the silence outright (`a_refused_debit_never
     /// _signals`), on the reasoning that a debit which moved no counter has
-    /// nothing to announce. The premise held for crossings and hid #109: it
+    /// nothing to announce. The premise held for crossings and hid GL-109: it
     /// read the doorbell as "low water was crossed" when what the refill
     /// plane needs is "act on this lease", and those differ exactly here.
     /// Both facts are now representable at once, so neither has to be given

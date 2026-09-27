@@ -464,7 +464,7 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    The doorbell only removes that floor if nothing in the loop body puts one
    back: the release pass carries a single `store_call_timeout` across every
    parked lease, so a wedged backend cannot make refill latency grow with the
-   parked count (#78).
+   parked count (GL-78).
    **A refusal is announced, and it is announced as a different thing.** A
    debit the lease cannot fund — for units or because its usability window has
    lapsed — raises the same doorbell, once per lease, and the plane is told
@@ -519,11 +519,11 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    reference-counted lease view before releasing the exact aggregate. Shutdown
    waits inside its own budget and *abandons* what has not quiesced by the
    deadline: releasing units a request may still spend cannot be undone, while
-   abandoning them forfeits their remainder at TTL reclaim (#9), a bounded
+   abandoning them forfeits their remainder at TTL reclaim (GL-9), a bounded
    cost that can never over-spend. The lifecycle
-   order in #13 asks an embedder to quiesce before shutting down; this no
+   order in GL-13 asks an embedder to quiesce before shutting down; this no
    longer depends on that, the predicate being the one the steady-state pass
-   already applies (#62). A lease leaves this instance's books only by being
+   already applies (GL-62). A lease leaves this instance's books only by being
    released or by being reported.
    *Tests:* `refill_begins_on_the_crossing_debit_not_the_next_tick`,
    `shutdown_abandons_a_lease_an_in_flight_request_still_holds`,
@@ -583,7 +583,7 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    committed while the caller was told the batch failed, which inverts
    "partial data is surfaced, never silently absorbed": the replay counts them
    as duplicates, so a partial success is reported as a total failure and
-   nothing says otherwise (#57).
+   nothing says otherwise (GL-57).
 
    *Tests:* `usage_replay_is_idempotent`,
    `mixed_usage_batch_preserves_partial_acceptance`,
@@ -599,7 +599,7 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    and enqueue never blocks unboundedly. The queue is partitioned into lanes
    by request locality, and "full" means every lane is full: a request whose
    own lane is full takes a slot in another before it sheds, so the shed
-   point is exactly the configured `queue_capacity` (#137). Shutdown closes
+   point is exactly the configured `queue_capacity` (GL-137). Shutdown closes
    every lane (new reservations refuse from that instant), then drains until
    every lane is empty and every outstanding permit has resolved by sending
    or dropping — a lane that is merely momentarily empty is not drained — bounded by
@@ -628,8 +628,8 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    forever and declares loss only at the final flush. The drain's budget is
    total wall clock, so its retry backoffs sleep into whatever remains and
    never past it: an overrun spends the margin `expiry_safety_margin +
-   reclaim_grace` reserves (#12), and bounding by attempt count alone is not a
-   bound (#18, #63). *Tests:* client writer
+   reclaim_grace` reserves (GL-12), and bounding by attempt count alone is not a
+   bound (GL-18, GL-63). *Tests:* client writer
    overflow tests,
    `the_final_flush_backoff_cannot_overrun_the_drain_deadline`,
    `shutdown_flushes_in_configured_batch_sizes`,
@@ -653,7 +653,7 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    released is settled by the expiry sweep after `expires_at + grace`, and
    the sweep credits nothing back: the whole `granted - recorded usage` is
    recorded as provisional settlement loss, exactly as a release claiming
-   nothing unspent would record it (#136). No unit can be proven unspent
+   nothing unspent would record it (GL-136). No unit can be proven unspent
    without a release. A lease accepts commits until `usable_until`, and a
    holder killed with a non-empty usage queue executed work the ledger never
    saw, so crediting the remainder would let that work be spent twice. Usage
@@ -670,7 +670,7 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    *oldest due* leases and stops at the first one that is not due, identically
    in both backends — and on PostgreSQL the batch's read work is bounded by the
    batch rather than by the backlog, because the sweep orders by the expiry
-   index's own columns so the `LIMIT` stops the walk (#65). *Tests:*
+   index's own columns so the `LIMIT` stops the walk (GL-65). *Tests:*
    `reclaim_forfeits_an_unreleased_remainder_as_provisional_loss`,
    `straggler_usage_after_reclaim_is_billed_against_the_forfeit`,
    `a_reclaimed_lease_forfeits_its_funding_instead_of_restoring_it`,
@@ -785,7 +785,7 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `elastic_readiness_serves_before_the_first_grant_and_recovers_after_funding`.
 
     The snapshot bar depends on how the tracked set is chosen, because the
-    same rule means opposite things at the two scales (#48). For a
+    same rule means opposite things at the two scales (GL-48). For a
     `Fixed` set — hand-configured, small — ready requires **every** tracked
     principal to hold a fresh positive or negative resolution: the set was
     chosen deliberately, so any gap in it is a real one. For an `All` set —
@@ -962,7 +962,7 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     about being dead, so the same generation arriving again is a
     re-observation. Conflating the two stranded any principal whose row went
     briefly absent, since the absence inherited the positive's generation and
-    then refused it back forever; that is #17's rule — keyed on what the source
+    then refused it back forever; that is GL-17's rule — keyed on what the source
     answered, never on what the instance remembers — applied to admission
     rather than to TTL selection.
     *Tests:* both snapshot-map contract tests,
@@ -1078,7 +1078,7 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     published revocation tombstone takes `revoked_ttl`. Conflating them
     strands a live principal for the reinstatement TTL whenever a source is
     merely rebuilding or failing over, while readiness still reports healthy.
-    Pruning visible negatives never weakens invariant #15, and neither does
+    Pruning visible negatives never weakens invariant GL-15, and neither does
     skipping them in the sweep: a live principal is always swept, so
     withdrawing one still propagates within `refresh_interval`; what the
     longer TTL bounds is the Negative → Present direction only.
@@ -1126,7 +1126,7 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     retry *count* alone is not a bound, and neither is a per-call bound on a
     pass that makes `N` calls: the lease manager's release pass carries one
     `store_call_timeout` across every parked lease, so no loop-body cost
-    scales with the parked count (#78). Every long await in a background
+    scales with the parked count (GL-78). Every long await in a background
     loop's body is raced against that task's shutdown watch, so the signal is
     acted on where it arrives rather than at the next loop top — this is what
     makes `LeaseManager::shutdown`'s documented `shutdown_release_deadline`
@@ -1134,16 +1134,16 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     never resolves is abandoned at `fetch_timeout` rather than awaited
     forever, because a `JoinSet` that cannot empty stops the snapshot sweep
     from returning at all, and readiness then falls without ever recovering
-    (#103). An abandoned call is counted apart from a refusal — `refresh_timeouts`
+    (GL-103). An abandoned call is counted apart from a refusal — `refresh_timeouts`
     beside `refresh_failures`, as `acquire_timeouts` sits beside the lease
     manager's refusals — because a timeout is not a domain answer: the backend
     may have done the work and simply not said so in time. Racing a call
     against shutdown is not a substitute for bounding it: it frees the
     shutdown path and leaves every other caller parked, which is how principal
-    enumeration stayed unbounded after its cancellation was fixed (#59). What
+    enumeration stayed unbounded after its cancellation was fixed (GL-59). What
     a bound could not complete is
     reported — a lease left unreleased is `LeaseManagerReport::abandoned` and
-    is forfeited at TTL reclaim (#9); an undelivered batch is `WriterStats::lost` —
+    is forfeited at TTL reclaim (GL-9); an undelivered batch is `WriterStats::lost` —
     never silently assumed done.
     *Tests:* `hung_ingest_cannot_stall_shutdown`,
     `hung_ingest_times_out_into_the_retry_path`,
@@ -1318,7 +1318,7 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     layout and the host's parallelism, and summed only when read. The shared
     counter identity is one per map, so an unpartitioned tally would be a line
     that unrelated accounts contend on; there is no inline variant to fall
-    back to (#132). *Tests:*
+    back to (GL-132). *Tests:*
     `the_counter_layout_covers_the_leases_and_the_host_as_a_power_of_two`,
     `the_default_lease_layout_still_separates_localities`, and
     `each_counter_occupies_its_own_cache_line`.
@@ -1368,13 +1368,13 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     account was republished carrying it at `generation + 1`, or nothing moved.
     Snapshots already at the target status are not rewritten, so a repeat
     converges and bumps no generation. Revoked principals are never
-    republished — resurrecting a tombstone is what #15 forbids, and revocation
+    republished — resurrecting a tombstone is what GL-15 forbids, and revocation
     stays a separate per-credential mechanism. A snapshot published directly
     with a status contradicting the ledger is refused, not accepted and
     reconciled later. `Closed` is terminal: an account enters it from any
     status and leaves it never, and the refusal changes nothing. Suspension
     does **not** reclaim outstanding leases — their units were debited at
-    grant and #9 already bounds them — so the bound on "requests stop" is one
+    grant and GL-9 already bounds them — so the bound on "requests stop" is one
     `SnapshotManager` refresh interval, not zero. The operation reports what it
     changed: how many snapshots it republished, and how many changed durably
     but could not be decoded to push, so a partial result is surfaced rather
@@ -1415,7 +1415,7 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     stayed open, with admission unable to compensate because expiry is a
     property of the credential and not of the account snapshot.
     `Verified::reusable_until` carries it, and `HmacRegistry` populates it
-    from the credential's own `not_after` when its record carries one (#104).
+    from the credential's own `not_after` when its record carries one (GL-104).
     A key without one is indefinite: it expires only by withdrawal, and
     withdrawal travels by snapshot.
 
@@ -1682,7 +1682,7 @@ exists to detect corrupt state and must not be able to launder it.
     HMAC is paid for, preserved across the persistence boundary rather than
     only within one process.
 
-    Revocation is durable and terminal, like a snapshot tombstone (#15): a
+    Revocation is durable and terminal, like a snapshot tombstone (GL-15): a
     retired credential is never resurrected, and issuance refuses to overwrite
     an existing `KeyId` rather than silently retiring what it replaces. A
     credential's own `not_after` is enforced by the directory, so every

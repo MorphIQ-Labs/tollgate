@@ -38,7 +38,7 @@ fi
 
 # The release commit is the squashed second parent of the merge commit under
 # the group-enforced merge method. Tag *it*, not the merge and not
-# CI_COMMIT_SHA (#142). Its tree is exactly the tree the CHANGELOG section was
+# CI_COMMIT_SHA (GL-142). Its tree is exactly the tree the CHANGELOG section was
 # written from and the release merge request's pipeline tested. The merge can
 # also carry commits that reached the default branch after preparation — v0.29.0
 # did: its tag contained a fix that its section omitted and 0.29.1's section

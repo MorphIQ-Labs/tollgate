@@ -271,7 +271,7 @@ fn backend_startup_failure_never_discloses_connection_strings_or_driver_text() {
 
 mod common;
 
-/// Issuer secret for the stock-binary cases (#143). Test-only.
+/// Issuer secret for the stock-binary cases (GL-143). Test-only.
 const BINARY_ISSUER: &str = "b143b143b143b143b143b143b143b143b143b143b143b143b143b143b143b143";
 
 /// A manifest with instance and operator bearers and, optionally, an issuer.
@@ -362,7 +362,7 @@ async fn send(
 }
 
 /// The acceptance path a deployment depends on, against the stock binary and
-/// its own configuration path (#143): issue once, a resend conflicts, a
+/// its own configuration path (GL-143): issue once, a resend conflicts, a
 /// verifier holding the same secret accepts the credential through the
 /// `/v1/keys` projection, its policy binds by key, and revocation plus
 /// withdrawal retire it.

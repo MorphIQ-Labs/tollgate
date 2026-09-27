@@ -1,4 +1,4 @@
-//! Issue #104 stage one: the credential lifecycle seam, exercised end to end
+//! Issue GL-104 stage one: the credential lifecycle seam, exercised end to end
 //! across the two crates that own its halves.
 //!
 //! `tollgate-auth` mints and verifies but holds no durable state;

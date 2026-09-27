@@ -1,5 +1,5 @@
 //! Execution-capacity admission: whether this instance should *start* an
-//! already-valid request with the compute it has right now (#99).
+//! already-valid request with the compute it has right now (GL-99).
 //!
 //! A different question from funding, and the separation is the point. Quota
 //! answers whether an account may pay for work; this answers whether the

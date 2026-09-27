@@ -1,4 +1,4 @@
-//! Property tests for the hot-path invariants (INVARIANTS.md #1–#3, #11).
+//! Property tests for the hot-path invariants (INVARIANTS.md GL-1–GL-3, GL-11).
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -68,7 +68,7 @@ proptest! {
 
     /// The complete u128 domain has one fixed-width textual representation;
     /// parsing never narrows through a JavaScript-sized integer
-    /// (INVARIANTS.md #21).
+    /// (INVARIANTS.md GL-21).
     #[test]
     fn identifier_text_round_trips_the_full_u128_domain(value in any::<u128>()) {
         let id = AccountId(value);
@@ -83,7 +83,7 @@ proptest! {
     /// A consumer compares these for equality to select its own metadata, so
     /// a byte that survived as a different byte — or an ordering the text
     /// transposed — would silently name a different policy while still
-    /// looking like a valid revision (INVARIANTS.md #21).
+    /// looking like a valid revision (INVARIANTS.md GL-21).
     #[test]
     fn revision_text_round_trips_the_full_256_bit_domain(bytes in any::<[u8; 32]>()) {
         let revision = PolicyRevision(bytes);
@@ -95,7 +95,7 @@ proptest! {
     }
 
     /// Quotes match exact u128 arithmetic or refuse with Overflow — never a
-    /// wrapped value (INVARIANTS.md #11).
+    /// wrapped value (INVARIANTS.md GL-11).
     #[test]
     fn quote_never_wraps(
         fixed in any::<u64>(),
@@ -120,7 +120,7 @@ proptest! {
 
     /// Snapshot publication agrees with an independent exact-arithmetic
     /// oracle for the worst registered operation at the configured batch cap
-    /// (INVARIANTS.md #16).
+    /// (INVARIANTS.md GL-16).
     #[test]
     fn snapshot_publication_matches_u128_worst_case_oracle(
         fixed in any::<u64>(),
@@ -171,7 +171,7 @@ proptest! {
 
     /// Units are conserved across any sequence of reservations and outcomes:
     /// `initial == remaining + committed` once every reservation is resolved,
-    /// and committed spend never exceeds the lease (INVARIANTS.md #1, #2).
+    /// and committed spend never exceeds the lease (INVARIANTS.md GL-1, GL-2).
     #[test]
     fn lease_units_are_conserved(
         capacity in 0u64..10_000,
@@ -232,7 +232,7 @@ proptest! {
     /// any mix of ordinary commits, cancels, drops, and commit-time elastic
     /// fallbacks. A committed request moves its units into the lease's spend
     /// or into overage — never both, never neither — and a released one moves
-    /// nothing (INVARIANTS.md #1, #2, #3).
+    /// nothing (INVARIANTS.md GL-1, GL-2, GL-3).
     ///
     /// This is the double-charge exclusion as a property. The lapse actions
     /// exercise the one transition that changes a reservation's funding source

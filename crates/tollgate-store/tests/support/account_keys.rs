@@ -1,7 +1,7 @@
 //! Identical backend scenarios for the account-scoped credential surface
-//! (#121): the two harnesses supply isolated stores.
+//! (GL-121): the two harnesses supply isolated stores.
 //!
-//! Written once and included by both suites rather than mirrored by name. #85
+//! Written once and included by both suites rather than mirrored by name. GL-85
 //! showed that mirrored tests drift *inside* the body where no name diff can
 //! see it; a shared scenario cannot drift at all, which is the stronger
 //! guarantee where the whole point is that two backends agree.

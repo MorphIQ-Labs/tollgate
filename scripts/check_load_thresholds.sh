@@ -23,7 +23,7 @@ fi
 
 # Same environment capture as the perf gate: read here because std offers no
 # portable load average, and recorded so a borderline ratio can be diagnosed
-# rather than only re-run (#49).
+# rather than only re-run (GL-49).
 load_average() {
     if [ -r /proc/loadavg ]; then
         cut -d' ' -f1-3 /proc/loadavg

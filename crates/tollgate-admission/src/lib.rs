@@ -12,7 +12,7 @@
 //! Nothing in this crate performs I/O, takes a blocking lock on the request
 //! path, or reads a wall/business clock for a policy decision: `now` is an
 //! argument. Misses deny — resolution is the background plane's job
-//! (INVARIANTS.md #5).
+//! (INVARIANTS.md GL-5).
 //!
 //! Two dependencies do their own bookkeeping underneath that, and the budget
 //! counts it rather than pretending it away. `governor` reads its own

@@ -371,7 +371,7 @@ impl SnapshotSource for HttpStore {
 
     /// Over HTTP this is the *only* way an instance learns the principal set:
     /// `subscribe` above is a closed channel, so there are no deltas to
-    /// accumulate and the periodic refresh carries everything (#48).
+    /// accumulate and the periodic refresh carries everything (GL-48).
     ///
     /// A server whose backend cannot enumerate answers 501, which maps back
     /// to `None` — "stay on your configured set" — rather than to an empty
@@ -413,7 +413,7 @@ impl UsageSink for HttpStore {
             // A 4xx is the server's judgement about *this batch*: too large,
             // undecodable, a contract it does not implement. Replaying it
             // unchanged earns the same answer forever, so it is refused rather
-            // than retried — the wedge #61 describes is a writer looping on
+            // than retried — the wedge GL-61 describes is a writer looping on
             // exactly this. The exceptions are the 4xx statuses that
             // describe the moment rather than the payload: 408 and 429 are
             // invitations to try again. 401/403 describe credentials, which

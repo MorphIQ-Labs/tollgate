@@ -1,4 +1,4 @@
-//! INVARIANTS.md #1, end to end: two full instance stacks (admission engine +
+//! INVARIANTS.md GL-1, end to end: two full instance stacks (admission engine +
 //! lease manager + usage writer) spend one account down to zero through the
 //! memory store. Total committed usage must equal the recorded billing ledger
 //! exactly and never exceed the deposit; conservation must hold at the store.
@@ -114,12 +114,12 @@ fn spawn_instance(store: &Arc<MemoryStore>, clock: &Arc<ManualClock>) -> Instanc
 
 /// Attempt up to `burst` requests on one instance; returns how many committed.
 /// Request ids come from each instance's own random generator — no shared
-/// sequence (review finding #6): global idempotency must hold across
+/// sequence (review finding GL-6): global idempotency must hold across
 /// independently generated ids, and the duplicate count proves it.
 fn hammer(instance: &mut Instance, burst: usize) -> usize {
     let mut committed = 0;
     for _ in 0..burst {
-        // INVARIANTS.md #8 ordering: accounting capacity is reserved before
+        // INVARIANTS.md GL-8 ordering: accounting capacity is reserved before
         // admission.
         let Ok(permit) = instance.engine.recorder().try_reserve() else {
             continue;
@@ -140,7 +140,7 @@ fn hammer(instance: &mut Instance, burst: usize) -> usize {
                 drop(committed_guard);
             }
             // Spending an account down ends in lease refusals and, once the
-            // allocator has attested what is left, funding refusals (#130).
+            // allocator has attested what is left, funding refusals (GL-130).
             // All are zero-charge.
             Err(
                 DenyReason::LeaseUnavailable

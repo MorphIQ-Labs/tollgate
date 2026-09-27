@@ -5,7 +5,7 @@ does not apply to it — with one exception. The engine's outcome tallies
 (`AdmissionCounters`) are one set per instance, shared by every account, so
 they are partitioned per locality under every layout, including the default:
 at least as finely as the lease layout and the host's parallelism, as a power
-of two (#132). `AdmissionCounters::local_sharding` reports that layout. It
+of two (GL-132). `AdmissionCounters::local_sharding` reports that layout. It
 carries none of the condition below, because a tally is a sum however it is
 split — two threads that share a tally shard cost each other contention, never
 correctness.
@@ -17,7 +17,7 @@ shard — admission state, lease counters, rate buckets, outcome tallies — so 
 worker threads hammering the same account stop fighting over the same cache
 lines. Measured on a 24-core x86_64 development host, eight threads on one
 account cost **176 ns** per admission when each held its own shard and **862 ns**
-when two shared one: a factor of 4.9 (#123). Across eight *different* accounts
+when two shared one: a factor of 4.9 (GL-123). Across eight *different* accounts
 the same collision cost ×1.38, because those threads share less per-shard state
 to begin with.
 
@@ -85,7 +85,7 @@ per account and buys nothing.
 Threads that are not serving requests still consume affinities if they reach
 the request path, and every one they take displaces a worker. The library no
 longer does this to you — control-plane reads inside `tollgate-client` use a
-fixed observer affinity and claim nothing (#124) — but an embedder that admits
+fixed observer affinity and claim nothing (GL-124) — but an embedder that admits
 from `spawn_blocking`, from a second runtime, or from short-lived threads is
 spending the same budget.
 
@@ -140,6 +140,6 @@ to buy, which is why this is reported rather than refused.
 
 - `docs/DESIGN.md` — why sharding is opt-in, and what each sharded component
   partitions.
-- `INVARIANTS.md` #40 — the property stated as a contract, and what enforces
+- `INVARIANTS.md` GL-40 — the property stated as a contract, and what enforces
   which half of it.
 - `docs/PERFORMANCE.md` — running the benchmarks that price the layout.

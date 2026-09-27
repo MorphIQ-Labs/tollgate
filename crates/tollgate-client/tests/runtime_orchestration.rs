@@ -562,7 +562,7 @@ async fn readiness_checks_freshness_at_the_callers_time_before_a_background_wake
 
 /// A source whose pulls can be made to fail. `subscribe` and `principals`
 /// need no mention: delegation supplies both, and `principals` in particular
-/// must not fall back to the trait default (#83).
+/// must not fall back to the trait default (GL-83).
 fn failing_snapshots(
     store: &Arc<MemoryStore>,
     fail: &Arc<AtomicBool>,
@@ -921,7 +921,7 @@ async fn an_in_flight_release_cannot_start_a_refill_after_shutdown_pauses_it() {
 /// The `Ok(None)` is stated rather than inherited. This double previously got
 /// it by *omitting* `principals`, which is the same silence that made other
 /// wrappers lie about a catalogue they did have — here it happened to be the
-/// intent. Saying it out loud is the difference between the two (#83).
+/// intent. Saying it out loud is the difference between the two (GL-83).
 fn push_only_source(store: &Arc<MemoryStore>) -> Arc<DelegatingStore<MemoryStore>> {
     Arc::new(DelegatingStore::wrapping(Arc::clone(store)).on_principals(|_| async { Ok(None) }))
 }
@@ -1443,7 +1443,7 @@ async fn shutdown_reports_an_unanswered_consolidation_grant() {
     let stopped = runtime.shutdown().await.unwrap();
     assert!(!stopped.deadline_expired);
     // The refused 60-unit quote grew the replacement past the policy's 50
-    // (#131); it still holds those units until reclaim.
+    // (GL-131); it still holds those units until reclaim.
     assert_eq!(
         store.balance(AccountId(1)),
         CostUnits(40),
@@ -1466,7 +1466,7 @@ async fn shutdown_reports_an_unanswered_consolidation_grant() {
         "only the unanswered replacement remains active"
     );
     // Nobody can prove the unanswered grant unspent, so it is forfeited
-    // rather than returned (#136).
+    // rather than returned (GL-136).
     assert_eq!(reclaimed[0].forfeited, CostUnits(60));
     assert_eq!(store.balance(AccountId(1)), CostUnits(40));
     let c = store.conservation(AccountId(1)).unwrap();
@@ -1501,7 +1501,7 @@ async fn ambiguous_consolidations_remain_visible_after_a_clean_shutdown() {
 }
 
 /// An instance reports the layout it is running and whether that layout still
-/// buys anything (#124).
+/// buys anything (GL-124).
 ///
 /// Sharding is worth its memory only while a request-serving thread writes to
 /// lines no peer writes, and that holds only while the affinities handed out do

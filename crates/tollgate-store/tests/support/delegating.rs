@@ -1,5 +1,5 @@
 //! One store double for every test crate, so that delegation is written
-//! once and the trait defaults are decided once (#83).
+//! once and the trait defaults are decided once (GL-83).
 //!
 //! Each of the seven store traits is implemented for [`DelegatingStore<S>`].
 //! A method with no hook falls through to `S`; a method with a hook calls it.
@@ -18,7 +18,7 @@
     clippy::missing_trait_methods,
     reason = "a trait method that gains a default body must not be inherited \
               here by accident -- this file is the one place the forward/inherit \
-              decision is made, and omitting a method is how #83 arose 44 times"
+              decision is made, and omitting a method is how GL-83 arose 44 times"
 )]
 
 use std::future::Future;
@@ -670,7 +670,7 @@ where
     // DELIBERATELY FORWARDED, not inherited. The trait default is the
     // sentinel `Ok(None)` -- "this source cannot enumerate" -- and all
     // three real stores override it with a catalogue. Inheriting it is
-    // exactly the defect in #83: a wrapper reports no catalogue while the
+    // exactly the defect in GL-83: a wrapper reports no catalogue while the
     // store it wraps has one. A double that wants the sentinel asks for
     // it by name, with `on_principals`.
     async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {

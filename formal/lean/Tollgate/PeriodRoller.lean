@@ -1,7 +1,7 @@
 import Init.Omega
 
 /-!
-The #107 driver's abstract lifecycle. A cutoff is chosen only at pass start;
+The GL-107 driver's abstract lifecycle. A cutoff is chosen only at pass start;
 batch calls are owned sequentially and a stop is terminal. Store effects,
 wall-clock bounds and scheduler fairness are outside this model. The store's
 rollover conservation proofs and Rust paused-time tests are separate evidence.

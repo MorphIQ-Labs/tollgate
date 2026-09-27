@@ -9,7 +9,7 @@ transitions perform no arithmetic, so there is no finite-precision gap inside
 the modeled operations. Scheduling, hashing, and memory ordering remain Rust
 implementation obligations covered by tests and the lock-free map design.
 
-The watermark records *why* it exists, and that is the content of issue #53. A
+The watermark records *why* it exists, and that is the content of issue GL-53. A
 generation this instance merely observed is not the same fact as a generation
 the source published a revocation at. Collapsing them made an absent row
 inherit the generation of the positive it replaced and then refuse it back
@@ -75,7 +75,7 @@ def installPositive (state : State) (incoming : Nat) : State :=
 
 /-- A revocation is refused when it is strictly older than whatever the
 principal already carries -- a delayed tombstone cannot revoke a newer positive
-snapshot (INVARIANTS.md #15). -/
+snapshot (INVARIANTS.md GL-15). -/
 def installRevoked (state : State) (incoming : Nat) : State :=
   match state.watermark with
   | none => { watermark := some (.revoked incoming), visible := .negative }
@@ -85,7 +85,7 @@ def installRevoked (state : State) (incoming : Nat) : State :=
 
 /-- An absent row denies locally and says nothing about any generation, so it
 leaves the watermark exactly as it found it. In particular it does not promote
-an observation into a revocation: that promotion is #53. -/
+an observation into a revocation: that promotion is GL-53. -/
 def installUnknown (state : State) : State :=
   { state with visible := .negative }
 
@@ -101,14 +101,14 @@ theorem unknown_preserves_watermark (state : State) :
   rfl
 
 /-- An absence never makes a generation dead. This is the property whose
-absence was issue #53. -/
+absence was issue GL-53. -/
 theorem unknown_never_creates_a_revocation (state : State) (generation : Nat)
     (h : state.watermark = some (.positive generation)) :
     (installUnknown state).watermark = some (.positive generation) := by
   simpa [installUnknown] using h
 
 /-- The half that must not loosen: a positive at or below a published
-revocation is refused, equality included (INVARIANTS.md #15). -/
+revocation is refused, equality included (INVARIANTS.md GL-15). -/
 theorem positive_at_or_below_revocation_is_rejected
     (current incoming : Nat) (visible : Visible) (h : incoming ≤ current) :
     installPositive { watermark := some (.revoked current), visible := visible } incoming =
@@ -118,7 +118,7 @@ theorem positive_at_or_below_revocation_is_rejected
   · have : incoming = current := Nat.le_antisymm h hge
     simp [installPositive, acceptsPositive, Watermark.generation, Watermark.isRevoked, this]
 
-/-- #15's other half, which the two-field model silently lost: a delayed older
+/-- GL-15's other half, which the two-field model silently lost: a delayed older
 revocation cannot revoke a newer positive. -/
 theorem older_revocation_cannot_revoke_a_newer_positive
     (current incoming : Nat) (visible : Visible) (h : incoming < current) :
@@ -160,7 +160,7 @@ theorem revoked_watermark_is_max
   · rename_i h
     rw [Nat.max_eq_right (Nat.le_of_not_gt h)]
 
-/-- INVARIANTS.md #15's headline over *any* prior watermark, not just a
+/-- INVARIANTS.md GL-15's headline over *any* prior watermark, not just a
 revocation: revoke, evict the visible entry, then replay a positive at or below
 the revoked generation -- the principal stays dead.
 
@@ -201,7 +201,7 @@ theorem revoked_then_evicted_rejects_replay_from_any_watermark
           simp [evictVisible, installPositive, acceptsPositive, Watermark.generation,
             Watermark.isRevoked, heq]
 
-/-- The headline composition of INVARIANTS.md #15, unweakened: revoke, evict the
+/-- The headline composition of INVARIANTS.md GL-15, unweakened: revoke, evict the
 visible entry, then replay a positive at or below the revoked generation -- the
 principal stays dead. -/
 theorem revoked_then_evicted_rejects_replay

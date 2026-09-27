@@ -1,5 +1,5 @@
 //! Account-status transitions hold their invariant over *sequences*, not just
-//! the transitions a scenario happened to write (#51, INVARIANTS.md #22).
+//! the transitions a scenario happened to write (GL-51, INVARIANTS.md GL-22).
 //!
 //! Written against `MemoryStore` as the reference, like `store_suite.rs`. What
 //! the scenarios pin one case at a time, this pins over random walks: after

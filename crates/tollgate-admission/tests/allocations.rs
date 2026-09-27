@@ -165,7 +165,7 @@ fn assert_zero(scope: &str, operation: impl FnOnce()) {
 /// Record a scope whose allocations belong to a dependency's amortized
 /// housekeeping, and hold it to a per-operation bound.
 ///
-/// Attribution matters here rather than being bookkeeping. INVARIANTS.md #24
+/// Attribution matters here rather than being bookkeeping. INVARIANTS.md GL-24
 /// says steady-state admission allocates nothing *it owns*; moka's cache
 /// maintenance is not Tollgate's, and moka does not promise a read never
 /// allocates. Recording it under `tollgate` and asserting zero claimed a
@@ -267,7 +267,7 @@ fn admission_allocates_nothing_on_the_arc_swap_default() {
     });
 }
 
-/// The first leg of #99's three-part disabled proof, and the same claim for
+/// The first leg of GL-99's three-part disabled proof, and the same claim for
 /// every enabled mode: acquiring or refusing execution capacity allocates
 /// nothing.
 ///
@@ -448,7 +448,7 @@ fn moka_reads_stay_within_their_amortized_allocation_budget() {
     // that deschedules this loop crosses the timer, moka drains, and the
     // drain allocates. This assertion used to demand zero across 1,024 reads
     // and failed a release merge request whose diff was version numbers and a
-    // changelog — the same shape of defect #102 removed from a Criterion
+    // changelog — the same shape of defect GL-102 removed from a Criterion
     // ratio, where a gate failed for a reason the change could not have
     // caused.
     //

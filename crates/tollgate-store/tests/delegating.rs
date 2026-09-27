@@ -1,4 +1,4 @@
-//! The shared store double's own contract (#83).
+//! The shared store double's own contract (GL-83).
 //!
 //! `tests/support/delegating.rs` is included by test binaries in three crates,
 //! and its whole job is to make the forward-or-inherit decision for a defaulted
@@ -62,7 +62,7 @@ fn snapshot() -> PublishableSnapshot {
     .expect("test snapshot limits are valid")
 }
 
-/// The defect #83 names, stated as an assertion.
+/// The defect GL-83 names, stated as an assertion.
 ///
 /// `SnapshotSource::principals` carries a default body returning `Ok(None)`,
 /// the sentinel for "this source cannot enumerate". Every real store overrides
@@ -153,7 +153,7 @@ async fn the_full_drain_keeps_calling_the_hook_until_a_batch_is_unsaturated() {
 async fn a_rejecting_double_names_the_method_it_was_not_given() {
     let double = rejecting("readiness must not touch the store");
     // The panic happens before this assertion is reached; it exists so the
-    // `#[must_use]` result is consumed rather than discarded (#82).
+    // `#[must_use]` result is consumed rather than discarded (GL-82).
     assert!(double.remove_snapshot(Principal(1)).await.is_ok());
 }
 

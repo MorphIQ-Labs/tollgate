@@ -71,7 +71,7 @@ case "${1:-}" in
       # also keeps cargo-mutants' timeout meaningful, because the suite each
       # mutant runs no longer takes longer than the gate's own floor.
       #
-      # #67 is why this exists: 159 mutants at one worker ran past the job's
+      # GL-67 is why this exists: 159 mutants at one worker ran past the job's
       # 90-minute limit, and a gate that cannot finish reports nothing at all.
       echo "mutation gate: no PostgreSQL change in this diff; the backend suite skips and the run uses $PARALLEL workers"
       unset TOLLGATE_PG_URL
@@ -82,7 +82,7 @@ case "${1:-}" in
     ;;
   # One crate's whole surface, rather than only what a branch touched. The
   # diff mode protects code as it is written; this is how code written before
-  # the gate existed gets measured at all (#43). `test_workspace` stays on, so
+  # the gate existed gets measured at all (GL-43). `test_workspace` stays on, so
   # a mutant here is still allowed to die to any test in the workspace.
   --package)
     package=${2:-}

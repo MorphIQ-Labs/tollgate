@@ -1,0 +1,27 @@
+# License gate for the dependency graph (`cargo deny check licenses`).
+# Advisories stay with scripts/check_advisories.sh; this file only answers
+# "may this graph ship under MIT OR Apache-2.0". Every entry is permissive: a
+# dependency that can only be taken under anything else fails the gate.
+[licenses]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "CC0-1.0",
+    "BSL-1.0",
+    # webpki-roots: Mozilla's CA bundle as data.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+# Workspace members are publish = false; their own license is checked by the
+# manifests, not here.
+ignore = true

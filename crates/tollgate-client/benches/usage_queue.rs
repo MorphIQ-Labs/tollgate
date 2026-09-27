@@ -1,7 +1,7 @@
-//! The usage queue under contention (#137).
+//! The usage queue under contention (GL-137).
 //!
 //! Every admitted request reserves a slot in, and later sends one event into,
-//! the one usage queue an instance has. #133 measured that pair at ~0.27 µs
+//! the one usage queue an instance has. GL-133 measured that pair at ~0.27 µs
 //! sequentially and ~0.85 µs at ten connections inside the example service;
 //! these rows reproduce it without HTTP and split it into its parts:
 //!

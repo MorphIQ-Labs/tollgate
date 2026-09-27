@@ -8,7 +8,7 @@
 //! Authorization: Bearer <key>
 //!   → connection-cache hit or HMAC-SHA256 verify, derive Principal
 //!   → AdmissionEngine::begin               (one lookup + route permission)
-//!   → reserve usage-writer permit          (shed on backpressure, #8)
+//!   → reserve usage-writer permit          (shed on backpressure, GL-8)
 //!   → read/decode under the pinned context
 //!   → RequestContext::admit                (shape/rate/concurrency/funding)
 //!   → acquire NoGate + commit
@@ -20,11 +20,11 @@
 //! The embedded topology runs `MemoryStore` in-process; pointing the same
 //! stack at a `tollgate-server` is a one-line swap to `HttpStore` (see the
 //! loopback test in tollgate-server). Readiness reports 503 until the account's
-//! lease slot is stocked (INVARIANTS.md #10).
+//! lease slot is stocked (INVARIANTS.md GL-10).
 
 #![allow(
     clippy::disallowed_methods,
-    reason = "the embedder is where business time legitimately enters the system (#100). \
+    reason = "the embedder is where business time legitimately enters the system (GL-100). \
               The library takes a `Timestamp` at every boundary precisely so that an \
               application reads the clock once, at its own edge, and passes the instant \
               down -- which is what makes admission replayable from its inputs. Reading \
@@ -135,13 +135,13 @@ pub struct PriceResponse {
     pub metadata: ResponseMetadata,
 }
 
-/// Mirrors ferro-risk's wire handle: enough for a client to reconcile the
+/// The response's charge handle: enough for a client to reconcile the
 /// charge post-hoc.
 #[derive(Debug, Serialize)]
 pub struct ResponseMetadata {
     pub request_id: String,
     pub units_charged: u64,
-    /// Which of the publisher's policies priced this request (#94).
+    /// Which of the publisher's policies priced this request (GL-94).
     ///
     /// Read off the committed guard rather than looked up again, so it is the
     /// revision the usage event carries by construction. A real consumer
@@ -357,7 +357,7 @@ pub const DEMO_ACCOUNT: AccountId = AccountId(1);
 /// One demo tenant: an account, the credential that reaches it, and the
 /// execution-capacity class its work belongs to.
 ///
-/// The example served exactly one account until #99, which is why the two
+/// The example served exactly one account until GL-99, which is why the two
 /// `load/` witnesses could not be written: capacity class is *account-owned*,
 /// so a publish carrying a class the ledger disagrees with is refused. Mixed
 /// assured and best-effort traffic therefore needs more than one account —
@@ -406,7 +406,7 @@ pub fn demo_tenants(assured: usize, best_effort: usize) -> Vec<DemoTenant> {
         .collect()
 }
 
-/// The example's application-policy identity (#94). A real publisher would
+/// The example's application-policy identity (GL-94). A real publisher would
 /// hash the resolved product records it compiled into the snapshot; a fixed
 /// value is enough to demonstrate that the response metadata and the usage
 /// event name the same policy.
@@ -423,7 +423,7 @@ const REPUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3
 ///
 /// The generation must *advance*, not merely change: a backend drops a
 /// republish whose generation does not exceed the one it holds
-/// (INVARIANTS.md #3's anti-resurrection watermark), so a stalled counter
+/// (INVARIANTS.md GL-3's anti-resurrection watermark), so a stalled counter
 /// would silently stop extending validity rather than fail visibly.
 async fn republish_snapshots(
     store: Arc<MemoryStore>,
@@ -518,7 +518,7 @@ pub async fn build_app_with_sharding(
     .await
 }
 
-/// The multi-tenant, capacity-gated stack: what #99's load witnesses measure.
+/// The multi-tenant, capacity-gated stack: what GL-99's load witnesses measure.
 ///
 /// Separate from the builders above because it varies the two knobs they fix
 /// by construction — how many accounts exist and how their classes are
@@ -567,7 +567,7 @@ async fn build_app_with(
             status: AccountStatus::Active,
             // The ledger owns the class; every snapshot published below only
             // carries it. Creating the account with it is what lets the two
-            // agree (#99).
+            // agree (GL-99).
             capacity_class: tenant.capacity_class,
         });
     }
@@ -576,7 +576,7 @@ async fn build_app_with(
     // CostTable + AccountSnapshot once per policy generation — never per
     // request. Validity is bounded (1h) and a demo control-plane task
     // republishes with extended validity; the SnapshotManager keeps running
-    // instances current (review finding #5 — no more install-once-forever).
+    // instances current (review finding GL-5 — no more install-once-forever).
     let clock: Arc<SystemClock> = Arc::new(SystemClock);
     let compile_snapshot = {
         let clock = Arc::clone(&clock);
@@ -601,11 +601,11 @@ async fn build_app_with(
                 .enforcement_mode(enforcement_mode)
                 // Carried, never chosen here: the ledger decided it at
                 // account creation, and a snapshot that disagreed would be
-                // refused at publication (#99).
+                // refused at publication (GL-99).
                 .capacity_class(tenant.capacity_class)
                 // A real publisher hashes the product records it compiled;
                 // this example states a fixed one, which is enough to show
-                // the value reaching both the response and the bill (#94).
+                // the value reaching both the response and the bill (GL-94).
                 .policy_revision(DEMO_POLICY_REVISION)
                 .key_id(tollgate_core::KeyId(tenant.account.0))
                 .build(),
@@ -654,7 +654,7 @@ async fn build_app_with(
     };
 
     // `Disabled` composes no gate at all rather than one that always admits,
-    // so a demo that never configures capacity allocates no pool (#99).
+    // so a demo that never configures capacity allocates no pool (GL-99).
     let capacity = ExecutionCapacityGate::new(capacity, sharding)
         .expect("example capacity configuration is valid");
 
@@ -674,7 +674,7 @@ async fn build_app_with(
                 snapshots: SnapshotManagerConfig {
                     // Stateless: any instance may serve any customer, so this
                     // one tracks everything the store knows rather than a list
-                    // fixed at boot (#48). Seeded with the demo key so the
+                    // fixed at boot (GL-48). Seeded with the demo key so the
                     // example still works against a source that cannot
                     // enumerate.
                     principals: TrackedPrincipals::All {
@@ -692,7 +692,7 @@ async fn build_app_with(
                     // latency would refresh nothing while looking healthy. Five
                     // seconds against an in-process store that answers in
                     // microseconds is deliberate headroom — the bound exists to
-                    // keep the sweep returning (#103), not to police latency.
+                    // keep the sweep returning (GL-103), not to police latency.
                     fetch_timeout: std::time::Duration::from_secs(5),
                     enumeration_timeout: std::time::Duration::from_secs(30),
                 },
@@ -793,7 +793,7 @@ pub struct Capacity {
 /// What this instance admitted, refused, and has left to spend.
 ///
 /// JSON rather than an exposition format on purpose: naming the metrics is
-/// the decision, and issue #38 owns continuous export while #39 owns the
+/// the decision, and issue GL-38 owns continuous export while GL-39 owns the
 /// operator documentation. Choosing a wire format here would pre-empt both.
 #[derive(Debug, Serialize)]
 pub struct Metrics {
@@ -832,7 +832,7 @@ pub struct Metrics {
     pub capacity_shed: u64,
     pub refused_at_start: u64,
     /// The two capacity outcomes broken down by class, labelled by the enum
-    /// tags alone so cardinality stays bounded (#99). Each sums to the total
+    /// tags alone so cardinality stays bounded (GL-99). Each sums to the total
     /// beside it; neither replaces one, so a reader never has to add two
     /// numbers to get one.
     pub execution_started_by_class: BTreeMap<&'static str, u64>,
@@ -880,7 +880,7 @@ pub struct Metrics {
     pub refill: Option<Refill>,
     /// Snapshot-distribution health.
     pub snapshots: Option<Snapshots>,
-    /// Admission exchanges that lost a race to another core (#134, #139): which accounts,
+    /// Admission exchanges that lost a race to another core (GL-134, GL-139): which accounts,
     /// if any, are hot enough here to be worth sharding. Cumulative lower
     /// bounds; compare two scrapes.
     pub contention: Option<Contention>,
@@ -932,7 +932,7 @@ pub struct Snapshots {
     /// Fetches abandoned at the configured timeout, distinct from a source
     /// returning a failure.
     pub refresh_timeouts: u64,
-    /// Enumerations the source could not answer (#48). Its own counter
+    /// Enumerations the source could not answer (GL-48). Its own counter
     /// because its consequence is different: fetch failures make known
     /// principals stale, which `unresolved` shows, while enumeration failures
     /// mean *new* principals never appear — invisible in every other number,
@@ -951,13 +951,13 @@ pub struct Snapshots {
 }
 
 /// What the usage writer has done with the charges handed to it — readable at
-/// any time, not only from a graceful shutdown (#38).
+/// any time, not only from a graceful shutdown (GL-38).
 #[derive(Debug, Serialize)]
 pub struct Accounting {
     /// Events the sink recorded.
     pub accepted: u64,
     /// Events whose request id the sink had already recorded — idempotent
-    /// replay, not loss (INVARIANTS.md #7).
+    /// replay, not loss (INVARIANTS.md GL-7).
     pub duplicate: u64,
     /// Events the sink *refused*: unknown lease, lease-capability mismatch,
     /// or no remaining lease capacity. Bounded billing loss, and the number
@@ -970,7 +970,7 @@ pub struct Accounting {
     pub lost: u64,
     /// Charges queued with no billing outcome yet.
     pub unaccounted: u64,
-    /// Requests refused for want of queue capacity (INVARIANTS.md #8).
+    /// Requests refused for want of queue capacity (INVARIANTS.md GL-8).
     pub shed: u64,
     /// Queue occupancy against its shed point: backpressure is visible here
     /// *before* it starts refusing requests.
@@ -985,7 +985,7 @@ pub struct Accounting {
 }
 
 /// The counters are read off the engine, not the request path: this handler
-/// does the loads, the formatting and the allocation that INVARIANTS.md #5
+/// does the loads, the formatting and the allocation that INVARIANTS.md GL-5
 /// keeps out of `admit`.
 async fn metrics(State(state): State<Arc<AppState>>) -> Json<Metrics> {
     let counters = state.counters().snapshot();
@@ -1172,7 +1172,7 @@ fn deny_response(reason: DenyReason) -> Response {
         }
         // 503, not 429: the caller did nothing wrong and slowing down would
         // not help — the instance is full, and capacity returns as requests
-        // finish rather than as a quota refills (#99).
+        // finish rather than as a quota refills (GL-99).
         DenyReason::CapacityUnavailable => {
             (StatusCode::SERVICE_UNAVAILABLE, "capacity-unavailable")
         }
@@ -1183,7 +1183,7 @@ fn deny_response(reason: DenyReason) -> Response {
 async fn price(input: PriceInput) -> Response {
     // One destructuring, not a flag check followed by an unwrap that has to
     // agree with it: the same `let` that rules out the baseline is what hands
-    // this handler the recorder (#16).
+    // this handler the recorder (GL-16).
     let PriceInput { request, staged } = input;
     let Some(Staged {
         context,
@@ -1240,7 +1240,7 @@ fn execute<P: CapacityPermit>(
     // Random 128-bit ids: idempotency keys are global, so ids must be
     // collision-free across instances and restarts — a process-local counter
     // would make a second instance's legitimate usage read as duplicates
-    // (review finding #6).
+    // (review finding GL-6).
     let request_id = RequestId(uuid::Uuid::new_v4().as_u128());
     let committed = match ready.commit(request_id, Timestamp::now()) {
         Ok(committed) => committed,
@@ -1506,7 +1506,7 @@ mod tests {
         assert_eq!(first.capacity_class, CapacityClass::Assured);
     }
 
-    /// #99's refusal reaches a caller as 503 `capacity-unavailable`.
+    /// GL-99's refusal reaches a caller as 503 `capacity-unavailable`.
     ///
     /// Deliberately not 429: the caller did nothing wrong and slowing down
     /// would not help, because capacity returns as requests finish rather than

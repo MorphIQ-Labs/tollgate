@@ -69,7 +69,7 @@ fn lease() -> Arc<LocalLease> {
 
 /// Record a scope that is *allowed* to allocate, and pin the exact count.
 ///
-/// `split` is the one allocation #93 adds, and it is opt-in: the unsplit
+/// `split` is the one allocation GL-93 adds, and it is opt-in: the unsplit
 /// scopes above stay at zero and are the comparison. Recording it under its own
 /// attribution keeps it out of the `tollgate` allocation-free rule while the
 /// gate still holds it to exactly one `Arc` — an exemption that could not fail
@@ -148,7 +148,7 @@ fn core_hot_path_allocates_nothing() {
     });
     // The commit-time elastic fallback changes a reservation's funding source
     // on the request path, so it must stay allocation-free like every other
-    // resolution (INVARIANTS.md #24). A lease that lapsed at execution start.
+    // resolution (INVARIANTS.md GL-24). A lease that lapsed at execution start.
     assert_zero("core/reserve_commit_overage_fallback", || {
         let reservation = Reservation::reserve(&lapsed_lease, CostUnits(100), now).unwrap();
         black_box(
@@ -168,7 +168,7 @@ fn core_hot_path_allocates_nothing() {
                 .expect("a committed fallback has usage"),
         );
     });
-    // The shared cancel state: the single allocation #93 permits, measured
+    // The shared cancel state: the single allocation GL-93 permits, measured
     // separately from the allocation-free path above so a consumer that does
     // not need a timeout/worker race is never charged for one.
     assert_exactly_one_allocation("reservation/commit_split", || {

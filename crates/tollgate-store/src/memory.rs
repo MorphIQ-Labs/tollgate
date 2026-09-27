@@ -27,12 +27,12 @@
 //!   its lease capability and checked against settlement capacity (see
 //!   [`UsageSink::ingest`]).
 //! - `snapshots` keeps revoked principals as tombstones, deliberately: that is
-//!   INVARIANTS.md #15's anti-resurrection watermark, and the population is
+//!   INVARIANTS.md GL-15's anti-resurrection watermark, and the population is
 //!   bounded by the number of principals rather than by traffic.
 //!
 //! The *sweep* cost does not follow that growth. Active leases are indexed
 //! in the private `leases` module, so reclaim and [`MemoryStore::conservation`] walk
-//! the live population, not the historical one (#23). Memory still does grow,
+//! the live population, not the historical one (GL-23). Memory still does grow,
 //! so this backend suits development and demos but not soak or load testing;
 //! [`MemoryStore::stored_records`] reports the numbers, and the server logs
 //! them once per sweep.
@@ -65,7 +65,7 @@ use crate::traits::{
     pushes_exceed_capacity,
 };
 
-/// An account's balance, split by what expires and what does not (#97).
+/// An account's balance, split by what expires and what does not (GL-97).
 ///
 /// One number could not carry this. At a period boundary the allowance's
 /// remainder is expired and manual credits are kept, and a single balance can
@@ -140,12 +140,12 @@ struct AccountRecord {
     expired: CostUnits,
     /// Mirrors `tollgate_accounts.status`. An [`AccountStatus`] rather than a
     /// bool so `Closed` is representable and terminality can be checked here
-    /// instead of inferred from snapshots (#51).
+    /// instead of inferred from snapshots (GL-51).
     status: AccountStatus,
     /// Mirrors `tollgate_accounts.capacity_class`. The account-owned fact a
     /// snapshot's `capacity_class` is a copy of, and the reason a publish
     /// carrying a different one is refused: two writers for one fact is the
-    /// divergence #51 abolished for status (#99).
+    /// divergence GL-51 abolished for status (GL-99).
     capacity_class: CapacityClass,
     next_fence: u64,
     /// Usage accepted into the billing ledger.
@@ -163,7 +163,7 @@ struct AccountRecord {
 
 impl AccountRecord {
     /// What this account could still spend, for a snapshot's budget view
-    /// (#97).
+    /// (GL-97).
     ///
     /// Balance *plus* the unspent remainder of every active lease, because
     /// units out on lease are still the account's — an instance holding a
@@ -218,7 +218,7 @@ fn allowance_lapsed(record: &AccountRecord, period_start: Timestamp) -> bool {
 }
 
 /// Return a settled lease's unspent units to the account — expiring the
-/// allowance half, if the period that funded it has closed (#97).
+/// allowance half, if the period that funded it has closed (GL-97).
 ///
 /// This is the whole of the "drain then expire" decision. An active lease at a
 /// period boundary keeps serving to its own TTL, so there is no admission gap
@@ -265,14 +265,14 @@ fn credit_settlement(
 /// A principal's stored snapshot state.
 ///
 /// An enum rather than `{ generation, snapshot: Option<_> }` so the generation
-/// is stored exactly once (#54). The struct held it twice whenever a snapshot
+/// is stored exactly once (GL-54). The struct held it twice whenever a snapshot
 /// was present — once in the field and once inside the snapshot — with nothing
 /// but caller discipline keeping them equal, the same shape PostgreSQL had
 /// between its column and its JSONB.
 ///
 /// The field could not simply be deleted: revoking sets the snapshot aside, and
 /// its generation is then the only surviving watermark, without which
-/// INVARIANTS.md #15's anti-resurrection rule would be unimplementable here. So
+/// INVARIANTS.md GL-15's anti-resurrection rule would be unimplementable here. So
 /// each state carries the generation in exactly one place instead.
 ///
 /// Variants named for the [`SnapshotResolution`] they map onto, since
@@ -333,7 +333,7 @@ struct StoredKey {
 /// This backend never forgets, so the first two numbers climb with traffic for
 /// the life of the process while the third returns to the live population.
 /// Reported so "grows without bound" is a number an operator can watch rather
-/// than a claim in a doc comment (#23).
+/// than a claim in a doc comment (GL-23).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoredRecords {
     /// Credentials with recorded attributable commitments, including retired keys.
@@ -402,7 +402,7 @@ impl MemoryStore {
 
     /// Create an account. Never destructive: an existing account (with its
     /// balance, ledger totals, fencing sequence, and leases) is left
-    /// untouched and the caller told (review finding #7).
+    /// untouched and the caller told (review finding GL-7).
     pub fn try_create_account(&self, config: AccountConfig) -> Result<(), CreateAccountError> {
         self.create_account_audited(config)
             .map(|receipt| receipt.outcome)
@@ -471,11 +471,11 @@ impl MemoryStore {
         // as they were computed left the ledger permanently short when the
         // second overflowed: conservation keeps `balance <= deposited`, so
         // `deposited` reaches the ceiling first, and a refused top-up on a
-        // fully-spent account still credited `balance` (#57). `PostgresStore`
+        // fully-spent account still credited `balance` (GL-57). `PostgresStore`
         // moves both columns in one statement, where an overflow aborts it
         // and nothing moves.
         // A manual deposit is a top-up: it survives a period boundary, which
-        // is the documented default (#97). An allowance only ever arrives
+        // is the documented default (GL-97). An allowance only ever arrives
         // through `roll_period`.
         let topup = record
             .balance
@@ -503,7 +503,7 @@ impl MemoryStore {
     /// subscribers. Generation-monotonic: a replayed or reordered publish
     /// carrying an older (or equal) generation is a no-op — matching the
     /// Postgres backend, which enforces the same rule in its upsert (review
-    /// finding #5's backend-divergence note).
+    /// finding GL-5's backend-divergence note).
     pub fn publish_snapshot(
         &self,
         principal: Principal,
@@ -562,7 +562,7 @@ impl MemoryStore {
     // ---- reconciliation / test surface -------------------------------
 
     /// The sums are recomputed from the lease records every time. The index
-    /// narrows *which* records are read (#23) and is never the source of the
+    /// narrows *which* records are read (GL-23) and is never the source of the
     /// numbers: this function exists to catch ledger bugs, and one that read a
     /// running total maintained by the same writers that might be wrong could
     /// not catch them.
@@ -631,7 +631,7 @@ impl MemoryStore {
     }
 
     /// Lease records examined by the sweep and by `conservation` since this
-    /// store was created. The bound #23 claims is about work, so only a count
+    /// store was created. The bound GL-23 claims is about work, so only a count
     /// of records actually looked at can witness it.
     #[cfg(test)]
     fn leases_examined(&self) -> usize {
@@ -656,7 +656,7 @@ impl MemoryStore {
 /// balance.
 ///
 /// Not always all of it: the allowance half of a lease funded by a period that
-/// has since closed expires instead of coming back (#97, and
+/// has since closed expires instead of coming back (GL-97, and
 /// [`credit_settlement`], which applies the same rule). A caller sizing a
 /// grant against the credit it is about to make must ask this rather than
 /// assume `unspent`.
@@ -860,7 +860,7 @@ fn apply_grant(
         .get_mut(&account)
         .expect("the plan validated this account under this same lock");
     // Allowance first, and the split travels with the lease so settlement
-    // returns each half where it came from (#97).
+    // returns each half where it came from (GL-97).
     let drawn = record
         .balance
         .take(plan.granted)
@@ -946,7 +946,7 @@ impl LeaseAllocator for MemoryStore {
             .ok_or(AllocateError::UnknownAccount)?;
         // Not `unspent`: the allowance half of a lease funded by a closed
         // period expires rather than returning, so the grant is sized against
-        // what the credit will actually restore (#97).
+        // what the credit will actually restore (GL-97).
         let restored = spendable_credit(record, release.funding, release.period_start, unspent);
         let preserves_funding = release.loss.is_zero() && restored == unspent;
         let grant = plan_grant(
@@ -972,7 +972,7 @@ impl LeaseAllocator for MemoryStore {
         let mut inner = self.lock();
         // Walks the active index, oldest expiry first, and stops at the first
         // lease that is not yet due — so the cost is what is being reclaimed,
-        // not what the process has ever leased (#23).
+        // not what the process has ever leased (GL-23).
         let expired = inner
             .leases
             .reclaimable(self.policy.reclaim_cutoff(now), limit.get());
@@ -981,13 +981,13 @@ impl LeaseAllocator for MemoryStore {
         // settled leases and credited balances would return `Err` over a
         // ledger that had moved. Unreachable while `reclaimable` respects the
         // limit, but the structure is the defect, and it is one refactor away
-        // from being reachable (#57).
+        // from being reachable (GL-57).
         let mut reclaimed = Vec::with_capacity(expired.len());
         // A holder that never released cannot prove any unit unspent: its
         // lease accepted commits until `usable_until`, and whatever it had
         // committed but not flushed died with it. So a sweep settles the lease
         // as a release claiming nothing would: no credit, and the remainder
-        // recorded as provisional settlement loss (#136). Usage that arrives
+        // recorded as provisional settlement loss (GL-136). Usage that arrives
         // later still fits in that gap and converts loss into billed usage
         // (see `ingest`), which is how a holder that outlived an outage is
         // billed rather than dropped.
@@ -1086,7 +1086,7 @@ fn publish_locked(
     {
         return Ok(None);
     }
-    // The store stamps the budget view; a publisher cannot supply one (#97).
+    // The store stamps the budget view; a publisher cannot supply one (GL-97).
     // Done here rather than at each caller so the two publication entry points
     // cannot drift, and under the same lock as the write so the number
     // published is the ledger as of that write. An account this store does not
@@ -1121,7 +1121,7 @@ fn remove_locked(inner: &mut Inner, principal: Principal) -> AdminReceipt<()> {
 }
 
 /// Resolve `account`'s credential `key` to its stored record under the
-/// caller's guard: the principal never leaves the store (#143).
+/// caller's guard: the principal never leaves the store (GL-143).
 fn account_key(
     inner: &Inner,
     account: AccountId,
@@ -1174,11 +1174,11 @@ impl Restamp {
 /// overflow surfaced, *before* a single record is touched. A loop that
 /// mutated as it went would leave an account half-republished behind a `u64`
 /// overflow — one ledger status, two different snapshot statuses — which is
-/// precisely the divergence #51 exists to abolish, reintroduced in the
+/// precisely the divergence GL-51 exists to abolish, reintroduced in the
 /// backend that serves as the executable reference.
 ///
 /// Tombstones are skipped: `snapshot: None` is a revoked principal, and
-/// republishing it would resurrect it (INVARIANTS.md #15). Note this backend
+/// republishing it would resurrect it (INVARIANTS.md GL-15). Note this backend
 /// skips them because the tombstone has *lost* its account attribution, while
 /// PostgreSQL skips them by `deleted = FALSE` with the JSON still present —
 /// different mechanisms, identical behaviour, which is what the mirrored
@@ -1197,7 +1197,7 @@ fn plan_republish(
     let mut planned = Vec::new();
     for (principal, record) in &inner.snapshots {
         // Revoked principals are skipped: republishing one would resurrect it,
-        // which INVARIANTS.md #15 forbids.
+        // which INVARIANTS.md GL-15 forbids.
         let SnapshotRecord::Present(snapshot) = record else {
             continue;
         };
@@ -1213,7 +1213,7 @@ fn plan_republish(
                 SetStatusError::Storage(StoreError("snapshot generation overflow".into()))
             })?;
         // The restamped snapshot carries the new generation; the plan does not
-        // carry a second copy of it (#54).
+        // carry a second copy of it (GL-54).
         planned.push((*principal, restamp.apply(snapshot, generation)));
     }
     planned.sort_unstable_by_key(|(principal, _)| *principal);
@@ -1299,7 +1299,7 @@ impl AdminStore for MemoryStore {
         // Iterating `accounts` directly and breaking at `limit` selected by
         // hash order, so with more accounts due than one batch can take, two
         // runs over identical state rolled different accounts — and a different
-        // set again from the backend this one is the reference for (#100). The
+        // set again from the backend this one is the reference for (GL-100). The
         // drain loop means every due account is rolled eventually, so this was
         // not a ledger defect; it was an unbounded-in-principle wait for any
         // particular account, and a divergence no test could see.
@@ -1391,7 +1391,7 @@ impl AdminStore for MemoryStore {
             // generation overflow surfaces here rather than after the ledger
             // has already moved. Writing the ledger first and failing here
             // would leave the account suspended with Active snapshots -- the
-            // divergence INVARIANTS.md #22 forbids, in the very backend that
+            // divergence INVARIANTS.md GL-22 forbids, in the very backend that
             // serves as its reference.
             let before = AdminState::Status {
                 status: record.status,
@@ -1509,8 +1509,8 @@ impl AdminStore for MemoryStore {
         // `plan_republish` never saw — because it did not exist yet. The
         // ledger said suspended, that principal's live snapshot said active,
         // and it kept being admitted until someone repeated the transition.
-        // That is #51's defect reintroduced in the backend that serves as
-        // INVARIANTS.md #22's reference. `PostgresStore` holds `FOR SHARE` on
+        // That is GL-51's defect reintroduced in the backend that serves as
+        // INVARIANTS.md GL-22's reference. `PostgresStore` holds `FOR SHARE` on
         // the account row across the same pair, which `set_account_status`'s
         // `FOR UPDATE` serialises against.
         let (published, before, after) = {
@@ -1602,14 +1602,14 @@ impl SnapshotSource for MemoryStore {
     /// Tombstones included: a revoked principal is one an instance must keep
     /// tracking so it keeps *knowing* about the revocation. Dropping it from
     /// the catalogue would make it indistinguishable from a principal that
-    /// never existed, which is the resurrection INVARIANTS.md #15 forbids.
+    /// never existed, which is the resurrection INVARIANTS.md GL-15 forbids.
     async fn principals(&self) -> Result<Option<Vec<Principal>>, StoreError> {
         // Sorted, because the catalogue is an output and `snapshots` is a
         // `HashMap`: returning its iteration order would make this call's
         // result depend on the hash seed rather than on the stored state, and
         // differ run to run. `PostgresStore` already answers
         // `ORDER BY principal`, so the reference backend was the one diverging
-        // (#100). The suite's assertion sorted before comparing, which is how
+        // (GL-100). The suite's assertion sorted before comparing, which is how
         // it stayed invisible.
         #[allow(
             clippy::disallowed_methods,
@@ -1633,12 +1633,12 @@ impl UsageSink for MemoryStore {
         // Planned first, applied second. The overage branch can fail the whole
         // batch on an accounting overflow, and returning from the middle of an
         // applying loop left every earlier event of the batch committed while
-        // the caller was told the batch failed (#57): `UsageWriter` reads a
+        // the caller was told the batch failed (GL-57): `UsageWriter` reads a
         // `StoreError` as an outage and retries, the replay counts the applied
         // events as duplicates, and retry accounting then describes a batch
         // that partially succeeded as a total failure. `PostgresStore` runs
         // the batch in one transaction and rolls it back, so this is the shape
-        // that makes the two backends agree (INVARIANTS.md #7).
+        // that makes the two backends agree (INVARIANTS.md GL-7).
         //
         // The plan carries overlays rather than reading `inner` twice, because
         // events in one batch see each other: two charges against the same
@@ -1686,7 +1686,7 @@ impl UsageSink for MemoryStore {
                     .get(&event.account_id)
                     .unwrap_or(&record.overage_recorded);
                 // Both terms must move or neither does, or the equation is
-                // left open (INVARIANTS.md #11). A total that cannot be
+                // left open (INVARIANTS.md GL-11). A total that cannot be
                 // represented is corruption of a monotonic column rather than
                 // a problem with this event, so it is surfaced as a store
                 // error and the whole batch fails — and because nothing has
@@ -1698,7 +1698,7 @@ impl UsageSink for MemoryStore {
                     // Refused, not unavailable: a monotonic column that cannot
                     // absorb these units will not absorb them on the next
                     // attempt either, so retrying this batch forever would
-                    // wedge the writer behind an arithmetic fact (#61).
+                    // wedge the writer behind an arithmetic fact (GL-61).
                     return Err(IngestError::Refused(StoreError(format!(
                         "overage accounting overflow for account {:#034x}: recorded usage {} \
                          and overage {} cannot absorb {}",
@@ -2047,7 +2047,7 @@ impl KeyDirectory for MemoryStore {
         // its own successful write may have filled the bound, and answering
         // `ActiveKeyLimit` would tell it to retire a credential when what
         // actually happened is that its first call worked. `AlreadyExists` is
-        // both the true answer and the one that makes the retry safe (#121).
+        // both the true answer and the one that makes the retry safe (GL-121).
         if !inner.accounts.contains_key(&record.account_id) {
             return Err(KeyError::UnknownAccount);
         }
@@ -2292,7 +2292,7 @@ mod tests {
         store.leases_examined() - before
     }
 
-    /// #23's whole claim: the sweep's cost follows the live population, not
+    /// GL-23's whole claim: the sweep's cost follows the live population, not
     /// what the process has ever leased. Two settled populations two orders of
     /// magnitude apart must cost the sweep the same, which is a stronger
     /// statement than any absolute constant — and the one that fails if the

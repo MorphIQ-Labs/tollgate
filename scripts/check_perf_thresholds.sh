@@ -11,9 +11,9 @@
 # verdict and report why no sample was retained; ratios-only never deposits.
 # `--record` rewrites testing/perf_baseline.json whole from the median of the
 # distinct runs at the current revision in the same environment, and refuses
-# with fewer than three; it is the only supported way to recalibrate (#114).
-# Mirrors ferro-risk's gate: stale Criterion output is wiped first and a
-# freshness marker rejects anything the current run did not produce.
+# with fewer than three; it is the only supported way to recalibrate (GL-114).
+# Stale Criterion output is wiped first and a freshness marker rejects
+# anything the current run did not produce.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -26,7 +26,7 @@ BASELINE="testing/perf_baseline.json"
 # this host and are never checked in.
 SAMPLES="target/perf-samples"
 # A bounded window of past readable runs, kept across calibration series, from
-# which --record derives each row's allowance (#141). --fresh-samples clears
+# which --record derives each row's allowance (GL-141). --fresh-samples clears
 # the samples of the series being recorded, never this.
 HISTORY="target/perf-history"
 gate_args=(--baseline "$BASELINE" --samples "$SAMPLES" --run-history "$HISTORY")
@@ -66,7 +66,7 @@ cargo bench --locked -p tollgate-core --bench core_hot_path
 cargo bench --locked -p tollgate-admission --bench admission_hot_path
 # Every id in the manifest must be produced by a benchmark this script runs, or
 # `evaluate` reports it missing-or-stale and the gate fails whatever the code
-# does. Adding a manifest entry without a run here is how that happens (#2).
+# does. Adding a manifest entry without a run here is how that happens (GL-2).
 cargo bench --locked -p tollgate-auth --bench credential_verification
 cargo bench --locked -p tollgate-client --bench managed_credentials
 cargo bench --locked -p tollgate-client --bench usage_queue
@@ -86,7 +86,7 @@ load_average() {
 
 # Swap pressure and free memory. A host that is paging produces wide
 # confidence intervals while its load average and CPU idle still look healthy,
-# which is how #114 mistook a swapping machine for a threshold problem.
+# which is how GL-114 mistook a swapping machine for a threshold problem.
 memory_state() {
     if [ -r /proc/meminfo ]; then
         awk '/^(MemAvailable|SwapFree|SwapTotal):/ { printf "%s %s kB; ", $1, $2 }' /proc/meminfo

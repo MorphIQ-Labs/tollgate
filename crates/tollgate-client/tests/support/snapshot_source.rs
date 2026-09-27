@@ -10,7 +10,7 @@ pub(crate) use crate::delegating::{DelegatingStore, RejectingStore};
 
 /// A source whose pulls are fixed and whose pushes the test drives directly.
 ///
-/// The #53 regression tests all use `MutableNoPushSource`, so they exercise the
+/// The GL-53 regression tests all use `MutableNoPushSource`, so they exercise the
 /// *sweep*. Pushes are the primary propagation path for an in-process store,
 /// with the sweep as fallback — and the manager applies the same generation
 /// rule at both. This source is what lets the push half be pinned.
@@ -41,7 +41,7 @@ impl DrivenPushSource {
                     .on_subscribe(move |_| subs.push.subscribe())
                     // Stated, not inherited: this source has no catalogue, and
                     // saying so is what keeps it distinguishable from a wrapper
-                    // that forgot to forward one it did have (#83).
+                    // that forgot to forward one it did have (GL-83).
                     .on_principals(|_| async { Ok(None) }),
             ),
         )

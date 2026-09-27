@@ -1,5 +1,5 @@
 //! Background snapshot distribution: initial load, push subscription with
-//! lag recovery, periodic refresh, and revocation (review finding #5).
+//! lag recovery, periodic refresh, and revocation (review finding GL-5).
 //!
 //! The manager keeps an admission map stocked for a tracked set of
 //! principals from a [`SnapshotSource`]:
@@ -7,7 +7,7 @@
 //! - **Initial load** — every tracked principal is resolved (installed, or
 //!   negative-cached when the source confirms it unknown) before the
 //!   [`ready`](SnapshotManager::ready) watch becomes true, so readiness never
-//!   precedes admissibility (INVARIANTS.md #10). It returns to false when a
+//!   precedes admissibility (INVARIANTS.md GL-10). It returns to false when a
 //!   resolution expires or the manager exits. Source errors keep retrying;
 //!   readiness waits.
 //! - **Pushes** — subscribed updates install immediately (the map's
@@ -45,7 +45,7 @@ pub use crate::registry::SlotRegistry;
 /// Which principals an instance serves.
 ///
 /// A shape rather than a flag beside a list, so there is no boolean that can
-/// disagree with the data it governs (#16's lesson, applied to #48).
+/// disagree with the data it governs (GL-16's lesson, applied to GL-48).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrackedPrincipals {
     /// Exactly these, fixed for the process's life. Onboarding a principal
@@ -82,7 +82,7 @@ impl TrackedPrincipals {
 #[derive(Debug, Clone)]
 pub struct SnapshotManagerConfig {
     /// The principals this instance serves — a fixed list, or everything the
-    /// source knows (#48).
+    /// source knows (GL-48).
     pub principals: TrackedPrincipals,
     /// Full refetch cadence — also the revocation propagation bound.
     pub refresh_interval: std::time::Duration,
@@ -97,7 +97,7 @@ pub struct SnapshotManagerConfig {
     /// onboarding latency.
     pub unknown_ttl: SignedDuration,
     /// How long a *published revocation tombstone* stays negative before the
-    /// manager rechecks it (#52).
+    /// manager rechecks it (GL-52).
     ///
     /// Long: coming back means an operator reinstated the account, which is
     /// rare, and a catalogue accumulates these forever — every cancelled
@@ -123,7 +123,7 @@ pub struct SnapshotManagerConfig {
     /// readiness falling as resolutions expire, not by cutting the call off.
     /// That is deliberate, and it is why this bound sits at the *fetch*: what
     /// it protects is the loop's ability to come back, not the freshness of
-    /// any one principal (#103). A future that never resolves is never
+    /// any one principal (GL-103). A future that never resolves is never
     /// joined, so without it one hung fetch stops the sweep from returning
     /// and no tick, push, or control wakeup is processed again for the life
     /// of the process.
@@ -149,7 +149,7 @@ pub struct SnapshotManagerConfig {
     /// performs, counted over the whole tracked set rather than a typical one.
     /// An abandoned enumeration keeps the set it already had, so a value under
     /// real catalogue latency freezes discovery while everything already
-    /// tracked keeps working — the failure #48 exists to make visible.
+    /// tracked keeps working — the failure GL-48 exists to make visible.
     pub enumeration_timeout: std::time::Duration,
 }
 
@@ -219,7 +219,7 @@ pub struct SnapshotManagerReport {
 /// Fixed/All rule. That is the right shape for a readiness probe and the
 /// wrong shape for diagnosis: it cannot say whether one principal is
 /// unresolved or a thousand, nor whether the source has been failing all
-/// morning (#4). These counters are the scrapeable half, and the
+/// morning (GL-4). These counters are the scrapeable half, and the
 /// `unresolved` gauge is computed from the same resolutions used by readiness.
 /// Task liveness is independent: a stopped manager is unready even if its
 /// last resolution pass had no unresolved principals.
@@ -265,7 +265,7 @@ impl SnapshotCounters {
         self.refresh_failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A fetch abandoned at `fetch_timeout` rather than answered (#103).
+    /// A fetch abandoned at `fetch_timeout` rather than answered (GL-103).
     ///
     /// Counted apart from `refresh_failures` for the reason the lease
     /// manager keeps `acquire_timeouts` apart from refusals: a timeout is not
@@ -283,7 +283,7 @@ impl SnapshotCounters {
     /// failure with a different consequence: fetches failing means known
     /// principals go stale, while enumeration failing means *new* principals
     /// never appear at all — and that one is otherwise invisible, since
-    /// everything already tracked keeps working perfectly (#48).
+    /// everything already tracked keeps working perfectly (GL-48).
     fn record_discovery_failure(&self) {
         self.discovery_failures.fetch_add(1, Ordering::Relaxed);
     }
@@ -425,7 +425,7 @@ impl SnapshotManager {
     /// Its two peers already return what they know at shutdown; this one
     /// returned nothing, so a manager that panicked mid-refresh was visible
     /// only as snapshots quietly going stale — indistinguishable from a
-    /// control plane with nothing to say (issue #36).
+    /// control plane with nothing to say (issue GL-36).
     pub async fn shutdown(mut self) -> SnapshotManagerReport {
         crate::signal(&self.shutdown, true, "snapshot-manager shutdown");
         let Some(handle) = self.handle.as_mut() else {
@@ -465,7 +465,7 @@ enum Resolution {
         ///
         /// It used to be a bare `Option<Generation>`, which could not say
         /// whether the number came from a published revocation or merely from
-        /// the positive this negative replaced. That conflation is #53.
+        /// the positive this negative replaced. That conflation is GL-53.
         watermark: Option<Watermark>,
     },
 }
@@ -486,7 +486,7 @@ impl UpdateOrigin {
 }
 
 impl Resolution {
-    /// Test-only since #22: production code reads deadlines out of the
+    /// Test-only since GL-22: production code reads deadlines out of the
     /// ordered indexes rather than out of the resolution, and this survives
     /// as the naive reference's accessor — the thing the property test checks
     /// the indexes against.
@@ -504,7 +504,7 @@ impl Resolution {
     /// A live snapshot's own generation is a [`Watermark::Positive`]: it orders
     /// snapshots, but it asserts nothing about that generation being dead, so
     /// the same generation arriving again is a re-observation rather than a
-    /// resurrection (#53).
+    /// resurrection (GL-53).
     fn watermark(self) -> Option<Watermark> {
         match self {
             Resolution::Present { generation, .. } => Some(Watermark::Positive(generation)),
@@ -560,7 +560,7 @@ impl Publication {
         self.slots
             .observe_many(principals.into_iter().map(|principal| {
                 // Observing our own publication is control-plane work, so it
-                // reads a fixed affinity rather than claiming one (#124).
+                // reads a fixed affinity rather than claiming one (GL-124).
                 (principal, self.map.get_at(&principal, Locality::OBSERVER))
             }));
         Ok(())
@@ -572,7 +572,7 @@ impl Publication {
 ///
 /// Every answer here used to be a full scan of the map, and one of them ran
 /// once per completed fetch inside the refresh sweep — so a sweep of N
-/// principals did N × O(N) work (#22). That is invisible at today's static
+/// principals did N × O(N) work (GL-22). That is invisible at today's static
 /// principal counts and becomes the binding constraint under the dynamic
 /// discovery seam `docs/DESIGN.md` defers.
 ///
@@ -591,7 +591,7 @@ struct Resolutions {
     /// The principals this instance tracks — the denominator readiness is
     /// measured against.
     ///
-    /// A set rather than #22's `usize` because discovery can change it (#48),
+    /// A set rather than GL-22's `usize` because discovery can change it (GL-48),
     /// and a count alone cannot answer "is this one still ours?" when a push
     /// arrives or an enumeration drops someone.
     tracked: HashSet<Principal>,
@@ -736,7 +736,7 @@ impl Resolutions {
     /// being revoked. A revoked principal is still enumerated (its tombstone
     /// is the record of the revocation), so it stays tracked and negative;
     /// conflating the two would drop a generation watermark and let a
-    /// replayed older snapshot resurrect it (INVARIANTS.md #15).
+    /// replayed older snapshot resurrect it (INVARIANTS.md GL-15).
     fn retain(&mut self, discovered: HashSet<Principal>) {
         let removed: Vec<Principal> = self
             .tracked
@@ -775,7 +775,7 @@ impl Resolutions {
     /// Delegates to the admission layer's decision function rather than
     /// restating the comparison. The manager gates *before* the map is ever
     /// called, so a second copy of the rule here would decide the outcome on
-    /// its own — which is how #53 survived a fix to the map alone.
+    /// its own — which is how GL-53 survived a fix to the map alone.
     ///
     /// History reclamation discards this resolution before refetching. A
     /// separate visible eviction leaves history intact; probe cache membership
@@ -960,7 +960,7 @@ impl Resolutions {
     ///
     /// Negatives are excluded because they already have a schedule of their
     /// own — [`Self::due_for_refetch`], on the TTL their kind carries. Sweeping
-    /// them as well fetched every tombstone twice per cycle for nothing (#52).
+    /// them as well fetched every tombstone twice per cycle for nothing (GL-52).
     ///
     /// Principals with *no* resolution stay in: that is the initial load, and
     /// every principal discovery has just added.
@@ -992,7 +992,7 @@ impl Resolutions {
     /// likely a reinstatement, Negative → Present, so the principals this
     /// path exists to repair are exactly the ones `due_for_sweep` filters
     /// out. Lag means local resolutions are untrustworthy; filtering by them
-    /// would be assuming the answer (#52).
+    /// would be assuming the answer (GL-52).
     fn all_tracked(&self) -> Vec<Principal> {
         #[allow(
             clippy::disallowed_methods,
@@ -1007,7 +1007,7 @@ impl Resolutions {
     /// `limit` of them.
     ///
     /// The cap is what keeps a due *population* from becoming one unbounded
-    /// await. Before #52 every sweep re-armed each negative's deadline, so the
+    /// await. Before GL-52 every sweep re-armed each negative's deadline, so the
     /// refetch index rarely fired at all; now a catalogue resolved in one
     /// initial load shares a deadline and comes due together. The caller
     /// awaits this batch inline, so an uncapped set would hold the select
@@ -1044,7 +1044,7 @@ fn until(deadline: jiff::Timestamp, now: jiff::Timestamp) -> std::time::Duration
 }
 
 /// Whether the instance should be in rotation, and why the answer differs by
-/// mode (INVARIANTS.md #10).
+/// mode (INVARIANTS.md GL-10).
 ///
 /// Under [`TrackedPrincipals::Fixed`] readiness is unchanged: every tracked
 /// principal resolved. The set is small and hand-configured, so anything less
@@ -1054,7 +1054,7 @@ fn until(deadline: jiff::Timestamp, now: jiff::Timestamp) -> std::time::Duration
 /// the whole customer base, so it would hold an instance serving 15,999 of
 /// 16,000 principals out of rotation for the one the source cannot answer for
 /// — fail-closed correctness masquerading as *un*availability, which is the
-/// same error #10 exists to prevent, pointed the other way. Per-principal
+/// same error GL-10 exists to prevent, pointed the other way. Per-principal
 /// admissibility does not need readiness to enforce it: the map already denies
 /// fail-closed for anything unresolved.
 ///
@@ -1083,7 +1083,7 @@ fn update_ready(
     let outstanding = resolutions.unresolved(clock.now());
     counters.set_unresolved(outstanding as u64);
     let now_ready = ready_now(mode, outstanding, resolutions.tracked.len());
-    // Readiness transitions are the operator-visible half of INVARIANTS #10;
+    // Readiness transitions are the operator-visible half of INVARIANTS GL-10;
     // report the edges, not every recomputation.
     if ready.borrow().ne(&now_ready) {
         tracing::info!(ready = now_ready, "snapshot readiness changed");
@@ -1100,7 +1100,7 @@ fn after_std(now: jiff::Timestamp, duration: std::time::Duration) -> jiff::Times
 /// Which negative TTL a resolution takes.
 ///
 /// The distinction is the source's answer, not this instance's memory. An
-/// earlier cut of #52 keyed the TTL on the merged generation, reasoning that
+/// earlier cut of GL-52 keyed the TTL on the merged generation, reasoning that
 /// `Some(_)` meant "once served, now withdrawn". It does not: a principal the
 /// instance has served resolves `Unknown` whenever the source's row is merely
 /// *absent* — a store rebuilding after restart, a lagging replica, a failover
@@ -1123,7 +1123,7 @@ enum NegativeKind {
 /// When a negative resolution should next be rechecked.
 ///
 /// Keyed on [`NegativeKind`] — what the *source* answered — never on the
-/// generation this instance happens to remember (#52).
+/// generation this instance happens to remember (GL-52).
 fn negative_deadline(
     now: jiff::Timestamp,
     config: &SnapshotManagerConfig,
@@ -1207,7 +1207,7 @@ async fn refresh_chunk_cancellable(
     // The inner result is the source's answer; the outer one says whether it
     // arrived at all. Abandoning the fetch — rather than the task holding a
     // future that never resolves — is what lets `tasks` empty and the sweep
-    // return (#103).
+    // return (GL-103).
     type Fetched = Result<Result<SnapshotResolution, StoreError>, tokio::time::error::Elapsed>;
     let mut tasks = JoinSet::<Refreshed<Fetched>>::new();
     for _ in 0..config.max_concurrent_fetches {
@@ -1350,7 +1350,7 @@ async fn refresh_chunk_cancellable(
                     // The watermark passes through untouched. The source said
                     // nothing about any generation, so there is nothing here to
                     // raise or re-tag -- and re-tagging it as a revocation is what
-                    // stranded the principal at its own generation (#53).
+                    // stranded the principal at its own generation (GL-53).
                     let (watermark, _) = accept_unknown(resolutions.watermark_of(principal));
                     let until = negative_deadline(now, config, NegativeKind::Unknown);
                     resolutions.insert(
@@ -1404,7 +1404,7 @@ async fn refresh_chunk_cancellable(
 /// the configured-set behaviour, not an empty catalogue. A source that *fails*
 /// also leaves it alone, but counts as a refresh failure, because an instance
 /// quietly narrowing to nothing on a transient error would deny every request
-/// while reporting itself perfectly healthy (#48).
+/// while reporting itself perfectly healthy (GL-48).
 /// Returns `None` when shutdown was observed while the source was
 /// enumerating, which the caller must treat as "stop", exactly as it treats
 /// the same answer from [`refresh_all_cancellable`].
@@ -1412,7 +1412,7 @@ async fn refresh_chunk_cancellable(
 /// Racing it matters because no snapshot-source call carries a wall-clock
 /// timeout — the manager bounds them by cancellation instead — so this was
 /// the one loop-body await a hung source could park indefinitely. Same defect
-/// as issue #78 in the lease manager, found in this crate's other background
+/// as issue GL-78 in the lease manager, found in this crate's other background
 /// loop while fixing that one.
 async fn discover(
     source: &Arc<dyn SnapshotSource>,
@@ -1424,8 +1424,8 @@ async fn discover(
     // Bounded as well as raced. The shutdown race means a wedged enumeration
     // cannot hold shutdown open, but nothing else escaped it: during ordinary
     // operation the loop stayed parked here, stopped sweeping, and never
-    // recovered — the same shape #103 fixed for fetches, on the one source
-    // call it did not cover (#59).
+    // recovered — the same shape GL-103 fixed for fetches, on the one source
+    // call it did not cover (GL-59).
     //
     // Both awaits carry the bound. The second is the spurious-wake path: a
     // watch change that is not a shutdown falls through to a fresh call, and
@@ -1444,7 +1444,7 @@ async fn discover(
     };
     let Ok(enumerated) = enumerated else {
         // Counted as a discovery failure, because the consequence is the same
-        // one #48 names: the tracked set is frozen, everything already known
+        // one GL-48 names: the tracked set is frozen, everything already known
         // keeps being refreshed, and nothing new is ever discovered. The event
         // says which of the two it was.
         counters.record_discovery_failure();
@@ -1573,7 +1573,7 @@ async fn run(
                     // Under discovery every push is ours: a push for a
                     // principal we have not enumerated yet *is* the discovery,
                     // and dropping it was how a newly provisioned customer
-                    // stayed invisible until a restart (#48).
+                    // stayed invisible until a restart (GL-48).
                     if config.principals.discovers() {
                         resolutions.track(push.principal);
                     }
@@ -1736,7 +1736,7 @@ mod tests {
     }
 
     /// Publishing and observing is control-plane work, and it must not spend
-    /// a request-serving thread's affinity to do it (#124).
+    /// a request-serving thread's affinity to do it (GL-124).
     ///
     /// `Locality` is handed out on a thread's *first* access from one
     /// process-global counter that never recycles, and every number it hands
@@ -2017,7 +2017,7 @@ mod tests {
         );
     }
 
-    // ---- #22: the indexed set must answer what the scans answered --------
+    // ---- GL-22: the indexed set must answer what the scans answered --------
 
     /// The pre-#22 implementations, kept verbatim as the reference the
     /// indexed set is checked against. If these and `Resolutions` ever
@@ -2152,7 +2152,7 @@ mod tests {
     proptest! {
         /// Every question the indexed set answers must match the scan it
         /// replaced, after any sequence of resolutions, backoffs and clock
-        /// advances (#22). Time only moves forward, as it does in the
+        /// advances (GL-22). Time only moves forward, as it does in the
         /// manager.
         #[test]
         fn indexed_resolutions_answer_exactly_what_scanning_answered(
@@ -2307,7 +2307,7 @@ mod tests {
     /// hold the select loop — and with it the `tick` arm that carries
     /// revocation within `refresh_interval` — for the entire catalogue. The
     /// remainder must stay due rather than be dropped, and the order must be
-    /// by deadline so a large population cannot starve its own tail (#52).
+    /// by deadline so a large population cannot starve its own tail (GL-52).
     #[test]
     fn a_due_population_is_refetched_in_bounded_waves() {
         let principals: Vec<Principal> = (0..5).map(Principal).collect();
@@ -2343,7 +2343,7 @@ mod tests {
     /// ones `due_for_sweep` leaves out. The two sets must stay distinct: if
     /// `all_tracked` ever starts filtering, a lagged broadcast strands a
     /// reinstated principal until its tombstone TTL, with nothing else on the
-    /// HTTP topology to notice (#52).
+    /// HTTP topology to notice (GL-52).
     #[test]
     fn lag_recovery_covers_the_negatives_a_sweep_skips() {
         let mut resolutions = Resolutions::new([Principal(0), Principal(1)]);
@@ -2377,7 +2377,7 @@ mod tests {
 
     /// The generation watermark outlives the resolution that carried it, or a
     /// replayed older generation could resurrect a revoked principal
-    /// (INVARIANTS.md #15).
+    /// (INVARIANTS.md GL-15).
     #[test]
     fn an_expired_resolution_keeps_its_generation() {
         let mut resolutions = Resolutions::new([Principal(0)]);
@@ -2416,7 +2416,7 @@ mod tests {
         // An absent row: the short TTL, so a signup in flight — or a source
         // still coming up — is picked up soon. A published tombstone: the long
         // one, because coming back means an operator reinstated the account
-        // (#52).
+        // (GL-52).
         assert_eq!(
             negative_deadline(t(10), &config, NegativeKind::Unknown),
             t(40)

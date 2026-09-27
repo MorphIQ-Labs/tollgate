@@ -16,7 +16,7 @@ use crate::{
 
 /// The plan PostgreSQL chooses for the active-lease sum inside
 /// [`PostgresStore::conservation`] — the query migration 0005's partial index
-/// exists to serve (#12).
+/// exists to serve (GL-12).
 ///
 /// Whether an index is *used* is a claim only the planner can settle, and
 /// this explains the same query string `conservation` runs rather than one
@@ -47,7 +47,7 @@ pub async fn explain_active_lease_sum(
 }
 
 /// The plan PostgreSQL chooses for the expiry sweep's selection inside
-/// `reclaim_expired_batch` (#65).
+/// `reclaim_expired_batch` (GL-65).
 ///
 /// The property worth pinning is not "an index is used" — the predicate always
 /// matched `tollgate_leases_expiry`. It is that the `LIMIT` can *stop* the
@@ -79,7 +79,7 @@ pub async fn explain_reclaim_due_leases(
 }
 
 /// The plan PostgreSQL chooses for the rollover sweep's selection inside
-/// `roll_due_periods` — #65's sibling, and the same property: the bounded page
+/// `roll_due_periods` — GL-65's sibling, and the same property: the bounded page
 /// must be an index-range stop rather than a sort of every account whose
 /// boundary has passed.
 pub async fn explain_due_periods(
@@ -127,7 +127,7 @@ pub async fn truncate_all(store: &PostgresStore) -> Result<(), StoreError> {
 
 /// The statements [`KeyDirectory::insert_key_within`] serialises with, exposed
 /// so a test can demonstrate the race the lock prevents by driving the same
-/// SQL rather than a copy of it (#121).
+/// SQL rather than a copy of it (GL-121).
 ///
 /// [`KeyDirectory::insert_key_within`]: tollgate_store::KeyDirectory::insert_key_within
 pub mod issuance_sql {

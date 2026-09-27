@@ -42,11 +42,11 @@ pub const API_PREFIX: &str = "/v1";
 /// added to `UsageEvent` cannot silently push a legitimate batch past the body
 /// limit derived from this number.
 ///
-/// #94 raised it from 268: the policy revision is fixed-width, so it costs the
+/// GL-94 raised it from 268: the policy revision is fixed-width, so it costs the
 /// same 85 bytes on every event whether stated or unstated. That is the price
 /// of carrying it on the wire in its canonical spelling, and it is recorded
 /// here rather than discovered when a maximal batch starts being refused.
-/// #105 adds the optional key ID and includes expanded negative years and
+/// GL-105 adds the optional key ID and includes expanded negative years and
 /// nine fractional digits in the fixture: measured maximum 410 bytes.
 pub const MAX_USAGE_EVENT_BYTES: usize = 410;
 
@@ -64,7 +64,7 @@ pub const MAX_USAGE_EVENT_BYTES: usize = 410;
 ///
 /// Declared rather than inherited. Without it the endpoint ran on axum's
 /// implicit 2 MiB default, which no document stated and which the server
-/// reported as malformed JSON when it bit (#61).
+/// reported as malformed JSON when it bit (GL-61).
 pub const MAX_INGEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 /// Four maximal u64 counters plus field names and framing. Includes a
@@ -188,7 +188,7 @@ pub struct ConsolidateRequest {
     pub fencing_token: FencingToken,
     pub unspent: CostUnits,
     pub requested: CostUnits,
-    /// The largest quote the returned lease refused (#131). Omitted when
+    /// The largest quote the returned lease refused (GL-131). Omitted when
     /// zero, so a server that predates it sees the request it always did;
     /// absent from an older client, it reads as zero: today's sizing.
     #[serde(default, skip_serializing_if = "no_demand")]
@@ -219,7 +219,7 @@ pub struct IngestRequest {
 /// it does not own, and copying that batch into a `Vec` just to reach serde
 /// bought nothing — least of all on the one path where it happened repeatedly.
 /// A failing sink is retried indefinitely with backoff by design (an outage is
-/// a duration, not an event), and every attempt re-copied the same batch (#20).
+/// a duration, not an event), and every attempt re-copied the same batch (GL-20).
 ///
 /// This produces byte-identical JSON to [`IngestRequest`], which is the whole
 /// reason it is safe to have two types; `borrowed_and_owned_ingest_requests_serialize_identically`
@@ -242,7 +242,7 @@ pub struct DepositRequest {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-/// The one operator action for an account's administrative status (#51).
+/// The one operator action for an account's administrative status (GL-51).
 ///
 /// An [`AccountStatus`] rather than the `active` bool this carried before:
 /// the bool named only the ledger flag, while the request now also republishes
@@ -253,7 +253,7 @@ pub struct SetStatusRequest {
     pub status: AccountStatus,
 }
 
-/// The one operator action for an account's execution-capacity class (#99).
+/// The one operator action for an account's execution-capacity class (GL-99).
 ///
 /// Its own request type rather than an optional field on
 /// [`SetStatusRequest`]: the two are different operator decisions about
@@ -270,7 +270,7 @@ pub struct SetCapacityClassRequest {
 }
 
 /// What a status change did, so an operator learns its blast radius at the
-/// moment of the call rather than from a later denial (#51).
+/// moment of the call rather than from a later denial (GL-51).
 ///
 /// `republished: 0` means the account had no live snapshot to change — no
 /// credentials, all of them revoked, or the change was a repeat. All three are
@@ -290,7 +290,7 @@ pub struct PublishSnapshotRequest {
 }
 
 /// The catalogue of principals a control plane knows, revoked ones included
-/// (#48). An instance serving any customer needs this to learn the set that
+/// (GL-48). An instance serving any customer needs this to learn the set that
 /// already exists; pushes only carry what changes after it subscribes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrincipalsResponse {
@@ -325,7 +325,7 @@ mod tests {
     use tollgate_core::RequestId;
     use tollgate_core::UsageSource;
 
-    /// #131's demand field changes nothing on the wire until it is used: an
+    /// GL-131's demand field changes nothing on the wire until it is used: an
     /// older server never sees it at zero, and an older client's request
     /// reads as zero.
     #[test]
@@ -363,7 +363,7 @@ mod tests {
         )
     }
 
-    /// #20 added a second ingest type so the transport could stop copying the
+    /// GL-20 added a second ingest type so the transport could stop copying the
     /// batch, and the entire argument for that being safe is that the two
     /// produce the same bytes. Checked here rather than trusted, because it is
     /// a claim about what leaves the process.
@@ -437,7 +437,7 @@ mod tests {
     }
 }
 
-/// One account as an operator reads it (#121).
+/// One account as an operator reads it (GL-121).
 ///
 /// **Authoritative, not an estimate**, and as of the instant it was read: every
 /// field comes from one consistent backend snapshot, so the terms agree with
@@ -491,7 +491,7 @@ pub struct AccountResponse {
     pub overage_recorded: tollgate_core::CostUnits,
 }
 
-/// Set or clear an account's periodic allowance (#121).
+/// Set or clear an account's periodic allowance (GL-121).
 ///
 /// `budget: null` clears the schedule, which is a different request from one
 /// with an allowance of zero: the first means "this balance does not expire",
@@ -526,7 +526,7 @@ pub struct SetBudgetResponse {
     pub current: Option<tollgate_core::BudgetSchedule>,
 }
 
-/// Issue one credential for an account (#121).
+/// Issue one credential for an account (GL-121).
 ///
 /// The caller chooses `key_id`, and that choice is the retry contract: a
 /// request that is lost after the credential is stored can be resent with the

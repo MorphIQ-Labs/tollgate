@@ -104,7 +104,7 @@ async fn serve() -> std::io::Result<()> {
     // `into_make_service_with_connect_info` is what gives each accepted
     // connection its own `PricingConnection`, and therefore its own credential
     // cache. Serving the router directly would silently fall back to
-    // per-request HMAC (#2).
+    // per-request HMAC (GL-2).
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let mut server = tokio::spawn(async move {
         axum::serve(

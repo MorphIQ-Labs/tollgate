@@ -2,7 +2,7 @@
 # Fails if a blocking gate's `rules` depend on where a change is routed.
 #
 # The `assurance` stage was once restricted to merge requests targeting the
-# default branch (#106). That is not a skipped job with a visible state: the
+# default branch (GL-106). That is not a skipped job with a visible state: the
 # jobs are never created, so the pipeline page shows a complete, green pipeline
 # with the whole column missing — and when the target branch merged, GitLab
 # retargeted the request to `main` and left that assurance-free pipeline
@@ -23,7 +23,7 @@ BLOCKING_GATES="formal mutation"
 
 # Timed measurements run locally. Compilation and allocation assertions still
 # belong in CI; a remote performance job must not silently restore the policy
-# that made unchanged release builds fail different ratios (#113).
+# that made unchanged release builds fail different ratios (GL-113).
 LOCAL_ONLY="perf-ratios perf-thresholds load-thresholds"
 
 status=0
@@ -51,7 +51,7 @@ for job in $BLOCKING_GATES; do
     fail "$job is no longer in the assurance stage; move it or update BLOCKING_GATES with the reason"
   fi
   if ! printf '%s\n' "$block" | grep -E '^  extends: ' | grep -q '\.merge-request\b'; then
-    fail "$job must extend .merge-request so it runs for every merge request, not only one targeting the default branch (#106)"
+    fail "$job must extend .merge-request so it runs for every merge request, not only one targeting the default branch (GL-106)"
   fi
   if ! printf '%s\n' "$block" | grep -q '^  allow_failure: false$'; then
     fail "$job must explicitly remain a blocking gate (allow_failure: false)"
@@ -59,7 +59,7 @@ for job in $BLOCKING_GATES; do
 done
 
 # 3. No job may restore a restricting performance anchor. This also catches
-#    a new gate added with the old target-dependent rule (#106).
+#    a new gate added with the old target-dependent rule (GL-106).
 restricted=$(awk '
   /^[a-z][a-z0-9-]*:$/ { job = substr($0, 1, length($0) - 1) }
   /^  extends: / && /\.main-merge-request/ {
@@ -90,7 +90,7 @@ fi
 #    that host, or — as the retired `perf-thresholds` job did — sets a value
 #    that can never match, so the comparison silently reports
 #    `baseline-skipped` and twelve days of drift accumulate behind a green
-#    pipeline (#114).
+#    pipeline (GL-114).
 if grep -E '^[[:space:]]*TOLLGATE_PERF_HOST:' "$CONFIG" > /dev/null; then
   fail "TOLLGATE_PERF_HOST is a local label for the host the baseline names; CI must not set it"
 fi

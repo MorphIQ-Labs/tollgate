@@ -409,7 +409,7 @@ impl PostgresStore {
             // successful write may have filled the bound, and answering
             // `ActiveKeyLimit` would tell it to retire a credential when in fact
             // its first call worked. `AlreadyExists` is both true and what makes
-            // the retry safe (#121).
+            // the retry safe (GL-121).
             let existing: Option<i32> = sqlx::query_scalar(
                 "SELECT 1 FROM tollgate_credential_keys WHERE key_id = $1 OR principal = $2",
             )
@@ -636,7 +636,7 @@ mod stored_id_tests {
 /// **Two facts in this table follow opposite rules, deliberately.** The
 /// generation is *not* here — it lives only in the `generation` column, because
 /// that column is what the `ON CONFLICT ... WHERE` monotonicity guard compares
-/// and what a tombstone reports after its snapshot is gone (#54). `account_id`
+/// and what a tombstone reports after its snapshot is gone (GL-54). `account_id`
 /// *is* here and must stay: its column is `GENERATED ALWAYS AS` a function of
 /// this JSON (migration 0006), so deleting it here would silently NULL that
 /// column, unmatch the partial index, and make an account-wide status change
@@ -649,7 +649,7 @@ struct StoredSnapshotRef<'a> {
     account_id: StoredId,
     key_id: Option<StoredId>,
     status: &'a AccountStatus,
-    /// The account-owned execution-capacity class (#99). Rides the JSONB
+    /// The account-owned execution-capacity class (GL-99). Rides the JSONB
     /// document; omitting it here would drop it on every publish.
     capacity_class: &'a CapacityClass,
     enforcement_mode: &'a EnforcementMode,
@@ -661,7 +661,7 @@ struct StoredSnapshotRef<'a> {
     /// it an instance that refreshed instead of receiving a push would report
     /// no budget at all, and the two would disagree about the same account.
     budget: Option<&'a BudgetView>,
-    /// The consuming application's policy identity (#94). Rides the JSONB
+    /// The consuming application's policy identity (GL-94). Rides the JSONB
     /// column, so it needs no schema change of its own — but it does need to
     /// be here: this DTO is the whole of what storage writes, and a field
     /// omitted from it is dropped on every publish without a word.
@@ -686,7 +686,7 @@ impl<'a> From<&'a AccountSnapshot> for StoredSnapshotRef<'a> {
     }
 }
 
-/// Rows written before #54 still carry a `generation` key. Serde ignores
+/// Rows written before GL-54 still carry a `generation` key. Serde ignores
 /// unknown fields, so those rows decode unchanged and the vestigial key is
 /// simply not read — which is why this needed no backfill.
 #[derive(Deserialize)]
@@ -694,7 +694,7 @@ struct StoredSnapshot {
     account_id: StoredId,
     key_id: Option<StoredId>,
     status: AccountStatus,
-    /// Absent from every row written before #99, and `default` for the reason
+    /// Absent from every row written before GL-99, and `default` for the reason
     /// the fields below are: a required field would make every pre-existing
     /// row fail to decode and deny every principal until the whole catalogue
     /// was republished. `Assured` is the safe default — the availability every
@@ -724,7 +724,7 @@ struct StoredSnapshot {
     /// nothing", which readers report as such rather than as a zero balance.
     #[serde(default)]
     budget: Option<BudgetView>,
-    /// Absent from every row written before #94, and `default` for the reason
+    /// Absent from every row written before GL-94, and `default` for the reason
     /// the two fields above are. The unstated revision is a value rather than
     /// an absence, so a pre-existing row decodes to "this account's publisher
     /// stated no policy identity" — which is true, and is what a consumer
@@ -763,7 +763,7 @@ impl StoredSnapshot {
 /// agree on it: `conservation` runs it, and `explain_active_lease_sum` asks the
 /// planner what it does with it. A test that copied the text would keep
 /// reporting an index scan after the real predicate had drifted away from
-/// migration 0005's index (#12).
+/// migration 0005's index (GL-12).
 ///
 /// `state = 0` is spelled out rather than bound, so the predicate is a literal
 /// the partial index can match.
@@ -774,7 +774,7 @@ impl StoredSnapshot {
 /// of `the_account_filter_is_answered_by_an_index_not_by_discarding_rows`, the
 /// correlated form kept the index 4 times in 5 and the uncorrelated form 10
 /// times in 12, against 12 in 12 for this shape. Atomicity is bought with a
-/// transaction instead (#56), which leaves this predicate — and the plan #12
+/// transaction instead (GL-56), which leaves this predicate — and the plan GL-12
 /// pinned — untouched.
 const ACTIVE_LEASE_SUM_SQL: &str =
     "SELECT COALESCE(SUM(granted), 0)::BIGINT, COALESCE(SUM(used), 0)::BIGINT
@@ -784,13 +784,13 @@ const ACTIVE_LEASE_SUM_SQL: &str =
 /// `reclaim_expired_batch` runs it and `explain_reclaim_due_leases` asks the
 /// planner what it does with it. A test that copied the text would keep
 /// reporting an index-ordered walk after the real `ORDER BY` had drifted away
-/// from `tollgate_leases_expiry` — which is exactly the drift #65 found.
+/// from `tollgate_leases_expiry` — which is exactly the drift GL-65 found.
 ///
 /// The `ORDER BY` is the index's own column order, and that is the whole
 /// point. It was `(account_id, lease_id)`, which no index answers, so the
 /// `LIMIT` could not stop an index walk: every batch read and sorted the
 /// entire remaining backlog to return 256 rows, making a drain quadratic in
-/// the backlog it exists to clear (#65). Ordering by the expiry pair makes
+/// the backlog it exists to clear (GL-65). Ordering by the expiry pair makes
 /// the `LIMIT` a range stop, and settles oldest-due-first like the reference
 /// backend does.
 /// Takes the account row before an issuance counts against its bound.
@@ -816,7 +816,7 @@ const RECLAIM_DUE_LEASES_SQL: &str = "SELECT lease_id, account_id, granted, used
      LIMIT $3 FOR UPDATE SKIP LOCKED";
 
 /// The rollover sweep's selection, hoisted and fixed for the same reason
-/// (#65's sibling) — but it needed two changes, not one.
+/// (GL-65's sibling) — but it needed two changes, not one.
 ///
 /// `ORDER BY account_id` sorted every due account to return one bounded page,
 /// and served the lowest ids rather than the most overdue boundaries.
@@ -841,7 +841,7 @@ const RECLAIM_DUE_LEASES_SQL: &str = "SELECT lease_id, account_id, granted, used
 /// order the CTE selected by. Ordering it *here* would mean a trailing
 /// `ORDER BY` and a `Sort` node, which is the cost
 /// `the_rollover_sweep_reaches_its_index_instead_of_sorting_the_due_set`
-/// forbids (#65) — so the page is ordered in Rust instead, where it is bounded
+/// forbids (GL-65) — so the page is ordered in Rust instead, where it is bounded
 /// by the batch limit rather than by how many accounts are due.
 const DUE_PERIODS_SQL: &str = "WITH due AS (
          SELECT account_id, allowance_balance AS prior, budget_allowance AS allowance,
@@ -973,7 +973,7 @@ where
 /// }
 /// ```
 ///
-/// The same holds for the two sweep plans (#65):
+/// The same holds for the two sweep plans (GL-65):
 ///
 /// ```compile_fail,E0599
 /// # use tollgate_store_postgres::PostgresStore;
@@ -997,7 +997,7 @@ pub struct PostgresStore {
 /// Connection-pool bounds. Callers that hold background tasks open against
 /// this store rely on `acquire_timeout`: when every connection is checked out
 /// by a stalled query, it is the only thing that turns "wait forever" into an
-/// error the caller can report (INVARIANTS.md #18).
+/// error the caller can report (INVARIANTS.md GL-18).
 #[derive(Debug, Clone, Copy)]
 pub struct PoolConfig {
     pub max_connections: u32,
@@ -1034,13 +1034,13 @@ impl PostgresStore {
     }
 
     /// Connect and run pending migrations (versioned under ./migrations,
-    /// tracked by sqlx's _sqlx_migrations table — review finding #11).
+    /// tracked by sqlx's _sqlx_migrations table — review finding GL-11).
     ///
     /// Note the limits of what a pool bound can promise: `acquire_timeout`
     /// covers waiting for a connection, including establishing one, but a
     /// query already in flight on a healthy connection is bounded only by a
     /// server-side `statement_timeout`. Callers must still bound their own
-    /// calls (INVARIANTS.md #18).
+    /// calls (INVARIANTS.md GL-18).
     pub async fn connect_with(
         url: &str,
         policy: GrantPolicy,
@@ -1125,7 +1125,7 @@ impl PostgresStore {
         // reading them on two pooled connections let a commit land between
         // them: reconciliation then paired a pre-write total with a post-write
         // sum and reported corruption on a correct ledger, or underflowed the
-        // subtraction outright (#56).
+        // subtraction outright (GL-56).
         //
         // `READ COMMITTED` is not enough, because it takes a fresh snapshot
         // per statement; `REPEATABLE READ` takes one at the first read and
@@ -1171,7 +1171,7 @@ impl PostgresStore {
             // Surfaced, never panicked on. These are two stored columns read
             // from a database this process does not exclusively own, so
             // `recorded < active_used` is corruption to report — the same
-            // class as a negative unit column (INVARIANTS.md #11) — not an
+            // class as a negative unit column (INVARIANTS.md GL-11) — not an
             // internal invariant a caller could not violate. `MemoryStore`
             // keeps its `expect` because there the counters are maintained by
             // one process under one lock and the state is unrepresentable.
@@ -1202,7 +1202,7 @@ struct LockedLeaseRow {
     /// The half of `granted` drawn from the account's periodic allowance, and
     /// the period that funded it. Settlement needs both: the split says which
     /// bucket each unspent unit belongs to, the period says whether the
-    /// allowance half still exists (#97).
+    /// allowance half still exists (GL-97).
     from_allowance: i64,
     period_start_us: i64,
 }
@@ -1252,10 +1252,10 @@ struct Exchange {
     /// [`LeaseAllocator::consolidate`]).
     floor: CostUnits,
     /// The largest quote the returned lease refused, which the grant may grow
-    /// to when the restored balance funds it (#131).
+    /// to when the restored balance funds it (GL-131).
     needed: CostUnits,
     /// Whether the settlement left total funding unchanged, so a refusal may
-    /// attest the ledger it reads (#130).
+    /// attest the ledger it reads (GL-130).
     preserves_funding: bool,
 }
 
@@ -1294,7 +1294,7 @@ impl PostgresStore {
 
         // Suspended and Closed both refuse, under one deny reason: no
         // client acts on the distinction, and splitting it would widen
-        // `AllocateError`'s per-reason tally for nothing (#51).
+        // `AllocateError`'s per-reason tally for nothing (GL-51).
         if decode_status(row.get::<String, _>(1)).map_err(AllocateError::Storage)?
             != AccountStatus::Active
         {
@@ -1335,7 +1335,7 @@ impl PostgresStore {
         // Allowance first: the units with an expiry date are spent
         // before the manual credits sitting beside them, and the lease
         // remembers the split so settlement can return each half to where
-        // it came from (#97).
+        // it came from (GL-97).
         let granted_i = to_i64(granted, "grant").map_err(AllocateError::Storage)?;
         let allowance_balance = row.get::<i64, _>(3);
         let from_allowance = granted_i.min(allowance_balance);
@@ -1451,7 +1451,7 @@ impl PostgresStore {
         // allowance first, so the top-up half is what survives a partly
         // spent lease. Crediting the allowance half back first would close
         // the equation just as well while moving durable credits into the
-        // bucket that expires at the next boundary (#97).
+        // bucket that expires at the next boundary (GL-97).
         let from_topup = granted
             .checked_sub(from_allowance)
             .filter(|t| *t >= 0)
@@ -1614,7 +1614,7 @@ impl LeaseAllocator for PostgresStore {
             // A holder that never released cannot prove any unit unspent, so
             // nothing is credited: each remainder becomes provisional
             // settlement loss, which later usage for the lease converts into
-            // billed usage (#136). `credited` stays zero so that usage fits.
+            // billed usage (GL-136). `credited` stays zero so that usage fits.
             let mut reclaimed = Vec::with_capacity(rows.len());
             let mut lease_ids = Vec::with_capacity(rows.len());
             let mut forfeits: std::collections::BTreeMap<Vec<u8>, i64> =
@@ -1729,7 +1729,7 @@ impl UsageSink for PostgresStore {
         events: &[UsageEvent],
         _now: Timestamp,
     ) -> Result<IngestReport, IngestError> {
-        // One transaction per *batch* (review finding #8): leases are locked
+        // One transaction per *batch* (review finding GL-8): leases are locked
         // in a single sorted ANY() query (sorted to keep concurrent batches
         // deadlock-free), duplicates are detected with one lookup, events are
         // classified in memory against the locked rows, and the accepted set
@@ -1781,7 +1781,7 @@ impl UsageSink for PostgresStore {
             // release touches a single lease, and reclaim takes its leases
             // with SKIP LOCKED, so it abandons a contended row instead of
             // queueing behind it. Concurrent ingests are therefore what this
-            // order is for -- reclaim selects in expiry order (#65) and is
+            // order is for -- reclaim selects in expiry order (GL-65) and is
             // still safe, because the lease-then-account phase order below is
             // what keeps the two from crossing.
             let lease_ids: Vec<Vec<u8>> = prepared
@@ -2286,7 +2286,7 @@ impl UsageSink for PostgresStore {
 ///
 /// Never defaults to `Active`. A value the `CHECK` constraint should have made
 /// impossible means the row was written outside this code, and admitting it as
-/// "active" would turn corruption into service (the rule INVARIANTS.md #11
+/// "active" would turn corruption into service (the rule INVARIANTS.md GL-11
 /// applies to the ledger's numbers, applied to its status).
 fn decode_status(stored: String) -> Result<AccountStatus, StoreError> {
     match stored.as_str() {
@@ -2298,7 +2298,7 @@ fn decode_status(stored: String) -> Result<AccountStatus, StoreError> {
 }
 
 /// The ledger's execution-capacity class, or a refusal for a spelling the
-/// vocabulary does not contain (#99).
+/// vocabulary does not contain (GL-99).
 ///
 /// Never defaults to `Assured`, for the reason [`decode_status`] never defaults
 /// to `Active`. A value the `CHECK` constraint should have made impossible
@@ -2372,7 +2372,7 @@ const GRANT_DEBIT_SQL: &str = "UPDATE tollgate_accounts
                settlement_loss, expired, budget_allowance, budget_period,
                budget_rollover, period_start_us";
 
-/// What the account could still spend, for a snapshot's budget view (#97).
+/// What the account could still spend, for a snapshot's budget view (GL-97).
 ///
 /// Balance *plus* the unspent remainder of every active lease, because units
 /// out on lease are still the account's. Derived from the account row alone:
@@ -2385,7 +2385,7 @@ const GRANT_DEBIT_SQL: &str = "UPDATE tollgate_accounts
 /// through 9. Corruption is reported rather than saturated: unlike
 /// `MemoryStore`, this backend does not exclusively own the ledger it reads,
 /// so an underflow here is the same class of event as a negative unit column
-/// (INVARIANTS.md #11) — see the note in `PostgresStore::conservation`.
+/// (INVARIANTS.md GL-11) — see the note in `PostgresStore::conservation`.
 fn budget_view(row: &sqlx::postgres::PgRow) -> Result<BudgetView, StoreError> {
     let deposited = to_units(row.get::<i64, _>(1), "deposited")?;
     let overage = to_units(row.get::<i64, _>(2), "overage_recorded")?;
@@ -2425,7 +2425,7 @@ fn budget_view(row: &sqlx::postgres::PgRow) -> Result<BudgetView, StoreError> {
 /// refuses is one the request path would refuse too, and finding that out at
 /// write time is the point.
 ///
-/// Since #54 that is literally true of the generation as well: both callers
+/// Since GL-54 that is literally true of the generation as well: both callers
 /// hand this the row's `generation` column, so a live read and a republish
 /// resolve it identically. Before, the JSON carried a second copy that only the
 /// live path consulted.
@@ -2463,7 +2463,7 @@ fn decode_publishable(
 /// unreadable row, and a caller-side conversion is one `?` away from doing
 /// exactly that.
 ///
-/// A negative value is corruption to surface, never to clamp (INVARIANTS #11).
+/// A negative value is corruption to surface, never to clamp (INVARIANTS GL-11).
 /// Migration 0007's CHECK is what keeps it from being written in the first
 /// place; this is the read-side backstop.
 fn generation_from(column: i64) -> Result<Generation, StoreError> {
@@ -2487,7 +2487,7 @@ impl SnapshotSource for PostgresStore {
             // They did not before: the tombstone read it here while a live read
             // decoded a second copy out of the JSON, so one row could answer
             // two different generations depending on which branch you reached
-            // (#54).
+            // (GL-54).
             Some(row) if row.get::<bool, _>(2) => Ok(SnapshotResolution::Revoked {
                 generation: generation_from(row.get::<i64, _>(0))?,
             }),
@@ -2538,15 +2538,15 @@ impl StoreHealth for PostgresStore {
 /// Re-stamp every live snapshot of `account`, patching one JSON key, and
 /// report which principals to push and how many rows could not be decoded.
 ///
-/// Shared by the two account-owned facts that republish — status (#51) and
-/// execution-capacity class (#99). They differ in their precondition and their
+/// Shared by the two account-owned facts that republish — status (GL-51) and
+/// execution-capacity class (GL-99). They differ in their precondition and their
 /// ledger column; everything below is identical, and it is the part where the
 /// subtlety lives, so it is written once.
 ///
 /// `jsonb_set` rather than read-modify-write in Rust, for three reasons any
 /// one of which decides it:
 ///
-/// 1. RMW reintroduces #51's own bug. A concurrent `publish_snapshot` landing
+/// 1. RMW reintroduces GL-51's own bug. A concurrent `publish_snapshot` landing
 ///    between the read and the write makes `generation + 1` no longer greater
 ///    than stored, and the monotonic guard then *silently drops the change*
 ///    for that principal.
@@ -2557,10 +2557,10 @@ impl StoreHealth for PostgresStore {
 ///    by one unrelated corrupt credential.
 ///
 /// Only the named key is patched. The generation lives in the column alone
-/// (#54), and `RETURNING generation` carries the new value out to the push.
+/// (GL-54), and `RETURNING generation` carries the new value out to the push.
 ///
 /// `deleted = FALSE` leaves tombstones alone: republishing one would resurrect
-/// a revoked principal (INVARIANTS.md #15), and revocation stays its own
+/// a revoked principal (INVARIANTS.md GL-15), and revocation stays its own
 /// per-credential mechanism. `IS DISTINCT FROM` makes a repeat converge,
 /// bumping nothing — and note that a document predating the key has SQL NULL
 /// there, so the first change of a newly added fact rewrites every row once.
@@ -2600,7 +2600,7 @@ async fn republish_patched_snapshots(
             // before the change touched it, and refusing to suspend or
             // reclassify an account because one of its credentials is corrupt
             // is the worse outcome. Reported, never silent (INVARIANTS.md
-            // #19). Counted as well as logged: the row changed durably but
+            // GL-19). Counted as well as logged: the row changed durably but
             // will not be pushed, so those principals converge only at their
             // next refresh.
             Err(error) => {
@@ -2740,7 +2740,7 @@ impl AdminStore for PostgresStore {
 
     async fn account_view(&self, account: AccountId) -> Result<Option<AccountView>, StoreError> {
         // One `REPEATABLE READ, READ ONLY` snapshot over the account row and
-        // its live leases, for the reason `conservation` takes one (#56): the
+        // its live leases, for the reason `conservation` takes one (GL-56): the
         // stored totals and the sums over active leases move together in a
         // single `ingest` transaction, so reading them under separate
         // snapshots can pair a pre-write total with a post-write sum and
@@ -3061,7 +3061,7 @@ impl AdminStore for PostgresStore {
 }
 
 /// Resolve `account`'s credential `key` to its principal and retirement,
-/// holding the credential row `FOR SHARE` until the transaction ends (#143).
+/// holding the credential row `FOR SHARE` until the transaction ends (GL-143).
 ///
 /// `FOR SHARE` conflicts with `revoke_key_audited`'s `FOR UPDATE`, so a
 /// key-bound publication and a revocation serialize: the publish either sees
@@ -3106,8 +3106,8 @@ async fn lock_account_key(
 }
 
 /// A publication's checks and write inside the caller's transaction: the
-/// stated credential binding (#35), the ledger status and capacity-class
-/// guards (#51, #99), the budget stamp (#97), and the generation-ordered
+/// stated credential binding (GL-35), the ledger status and capacity-class
+/// guards (GL-51, GL-99), the budget stamp (GL-97), and the generation-ordered
 /// write. Returns whether a row was written, the stamped snapshot to push
 /// after commit, and the audited predecessor and successor.
 async fn publish_in_tx(
@@ -3134,14 +3134,14 @@ async fn publish_in_tx(
     // The ledger decides an account's status; a publish may carry it
     // but not change it, or the two records `set_account_status`
     // unified could be pulled apart again one principal at a time
-    // (#51). FOR SHARE, not FOR UPDATE: this only has to hold the
+    // (GL-51). FOR SHARE, not FOR UPDATE: this only has to hold the
     // status still, and a status change takes FOR UPDATE on the same
     // row, so the two serialize without publishes blocking each other.
     //
     // The budget columns ride along on the read that was already being
     // taken, under the same lock, so the view stamped below is the
     // ledger as of this publication rather than a second read that
-    // could straddle a lease or a rollover (#97).
+    // could straddle a lease or a rollover (GL-97).
     let ledger = sqlx::query(
         "SELECT status, deposited, overage_recorded, usage_recorded, settlement_loss,
                     expired, budget_allowance, budget_period, budget_rollover, period_start_us,
@@ -3170,7 +3170,7 @@ async fn publish_in_tx(
                 });
             }
             // The capacity class is the same kind of fact and gets the
-            // same guard (#99): the ledger owns it, a publish may
+            // same guard (GL-99): the ledger owns it, a publish may
             // carry it, and only `set_capacity_class` may change it.
             let ledger_class = decode_capacity_class(row.get::<String, _>(10))?;
             if ledger_class != snapshot.capacity_class {
@@ -3300,7 +3300,7 @@ mod tests {
     }
 
     /// A readiness probe is evidence that PostgreSQL answered, not merely that
-    /// a store object exists (INVARIANTS.md #19).
+    /// a store object exists (INVARIANTS.md GL-19).
     #[tokio::test]
     async fn ping_surfaces_a_closed_pool() {
         let pool = PgPoolOptions::new()
