@@ -35,7 +35,7 @@ slower benchmark builds. Load tests use the production profile (fat LTO,
 `panic=abort`). Preserve `reports/perf_gate_report.json`,
 `reports/load_gate_report.json`, the allocation report and command logs with the
 review evidence. Reports are generated artifacts, not files to add to the source
-tree. Attach them to the MR or retain an inspectable evidence artifact and link it.
+tree. Attach them to the pull request or retain an inspectable evidence artifact and link it.
 
 Record the tested commit and any uncommitted changes, host/CPU, OS, Rust version,
 profile, commands, date, background load and verdict. Record all failures and
@@ -199,7 +199,7 @@ of leaving it at whatever was last typed in:
   to the next 0.05, and at least the 0.05 default. It needs six believed runs
   across two revisions, or the row keeps its carried allowance.
 - It **never narrows** a carried allowance. Lowering one stays a deliberate
-  edit made before recording, with the evidence in the merge request.
+  edit made before recording, with the evidence in the pull request.
 
 The recording prints every allowance it widened and every excursion it set
 aside. Every full run lists the rows carrying an allowance above 0.30 as weak
@@ -222,7 +222,7 @@ before removing its leftover staging file and retrying. Do not remove an active
 writer's staging file. A refusal preserves the previous baseline.
 
 Then validate with a fresh full run that exits 0 with `enforced: true`, and put
-both the recalibration and that validating report in the merge request.
+both the recalibration and that validating report in the pull request.
 
 Leave the host idle between runs — several minutes, not seconds. Back-to-back
 full-suite runs on Apple Silicon degrade: in the GL-114 measurements the first
@@ -250,7 +250,7 @@ thresholds, request-path constraints or baseline data.
 CI continues to require format, lint, toolchain compatibility, tests, PostgreSQL
 parity, dependency advisories, benchmark compilation, allocation assertions,
 formal verification and mutation assurance. Formal and mutation jobs run on
-every merge request regardless of its target. `scripts/check_ci_rules.sh`
+every pull request regardless of its target. `scripts/check_ci_rules.sh`
 enforces their blocking status and rejects restoration of the retired timed
 performance jobs or direct timed benchmark commands.
 
