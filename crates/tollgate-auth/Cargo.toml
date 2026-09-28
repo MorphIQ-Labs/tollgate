@@ -15,7 +15,7 @@ categories = ["authentication", "web-programming"]
 workspace = true
 
 [dependencies]
-tollgate-core = { path = "../tollgate-core", version = "=0.30.1" }
+tollgate-core = { path = "../tollgate-core", version = "=0.30.2" }
 arc-swap = { workspace = true }
 jiff = { workspace = true }
 zeroize = { workspace = true }
