@@ -91,6 +91,11 @@ pub struct SecurityLoader {
     pending_issuer: Option<Option<[u8; 32]>>,
 }
 
+/// A complete, validated security generation staged by
+/// [`SecurityLoader::load`] and not yet live.
+///
+/// Pass the first one to [`SecurityLoader::start`] and later ones to
+/// [`SecurityLoader::install`]. Dropping it discards the generation.
 pub struct LoadedSecurity {
     policy: SecurityPolicy,
     tls: Option<TlsConfig>,
@@ -133,6 +138,9 @@ impl IssuerSecret {
 }
 
 impl SecurityLoader {
+    /// A loader for the JSON manifest at `path`. Nothing is read until
+    /// [`load`](Self::load); relative paths inside the manifest resolve
+    /// against its directory.
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
@@ -203,6 +211,33 @@ impl SecurityLoader {
         self.pending_issuer.is_some()
     }
 
+    /// Reads the manifest and every file it references, validates them, and
+    /// stages a complete generation without making it live.
+    ///
+    /// Each load builds a fresh control-plane bearer verifier keyed by a new
+    /// random secret, so only HMAC digests of the static tokens are retained.
+    /// When the manifest configures Google identity, this also refreshes
+    /// Google's signing keys if a refresh is due: after a successful fetch,
+    /// at half the key set's lifetime, clamped between five seconds and five
+    /// minutes; after a failure, five minutes later. A fetched key set is
+    /// usable until `now` plus the lifetime its `Cache-Control`/`Age`
+    /// headers allow: five minutes without cache metadata, and never more
+    /// than one hour. A failed fetch keeps
+    /// the previous keys and their original expiry, or fails the load when
+    /// there are none. A fetched key set that fails validation fails the
+    /// load and also leaves the previous keys in place.
+    ///
+    /// Returns `Ok(None)` when the manifest, every referenced file, and any
+    /// signing keys and their expiry are unchanged since the generation last passed to
+    /// [`start`](Self::start) or [`install`](Self::install).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SecurityError`] for an unreadable file, unknown manifest
+    /// fields, a malformed or out-of-bounds credential, a duplicate
+    /// credential mapping, an issuer secret that is malformed or equal to a
+    /// bearer token, invalid TLS material, or unavailable signing keys. The
+    /// live generation is unaffected.
     pub async fn load(&mut self, now: Timestamp) -> Result<Option<LoadedSecurity>, SecurityError> {
         self.load_with_keys(now, || {
             crate::google::fetch_keys("https://www.googleapis.com/oauth2/v3/certs")
@@ -397,6 +432,19 @@ impl Drop for ReloadExit {
 }
 
 impl SecurityReloader {
+    /// Spawns the reload task on the current Tokio runtime.
+    ///
+    /// Every five seconds it calls [`SecurityLoader::load`] with `clock`'s
+    /// time and passes any changed generation to
+    /// [`SecurityLoader::install`], which publishes it to `security`. A
+    /// failed load or install is logged at `warn` and the previous generation
+    /// stays live; the next attempt retries. Pass a loader that has already
+    /// been [started](SecurityLoader::start) with `security`'s first
+    /// generation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a Tokio runtime.
     pub fn spawn(
         mut loader: SecurityLoader,
         security: Arc<ServerSecurity>,

@@ -66,6 +66,8 @@
 //! assert!(!session.is_authenticated());
 //! ```
 
+#![deny(missing_docs)]
+
 mod hmac_registry;
 mod session;
 mod verifier;
