@@ -528,6 +528,8 @@ pub struct CountersSnapshot {
     /// order. Each sums to the total beside it; neither replaces it, so a
     /// reader never has to add two numbers to get one.
     pub capacity_shed_by_class: [u64; CAPACITY_CLASS_COUNT],
+    /// Execution starts per class, in [`CAPACITY_CLASS_NAMES`] order; sums to
+    /// `execution_started`.
     pub execution_started_by_class: [u64; CAPACITY_CLASS_COUNT],
     /// Admitted requests that resolved for zero between admission and
     /// execution start — cancelled, or abandoned while pending.

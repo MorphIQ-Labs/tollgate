@@ -39,6 +39,8 @@
 //! the design review deliberately treats the cache choice as an empirical
 //! question for the perf gate, not a foregone conclusion.
 
+#![deny(missing_docs)]
+
 pub mod capacity;
 pub mod counters;
 pub mod engine;

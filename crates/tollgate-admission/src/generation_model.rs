@@ -54,6 +54,7 @@ pub enum Watermark {
 }
 
 impl Watermark {
+    /// The generation the watermark holds, whichever variant carries it.
     #[must_use]
     pub fn generation(self) -> Generation {
         match self {
@@ -61,6 +62,8 @@ impl Watermark {
         }
     }
 
+    /// Whether this is a published revocation, which refuses a positive at its
+    /// own generation as well as older ones.
     #[must_use]
     pub fn is_revoked(self) -> bool {
         matches!(self, Watermark::Revoked(_))
