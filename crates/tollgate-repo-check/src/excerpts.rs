@@ -147,6 +147,13 @@ mod tests {
     }
 
     #[test]
+    fn an_excerpt_may_begin_with_a_blank_line() {
+        let code = "fn main() {\n\n    let a = 1;\n}\n";
+        assert!(contains_excerpt(code, &lines("\nlet a = 1;")));
+        assert!(!contains_excerpt(code, &lines("\nlet a = 2;")));
+    }
+
+    #[test]
     fn only_rust_blocks_are_excerpts() {
         let text = "<!-- excerpts-of: x.rs -->\n```toml\na = 1\n```\n\n```rust\nlet a = 1;\n```\n";
         let blocks = rust_blocks(text);
