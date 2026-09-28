@@ -1160,6 +1160,18 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `the_default_batch_writes_dispatch_every_update_variant`,
     `the_default_install_many_publishes_the_whole_batch`, and
     `an_unfenced_reservation_round_trip_publishes_its_reads`.
+    `NegativeCache.lean` proves the exact cache model: it never holds more
+    than its bound (`Tollgate.NegativeCache.record_bounded`,
+    `Tollgate.NegativeCache.prune_bounded`); eviction removes an entry whose
+    deadline is no later than any other's
+    (`Tollgate.NegativeCache.evict_removes_earliest`); pruning keeps exactly
+    the unexpired negatives (`Tollgate.NegativeCache.prune_exact`); a
+    principal's negative is due at the TTL its source answer selects, whatever
+    was remembered before (`Tollgate.NegativeCache.record_sets_answer_deadline`,
+    `Tollgate.NegativeCache.absent_takes_unknown_ttl`,
+    `Tollgate.NegativeCache.tombstone_takes_revoked_ttl`); and a present
+    answer clears it (`Tollgate.NegativeCache.resolve_clears`). Pull
+    scheduling, backoff and lag recovery are outside the model.
     *Tests:* `arc_swap_negative_cache_is_bounded_and_evicts_oldest_deadline_first`,
     `arc_swap_control_write_drops_expired_negatives`,
     `many_unknowns_leave_only_the_configured_number_visible`,

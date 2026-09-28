@@ -60,6 +60,14 @@ This Lean package contains exact models for critical contracts:
   holds the slot bound at reservation, so its event is emitted without a
   capacity check, once, with the charge fixed at commit. Queue lanes, the
   drain deadline, sharded counters and process loss are outside the model.
+- `NegativeCache` models the bounded request-visible negative cache as a list
+  of principal deadlines. It proves the bound holds under recording and
+  pruning; that a full cache evicts an entry with the earliest deadline; that
+  pruning keeps exactly the unexpired entries; that each principal has one
+  negative, due at `now` plus the TTL the source's answer selects (unknown for
+  an absent row, revoked for a tombstone); and that a present answer clears
+  it. Pull scheduling, retry backoff and broadcast-lag recovery are the
+  snapshot manager's, witnessed by its tests.
 - [`Conservation`](Tollgate/Conservation.lean) models the per-account ledger equation
   `deposited + overage = balance + activeGrants + settledUsage + loss + expired`,
   where `balance = allowanceBalance + topupBalance`, and
