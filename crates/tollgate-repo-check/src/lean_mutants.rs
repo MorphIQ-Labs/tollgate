@@ -478,7 +478,10 @@ end M
 
     #[test]
     fn a_theorem_is_never_a_definition_body() {
-        let model = "theorem t (a : Nat) : a + 1 = 1 + a := by\n  omega\n";
+        // The term after `:=` has operators, so reading this theorem as a
+        // definition would produce mutants.
+        let model =
+            "theorem t (a : Nat) : a + 1 = 1 + a := Nat.add_comm a 1 ▸ h a + 0\n  |>.symm\n";
         assert!(mutants("M", model).is_empty());
     }
 

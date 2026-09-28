@@ -625,6 +625,19 @@ mod tests {
     }
 
     #[test]
+    fn a_layer_outside_parentheses_applies_to_the_routes_inside() {
+        // `.route_layer` registers nothing itself, so the chain is only seen
+        // as one router, and the layer's role only reaches `/w`, if the
+        // parentheses are looked through.
+        let source = r#"
+            fn router() -> Router {
+                (Router::new().route("/w", get(h))).route_layer(auth(Role::Operator))
+            }
+        "#;
+        assert_eq!(found(&[("a.rs", source)]), ["| GET | /w | operator |"]);
+    }
+
+    #[test]
     fn parentheses_are_looked_through_and_merged_routers_are_kept() {
         let source = r#"
             fn router() -> Router {
