@@ -51,6 +51,15 @@ This Lean package contains exact models for critical contracts:
   billed total grows by exactly the accepted units; that a rejected event
   does not claim its ID; and that a failed batch changes nothing. Batch
   atomicity is an assumption; the mirrored store suites witness it.
+- `ChargeLifecycle` models a request's charge lifecycle on one instance: a
+  list of requests sharing a lease and a usage queue of fixed capacity, moving
+  through reserve, admit, cancel, commit, emit and deliver. It proves that the
+  slots in use never exceed capacity and a full queue sheds with no charge;
+  that nothing is charged before commit and cancellation refunds exactly the
+  admitted debit, so the lease is conserved; and that a committed request
+  holds the slot bound at reservation, so its event is emitted without a
+  capacity check, once, with the charge fixed at commit. Queue lanes, the
+  drain deadline, sharded counters and process loss are outside the model.
 - [`Conservation`](Tollgate/Conservation.lean) models the per-account ledger equation
   `deposited + overage = balance + activeGrants + settledUsage + loss + expired`,
   where `balance = allowanceBalance + topupBalance`, and

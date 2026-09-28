@@ -252,7 +252,14 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    may rebalance because they are partitions of the same lease bound. A
    commit-time elastic fallback is a *commit*, not a release: it returns the
    lease receipt because overage now funds the same units, and the charge
-   stands in full. *Tests:*
+   stands in full. `ChargeLifecycle.lean` proves the exact lifecycle model:
+   only a committed request is charged
+   (`Tollgate.ChargeLifecycle.uncommitted_charges_nothing`,
+   `Tollgate.ChargeLifecycle.admit_charges_nothing`), cancellation refunds
+   exactly the admitted debit (`Tollgate.ChargeLifecycle.cancel_refunds_exactly`),
+   and every transition conserves the lease
+   (`Tollgate.ChargeLifecycle.admit_wf`, `Tollgate.ChargeLifecycle.cancel_wf`).
+   *Tests:*
    `reservation::tests::{drop_releases_pending, cancel_charges_zero_and_refunds}`,
    `fragmented_reservation_refunds_without_stranding_capacity`,
    `a_fallback_commit_refunds_its_lease_exactly_once`, and
@@ -660,7 +667,12 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    total wall clock, so its retry backoffs sleep into whatever remains and
    never past it: an overrun spends the margin `expiry_safety_margin +
    reclaim_grace` reserves (GL-12), and bounding by attempt count alone is not a
-   bound (GL-18, GL-63). *Tests:* client writer
+   bound (GL-18, GL-63). `ChargeLifecycle.lean` proves the slot model: the
+   slots in use never exceed the queue's capacity
+   (`Tollgate.ChargeLifecycle.reserve_wf`), and a request finding the queue
+   full is shed with nothing charged
+   (`Tollgate.ChargeLifecycle.full_queue_sheds`). Lanes, the drain deadline
+   and the writer's counters are outside the model. *Tests:* client writer
    overflow tests,
    `the_final_flush_backoff_cannot_overrun_the_drain_deadline`,
    `shutdown_flushes_in_configured_batch_sizes`,
@@ -923,6 +935,17 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     order is: stop admitting, quiesce request tasks holding permits or
     guards, shut the usage writer down, then release leases. A spent lease
     with no billing event requires losing the whole process.
+    `ChargeLifecycle.lean` proves the binding in the exact model: a committed
+    request holds the slot bound at reservation
+    (`Tollgate.ChargeLifecycle.committed_holds_its_slot`), so emitting its
+    event needs no capacity and cannot be refused
+    (`Tollgate.ChargeLifecycle.committed_always_emits`); the charge is fixed
+    at commit (`Tollgate.ChargeLifecycle.commit_charges_admitted_units`) and
+    emitted once (`Tollgate.ChargeLifecycle.emitted_once`,
+    `Tollgate.ChargeLifecycle.emit_keeps_charge`); and an instance never
+    charges more than its lease granted
+    (`Tollgate.ChargeLifecycle.charged_within_grant`). Process loss is the
+    stated boundary, outside the model.
 
     `InstanceRuntime` owns this order under one total deadline: stop snapshot
     discovery and pause refills, close the accounting queue and drain issued
