@@ -12,7 +12,7 @@ keywords = ["quota", "rate-limiting", "admission-control", "metering", "lock-fre
 categories = ["concurrency", "web-programming"]
 
 [dependencies]
-tollgate-core = { path = "../tollgate-core", version = "=0.30.3" }
+tollgate-core = { path = "../tollgate-core", version = "=0.31.0" }
 arc-swap = { workspace = true }
 foldhash = { workspace = true }
 moka = { workspace = true }
