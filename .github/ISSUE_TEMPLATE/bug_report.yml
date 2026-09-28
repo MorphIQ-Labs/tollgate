@@ -1,0 +1,53 @@
+name: Bug report
+description: Tollgate did something it should not, or did not do something it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. If the bug lets work run without being charged, charges twice, bypasses authentication, leaks a credential or corrupts the ledger, **stop here and report it privately** through the Security tab instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you observed, including any refusal reason, error or log line.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: If the behavior contradicts an invariant in INVARIANTS.md, name its number.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: The smallest program, test or command sequence that shows it. A failing test is the most useful form.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Tollgate version or commit
+      placeholder: 0.30.1, or a commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: topology
+    attributes:
+      label: Topology
+      options:
+        - In-process (MemoryStore)
+        - Direct store (PostgreSQL)
+        - Via tollgate-server (HttpStore)
+        - Request path only (AdmissionEngine)
+        - Not applicable
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Rust version, OS and architecture, PostgreSQL version if relevant, and the enabled features.
