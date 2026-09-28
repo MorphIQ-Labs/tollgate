@@ -33,7 +33,7 @@ Tests verify enforcement; they don't replace it.
 | Unit, property and integration tests | The behavior. Property tests (`proptest`) cover the interleavings fixed tests miss. | Every pull request |
 | Backend parity | `MemoryStore` is the executable specification. `PostgresStore` passes the same scenario suite, test by test and name by name, and a check fails if a mirrored test drives a different contract on each side. | Every pull request |
 | Mutation testing | Code a pull request changes is mutated with `cargo-mutants`. A mutant that no test catches fails the build, so a test that doesn't bite can't pass as coverage. | Every pull request |
-| Machine-checked proofs | 20 Lean 4 modules with 252 theorems prove exact models of the critical accounting and concurrency state machines. The gate rejects any `sorry` or `admit`. | Every pull request |
+| Machine-checked proofs | 21 Lean 4 modules with 273 theorems prove exact models of the critical accounting and concurrency state machines. The gate rejects any `sorry` or `admit`. | Every pull request |
 | Allocation assertions | The steady-state admission path allocates nothing it owns; counted deterministically. | Every pull request |
 | Performance gates | Hot-path benchmarks and loopback load tests against calibrated thresholds, with the host and revision recorded. See [performance](PERFORMANCE.md). | Locally, on a controlled host |
 | Supply chain | RustSec advisories, permissive licenses only, a secret scan, and the declared MSRV. | Every pull request |
@@ -46,7 +46,7 @@ allocation counts.
 
 ## The invariant map
 
-Each invariant, and the Lean modules whose theorems it cites. 20 of the 40
+Each invariant, and the Lean modules whose theorems it cites. 23 of the 40
 rest partly on a machine-checked proof. The others are enforced by types, by
 their owning component, or by tested convention, as each one states. A dash
 means no proof is claimed, not that the invariant is unchecked.
@@ -59,18 +59,18 @@ theorem or invariant count stated on this page or in the README goes stale.
 | # | Invariant | Proofs |
 |---|---|---|
 | 1 | Bounded spend. | [BalanceExhaustion](../formal/lean/Tollgate/BalanceExhaustion.lean), [Conservation](../formal/lean/Tollgate/Conservation.lean), [LeaseShards](../formal/lean/Tollgate/LeaseShards.lean), [OveragePublication](../formal/lean/Tollgate/OveragePublication.lean) |
-| 2 | Zero charge before execution. | — |
+| 2 | Zero charge before execution. | [ChargeLifecycle](../formal/lean/Tollgate/ChargeLifecycle.lean) |
 | 3 | Atomic commit-vs-cancel. | [CommitFallback](../formal/lean/Tollgate/CommitFallback.lean), [OveragePublication](../formal/lean/Tollgate/OveragePublication.lean) |
 | 4 | Lease capabilities are exact and lease-scoped. | [LeaseFencing](../formal/lean/Tollgate/LeaseFencing.lean) |
 | 5 | Fail closed, zero I/O. | [RatePublication](../formal/lean/Tollgate/RatePublication.lean) |
 | 6 | Foreground isolation. | [AccountLifecycle](../formal/lean/Tollgate/AccountLifecycle.lean) |
 | 7 | Idempotent partial accounting. | [IdempotentIngest](../formal/lean/Tollgate/IdempotentIngest.lean) |
-| 8 | Accounting backpressure sheds. | — |
+| 8 | Accounting backpressure sheds. | [ChargeLifecycle](../formal/lean/Tollgate/ChargeLifecycle.lean) |
 | 9 | A crashed holder can never over-spend. | [Conservation](../formal/lean/Tollgate/Conservation.lean), [LeaseTiming](../formal/lean/Tollgate/LeaseTiming.lean) |
 | 10 | Ready means currently admissible. | — |
 | 11 | Checked arithmetic only. | — |
 | 12 | No commit outside the usability window. | [CommitFallback](../formal/lean/Tollgate/CommitFallback.lean) |
-| 13 | A committed charge is always emitted. | — |
+| 13 | A committed charge is always emitted. | [ChargeLifecycle](../formal/lean/Tollgate/ChargeLifecycle.lean) |
 | 14 | Account creation is never destructive. | — |
 | 15 | Authorization generations never move backward. | [SnapshotCache](../formal/lean/Tollgate/SnapshotCache.lean), [SnapshotHistory](../formal/lean/Tollgate/SnapshotHistory.lean) |
 | 16 | Unsafe configuration never becomes authoritative. | [SnapshotLimits](../formal/lean/Tollgate/SnapshotLimits.lean) |
