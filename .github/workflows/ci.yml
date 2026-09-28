@@ -391,13 +391,23 @@ jobs:
       - run: ./scripts/check_formal_mutants.sh
 
   # Blocking assurance gate: diff-scoped mutation testing, including the
-  # Postgres backend.
-  mutation:
-    name: assurance / mutation
+  # Postgres backend, split into shards so a large diff finishes inside the
+  # job timeout (GL-67). cargo-mutants' `--shard k/n` partitions one
+  # deterministic mutant list, so the shards together test exactly the
+  # mutants one run would. Each shard has its own Postgres service: the
+  # backend suite truncates its database, and shards sharing one would turn
+  # unrelated failures into false "caught" mutants.
+  mutation-shard:
+    name: assurance / mutation shard ${{ matrix.shard }}/8
     needs: [test, allocation-assertions, test-no-default-features, test-postgres, bench-compile, load-failure-reporting]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    strategy:
+      # Every shard reports, so one failure does not hide another's survivors.
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     services:
       postgres:
         image: postgres:16-alpine
@@ -425,8 +435,29 @@ jobs:
       - run: ./scripts/check_mutations.sh --diff "$BASE"
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
+          MUTANTS_SHARD: ${{ matrix.shard }}/8
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: mutation-report
+          name: mutation-report-${{ matrix.shard }}
           path: reports/mutations
+
+  # The required check. One stable name however many shards there are, so
+  # branch protection does not track the matrix. `always()` is deliberate:
+  # GitHub reports a job skipped behind a failed dependency as passing, so
+  # this must run and fail whenever any shard did not succeed, including a
+  # shard skipped because an earlier stage failed.
+  mutation:
+    name: assurance / mutation
+    needs: [mutation-shard]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: every shard passed
+        run: |
+          if [ "$RESULT" != "success" ]; then
+            echo "mutation shards finished as '$RESULT'; see each shard's mutation-report artifact" >&2
+            exit 1
+          fi
+        env:
+          RESULT: ${{ needs.mutation-shard.result }}

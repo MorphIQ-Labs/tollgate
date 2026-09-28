@@ -18,7 +18,13 @@ CONFIG="$ROOT/.github/workflows/ci.yml"
 WORKFLOWS="$ROOT/.github/workflows"
 
 # Blocking gates. Each must run on every pull request, whatever it targets.
-BLOCKING_GATES="formal mutation"
+BLOCKING_GATES="formal mutation-shard"
+
+# Required checks that summarise a sharded gate, as `<job>:<gate>`. Each runs
+# under `always()` and fails unless the gate's result is `success`, because
+# GitHub reports a job skipped behind a failed dependency as passing: an
+# aggregate without `always()` would go green exactly when a shard failed.
+AGGREGATES="mutation:mutation-shard"
 
 # Timed measurements run locally. Compilation and allocation assertions still
 # belong in CI; a remote performance job must not silently restore the policy
@@ -75,6 +81,31 @@ for job in $BLOCKING_GATES; do
   condition=$(printf '%s\n' "$block" | sed -n 's/^    if:[[:space:]]*//p')
   if [ "$condition" != "github.event_name == 'pull_request'" ]; then
     fail "$job must run on every pull request (if: github.event_name == 'pull_request'), found: ${condition:-no condition}"
+  fi
+  if printf '%s\n' "$block" | grep -qE '^[[:space:]]+continue-on-error:[[:space:]]*true'; then
+    fail "$job must remain a blocking gate; continue-on-error turns a failure green"
+  fi
+done
+
+# 2b. Each aggregate runs on every pull request even after a failure, depends
+#     on its gate, and fails unless that gate succeeded.
+for pair in $AGGREGATES; do
+  job=${pair%%:*}
+  gate=${pair#*:}
+  block=$(job_block "$job")
+  if [ -z "$block" ]; then
+    fail "$job is not a job in ci.yml; the required check summarising $gate is missing"
+    continue
+  fi
+  condition=$(printf '%s\n' "$block" | sed -n 's/^    if:[[:space:]]*//p')
+  if [ "$condition" != "always() && github.event_name == 'pull_request'" ]; then
+    fail "$job must run whenever $gate ran or was skipped (if: always() && github.event_name == 'pull_request'), found: ${condition:-no condition}"
+  fi
+  if ! printf '%s\n' "$block" | grep -qE "^    needs: \[$gate\]\$"; then
+    fail "$job must depend on exactly $gate (needs: [$gate])"
+  fi
+  if ! printf '%s\n' "$block" | grep -qF "needs.$gate.result"; then
+    fail "$job must fail unless needs.$gate.result is success"
   fi
   if printf '%s\n' "$block" | grep -qE '^[[:space:]]+continue-on-error:[[:space:]]*true'; then
     fail "$job must remain a blocking gate; continue-on-error turns a failure green"
