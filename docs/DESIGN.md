@@ -480,7 +480,7 @@ The fixed-width operations are checked. Before that scan, both weighted-rate
 scalars are checked in full width against governor's non-zero `u32` domain;
 zero or a wider value refuses publication rather than being repaired by the
 request-path defensive narrowing (GL-66). The carried pair is checked even when
-the new weighted-rate flag is disabled because a pre-#91 reader still enforces
+the new weighted-rate flag is disabled because a pre-GL-91 reader still enforces
 it during rollback. Overflow or a result greater than the carried
 `rate_burst_units` refuses publication; equality is valid. A table with no
 registered operation is valid only after the rate-domain check because no

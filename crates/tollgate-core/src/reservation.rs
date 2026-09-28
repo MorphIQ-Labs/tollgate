@@ -53,7 +53,10 @@ pub enum CancelOutcome {
     /// charged, units returned to the lease.
     ZeroCharged,
     /// Execution had already started; the full charge stands.
-    AlreadyCommitted { units: CostUnits },
+    AlreadyCommitted {
+        /// The units the committed charge bills.
+        units: CostUnits,
+    },
 }
 
 /// Error from [`Reservation::commit_at_execution_start`].
@@ -109,7 +112,9 @@ pub enum CommitFunding<'a> {
     /// [`EnforcementMode::Elastic`]:
     /// a lapsed lease may settle against overage instead, bounded by `cap`.
     OverageFallback {
+        /// The account's overage counter on this instance.
         overage: &'a AccountOverage,
+        /// The most unfunded spend this instance may extend the account.
         cap: CostUnits,
     },
 }
@@ -270,6 +275,8 @@ impl Reservation {
         })
     }
 
+    /// The units this reservation debited: what commit charges and
+    /// cancellation returns.
     #[must_use]
     pub fn units(&self) -> CostUnits {
         self.units

@@ -53,6 +53,7 @@ pub struct LocalSharding {
 }
 
 impl LocalSharding {
+    /// One shard: the default layout, with no per-thread partitioning.
     pub const SINGLE: Self = Self::new(NonZeroUsize::MIN);
 
     /// No mask exists for this shard count, so the reduction is a modulo.
@@ -61,6 +62,9 @@ impl LocalSharding {
     /// `2^64` shards, which no allocation can hold.
     const NOT_A_MASK: usize = usize::MAX;
 
+    /// A layout of `shards` per-account shards, fixed for the process.
+    /// A power of two reduces a locality with a mask; any other count uses a
+    /// modulo.
     #[must_use]
     pub const fn new(shards: NonZeroUsize) -> Self {
         Self {
@@ -80,6 +84,7 @@ impl LocalSharding {
         Self::new(std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN))
     }
 
+    /// The number of shards.
     #[must_use]
     pub const fn get(self) -> usize {
         self.shards.get()
@@ -185,6 +190,8 @@ impl Locality {
     /// this thread happens to hold" does.
     pub const OBSERVER: Self = Self(0);
 
+    /// The calling thread's affinity, assigned on its first use and fixed for
+    /// the thread's life.
     #[inline]
     #[must_use]
     pub fn current() -> Self {
@@ -201,6 +208,8 @@ impl Locality {
         NEXT_LOCALITY.load(Ordering::Relaxed)
     }
 
+    /// The shard this affinity selects under `sharding`: always below
+    /// [`LocalSharding::get`].
     #[inline]
     #[must_use]
     pub fn index(self, sharding: LocalSharding) -> usize {

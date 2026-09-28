@@ -153,7 +153,11 @@ pub enum DenyReason {
     /// units held in leases, is below this request's quote. Retry requires a
     /// smaller quote, new funding, or a new budget period; quotes within
     /// `remaining` are unaffected and keep their own lease-gap advice.
-    BalanceInsufficient { remaining: CostUnits },
+    BalanceInsufficient {
+        /// The most the account can still spend, counting units held in
+        /// leases: an upper bound, not a balance to display.
+        remaining: CostUnits,
+    },
 }
 
 impl DenyReason {

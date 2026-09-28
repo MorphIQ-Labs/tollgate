@@ -28,11 +28,16 @@ use crate::units::CostUnits;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LeaseGrant {
+    /// The allocator's identity for this lease record.
     pub lease_id: LeaseId,
+    /// The account whose balance funded the lease.
     pub account_id: AccountId,
     /// Capability token for this lease record, not an account-wide epoch.
     pub fencing_token: FencingToken,
+    /// Units debited from the account at grant and spendable by the holder.
     pub units: CostUnits,
+    /// When the allocator's grant ends. The holder stops spending earlier,
+    /// at `expires_at` minus its safety margin (see [`LocalLease::usable_until`]).
     pub expires_at: Timestamp,
 }
 
@@ -113,6 +118,8 @@ impl Drop for OverageCommitPublication<'_> {
 }
 
 impl AccountOverage {
+    /// An empty overage counter for one account on this instance: nothing
+    /// extended, nothing committed.
     #[must_use]
     pub fn new(account_id: AccountId) -> Self {
         AccountOverage {
@@ -132,6 +139,7 @@ impl AccountOverage {
         self.contended.load(Ordering::Relaxed)
     }
 
+    /// The account this counter belongs to.
     #[must_use]
     pub fn account_id(&self) -> AccountId {
         self.account_id
@@ -661,6 +669,7 @@ impl LocalLease {
         self.inner.usable_until
     }
 
+    /// The allocator's grant this local lease spends.
     #[must_use]
     pub fn grant(&self) -> &LeaseGrant {
         &self.inner.grant
@@ -1902,7 +1911,7 @@ mod tests {
         );
     }
 
-    /// A lease with no signal attached is the pre-#10 behaviour: the crossing
+    /// A lease with no signal attached is the pre-GL-10 behaviour: the crossing
     /// is still recorded for the poll loop, it simply arrives later.
     #[test]
     fn a_lease_without_a_signal_still_reports_the_crossing() {

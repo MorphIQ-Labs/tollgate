@@ -20,6 +20,9 @@ use crate::units::CostUnits;
 /// Implementations must record without fallible I/O: obtaining a slot is the
 /// backpressure decision, while consuming it is the committed-charge path.
 pub trait UsageSlot: Send + 'static {
+    /// Record the charge into the capacity this slot reserved. Called from the
+    /// committed guard's drop, so it must not block, allocate fallibly or
+    /// fail.
     fn record(self, event: UsageEvent);
 }
 
@@ -112,7 +115,9 @@ pub enum UsageSource {
     /// event may change either ledger; token age relative to another active
     /// lease is irrelevant (INVARIANTS.md GL-4).
     Leased {
+        /// The lease the units were debited from.
         lease_id: LeaseId,
+        /// That lease's capability token.
         fencing_token: FencingToken,
     },
     /// Admitted under [`EnforcementMode::Elastic`] with no lease behind it.
@@ -172,10 +177,13 @@ pub struct UsageEvent {
     /// funded, which is what lets overage replay under the same rule as any
     /// other event (INVARIANTS.md GL-7).
     pub request_id: RequestId,
+    /// The account billed.
     pub account_id: AccountId,
     /// What funded the units, and the evidence the sink validates.
     pub source: UsageSource,
+    /// The units charged: the quote reserved at admission.
     pub units: CostUnits,
+    /// When the charge was committed, at execution start.
     pub occurred_at: Timestamp,
     /// The consuming application's policy identity, copied from the pinned
     /// snapshot that priced this request (GL-94).

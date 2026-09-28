@@ -23,6 +23,8 @@
 //! the same version, and the crates depend on each other at exactly that
 //! version.
 
+#![deny(missing_docs)]
+
 pub mod budget;
 pub mod cost_table;
 pub mod deny;
