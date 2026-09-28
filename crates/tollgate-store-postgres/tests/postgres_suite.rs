@@ -7714,3 +7714,46 @@ async fn a_deposit_outside_bigint_is_a_permanent_refusal() {
         assert_eq!(store.conservation(ACCOUNT).await.unwrap().unwrap(), before);
     }
 }
+
+#[tokio::test]
+async fn repeating_operator_suspension_establishes_a_hold() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    let provisioned = AccountId(390);
+    AdminStore::create_provisioned_account(&*store, provisioned)
+        .await
+        .unwrap();
+    // The status is already Suspended. The operator must still take authorship,
+    // or a provisioner could lift this explicit hold by activating the account.
+    let receipt = AdminStore::set_account_status(&*store, provisioned, AccountStatus::Suspended)
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt.before,
+        AdminState::Status {
+            status: AccountStatus::Suspended,
+            set_by: AdminAuthority::Provisioner,
+        }
+    );
+    assert_eq!(
+        receipt.after,
+        AdminState::Status {
+            status: AccountStatus::Suspended,
+            set_by: AdminAuthority::Operator,
+        }
+    );
+    assert_eq!(
+        AdminStore::activate_provisioned(&*store, provisioned)
+            .await
+            .unwrap_err(),
+        SetStatusError::OperatorHold
+    );
+    let view = AdminStore::account_view(&*store, provisioned)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.status, AccountStatus::Suspended);
+    assert_eq!(view.status_set_by, AdminAuthority::Operator);
+}

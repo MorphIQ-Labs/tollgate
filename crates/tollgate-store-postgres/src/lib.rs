@@ -3499,6 +3499,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stored_authorities_reject_unknown_vocabulary() {
+        assert_eq!(
+            decode_authority("Operator".into()).unwrap(),
+            AdminAuthority::Operator
+        );
+        assert_eq!(
+            decode_authority("Provisioner".into()).unwrap(),
+            AdminAuthority::Provisioner
+        );
+        for invalid in ["", "operator", "provisioner", "Administrator", "Provisioner "] {
+            assert!(decode_authority(invalid.into()).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
     fn stored_fences_use_the_exact_positive_bigint_domain() {
         for invalid in [i64::MIN, -1, 0] {
             assert!(stored_fence(invalid).is_err());
