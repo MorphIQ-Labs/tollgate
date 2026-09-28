@@ -15,6 +15,10 @@ release from that section when the merge request lands.
   returns `KeyError` instead of `StoreError`; custom backends and Rust callers
   must update their signatures and handle `UnknownAccount`.
 
+- Oversized request bodies now receive a route-neutral error title; only usage
+  ingest includes the usage-batch event cap. `413 batch-too-large` is unchanged
+  (#42).
+
 ## [0.30.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.30.2...v0.30.3) - 2026-09-28
 
 ### Fixed

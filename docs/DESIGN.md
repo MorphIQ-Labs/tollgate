@@ -7653,6 +7653,21 @@ return error type from `StoreError` to `KeyError`. Deploy updated clients before
 the server where that behavior matters. There is no schema migration,
 authentication change, extra round trip, or request-path work.
 
+## Body-limit advice belongs to the route (GH-42)
+
+The shared JSON rejection converter appended the usage-batch event cap to
+all `413 batch-too-large` responses, including snapshot publication and account
+creation. Its existing regression exercised only ingest, where that advice was
+correct, so the misuse on other routes went unnoticed.
+
+The converter now supplies a route-neutral title. The ingest handler accepts
+the extractor result and adds its event cap only to a body-size rejection,
+before any store call. Snapshot and default-limit route tests pin the neutral
+message; ingest tests retain the cap and keep malformed JSON distinct.
+Status, code, byte limits, event limits, authentication and schemas are unchanged.
+Only human-readable error advice changes; there is no migration or request-path
+cost.
+
 ## Deposit overflow is a permanent refusal (GH-40)
 
 Deposit arithmetic already refused overflow atomically, but memory wrapped its
@@ -7680,3 +7695,13 @@ problem codes before the server so they recognize the permanent refusal.
 There is no schema migration or request-path work. Boundary tests cover exact
 fit, both overflowing counters, repeat refusals and PostgreSQL's input domain;
 the HTTP regression pins status and code as well as unchanged accounting.
+
+## Mutation diff runs and PostgreSQL requirements
+
+The diff gate intentionally disables PostgreSQL when no backend files change,
+to let independent mutation workers run without sharing a database. After the
+credential expiry integration test began enforcing `TOLLGATE_REQUIRE_PG`, the
+gate still removed only the URL, leaving a contradictory required-but-unavailable
+backend. Server-only changes therefore failed the unmutated baseline. The gate
+now clears both variables together only in that intentional optional-backend
+branch; backend changes and full sweeps retain the PostgreSQL requirement.
