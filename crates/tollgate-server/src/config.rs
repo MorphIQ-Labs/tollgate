@@ -1,6 +1,7 @@
 //! File-backed security configuration. Operators stage referenced files first,
 //! then atomically replace the JSON manifest. Failed loads preserve the live generation.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +15,8 @@ use zeroize::Zeroizing;
 
 use crate::google::GoogleVerifier;
 use crate::security::{
-    ControlIdentity, ProvisionerLimits, Role, SecurityError, SecurityPolicy, ServerSecurity,
+    ControlIdentity, ProvisionerLimits, ProvisionerPolicyTemplate, Role, SecurityError,
+    SecurityPolicy, ServerSecurity,
 };
 use crate::transport::{TlsConfig, certificate_fingerprint};
 use tollgate_core::CostUnits;
@@ -29,6 +31,8 @@ struct Manifest {
     certificates: Vec<CertificateFile>,
     google: Option<GoogleConfig>,
     issuer: Option<IssuerFile>,
+    #[serde(default)]
+    policy_templates: BTreeMap<String, ProvisionerPolicyTemplate>,
 }
 
 /// Customer-credential issuance authority. Distinct from every bearer: the
@@ -55,6 +59,8 @@ struct BearerFile {
     token_file: PathBuf,
     /// Required for, and only for, a `provisioner` (#39).
     max_budget_allowance: Option<CostUnits>,
+    /// Required nonempty template names for provisioners only (#43).
+    allowed_policy_templates: Option<Vec<String>>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -64,6 +70,8 @@ struct CertificateFile {
     certificate: PathBuf,
     /// Required for, and only for, a `provisioner` (#39).
     max_budget_allowance: Option<CostUnits>,
+    /// Required nonempty template names for provisioners only (#43).
+    allowed_policy_templates: Option<Vec<String>>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -79,6 +87,8 @@ struct GoogleSubject {
     role: Role,
     /// Required for, and only for, a `provisioner` (#39).
     max_budget_allowance: Option<CostUnits>,
+    /// Required nonempty template names for provisioners only (#43).
+    allowed_policy_templates: Option<Vec<String>>,
 }
 
 /// Loader state retains Google keys for at most one hour after a successful
@@ -262,6 +272,9 @@ impl SecurityLoader {
         let bytes = read(&self.path).await?;
         let manifest: Manifest = serde_json::from_slice(&bytes)
             .map_err(|_| SecurityError("invalid security manifest"))?;
+        for template in manifest.policy_templates.values() {
+            template.validate()?;
+        }
         let directory = self.path.parent().unwrap_or(Path::new("."));
         let mut digest = Sha256::new();
         record_digest(&mut digest, bytes.as_slice());
@@ -293,6 +306,8 @@ impl SecurityLoader {
                 bearer.identity,
                 bearer.role,
                 bearer.max_budget_allowance,
+                bearer.allowed_policy_templates,
+                &manifest.policy_templates,
             )?);
             tokens.push(token);
         }
@@ -332,6 +347,8 @@ impl SecurityLoader {
                     certificate.identity,
                     certificate.role,
                     certificate.max_budget_allowance,
+                    certificate.allowed_policy_templates,
+                    &manifest.policy_templates,
                 )?,
             )?;
         }
@@ -394,7 +411,13 @@ impl SecurityLoader {
                 }
                 mapped.push((
                     GoogleVerifier::principal(&subject.subject),
-                    identity(subject.identity, subject.role, subject.max_budget_allowance)?,
+                    identity(
+                        subject.identity,
+                        subject.role,
+                        subject.max_budget_allowance,
+                        subject.allowed_policy_templates,
+                        &manifest.policy_templates,
+                    )?,
                 ));
             }
             policy = policy.with_bearer(verifier, mapped)?;
@@ -412,25 +435,36 @@ impl SecurityLoader {
     }
 }
 
-/// One manifest entry's identity. The ceiling is required for a provisioner
-/// and refused for any other role, so a misplaced field is an error rather
-/// than a silently ignored limit (#39).
+/// Resolve one manifest identity's budget ceiling and approved templates.
+/// Provisioners require both; other roles refuse either instead of silently
+/// ignoring misplaced authority (#39, #43).
 fn identity(
     name: String,
     role: Role,
     max_budget_allowance: Option<CostUnits>,
+    allowed_policy_templates: Option<Vec<String>>,
+    templates: &BTreeMap<String, ProvisionerPolicyTemplate>,
 ) -> Result<ControlIdentity, SecurityError> {
-    match (role, max_budget_allowance) {
-        (Role::Provisioner, Some(max)) => {
-            ControlIdentity::provisioner(name, ProvisionerLimits::new(max))
+    match (role, max_budget_allowance, allowed_policy_templates) {
+        (Role::Provisioner, Some(max), Some(names)) => {
+            let approved = names
+                .into_iter()
+                .map(|name| {
+                    templates
+                        .get(&name)
+                        .cloned()
+                        .ok_or(SecurityError("unknown provisioner policy template"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            ControlIdentity::provisioner(name, ProvisionerLimits::new(max, approved)?)
         }
-        (Role::Provisioner, None) => Err(SecurityError(
-            "a provisioner identity requires max_budget_allowance",
+        (Role::Provisioner, _, _) => Err(SecurityError(
+            "a provisioner identity requires max_budget_allowance and allowed_policy_templates",
         )),
-        (Role::Instance | Role::Operator, Some(_)) => Err(SecurityError(
-            "max_budget_allowance applies only to a provisioner identity",
+        (Role::Instance | Role::Operator, None, None) => ControlIdentity::new(name, role),
+        (Role::Instance | Role::Operator, _, _) => Err(SecurityError(
+            "provisioner limits apply only to a provisioner identity",
         )),
-        (Role::Instance | Role::Operator, None) => ControlIdentity::new(name, role),
     }
 }
 
@@ -524,6 +558,17 @@ impl Drop for SecurityReloader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn template() -> ProvisionerPolicyTemplate {
+        ProvisionerPolicyTemplate {
+            cost_table: Arc::new(
+                tollgate_core::CostTable::builder(CostUnits(1), CostUnits(1)).build(),
+            ),
+            limits: tollgate_core::ResolvedLimits::new(1),
+            permissions: tollgate_core::PermissionBits(0),
+            policy_revision: tollgate_core::PolicyRevision::UNSTATED,
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn dropping_the_reloader_releases_its_owned_task_and_clock() {
@@ -622,7 +667,7 @@ mod tests {
         let now = Timestamp::from_second(1_700_000_100).unwrap();
         for (subject, valid) in [
             (
-                serde_json::json!({"subject": "1", "identity": "signup", "role": "provisioner", "max_budget_allowance": 1000}),
+                serde_json::json!({"subject": "1", "identity": "signup", "role": "provisioner", "max_budget_allowance": 1000, "allowed_policy_templates": ["standard"]}),
                 true,
             ),
             (
@@ -633,12 +678,28 @@ mod tests {
                 serde_json::json!({"subject": "1", "identity": "ops", "role": "operator", "max_budget_allowance": 1000}),
                 false,
             ),
+            (
+                serde_json::json!({"subject": "1", "identity": "signup", "role": "provisioner", "max_budget_allowance": 1000}),
+                false,
+            ),
+            (
+                serde_json::json!({"subject": "1", "identity": "signup", "role": "provisioner", "max_budget_allowance": 1000, "allowed_policy_templates": []}),
+                false,
+            ),
+            (
+                serde_json::json!({"subject": "1", "identity": "signup", "role": "provisioner", "max_budget_allowance": 1000, "allowed_policy_templates": ["missing"]}),
+                false,
+            ),
+            (
+                serde_json::json!({"subject": "1", "identity": "ops", "role": "operator", "allowed_policy_templates": ["standard"]}),
+                false,
+            ),
         ] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("security.json");
             std::fs::write(
                 &path,
-                serde_json::json!({"google": {"audience": "https://control.example.test", "subjects": [subject]}})
+                serde_json::json!({"policy_templates": {"standard": template()}, "google": {"audience": "https://control.example.test", "subjects": [subject]}})
                     .to_string(),
             )
             .unwrap();
@@ -653,14 +714,20 @@ mod tests {
 
     #[test]
     fn a_manifest_ceiling_reaches_only_the_provisioner_identity() {
-        let provisioner =
-            identity("signup".into(), Role::Provisioner, Some(CostUnits(1000))).unwrap();
+        let provisioner = identity(
+            "signup".into(),
+            Role::Provisioner,
+            Some(CostUnits(1000)),
+            Some(vec!["standard".into()]),
+            &BTreeMap::from([("standard".into(), template())]),
+        )
+        .unwrap();
         assert_eq!(
             provisioner.provisioner_limits(),
-            Some(ProvisionerLimits::new(CostUnits(1000)))
+            Some(ProvisionerLimits::new(CostUnits(1000), vec![template()]).unwrap())
         );
         for role in [Role::Instance, Role::Operator] {
-            let other = identity("ops".into(), role, None).unwrap();
+            let other = identity("ops".into(), role, None, None, &BTreeMap::new()).unwrap();
             assert_eq!(other.provisioner_limits(), None);
         }
     }

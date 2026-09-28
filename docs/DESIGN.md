@@ -7768,6 +7768,47 @@ credential, withdraw its snapshot, and issue a fresh key/principal before
 publishing again. Never lower a stored generation to recover it: instances
 retain the higher watermark.
 
+## Operator-approved provisioner snapshot policy (GH-43)
+
+The scoped provisioner role removed funding and operator-state authority, but
+its strict key snapshot still let the caller choose pricing, limits and
+permissions. Refusing elastic credit did not prevent a zero-cost schedule or
+broader access. The prior invariants and API reference documented the gap;
+this change closes it at the authenticated policy-publication boundary.
+
+The security manifest owns named `policy_templates`; each provisioner bearer,
+certificate or Google subject requires a nonempty `allowed_policy_templates`
+list. Resolving those names produces validated immutable templates inside
+`ProvisionerLimits`. Startup rejects missing, unknown or invalid approvals.
+Reload stages the whole manifest and preserves the last valid generation on
+failure. No separate store catalog, migration, digest encoding or hash-collision
+assumption is needed.
+
+Matching uses existing typed equality for the entire cost table, resolved
+limits, permission bits and policy revision, plus mandatory strict enforcement.
+It accepts one whole template, never independent fields selected across several.
+Including revision prevents attributing an approved policy to an unapproved
+revision. Account/key binding, status/class, budget stamping and generation
+allocation remain store contracts; snapshot validity remains caller-supplied.
+The match executes before provenance reads and publication, and uses the
+existing static-message `403 scope-forbidden` audit path. Operators retain
+policy-authoring authority. Both principal-snapshot routes remain operator-only;
+key snapshot publication is the only provisioner route that accepts a policy.
+
+The comparison costs O(approved templates × policy size), on an administrative
+control-plane request. Identity clones share the template slice and cost tables
+through Arc. There is no request-path change or extra database call. Complete
+field mutation tests, identity-scoped/mixed-template tests, no-store-call audit
+fixtures and reload tests provide implementation evidence; Lean models whole
+policy membership and strictness under explicit equality/generation assumptions.
+
+The manifest and Rust constructor changes are intentional breaks for provisioner
+users, with no permissive fallback. Existing instance/operator manifests still
+load. See the security guide for fleet replacement order: old servers reject
+new fields and can retain their old permissive generation. Reload affects new
+authentications, not in-flight grants or previously published snapshots;
+operators withdraw or replace those explicitly when removing an entitlement.
+
 ## Account key listing preserves owner absence (GH-41)
 
 The credential directory previously returned only a vector or `StoreError`.

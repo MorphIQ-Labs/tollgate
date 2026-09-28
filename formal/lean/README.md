@@ -122,7 +122,8 @@ This Lean package contains exact models for critical contracts:
   Watch-channel closure, task cancellation, HTTP delivery and finite counters
   remain separate implementation obligations.
 - `ControlPlane` models disjoint role evidence, route role-set admission, the
-  provisioner's account provenance and operator hold (#39), and serialized administrative
+  provisioner's account provenance and operator hold (#39), whole-template policy
+  approval with strict enforcement (#43), and serialized administrative
   receipt composition, whole-value replacement predecessors, and credential
   retirement identity preservation, idempotency and terminality. It assumes
   credential authenticity and atomic policy

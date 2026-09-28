@@ -2,6 +2,8 @@
 //! scoped so that compromising it cannot fund, close, grant `Assured`, reach
 //! an operator's accounts, or undo an operator's suspension.
 mod common;
+#[path = "../../tollgate-store/tests/support/delegating.rs"]
+mod delegating;
 
 use std::sync::Arc;
 
@@ -665,4 +667,190 @@ async fn provisioner_generation_extremes_cannot_block_operator_transitions() {
         assert_eq!(view.status_set_by, AdminAuthority::Operator);
         assert_eq!(view.capacity_class, CapacityClass::Assured);
     }
+}
+
+#[tokio::test]
+async fn unapproved_snapshot_fields_are_audited_before_any_store_call() {
+    let app = router(ServerState {
+        store: Arc::new(delegating::RejectingStore::new(
+            "policy refusal must precede every store call",
+        )),
+        clock: Arc::new(SystemClock),
+        security: common::security(),
+        issuer: None,
+    });
+    let account = AccountId(43);
+    let path = format!("/v1/admin/accounts/{account}/keys/{}/snapshot", KeyId(1043));
+    let approved = key_snapshot(account, EnforcementMode::Strict);
+    let mut changed = Vec::new();
+    for (field, value) in [
+        ("permissions", json!(1)),
+        (
+            "policy_revision",
+            json!(tollgate_core::PolicyRevision([1; 32])),
+        ),
+        ("enforcement_mode", json!({"Elastic": {"overage_cap": 1}})),
+    ] {
+        let mut body = approved.clone();
+        body["snapshot"][field] = value;
+        changed.push(body);
+    }
+    for (field, value) in [
+        ("fixed_request", json!(0)),
+        ("minimum_charge", json!(0)),
+        ("weights", json!([0])),
+        ("permissions", json!([1])),
+    ] {
+        let mut body = approved.clone();
+        body["snapshot"]["cost_table"][field] = value;
+        changed.push(body);
+    }
+    for (field, value) in [
+        ("max_items_per_request", json!(2)),
+        ("rate_units_per_second", json!(1)),
+        ("rate_burst_units", json!(1)),
+        ("weighted_rate_enabled", json!(true)),
+        ("max_concurrent_requests", json!(1)),
+        ("principal_max_concurrent_requests", json!(1)),
+        ("request_rate_per_second", json!(1)),
+    ] {
+        let mut body = approved.clone();
+        body["snapshot"]["limits"][field] = value;
+        if field == "request_rate_per_second" {
+            body["snapshot"]["limits"]["request_burst"] = json!(1);
+        }
+        // Principal concurrency requires an account bound to deserialize.
+        if field == "principal_max_concurrent_requests" {
+            body["snapshot"]["limits"]["max_concurrent_requests"] = json!(2);
+        }
+        changed.push(body);
+    }
+    for body in changed {
+        let capture = common::EventCapture::default();
+        let (status, problem) = capture
+            .during(call(&app, common::PROVISIONER, "PUT", &path, body.clone()))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}: {problem}");
+        assert_eq!(problem["code"], "scope-forbidden");
+        let events = audit(&capture);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["outcome"], "refused");
+        assert_eq!(events[0]["role"], "provisioner");
+        assert_eq!(events[0]["action"], "publish_key_snapshot");
+        assert_eq!(events[0]["actor"], "test-provisioner");
+        assert_eq!(events[0]["code"], "scope-forbidden");
+    }
+}
+
+#[tokio::test]
+async fn template_reload_changes_future_publications_and_bad_reload_preserves_approval() {
+    use tollgate_server::config::SecurityLoader;
+    use tollgate_store::{Clock, SnapshotResolution, SnapshotSource};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("security.json");
+    std::fs::write(directory.path().join("token"), common::PROVISIONER).unwrap();
+    let mut manifest = json!({
+        "policy_templates": {"standard": common::provisioner_template()},
+        "bearers": [{"identity": "signup", "role": "provisioner", "token_file": "token",
+            "max_budget_allowance": 1000, "allowed_policy_templates": ["standard"]}]
+    });
+    std::fs::write(&path, manifest.to_string()).unwrap();
+    let mut loader = SecurityLoader::new(&path);
+    let loaded = loader.load(SystemClock.now()).await.unwrap().unwrap();
+    let security = loader.start(loaded).unwrap();
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    let app = router(ServerState {
+        store: Arc::clone(&store),
+        clock: Arc::new(SystemClock),
+        security: Arc::clone(&security),
+        issuer: Some(Arc::new(tollgate_auth::HmacRegistry::new(
+            ISSUER_SECRET.as_bytes(),
+        ))),
+    });
+    let account = AccountId(44);
+    let key = provisioned(&app, account).await;
+    let endpoint = format!("/v1/admin/accounts/{account}/keys/{key}/snapshot");
+    let approved = key_snapshot(account, EnforcementMode::Strict);
+    assert_eq!(
+        call(
+            &app,
+            common::PROVISIONER,
+            "PUT",
+            &endpoint,
+            approved.clone()
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    // The durable snapshot and its generation survive a refused replacement.
+    let principal = store.principals().await.unwrap().unwrap()[0];
+    let before = match store.snapshot(principal).await.unwrap() {
+        SnapshotResolution::Present(snapshot) => snapshot.generation,
+        other => panic!("expected live snapshot: {other:?}"),
+    };
+    manifest["policy_templates"]["standard"]["permissions"] = json!(1);
+    std::fs::write(&path, manifest.to_string()).unwrap();
+    let loaded = loader.load(SystemClock.now()).await.unwrap().unwrap();
+    loader.install(loaded, &security).unwrap();
+    assert_eq!(
+        call(
+            &app,
+            common::PROVISIONER,
+            "PUT",
+            &endpoint,
+            approved.clone()
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    match store.snapshot(principal).await.unwrap() {
+        SnapshotResolution::Present(snapshot) => assert_eq!(snapshot.generation, before),
+        other => panic!("expected unchanged snapshot: {other:?}"),
+    }
+    let mut newly_approved = approved;
+    newly_approved["snapshot"]["permissions"] = json!(1);
+    assert_eq!(
+        call(
+            &app,
+            common::PROVISIONER,
+            "PUT",
+            &endpoint,
+            newly_approved.clone()
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    manifest["bearers"][0]["allowed_policy_templates"] = json!(["missing"]);
+    std::fs::write(&path, manifest.to_string()).unwrap();
+    assert!(loader.load(SystemClock.now()).await.is_err());
+    assert_eq!(
+        call(&app, common::PROVISIONER, "PUT", &endpoint, newly_approved)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn operators_can_publish_policies_outside_provisioner_templates() {
+    let (_store, app) = app();
+    let account = AccountId(45);
+    let key = provisioned(&app, account).await;
+    let endpoint = format!("/v1/admin/accounts/{account}/keys/{key}/snapshot");
+    let mut free = key_snapshot(account, EnforcementMode::Strict);
+    free["snapshot"]["cost_table"]["fixed_request"] = json!(0);
+    free["snapshot"]["cost_table"]["minimum_charge"] = json!(0);
+    assert_eq!(
+        call(&app, common::PROVISIONER, "PUT", &endpoint, free.clone())
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(&app, common::OPERATOR, "PUT", &endpoint, free).await.0,
+        StatusCode::NO_CONTENT
+    );
 }

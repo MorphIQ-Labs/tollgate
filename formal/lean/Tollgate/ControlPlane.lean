@@ -267,4 +267,48 @@ theorem first_allocated_generation_is_one (limit : Nat) (positive : 0 < limit) :
     nextGeneration 0 limit = some 1 := by
   simp [nextGeneration, positive]
 
+/-! Operator-approved provisioner policy (GH-43). Each field stands for its
+complete typed Rust value, not a digest. Exact comparison and manifest parsing
+are implementation assumptions; HTTP tests witness their field coverage and
+pre-store refusal. One request uses one immutable authorization generation. -/
+structure SnapshotPolicy where
+  pricing : Nat
+  limits : Nat
+  permissions : Nat
+  revision : Nat
+  deriving DecidableEq, Repr
+
+def approvePolicy (templates : List SnapshotPolicy) (candidate : SnapshotPolicy)
+    (strict : Bool) : Option SnapshotPolicy :=
+  if strict = true ∧ candidate ∈ templates then some candidate else none
+
+theorem approved_policy_is_one_whole_template
+    (templates : List SnapshotPolicy) (candidate published : SnapshotPolicy) (strict : Bool)
+    (accepted : approvePolicy templates candidate strict = some published) :
+    candidate = published ∧ strict = true ∧ candidate ∈ templates := by
+  unfold approvePolicy at accepted
+  split at accepted
+  next h => exact ⟨Option.some.inj accepted, h.1, h.2⟩
+  next h => cases accepted
+
+theorem an_approved_strict_policy_can_publish
+    (templates : List SnapshotPolicy) (candidate : SnapshotPolicy)
+    (approved : candidate ∈ templates) :
+    approvePolicy templates candidate true = some candidate := by
+  simp [approvePolicy, approved]
+
+theorem an_empty_template_set_grants_nothing (candidate : SnapshotPolicy) (strict : Bool) :
+    approvePolicy [] candidate strict = none := by
+  simp [approvePolicy]
+
+theorem templates_never_authorize_elastic (templates : List SnapshotPolicy) (candidate : SnapshotPolicy) :
+    approvePolicy templates candidate false = none := by
+  simp [approvePolicy]
+
+theorem removing_approval_refuses_future_publication
+    (templates : List SnapshotPolicy) (candidate : SnapshotPolicy) (strict : Bool)
+    (unapproved : candidate ∉ templates) :
+    approvePolicy templates candidate strict = none := by
+  simp [approvePolicy, unapproved]
+
 end Tollgate.ControlPlane

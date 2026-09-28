@@ -67,7 +67,7 @@ valid generation.
   "bearers": [
     {"identity": "deployment-operator", "role": "operator", "token_file": "operator.token"},
     {"identity": "signup-service", "role": "provisioner", "token_file": "signup.token",
-     "max_budget_allowance": 100000}
+     "max_budget_allowance": 100000, "allowed_policy_templates": ["standard"]}
   ],
   "certificates": [
     {"identity": "instance-service", "role": "instance", "certificate": "instance-leaf.pem"}
@@ -78,7 +78,15 @@ valid generation.
       {"subject": "123456789012345678901", "identity": "pricing-api", "role": "instance"}
     ]
   },
-  "issuer": {"secret_file": "issuer.secret"}
+  "issuer": {"secret_file": "issuer.secret"},
+  "policy_templates": {
+    "standard": {
+      "cost_table": {"fixed_request": 1, "minimum_charge": 1, "weights": [1]},
+      "limits": {"max_items_per_request": 100, "rate_units_per_second": 1000,
+                 "rate_burst_units": 1000},
+      "permissions": 1
+    }
+  }
 }
 ```
 
@@ -105,12 +113,39 @@ principal snapshot, reach an account an operator created, or lift a status an
 operator set. Compromising it therefore cannot fund an account or undo an abuse
 suspension. Keep `operator` for people and trusted tooling.
 
-`max_budget_allowance` is required on every `provisioner` entry and refused on
-any other role, so a missing or misplaced ceiling rejects the configuration.
-Set it to the largest allowance any self-service plan grants: a periodic
-allowance funds admission, so the ceiling bounds what a compromised provisioner
-can hand an account each period. A provisioner's key snapshots still carry its
-own cost table, limits and permissions; only `Elastic` enforcement is refused.
+`max_budget_allowance` and a nonempty `allowed_policy_templates` list are
+required on every `provisioner` bearer, certificate or Google subject entry.
+Both fields are refused on other roles. Names resolve in the manifest's
+`policy_templates` map; a missing name, missing/empty allowlist or invalid
+template rejects startup. Failed reloads retain the last valid generation.
+
+A provisioner's key snapshot must match one complete approved template's
+`cost_table`, `limits`, `permissions` and `policy_revision`. Revision defaults
+to the unstated value when omitted. Equality compares the typed values,
+including every operation weight/permission and legacy rate fallback; JSON
+object order is irrelevant. Templates cannot be combined field by field.
+`Strict` enforcement remains mandatory. A mismatched snapshot receives audited
+`403 scope-forbidden` before any store read or write. Operators remain
+unrestricted by these templates.
+
+Templates exclude account/key binding, status, capacity class, `valid_until`,
+`generation` and `budget`. Existing store checks own binding/status/class;
+provisioner generations and budget views are assigned by the store. The
+provisioner chooses snapshot validity. Template changes are part of the normal
+atomic security-generation reload and constrain requests authenticated after
+installation. Already authenticated requests retain their captured generation;
+already published snapshots remain valid until expiry, replacement or
+withdrawal. Revoke or replace existing snapshots separately when withdrawing
+an entitlement; changing an allowlist is not retroactive revocation.
+
+For an existing provisioner deployment, stage the templates and identity
+allowlists before starting the upgraded server; there is no allow-all fallback
+or database migration. Replace/drain every old server before resuming
+provisioner traffic. An old binary rejects the new manifest and can retain its
+previous permissive generation on reload, so a mixed fleet does not enforce
+this restriction uniformly. Instance/operator-only manifests are unchanged.
+Library embedders pass the approved policies to the now-fallible
+`ProvisionerLimits::new`; an empty set cannot create an identity.
 
 A provisioner reaches only accounts whose `origin` is `Provisioner`. Every
 account that existed before the role did is an operator's, so a signup service
