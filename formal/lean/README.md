@@ -76,6 +76,14 @@ This Lean package contains exact models for critical contracts:
   backward; that repeating a change republishes nothing; that publication
   contradicting the ledger is refused; and that `closed` is terminal. The
   operation's atomicity is an assumption the backend suites witness.
+- `SessionCredential` models the session-scoped credential cache over an
+  arbitrary verifier, so it holds for any scheme the verifier seam admits. It
+  proves that every principal the cache returns is exactly the verifier's
+  answer for the presented bytes and is still reusable at `now`; that a hit
+  requires the identical credential; that a changed or failed credential
+  never leaves the previous principal reusable; that an already-expired answer
+  is neither returned nor cached; and that sessions are isolated.
+  Constant-time comparison and wiping on drop are the tollgate-auth tests'.
 - [`Conservation`](Tollgate/Conservation.lean) models the per-account ledger equation
   `deposited + overage = balance + activeGrants + settledUsage + loss + expired`,
   where `balance = allowanceBalance + topupBalance`, and

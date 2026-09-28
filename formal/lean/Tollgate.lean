@@ -21,3 +21,4 @@ import Tollgate.IdempotentIngest
 import Tollgate.ChargeLifecycle
 import Tollgate.NegativeCache
 import Tollgate.StatusPropagation
+import Tollgate.SessionCredential

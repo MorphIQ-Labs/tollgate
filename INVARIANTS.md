@@ -1514,6 +1514,20 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     witnessed: reading the buffer after the drop would be undefined behaviour,
     so the wipe is observed from inside the drop instead — the last instant
     those bytes are still defined to read.
+    `SessionCredential.lean` proves the exact cache model for any verifier:
+    every principal the cache returns is what the verifier answers for the
+    presented bytes and is still reusable at `now`
+    (`Tollgate.SessionCredential.answer_is_current_verification`,
+    `Tollgate.SessionCredential.authenticate_sound`); a hit requires the
+    identical credential and a reusable proof
+    (`Tollgate.SessionCredential.hit_requires_identical_and_reusable`); a
+    changed or failed credential never leaves the previous principal reusable
+    (`Tollgate.SessionCredential.fresh_replaces_or_clears`,
+    `Tollgate.SessionCredential.failed_verification_clears`); an expired
+    answer is neither returned nor cached
+    (`Tollgate.SessionCredential.expired_answer_refused`); and sessions are
+    isolated (`Tollgate.SessionCredential.sessions_isolated`). Constant-time
+    comparison and the wipe on drop are Rust obligations.
     *Tests:* `an_unchanged_credential_is_verified_once_per_session`,
     `the_cache_is_isolated_per_session`,
     `a_failed_replacement_does_not_leave_the_previous_principal_usable`,
