@@ -12,10 +12,17 @@ use crate::{KeyRecord, StoreError};
 /// A page bounds transport memory, not the total credential catalogue.
 /// At the maximum, the canonical wire page fits its derived ~1 MiB envelope.
 pub const MAX_KEY_PAGE_LIMIT: usize = 4096;
+/// The page size used when a caller does not choose one: the server's default
+/// for an omitted `limit` query, and the client key manager's default.
 pub const DEFAULT_KEY_PAGE_LIMIT: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 /// PostgreSQL stores revisions as nonnegative BIGINTs. Neither backend wraps.
 pub const MAX_KEY_REVISION: u64 = i64::MAX as u64;
 
+/// Refuse a page limit above [`MAX_KEY_PAGE_LIMIT`].
+///
+/// # Errors
+///
+/// A [`StoreError`] when `limit` exceeds the maximum.
 pub fn validate_key_page_limit(limit: NonZeroUsize) -> Result<(), StoreError> {
     if limit.get() > MAX_KEY_PAGE_LIMIT {
         return Err(StoreError("credential page limit exceeds 4096".into()));
@@ -28,8 +35,13 @@ pub fn validate_key_page_limit(limit: NonZeroUsize) -> Result<(), StoreError> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 pub struct CredentialRecord {
+    /// The credential's identifier: the page's sort key and pagination cursor.
     pub key_id: KeyId,
+    /// The principal the credential authenticates as. [`CredentialSet::try_new`]
+    /// requires it to equal the leading 128 bits of `digest`.
     pub principal: Principal,
+    /// The verifier's HMAC-SHA256 digest of the secret. On the wire, exactly 64
+    /// lowercase hexadecimal characters; redacted from `Debug` output.
     #[cfg_attr(feature = "wire", serde(with = "digest_hex"))]
     pub digest: [u8; 32],
     /// Required on the wire: explicit null means no individual expiry.
@@ -65,6 +77,12 @@ impl From<KeyRecord> for CredentialRecord {
 pub struct CredentialSet(Vec<CredentialRecord>);
 
 impl CredentialSet {
+    /// Validate records as one set of identity evidence.
+    ///
+    /// # Errors
+    ///
+    /// A [`StoreError`] when a record's principal is not the leading 128 bits of its
+    /// digest, or when two records share a principal or a key id.
     pub fn try_new(records: Vec<CredentialRecord>) -> Result<Self, StoreError> {
         let mut principals = HashSet::with_capacity(records.len());
         let mut ids = HashSet::with_capacity(records.len());
@@ -85,9 +103,11 @@ impl CredentialSet {
         Ok(Self(records))
     }
 
+    /// The validated records, in the order given.
     pub fn records(&self) -> &[CredentialRecord] {
         &self.0
     }
+    /// Consume the set, returning its records.
     pub fn into_records(self) -> Vec<CredentialRecord> {
         self.0
     }
@@ -108,6 +128,16 @@ pub struct KeyPage {
 }
 
 impl KeyPage {
+    /// Validate one page against the request (`after`, `limit`) that produced it.
+    /// `as_of` is the instant the source selected active records at.
+    ///
+    /// # Errors
+    ///
+    /// A [`StoreError`] when `limit` exceeds [`MAX_KEY_PAGE_LIMIT`]; `revision`
+    /// exceeds [`MAX_KEY_REVISION`]; there are more than `limit` records; key ids do
+    /// not strictly increase from `after`; a record's `not_after` is at or before
+    /// `as_of`; `next_after` is present on a page that is not full or does not name
+    /// its last record; or the records fail [`CredentialSet::try_new`].
     pub fn try_new(
         revision: u64,
         as_of: Timestamp,
@@ -150,6 +180,11 @@ impl KeyPage {
         })
     }
 
+    /// Check that this page answers the request (`after`, `limit`).
+    ///
+    /// # Errors
+    ///
+    /// A [`StoreError`] when either differs from the request the page was built for.
     pub fn validate_request(
         &self,
         after: Option<KeyId>,
@@ -163,23 +198,33 @@ impl KeyPage {
         Ok(())
     }
 
+    /// The source revision the records were read at.
     pub fn revision(&self) -> u64 {
         self.revision
     }
+    /// The instant the source selected active records at.
     pub fn as_of(&self) -> Timestamp {
         self.as_of
     }
+    /// The page's records, in strictly increasing key-id order.
     pub fn records(&self) -> &[CredentialRecord] {
         self.keys.records()
     }
+    /// The cursor for the next page, which is this page's last key id, or `None`
+    /// when the page is terminal.
     pub fn next_after(&self) -> Option<KeyId> {
         self.next_after
     }
+    /// Consume the page, returning its records.
     pub fn into_records(self) -> Vec<CredentialRecord> {
         self.keys.into_records()
     }
 }
 
+/// A read-only source of revisioned, paginated active-credential pages: what
+/// a serving instance drains to build its verifier projection (INVARIANTS.md
+/// 34). It carries no lifecycle or administrative authority; that belongs to
+/// [`KeyDirectory`](crate::KeyDirectory).
 #[async_trait]
 pub trait KeySource: Send + Sync {
     /// Read active records in strictly increasing key-id order. Direct stores

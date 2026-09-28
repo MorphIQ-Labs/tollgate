@@ -349,6 +349,13 @@ pub struct StoredRecords {
     pub active_leases: usize,
 }
 
+/// The in-memory reference backend: every store trait behind one mutex.
+///
+/// It implements [`LeaseAllocator`], [`SnapshotSource`], [`UsageSink`],
+/// [`AdminStore`], [`KeyDirectory`], [`KeySource`](crate::KeySource) and
+/// [`StoreHealth`] with the settlement rules every backend must reproduce. It
+/// never deletes a record, so it suits development, tests and demos but not
+/// long-running load; see the [module documentation](crate::memory).
 pub struct MemoryStore {
     inner: Mutex<Inner>,
     policy: GrantPolicy,
@@ -356,6 +363,11 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
+    /// Create an empty store that sizes grants with `policy`.
+    ///
+    /// # Errors
+    ///
+    /// [`GrantPolicyError`] when `policy` fails [`GrantPolicy::validate`].
     pub fn new(policy: GrantPolicy) -> Result<Arc<Self>, GrantPolicyError> {
         policy.validate()?;
         let (push, _) = broadcast::channel(PUSH_CHANNEL_CAPACITY);
@@ -537,6 +549,12 @@ impl MemoryStore {
         );
     }
 
+    /// Tombstone a principal's live snapshot at its current generation and push
+    /// the revocation to subscribers. A principal with no snapshot, or one already
+    /// tombstoned, is left unchanged and nothing is pushed.
+    ///
+    /// Test/bootstrap convenience beside [`AdminStore::remove_snapshot`], which
+    /// also returns the audit receipt.
     pub fn remove_snapshot(&self, principal: Principal) {
         self.remove_snapshot_audited(principal);
     }
@@ -594,6 +612,8 @@ impl MemoryStore {
         })
     }
 
+    /// Every usage unit accepted for `account`: on active and settled leases, and
+    /// as overage. Zero for an unknown account.
     #[must_use]
     pub fn usage_recorded(&self, account: AccountId) -> CostUnits {
         self.lock()
@@ -621,6 +641,8 @@ impl MemoryStore {
         self.lock().usage.get(&request_id).copied()
     }
 
+    /// `account`'s spendable balance, allowance plus top-up, excluding units out on
+    /// lease. Zero for an unknown account.
     #[must_use]
     pub fn balance(&self, account: AccountId) -> CostUnits {
         self.lock()

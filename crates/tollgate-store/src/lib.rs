@@ -21,6 +21,8 @@
 //! correctness suite run without infrastructure, and to serve as executable
 //! documentation of the settlement rules a real backend must reproduce.
 
+#![deny(missing_docs)]
+
 pub mod audit;
 pub mod clock;
 pub mod credentials;
