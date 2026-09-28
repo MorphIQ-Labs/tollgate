@@ -242,4 +242,29 @@ theorem repeated_retirement_is_a_noop (before : CredentialState) :
 theorem retirement_is_terminal (before : CredentialState) :
     (retire (retire before).after).after.revoked = true := by rfl
 
+/-! Store-owned snapshot generations. The predecessor is the locked live or
+revoked watermark, or zero for first publication; limit is u64::MAX in memory
+and i64::MAX in PostgreSQL. No caller generation enters this transition.
+Atomicity and agreement between the SQL column, push and receipt are backend
+assumptions, witnessed separately by the mirrored integration tests. -/
+def nextGeneration (previous limit : Nat) : Option Nat :=
+  if previous < limit then some (previous + 1) else none
+
+theorem allocated_generation_advances_exactly_once (previous limit next : Nat)
+    (accepted : nextGeneration previous limit = some next) :
+    next = previous + 1 ∧ previous < next ∧ next ≤ limit := by
+  unfold nextGeneration at accepted
+  split at accepted
+  · simp only [Option.some.injEq] at accepted
+    omega
+  · cases accepted
+
+theorem exhausted_generation_refuses (previous limit : Nat) (full : limit ≤ previous) :
+    nextGeneration previous limit = none := by
+  simp [nextGeneration, Nat.not_lt.mpr full]
+
+theorem first_allocated_generation_is_one (limit : Nat) (positive : 0 < limit) :
+    nextGeneration 0 limit = some 1 := by
+  simp [nextGeneration, positive]
+
 end Tollgate.ControlPlane

@@ -1804,6 +1804,23 @@ pub trait KeyDirectory: crate::KeySource {
         snapshot: PublishableSnapshot,
     ) -> Result<crate::AdminReceipt<()>, KeySnapshotError>;
 
+    /// Publish key policy with a store-allocated generation. The submitted
+    /// generation is ignored: first publication uses 1, and each later write
+    /// uses the live snapshot or tombstone's generation plus one. Allocation,
+    /// validation, publication and receipt capture are one atomic operation.
+    /// Overflow fails without changing the snapshot or emitting a push.
+    ///
+    /// Provisioner HTTP publication must use this operation so an untrusted
+    /// caller cannot exhaust generations with an arbitrary jump. Repeats are
+    /// new publications, ordered by the store. All credential and ledger
+    /// checks from [`Self::publish_key_snapshot`] still apply.
+    async fn publish_key_snapshot_next(
+        &self,
+        account: AccountId,
+        key: KeyId,
+        snapshot: PublishableSnapshot,
+    ) -> Result<crate::AdminReceipt<()>, KeySnapshotError>;
+
     /// Withdraw the snapshot of `account`'s credential `key`, tombstoning it
     /// as [`AdminStore::remove_snapshot`] does. Allowed for a revoked
     /// credential: revocation does not withdraw its snapshot, and withdrawal

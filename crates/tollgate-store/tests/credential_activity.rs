@@ -205,3 +205,48 @@ async fn a_retired_credential_is_never_granted_a_snapshot_but_can_be_withdrawn()
     support::credential_activity::setup(&*store).await;
     support::credential_activity::a_retired_credential_is_never_granted_a_snapshot_but_can_be_withdrawn(&*store).await;
 }
+
+#[tokio::test]
+async fn store_allocated_generations_ignore_input_and_follow_tombstones() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    support::credential_activity::setup(&*store).await;
+    support::credential_activity::store_allocated_generations_ignore_input_and_follow_tombstones(
+        &*store,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn store_allocated_generations_preserve_operator_transitions() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    support::credential_activity::setup(&*store).await;
+    support::credential_activity::store_allocated_generations_preserve_operator_transitions(
+        &*store,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn concurrent_store_allocated_publications_have_distinct_generations() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    support::credential_activity::setup(&*store).await;
+    support::credential_activity::concurrent_store_allocated_publications_have_distinct_generations(&*store).await;
+}
+
+#[tokio::test]
+async fn exhausted_store_allocated_generation_changes_nothing() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    support::credential_activity::setup(&*store).await;
+    support::credential_activity::exhausted_store_allocated_generation_changes_nothing(
+        &*store,
+        u64::MAX,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn store_allocated_publication_preserves_binding_retirement_and_ledger_checks() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    support::credential_activity::setup(&*store).await;
+    support::credential_activity::store_allocated_publication_preserves_binding_retirement_and_ledger_checks(&*store).await;
+}

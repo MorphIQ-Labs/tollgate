@@ -7711,7 +7711,8 @@ the store transaction, so it arrives as a `failed` event with code
 role-mismatch `403` left no trace.
 
 **Compatibility.** The library change is breaking and ships as a minor bump
-under 0.x. `AdminStore` gains two required methods, `AdminState` two fields,
+under 0.x. `AdminStore` gains two required methods, `KeyDirectory` gains
+`publish_key_snapshot_next`, `AdminState` two fields,
 `SetStatusError` two variants, `AccountView` two fields, and
 `ControlIdentity::new` refuses `Role::Provisioner`. Manifests, wire requests
 and HTTP behaviour for `instance` and `operator` are unchanged.
@@ -7720,3 +7721,49 @@ and HTTP behaviour for `instance` and `operator` are unchanged.
 `403 account-not-provisioned` and `403 operator-hold`, are additive. Rollout:
 schema, then every server instance, then provisioner credentials. A server that
 predates the role rejects a manifest naming it, which is the safe failure.
+
+
+### Provisioner generations cannot consume operator transition headroom
+
+Review of #44 found that the new provisioner route reused the operator's
+key-snapshot write verbatim. Publishing a valid Strict snapshot at `u64::MAX`
+(memory) or `i64::MAX` (PostgreSQL) exhausted the counter in one request.
+Suspension, closure and capacity-class changes all republish at generation + 1,
+so they rolled back on overflow. The existing hold tests covered status authors
+but published no snapshot, and publication tests used small generations. The
+Lean hold model likewise assumed the status transition could complete.
+
+`KeyDirectory::publish_key_snapshot_next` now owns successor allocation for
+provisioners: 1 for an absent principal, otherwise the locked live or revoked
+watermark plus one. It disregards the submitted generation, uses checked
+arithmetic, and publishes the same value in storage, receipts and pushes.
+Memory holds its existing mutex; PostgreSQL uses the existing snapshot write
+lock and, after a concurrent first-insert conflict, allocates against the
+winner. The credential/account/snapshot lock order stays unchanged. Allocation
+adds a constant amount of control-plane work to the existing indexed write;
+there is no request-path change or new dependency.
+
+The sibling audit covered both publication routes and all status/class
+restamping paths. Principal publication is operator-only, and operator key
+publication retains its existing generation/no-op contract. Withdrawal keeps
+the current generation and cannot jump it. All provisioner key publications
+select the new method. No other provisioner operation accepts a generation.
+
+Mirrored tests now cover extreme supplied values, tombstones, concurrent first
+and subsequent writes, actual finite-width exhaustion, validation and all
+three operator transitions. An HTTP regression tests both domain maxima.
+The bounded successor model in `ControlPlane.lean` proves exact increment,
+monotonicity and overflow refusal; it does not prove SQL locking or HTTP
+dispatch, which the integration tests witness.
+
+This adds one required `KeyDirectory` method to the already-breaking library
+change. Wire DTOs and operator behavior are unchanged. Provisioner generations
+are store-assigned and retries are new publications; callers must serialize
+policy updates whose order matters. No further schema migration is needed.
+Deploy every server with this fix before enabling provisioner credentials;
+rolling back to a build with the vulnerable provisioner route reopens the gap.
+The fix does not reset existing operator-selected high watermarks. A deployment
+that exercised the unreleased vulnerable role must retire an exhausted
+credential, withdraw its snapshot, and issue a fresh key/principal before
+publishing again. Never lower a stored generation to recover it: instances
+retain the higher watermark.

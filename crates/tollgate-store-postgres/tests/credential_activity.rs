@@ -524,3 +524,44 @@ async fn key_bound_publication_and_status_changes_never_deadlock() {
         }
     }
 }
+
+#[tokio::test]
+async fn store_allocated_generations_ignore_input_and_follow_tombstones() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store().await else { return };
+    scenarios::setup(&*store).await;
+    scenarios::store_allocated_generations_ignore_input_and_follow_tombstones(&*store).await;
+}
+
+#[tokio::test]
+async fn store_allocated_generations_preserve_operator_transitions() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store().await else { return };
+    scenarios::setup(&*store).await;
+    scenarios::store_allocated_generations_preserve_operator_transitions(&*store).await;
+}
+
+#[tokio::test]
+async fn concurrent_store_allocated_publications_have_distinct_generations() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store().await else { return };
+    scenarios::setup(&*store).await;
+    scenarios::concurrent_store_allocated_publications_have_distinct_generations(&*store).await;
+}
+
+#[tokio::test]
+async fn exhausted_store_allocated_generation_changes_nothing() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store().await else { return };
+    scenarios::setup(&*store).await;
+    scenarios::exhausted_store_allocated_generation_changes_nothing(&*store, i64::MAX as u64).await;
+}
+
+#[tokio::test]
+async fn store_allocated_publication_preserves_binding_retirement_and_ledger_checks() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store().await else { return };
+    scenarios::setup(&*store).await;
+    scenarios::store_allocated_publication_preserves_binding_retirement_and_ledger_checks(&*store)
+        .await;
+}

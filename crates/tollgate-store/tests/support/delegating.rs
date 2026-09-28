@@ -875,6 +875,15 @@ where
         KeyDirectory::publish_key_snapshot(&*self.inner, account, key, snapshot).await
     }
 
+    async fn publish_key_snapshot_next(
+        &self,
+        account: AccountId,
+        key: KeyId,
+        snapshot: PublishableSnapshot,
+    ) -> Result<AdminReceipt<()>, KeySnapshotError> {
+        KeyDirectory::publish_key_snapshot_next(&*self.inner, account, key, snapshot).await
+    }
+
     async fn remove_key_snapshot(
         &self,
         account: AccountId,
@@ -1163,6 +1172,15 @@ impl KeyDirectory for RejectingStore {
         _snapshot: PublishableSnapshot,
     ) -> Result<AdminReceipt<()>, KeySnapshotError> {
         unreachable!("{}: KeyDirectory::publish_key_snapshot", self.reason)
+    }
+
+    async fn publish_key_snapshot_next(
+        &self,
+        _account: AccountId,
+        _key: KeyId,
+        _snapshot: PublishableSnapshot,
+    ) -> Result<AdminReceipt<()>, KeySnapshotError> {
+        unreachable!("{}: KeyDirectory::publish_key_snapshot_next", self.reason)
     }
 
     async fn remove_key_snapshot(

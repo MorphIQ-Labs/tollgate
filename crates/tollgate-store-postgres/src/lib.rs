@@ -253,31 +253,18 @@ impl KeyDirectory for PostgresStore {
         key: KeyId,
         snapshot: PublishableSnapshot,
     ) -> Result<AdminReceipt<()>, KeySnapshotError> {
-        let generation = i64::try_from(snapshot.generation.0).map_err(|_| {
-            StoreError("snapshot generation exceeds PostgreSQL BIGINT range".into())
-        })?;
-        let mut tx = self.pool.begin().await.map_err(storage)?;
-        let result = async {
-            let (principal, revoked) = lock_account_key(&mut tx, account, key).await?;
-            if revoked {
-                return Err(KeySnapshotError::Retired { key_id: key });
-            }
-            if snapshot.key_id != Some(key) {
-                return Err(PublishSnapshotError::CredentialMismatch { key_id: key }.into());
-            }
-            let published = publish_in_tx(&mut tx, principal, generation, snapshot).await?;
-            Ok((principal, published))
-        }
-        .await;
-        let (principal, (written, published, before, after)) =
-            finish_transaction(tx, result).await?;
-        if written {
-            self.push_to_subscribers(SnapshotPush {
-                principal,
-                resolution: SnapshotResolution::Present(published),
-            });
-        }
-        Ok(AdminReceipt::new((), before, after))
+        self.publish_key_snapshot_with_generation(account, key, snapshot, false)
+            .await
+    }
+
+    async fn publish_key_snapshot_next(
+        &self,
+        account: AccountId,
+        key: KeyId,
+        snapshot: PublishableSnapshot,
+    ) -> Result<AdminReceipt<()>, KeySnapshotError> {
+        self.publish_key_snapshot_with_generation(account, key, snapshot, true)
+            .await
     }
 
     async fn remove_key_snapshot(
@@ -375,6 +362,44 @@ impl KeyDirectory for PostgresStore {
 }
 
 impl PostgresStore {
+    async fn publish_key_snapshot_with_generation(
+        &self,
+        account: AccountId,
+        key: KeyId,
+        snapshot: PublishableSnapshot,
+        allocate_generation: bool,
+    ) -> Result<AdminReceipt<()>, KeySnapshotError> {
+        let generation = if allocate_generation {
+            None
+        } else {
+            Some(i64::try_from(snapshot.generation.0).map_err(|_| {
+                StoreError("snapshot generation exceeds PostgreSQL BIGINT range".into())
+            })?)
+        };
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let result = async {
+            let (principal, revoked) = lock_account_key(&mut tx, account, key).await?;
+            if revoked {
+                return Err(KeySnapshotError::Retired { key_id: key });
+            }
+            if snapshot.key_id != Some(key) {
+                return Err(PublishSnapshotError::CredentialMismatch { key_id: key }.into());
+            }
+            let published = publish_in_tx(&mut tx, principal, generation, snapshot).await?;
+            Ok((principal, published))
+        }
+        .await;
+        let (principal, (written, published, before, after)) =
+            finish_transaction(tx, result).await?;
+        if written {
+            self.push_to_subscribers(SnapshotPush {
+                principal,
+                resolution: SnapshotResolution::Present(published),
+            });
+        }
+        Ok(AdminReceipt::new((), before, after))
+    }
+
     /// Account creation for either authority (#39). `origin` is written once
     /// here, as both the creator and the author of the opening status.
     async fn create_account_as(
@@ -3166,7 +3191,7 @@ impl AdminStore for PostgresStore {
         })?;
 
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        let result = publish_in_tx(&mut tx, principal, generation, snapshot).await;
+        let result = publish_in_tx(&mut tx, principal, Some(generation), snapshot).await;
 
         let (written, published, before, after) = finish_transaction(tx, result).await?;
         if written {
@@ -3239,11 +3264,13 @@ async fn lock_account_key(
 /// stated credential binding (GL-35), the ledger status and capacity-class
 /// guards (GL-51, GL-99), the budget stamp (GL-97), and the generation-ordered
 /// write. Returns whether a row was written, the stamped snapshot to push
-/// after commit, and the audited predecessor and successor.
+/// after commit, and the audited predecessor and successor. `None` requests
+/// generation allocation under the snapshot write lock; `Some` retains the
+/// operator's generation-ordered publication contract.
 async fn publish_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     principal: Principal,
-    generation: i64,
+    generation: Option<i64>,
     snapshot: PublishableSnapshot,
 ) -> Result<(bool, PublishableSnapshot, AdminState, AdminState), PublishSnapshotError> {
     if let Some(key_id) = snapshot.key_id {
@@ -3318,6 +3345,14 @@ async fn publish_in_tx(
         .map_err(|e| StoreError(format!("snapshot encode: {e}")))?;
 
     let (written, before, after) = write_snapshot_audited(tx, principal, generation, value).await?;
+    let published = if generation.is_none() {
+        let AdminState::Snapshot { generation, .. } = after else {
+            return Err(StoreError("published snapshot has no generation".into()).into());
+        };
+        published.restamped(published.status, generation)
+    } else {
+        published
+    };
     Ok((written, published, before, after))
 }
 
@@ -3373,21 +3408,22 @@ async fn snapshot_audit_row(
 async fn write_snapshot_audited(
     tx: &mut Transaction<'_, Postgres>,
     principal: Principal,
-    generation: i64,
+    generation: Option<i64>,
     value: serde_json::Value,
 ) -> Result<(bool, AdminState, AdminState), StoreError> {
     let mut before = snapshot_audit_row(tx, principal).await?;
-    let after = AdminState::Snapshot {
-        generation: generation_from(generation)?,
-        revoked: false,
-    };
     if before == AdminState::Absent {
+        let initial = generation.unwrap_or(1);
+        let after = AdminState::Snapshot {
+            generation: generation_from(initial)?,
+            revoked: false,
+        };
         let inserted = sqlx::query(
             "INSERT INTO tollgate_snapshots (principal, generation, snapshot, deleted)
             VALUES ($1, $2, $3, FALSE) ON CONFLICT (principal) DO NOTHING",
         )
         .bind(id_bytes(principal.0))
-        .bind(generation)
+        .bind(initial)
         .bind(&value)
         .execute(&mut **tx)
         .await
@@ -3405,6 +3441,19 @@ async fn write_snapshot_audited(
     } = before
     else {
         return Err(StoreError("snapshot disappeared during publication".into()));
+    };
+    // Recompute after an insert conflict as well: the locked predecessor,
+    // including a tombstone, is the only authority for the next generation.
+    let generation = match generation {
+        Some(stated) => stated,
+        None => i64::try_from(previous.0)
+            .ok()
+            .and_then(|previous| previous.checked_add(1))
+            .ok_or_else(|| StoreError("snapshot generation overflow".into()))?,
+    };
+    let after = AdminState::Snapshot {
+        generation: generation_from(generation)?,
+        revoked: false,
     };
     if previous >= generation_from(generation)? {
         return Ok((false, before, before));

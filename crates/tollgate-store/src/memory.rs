@@ -369,6 +369,51 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
+    fn publish_key_snapshot_with_generation(
+        &self,
+        account: AccountId,
+        key: KeyId,
+        snapshot: PublishableSnapshot,
+        allocate_generation: bool,
+    ) -> Result<crate::AdminReceipt<()>, KeySnapshotError> {
+        // One guard across resolution, the retirement check and publication,
+        // so a revocation cannot land between them.
+        let (principal, published, before, after) = {
+            let mut inner = self.lock();
+            let stored = account_key(&inner, account, key)?;
+            if stored.revoked_at.is_some() {
+                return Err(KeySnapshotError::Retired { key_id: key });
+            }
+            let principal = stored.record.principal;
+            if snapshot.key_id != Some(key) {
+                return Err(PublishSnapshotError::CredentialMismatch { key_id: key }.into());
+            }
+            let before = snapshot_audit(inner.snapshots.get(&principal));
+            let snapshot = if allocate_generation {
+                let previous = inner
+                    .snapshots
+                    .get(&principal)
+                    .map_or(0, |s| s.generation().0);
+                let next = previous
+                    .checked_add(1)
+                    .ok_or_else(|| StoreError("snapshot generation overflow".into()))?;
+                snapshot.restamped(snapshot.status, Generation(next))
+            } else {
+                snapshot
+            };
+            let published = publish_locked(&mut inner, principal, snapshot)?;
+            let after = snapshot_audit(inner.snapshots.get(&principal));
+            (principal, published, before, after)
+        };
+        if let Some(snapshot) = published {
+            self.push_to_subscribers(SnapshotPush {
+                principal,
+                resolution: SnapshotResolution::Present(snapshot),
+            });
+        }
+        Ok(AdminReceipt::new((), before, after))
+    }
+
     /// Create an empty store that sizes grants with `policy`.
     ///
     /// # Errors
@@ -1970,31 +2015,17 @@ impl KeyDirectory for MemoryStore {
         account: AccountId,
         key: KeyId,
         snapshot: PublishableSnapshot,
-    ) -> Result<crate::AdminReceipt<()>, KeySnapshotError> {
-        // One guard across resolution, the retirement check and publication,
-        // so a revocation cannot land between them.
-        let (principal, published, before, after) = {
-            let mut inner = self.lock();
-            let stored = account_key(&inner, account, key)?;
-            if stored.revoked_at.is_some() {
-                return Err(KeySnapshotError::Retired { key_id: key });
-            }
-            let principal = stored.record.principal;
-            if snapshot.key_id != Some(key) {
-                return Err(PublishSnapshotError::CredentialMismatch { key_id: key }.into());
-            }
-            let before = snapshot_audit(inner.snapshots.get(&principal));
-            let published = publish_locked(&mut inner, principal, snapshot)?;
-            let after = snapshot_audit(inner.snapshots.get(&principal));
-            (principal, published, before, after)
-        };
-        if let Some(snapshot) = published {
-            self.push_to_subscribers(SnapshotPush {
-                principal,
-                resolution: SnapshotResolution::Present(snapshot),
-            });
-        }
-        Ok(AdminReceipt::new((), before, after))
+    ) -> Result<AdminReceipt<()>, KeySnapshotError> {
+        self.publish_key_snapshot_with_generation(account, key, snapshot, false)
+    }
+
+    async fn publish_key_snapshot_next(
+        &self,
+        account: AccountId,
+        key: KeyId,
+        snapshot: PublishableSnapshot,
+    ) -> Result<AdminReceipt<()>, KeySnapshotError> {
+        self.publish_key_snapshot_with_generation(account, key, snapshot, true)
     }
 
     async fn remove_key_snapshot(

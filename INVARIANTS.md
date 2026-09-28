@@ -2561,14 +2561,20 @@ exists to detect corrupt state and must not be able to launder it.
 
 41. **A provisioner can neither fund, close, grant `Assured`, exceed its budget
     ceiling, extend credit, reach an operator's account, nor undo an operator's
-    status.** A `provisioner` identity (#39) reaches every admin route except
+    status or exhaust snapshot generations through caller-selected jumps.**
+    A `provisioner` identity (#39) reaches every admin route except
     deposit and principal-snapshot publication. On those it reaches, it may
     create only an unfunded, suspended, best-effort account; move status only to
     `Active`; set only `BestEffort`; set an allowance no larger than its
     identity's `max_budget_allowance`; and publish only `Strict` key snapshots.
+    Key-snapshot generations are store-allocated: first publication is 1,
+    then the locked live or revoked watermark plus one, regardless of the
+    submitted generation. A repeat is a new publication; arithmetic overflow
+    changes nothing. This removes arbitrary jumps that could block the
+    operator's status or capacity-class republishing.
     Every account-scoped route requires the account's `origin` to be
     `Provisioner`, and activation refuses an account whose current status an
-    operator set. Every refusal is `403` and audited; none moves the store.
+    operator set. Every scope refusal is `403` and audited; none moves the store.
 
     Enforcement, top of the ladder first. *Unrepresentable:* a provisioner
     `ControlIdentity` cannot be built without `ProvisionerLimits`, nor any other
@@ -2580,7 +2586,10 @@ exists to detect corrupt state and must not be able to launder it.
     `activate_provisioned` checks provenance and the status author under the
     same row lock or mutex as the write, and every `set_account_status` records
     the operator as author, so a racing suspension either lands first and
-    holds or lands second and wins. `origin` is immutable, so the handlers'
+    holds or lands second and wins. `KeyDirectory::publish_key_snapshot_next`
+    allocates and publishes under the same mutex or snapshot-row lock, with
+    insert conflicts resolved against the winning row before allocation.
+    `origin` is immutable, so the handlers'
     `AdminIdentity::check_account` may read it before a separate write without
     a race. Argument refusals (balance, status, class, ceiling, enforcement
     mode) are handler checks made before any store call — tested convention,
@@ -2590,7 +2599,17 @@ exists to detect corrupt state and must not be able to launder it.
     `a_provisioner_cannot_fund_or_publish_principals`,
     `an_operator_suspension_holds`, `activation_only_activates` and
     `an_operators_account_is_out_of_reach`, assuming each transition is atomic;
-    it does not model balances, snapshots or the handler argument checks.
+    it does not model balances, snapshot policy or the handler argument checks.
+    `allocated_generation_advances_exactly_once`, `exhausted_generation_refuses`
+    and `first_allocated_generation_is_one` prove bounded successor allocation
+    in the same model. Finite-width and concurrency witnesses in both backends:
+    `store_allocated_generations_ignore_input_and_follow_tombstones`,
+    `store_allocated_generations_preserve_operator_transitions`,
+    `concurrent_store_allocated_publications_have_distinct_generations`,
+    `exhausted_store_allocated_generation_changes_nothing`, and
+    `store_allocated_publication_preserves_binding_retirement_and_ledger_checks`.
+    The HTTP dispatch witness is
+    `provisioner_generation_extremes_cannot_block_operator_transitions`.
     Mirrored backend tests:
     `a_provisioned_account_is_born_unfunded_suspended_and_best_effort` and
     `provisioned_activation_honours_provenance_and_operator_holds`; PostgreSQL:

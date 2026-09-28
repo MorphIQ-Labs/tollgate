@@ -319,7 +319,7 @@ written to the audit log with the actor, the role and the action.
 | `POST …/status` | `Active` | `Suspended`, `Closed` |
 | `POST …/capacity-class` | `BestEffort` | `Assured` |
 | `PUT …/budget` | an allowance up to its `max_budget_allowance`, or `null` | a larger allowance |
-| `PUT …/keys/{key}/snapshot` | a `Strict` snapshot | `Elastic`, which extends unfunded credit |
+| `PUT …/keys/{key}/snapshot` | a `Strict` snapshot with a store-allocated generation | `Elastic`, which extends unfunded credit |
 | `POST …/deposit`, `/snapshots/{principal}` | nothing | every call |
 
 Every route that names an account also requires that a provisioner created it.
@@ -331,7 +331,7 @@ operator's suspension holds until an operator lifts it. The account's
 `origin` and `status_set_by` report both facts.
 
 A provisioner's snapshot still carries its own cost table, limits and
-permissions; only the enforcement mode is constrained
+permissions; the enforcement mode is constrained and the store owns generations
 ([#43](https://github.com/MorphIQ-Labs/tollgate/issues/43) tracks
 operator-approved policy templates). Deploy a provisioner whose policy source
 you trust.
@@ -507,8 +507,18 @@ server resolves the principal from its own key record, and fills in the
 snapshot's `key_id` when it is unset.
 
 Request `PublishSnapshotRequest`: `{"snapshot": { … }}`, an `AccountSnapshot`.
-`204` with no body. A generation at or below the stored one changes nothing and
-still answers `204`.
+`204` with no body. For an operator, a generation at or below the stored one
+changes nothing and still answers `204`.
+
+For a provisioner, the submitted `generation` is ignored. The store assigns 1
+on first publication, then the stored live snapshot or tombstone's generation
+plus one, atomically with publication. Repeats receive a fresh generation;
+concurrent writes are ordered by the store, so a retry can replace a newer
+policy. Serialize policy updates per key when their order matters. The audit
+receipt records the allocated generation. Arbitrary caller-selected jumps
+cannot exhaust the counter and obstruct operator suspension, closure or
+capacity-class changes. Exhaustion of the stored counter returns `503 storage`
+without a publication; the generation never wraps or resets.
 
 Errors: `404 unknown-credential`, `409 credential-retired`,
 `422 invalid-credential-binding`, `422 invalid-snapshot-limits`,

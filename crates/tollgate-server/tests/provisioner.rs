@@ -616,3 +616,53 @@ async fn a_refused_role_is_audited_with_its_actor_role_and_action() {
         );
     }
 }
+
+#[tokio::test]
+async fn provisioner_generation_extremes_cannot_block_operator_transitions() {
+    for offered in [u64::MAX, i64::MAX as u64] {
+        let (store, app) = app();
+        let account = AccountId(12);
+        let key = provisioned(&app, account).await;
+        let base = format!("/v1/admin/accounts/{account}");
+        let mut body = key_snapshot(account, EnforcementMode::Strict);
+        body["snapshot"]["generation"] = json!(offered);
+        let capture = common::EventCapture::default();
+        let (status, problem) = capture
+            .during(call(
+                &app,
+                common::PROVISIONER,
+                "PUT",
+                format!("{base}/keys/{key}/snapshot"),
+                body,
+            ))
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{problem}");
+        // The HTTP route must select store allocation; the operator path
+        // remains caller-generation ordered (covered by api.rs).
+        let events = audit(&capture);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.get("outcome").map(String::as_str) == Some("confirmed"))
+        );
+        for (suffix, body) in [
+            ("capacity-class", json!({"capacity_class": "Assured"})),
+            ("status", json!({"status": "Suspended"})),
+            ("status", json!({"status": "Closed"})),
+        ] {
+            let (status, problem) = call(
+                &app,
+                common::OPERATOR,
+                "POST",
+                format!("{base}/{suffix}"),
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{suffix}: {problem}");
+        }
+        let view = view(&store, account).await.unwrap();
+        assert_eq!(view.status, AccountStatus::Closed);
+        assert_eq!(view.status_set_by, AdminAuthority::Operator);
+        assert_eq!(view.capacity_class, CapacityClass::Assured);
+    }
+}

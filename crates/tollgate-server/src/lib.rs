@@ -1228,7 +1228,19 @@ async fn publish_key_snapshot<S: Backend>(
             "publish_key_snapshot",
             target,
             state.clock.as_ref(),
-            state.store.publish_key_snapshot(account, key, snapshot),
+            async {
+                if matches!(admin, AdminIdentity::Provisioner(..)) {
+                    state
+                        .store
+                        .publish_key_snapshot_next(account, key, snapshot)
+                        .await
+                } else {
+                    state
+                        .store
+                        .publish_key_snapshot(account, key, snapshot)
+                        .await
+                }
+            },
         )
         .await?;
     Ok(StatusCode::NO_CONTENT)
