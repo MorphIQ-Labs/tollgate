@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.30.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.30.2...v0.30.3) - 2026-09-28
+
+### Fixed
+
+- *(store)* classify deposit overflow as a permanent refusal (#50)
+
 ### Fixed
 
 - Deposit overflow now returns the additive `422 balance-overflow` problem
