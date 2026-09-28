@@ -61,8 +61,8 @@ Tollgate is built so that its claims are checked, not asserted:
 - **Exact conservation:** every backend's suite asserts, per account,
   `deposited + overage_recorded == balance + active grants + settled usage +
   settlement loss + expired`.
-- **Machine-checked proofs:** [21 Lean 4 modules](formal/lean/README.md)
-  with 273 theorems, and no `sorry` or axioms, model a request's charge
+- **Machine-checked proofs:** [22 Lean 4 modules](formal/lean/README.md)
+  with 290 theorems, and no `sorry` or axioms, model a request's charge
   lifecycle, lease timing and fencing, idempotent ingest, sharded counters,
   snapshot revocation, conservation and more. CI checks them on every pull
   request.
