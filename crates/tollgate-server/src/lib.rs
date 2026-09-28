@@ -670,8 +670,19 @@ async fn list_principals<S: Backend>(
 async fn ingest<S: Backend>(
     _identity: InstanceIdentity,
     State(state): State<ServerState<S>>,
-    ApiJson(request): ApiJson<IngestRequest>,
+    body: Result<ApiJson<IngestRequest>, ApiError>,
 ) -> Result<Json<IngestReport>, ApiError> {
+    let ApiJson(request) = body.map_err(|mut error| {
+        // Only this route accepts usage batches. The shared JSON rejection
+        // describes the byte limit without advice about another route's data.
+        if error.status == StatusCode::PAYLOAD_TOO_LARGE {
+            error.title.push_str(&format!(
+                "; usage batches are capped at {} events",
+                tollgate_store::MAX_INGEST_BATCH
+            ));
+        }
+        error
+    })?;
     Ok(Json(
         state
             .store
