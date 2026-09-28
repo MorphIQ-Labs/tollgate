@@ -20,6 +20,12 @@
 
 - [Control-plane security](CONTROL_PLANE_SECURITY.md)
 
+# Reference
+
+- [HTTP API](HTTP_API.md)
+- [Errors](ERRORS.md)
+- [Metrics](METRICS.md)
+
 # Guarantees and evidence
 
 - [Guarantees](GUARANTEES.md)

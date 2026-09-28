@@ -5,6 +5,7 @@ pub mod book;
 pub mod cli;
 pub mod excerpts;
 pub mod guarantees;
+pub mod http_routes;
 pub mod lean_mutants;
 pub mod parity;
 pub mod seam;
