@@ -7,6 +7,16 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.31.0...v0.32.0) - 2026-09-28
+
+### Added
+
+- *(server)* [**breaking**] scoped provisioner role for self-service signup (#44)
+
+### Fixed
+
+- *(server)* [**breaking**] constrain provisioners to approved policy templates (#54)
+
 ### Changed
 
 - **Breaking:** provisioner identities require a nonempty allowlist of approved
