@@ -3,6 +3,7 @@
 
 pub mod book;
 pub mod cli;
+pub mod excerpts;
 pub mod parity;
 pub mod seam;
 

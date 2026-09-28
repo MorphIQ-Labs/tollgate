@@ -4,6 +4,8 @@
 
 # Using Tollgate
 
+- [Getting started](GETTING_STARTED.md)
+- [Concepts](CONCEPTS.md)
 - [Embedding Tollgate](EMBEDDING.md)
 - [Account administration](ACCOUNT_ADMINISTRATION.md)
 - [Usage accounting](USAGE_ACCOUNTING.md)
