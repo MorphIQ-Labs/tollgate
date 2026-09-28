@@ -601,6 +601,21 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    as duplicates, so a partial success is reported as a total failure and
    nothing says otherwise (GL-57).
 
+   `IdempotentIngest.lean` proves the exact model for any acceptance
+   decision: each input is classified once
+   (`Tollgate.IdempotentIngest.classified_once`); a duplicate is recognized
+   from its request ID before its payload
+   (`Tollgate.IdempotentIngest.duplicate_ignores_payload`); a rejected event
+   claims nothing (`Tollgate.IdempotentIngest.rejected_claims_nothing`); the
+   ledger only appends accepted events
+   (`Tollgate.IdempotentIngest.plan_ledger`), so no request ID is billed twice
+   across any replay (`Tollgate.IdempotentIngest.billed_at_most_once`,
+   `Tollgate.IdempotentIngest.replay_accepts_nothing_twice`); the billed total
+   grows by exactly the accepted units
+   (`Tollgate.IdempotentIngest.billed_grows_by_accepted`); and a failed batch
+   changes nothing (`Tollgate.IdempotentIngest.failed_batch_changes_nothing`).
+   It assumes the batch applies atomically, as stated above.
+
    *Tests:* `usage_replay_is_idempotent`,
    `mixed_usage_batch_preserves_partial_acceptance`,
    `usage_accepts_zero_and_the_backends_unit_ceiling`,
