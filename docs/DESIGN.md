@@ -7622,3 +7622,101 @@ lock, issuance only inserts new rows, and ingest reads credentials with a plain
 `SELECT` and writes activity rows whose foreign key takes `FOR KEY SHARE`,
 which `FOR SHARE` does not block. The audit is recorded on `lock_account_key`,
 and a status-change race test witnesses it.
+
+## 2026-09-28 — A scoped role for self-service provisioning (#39)
+
+A deployment with self-service signup gave its internet-facing account service
+an `operator` credential, because no other role could create accounts or issue
+keys. Compromising that service (RCE, SSRF, a bad image) then meant unlimited
+deposits, closing any account, granting `Assured`, any budget and
+principal-level snapshots, on every account. The only mitigation was reading
+the audit log afterwards. The account service needs ten calls with narrow
+arguments. It never deposits, suspends, closes, grants `Assured` or touches
+`/snapshots/{principal}`.
+
+**A fixed role, not permission lists.** `provisioner` is a third disjoint
+`Role` with a hard-coded scope. Per-identity action lists would be more
+flexible, but they are a configuration language whose every combination needs
+a test, and the one known consumer needs exactly one shape. If a second shape
+appears, it can be designed then.
+
+**Routes split by who may call them.** The admin router became two routers:
+`[operator]` for deposit and principal snapshots, `[operator, provisioner]`
+for the rest. A provisioner therefore cannot reach a funding route even through
+a handler bug. `Authorization.roles` is a role set rather than one role, and
+the route-table check (`tollgate-repo-check`) derives and renders the set, so
+`docs/HTTP_API.md` cannot drift from it. Argument limits have to live in the
+handlers, because the router cannot see a body.
+
+**The store owns the shape of a provisioner's account.**
+`AdminStore::create_provisioned_account` takes only an id and writes zero
+balance, `Suspended`, `BestEffort` and `origin = Provisioner`. The HTTP layer
+still refuses a non-zero balance or a non-`Suspended` status with `403`, rather
+than silently ignoring them. But a handler bug cannot produce a funded,
+active or assured account, because the call that creates one has no parameter
+to carry it.
+
+**Provenance, not an actor log.** The account-scope and operator-hold rules
+need two facts: which kind of authority created the account, and which kind
+set its status. These are stored as `origin` and `status_set_by`
+(`AdminAuthority`), not as identity names. A name is an audit concern that the
+HTTP boundary already logs; the *kind* is what a rule is decided on, and the
+store has no business knowing deployment identities.
+
+**Why a pre-read for scope, but a transaction for the hold.** `origin` is
+written once and never updated. A handler may therefore read it in
+`AdminIdentity::check_account` and then run a separate write, with no window
+in which the fact could change. `status_set_by` is mutable, and the hold
+exists precisely to win a race: an operator suspending while the customer
+retries signup. So the check is inside the store, in `activate_provisioned`,
+under the row lock or mutex that serializes every status write. Whichever
+lands second sees the other's author. Every `set_account_status` records the
+operator as author, repeats included, so an operator re-suspending an account
+already suspended by creation establishes a hold.
+
+**Existing accounts are operators'.** Migration 0020 defaults both columns to
+`Operator`. That is the only safe backfill: every existing account was created
+with an operator credential, and the opposite default would give a newly
+deployed provisioner every account in the database. The cost falls on
+migration. A signup service moved from an operator credential to a provisioner
+cannot administer the accounts it created before the move; they stay with
+operator tooling or are re-created. Tollgate cannot tell, after the fact,
+which operator-created accounts a signup service made, so it does not guess.
+
+**The budget ceiling is per identity and required.** A periodic allowance
+funds admission, so an unbounded one is a deposit renamed. The limit belongs
+to the credential (`max_budget_allowance` on the manifest entry), because it
+is a statement about how far that deployment trusts that service. It is
+required, and refused on other roles, so a forgotten ceiling fails
+configuration instead of meaning "unlimited". `ProvisionerLimits` is carried
+inside the identity's grant, which makes a provisioner without a ceiling
+unrepresentable.
+
+**Elastic is refused; the rest of the snapshot is a known gap.** A key
+snapshot carries policy the store validates only against the ledger (status,
+class). `Elastic` enforcement extends unfunded overage credit, so a provisioner
+may publish only `Strict`. The cost table, limits and permissions remain
+caller-supplied: a compromised provisioner can still make its own accounts
+cheap or unthrottled, though not funded. Closing that needs operator-approved
+policy templates. That is a design of its own, tracked in #43, and
+`INVARIANTS.md` 41 states the gap rather than overclaiming.
+
+**Refusals are audited where they happen.** A role mismatch is refused in
+`authorize` and logged there with the method and route template, since no
+handler runs. An argument or scope refusal is logged by
+`AdminIdentity::refuse` before any store call, as one `refused` event with no
+`started`, because nothing was attempted. The operator hold is found inside
+the store transaction, so it arrives as a `failed` event with code
+`operator-hold`. All audit events now carry the role. Before this change a
+role-mismatch `403` left no trace.
+
+**Compatibility.** The library change is breaking and ships as a minor bump
+under 0.x. `AdminStore` gains two required methods, `AdminState` two fields,
+`SetStatusError` two variants, `AccountView` two fields, and
+`ControlIdentity::new` refuses `Role::Provisioner`. Manifests, wire requests
+and HTTP behaviour for `instance` and `operator` are unchanged.
+`AccountResponse` gains `origin` and `status_set_by`, which default to
+`Operator` when absent, so a new client reads an old server. The new codes,
+`403 account-not-provisioned` and `403 operator-hold`, are additive. Rollout:
+schema, then every server instance, then provisioner credentials. A server that
+predates the role rejects a manifest naming it, which is the safe failure.

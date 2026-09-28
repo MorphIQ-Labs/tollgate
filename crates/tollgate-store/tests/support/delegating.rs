@@ -735,6 +735,20 @@ where
         }
     }
 
+    async fn create_provisioned_account(
+        &self,
+        account: AccountId,
+    ) -> Result<AdminReceipt<()>, CreateAccountError> {
+        AdminStore::create_provisioned_account(&*self.inner, account).await
+    }
+
+    async fn activate_provisioned(
+        &self,
+        account: AccountId,
+    ) -> Result<AdminReceipt<StatusChange>, SetStatusError> {
+        AdminStore::activate_provisioned(&*self.inner, account).await
+    }
+
     async fn set_capacity_class(
         &self,
         account: AccountId,
@@ -1048,6 +1062,20 @@ impl AdminStore for RejectingStore {
         _status: AccountStatus,
     ) -> Result<AdminReceipt<StatusChange>, SetStatusError> {
         unreachable!("{}: AdminStore::set_account_status", self.reason)
+    }
+
+    async fn create_provisioned_account(
+        &self,
+        _account: AccountId,
+    ) -> Result<AdminReceipt<()>, CreateAccountError> {
+        unreachable!("{}: AdminStore::create_provisioned_account", self.reason)
+    }
+
+    async fn activate_provisioned(
+        &self,
+        _account: AccountId,
+    ) -> Result<AdminReceipt<StatusChange>, SetStatusError> {
+        unreachable!("{}: AdminStore::activate_provisioned", self.reason)
     }
 
     async fn set_capacity_class(

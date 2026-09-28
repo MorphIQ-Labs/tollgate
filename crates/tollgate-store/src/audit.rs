@@ -4,6 +4,36 @@
 
 use tollgate_core::{AccountStatus, CapacityClass, CostUnits, Generation};
 
+/// Which kind of control-plane authority wrote an account-owned fact (#39).
+///
+/// The store records it rather than the name of the caller: the name is an
+/// audit concern the HTTP boundary logs, while the *kind* decides what a later
+/// caller may do. An account a provisioner created is the only kind a
+/// provisioner may administer, and a status an operator set is one a
+/// provisioner may never undo.
+///
+/// Rows written before the distinction existed are [`AdminAuthority::Operator`]:
+/// the conservative reading, because it grants a provisioner nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
+pub enum AdminAuthority {
+    /// Full administrative authority: an operator, or a direct store caller.
+    Operator,
+    /// Self-service provisioning authority, scoped to the accounts it created.
+    Provisioner,
+}
+
+impl AdminAuthority {
+    /// The one spelling used in storage and on the wire.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            AdminAuthority::Operator => "Operator",
+            AdminAuthority::Provisioner => "Provisioner",
+        }
+    }
+}
+
 /// The fields one administrative operation owns, as an [`AdminReceipt`]
 /// records them before and after (INVARIANTS.md 33).
 ///
@@ -25,6 +55,8 @@ pub enum AdminState {
         status: AccountStatus,
         /// Execution-capacity class at creation.
         capacity_class: CapacityClass,
+        /// Which authority created the account; immutable afterwards.
+        origin: AdminAuthority,
     },
     /// An account's funding counters around a deposit.
     Funding {
@@ -38,6 +70,8 @@ pub enum AdminState {
     Status {
         /// The status the ledger holds.
         status: AccountStatus,
+        /// Which authority set that status.
+        set_by: AdminAuthority,
     },
     /// An account's execution-capacity class around a class change.
     CapacityClass {

@@ -521,6 +521,15 @@ pub struct AccountResponse {
     pub status: tollgate_core::AccountStatus,
     /// Execution-capacity class.
     pub capacity_class: tollgate_core::CapacityClass,
+    /// Which authority created the account (#39). Defaults to `Operator` when
+    /// absent, which is what every account a server predating the field
+    /// holds.
+    #[serde(default = "operator_authority")]
+    pub origin: crate::AdminAuthority,
+    /// Which authority set the current `status`. An operator's `Suspended` is
+    /// a hold a provisioner cannot lift (#39). Defaults as `origin` does.
+    #[serde(default = "operator_authority")]
+    pub status_set_by: crate::AdminAuthority,
     /// The periodic allowance, or `None` for "no schedule; the balance does
     /// not expire". Not the same as an allowance of zero.
     pub budget: Option<tollgate_core::BudgetSchedule>,
@@ -666,4 +675,8 @@ pub struct RevokeKeyResponse {
     pub key_id: tollgate_core::KeyId,
     /// `true` if this call retired the credential, `false` if it was already revoked.
     pub retired: bool,
+}
+
+fn operator_authority() -> crate::AdminAuthority {
+    crate::AdminAuthority::Operator
 }

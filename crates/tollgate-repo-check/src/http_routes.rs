@@ -12,12 +12,13 @@
 //! different values is refused rather than guessed.
 //!
 //! **Roles are derived from the authorization layer, not from handlers.** A
-//! `route_layer(…)` or `layer(…)` whose arguments name `Role::Instance` or
-//! `Role::Operator` assigns that role to every route registered on the router
-//! before it, which is the scope axum gives such a layer. A route behind no
-//! such layer is `none`. The check cannot see what a handler extracts or what
+//! `route_layer(…)` or `layer(…)` whose arguments name one or more `Role::…`
+//! variants assigns that role set to every route registered on the router
+//! before it, which is the scope axum gives such a layer. A set renders
+//! sorted and comma-separated (`operator, provisioner`), because a layer that
+//! admits two roles admits either. A route behind no such layer is `none`. The check cannot see what a handler extracts or what
 //! the named layer does at runtime; it trusts that a layer naming a `Role` is
-//! the authorization layer. A route under two different roles is refused.
+//! the authorization layer. A route under two different role layers is refused.
 //!
 //! Registrations the check cannot evaluate — `route_service`, `nest_service`,
 //! a method router it does not recognise, a path that is not a literal or a
@@ -487,7 +488,8 @@ fn methods(expr: &syn::Expr) -> Result<Vec<String>, String> {
     }
 }
 
-/// The role a layer's arguments name, if any.
+/// The role set a layer's arguments name, if any, rendered as the table
+/// shows it.
 fn role(
     args: &syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>,
 ) -> Result<Option<String>, String> {
@@ -508,12 +510,10 @@ fn role(
     for arg in args {
         roles.visit_expr(arg);
     }
-    let mut roles = roles.0.into_iter();
-    match (roles.next(), roles.next()) {
-        (role, None) => Ok(role),
-        (Some(a), Some(b)) => Err(format!("one layer names two roles, `{a}` and `{b}`")),
-        (None, Some(_)) => unreachable!("an iterator yields a second item only after a first"),
+    if roles.0.is_empty() {
+        return Ok(None);
     }
+    Ok(Some(roles.0.into_iter().collect::<Vec<_>>().join(", ")))
 }
 
 fn last_segment(expr: &syn::Expr) -> Option<String> {
@@ -536,10 +536,16 @@ mod tests {
                 .route_layer(from_fn_with_state(auth(Role::Instance), authorize));
             let admin = Router::new()
                 .route("/users", put(set).layer(DefaultBodyLimit::max(10)))
-                .route_layer(from_fn_with_state(auth(Role::Operator), authorize));
+                .route_layer(from_fn_with_state(auth(&[Role::Operator]), authorize));
+            let shared = Router::new()
+                .route("/accounts", post(create))
+                .route_layer(from_fn_with_state(
+                    auth(&[Role::Provisioner, Role::Operator]),
+                    authorize,
+                ));
             Router::new()
                 .route("/livez", get(async || StatusCode::OK))
-                .nest(PREFIX, inner.nest("/admin", admin))
+                .nest(PREFIX, inner.nest("/admin", admin.merge(shared)))
                 .with_state(state)
                 .layer(from_fn(report))
         }
@@ -565,6 +571,7 @@ mod tests {
             fixture_routes(),
             [
                 "| GET | /livez | none |",
+                "| POST | /v2/admin/accounts | operator, provisioner |",
                 "| PUT | /v2/admin/users | operator |",
                 "| GET | /v2/things | instance |",
                 "| POST | /v2/things | instance |",

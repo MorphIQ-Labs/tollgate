@@ -26,17 +26,20 @@ authority for deployment; this is a summary.
   maps each certificate fingerprint, token file or token subject to a named
   identity with one role. A request that presents both a certificate and a
   bearer must resolve both to the same identity.
-- **Two disjoint roles.** `instance` calls the lease, snapshot, credential-feed
-  and usage routes. `operator` calls everything under `/v1/admin`. Neither role
-  reaches the other's routes: an operator credential on an instance route, or
-  the reverse, answers `403 scope-forbidden`.
+- **Three disjoint roles.** `instance` calls the lease, snapshot,
+  credential-feed and usage routes. `operator` calls everything under
+  `/v1/admin`. `provisioner` calls the self-service subset of `/v1/admin` —
+  every account route except `deposit`, and no principal-snapshot route — and
+  only with the arguments and on the accounts
+  [its scope](#the-provisioner-scope) allows. A credential on a route its role
+  does not reach answers `403 scope-forbidden`, and the refusal is audited.
 - **Probes are open.** `/livez` and `/readyz` take no credential.
 
 Missing, malformed, unverifiable or expired evidence answers
 `401 authentication-required` with
 `WWW-Authenticate: Bearer realm="tollgate-control"`. Evidence that verifies
-but maps to no identity, or to an identity of the other role, answers
-`403 scope-forbidden`. Authorization runs before the body or path is decoded,
+but maps to no identity, or to an identity whose role the route does not admit,
+answers `403 scope-forbidden`. Authorization runs before the body or path is decoded,
 so an unauthenticated request never reaches validation.
 
 ## Conventions
@@ -81,6 +84,9 @@ The table is checked against the router by `tollgate-repo-check`
 ([`src/http_routes.rs`](../crates/tollgate-repo-check/src/http_routes.rs)):
 a route added, removed or re-roled without updating it fails the build.
 
+A provisioner's argument and account limits are listed under
+[the provisioner scope](#the-provisioner-scope).
+
 <!-- http-routes:start -->
 | Method | Path | Role |
 |---|---|---|
@@ -94,17 +100,17 @@ a route added, removed or re-roled without updating it fails the build.
 | GET | /v1/snapshots/{principal} | instance |
 | GET | /v1/keys | instance |
 | POST | /v1/usage/ingest | instance |
-| POST | /v1/admin/accounts | operator |
-| GET | /v1/admin/accounts/{account} | operator |
-| PUT | /v1/admin/accounts/{account}/budget | operator |
+| POST | /v1/admin/accounts | operator, provisioner |
+| GET | /v1/admin/accounts/{account} | operator, provisioner |
+| PUT | /v1/admin/accounts/{account}/budget | operator, provisioner |
 | POST | /v1/admin/accounts/{account}/deposit | operator |
-| POST | /v1/admin/accounts/{account}/status | operator |
-| POST | /v1/admin/accounts/{account}/capacity-class | operator |
-| POST | /v1/admin/accounts/{account}/keys | operator |
-| GET | /v1/admin/accounts/{account}/keys | operator |
-| DELETE | /v1/admin/accounts/{account}/keys/{key} | operator |
-| PUT | /v1/admin/accounts/{account}/keys/{key}/snapshot | operator |
-| DELETE | /v1/admin/accounts/{account}/keys/{key}/snapshot | operator |
+| POST | /v1/admin/accounts/{account}/status | operator, provisioner |
+| POST | /v1/admin/accounts/{account}/capacity-class | operator, provisioner |
+| POST | /v1/admin/accounts/{account}/keys | operator, provisioner |
+| GET | /v1/admin/accounts/{account}/keys | operator, provisioner |
+| DELETE | /v1/admin/accounts/{account}/keys/{key} | operator, provisioner |
+| PUT | /v1/admin/accounts/{account}/keys/{key}/snapshot | operator, provisioner |
+| DELETE | /v1/admin/accounts/{account}/keys/{key}/snapshot | operator, provisioner |
 | PUT | /v1/admin/snapshots/{principal} | operator |
 | DELETE | /v1/admin/snapshots/{principal} | operator |
 <!-- http-routes:end -->
@@ -293,15 +299,47 @@ it again unchanged; `413 batch-too-large`. See
 
 ## Account administration
 
-Every route in this section requires the `operator` role. Mutations are audited
-with a receipt captured by the backend; see
+Every route in this section admits `operator`; all but `deposit` also admit
+`provisioner`, within [its scope](#the-provisioner-scope). Mutations are
+audited with a receipt captured by the backend; see
 [administrative audit](CONTROL_PLANE_SECURITY.md#administrative-audit). The
 [account administration](ACCOUNT_ADMINISTRATION.md) page is the provisioning
 guide these routes serve.
 
+### The provisioner scope
+
+A `provisioner` credential is what an internet-facing signup service holds, so
+compromising it must not fund, close, grant `Assured`, or reach an account an
+operator made. Its limits are enforced before any write, and every refusal is
+written to the audit log with the actor, the role and the action.
+
+| Route | A provisioner may | Refused with `403 scope-forbidden` |
+|---|---|---|
+| `POST /accounts` | `initial_balance: 0` and `status: "Suspended"`; the account is created `BestEffort` | any other balance or status |
+| `POST …/status` | `Active` | `Suspended`, `Closed` |
+| `POST …/capacity-class` | `BestEffort` | `Assured` |
+| `PUT …/budget` | an allowance up to its `max_budget_allowance`, or `null` | a larger allowance |
+| `PUT …/keys/{key}/snapshot` | a `Strict` snapshot | `Elastic`, which extends unfunded credit |
+| `POST …/deposit`, `/snapshots/{principal}` | nothing | every call |
+
+Every route that names an account also requires that a provisioner created it.
+An account an operator created — every account that predates the role
+included — answers `403 account-not-provisioned`, and one that does not exist
+answers `404 unknown-account`. Activation additionally answers
+`403 operator-hold` when an operator set the account's current status: an
+operator's suspension holds until an operator lifts it. The account's
+`origin` and `status_set_by` report both facts.
+
+A provisioner's snapshot still carries its own cost table, limits and
+permissions; only the enforcement mode is constrained
+([#43](https://github.com/MorphIQ-Labs/tollgate/issues/43) tracks
+operator-approved policy templates). Deploy a provisioner whose policy source
+you trust.
+
 ### `POST /v1/admin/accounts`
 
-Create an account. Its capacity class is always `Assured`.
+Create an account. An operator's is always `Assured`; a provisioner's is
+always `BestEffort`, unfunded and suspended.
 
 Request `CreateAccountRequest`:
 
@@ -309,7 +347,8 @@ Request `CreateAccountRequest`:
 {"account_id": "…", "initial_balance": 0, "status": "Suspended"}
 ```
 
-`201` with no body. Errors: `409 account-exists`.
+`201` with no body. Errors: `409 account-exists`, and for a provisioner
+`403 scope-forbidden`.
 
 ### `GET /v1/admin/accounts/{account}`
 
@@ -320,13 +359,19 @@ consistent backend snapshot as of `as_of`.
 
 ```json
 {"account_id": "…", "as_of": "…", "status": "Active",
- "capacity_class": "Assured", "budget": null, "period_start": "…",
+ "capacity_class": "Assured", "origin": "Operator", "status_set_by": "Operator",
+ "budget": null, "period_start": "…",
  "balance": 600, "outstanding_lease_grants": 400, "settled_usage": 0,
  "expired_allowance": 0, "settlement_loss": 0, "deposited": 1000,
  "overage_recorded": 0}
 ```
 
-Errors: `404 unknown-account`.
+`origin` is the authority that created the account, `Operator` or
+`Provisioner`, and never changes. `status_set_by` is the authority that set
+the current status. A client reading a server that predates them sees
+`Operator` for both.
+
+Errors: `404 unknown-account`; for a provisioner, `403 account-not-provisioned`.
 
 ### `PUT /v1/admin/accounts/{account}/budget`
 
@@ -346,12 +391,13 @@ in force; equal values mean the call changed nothing.
 {"previous": null, "current": {"allowance": 500, "period": "UtcCalendarMonth", "rollover": "None"}}
 ```
 
-Errors: `404 unknown-account`. An absent `budget` field or an unknown field is
-`422 invalid-json`.
+Errors: `404 unknown-account`; for a provisioner, `403 scope-forbidden` above
+its ceiling and `403 account-not-provisioned`. An absent `budget` field or an
+unknown field is `422 invalid-json`.
 
 ### `POST /v1/admin/accounts/{account}/deposit`
 
-Add units to the account's balance once, as a top-up that survives period
+Role `operator` only. Add units to the account's balance once, as a top-up that survives period
 boundaries.
 
 Request `DepositRequest`: `{"units": 1000}`. `204` with no body.
@@ -376,7 +422,12 @@ be decoded to push, which converge at their next refresh.
 {"republished": 2, "unreadable": 0}
 ```
 
-Errors: `404 unknown-account`, `409 account-closed`.
+An operator's status is recorded as an operator hold: a provisioner cannot
+change it.
+
+Errors: `404 unknown-account`, `409 account-closed`; for a provisioner,
+`403 scope-forbidden` for anything but `Active`, `403 account-not-provisioned`
+and `403 operator-hold`.
 
 ### `POST /v1/admin/accounts/{account}/capacity-class`
 
@@ -385,13 +436,14 @@ Set the account's execution-capacity class and republish its live snapshots.
 Request `SetCapacityClassRequest`: `{"capacity_class": "BestEffort"}` —
 `Assured` or `BestEffort`. `200` with `SetStatusResponse`, as for status.
 
-Errors: `404 unknown-account`, `409 account-closed`.
+Errors: `404 unknown-account`, `409 account-closed`; for a provisioner,
+`403 scope-forbidden` for `Assured` and `403 account-not-provisioned`.
 
 ## Credential administration
 
 ### `POST /v1/admin/accounts/{account}/keys`
 
-Role `operator`. Issue a credential. The response is the only time its secret
+Roles `operator` and `provisioner`. Issue a credential. The response is the only time its secret
 is disclosed.
 
 Request `IssueKeyRequest`. The caller chooses `key_id`; `max_active_keys` is
@@ -409,14 +461,18 @@ the caller's bound on the account's live credentials; `not_after` is optional.
 
 Errors: `404 unknown-account`, `409 credential-exists`,
 `409 active-key-limit`, `501 issuance-unsupported` when the server has no
-credential issuer, `503 entropy-unavailable`, `500 issuer-misconfigured`.
+credential issuer, `503 entropy-unavailable`, `500 issuer-misconfigured`; for
+a provisioner, `404 unknown-account` and `403 account-not-provisioned`, checked
+before anything is minted.
 
 ### `GET /v1/admin/accounts/{account}/keys`
 
-Role `operator`. One page of the account's credentials, revoked and expired
-ones included: metadata only, never a secret, digest or principal. Query:
-`after` and `limit`, as for `GET /v1/keys`. An account with no credentials,
-including one that does not exist, answers an empty page.
+Roles `operator` and `provisioner`. One page of the account's credentials,
+revoked and expired ones included: metadata only, never a secret, digest or
+principal. Query: `after` and `limit`, as for `GET /v1/keys`. An account with
+no credentials answers an empty page, and so does one that does not exist when
+an operator asks; a provisioner gets `404 unknown-account`, because its scope
+check reads the account first.
 
 `200` with `AccountKeysResponse`, whose entries are `AccountKeyResponse`.
 `next_after` is `null` on the last page.
@@ -426,11 +482,12 @@ including one that does not exist, answers an empty page.
   "revoked_at": null, "live": true}], "next_after": null}
 ```
 
-Errors: `400 invalid-query`, `422 invalid-limit`.
+Errors: `400 invalid-query`, `422 invalid-limit`; for a provisioner,
+`404 unknown-account` and `403 account-not-provisioned`.
 
 ### `DELETE /v1/admin/accounts/{account}/keys/{key}`
 
-Role `operator`. Revoke one of the account's credentials. Revocation leaves its
+Roles `operator` and `provisioner`. Revoke one of the account's credentials. Revocation leaves its
 bound snapshot in place; withdraw that with the `DELETE` below.
 
 `200` with `RevokeKeyResponse`. `retired: false` means it was already revoked.
@@ -439,11 +496,13 @@ bound snapshot in place; withdraw that with the `DELETE` below.
 {"key_id": "…", "retired": true}
 ```
 
-Errors: `404 unknown-credential`, including for another account's key.
+Errors: `404 unknown-credential`, including for another account's key; for a
+provisioner, `404 unknown-account` and `403 account-not-provisioned`.
 
 ### `PUT /v1/admin/accounts/{account}/keys/{key}/snapshot`
 
-Role `operator`. Publish the snapshot one credential authorizes against. The
+Roles `operator` and `provisioner`. Publish the snapshot one credential
+authorizes against. The
 server resolves the principal from its own key record, and fills in the
 snapshot's `key_id` when it is unset.
 
@@ -453,14 +512,17 @@ still answers `204`.
 
 Errors: `404 unknown-credential`, `409 credential-retired`,
 `422 invalid-credential-binding`, `422 invalid-snapshot-limits`,
-`409 snapshot-status-mismatch`, `409 snapshot-capacity-class-mismatch`.
+`409 snapshot-status-mismatch`, `409 snapshot-capacity-class-mismatch`; for a
+provisioner, `403 scope-forbidden` for an `Elastic` snapshot,
+`404 unknown-account` and `403 account-not-provisioned`.
 
 ### `DELETE /v1/admin/accounts/{account}/keys/{key}/snapshot`
 
-Role `operator`. Withdraw the snapshot bound to one credential, revoked or not.
-`204` with no body.
+Roles `operator` and `provisioner`. Withdraw the snapshot bound to one
+credential, revoked or not. `204` with no body.
 
-Errors: `404 unknown-credential`.
+Errors: `404 unknown-credential`; for a provisioner, `404 unknown-account` and
+`403 account-not-provisioned`.
 
 ## Principal snapshots
 
@@ -469,7 +531,7 @@ the supported path for credentials this server issues.
 
 ### `PUT /v1/admin/snapshots/{principal}`
 
-Role `operator`. Publish a principal's snapshot, generation-monotonically.
+Role `operator` only. Publish a principal's snapshot, generation-monotonically.
 
 Request `PublishSnapshotRequest`. `204` with no body.
 

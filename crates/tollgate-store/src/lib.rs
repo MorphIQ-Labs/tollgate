@@ -32,7 +32,7 @@ pub mod traits;
 #[cfg(feature = "wire")]
 pub mod wire;
 
-pub use audit::{AdminReceipt, AdminState};
+pub use audit::{AdminAuthority, AdminReceipt, AdminState};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use credentials::{
     CredentialRecord, CredentialSet, DEFAULT_KEY_PAGE_LIMIT, KeyPage, KeySource,

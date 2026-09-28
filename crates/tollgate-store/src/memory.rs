@@ -37,7 +37,7 @@
 //! [`MemoryStore::stored_records`] reports the numbers, and the server logs
 //! them once per sweep.
 
-use crate::{AccountView, AdminReceipt, AdminState};
+use crate::{AccountView, AdminAuthority, AdminReceipt, AdminState};
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -147,6 +147,12 @@ struct AccountRecord {
     /// carrying a different one is refused: two writers for one fact is the
     /// divergence GL-51 abolished for status (GL-99).
     capacity_class: CapacityClass,
+    /// Mirrors `tollgate_accounts.origin`: which authority created the
+    /// account. Written once, never changed (#39).
+    origin: AdminAuthority,
+    /// Mirrors `tollgate_accounts.status_set_by`: which authority wrote
+    /// `status` last, the fact an operator hold is read from (#39).
+    status_set_by: AdminAuthority,
     next_fence: u64,
     /// Usage accepted into the billing ledger.
     usage_recorded: CostUnits,
@@ -416,13 +422,14 @@ impl MemoryStore {
     /// balance, ledger totals, fencing sequence, and leases) is left
     /// untouched and the caller told (review finding GL-7).
     pub fn try_create_account(&self, config: AccountConfig) -> Result<(), CreateAccountError> {
-        self.create_account_audited(config)
+        self.create_account_audited(config, AdminAuthority::Operator)
             .map(|receipt| receipt.outcome)
     }
 
     fn create_account_audited(
         &self,
         config: AccountConfig,
+        origin: AdminAuthority,
     ) -> Result<AdminReceipt<()>, CreateAccountError> {
         let mut inner = self.lock();
         if inner.accounts.contains_key(&config.account_id) {
@@ -445,6 +452,8 @@ impl MemoryStore {
                 expired: CostUnits::ZERO,
                 status: config.status,
                 capacity_class: config.capacity_class,
+                origin,
+                status_set_by: origin,
                 next_fence: 1,
                 usage_recorded: CostUnits::ZERO,
                 overage_recorded: CostUnits::ZERO,
@@ -458,7 +467,100 @@ impl MemoryStore {
                 initial_balance: config.initial_balance,
                 status: config.status,
                 capacity_class: config.capacity_class,
+                origin,
             },
+        ))
+    }
+
+    /// The one status transition, for either authority (#39). Operator
+    /// writes and provisioner activations share the lock, the refusal phase
+    /// and the republication, so the hold is checked at the same point the
+    /// write is made.
+    fn set_status_as(
+        &self,
+        account: AccountId,
+        status: AccountStatus,
+        authority: AdminAuthority,
+    ) -> Result<AdminReceipt<StatusChange>, SetStatusError> {
+        // One lock for both records. The inherent `publish_snapshot` takes the
+        // lock itself, so it cannot be reused here: the whole point is that no
+        // observer sees the ledger moved and the snapshots not.
+        let (republished, before, set_by) = {
+            let mut inner = self.lock();
+            // Phase 1, read-only: every refusal happens before anything moves.
+            let record = inner
+                .accounts
+                .get(&account)
+                .ok_or(SetStatusError::UnknownAccount)?;
+            if authority == AdminAuthority::Provisioner
+                && record.origin != AdminAuthority::Provisioner
+            {
+                return Err(SetStatusError::NotProvisioned);
+            }
+            if record.status == AccountStatus::Closed && status != AccountStatus::Closed {
+                return Err(SetStatusError::AccountClosed);
+            }
+            if authority == AdminAuthority::Provisioner
+                && record.status != status
+                && record.status_set_by == AdminAuthority::Operator
+            {
+                return Err(SetStatusError::OperatorHold);
+            }
+            // A provisioner repeating an activation changes nothing, not even
+            // the author: an operator who reactivated keeps that authorship.
+            let set_by = if authority == AdminAuthority::Provisioner && record.status == status {
+                record.status_set_by
+            } else {
+                authority
+            };
+            // Phase 2, still read-only: plan every snapshot write, so a
+            // generation overflow surfaces here rather than after the ledger
+            // has already moved. Writing the ledger first and failing here
+            // would leave the account suspended with Active snapshots -- the
+            // divergence INVARIANTS.md GL-22 forbids, in the very backend that
+            // serves as its reference.
+            let before = AdminState::Status {
+                status: record.status,
+                set_by: record.status_set_by,
+            };
+            let planned = plan_republish(&inner, account, Restamp::Status(status))?;
+            // Phase 3: apply. Nothing below this line can fail.
+            let record = inner
+                .accounts
+                .get_mut(&account)
+                .expect("the account was found under this same guard");
+            record.status = status;
+            record.status_set_by = set_by;
+            (apply_republish(&mut inner, planned), before, set_by)
+        };
+        // Outside the guard: `push_to_subscribers` must not run under it, and
+        // a subscriber must never observe a push for a transition that is
+        // still mid-flight.
+        if pushes_exceed_capacity(republished.len()) {
+            tracing::warn!(
+                %account,
+                principals = republished.len(),
+                capacity = PUSH_CHANNEL_CAPACITY,
+                "status change emitted more pushes than the channel holds; subscribers will resync"
+            );
+        }
+        let planned_pushes = republished;
+        let republished = planned_pushes.len();
+        for (principal, snapshot) in planned_pushes {
+            self.push_to_subscribers(SnapshotPush {
+                principal,
+                resolution: SnapshotResolution::Present(snapshot),
+            });
+        }
+        Ok(AdminReceipt::new(
+            StatusChange {
+                republished,
+                // This backend holds validated snapshots rather than encoded ones,
+                // so there is nothing here that can fail to decode.
+                unreadable: 0,
+            },
+            before,
+            AdminState::Status { status, set_by },
         ))
     }
 
@@ -1273,7 +1375,22 @@ impl AdminStore for MemoryStore {
         &self,
         config: AccountConfig,
     ) -> Result<crate::AdminReceipt<()>, CreateAccountError> {
-        self.create_account_audited(config)
+        self.create_account_audited(config, AdminAuthority::Operator)
+    }
+
+    async fn create_provisioned_account(
+        &self,
+        account: AccountId,
+    ) -> Result<crate::AdminReceipt<()>, CreateAccountError> {
+        self.create_account_audited(
+            AccountConfig {
+                account_id: account,
+                initial_balance: CostUnits::ZERO,
+                status: AccountStatus::Suspended,
+                capacity_class: CapacityClass::BestEffort,
+            },
+            AdminAuthority::Provisioner,
+        )
     }
 
     async fn deposit(
@@ -1396,66 +1513,14 @@ impl AdminStore for MemoryStore {
         account: AccountId,
         status: AccountStatus,
     ) -> Result<crate::AdminReceipt<StatusChange>, SetStatusError> {
-        // One lock for both records. The inherent `publish_snapshot` takes the
-        // lock itself, so it cannot be reused here: the whole point is that no
-        // observer sees the ledger moved and the snapshots not.
-        let (republished, before) = {
-            let mut inner = self.lock();
-            // Phase 1, read-only: every refusal happens before anything moves.
-            let record = inner
-                .accounts
-                .get(&account)
-                .ok_or(SetStatusError::UnknownAccount)?;
-            if record.status == AccountStatus::Closed && status != AccountStatus::Closed {
-                return Err(SetStatusError::AccountClosed);
-            }
-            // Phase 2, still read-only: plan every snapshot write, so a
-            // generation overflow surfaces here rather than after the ledger
-            // has already moved. Writing the ledger first and failing here
-            // would leave the account suspended with Active snapshots -- the
-            // divergence INVARIANTS.md GL-22 forbids, in the very backend that
-            // serves as its reference.
-            let before = AdminState::Status {
-                status: record.status,
-            };
-            let planned = plan_republish(&inner, account, Restamp::Status(status))?;
-            // Phase 3: apply. Nothing below this line can fail.
-            inner
-                .accounts
-                .get_mut(&account)
-                .expect("the account was found under this same guard")
-                .status = status;
-            (apply_republish(&mut inner, planned), before)
-        };
-        // Outside the guard: `push_to_subscribers` must not run under it, and
-        // a subscriber must never observe a push for a transition that is
-        // still mid-flight.
-        if pushes_exceed_capacity(republished.len()) {
-            tracing::warn!(
-                %account,
-                principals = republished.len(),
-                capacity = PUSH_CHANNEL_CAPACITY,
-                "status change emitted more pushes than the channel holds; subscribers will resync"
-            );
-        }
-        let planned_pushes = republished;
-        let republished = planned_pushes.len();
-        for (principal, snapshot) in planned_pushes {
-            self.push_to_subscribers(SnapshotPush {
-                principal,
-                resolution: SnapshotResolution::Present(snapshot),
-            });
-        }
-        Ok(AdminReceipt::new(
-            StatusChange {
-                republished,
-                // This backend holds validated snapshots rather than encoded ones,
-                // so there is nothing here that can fail to decode.
-                unreadable: 0,
-            },
-            before,
-            AdminState::Status { status },
-        ))
+        self.set_status_as(account, status, AdminAuthority::Operator)
+    }
+
+    async fn activate_provisioned(
+        &self,
+        account: AccountId,
+    ) -> Result<crate::AdminReceipt<StatusChange>, SetStatusError> {
+        self.set_status_as(account, AccountStatus::Active, AdminAuthority::Provisioner)
     }
 
     async fn set_capacity_class(
@@ -1576,6 +1641,8 @@ impl AdminStore for MemoryStore {
             account_id: account,
             status: record.status,
             capacity_class: record.capacity_class,
+            origin: record.origin,
+            status_set_by: record.status_set_by,
             schedule: record.schedule,
             period_start: record.period_start,
             conservation: Conservation {

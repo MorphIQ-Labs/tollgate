@@ -14,10 +14,10 @@ use tollgate_core::{
     Principal, PublishableSnapshot, RequestId, ResolvedLimits, UsageEvent, UsageSource,
 };
 use tollgate_store::{
-    AccountConfig, AdminStore, AllocateError, BudgetError, Conservation, CreateAccountError,
-    GrantPolicy, KeyDirectory, KeyError, KeyRecord, LeaseAllocator, MemoryStore,
-    PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation, RolledAccount, SetStatusError,
-    SnapshotResolution, SnapshotSource, UsageSink,
+    AccountConfig, AdminAuthority, AdminState, AdminStore, AllocateError, BudgetError,
+    Conservation, CreateAccountError, GrantPolicy, KeyDirectory, KeyError, KeyRecord,
+    LeaseAllocator, MemoryStore, PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation,
+    RolledAccount, SetStatusError, SnapshotResolution, SnapshotSource, UsageSink,
 };
 
 fn t(secs: i64) -> Timestamp {
@@ -4117,7 +4117,8 @@ async fn admin_receipts_identify_the_state_each_operation_replaced() {
         AdminState::AccountCreated {
             initial_balance: CostUnits(10),
             status: AccountStatus::Active,
-            capacity_class: CapacityClass::Assured
+            capacity_class: CapacityClass::Assured,
+            origin: AdminAuthority::Operator,
         }
     );
     let deposit = AdminStore::deposit(&*store, ACCOUNT, CostUnits(25))
@@ -4143,13 +4144,15 @@ async fn admin_receipts_identify_the_state_each_operation_replaced() {
     assert_eq!(
         status.before,
         AdminState::Status {
-            status: AccountStatus::Active
+            status: AccountStatus::Active,
+            set_by: AdminAuthority::Operator,
         }
     );
     assert_eq!(
         status.after,
         AdminState::Status {
-            status: AccountStatus::Suspended
+            status: AccountStatus::Suspended,
+            set_by: AdminAuthority::Operator,
         }
     );
     let repeated = AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
@@ -5078,4 +5081,162 @@ async fn exhaustion_evidence_names_the_stored_period_and_rollover_restores_fundi
         CostUnits(100)
     );
     assert_conserved(&store);
+}
+
+/// A provisioner's account shape is fixed by the store, not the caller (#39).
+#[tokio::test]
+async fn a_provisioned_account_is_born_unfunded_suspended_and_best_effort() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
+    let provisioned = AccountId(39);
+    let receipt = AdminStore::create_provisioned_account(&*store, provisioned)
+        .await
+        .unwrap();
+    assert_eq!(receipt.before, AdminState::Absent);
+    assert_eq!(
+        receipt.after,
+        AdminState::AccountCreated {
+            initial_balance: CostUnits::ZERO,
+            status: AccountStatus::Suspended,
+            capacity_class: CapacityClass::BestEffort,
+            origin: AdminAuthority::Provisioner,
+        }
+    );
+    let view = AdminStore::account_view(&*store, provisioned)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.status, AccountStatus::Suspended);
+    assert_eq!(view.capacity_class, CapacityClass::BestEffort);
+    assert_eq!(view.origin, AdminAuthority::Provisioner);
+    assert_eq!(view.status_set_by, AdminAuthority::Provisioner);
+    assert_eq!(view.conservation.deposited, CostUnits::ZERO);
+    assert_eq!(view.conservation.balance, CostUnits::ZERO);
+    assert_eq!(
+        AdminStore::create_provisioned_account(&*store, provisioned)
+            .await
+            .unwrap_err(),
+        CreateAccountError::AlreadyExists
+    );
+    assert_eq!(
+        AdminStore::create_provisioned_account(&*store, ACCOUNT)
+            .await
+            .unwrap_err(),
+        CreateAccountError::AlreadyExists,
+        "an operator's account is never re-created as a provisioner's"
+    );
+    let operator = AdminStore::account_view(&*store, ACCOUNT)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(operator.origin, AdminAuthority::Operator);
+    assert_eq!(operator.status_set_by, AdminAuthority::Operator);
+}
+
+/// Activation for a provisioner reads provenance and the status author in the
+/// same serialization point as the write (#39).
+#[tokio::test]
+async fn provisioned_activation_honours_provenance_and_operator_holds() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
+    assert_eq!(
+        AdminStore::activate_provisioned(&*store, AccountId(999))
+            .await
+            .unwrap_err(),
+        SetStatusError::UnknownAccount
+    );
+    AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
+        .await
+        .unwrap();
+    assert_eq!(
+        AdminStore::activate_provisioned(&*store, ACCOUNT)
+            .await
+            .unwrap_err(),
+        SetStatusError::NotProvisioned,
+        "an operator's account is out of a provisioner's reach"
+    );
+    assert_eq!(
+        AdminStore::account_view(&*store, ACCOUNT)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        AccountStatus::Suspended
+    );
+
+    let provisioned = AccountId(39);
+    AdminStore::create_provisioned_account(&*store, provisioned)
+        .await
+        .unwrap();
+    let activated = AdminStore::activate_provisioned(&*store, provisioned)
+        .await
+        .unwrap();
+    assert_eq!(
+        activated.before,
+        AdminState::Status {
+            status: AccountStatus::Suspended,
+            set_by: AdminAuthority::Provisioner,
+        }
+    );
+    assert_eq!(
+        activated.after,
+        AdminState::Status {
+            status: AccountStatus::Active,
+            set_by: AdminAuthority::Provisioner,
+        }
+    );
+    let repeated = AdminStore::activate_provisioned(&*store, provisioned)
+        .await
+        .unwrap();
+    assert_eq!(repeated.before, repeated.after);
+
+    // An operator's suspension holds.
+    let suspended = AdminStore::set_account_status(&*store, provisioned, AccountStatus::Suspended)
+        .await
+        .unwrap();
+    assert_eq!(
+        suspended.after,
+        AdminState::Status {
+            status: AccountStatus::Suspended,
+            set_by: AdminAuthority::Operator,
+        }
+    );
+    assert_eq!(
+        AdminStore::activate_provisioned(&*store, provisioned)
+            .await
+            .unwrap_err(),
+        SetStatusError::OperatorHold
+    );
+    let held = AdminStore::account_view(&*store, provisioned)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.status, AccountStatus::Suspended);
+    assert_eq!(held.status_set_by, AdminAuthority::Operator);
+
+    // Only an operator lifts it, and a provisioner's later repeat keeps the
+    // operator as the author.
+    AdminStore::set_account_status(&*store, provisioned, AccountStatus::Active)
+        .await
+        .unwrap();
+    let noop = AdminStore::activate_provisioned(&*store, provisioned)
+        .await
+        .unwrap();
+    assert_eq!(noop.before, noop.after);
+    assert_eq!(
+        noop.after,
+        AdminState::Status {
+            status: AccountStatus::Active,
+            set_by: AdminAuthority::Operator,
+        }
+    );
+
+    // Closed is terminal whoever asks.
+    AdminStore::set_account_status(&*store, provisioned, AccountStatus::Closed)
+        .await
+        .unwrap();
+    assert_eq!(
+        AdminStore::activate_provisioned(&*store, provisioned)
+            .await
+            .unwrap_err(),
+        SetStatusError::AccountClosed
+    );
 }
