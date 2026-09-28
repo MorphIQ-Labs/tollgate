@@ -12,9 +12,15 @@ publish.workspace = true
 syn.workspace = true
 proc-macro2.workspace = true
 serde_json.workspace = true
+pulldown-cmark.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The repository README's example is compiled and run as a doctest here: this
+# crate is never published, so it can include a file outside its package.
+jiff.workspace = true
+tollgate-core = { path = "../tollgate-core" }
+tollgate-admission = { path = "../tollgate-admission" }
 
 [lints]
 workspace = true
@@ -30,3 +36,11 @@ path = "src/bin/check_backend_parity.rs"
 [[bin]]
 name = "check_seam_contract"
 path = "src/bin/check_seam_contract.rs"
+
+[[bin]]
+name = "mdbook-repo-links"
+path = "src/bin/mdbook_repo_links.rs"
+
+[[bin]]
+name = "check_lean_mutants"
+path = "src/bin/check_lean_mutants.rs"

@@ -1,0 +1,27 @@
+name: Feature request
+description: Propose a change to what Tollgate does.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and where Tollgate falls short today. Describe the need before the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What you would like to happen. Note any effect on the request path, which performs no I/O, takes no blocking locks and reads no clock for a policy decision.
+    validations:
+      required: true
+  - type: textarea
+    id: contracts
+    attributes:
+      label: Contracts affected
+      description: Invariants, public APIs, wire formats, error codes, configuration or database schema this would change, and whether the change is backward compatible.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

@@ -241,7 +241,7 @@ classify the liquidity difference alone as lost billing, because late usage for
 the lease still bills against the forfeit. Reconcile recorded usage and ledger conservation both before
 and after reclamation. Expiry does not erase the runtime's historical counters.
 
-## Instance clients and Cloud Run
+## Instance clients and Google service-account identity
 
 `HttpStore::with_config` validates its URL, credentials, TLS roots and deadlines
 before construction. HTTPS verifies the server certificate and host name. A
@@ -254,8 +254,9 @@ is accepted only for literal loopback addresses or `localhost`, which is pinned
 to loopback rather than resolved through DNS. URL userinfo, queries and fragments
 are refused.
 
-Cloud Run instances can use their attached service account without distributing
-per-replica secrets:
+Instances running on Google Cloud can use their attached service account,
+through the platform's metadata server, without distributing per-replica
+secrets:
 
 ```rust,ignore
 use tollgate_client::{GoogleIdentity, HttpStore, HttpStoreConfig};
@@ -286,14 +287,14 @@ never extend identity validity. Expired or unknown keys fail closed until a
 valid refresh succeeds. Internet access to Google's signing-key endpoint and
 accurate server time are deployment prerequisites for this mode.
 
-The supported topology has Cloud Run clients connecting over TLS to a directly
-encrypted server endpoint, with PostgreSQL behind the server. A VM or GKE
-deployment can expose this TLS listener. Cloud Run's
-usual server-side HTTP container termination is not an exemption from the
-non-loopback plaintext rule; this feature does not provide a forwarded-identity
-or trusted-proxy bypass.
+The supported topology has clients connecting over TLS to a directly encrypted
+server endpoint, with PostgreSQL behind the server. The server must therefore
+run where it can expose its own TLS listener. A platform front end that
+terminates TLS and forwards plaintext is not an exemption from the non-loopback
+plaintext rule; this feature does not provide a forwarded-identity or
+trusted-proxy bypass.
 
-References: [Google service-to-service identity](https://docs.cloud.google.com/run/docs/authenticating/service-to-service),
+References: [Google ID tokens for service accounts](https://cloud.google.com/docs/authentication/get-id-token),
 [Google ID token validation and key caching](https://developers.google.com/identity/openid-connect/openid-connect).
 
 ## Rotation and revocation

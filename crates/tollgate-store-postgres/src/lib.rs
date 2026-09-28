@@ -27,6 +27,8 @@
 //! (LISTEN/NOTIFY or the server's future SSE) is a documented seam in
 //! `docs/DESIGN.md`.
 
+#![deny(missing_docs)]
+
 pub(crate) mod instant;
 
 #[cfg(feature = "test-support")]
@@ -1000,6 +1002,8 @@ pub struct PostgresStore {
 /// error the caller can report (INVARIANTS.md GL-18).
 #[derive(Debug, Clone, Copy)]
 pub struct PoolConfig {
+    /// The most connections the pool opens at once. Must be positive;
+    /// defaults to 16.
     pub max_connections: u32,
     /// How long a caller may wait for a free connection before the call
     /// fails. Must be positive.
@@ -1016,6 +1020,11 @@ impl Default for PoolConfig {
 }
 
 impl PoolConfig {
+    /// Rejects a zero `max_connections` or a zero `acquire_timeout`.
+    ///
+    /// [`PostgresStore::connect_with`] calls this before it opens any
+    /// connection, so an unsafe bound never reaches the database
+    /// (INVARIANTS.md 16).
     pub fn validate(&self) -> Result<(), StoreError> {
         if self.max_connections == 0 {
             return Err(StoreError("max_connections must be positive".into()));
@@ -1093,6 +1102,13 @@ impl PostgresStore {
 
     // ---- reconciliation / test surface (mirrors MemoryStore) ---------
 
+    /// The account's unspent balance, read in one statement outside any
+    /// transaction. An unknown account reads as zero, as in `MemoryStore`.
+    ///
+    /// A negative stored value is reported as a [`StoreError`], never
+    /// clamped (INVARIANTS.md 11). For figures that must agree with each
+    /// other, use [`conservation`](Self::conservation), which reads them
+    /// from one snapshot.
     pub async fn balance(&self, account: AccountId) -> Result<CostUnits, StoreError> {
         let row = sqlx::query("SELECT balance FROM tollgate_accounts WHERE account_id = $1")
             .bind(id_bytes(account.0))
@@ -1104,6 +1120,12 @@ impl PostgresStore {
             .map(|units| units.unwrap_or(CostUnits::ZERO))
     }
 
+    /// Total usage accepted into the account's billing ledger, including
+    /// overage usage, read in one statement outside any transaction. An
+    /// unknown account reads as zero, as in `MemoryStore`.
+    ///
+    /// A negative stored value is reported as a [`StoreError`], never
+    /// clamped (INVARIANTS.md 11).
     pub async fn usage_recorded(&self, account: AccountId) -> Result<CostUnits, StoreError> {
         let row = sqlx::query("SELECT usage_recorded FROM tollgate_accounts WHERE account_id = $1")
             .bind(id_bytes(account.0))
@@ -1115,6 +1137,20 @@ impl PostgresStore {
             .map(|units| units.unwrap_or(CostUnits::ZERO))
     }
 
+    /// The terms of the account's ledger equation, for reconciliation
+    /// against the ledger contract in `INVARIANTS.md`. `None` when the account
+    /// does not exist.
+    ///
+    /// The account totals and the sums over its active leases are read in one
+    /// `REPEATABLE READ, READ ONLY` transaction, so both come from the same
+    /// snapshot and a concurrent commit cannot land between them. The
+    /// transaction writes nothing.
+    ///
+    /// Stored state that cannot be a valid ledger is reported as a
+    /// [`StoreError`], never clamped or panicked on: a negative unit column
+    /// (INVARIANTS.md 11), or active-lease usage exceeding recorded usage.
+    /// Whether the returned terms balance is for the caller to check with
+    /// [`Conservation::holds`](tollgate_store::Conservation::holds).
     pub async fn conservation(
         &self,
         account: AccountId,

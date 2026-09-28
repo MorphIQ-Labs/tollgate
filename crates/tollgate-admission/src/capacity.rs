@@ -59,6 +59,8 @@ pub trait CapacityPermit: private::Sealed + Send + 'static {}
 /// Sealed around the three built-in implementations for the same reason the
 /// permit is.
 pub trait CapacityGate: private::Sealed + Send + Sync + 'static {
+    /// The proof of acquisition this gate issues; holding it keeps the
+    /// capacity taken, and dropping it returns the capacity.
     type Permit: CapacityPermit;
 
     /// Acquire capacity for one request, or refuse.
@@ -150,11 +152,18 @@ pub enum ExecutionCapacityMode {
     Disabled,
     /// Bound total execution without differentiating classes. Fail-fast
     /// overload protection for a product that wants a cap but no fast lane.
-    Uniform { total: NonZeroU32 },
+    Uniform {
+        /// Execution slots the instance may hold at once, across all classes.
+        total: NonZeroU32,
+    },
     /// Bound total execution and keep part of it for assured work. The only
     /// mode in which [`CapacityClass`] changes an outcome.
     Reserved {
+        /// Execution slots the instance may hold at once, reserve included.
         total: NonZeroU32,
+        /// Slots within `total` that only [`CapacityClass::Assured`] work may
+        /// use, once the shared remainder is full. Must be smaller than
+        /// `total`; [`ExecutionCapacityGate::new`] rejects it otherwise.
         assured_reserve: NonZeroU32,
     },
 }
@@ -169,7 +178,12 @@ pub enum ExecutionCapacityMode {
 pub enum CapacityConfigError {
     /// The reserve is not smaller than the total, so shared capacity would be
     /// zero and no best-effort request could ever start.
-    ReserveLeavesNoSharedCapacity { total: u32, assured_reserve: u32 },
+    ReserveLeavesNoSharedCapacity {
+        /// The configured total, in execution slots.
+        total: u32,
+        /// The configured assured reserve, in execution slots.
+        assured_reserve: u32,
+    },
 }
 
 impl std::fmt::Display for CapacityConfigError {
@@ -468,10 +482,16 @@ impl ExecutionCapacityGate {
 /// labelled by account is a cardinality incident waiting for a busy tenant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapacityOccupancy {
+    /// Slots in the shared pool, which every class draws from first: the
+    /// whole total under `Uniform`, total minus the reserve under `Reserved`.
     pub shared_total: u32,
+    /// Shared slots free at the time of the read; an estimate, since the
+    /// shards are summed one at a time.
     pub shared_available: u32,
     /// Zero under `Uniform`, which has no reserve rather than an empty one.
     pub reserve_total: u32,
+    /// Reserve slots free at the time of the read; an estimate, and zero
+    /// under `Uniform`.
     pub reserve_available: u32,
 }
 

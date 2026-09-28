@@ -252,7 +252,14 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    may rebalance because they are partitions of the same lease bound. A
    commit-time elastic fallback is a *commit*, not a release: it returns the
    lease receipt because overage now funds the same units, and the charge
-   stands in full. *Tests:*
+   stands in full. `ChargeLifecycle.lean` proves the exact lifecycle model:
+   only a committed request is charged
+   (`Tollgate.ChargeLifecycle.uncommitted_charges_nothing`,
+   `Tollgate.ChargeLifecycle.admit_charges_nothing`), cancellation refunds
+   exactly the admitted debit (`Tollgate.ChargeLifecycle.cancel_refunds_exactly`),
+   and every transition conserves the lease
+   (`Tollgate.ChargeLifecycle.admit_wf`, `Tollgate.ChargeLifecycle.cancel_wf`).
+   *Tests:*
    `reservation::tests::{drop_releases_pending, cancel_charges_zero_and_refunds}`,
    `fragmented_reservation_refunds_without_stranding_capacity`,
    `a_fallback_commit_refunds_its_lease_exactly_once`, and
@@ -321,6 +328,22 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    monotonic audit trail. If release rejects the token attached to a grant the
    client believed valid, the client clears its slot and fails closed because
    its local lease identity can no longer be trusted relative to the store.
+   `LeaseFencing.lean` proves the exact model: fences are positive, unique per
+   account and increasing (`Tollgate.LeaseFencing.capability_names_one_lease`,
+   `Tollgate.LeaseFencing.acquire_fence_exceeds_existing`); a newer lease
+   leaves existing ones untouched
+   (`Tollgate.LeaseFencing.acquire_preserves_existing`); a mismatched pair or
+   triple is refused (`Tollgate.LeaseFencing.release_refuses_wrong_fence`,
+   `Tollgate.LeaseFencing.ingest_refuses_wrong_fence`,
+   `Tollgate.LeaseFencing.ingest_refuses_wrong_account`); each operation
+   changes only the lease it names (`Tollgate.LeaseFencing.ingest_scoped`,
+   `Tollgate.LeaseFencing.release_scoped`); a settled lease never revives
+   (`Tollgate.LeaseFencing.settled_lease_never_revives`); and billed plus
+   returned units stay within the grant
+   (`Tollgate.LeaseFencing.billed_and_returned_within_grant`,
+   `Tollgate.LeaseFencing.ingest_refuses_past_capacity`). It assumes atomic
+   store operations and does not prove the Rust or SQL refinement, which the
+   tests below witness.
    *Tests:* `newer_lease_does_not_invalidate_older_active_capability`,
    `wrong_token_release_leaves_lease_reclaimable`, and
    `usage_rejects_mismatched_lease_capability` (store suites);
@@ -585,6 +608,21 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    as duplicates, so a partial success is reported as a total failure and
    nothing says otherwise (GL-57).
 
+   `IdempotentIngest.lean` proves the exact model for any acceptance
+   decision: each input is classified once
+   (`Tollgate.IdempotentIngest.classified_once`); a duplicate is recognized
+   from its request ID before its payload
+   (`Tollgate.IdempotentIngest.duplicate_ignores_payload`); a rejected event
+   claims nothing (`Tollgate.IdempotentIngest.rejected_claims_nothing`); the
+   ledger only appends accepted events
+   (`Tollgate.IdempotentIngest.plan_ledger`), so no request ID is billed twice
+   across any replay (`Tollgate.IdempotentIngest.billed_at_most_once`,
+   `Tollgate.IdempotentIngest.replay_accepts_nothing_twice`); the billed total
+   grows by exactly the accepted units
+   (`Tollgate.IdempotentIngest.billed_grows_by_accepted`); and a failed batch
+   changes nothing (`Tollgate.IdempotentIngest.failed_batch_changes_nothing`).
+   It assumes the batch applies atomically, as stated above.
+
    *Tests:* `usage_replay_is_idempotent`,
    `mixed_usage_batch_preserves_partial_acceptance`,
    `usage_accepts_zero_and_the_backends_unit_ceiling`,
@@ -624,12 +662,20 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    sheds; sheds are counted at `try_reserve`, the only place a refusal can
    happen, so no embedder can forget to; and the time the sink last answered
    separates a quiet writer from an unreachable one — a distinction `lost`
-   cannot make while the process runs, since the steady-state path retries
-   forever and declares loss only at the final flush. The drain's budget is
+   cannot make while the process runs, since the steady-state path retries an
+   unavailable sink forever and declares that loss only at the final flush. A
+   batch the sink refuses outright is the exception: it is counted lost and
+   dropped when refused, so a permanent error cannot stall every event queued
+   behind it. The drain's budget is
    total wall clock, so its retry backoffs sleep into whatever remains and
    never past it: an overrun spends the margin `expiry_safety_margin +
    reclaim_grace` reserves (GL-12), and bounding by attempt count alone is not a
-   bound (GL-18, GL-63). *Tests:* client writer
+   bound (GL-18, GL-63). `ChargeLifecycle.lean` proves the slot model: the
+   slots in use never exceed the queue's capacity
+   (`Tollgate.ChargeLifecycle.reserve_wf`), and a request finding the queue
+   full is shed with nothing charged
+   (`Tollgate.ChargeLifecycle.full_queue_sheds`). Lanes, the drain deadline
+   and the writer's counters are outside the model. *Tests:* client writer
    overflow tests,
    `the_final_flush_backoff_cannot_overrun_the_drain_deadline`,
    `shutdown_flushes_in_configured_batch_sizes`,
@@ -892,6 +938,17 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     order is: stop admitting, quiesce request tasks holding permits or
     guards, shut the usage writer down, then release leases. A spent lease
     with no billing event requires losing the whole process.
+    `ChargeLifecycle.lean` proves the binding in the exact model: a committed
+    request holds the slot bound at reservation
+    (`Tollgate.ChargeLifecycle.committed_holds_its_slot`), so emitting its
+    event needs no capacity and cannot be refused
+    (`Tollgate.ChargeLifecycle.committed_always_emits`); the charge is fixed
+    at commit (`Tollgate.ChargeLifecycle.commit_charges_admitted_units`) and
+    emitted once (`Tollgate.ChargeLifecycle.emitted_once`,
+    `Tollgate.ChargeLifecycle.emit_keeps_charge`); and an instance never
+    charges more than its lease granted
+    (`Tollgate.ChargeLifecycle.charged_within_grant`). Process loss is the
+    stated boundary, outside the model.
 
     `InstanceRuntime` owns this order under one total deadline: stop snapshot
     discovery and pause refills, close the accounting queue and drain issued
@@ -1106,6 +1163,18 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `the_default_batch_writes_dispatch_every_update_variant`,
     `the_default_install_many_publishes_the_whole_batch`, and
     `an_unfenced_reservation_round_trip_publishes_its_reads`.
+    `NegativeCache.lean` proves the exact cache model: it never holds more
+    than its bound (`Tollgate.NegativeCache.record_bounded`,
+    `Tollgate.NegativeCache.prune_bounded`); eviction removes an entry whose
+    deadline is no later than any other's
+    (`Tollgate.NegativeCache.evict_removes_earliest`); pruning keeps exactly
+    the unexpired negatives (`Tollgate.NegativeCache.prune_exact`); a
+    principal's negative is due at the TTL its source answer selects, whatever
+    was remembered before (`Tollgate.NegativeCache.record_sets_answer_deadline`,
+    `Tollgate.NegativeCache.absent_takes_unknown_ttl`,
+    `Tollgate.NegativeCache.tombstone_takes_revoked_ttl`); and a present
+    answer clears it (`Tollgate.NegativeCache.resolve_clears`). Pull
+    scheduling, backoff and lag recovery are outside the model.
     *Tests:* `arc_swap_negative_cache_is_bounded_and_evicts_oldest_deadline_first`,
     `arc_swap_control_write_drops_expired_negatives`,
     `many_unknowns_leave_only_the_configured_number_visible`,
@@ -1378,7 +1447,21 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `SnapshotManager` refresh interval, not zero. The operation reports what it
     changed: how many snapshots it republished, and how many changed durably
     but could not be decoded to push, so a partial result is surfaced rather
-    than absorbed. *Tests:*
+    than absorbed. `StatusPropagation.lean` proves the exact model: the ledger
+    and every live snapshot always agree
+    (`Tollgate.StatusPropagation.setStatus_agrees`,
+    `Tollgate.StatusPropagation.publish_agrees`); a change republishes exactly
+    the account's live snapshots not already at the target, each at
+    generation + 1 (`Tollgate.StatusPropagation.setStatus_restamps_exactly`),
+    never a tombstone (`Tollgate.StatusPropagation.revoked_never_republished`)
+    and never backward (`Tollgate.StatusPropagation.generation_monotone`);
+    repeating it changes nothing
+    (`Tollgate.StatusPropagation.repeat_changes_nothing`); a contradicting
+    publication is refused
+    (`Tollgate.StatusPropagation.contradicting_publication_refused`); and
+    `Closed` is terminal (`Tollgate.StatusPropagation.closed_is_terminal`,
+    `Tollgate.StatusPropagation.closed_stays_closed`). The operation is atomic
+    by assumption. *Tests:*
     `suspending_an_account_stops_leases_and_republishes_its_snapshots`,
     `suspension_republishes_only_the_suspended_accounts_snapshots`,
     `suspending_an_account_does_not_resurrect_revoked_principals`,
@@ -1434,6 +1517,20 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     witnessed: reading the buffer after the drop would be undefined behaviour,
     so the wipe is observed from inside the drop instead — the last instant
     those bytes are still defined to read.
+    `SessionCredential.lean` proves the exact cache model for any verifier:
+    every principal the cache returns is what the verifier answers for the
+    presented bytes and is still reusable at `now`
+    (`Tollgate.SessionCredential.answer_is_current_verification`,
+    `Tollgate.SessionCredential.authenticate_sound`); a hit requires the
+    identical credential and a reusable proof
+    (`Tollgate.SessionCredential.hit_requires_identical_and_reusable`); a
+    changed or failed credential never leaves the previous principal reusable
+    (`Tollgate.SessionCredential.fresh_replaces_or_clears`,
+    `Tollgate.SessionCredential.failed_verification_clears`); an expired
+    answer is neither returned nor cached
+    (`Tollgate.SessionCredential.expired_answer_refused`); and sessions are
+    isolated (`Tollgate.SessionCredential.sessions_isolated`). Constant-time
+    comparison and the wipe on drop are Rust obligations.
     *Tests:* `an_unchanged_credential_is_verified_once_per_session`,
     `the_cache_is_isolated_per_session`,
     `a_failed_replacement_does_not_leave_the_previous_principal_usable`,

@@ -31,6 +31,16 @@ use tollgate_store::{
     SnapshotPush, SnapshotResolution, SnapshotSource, StoreError, UsageSink,
 };
 
+/// A `tollgate-server` client implementing [`LeaseAllocator`],
+/// [`SnapshotSource`], [`UsageSink`] and `KeySource` over HTTP(S).
+///
+/// Every call carries the configured bearer credential, if any, and runs
+/// under one request deadline that also covers obtaining that credential.
+/// Server problem codes map back to the domain errors a direct backend
+/// returns. Snapshot pushes are not supported, so the snapshot manager relies
+/// on periodic refresh. Shared as an `Arc` by every background component;
+/// [`reconfigure`](Self::reconfigure) rotates credentials and TLS material in
+/// place.
 pub struct HttpStore {
     base: String,
     transport: arc_swap::ArcSwap<HttpTransport>,
@@ -49,6 +59,14 @@ impl HttpStore {
         Self::with_config(base_url, crate::http_security::HttpStoreConfig::default())
     }
 
+    /// Connect with the given deadlines and otherwise default settings, so
+    /// no credentials: tollgate-server refuses unauthenticated calls. See
+    /// [`HttpStoreConfig`](crate::HttpStoreConfig) for what each deadline bounds.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] for an unusable URL or deadline, as
+    /// [`with_config`](Self::with_config).
     pub fn with_timeouts(
         base_url: impl Into<String>,
         connect_timeout: std::time::Duration,
@@ -64,6 +82,15 @@ impl HttpStore {
         )
     }
 
+    /// Connect to `base_url` with `config`'s deadlines, TLS material and
+    /// credential provider. No request is made here.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] when the URL is not HTTP(S), carries userinfo, a query
+    /// or a fragment, or uses plaintext `http` to anything but a loopback
+    /// address or with TLS material configured; when a deadline is zero or
+    /// unrepresentable; or when the CA or identity PEM is invalid.
     pub fn with_config(
         base_url: impl Into<String>,
         config: crate::http_security::HttpStoreConfig,

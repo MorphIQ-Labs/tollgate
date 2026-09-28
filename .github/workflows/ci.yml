@@ -1,6 +1,6 @@
 # Tollgate CI — Rust correctness, dependency advisories and licenses, backend
 # parity, performance compilation, mutation assurance, machine-checked proofs,
-# and a secret scan.
+# a secret scan, and the documentation site's build and link check.
 #
 # The toolchain comes from rust-toolchain.toml; rustup installs exactly that
 # pin, so CI and local builds cannot drift. Timed Criterion and loopback load
@@ -217,9 +217,29 @@ jobs:
       - run: rustc --version && cargo --version
       - run: cargo check --locked --workspace --all-features --all-targets
 
+  # The documentation site builds, and every link in it resolves: the
+  # repo-links preprocessor fails the build on a missing path or heading, or
+  # a document under docs/ that SUMMARY.md leaves off the site. The built
+  # site is attached to the run for review; pages.yml publishes it from main.
+  docs:
+    name: check / docs
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: tools
+      - run: cargo install --locked mdbook --version "$(cat .cargo/mdbook-version)"
+      - run: mdbook build
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: documentation-site
+          path: target/book
+
   test:
     name: test / test
-    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv]
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv, docs]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -235,7 +255,7 @@ jobs:
   # controlled-host calibration and stays local.
   allocation-assertions:
     name: test / allocation-assertions
-    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv]
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv, docs]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -255,7 +275,7 @@ jobs:
   # Postgres backend is disabled; the tree check makes that claim executable.
   test-no-default-features:
     name: test / test-no-default-features
-    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv]
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv, docs]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -281,7 +301,7 @@ jobs:
   # runs for real here. TOLLGATE_REQUIRE_PG makes a silent skip fail red.
   test-postgres:
     name: test / test-postgres
-    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv]
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv, docs]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     services:
@@ -310,7 +330,7 @@ jobs:
 
   bench-compile:
     name: test / bench-compile
-    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv]
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv, docs]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -325,7 +345,7 @@ jobs:
   # No workload, timed measurement, or threshold verdict runs here.
   load-failure-reporting:
     name: test / load-failure-reporting
-    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv]
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv, docs]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -361,15 +381,33 @@ jobs:
             | sh -s -- -y --default-toolchain "$(cat formal/lean/lean-toolchain)"
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       - run: ./scripts/check_formal.sh
+      # Mutation testing for the models: each transition definition is
+      # mutated and some theorem must fail. A survivor fails unless
+      # formal/lean/mutants-allowed.txt names it as equivalent, with a reason.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: tools
+          save-if: false
+      - run: ./scripts/check_formal_mutants.sh
 
   # Blocking assurance gate: diff-scoped mutation testing, including the
-  # Postgres backend.
-  mutation:
-    name: assurance / mutation
+  # Postgres backend, split into shards so a large diff finishes inside the
+  # job timeout (GL-67). cargo-mutants' `--shard k/n` partitions one
+  # deterministic mutant list, so the shards together test exactly the
+  # mutants one run would. Each shard has its own Postgres service: the
+  # backend suite truncates its database, and shards sharing one would turn
+  # unrelated failures into false "caught" mutants.
+  mutation-shard:
+    name: assurance / mutation shard ${{ matrix.shard }}/8
     needs: [test, allocation-assertions, test-no-default-features, test-postgres, bench-compile, load-failure-reporting]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    strategy:
+      # Every shard reports, so one failure does not hide another's survivors.
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     services:
       postgres:
         image: postgres:16-alpine
@@ -397,8 +435,29 @@ jobs:
       - run: ./scripts/check_mutations.sh --diff "$BASE"
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
+          MUTANTS_SHARD: ${{ matrix.shard }}/8
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: mutation-report
+          name: mutation-report-${{ matrix.shard }}
           path: reports/mutations
+
+  # The required check. One stable name however many shards there are, so
+  # branch protection does not track the matrix. `always()` is deliberate:
+  # GitHub reports a job skipped behind a failed dependency as passing, so
+  # this must run and fail whenever any shard did not succeed, including a
+  # shard skipped because an earlier stage failed.
+  mutation:
+    name: assurance / mutation
+    needs: [mutation-shard]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: every shard passed
+        run: |
+          if [ "$RESULT" != "success" ]; then
+            echo "mutation shards finished as '$RESULT'; see each shard's mutation-report artifact" >&2
+            exit 1
+          fi
+        env:
+          RESULT: ${{ needs.mutation-shard.result }}

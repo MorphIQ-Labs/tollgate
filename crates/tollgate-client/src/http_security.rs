@@ -14,6 +14,13 @@ use zeroize::Zeroizing;
 /// transport. HttpStore's request budget includes this call.
 #[async_trait]
 pub trait BearerProvider: Send + Sync {
+    /// The credential to send on the next control-plane call. Called once
+    /// per request, inside that request's deadline.
+    ///
+    /// # Errors
+    ///
+    /// A [`StoreError`] fails the call as a storage error; the call is never
+    /// sent unauthenticated.
     async fn token(&self) -> Result<BearerToken, StoreError>;
 }
 
@@ -22,6 +29,13 @@ pub trait BearerProvider: Send + Sync {
 pub struct BearerToken(Zeroizing<String>);
 
 impl BearerToken {
+    /// Validate a raw token for the `Authorization: Bearer` header.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] when the token is empty, longer than 16 KiB less the
+    /// `Bearer ` prefix, or contains anything but visible ASCII (no spaces
+    /// or control characters).
     pub fn new(token: impl Into<String>) -> Result<Self, StoreError> {
         let token = Zeroizing::new(token.into());
         if token.is_empty()
@@ -54,12 +68,16 @@ impl std::fmt::Debug for BearerToken {
 pub struct StaticBearer(ArcSwapOption<BearerToken>);
 
 impl StaticBearer {
+    /// A provider that returns `token` until replaced or revoked.
     pub fn new(token: BearerToken) -> Arc<Self> {
         Arc::new(Self(ArcSwapOption::from(Some(Arc::new(token)))))
     }
+    /// Rotate to `token`; calls that ask for a credential afterward use it.
     pub fn replace(&self, token: BearerToken) {
         self.0.store(Some(Arc::new(token)));
     }
+    /// Withdraw the credential. Later calls fail with a storage error rather
+    /// than going out unauthenticated, until [`replace`](Self::replace).
     pub fn revoke(&self) {
         self.0.store(None);
     }
@@ -75,7 +93,8 @@ impl BearerProvider for StaticBearer {
     }
 }
 
-/// Cloud Run uses its attached service account; there is no per-instance secret.
+/// A Google Cloud workload uses its attached service account; there is no
+/// per-instance secret.
 /// The metadata endpoint is fixed, never supplied by an untrusted URL or header.
 pub struct GoogleIdentity {
     client: reqwest::Client,
@@ -84,6 +103,14 @@ pub struct GoogleIdentity {
 }
 
 impl GoogleIdentity {
+    /// A provider of Google-signed identity tokens for `audience`, fetched
+    /// from the fixed metadata endpoint and cached for 60 seconds. The
+    /// server verifies expiry, issuer, audience and subject on every call.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] when `audience` is empty or the metadata client cannot
+    /// be built.
     pub fn new(audience: impl Into<String>) -> Result<Arc<Self>, StoreError> {
         let audience = audience.into();
         if audience.is_empty() {
@@ -175,11 +202,36 @@ impl GoogleIdentity {
 
 /// Authentication and TLS settings for HttpStore. A custom CA replaces public
 /// roots. Identity PEM contains the certificate chain and private key.
+///
+/// [`Default`] gives a two-second connect timeout, a ten-second request
+/// timeout, public roots, no client certificate and no bearer, which
+/// tollgate-server refuses. Every rule is checked when the client is built,
+/// by [`HttpStore::with_config`](crate::HttpStore::with_config) and
+/// [`HttpStore::reconfigure`](crate::HttpStore::reconfigure).
 pub struct HttpStoreConfig {
+    /// Bound on establishing one connection to the server.
+    /// Too short fails calls across a slow network path; too long lets an
+    /// unreachable server consume most of `request_timeout`. Must be
+    /// positive and representable.
     pub connect_timeout: Duration,
+    /// Bound on one whole call: obtaining the bearer credential, connecting,
+    /// sending, and reading the response body. Background components apply
+    /// their own per-call timeouts as well (`store_call_timeout`,
+    /// `ingest_timeout`, `fetch_timeout`), and the shorter bound wins. Set it
+    /// above the server's slowest legitimate answer, a full ingest batch or
+    /// catalogue page included; too short turns slow answers into retried
+    /// storage errors. Must be positive and representable.
     pub request_timeout: Duration,
+    /// PEM bundle of CA certificates that replace the public roots for
+    /// verifying the server. Must contain at least one certificate; not
+    /// allowed with plaintext `http`.
     pub root_ca_pem: Option<Vec<u8>>,
+    /// PEM certificate chain and private key presenting this instance's
+    /// client certificate for mutual TLS. Wiped from memory when dropped;
+    /// not allowed with plaintext `http`.
     pub identity_pem: Option<Zeroizing<Vec<u8>>>,
+    /// Source of the bearer credential sent on every call. `None` sends no
+    /// `Authorization` header.
     pub bearer: Option<Arc<dyn BearerProvider>>,
 }
 

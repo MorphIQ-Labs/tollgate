@@ -1,0 +1,7 @@
+# Equivalent mutants of the Lean models: changes that alter no observable
+# behaviour, so no theorem can or should fail. `check_lean_mutants` fails on
+# any survivor not listed here, and on any entry here that no longer survives.
+#
+# Format: <mutant key> :: reason: <why it is equivalent>
+
+RatePublication :: generation := if current.generation < incomingGeneration then :: < -> ≤ #0 :: reason: at equal generations both branches yield the same value (`incomingGeneration = current.generation`), so `<` and `≤` select the same generation

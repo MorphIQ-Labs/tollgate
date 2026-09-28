@@ -61,31 +61,88 @@ use tollgate_store::{AllocateError, LeaseAllocator};
 
 use tollgate_store::Clock;
 
+/// One account's refill settings: how large a lease to hold, when to replace
+/// it, how long it lives, and how patiently to talk to the allocator.
+///
+/// There are no defaults. [`validate`](Self::validate) runs before the task
+/// starts (INVARIANTS.md 16). Under an [`InstanceRuntime`](crate::InstanceRuntime)
+/// these come from [`AccountLeaseConfig::for_account`].
 #[derive(Debug, Clone, Copy)]
 pub struct LeaseManagerConfig {
+    /// The account whose slot this manager refills and whose balance every
+    /// acquire draws on.
     pub account: AccountId,
     /// Units requested per acquire; the allocator's grant policy may shrink
     /// the actual grant near exhaustion.
+    ///
+    /// Too small rotates leases often, costing an allocator round trip each
+    /// time, and makes any quote larger than the grant unfundable locally
+    /// until consolidation folds the refused lease into a larger one
+    /// ([`LeaseStats::consolidated`] rising says so). Too large strands
+    /// balance on one instance that other instances could have spent, and
+    /// raises what a crash leaves to TTL reclaim. Must be positive and above
+    /// `low_water`.
     pub target_grant: CostUnits,
     /// Refill threshold installed into each `LocalLease`.
+    ///
+    /// When a debit leaves the lease at or below this many units, the manager
+    /// acquires a replacement while the current lease keeps serving, so
+    /// rotation is invisible to requests. Size it to cover the units spent
+    /// during one refill (`poll_interval` plus an allocator round trip) at
+    /// peak rate. Too small lets the lease run dry before the replacement
+    /// lands, denying funded work as `LeaseExhausted`; too close to
+    /// `target_grant` rotates almost immediately. Must be below
+    /// `target_grant`; for a grant the allocator shrank, the manager caps it
+    /// below the actual grant.
     pub low_water: CostUnits,
+    /// Requested lifetime of each lease, from acquisition to `expires_at`.
+    /// The allocator clamps it to its policy's `max_ttl`.
+    ///
+    /// Too short rotates leases on expiry rather than on spending and gives
+    /// less room over `expiry_safety_margin`; too long delays the return of
+    /// units a crashed holder never released, which come back only after
+    /// `expires_at + reclaim_grace` (INVARIANTS.md 9). Must be positive and
+    /// longer than `expiry_safety_margin`.
     pub lease_ttl: SignedDuration,
     /// Local safety margin: installed leases stop accepting debits and
     /// commits at `expires_at - margin`. Size it to cover worst-case
     /// allocator/holder clock skew plus the longest request the service
     /// executes; the allocator's reclaim grace covers the other side
     /// (review finding GL-1).
+    ///
+    /// Too small risks committing against capacity the allocator may already
+    /// treat as expired (INVARIANTS.md 12); too large shortens each lease's
+    /// usable life. Must not be negative and must be shorter than
+    /// `lease_ttl`.
     pub expiry_safety_margin: SignedDuration,
     /// How often the slot is inspected. Refill latency is bounded by this
     /// plus one allocator round-trip — all off the request path.
+    ///
+    /// A debit crossing `low_water` wakes the manager at once; the poll is
+    /// the backstop for a cold start and for a lease reaching its usability
+    /// deadline, which no debit announces. Too long delays the first grant
+    /// and replacement after expiry; too short spends wakeups on idle
+    /// inspection. Must be positive.
     pub poll_interval: std::time::Duration,
     /// Wall-clock bound on one allocator call (acquire or release). An
     /// allocator that hangs rather than erroring would otherwise park the
     /// refill task forever. Must be positive.
+    ///
+    /// It also bounds each steady-state release pass as a whole, however many
+    /// leases are parked (INVARIANTS.md 18). Set it above the allocator's
+    /// slowest legitimate answer: a timeout is not a refusal, the allocator
+    /// may have granted anyway, and each one is counted in
+    /// [`LeaseStats::acquire_timeouts`] and
+    /// [`LeaseStats::uncertain_acquires`].
     pub store_call_timeout: std::time::Duration,
     /// Total budget for returning leases at shutdown, across every parked
     /// lease. Leases still unreleased when it expires are reported and left
     /// to TTL reclaim (INVARIANTS.md GL-9). Must be positive.
+    ///
+    /// It includes waiting for in-flight reservations to let go of a lease.
+    /// Too short abandons leases whose units then stay unavailable until
+    /// reclaim ([`LeaseManagerReport::abandoned`]); too long delays process
+    /// exit behind a slow allocator.
     pub shutdown_release_deadline: std::time::Duration,
 }
 
@@ -93,16 +150,30 @@ pub struct LeaseManagerConfig {
 /// Field semantics and validation are those of [`LeaseManagerConfig`].
 #[derive(Debug, Clone, Copy)]
 pub struct AccountLeaseConfig {
+    /// Units requested per acquire. See [`LeaseManagerConfig::target_grant`].
     pub target_grant: CostUnits,
+    /// Early-refill threshold, below `target_grant`. See
+    /// [`LeaseManagerConfig::low_water`].
     pub low_water: CostUnits,
+    /// Requested lease lifetime. See [`LeaseManagerConfig::lease_ttl`].
     pub lease_ttl: SignedDuration,
+    /// Margin before expiry at which local spending stops. See
+    /// [`LeaseManagerConfig::expiry_safety_margin`].
     pub expiry_safety_margin: SignedDuration,
+    /// Slot inspection interval. See [`LeaseManagerConfig::poll_interval`].
     pub poll_interval: std::time::Duration,
+    /// Bound on one allocator call and on each release pass. See
+    /// [`LeaseManagerConfig::store_call_timeout`].
     pub store_call_timeout: std::time::Duration,
+    /// Per-account budget for returning leases at shutdown. See
+    /// [`LeaseManagerConfig::shutdown_release_deadline`]. Accounts release
+    /// concurrently, so the runtime's `shutdown_deadline` covers this once,
+    /// not once per account.
     pub shutdown_release_deadline: std::time::Duration,
 }
 
 impl AccountLeaseConfig {
+    /// The complete per-account configuration, every field set explicitly.
     #[must_use]
     pub fn for_account(self, account: AccountId) -> LeaseManagerConfig {
         LeaseManagerConfig {
@@ -117,6 +188,11 @@ impl AccountLeaseConfig {
         }
     }
 
+    /// Apply [`LeaseManagerConfig::validate`]'s rules to these settings.
+    ///
+    /// # Errors
+    ///
+    /// The first rule the settings break.
     pub fn validate(&self) -> Result<(), LeaseManagerConfigError> {
         self.for_account(AccountId(0)).validate()
     }
@@ -136,6 +212,7 @@ pub struct LeaseManagerReport {
     pub task_died: bool,
 }
 
+/// Why a [`LeaseManagerConfig`] was refused: the first rule it broke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeaseManagerConfigError(pub &'static str);
 
@@ -148,6 +225,16 @@ impl std::fmt::Display for LeaseManagerConfigError {
 impl std::error::Error for LeaseManagerConfigError {}
 
 impl LeaseManagerConfig {
+    /// Check every field without starting anything: a positive
+    /// `target_grant` above `low_water`, a positive `lease_ttl`, a
+    /// nonnegative `expiry_safety_margin` shorter than `lease_ttl`, and
+    /// positive `poll_interval`, `store_call_timeout` and
+    /// `shutdown_release_deadline`. Nothing is silently repaired
+    /// (INVARIANTS.md 16). [`LeaseManager::spawn`] calls this first.
+    ///
+    /// # Errors
+    ///
+    /// The first rule the configuration breaks.
     pub fn validate(&self) -> Result<(), LeaseManagerConfigError> {
         if self.target_grant.is_zero() {
             return Err(LeaseManagerConfigError("target_grant must be positive"));
@@ -267,6 +354,7 @@ pub struct LeaseCounters {
 }
 
 impl LeaseCounters {
+    /// A counter set that has recorded nothing.
     #[must_use]
     pub const fn new() -> Self {
         LeaseCounters {
@@ -341,6 +429,8 @@ impl LeaseCounters {
         self.abandoned.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Read every counter. Each is read independently, so a reading taken
+    /// while the task runs is not one atomic instant across fields.
     #[must_use]
     pub fn snapshot(&self) -> LeaseStats {
         LeaseStats {
@@ -402,6 +492,7 @@ pub struct LeaseStats {
 }
 
 impl LeaseStats {
+    /// Nothing recorded: the starting value for a sum.
     pub const ZERO: Self = Self {
         acquired: 0,
         acquired_units: 0,
@@ -466,6 +557,20 @@ pub struct LeaseManager {
 }
 
 impl LeaseManager {
+    /// Validate `config` and start the refill task for `slot`, which should
+    /// be the account's one shared slot (see
+    /// [`SlotRegistry::slot`](crate::SlotRegistry::slot)). The first slot
+    /// inspection, and so the first acquire for an empty slot, runs
+    /// immediately. Must be called within a Tokio runtime.
+    ///
+    /// Retain the handle and call [`shutdown`](Self::shutdown) after the
+    /// usage writer has drained; dropping it aborts the task and leaves its
+    /// leases to TTL reclaim.
+    ///
+    /// # Errors
+    ///
+    /// [`LeaseManagerConfigError`] when `config` fails validation; nothing is
+    /// started.
     pub fn spawn(
         allocator: Arc<dyn LeaseAllocator>,
         slot: Arc<LeaseSlot>,

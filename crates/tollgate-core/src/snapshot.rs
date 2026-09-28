@@ -22,6 +22,7 @@ use crate::units::CostUnits;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AccountStatus {
+    /// Admits, subject to every other check.
     Active,
     /// Temporarily disabled; denies but may return.
     Suspended,
@@ -144,7 +145,11 @@ pub enum EnforcementMode {
     /// no lease debited. It is billed like any other usage — the resulting
     /// event carries no lease capability, and the ledger records it as a
     /// second funding term so per-account conservation still closes exactly.
-    Elastic { overage_cap: CostUnits },
+    Elastic {
+        /// The most unfunded spend one service instance may extend this
+        /// account.
+        overage_cap: CostUnits,
+    },
 }
 
 impl EnforcementMode {
@@ -184,7 +189,9 @@ impl EnforcementMode {
 pub struct PermissionBits(pub u64);
 
 impl PermissionBits {
+    /// No permissions: required by nothing, and granting nothing.
     pub const NONE: PermissionBits = PermissionBits(0);
+    /// Every permission bit.
     pub const ALL: PermissionBits = PermissionBits(u64::MAX);
 
     /// The single permission at `bit` (0..64).
@@ -194,6 +201,7 @@ impl PermissionBits {
         PermissionBits(1u64 << bit)
     }
 
+    /// Every bit set in either.
     #[inline]
     #[must_use]
     pub const fn union(self, other: PermissionBits) -> PermissionBits {
@@ -216,11 +224,14 @@ pub struct WeightedRateLimit {
 }
 
 impl WeightedRateLimit {
+    /// Cost units the bucket refills per second.
     #[must_use]
     pub const fn units_per_second(self) -> u64 {
         self.units_per_second
     }
 
+    /// The bucket's capacity in cost units: the largest quote it can admit at
+    /// once.
     #[must_use]
     pub const fn burst_units(self) -> u64 {
         self.burst_units
@@ -235,11 +246,13 @@ pub struct RequestRateLimit {
 }
 
 impl RequestRateLimit {
+    /// Requests the bucket refills per second, whatever each costs.
     #[must_use]
     pub const fn requests_per_second(self) -> NonZeroU32 {
         self.requests_per_second
     }
 
+    /// The bucket's capacity in requests.
     #[must_use]
     pub const fn burst_requests(self) -> NonZeroU32 {
         self.burst_requests
@@ -260,16 +273,20 @@ pub struct AccountRatePolicy {
 }
 
 impl AccountRatePolicy {
+    /// The cost-weighted bucket, or `None` when it is disabled.
     #[must_use]
     pub const fn weighted_rate(self) -> Option<WeightedRateLimit> {
         self.weighted_rate
     }
 
+    /// The weighted pair older readers enforce; see
+    /// [`ResolvedLimits::legacy_weighted_rate`].
     #[must_use]
     pub const fn legacy_weighted_rate(self) -> WeightedRateLimit {
         self.legacy_weighted_rate
     }
 
+    /// The request-count bucket, or `None` when it is disabled.
     #[must_use]
     pub const fn request_rate(self) -> Option<RequestRateLimit> {
         self.request_rate
@@ -279,10 +296,17 @@ impl AccountRatePolicy {
 /// Why resolved limits could not be constructed from a wire representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedLimitsError {
+    /// A request rate arrived without its burst, or the reverse.
     RequestRatePairIncomplete,
+    /// A per-principal concurrency ceiling arrived without the account
+    /// ceiling it narrows.
     PrincipalConcurrencyWithoutAccount,
+    /// The per-principal ceiling is larger than the account's, which would
+    /// let one principal hold more than the whole account may.
     PrincipalConcurrencyExceedsAccount {
+        /// The per-principal ceiling supplied.
         principal: NonZeroU32,
+        /// The account ceiling it exceeds.
         account: NonZeroU32,
     },
 }
@@ -352,6 +376,8 @@ impl ResolvedLimits {
         }
     }
 
+    /// Enable the cost-weighted token bucket: `units_per_second` of refill
+    /// and `burst_units` of capacity. Older readers enforce the same pair.
     #[must_use]
     pub const fn with_weighted_rate(mut self, units_per_second: u64, burst_units: u64) -> Self {
         let rate = WeightedRateLimit {
@@ -379,6 +405,8 @@ impl ResolvedLimits {
         self
     }
 
+    /// Enable the request-count token bucket, which limits requests whatever
+    /// each costs.
     #[must_use]
     pub const fn with_request_rate(
         mut self,
@@ -392,6 +420,13 @@ impl ResolvedLimits {
         self
     }
 
+    /// Cap the requests in flight at once for the account, and optionally for
+    /// each principal within it.
+    ///
+    /// # Errors
+    ///
+    /// [`ResolvedLimitsError::PrincipalConcurrencyExceedsAccount`] when the
+    /// per-principal ceiling is larger than the account's.
     pub fn with_concurrency(
         mut self,
         max_concurrent_requests: NonZeroU32,
@@ -410,23 +445,27 @@ impl ResolvedLimits {
         Ok(self)
     }
 
+    /// The most items one request may carry; a larger request is refused
+    /// with `RequestTooLarge`.
     #[must_use]
     pub const fn max_items_per_request(self) -> u64 {
         self.max_items_per_request
     }
 
+    /// The cost-weighted bucket, or `None` when it is disabled.
     #[must_use]
     pub const fn weighted_rate(self) -> Option<WeightedRateLimit> {
         self.weighted_rate
     }
 
-    /// The pair understood by pre-#91 readers. During the reader-first phase
+    /// The pair understood by pre-GL-91 readers. During the reader-first phase
     /// they continue enforcing it even when the new flag disables the bucket.
     #[must_use]
     pub const fn legacy_weighted_rate(self) -> WeightedRateLimit {
         self.legacy_weighted_rate
     }
 
+    /// The request-count bucket, or `None` when it is disabled.
     #[must_use]
     pub const fn request_rate(self) -> Option<RequestRateLimit> {
         self.request_rate
@@ -443,11 +482,14 @@ impl ResolvedLimits {
         }
     }
 
+    /// The account's in-flight ceiling on this instance, or `None` for none.
     #[must_use]
     pub const fn max_concurrent_requests(self) -> Option<NonZeroU32> {
         self.max_concurrent_requests
     }
 
+    /// Each principal's in-flight ceiling within the account, or `None` when
+    /// principals share the account ceiling.
     #[must_use]
     pub const fn principal_max_concurrent_requests(self) -> Option<NonZeroU32> {
         self.principal_max_concurrent_requests
@@ -553,6 +595,7 @@ impl From<ResolvedLimits> for WireResolvedLimits {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub struct AccountSnapshot {
+    /// Whether the account may admit at all; anything but `Active` denies.
     pub status: AccountStatus,
     /// Which execution-capacity class this account's work belongs to (GL-99).
     ///
@@ -569,6 +612,7 @@ pub struct AccountSnapshot {
     /// existing traffic sheddable the moment a gate was enabled.
     #[cfg_attr(feature = "serde", serde(default))]
     pub capacity_class: CapacityClass,
+    /// What this principal may do; a route's required bits must all be here.
     pub permissions: PermissionBits,
     /// Hard staleness bound: past this instant the snapshot denies
     /// (INVARIANTS.md GL-5) until the control plane delivers a successor.
@@ -586,10 +630,14 @@ pub struct AccountSnapshot {
     pub enforcement_mode: EnforcementMode,
     /// Monotonic snapshot version; see [`Generation`].
     pub generation: Generation,
+    /// The pricing schedule quotes use, shared by every snapshot compiled
+    /// from the same schedule.
     pub cost_table: Arc<CostTable>,
+    /// The account this principal belongs to and bills.
     pub account_id: AccountId,
     /// The credential this snapshot was compiled for, when key-scoped.
     pub key_id: Option<KeyId>,
+    /// Rate, shape and concurrency limits admission enforces.
     pub limits: ResolvedLimits,
     /// What the control plane last said about the account's budget (GL-97), or
     /// `None` when it said nothing — an older control plane, or a publication
@@ -646,12 +694,15 @@ pub struct AccountSnapshotBuilder {
 }
 
 impl AccountSnapshotBuilder {
+    /// Name the credential this snapshot was compiled for.
     #[must_use]
     pub const fn key_id(mut self, key_id: KeyId) -> Self {
         self.key_id = Some(key_id);
         self
     }
 
+    /// Set what the account does when its lease cannot fund a quote.
+    /// Omitting it leaves [`EnforcementMode::Strict`].
     #[must_use]
     pub const fn enforcement_mode(mut self, enforcement_mode: EnforcementMode) -> Self {
         self.enforcement_mode = enforcement_mode;
@@ -682,6 +733,9 @@ impl AccountSnapshotBuilder {
         self
     }
 
+    /// Finish the snapshot. It carries no budget view: only the store attaches
+    /// one, through [`PublishableSnapshot::with_budget`]. Validate it with
+    /// [`PublishableSnapshot::try_new`] before publishing.
     #[must_use]
     pub fn build(self) -> AccountSnapshot {
         AccountSnapshot {
@@ -714,18 +768,25 @@ pub enum SnapshotValidationError {
     /// It is validated even when disabled because an older reader will still
     /// enforce these values during a mixed-version rollout.
     WeightedRateOutsideGovernorDomain {
+        /// The refill rate supplied.
         units_per_second: u64,
+        /// The burst supplied.
         burst_units: u64,
     },
     /// The most expensive registered operation overflows at the batch cap.
     QuoteOverflow {
+        /// The operation whose worst quote overflows.
         operation_index: usize,
+        /// The batch cap it was quoted at.
         max_items: u64,
     },
     /// A request admitted by the batch cap can never fit in the whole burst.
     QuoteExceedsBurst {
+        /// The most expensive operation.
         operation_index: usize,
+        /// Its quote at the batch cap.
         max_quote: CostUnits,
+        /// The burst it cannot fit in.
         burst_units: CostUnits,
     },
     /// An elastic account's overage cap cannot fund even one worst-case
@@ -737,8 +798,11 @@ pub enum SnapshotValidationError {
     /// while behaving as `Strict` is the silent-semantics failure the
     /// repository guidelines forbid.
     OverageCapBelowMaxQuote {
+        /// The most expensive operation.
         operation_index: usize,
+        /// Its quote at the batch cap.
         max_quote: CostUnits,
+        /// The elastic cap that cannot fund it.
         overage_cap: CostUnits,
     },
 }
@@ -795,6 +859,14 @@ pub struct PublishableSnapshot {
 }
 
 impl PublishableSnapshot {
+    /// Validate a compiled snapshot for publication.
+    ///
+    /// # Errors
+    ///
+    /// A [`SnapshotValidationError`] when the carried weighted-rate pair is
+    /// outside governor's domain, when the most expensive operation's quote
+    /// at the batch cap overflows, exceeds the burst, or exceeds an elastic
+    /// account's overage cap.
     pub fn try_new(snapshot: Arc<AccountSnapshot>) -> Result<Self, SnapshotValidationError> {
         let legacy_rate = snapshot.limits.legacy_weighted_rate();
         if legacy_rate.units_per_second() == 0
@@ -846,6 +918,7 @@ impl PublishableSnapshot {
         })
     }
 
+    /// The validated snapshot.
     #[must_use]
     pub fn as_snapshot(&self) -> &AccountSnapshot {
         &self.snapshot
@@ -859,30 +932,12 @@ impl PublishableSnapshot {
         self.maximum_quote
     }
 
+    /// The validated snapshot, giving up the publication proof.
     #[must_use]
     pub fn into_inner(self) -> Arc<AccountSnapshot> {
         self.snapshot
     }
 
-    /// Re-stamp status and generation, carrying the publication proof over.
-    ///
-    /// Sound without revalidating, and the reason is worth keeping next to the
-    /// code rather than at the call site: [`try_new`](Self::try_new) checks
-    /// [`try_new`](Self::try_new) checks the carried weighted-rate pair's
-    /// domain, then checks `cost_table`'s worst quote at the batch cap against
-    /// the carried compatibility burst and an elastic account's
-    /// `overage_cap`. Neither `status` nor `generation` participates in those
-    /// checks, so a snapshot that was publishable stays publishable under any
-    /// value of either.
-    ///
-    /// Note what this method therefore must not grow: re-stamping the
-    /// enforcement mode would change a value validation *does* depend on, and
-    /// would need a fallible signature. An account-wide mode change goes
-    /// through publication, not through here.
-    ///
-    /// This is what an account-wide status change needs (GL-22): the ledger and
-    /// every live snapshot move together, and re-deriving a proof that cannot
-    /// have changed would only invite an `expect` at each call site.
     /// Attach the ledger's budget view, carrying the publication proof over.
     ///
     /// Sound without revalidating for the reason [`restamped`](Self::restamped)
@@ -909,6 +964,25 @@ impl PublishableSnapshot {
         }
     }
 
+    /// Re-stamp status and generation, carrying the publication proof over.
+    ///
+    /// Sound without revalidating, and the reason is worth keeping next to the
+    /// code rather than at the call site: [`try_new`](Self::try_new) checks
+    /// the carried weighted-rate pair's
+    /// domain, then checks `cost_table`'s worst quote at the batch cap against
+    /// the carried compatibility burst and an elastic account's
+    /// `overage_cap`. Neither `status` nor `generation` participates in those
+    /// checks, so a snapshot that was publishable stays publishable under any
+    /// value of either.
+    ///
+    /// Note what this method therefore must not grow: re-stamping the
+    /// enforcement mode would change a value validation *does* depend on, and
+    /// would need a fallible signature. An account-wide mode change goes
+    /// through publication, not through here.
+    ///
+    /// This is what an account-wide status change needs (GL-22): the ledger and
+    /// every live snapshot move together, and re-deriving a proof that cannot
+    /// have changed would only invite an `expect` at each call site.
     #[must_use]
     pub fn restamped(&self, status: AccountStatus, generation: Generation) -> Self {
         let mut snapshot = AccountSnapshot::clone(&self.snapshot);

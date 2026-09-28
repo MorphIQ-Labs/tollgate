@@ -32,16 +32,23 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
+    /// The account snapshot this request pinned in
+    /// [`AdmissionEngine::begin`]; a later publication does not replace it
+    /// (INVARIANTS.md 26).
     #[must_use]
     pub fn snapshot(&self) -> &AccountSnapshot {
         &self.state().snapshot
     }
 
+    /// The resolved limits of the pinned snapshot, such as the per-request
+    /// item cap `admit` enforces.
     #[must_use]
     pub fn limits(&self) -> &tollgate_core::ResolvedLimits {
         &self.state().snapshot.limits
     }
 
+    /// The generation of the pinned snapshot: the one every later stage of
+    /// this request decides against.
     #[must_use]
     pub fn generation(&self) -> Generation {
         self.state().snapshot.generation
@@ -81,6 +88,26 @@ impl RequestContext {
         self.state().estimate_remaining()
     }
 
+    /// Price the decoded workload and reserve funding for it: stage two of
+    /// admission, run after body decoding without another map lookup.
+    ///
+    /// `workload` is `(operation, item count)` pairs, quoted against the
+    /// pinned snapshot's cost table; entries with a zero count are skipped.
+    /// In order, this checks that the snapshot is still valid at `now`, that
+    /// the workload prices, that the pinned snapshot grants the permissions
+    /// its operation classes require, and that the item count is within the
+    /// per-request cap; then it takes the request-count and weighted rate
+    /// tokens, acquires principal and account concurrency, and debits the
+    /// lease (or, under [`EnforcementMode::Elastic`], overage when the lease
+    /// cannot fund the quote). `slot` is bound now and receives the usage
+    /// event when the eventual [`Committed`] guard drops (INVARIANTS.md 13).
+    ///
+    /// On `Err` no funding is reserved, no concurrency is held, and the
+    /// refusal is already counted in [`AdmissionCounters`]. Rate tokens taken
+    /// before a later refusal are not returned. Performs no I/O and does not
+    /// block.
+    ///
+    /// [`EnforcementMode::Elastic`]: tollgate_core::EnforcementMode::Elastic
     pub fn admit<O: OpIndex, S: UsageSlot>(
         self,
         workload: &[(O, u64)],
@@ -114,38 +141,6 @@ impl RequestContext {
     }
 }
 
-/// Funding is reserved, but execution capacity has not yet been acquired.
-///
-/// The reservation, the concurrency guard, and the usage slot have no public
-/// accessors. Every transition out of this state consumes it, so safe code
-/// cannot retain funding while releasing occupancy, and cannot reach the
-/// reservation to resolve it out of band.
-///
-/// The reservation is unreachable because the field is private, and the error
-/// code is pinned so this witness cannot pass for an unrelated reason: making
-/// the field public compiles (E0616 disappears), and renaming it reports E0609
-/// instead. Either way the doctest fails and the invariant is re-examined.
-///
-/// ```compile_fail,E0616
-/// use tollgate_core::DiscardedUsageSlot;
-///
-/// fn detach(pending: tollgate_admission::Pending<DiscardedUsageSlot>) {
-///     let _raw = pending.reservation;
-/// }
-/// ```
-///
-/// Its companion: the supported path compiles, so the refusal above can never
-/// be a refusal of an API that stopped existing.
-///
-/// ```
-/// use tollgate_core::DiscardedUsageSlot;
-///
-/// # fn release(
-/// #     pending: tollgate_admission::Pending<DiscardedUsageSlot>,
-/// # ) -> tollgate_admission::Released {
-/// pending.cancel()
-/// # }
-/// ```
 impl Drop for RequestContext {
     fn drop(&mut self) {
         let Some(state) = &self.state else {
@@ -220,6 +215,38 @@ impl Drop for WorkerShare {
     }
 }
 
+/// Funding is reserved, but execution capacity has not yet been acquired.
+///
+/// The reservation, the concurrency guard, and the usage slot have no public
+/// accessors. Every transition out of this state consumes it, so safe code
+/// cannot retain funding while releasing occupancy, and cannot reach the
+/// reservation to resolve it out of band.
+///
+/// The reservation is unreachable because the field is private, and the error
+/// code is pinned so this witness cannot pass for an unrelated reason: making
+/// the field public compiles (E0616 disappears), and renaming it reports E0609
+/// instead. Either way the doctest fails and the invariant is re-examined.
+///
+/// ```compile_fail,E0616
+/// use tollgate_core::DiscardedUsageSlot;
+///
+/// fn detach(pending: tollgate_admission::Pending<DiscardedUsageSlot>) {
+///     let _raw = pending.reservation;
+/// }
+/// ```
+///
+/// Its companion: the supported path compiles, so the refusal above can never
+/// be a refusal of an API that stopped existing.
+///
+/// ```
+/// use tollgate_core::DiscardedUsageSlot;
+///
+/// # fn release(
+/// #     pending: tollgate_admission::Pending<DiscardedUsageSlot>,
+/// # ) -> tollgate_admission::Released {
+/// pending.cancel()
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct Pending<S: UsageSlot> {
     concurrency: ConcurrencyGuard,
@@ -234,16 +261,21 @@ pub struct Pending<S: UsageSlot> {
 }
 
 impl<S: UsageSlot> Pending<S> {
+    /// The price `admit` computed and reserved: the full charge if execution
+    /// starts.
     #[must_use]
     pub fn quote(&self) -> CostQuote {
         self.quote
     }
 
+    /// The account snapshot this request pinned in
+    /// [`AdmissionEngine::begin`], unchanged by later publications.
     #[must_use]
     pub fn snapshot(&self) -> &AccountSnapshot {
         &self.concurrency.state().snapshot
     }
 
+    /// The resolved limits of the pinned snapshot.
     #[must_use]
     pub fn limits(&self) -> &tollgate_core::ResolvedLimits {
         &self.snapshot().limits
@@ -263,6 +295,14 @@ impl<S: UsageSlot> Pending<S> {
         self.concurrency.state().estimate_remaining()
     }
 
+    /// Ask `gate` for execution capacity for this request, using the
+    /// capacity class and generation of the pinned snapshot.
+    ///
+    /// On success the funding and the permit travel together in
+    /// [`ReadyToStart`]. On refusal the reservation is released for zero, the
+    /// shed is counted against the request's class, and the gate's
+    /// [`DenyReason`] is returned with the [`Released`] proof. Never waits for
+    /// capacity: a gate refuses rather than queues.
     pub fn acquire_capacity<G: CapacityGate>(
         self,
         gate: &G,
@@ -297,6 +337,10 @@ impl<S: UsageSlot> Pending<S> {
         }
     }
 
+    /// Resolve this request before execution for zero charge.
+    ///
+    /// Releases the reserved funding and the concurrency slots; the request
+    /// is counted as cancelled before start.
     pub fn cancel(self) -> Released {
         // The guard's `Drop` records the terminal outcome; cancelling here
         // only resolves the funding.
@@ -319,6 +363,24 @@ pub struct ReadyToStart<S: UsageSlot, P: CapacityPermit> {
 }
 
 impl<S: UsageSlot, P: CapacityPermit> ReadyToStart<S, P> {
+    /// Commit the charge because the kernel is about to start, and return
+    /// the guard that must be held while it runs.
+    ///
+    /// From a successful commit the full quote stands however execution
+    /// ends, and the usage event is emitted when the [`Committed`] guard
+    /// drops. The lease's usability window is rechecked at `now`. If it has
+    /// lapsed, [`EnforcementMode::Strict`] refuses with
+    /// [`CommitError::Denied`]; [`EnforcementMode::Elastic`] settles the same
+    /// charge against overage instead, refusing only if the overage cap
+    /// cannot hold it.
+    ///
+    /// On `Err` the caller must not execute: the funding is already released
+    /// for zero. [`CommitError::Denied`] carries the refusal reason;
+    /// [`CommitError::Cancelled`] means a [`CancelHandle`] from
+    /// [`split`](Self::split) won the race first.
+    ///
+    /// [`EnforcementMode::Strict`]: tollgate_core::EnforcementMode::Strict
+    /// [`EnforcementMode::Elastic`]: tollgate_core::EnforcementMode::Elastic
     #[must_use = "the kernel may run only while holding the returned Committed guard"]
     pub fn commit(
         self,
@@ -486,6 +548,8 @@ impl<S: UsageSlot, P: CapacityPermit> ReadyToStart<S, P> {
         )
     }
 
+    /// Resolve this request before execution for zero charge, releasing its
+    /// funding, concurrency slots and execution-capacity permit.
     pub fn cancel(self) -> Released {
         self.pending.cancel()
     }
@@ -574,11 +638,15 @@ pub struct Committed<S: UsageSlot, P: CapacityPermit> {
 }
 
 impl<S: UsageSlot, P: CapacityPermit> Committed<S, P> {
+    /// The units charged: the request's full quote, which stands however
+    /// execution ends.
     #[must_use]
     pub fn units(&self) -> CostUnits {
         self.units
     }
 
+    /// The request identifier passed to [`ReadyToStart::commit`], and
+    /// carried by the usage event this guard emits.
     #[must_use]
     pub fn request_id(&self) -> RequestId {
         self.request_id
@@ -641,6 +709,8 @@ pub struct AdmissionEngine<M: SnapshotMap> {
 }
 
 impl<M: SnapshotMap> AdmissionEngine<M> {
+    /// Build an engine over `map`, which supplies both the snapshots and the
+    /// [`AdmissionCounters`] the engine reports into.
     #[must_use]
     pub fn new(map: M) -> Self {
         AdmissionEngine { map }

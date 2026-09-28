@@ -80,9 +80,9 @@ impl Padded {
 /// start.
 ///
 /// A small dedicated vocabulary rather than a second [`DenyReason`]-shaped
-/// array. Only four refusals can reach commit, and mirroring the twenty-one
-/// slot table would add roughly 2.7 KB per counter set for seventeen slots
-/// nothing can ever bump. It keeps `DenyReason`'s forcing function, though:
+/// array. Only four refusals can reach commit, and mirroring the full
+/// [`DenyReason::COUNT`]-slot table would spend a padded counter per shard on
+/// every reason that can never be bumped here. It keeps `DenyReason`'s forcing function, though:
 /// [`index`](CommitRefusal::index) is an exhaustive match, so a new variant
 /// fails to compile until it has a slot, and [`NAMES`](CommitRefusal::NAMES)
 /// gives every slot a stable label.
@@ -528,6 +528,8 @@ pub struct CountersSnapshot {
     /// order. Each sums to the total beside it; neither replaces it, so a
     /// reader never has to add two numbers to get one.
     pub capacity_shed_by_class: [u64; CAPACITY_CLASS_COUNT],
+    /// Execution starts per class, in [`CAPACITY_CLASS_NAMES`] order; sums to
+    /// `execution_started`.
     pub execution_started_by_class: [u64; CAPACITY_CLASS_COUNT],
     /// Admitted requests that resolved for zero between admission and
     /// execution start — cancelled, or abandoned while pending.

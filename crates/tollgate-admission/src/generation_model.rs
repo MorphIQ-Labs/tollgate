@@ -54,6 +54,7 @@ pub enum Watermark {
 }
 
 impl Watermark {
+    /// The generation the watermark holds, whichever variant carries it.
     #[must_use]
     pub fn generation(self) -> Generation {
         match self {
@@ -61,6 +62,8 @@ impl Watermark {
         }
     }
 
+    /// Whether this is a published revocation, which refuses a positive at its
+    /// own generation as well as older ones.
     #[must_use]
     pub fn is_revoked(self) -> bool {
         matches!(self, Watermark::Revoked(_))
@@ -204,7 +207,7 @@ mod tests {
             );
             // Only an accepted revocation makes a generation dead. A delayed
             // older one is refused and leaves the observation it found --
-            // which is a change from the pre-#53 model, where refusing still
+            // which is a change from the pre-GL-53 model, where refusing still
             // left something the next positive read as a tombstone.
             let expected = if revoked < current {
                 Watermark::Positive(Generation(current))

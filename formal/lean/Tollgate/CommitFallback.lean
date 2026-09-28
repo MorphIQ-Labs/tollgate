@@ -292,4 +292,9 @@ theorem a_native_overage_admission_never_enters_the_fallback (units : Nat) (next
     claim (openReservation units .overage).phase .pendingLease next = none := by
   simp [claim, openReservation]
 
+/-- Exactly the committed and released phases are terminal. -/
+theorem terminal_is_exact (p : Phase) :
+    terminal p = true ↔ (p = .committedLease ∨ p = .committedOverage ∨ p = .released) := by
+  cases p <;> simp [terminal]
+
 end Tollgate.CommitFallback

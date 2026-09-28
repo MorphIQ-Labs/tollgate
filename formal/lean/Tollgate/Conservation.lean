@@ -406,4 +406,17 @@ theorem fleet_overage_is_bounded_by_instances_times_the_cap :
       simp only [List.sum_cons, List.length_cons, Nat.add_mul, Nat.one_mul]
       omega
 
+/-- A debit that reaches the cap exactly is accepted, at exactly the new
+total. -/
+theorem a_debit_up_to_the_cap_is_accepted (spent cap units : Nat) (fits : spent + units ≤ cap) :
+    debit spent cap units = some (spent + units) := by
+  simp [debit, fits]
+
+/-- A refused quote the restored balance funds grows the grant to exactly it. -/
+theorem a_funded_need_is_granted (available sized needed : Nat)
+    (funded : needed ≤ available) (larger : sized ≤ needed) :
+    consolidationGrant available sized needed = needed := by
+  simp [consolidationGrant, funded]
+  omega
+
 end Tollgate.Conservation

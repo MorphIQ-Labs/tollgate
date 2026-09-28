@@ -9,6 +9,8 @@ use crate::hmac_registry::{EntropyUnavailable, MintedKey};
 /// answer may be reused without asking again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Verified {
+    /// Who presented the credential: the identity it authenticates as, and
+    /// nothing about what that identity may do.
     pub principal: Principal,
     /// The instant from which this answer must be re-derived.
     ///

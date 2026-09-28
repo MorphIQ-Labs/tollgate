@@ -32,6 +32,58 @@ This Lean package contains exact models for critical contracts:
   proves that transfer retains occupancy and that only finishing either the
   pending or execution owner releases it; Rust's private fields, behavior
   witness, and compile-fail witness connect that model to the API.
+- `LeaseFencing` models lease capabilities: a store of leases keyed by ID with
+  a per-account fence counter starting at one. It proves that fences are
+  positive, unique per account and increasing; that acquiring a lease leaves
+  every existing lease unchanged, so the sequence is an audit order and not a
+  validity epoch; that release and ingest refuse a mismatched `(lease, fence)`
+  pair or `(lease, account, fence)` triple; that each operation changes only
+  the lease it names; that a settled lease is never active again; and that
+  billed plus returned units never exceed the grant. Expiry reclaim is
+  modeled as forfeiture. Operations are atomic by assumption; the store
+  suites' capability tests witness the Rust and SQL.
+- `IdempotentIngest` models batched usage ingest keyed by request ID, with
+  acceptance left as an arbitrary decision over the ledger planned so far. It
+  proves that every input is classified exactly once; that a duplicate is
+  recognized from its ID before its payload or the decision is consulted;
+  that the ledger only appends accepted events, so no settled event is
+  replaced and no request ID is billed twice across any replay; that the
+  billed total grows by exactly the accepted units; that a rejected event
+  does not claim its ID; and that a failed batch changes nothing. Batch
+  atomicity is an assumption; the mirrored store suites witness it.
+- `ChargeLifecycle` models a request's charge lifecycle on one instance: a
+  list of requests sharing a lease and a usage queue of fixed capacity, moving
+  through reserve, admit, cancel, commit, emit and deliver. It proves that the
+  slots in use never exceed capacity and a full queue sheds with no charge;
+  that nothing is charged before commit and cancellation refunds exactly the
+  admitted debit, so the lease is conserved; and that a committed request
+  holds the slot bound at reservation, so its event is emitted without a
+  capacity check, once, with the charge fixed at commit. Queue lanes, the
+  drain deadline, sharded counters and process loss are outside the model.
+- `NegativeCache` models the bounded request-visible negative cache as a list
+  of principal deadlines. It proves the bound holds under recording and
+  pruning; that a full cache evicts an entry with the earliest deadline; that
+  pruning keeps exactly the unexpired entries; that each principal has one
+  negative, due at `now` plus the TTL the source's answer selects (unknown for
+  an absent row, revoked for a tombstone); and that a present answer clears
+  it. Pull scheduling, retry backoff and broadcast-lag recovery are the
+  snapshot manager's, witnessed by its tests.
+- `StatusPropagation` models an account's status as one ledger value and the
+  status inside each of its snapshots, written together by one operation. It
+  proves that the ledger and every live snapshot always agree; that a status
+  change republishes exactly the account's live snapshots not already at the
+  target, each at generation + 1, never a revocation tombstone and never
+  backward; that repeating a change republishes nothing; that publication
+  contradicting the ledger is refused; and that `closed` is terminal. The
+  operation's atomicity is an assumption the backend suites witness.
+- `SessionCredential` models the session-scoped credential cache over an
+  arbitrary verifier, so it holds for any scheme the verifier seam admits. It
+  proves that every principal the cache returns is exactly the verifier's
+  answer for the presented bytes and is still reusable at `now`; that a hit
+  requires the identical credential; that a changed or failed credential
+  never leaves the previous principal reusable; that an already-expired answer
+  is neither returned nor cached; and that sessions are isolated.
+  Constant-time comparison and wiping on drop are the tollgate-auth tests'.
 - [`Conservation`](Tollgate/Conservation.lean) models the per-account ledger equation
   `deposited + overage = balance + activeGrants + settledUsage + loss + expired`,
   where `balance = allowanceBalance + topupBalance`, and
@@ -90,7 +142,17 @@ Run from the repository root:
 
 ```sh
 ./scripts/check_formal.sh
+./scripts/check_formal_mutants.sh
 ```
+
+The second command mutates every transition definition, one operator at a
+time, and requires some theorem to fail for each: a proof that still passes
+against a broken model states less than it appears to. A surviving mutant
+fails the gate unless `mutants-allowed.txt` names it as equivalent, with a
+reason. When you add or change a model, add the theorems that kill its
+mutants. In practice these are the liveness and exactness facts beside the
+safety ones: that the exact limit is accepted, not only that exceeding it is
+refused.
 
 The models use exact natural-number or integer arithmetic and atomic transitions. Rust
 property, cache, manager, HTTP, and backend-parity tests establish the

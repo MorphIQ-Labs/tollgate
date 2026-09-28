@@ -37,6 +37,13 @@ theorem reservation_keeps_every_new_entry (used capacity added : Nat) :
   unfold retainedAfterReserve
   omega
 
+/-- It evicts only the deficit: exactly as many entries survive as fit. -/
+theorem reservation_evicts_only_the_deficit (used capacity added : Nat)
+    (held : used ≤ capacity) (batch : added ≤ capacity) :
+    retainedAfterReserve used capacity added = min (used + added) capacity := by
+  unfold retainedAfterReserve
+  omega
+
 structure Fence where
   owner : Nat
   principal : Nat
@@ -70,6 +77,20 @@ def finish (slot : Slot) (fence : Fence) (answer : Answer) : Slot :=
     | .revoked g => { slot with initialized := true, cache := installRevoked slot.cache g }
     | .unknown => { slot with cache := installUnknown slot.cache }
   else slot
+
+/-- A fresh reservation accepts the read it was reserved for. -/
+theorem a_fresh_reservation_accepts_its_read (owner principal incarnation : Nat) :
+    valid (reserve owner principal incarnation) ⟨owner, principal, incarnation⟩ = true := by
+  simp [valid, reserve]
+
+/-- An authoritative answer initializes the slot, so later pushes apply to
+it instead of being refused as pending. -/
+theorem an_authoritative_answer_initializes (owner principal incarnation g : Nat) :
+    (finish (reserve owner principal incarnation) ⟨owner, principal, incarnation⟩
+      (.positive g)).initialized = true ∧
+    (finish (reserve owner principal incarnation) ⟨owner, principal, incarnation⟩
+      (.revoked g)).initialized = true := by
+  simp [finish, valid, reserve]
 
 /-- A push cannot reconstruct pending history. Refusal fences an older read. -/
 def pushPositive (slot : Slot) (generation : Nat) : Slot :=

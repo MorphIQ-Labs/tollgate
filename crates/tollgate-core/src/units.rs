@@ -3,7 +3,7 @@
 use core::fmt;
 
 /// A quantity of abstract cost units — the generic stand-in for a consumer's
-/// compute-unit vocabulary (FerroRisk's FCUs, another product's credits).
+/// compute-unit vocabulary (one product's compute units, another's credits).
 ///
 /// All arithmetic is checked: overflow returns `None` and callers must treat
 /// it as a denial (INVARIANTS.md GL-11). There are deliberately no `Add`/`Mul`
@@ -14,14 +14,18 @@ use core::fmt;
 pub struct CostUnits(pub u64);
 
 impl CostUnits {
+    /// No units: an empty quote, an exhausted lease, or nothing charged.
     pub const ZERO: CostUnits = CostUnits(0);
 
+    /// The raw count, for storage, wire formats and metrics.
     #[inline]
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
     }
 
+    /// The sum, or `None` if it would overflow `u64`. A caller treats `None`
+    /// as a refusal, never as a saturated or wrapped total.
     #[inline]
     #[must_use]
     pub const fn checked_add(self, other: CostUnits) -> Option<CostUnits> {
@@ -31,6 +35,8 @@ impl CostUnits {
         }
     }
 
+    /// The difference, or `None` if `other` exceeds `self`: spending more
+    /// than is held is a refusal, not a zero.
     #[inline]
     #[must_use]
     pub const fn checked_sub(self, other: CostUnits) -> Option<CostUnits> {
@@ -40,6 +46,8 @@ impl CostUnits {
         }
     }
 
+    /// `count` repetitions of this cost (a per-item weight times an item
+    /// count), or `None` if it would overflow.
     #[inline]
     #[must_use]
     pub const fn checked_mul(self, count: u64) -> Option<CostUnits> {
@@ -49,12 +57,14 @@ impl CostUnits {
         }
     }
 
+    /// The larger of the two quantities.
     #[inline]
     #[must_use]
     pub const fn max(self, other: CostUnits) -> CostUnits {
         if self.0 >= other.0 { self } else { other }
     }
 
+    /// Whether this is no units at all.
     #[inline]
     #[must_use]
     pub const fn is_zero(self) -> bool {

@@ -529,11 +529,16 @@ pub struct MokaSnapshotMap {
 }
 
 impl MokaSnapshotMap {
+    /// A map holding at most `max_capacity` entries, positive and negative
+    /// alike, with a single counter shard and a generation history of the
+    /// same size (at least one).
     #[must_use]
     pub fn new(max_capacity: u64) -> Self {
         Self::with_sharding(max_capacity, LocalSharding::SINGLE)
     }
 
+    /// As [`new`](Self::new), with the instance-local `sharding` used for the
+    /// map's counters and every per-principal state it installs.
     #[must_use]
     pub fn with_sharding(max_capacity: u64, sharding: LocalSharding) -> Self {
         let history = NonZeroUsize::new(usize::try_from(max_capacity).unwrap_or(usize::MAX).max(1))
@@ -645,26 +650,38 @@ pub struct ArcSwapSnapshotMap {
 }
 
 impl ArcSwapSnapshotMap {
+    /// Request-visible negative entries retained when no other bound is
+    /// configured (INVARIANTS.md 17).
     pub const DEFAULT_MAX_NEGATIVE_ENTRIES: usize = 4_096;
     /// Covers the configured simultaneously served set, including refreshes.
     pub const DEFAULT_GENERATION_CAPACITY: NonZeroUsize =
         NonZeroUsize::new(65_536).expect("positive constant");
 
+    /// An empty map with a single counter shard and the default negative and
+    /// generation-history bounds. Positive entries are not bounded.
     #[must_use]
     pub fn new() -> Self {
         Self::with_sharding(LocalSharding::SINGLE)
     }
 
+    /// As [`new`](Self::new), with the instance-local `sharding` used for the
+    /// map's counters and every per-principal state it installs.
     #[must_use]
     pub fn with_sharding(sharding: LocalSharding) -> Self {
         Self::with_sharding_and_max_negative_entries(sharding, Self::DEFAULT_MAX_NEGATIVE_ENTRIES)
     }
 
+    /// As [`new`](Self::new), retaining at most `max_negative_entries`
+    /// request-visible negatives. Each control write trims the excess,
+    /// earliest expiry first; zero keeps none, so an unknown or revoked
+    /// principal then denies through a missing entry instead.
     #[must_use]
     pub fn with_max_negative_entries(max_negative_entries: usize) -> Self {
         Self::with_sharding_and_max_negative_entries(LocalSharding::SINGLE, max_negative_entries)
     }
 
+    /// Combines [`with_sharding`](Self::with_sharding) and
+    /// [`with_max_negative_entries`](Self::with_max_negative_entries).
     #[must_use]
     pub fn with_sharding_and_max_negative_entries(
         sharding: LocalSharding,
@@ -677,6 +694,10 @@ impl ArcSwapSnapshotMap {
         )
     }
 
+    /// Configure every bound explicitly: `max_negative_entries` as in
+    /// [`with_max_negative_entries`](Self::with_max_negative_entries), and
+    /// `history` as the number of principals whose generation history is
+    /// retained, pending source reads included.
     #[must_use]
     pub fn with_capacities(
         sharding: LocalSharding,

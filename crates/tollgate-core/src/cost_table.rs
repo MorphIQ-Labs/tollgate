@@ -15,6 +15,8 @@ use crate::{snapshot::PermissionBits, units::CostUnits};
 /// indices (typically `enum as usize`). The table is sized to the largest
 /// index registered at build time; quoting an unregistered index denies.
 pub trait OpIndex {
+    /// This operation's index into the cost table. Must be stable for the
+    /// life of the process and small, because the table is a dense array.
     fn index(&self) -> usize;
 }
 
@@ -45,7 +47,10 @@ pub enum QuoteError {
     /// The caller supplied no nonzero work.
     EmptyWorkload,
     /// The operation's index was never registered in this table.
-    UnknownOperation { index: usize },
+    UnknownOperation {
+        /// The unregistered index the workload named.
+        index: usize,
+    },
     /// `fixed + per_item * items` exceeded `u64` (INVARIANTS.md GL-11).
     Overflow,
 }
@@ -89,6 +94,10 @@ pub struct CostTable {
 }
 
 impl CostTable {
+    /// Start a table. `fixed_request` is charged once per request whatever
+    /// its workload; `minimum_charge` is the floor a quote never goes below.
+    /// Register each operation with [`CostTableBuilder::weight`] or
+    /// [`CostTableBuilder::class`], then [`CostTableBuilder::build`].
     #[must_use]
     pub fn builder(fixed_request: CostUnits, minimum_charge: CostUnits) -> CostTableBuilder {
         CostTableBuilder {
@@ -222,11 +231,13 @@ impl CostTable {
         maximum
     }
 
+    /// The units charged once per request, whatever its workload.
     #[must_use]
     pub fn fixed_request(&self) -> CostUnits {
         self.fixed_request
     }
 
+    /// The floor no quote goes below.
     #[must_use]
     pub fn minimum_charge(&self) -> CostUnits {
         self.minimum_charge
@@ -275,6 +286,8 @@ impl CostTableBuilder {
         self
     }
 
+    /// Finish the table. It is immutable from here on and is shared by every
+    /// snapshot compiled from the same schedule.
     #[must_use]
     pub fn build(mut self) -> CostTable {
         // Canonical form: trailing `NONE` carries no information, and leaving

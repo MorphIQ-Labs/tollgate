@@ -90,9 +90,14 @@ pub const MAX_SNAPSHOT_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// HMAC secrets and raw credentials are never part of this response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeysResponse {
+    /// The source revision the page was read at.
     pub revision: u64,
+    /// The server-clock instant active records were selected at.
     pub as_of: jiff::Timestamp,
+    /// Active credentials, in strictly increasing key-id order.
     pub keys: Vec<crate::CredentialRecord>,
+    /// Cursor for the next page, or `null` when this page is the last. Required:
+    /// an omitted field is refused rather than read as terminal.
     #[serde(deserialize_with = "crate::credentials::required_option")]
     pub next_after: Option<tollgate_core::KeyId>,
 }
@@ -143,6 +148,13 @@ impl TryFrom<SignedDuration> for LeaseTtl {
 }
 
 impl LeaseTtl {
+    /// The lease lifetime this request declares.
+    ///
+    /// # Errors
+    ///
+    /// [`AllocateError::InvalidTtl`](crate::AllocateError::InvalidTtl) when
+    /// `ttl_seconds` is nonzero alongside `ttl`, or the declared duration is not
+    /// strictly positive.
     pub fn duration(self) -> Result<SignedDuration, crate::AllocateError> {
         let ttl = match (self.ttl_seconds, self.ttl) {
             (0, Some(ttl)) => ttl,
@@ -157,10 +169,15 @@ impl LeaseTtl {
     }
 }
 
+/// Body of `POST /v1/leases/acquire`: [`LeaseAllocator::acquire`](crate::LeaseAllocator::acquire)
+/// over HTTP.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AcquireRequest {
+    /// The account to debit.
     pub account_id: AccountId,
+    /// Units asked for. The grant may be smaller, per the server's [`GrantPolicy`](crate::GrantPolicy).
     pub requested: CostUnits,
+    /// Requested lease lifetime, flattened into this object. The server clamps it to its policy's `max_ttl`.
     #[serde(flatten)]
     pub ttl: LeaseTtl,
 }
@@ -170,10 +187,15 @@ pub struct AcquireRequest {
 /// predates it omits `funding`, which reads as no attestation.
 pub type AcquireResponse = crate::Allocation;
 
+/// Body of `POST /v1/leases/release`: [`LeaseAllocator::release`](crate::LeaseAllocator::release)
+/// over HTTP.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ReleaseRequest {
+    /// The lease to release.
     pub lease_id: LeaseId,
+    /// The fencing token stored with that lease; any other value is refused as fenced.
     pub fencing_token: FencingToken,
+    /// Units the holder did not spend, credited back to the account.
     pub unspent: CostUnits,
 }
 
@@ -184,19 +206,26 @@ pub struct ReleaseRequest {
 /// disagree with the ledger about (see `LeaseAllocator::consolidate`).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ConsolidateRequest {
+    /// The lease to return.
     pub lease_id: LeaseId,
+    /// The fencing token stored with that lease; any other value is refused as fenced.
     pub fencing_token: FencingToken,
+    /// Units the holder did not spend on the returned lease.
     pub unspent: CostUnits,
+    /// Units asked for in the replacement grant.
     pub requested: CostUnits,
     /// The largest quote the returned lease refused (GL-131). Omitted when
     /// zero, so a server that predates it sees the request it always did;
     /// absent from an older client, it reads as zero: today's sizing.
     #[serde(default, skip_serializing_if = "no_demand")]
     pub needed: CostUnits,
+    /// Replacement lease lifetime, flattened into this object.
     #[serde(flatten)]
     pub ttl: LeaseTtl,
 }
 
+/// Response to `POST /v1/leases/consolidate`: the replacement grant and its
+/// funding evidence, shaped exactly as [`AcquireResponse`].
 pub type ConsolidateResponse = crate::Allocation;
 
 // Serde passes a reference; `CostUnits::is_zero` takes the value.
@@ -212,6 +241,8 @@ fn no_demand(units: &CostUnits) -> bool {
 /// `DeserializeOwned`, so the receiving side cannot borrow from the body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestRequest {
+    /// The usage batch. The route's body limit, [`MAX_INGEST_BODY_BYTES`], admits
+    /// [`MAX_INGEST_BATCH`](crate::MAX_INGEST_BATCH) of the widest events.
     pub events: Vec<UsageEvent>,
 }
 
@@ -226,18 +257,27 @@ pub struct IngestRequest {
 /// is what checks that rather than trusting it.
 #[derive(Debug, Serialize)]
 pub struct IngestRequestRef<'a> {
+    /// The usage batch to send.
     pub events: &'a [UsageEvent],
 }
 
+/// Body of `POST /v1/admin/accounts`. The server creates the account with
+/// [`CapacityClass::Assured`]; change it afterwards with
+/// [`SetCapacityClassRequest`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateAccountRequest {
+    /// Identifier for the new account.
     pub account_id: AccountId,
+    /// Opening balance, deposited as a top-up.
     pub initial_balance: CostUnits,
+    /// Administrative status at creation.
     pub status: AccountStatus,
 }
 
+/// Body of `POST /v1/admin/accounts/{account}/deposit`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct DepositRequest {
+    /// Units to add as a top-up. The server refuses zero.
     pub units: CostUnits,
 }
 
@@ -250,6 +290,7 @@ pub struct DepositRequest {
 /// would have been the silent-semantics change the repository guidelines
 /// forbid, so the field is renamed and an old body fails loudly.
 pub struct SetStatusRequest {
+    /// The status to set.
     pub status: AccountStatus,
 }
 
@@ -266,6 +307,7 @@ pub struct SetStatusRequest {
 /// many rows could not be pushed.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SetCapacityClassRequest {
+    /// The class to set.
     pub capacity_class: CapacityClass,
 }
 
@@ -277,6 +319,7 @@ pub struct SetCapacityClassRequest {
 /// worth seeing.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SetStatusResponse {
+    /// Live snapshots republished with the new value; see [`StatusChange::republished`](crate::StatusChange::republished).
     pub republished: usize,
     /// Rows that changed durably but could not be decoded well enough to push,
     /// so those principals converge only at their next refresh. Always zero on
@@ -284,8 +327,14 @@ pub struct SetStatusResponse {
     pub unreadable: usize,
 }
 
+/// Body of both snapshot-publication routes:
+/// `PUT /v1/admin/snapshots/{principal}` and
+/// `PUT /v1/admin/accounts/{account}/keys/{key}/snapshot`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishSnapshotRequest {
+    /// The complete compiled snapshot, cost table included, which the server
+    /// validates before publishing. On the credential-bound route, an unstated
+    /// `key_id` is filled in from the path.
     pub snapshot: Arc<AccountSnapshot>,
 }
 
@@ -294,6 +343,7 @@ pub struct PublishSnapshotRequest {
 /// already exists; pushes only carry what changes after it subscribes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrincipalsResponse {
+    /// Every principal the control plane knows, revoked ones included.
     pub principals: Vec<tollgate_core::Principal>,
 }
 
@@ -301,8 +351,12 @@ pub struct PrincipalsResponse {
 /// into domain errors by the HTTP transport.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Problem {
+    /// The HTTP status code of the response.
     pub status: u16,
+    /// Stable machine-readable error code, such as `unknown-account`, which the
+    /// HTTP transport maps back to a domain error.
     pub code: String,
+    /// Human-readable summary. Never carries backend error text (INVARIANTS.md 37).
     pub title: String,
     /// Optional extension used by versioned tombstone responses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -459,10 +513,13 @@ mod tests {
 /// prices.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AccountResponse {
+    /// The account read.
     pub account_id: tollgate_core::AccountId,
     /// When this view was read. Every other field is as of this instant.
     pub as_of: jiff::Timestamp,
+    /// Administrative status.
     pub status: tollgate_core::AccountStatus,
+    /// Execution-capacity class.
     pub capacity_class: tollgate_core::CapacityClass,
     /// The periodic allowance, or `None` for "no schedule; the balance does
     /// not expire". Not the same as an allowance of zero.
@@ -488,6 +545,7 @@ pub struct AccountResponse {
     /// `Elastic`. Together these are the left side of the funding equation
     /// whose right side is the four figures above.
     pub deposited: tollgate_core::CostUnits,
+    /// Unfunded units admitted under `Elastic` enforcement; see [`Conservation::overage_recorded`](crate::Conservation::overage_recorded).
     pub overage_recorded: tollgate_core::CostUnits,
 }
 
@@ -500,6 +558,7 @@ pub struct AccountResponse {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetBudgetRequest {
+    /// The schedule to set, or `null` to clear it. Required: an omitted field is refused.
     #[serde(deserialize_with = "required_budget")]
     pub budget: Option<tollgate_core::BudgetSchedule>,
 }
@@ -522,7 +581,9 @@ where
 /// different one, or changed nothing. Equal values mean the call was a no-op.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SetBudgetResponse {
+    /// The schedule this call replaced, or `null` when there was none.
     pub previous: Option<tollgate_core::BudgetSchedule>,
+    /// The schedule now in force, which is the one requested.
     pub current: Option<tollgate_core::BudgetSchedule>,
 }
 
@@ -540,7 +601,11 @@ pub struct SetBudgetResponse {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IssueKeyRequest {
+    /// Caller-chosen identifier for the new credential. Resending it after a lost
+    /// response is refused as a duplicate.
     pub key_id: tollgate_core::KeyId,
+    /// The most live credentials the account may hold. Issuance is refused when
+    /// the account already holds this many; the count and the insert are atomic.
     pub max_active_keys: std::num::NonZeroUsize,
     /// When the credential stops being valid of its own accord. `None` means
     /// it lapses only on revocation.
@@ -557,9 +622,11 @@ pub struct IssueKeyRequest {
 /// `key_id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssuedKeyResponse {
+    /// The issued credential's identifier.
     pub key_id: tollgate_core::KeyId,
     /// The bearer secret, hex-encoded. Disclosed once.
     pub secret: String,
+    /// The credential's expiry, as requested, or `null` for none.
     pub not_after: Option<jiff::Timestamp>,
 }
 
@@ -568,8 +635,11 @@ pub struct IssuedKeyResponse {
 /// of the digest, so exposing it would leak half of it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AccountKeyResponse {
+    /// The credential's non-secret identifier.
     pub key_id: tollgate_core::KeyId,
+    /// When the credential stops being valid of its own accord, or `null` if never.
     pub not_after: Option<jiff::Timestamp>,
+    /// When the credential was revoked, or `null` if it has not been.
     pub revoked_at: Option<jiff::Timestamp>,
     /// Whether this credential can still authenticate as of `as_of` in the
     /// enclosing page. Derived, so a caller need not re-implement the rule.
@@ -579,7 +649,9 @@ pub struct AccountKeyResponse {
 /// One page of an account's credentials.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountKeysResponse {
+    /// The server-clock instant each `live` flag is evaluated at.
     pub as_of: jiff::Timestamp,
+    /// Credentials in increasing key-id order, revoked and expired ones included.
     pub keys: Vec<AccountKeyResponse>,
     /// Cursor for the next page, or `None` when this page is the last.
     pub next_after: Option<tollgate_core::KeyId>,
@@ -590,6 +662,8 @@ pub struct AccountKeysResponse {
 /// intent is satisfied either way, but the distinction matters in an audit.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RevokeKeyResponse {
+    /// The credential named in the request.
     pub key_id: tollgate_core::KeyId,
+    /// `true` if this call retired the credential, `false` if it was already revoked.
     pub retired: bool,
 }

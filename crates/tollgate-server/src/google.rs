@@ -20,6 +20,25 @@ pub struct GoogleVerifier {
 }
 
 impl GoogleVerifier {
+    /// Builds a verifier for ID tokens issued to `audience`, from Google's
+    /// published JSON Web Key Set.
+    ///
+    /// `usable_until` is when the key set stops being trusted. Every
+    /// [`Verified`] this verifier returns expires at the earlier of the
+    /// token's `exp` and this instant, so a stale key set cannot extend a
+    /// token's validity. The caller compares that expiry against its own
+    /// clock; this verifier reads no clock.
+    ///
+    /// A token verifies only with an RS256 signature under a key named by its
+    /// `kid`, a Google issuer (`https://accounts.google.com` or
+    /// `accounts.google.com`), exactly this audience, a nonempty `sub`, no
+    /// `nbf`, and `iat` before `exp`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SecurityError`] for an empty audience, malformed JSON, an
+    /// empty key set, a duplicate `kid`, or any key that is not an identified
+    /// RSA `RS256` signing key.
     pub fn from_jwks(
         audience: &str,
         jwks: &[u8],
@@ -75,6 +94,14 @@ impl GoogleVerifier {
         })
     }
 
+    /// The [`Principal`] a token with this `sub` claim verifies as: a
+    /// domain-separated SHA-256 digest of the subject, truncated to 128 bits.
+    ///
+    /// Map a service account's numeric unique ID through this to give it a
+    /// role with [`SecurityPolicy::with_bearer`]. The email claim plays no
+    /// part.
+    ///
+    /// [`SecurityPolicy::with_bearer`]: crate::security::SecurityPolicy::with_bearer
     pub fn principal(subject: &str) -> Principal {
         let mut digest = Sha256::new();
         digest.update(b"tollgate-control:google-sub:");

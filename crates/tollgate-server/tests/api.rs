@@ -650,7 +650,7 @@ async fn account_status_endpoint_speaks_the_status_vocabulary() {
     assert_eq!(
         status,
         StatusCode::UNPROCESSABLE_ENTITY,
-        "a pre-#51 body must be refused, never reinterpreted"
+        "a pre-GL-51 body must be refused, never reinterpreted"
     );
     assert_eq!(problem["code"], "invalid-json");
 }

@@ -3172,7 +3172,7 @@ async fn a_closed_account_cannot_be_reactivated() {
 ///
 /// Free on the memory side; not here. This one goes through `jsonb_set` and a
 /// `FOR UPDATE` lock, and the JSON key it patches did not exist before GL-99 —
-/// so this is also where the migration's own note is checked: a pre-#99
+/// so this is also where the migration's own note is checked: a pre-GL-99
 /// document has SQL NULL at that key, `IS DISTINCT FROM` matches it, and the
 /// first change rewrites every row exactly once.
 #[tokio::test]
@@ -5590,7 +5590,7 @@ async fn a_legacy_snapshot_document_defaults_the_revision_to_unstated() {
             .unwrap();
     assert!(
         stored.get("policy_revision").is_none(),
-        "the fixture must actually be a pre-#94 document"
+        "the fixture must actually be a pre-GL-94 document"
     );
 
     let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {

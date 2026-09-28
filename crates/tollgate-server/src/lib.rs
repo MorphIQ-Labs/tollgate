@@ -29,6 +29,8 @@
 //! carry receipts captured by the backend at mutation. See
 //! `docs/CONTROL_PLANE_SECURITY.md` for deployment and audit collection.
 
+#![deny(missing_docs)]
+
 pub mod config;
 pub mod error;
 pub mod google;
@@ -67,8 +69,16 @@ use crate::security::{Authorization, InstanceIdentity, OperatorIdentity, Role, S
 /// Everything the handlers need. `S` is the storage backend; the clock is the
 /// single place wall time enters the server.
 pub struct ServerState<S> {
+    /// The backend every handler and the [`serve`] maintenance sweep act on.
     pub store: Arc<S>,
+    /// The time source for lease and ingest calls, credential page reads,
+    /// credential and client-certificate validity checks, audit event times,
+    /// and the maintenance sweep.
     pub clock: Arc<dyn Clock>,
+    /// The live verifier, role map and TLS generation, shared by the
+    /// authorization middleware and the listener [`serve`] builds. Its
+    /// transport mode decides whether `serve` accepts a non-loopback
+    /// listener.
     pub security: Arc<ServerSecurity>,
     /// Who may mint credentials, if this deployment issues them at all (GL-121).
     ///

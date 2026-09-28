@@ -304,7 +304,7 @@ struct MixedReport {
     verdict: MixedVerdict,
 }
 
-/// The single-contract body every pre-#99 scenario sent, kept as the fixture
+/// The single-contract body every pre-GL-99 scenario sent, kept as the fixture
 /// `body(1)` is pinned against.
 ///
 /// Test-only now: the scenarios build their bodies with `body`, and this is

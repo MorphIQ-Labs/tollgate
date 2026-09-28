@@ -25,7 +25,12 @@ pub enum PublicationError {
     /// another principal/map. Discard the response and start a new read.
     Superseded(Principal),
     /// One atomic refresh cannot retain more distinct principals than its budget.
-    BatchExceedsCapacity { requested: usize, capacity: usize },
+    BatchExceedsCapacity {
+        /// Distinct principals in the refused batch.
+        requested: usize,
+        /// The map's generation-history capacity.
+        capacity: usize,
+    },
     /// Read identities never wrap. Replace the map and revalidate from the source.
     IdentityExhausted,
 }
@@ -77,11 +82,15 @@ impl SnapshotRefresh {
         })
     }
 
+    /// The principal this slot was reserved for.
     #[must_use]
     pub fn principal(&self) -> Principal {
         self.0.principal
     }
 
+    /// Run the authoritative source read and tie its result to this slot's
+    /// fence. `read` is invoked once, only when the returned future is first
+    /// polled; dropping that future drops the reservation with it.
     pub async fn fetch<T, F: Future<Output = T>>(self, read: impl FnOnce() -> F) -> Refreshed<T> {
         let value = read().await;
         Refreshed {
@@ -112,6 +121,7 @@ impl<T> Refreshed<T> {
     pub(crate) fn value(&self) -> &T {
         &self.value
     }
+    /// The principal whose slot this read was fenced against.
     #[must_use]
     pub fn principal(&self) -> Principal {
         self.fence.principal
@@ -134,6 +144,8 @@ impl<T> Refreshed<T> {
 /// Reservation changes are reported even if the ensuing source reads fail.
 #[derive(Debug)]
 pub struct RefreshBatch {
+    /// One reserved slot per requested principal, in request order. Each must
+    /// be spent on a source read started after this batch was prepared.
     pub reads: Vec<SnapshotRefresh>,
     /// These principals are already absent from the request-visible map. Drop
     /// their resolution/deadline bookkeeping, preserving account lease slots.
@@ -143,7 +155,9 @@ pub struct RefreshBatch {
 /// Current control-plane retention occupancy, including pending source reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotHistoryStats {
+    /// Principals whose generation history the map can retain.
     pub capacity: usize,
+    /// Principals whose history is retained now, pending reads included.
     pub retained: usize,
 }
 

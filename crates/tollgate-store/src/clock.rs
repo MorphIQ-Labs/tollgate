@@ -20,6 +20,7 @@ pub fn timestamp_from_micros(value: i64) -> Result<Timestamp, crate::StoreError>
 /// take timestamps as arguments; implementations of this trait are the only
 /// code that decides what those timestamps are.
 pub trait Clock: Send + Sync + 'static {
+    /// The current instant, as this clock defines it.
     fn now(&self) -> Timestamp;
 }
 
@@ -42,15 +43,28 @@ impl Clock for SystemClock {
 pub struct ManualClock(Mutex<Timestamp>);
 
 impl ManualClock {
+    /// A clock that reads `start` until it is moved.
     #[must_use]
     pub fn new(start: Timestamp) -> Self {
         ManualClock(Mutex::new(start))
     }
 
+    /// Move the clock to `to`, forwards or backwards.
+    ///
+    /// # Panics
+    ///
+    /// If an earlier call panicked while holding the clock's lock, as an
+    /// overflowing [`advance`](Self::advance) does.
     pub fn set(&self, to: Timestamp) {
         *self.0.lock().expect("manual clock poisoned") = to;
     }
 
+    /// Move the clock by `by`, which may be negative.
+    ///
+    /// # Panics
+    ///
+    /// If the result falls outside the [`Timestamp`] range, or an earlier call
+    /// panicked while holding the clock's lock.
     pub fn advance(&self, by: SignedDuration) {
         let mut guard = self.0.lock().expect("manual clock poisoned");
         *guard = guard.checked_add(by).expect("manual clock overflow");

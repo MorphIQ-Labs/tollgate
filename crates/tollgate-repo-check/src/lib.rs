@@ -1,7 +1,12 @@
 //! Declaration resolution for current invariant documentation. This is not a
 //! coverage check, a Rust name resolver, or a substitute for executing proofs.
 
+pub mod book;
 pub mod cli;
+pub mod excerpts;
+pub mod guarantees;
+pub mod http_routes;
+pub mod lean_mutants;
 pub mod parity;
 pub mod seam;
 
@@ -445,3 +450,11 @@ pub fn check(root: &Path) -> Result<Report, String> {
         Err(errors.join("\n"))
     }
 }
+
+// Compiles and runs the repository README's example as a doctest, so the
+// first code a reader sees cannot drift from the API. The published crates
+// cannot include a file outside their own package; this crate is never
+// published.
+#[doc = include_str!("../../../README.md")]
+#[cfg(doctest)]
+pub struct RepositoryReadmeDoctests;

@@ -19,13 +19,29 @@ use tollgate_store::{
 };
 use tollgate_store::{IngestError, MAX_INGEST_BATCH};
 
+/// A refused control-plane request, rendered as an RFC-7807
+/// `application/problem+json` body in the [`Problem`] shape.
+///
+/// A `401` also carries a `Bearer` challenge. A 5xx or `usage-refused`
+/// response adds an optional `error_id` that matches a warning on the
+/// `tollgate::diagnostics` target. Converting a [`StoreError`] never exposes
+/// its text, in the body or in `Debug` output (INVARIANTS.md 37).
 #[derive(Debug)]
 pub struct ApiError {
+    /// The HTTP status, also sent as the body's `status`.
     pub status: StatusCode,
+    /// The stable machine code clients classify the refusal by. Part of the
+    /// wire contract.
     pub code: &'static str,
+    /// A short public description. Not a contract; classify by `status` and
+    /// `code`.
     pub title: String,
+    /// The tombstone's generation on a `revoked-principal` refusal.
     pub generation: Option<Generation>,
+    /// The allocator's evidence on a `balance-exhausted` refusal.
     pub balance_exhaustion: Option<tollgate_core::BalanceExhaustion>,
+    /// The remaining funding on an `insufficient-balance` refusal, when the
+    /// allocator attested it.
     pub balance_shortfall: Option<tollgate_core::BalanceShortfall>,
 }
 
@@ -91,6 +107,8 @@ where
 }
 
 impl ApiError {
+    /// `401 authentication-required`: credentials are missing, invalid,
+    /// expired or conflicting. The response carries a `Bearer` challenge.
     pub fn unauthorized() -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
@@ -102,6 +120,8 @@ impl ApiError {
         }
     }
 
+    /// `403 scope-forbidden`: the credential is valid, but its identity lacks
+    /// the role this route requires.
     pub fn forbidden() -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
@@ -112,6 +132,7 @@ impl ApiError {
             balance_shortfall: None,
         }
     }
+    /// `404` with the given machine code and title.
     pub fn not_found(code: &'static str, title: impl Into<String>) -> Self {
         ApiError {
             status: StatusCode::NOT_FOUND,
@@ -123,6 +144,9 @@ impl ApiError {
         }
     }
 
+    /// `410 revoked-principal`: the principal's snapshot is a tombstone.
+    /// Carries the tombstone's `generation` so a client can order it against
+    /// the positive snapshots it holds (INVARIANTS.md 15).
     pub fn revoked(generation: Generation) -> Self {
         ApiError {
             status: StatusCode::GONE,
@@ -134,6 +158,7 @@ impl ApiError {
         }
     }
 
+    /// `400` with the given machine code and title.
     pub fn bad_request(code: &'static str, title: impl Into<String>) -> Self {
         ApiError {
             status: StatusCode::BAD_REQUEST,

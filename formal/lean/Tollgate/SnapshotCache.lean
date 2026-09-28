@@ -127,7 +127,7 @@ theorem older_revocation_cannot_revoke_a_newer_positive
   simp [installRevoked, Watermark.generation, h]
 
 /-- The fix, stated: observe a generation, lose the row, see the same
-generation again -- and it is admitted. Under the pre-#53 model this was false,
+generation again -- and it is admitted. Under the pre-GL-53 model this was false,
 and its negation was derivable. -/
 theorem unknown_then_same_generation_positive_is_accepted (incoming : Nat) :
     installPositive
@@ -230,5 +230,8 @@ theorem revoked_then_evicted_rejects_replay
     · have : replay = revoked := Nat.le_antisymm replay_le_revoked hle
       simp [installRevoked, Watermark.generation, h, evictVisible, installPositive,
         acceptsPositive, Watermark.isRevoked, this, hmax]
+
+theorem isPresent_is_exact (v : Visible) : v.isPresent = true ↔ ∃ g, v = .present g := by
+  cases v <;> simp [Visible.isPresent]
 
 end Tollgate.SnapshotCache

@@ -21,7 +21,11 @@ use crate::transport::{PeerIdentity, TlsConfig};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
+    /// A service instance: lease lifecycle, snapshot and principal reads,
+    /// the active-credential projection (`GET /v1/keys`) and usage ingestion.
     Instance,
+    /// An operator: every route under `/v1/admin`, including account
+    /// funding, status, budgets, credentials and snapshot publication.
     Operator,
 }
 
@@ -33,6 +37,12 @@ pub struct ControlIdentity {
 }
 
 impl ControlIdentity {
+    /// An identity named `name` holding `role`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SecurityError`] unless `name` is 1 to 128 ASCII
+    /// characters, each alphanumeric or one of `@ . _ : / -`.
     pub fn new(name: impl Into<String>, role: Role) -> Result<Self, SecurityError> {
         let name = name.into();
         if name.is_empty()
@@ -48,14 +58,22 @@ impl ControlIdentity {
         Ok(Self { name, role })
     }
 
+    /// The audit name, recorded as the actor on authentication and
+    /// administrative audit events.
     pub fn name(&self) -> &str {
         &self.name
     }
+    /// The one role this identity holds.
     pub fn role(&self) -> Role {
         self.role
     }
 }
 
+/// A refused security configuration, credential file, TLS material or key
+/// set.
+///
+/// The message is a static description of which check failed. It never
+/// contains credential, key or token material, so it is safe to log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SecurityError(pub &'static str);
 
@@ -80,10 +98,23 @@ pub struct SecurityPolicy {
 }
 
 impl SecurityPolicy {
+    /// A policy with no credentials. It denies every protected operation.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Adds a bearer scheme: `verifier` authenticates the presented token,
+    /// and `identities` maps each principal it verifies as to an identity.
+    ///
+    /// A request's bearer token is offered to every scheme. It is refused
+    /// with `401` if no scheme verifies it, if a verifying scheme's evidence
+    /// is no longer reusable at the server's current time, or if two schemes
+    /// resolve it to different identities. A verified principal with no
+    /// mapping in its scheme is refused with `403` (INVARIANTS.md 32).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SecurityError`] if `identities` names a principal twice.
     pub fn with_bearer(
         mut self,
         verifier: Arc<dyn CredentialVerifier + Send + Sync>,
@@ -147,6 +178,14 @@ pub struct ServerSecurity {
 }
 
 impl ServerSecurity {
+    /// Publishes the first generation and fixes the transport mode: TLS if
+    /// `tls` is present, plaintext otherwise. [`replace`](Self::replace)
+    /// cannot change that mode later.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SecurityError`] if `policy` maps client certificates but
+    /// `tls` is absent or has no client CA.
     pub fn new(policy: SecurityPolicy, tls: Option<TlsConfig>) -> Result<Arc<Self>, SecurityError> {
         validate(&policy, tls.as_ref())?;
         Ok(Arc::new(Self {
@@ -173,6 +212,9 @@ impl ServerSecurity {
         Ok(())
     }
 
+    /// Whether this server was constructed with TLS. Fixed for its lifetime;
+    /// [`serve`](crate::serve) refuses a non-loopback listener when it is
+    /// `false`.
     pub fn encrypted(&self) -> bool {
         self.encrypted
     }

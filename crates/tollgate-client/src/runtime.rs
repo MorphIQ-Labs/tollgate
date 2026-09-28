@@ -25,24 +25,83 @@ use crate::{
     WriterShutdownError, WriterStats,
 };
 
+/// Everything an [`InstanceRuntime`] needs to run one instance's control
+/// plane: snapshot distribution, per-account lease refill, usage accounting,
+/// local sharding, account lifecycle timing and the shutdown budget.
+///
+/// There are no defaults; every value is a deployment decision.
+/// [`validate`](Self::validate) runs before any task starts (INVARIANTS.md 16),
+/// and `docs/GETTING_STARTED.md` walks through a worked configuration.
 #[derive(Debug, Clone)]
 pub struct InstanceRuntimeConfig {
+    /// Snapshot distribution: which principals to serve, and how often and
+    /// how patiently to fetch them. Validated by
+    /// [`SnapshotManagerConfig::validate`]; a [`TrackedPrincipals::Fixed`]
+    /// list must also fit `snapshot_history_capacity`.
     pub snapshots: SnapshotManagerConfig,
+    /// Lease refill settings applied to every account the runtime discovers.
+    /// Validated by [`AccountLeaseConfig::validate`]. Its
+    /// `shutdown_release_deadline` is one of the two phases
+    /// `shutdown_deadline` must cover.
     pub leases: AccountLeaseConfig,
+    /// The bounded usage queue and its writer. Validated by
+    /// [`UsageWriterConfig::validate`]. Its `shutdown_drain_deadline` is the
+    /// other phase `shutdown_deadline` must cover.
     pub usage: UsageWriterConfig,
+    /// Instance-local shard layout for the snapshot map and every account's
+    /// lease slot. [`LocalSharding::SINGLE`] is the unsharded layout; more
+    /// shards trade per-account memory for less cache-line sharing between
+    /// request-serving threads, and help only while those threads do not
+    /// outnumber the shards ([`RuntimeReport::sharding`] reports whether they
+    /// do). See `docs/LOCAL_SHARDING.md`.
     pub sharding: LocalSharding,
     /// Retained snapshot histories, including in-flight authoritative reads.
     /// Cover the simultaneously served principal set; exceeding it evicts
     /// principals until a fresh source read can reconstruct their history.
+    ///
+    /// Counted in principals. Too small evicts live principals, which deny
+    /// until the next authoritative read restores them and show up in
+    /// [`SnapshotStats::history_evictions`]; larger costs memory per retained
+    /// history. Must be at least the length of a
+    /// [`TrackedPrincipals::Fixed`] list.
     pub snapshot_history_capacity: std::num::NonZeroUsize,
     /// Time with no fresh active principal before returning routine grants.
     /// Zero requests immediate retirement; this is not a traffic-idle timer.
+    ///
+    /// An account becomes ineligible when its last active, unexpired
+    /// snapshot is removed, revoked, suspended or expires; its lease manager
+    /// then lingers for this long and is retired (releasing its lease) unless
+    /// a fresh active principal returns first. Too short churns lease
+    /// acquire and release when an account's snapshots briefly lapse; too
+    /// long holds granted units on an instance that can no longer spend
+    /// them. Must fit the monotonic clock.
     pub idle_account_linger: Duration,
+    /// Delay before restarting an account's lease manager that exited while
+    /// the account was still eligible. The account is in
+    /// [`AccountPhase::Backoff`] meanwhile, with no manager refilling its
+    /// slot.
+    ///
+    /// Too short retries a failing allocator or a crashing task in a tight
+    /// loop; too long leaves the account's slot unrefilled, and readiness
+    /// counts it unmanaged, for the whole delay. An integrity fault is never
+    /// restarted: it shuts the runtime down instead (INVARIANTS.md 31). Must
+    /// be positive.
     pub manager_restart_backoff: Duration,
     /// One budget, measured from the first shutdown request.
+    ///
+    /// Covers the usage drain, the snapshot manager's stop and every
+    /// account's lease release; a background failure that triggers shutdown
+    /// starts it too. Must be at least
+    /// `usage.shutdown_drain_deadline + leases.shutdown_release_deadline`.
+    /// Too short leaves usage unresolved and leases abandoned to TTL reclaim
+    /// (INVARIANTS.md 9), reported in [`RuntimeShutdownReport`]; the value is
+    /// also how long an orchestrator must allow the process to stop.
     pub shutdown_deadline: Duration,
 }
 
+/// Why an [`InstanceRuntimeConfig`] was refused, as a human-readable
+/// description of the first rule it broke. Also carries a component
+/// configuration error raised while spawning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceRuntimeConfigError(pub String);
 impl std::fmt::Display for InstanceRuntimeConfigError {
@@ -53,6 +112,16 @@ impl std::fmt::Display for InstanceRuntimeConfigError {
 impl std::error::Error for InstanceRuntimeConfigError {}
 
 impl InstanceRuntimeConfig {
+    /// Check the whole configuration without starting anything: each
+    /// component's own `validate`, a fixed principal list within
+    /// `snapshot_history_capacity`, a `shutdown_deadline` that covers the
+    /// usage drain plus lease release, a positive `manager_restart_backoff`,
+    /// and every duration representable on the monotonic clock.
+    /// [`InstanceRuntime::spawn`] calls this first.
+    ///
+    /// # Errors
+    ///
+    /// The first rule the configuration breaks.
     pub fn validate(&self) -> Result<(), InstanceRuntimeConfigError> {
         let error = |text: String| InstanceRuntimeConfigError(text);
         self.snapshots
@@ -104,23 +173,56 @@ impl InstanceRuntimeConfig {
     }
 }
 
+/// Where an account's lease manager is in the runtime's lifecycle.
+///
+/// An account is *eligible* while at least one of its principals has an
+/// active, unexpired snapshot; the runtime keeps at most one manager per
+/// account (INVARIANTS.md 31).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountPhase {
+    /// Eligible, with a manager refilling its slot.
     Running,
+    /// No longer eligible, but its manager is still running until
+    /// [`InstanceRuntimeConfig::idle_account_linger`] expires. Becoming
+    /// eligible again cancels the linger and returns it to `Running`.
     Lingering,
+    /// Its manager has been told to stop and is releasing its leases; the
+    /// runtime has not yet joined it. A replacement waits for that join.
     Retiring,
+    /// Its manager exited while the account was still eligible; a new one
+    /// starts after [`InstanceRuntimeConfig::manager_restart_backoff`].
     Backoff,
+    /// No manager: the account is known but not eligible, or its manager was
+    /// retired.
     Dormant,
+    /// Its manager recorded an accounting-integrity fault, such as the store
+    /// rejecting a release as an accounting error. Terminal: the runtime
+    /// shuts down rather than restart it.
     Faulted,
 }
 
+/// One account's lifecycle and refill diagnostics, from
+/// [`RuntimeHandle::account_reports`]. Kept out of metric labels because the
+/// account set is unbounded.
 #[derive(Debug, Clone)]
 pub struct AccountReport {
+    /// The account reported on.
     pub account: AccountId,
+    /// Its lease manager's current lifecycle phase.
     pub phase: AccountPhase,
+    /// At least one of its principals has an active, unexpired snapshot at
+    /// the supplied time.
     pub eligible: bool,
+    /// It is eligible and can fund work now: an active snapshot and either a
+    /// usable lease with units remaining or, under elastic enforcement,
+    /// overage headroom. Eligible but not fundable means requests deny for
+    /// want of funding.
     pub fundable: bool,
+    /// Its manager is not faulted and, if running, its health watch is still
+    /// true. False means the task died or recorded a fault.
     pub task_healthy: bool,
+    /// Times a replacement manager started after an unexpected exit. A
+    /// rising count is a manager that keeps dying.
     pub restarts: u64,
     /// Known grants lost with a dead task, excluding its recoverable current
     /// slot. Unanswered acquires are reported separately, never counted exact.
@@ -132,38 +234,97 @@ pub struct AccountReport {
     pub refill: Option<LeaseStats>,
 }
 
+/// Whether this instance can admit work now, and which condition withdrew it
+/// when it cannot (INVARIANTS.md 10). From [`RuntimeHandle::readiness`].
+///
+/// [`is_ready`](Self::is_ready) is the probe's answer; the fields are its
+/// inputs, for diagnosis.
 #[derive(Debug, Clone)]
 pub struct RuntimeReadiness {
+    /// Shutdown has been requested, or the runtime owner was dropped.
+    /// Readiness is withdrawn for good.
     pub stopping: bool,
+    /// The snapshot task is alive and ready, and current resolutions meet the
+    /// tracking rule: with [`TrackedPrincipals::Fixed`] every tracked
+    /// principal is resolved; with [`TrackedPrincipals::All`] at least one is,
+    /// or none is tracked.
     pub snapshots_ready: bool,
+    /// The supervisor and snapshot task are alive, no background failure has
+    /// been recorded, no account is faulted, and every eligible account has a
+    /// healthy running or lingering manager.
     pub background_healthy: bool,
+    /// The usage writer is open, has recorded no `lost` or `rejected`
+    /// events, and its queue is below capacity. A sticky `lost` or `rejected`
+    /// keeps this false for the rest of the process's life.
     pub accounting_healthy: bool,
+    /// Accounts with at least one active, unexpired snapshot.
     pub eligible_accounts: usize,
+    /// Eligible accounts that cannot fund work now: no usable lease with
+    /// units remaining and no elastic overage headroom. With `Fixed`
+    /// tracking any such account withdraws readiness; with `All`, readiness
+    /// needs only some eligible account to be fundable.
     pub unfundable_accounts: usize,
+    /// Eligible accounts without a healthy running or lingering lease
+    /// manager: starting, backing off after a crash, retiring or faulted.
+    /// Nonzero withdraws readiness through `background_healthy`.
     pub unmanaged_accounts: usize,
+    /// Tracked principals with no currently valid resolution (neither an
+    /// unexpired snapshot nor an unexpired negative entry).
     pub unresolved_principals: u64,
     ready: bool,
 }
 impl RuntimeReadiness {
+    /// True only when the runtime is not stopping, snapshots are ready,
+    /// background tasks and accounting are healthy, and the funding rule
+    /// holds: with no account holding a published snapshot, trivially; with
+    /// `All` tracking, some
+    /// eligible account is fundable; with `Fixed`, at least one account is
+    /// eligible and every eligible account is fundable.
     #[must_use]
     pub fn is_ready(&self) -> bool {
         self.ready
     }
 }
 
+/// Instance-wide aggregate of the runtime's accounts, refill, snapshot and
+/// accounting counters, from [`RuntimeHandle::report`]. Safe to expose as
+/// metrics: it carries no per-account labels except the bounded
+/// [`ContentionReport::hottest`] list.
 #[derive(Debug, Clone)]
 pub struct RuntimeReport {
+    /// Accounts with a lease slot on this instance. Slots are kept for the
+    /// process's life because they carry irreversible overage spend, so this
+    /// only grows.
     pub retained_accounts: usize,
+    /// Accounts with a live lease manager: running or lingering.
     pub managed_accounts: usize,
+    /// Of `managed_accounts`, those no longer eligible and waiting out
+    /// [`InstanceRuntimeConfig::idle_account_linger`].
     pub lingering_accounts: usize,
+    /// Accounts whose manager is releasing its leases and not yet joined.
     pub retiring_accounts: usize,
+    /// Accounts waiting out [`InstanceRuntimeConfig::manager_restart_backoff`]
+    /// after their manager exited unexpectedly.
     pub restarting_accounts: usize,
+    /// Manager restarts after an unexpected exit, summed across accounts.
+    /// Nonzero means a lease manager died; a rising count means one keeps
+    /// dying.
     pub manager_restarts: u64,
+    /// Summed across accounts: see [`AccountReport::unrecovered_grants`].
+    /// Nonzero is crash exposure — granted units that return only at TTL
+    /// reclaim (INVARIANTS.md 9).
     pub unrecovered_grants: u64,
+    /// Summed across accounts: see [`AccountReport::uncertain_acquires`].
     pub uncertain_acquires: u64,
+    /// Some counter in this report, or one it aggregates, exceeded `u64` and
+    /// is saturated. Totals are then lower bounds, never wrapped values.
     pub counter_overflow: bool,
+    /// Refill counters summed across every account, including managers that
+    /// have since retired or died. `None` when the sum overflowed.
     pub refill: Option<LeaseStats>,
+    /// The snapshot task's counters.
     pub snapshots: SnapshotStats,
+    /// The usage writer's accounting health.
     pub accounting: WriterHealth,
     /// What this instance's shard layout is carrying (GL-124).
     ///
@@ -229,18 +390,42 @@ impl ContentionReport {
     }
 }
 
+/// Why the usage writer produced no terminal [`WriterStats`] during runtime
+/// shutdown.
 #[derive(Debug)]
 pub enum RuntimeWriterError {
+    /// The writer task panicked or was aborted; the error carries a lower
+    /// bound on committed charges it left with no billing record.
     Task(WriterShutdownError),
+    /// The runtime's shutdown deadline expired before the writer finished.
+    /// Carries its accounting health read at that moment; its `unaccounted`
+    /// and queue depth are the charges still without an outcome.
     Deadline(WriterHealth),
 }
+/// What [`InstanceRuntime::shutdown`] observed, component by component.
+/// Nothing here is silent: every shortfall names what it left behind.
 #[derive(Debug)]
 pub struct RuntimeShutdownReport {
+    /// The usage writer's terminal counters, or why there are none. Nonzero
+    /// `lost` or `unresolved` are committed charges that were not billed.
     pub usage: Result<WriterStats, RuntimeWriterError>,
+    /// The snapshot manager's shutdown report, or `None` when it did not
+    /// stop within the deadline.
     pub snapshots: Option<SnapshotManagerReport>,
+    /// Lease release outcomes for every account whose manager was joined
+    /// during shutdown. Nonzero `abandoned` counts leases left to TTL
+    /// reclaim (INVARIANTS.md 9).
     pub accounts: BTreeMap<AccountId, LeaseManagerReport>,
+    /// Accounts whose manager was still retiring when shutdown finished: its
+    /// release outcome is unknown and its leases settle at TTL reclaim.
     pub unfinished_accounts: Vec<AccountId>,
+    /// A background component failed during the runtime's life or its
+    /// shutdown: a task exited unexpectedly, a join failed, or an account
+    /// recorded an integrity fault. Such a failure is also what starts an
+    /// unrequested shutdown.
     pub background_failed: bool,
+    /// Shutdown finished at or after the deadline, so some phase may have
+    /// been cut short; the other fields say which.
     pub deadline_expired: bool,
 }
 
@@ -326,10 +511,26 @@ pub struct RuntimeHandle {
     budget: Duration,
 }
 impl RuntimeHandle {
+    /// Instance-wide funding estimates at `now`: lease units in hand, overage
+    /// spent and capped, and the earliest lease usability deadline. A
+    /// diagnostic read that takes the registry lock; admission never reads
+    /// it.
     #[must_use]
     pub fn funding(&self, now: Timestamp) -> RuntimeFundingReport {
         self.shared.slots.funding(now)
     }
+    /// Begin staged admission for `principal` at the caller-supplied `now`:
+    /// one snapshot lookup, the account status check and the route's
+    /// `required` permission check. Request path: no I/O, no blocking lock
+    /// and no clock read (INVARIANTS.md 5). The returned [`RequestContext`]
+    /// retains the principal's snapshot generation for the rest of the
+    /// request (INVARIANTS.md 26).
+    ///
+    /// # Errors
+    ///
+    /// The [`DenyReason`] for an unknown principal, an inactive account, an
+    /// expired snapshot or a missing permission, counted in
+    /// [`counters`](Self::counters). Nothing is charged.
     pub fn begin(
         &self,
         principal: Principal,
@@ -338,10 +539,14 @@ impl RuntimeHandle {
     ) -> Result<RequestContext, DenyReason> {
         self.shared.engine.begin(principal, required, now)
     }
+    /// The usage queue's request-side handle. Reserve a permit with
+    /// [`UsageRecorder::try_reserve`] before admitting work, so a full queue
+    /// sheds before anything is charged (INVARIANTS.md 8).
     #[must_use]
     pub fn recorder(&self) -> &UsageRecorder {
         &self.shared.recorder
     }
+    /// What this instance has admitted and refused, per outcome.
     #[must_use]
     pub fn counters(&self) -> &AdmissionCounters {
         self.shared.engine.counters()
@@ -354,6 +559,11 @@ impl RuntimeHandle {
         self.shared.request_shutdown(self.budget)
     }
 
+    /// Whether this instance can admit work at `now`, with the inputs to that
+    /// answer. Serve a readiness probe from
+    /// [`is_ready`](RuntimeReadiness::is_ready) so no traffic reaches an
+    /// instance that would refuse it (INVARIANTS.md 10). Control plane: takes
+    /// the registry and observation locks.
     #[must_use]
     pub fn readiness(&self, now: Timestamp) -> RuntimeReadiness {
         let stopping = self.shared.stopping.load(Ordering::Acquire);
@@ -451,6 +661,9 @@ impl RuntimeHandle {
             .collect()
     }
 
+    /// Instance-wide counters across accounts, refill, snapshots, accounting,
+    /// sharding and contention. Control plane: takes the observation and
+    /// registry locks.
     #[must_use]
     pub fn report(&self) -> RuntimeReport {
         let observations = self
@@ -518,10 +731,24 @@ pub struct InstanceRuntime {
     task: Option<JoinHandle<RuntimeShutdownReport>>,
 }
 impl InstanceRuntime {
+    /// Another clone of the runtime's request and diagnostic handle.
     #[must_use]
     pub fn handle(&self) -> RuntimeHandle {
         self.handle.clone()
     }
+    /// Validate `config`, then start the snapshot manager, the usage writer
+    /// and the supervisor that runs one lease manager per eligible account.
+    /// Returns the unique owner, which must be retained and shut down, and a
+    /// first [`RuntimeHandle`].
+    ///
+    /// `source`, `allocator` and `sink` may be the same backend. `clock`
+    /// supplies control-plane timestamps. Must be called within a Tokio
+    /// runtime. Nothing starts when validation fails.
+    ///
+    /// # Errors
+    ///
+    /// [`InstanceRuntimeConfigError`] for any configuration rule
+    /// [`InstanceRuntimeConfig::validate`] or a component's spawn refuses.
     pub fn spawn(
         source: Arc<dyn SnapshotSource>,
         allocator: Arc<dyn LeaseAllocator>,
@@ -575,6 +802,18 @@ impl InstanceRuntime {
             handle,
         ))
     }
+    /// Request shutdown (starting the total deadline if no one has yet) and
+    /// wait for the supervisor to finish it: stop discovery, pause refills,
+    /// drain the usage writer, stop the snapshot manager, then release every
+    /// account's leases, all within
+    /// [`InstanceRuntimeConfig::shutdown_deadline`]. Stop the application's
+    /// listeners and quiesce its request tasks alongside, bounded by the same
+    /// deadline. Cancelling this future aborts the supervisor.
+    ///
+    /// # Errors
+    ///
+    /// The supervisor task's [`JoinError`](tokio::task::JoinError) if it
+    /// panicked or was cancelled; its report is then unavailable.
     pub async fn shutdown(mut self) -> Result<RuntimeShutdownReport, tokio::task::JoinError> {
         self.handle.request_shutdown();
         let report = self

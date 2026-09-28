@@ -19,6 +19,25 @@ pub enum Invocation {
     Check(PathBuf),
 }
 
+/// The text `--help`/`-h` or `--version`/`-V` asks for, if one of them comes
+/// before `--`; the first one wins.
+///
+/// Help and version win over everything before `--`, including a malformed
+/// option: someone reaching for `--help` is asking what the options are. A
+/// binary with its own positional grammar calls this before parsing it.
+pub fn information<S: AsRef<OsStr>>(args: &[S], name: &str, usage: &str) -> Option<String> {
+    for arg in args.iter().take_while(|arg| arg.as_ref() != "--") {
+        match arg.as_ref().to_str() {
+            Some("--help" | "-h") => return Some(usage.to_owned()),
+            Some("--version" | "-V") => {
+                return Some(format!("{name} {}", env!("CARGO_PKG_VERSION")));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Parse `args` (already excluding the program name).
 ///
 /// `--` ends option processing, so a path that begins with a dash is still
@@ -35,19 +54,8 @@ where
         .into_iter()
         .map(|a| PathBuf::from(a.as_ref()))
         .collect();
-    // Help and version win over everything before `--`, including a malformed
-    // option: someone reaching for `--help` is asking what the options are.
-    for arg in args.iter().take_while(|arg| arg.as_os_str() != "--") {
-        match arg.to_str() {
-            Some("--help" | "-h") => return Ok(Invocation::Print(usage.to_owned())),
-            Some("--version" | "-V") => {
-                return Ok(Invocation::Print(format!(
-                    "{name} {}",
-                    env!("CARGO_PKG_VERSION")
-                )));
-            }
-            _ => {}
-        }
+    if let Some(text) = information(&args, name, usage) {
+        return Ok(Invocation::Print(text));
     }
     let mut positional = Vec::new();
     let mut terminated = false;

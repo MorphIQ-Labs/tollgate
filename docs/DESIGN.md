@@ -7,7 +7,7 @@ and the findings the PoC produced. The testable contract lives in
 
 ## Problem
 
-A latency-sensitive API service (FerroRisk's pricing service is the motivating
+A latency-sensitive API service (an options-pricing API is the motivating
 consumer, with a microsecond-scale in-process request budget) must enforce
 account policy, rate limits, quota, and billing **without any synchronous I/O
 on the request path**. One database round-trip per request would be two to
@@ -480,7 +480,7 @@ The fixed-width operations are checked. Before that scan, both weighted-rate
 scalars are checked in full width against governor's non-zero `u32` domain;
 zero or a wider value refuses publication rather than being repaired by the
 request-path defensive narrowing (GL-66). The carried pair is checked even when
-the new weighted-rate flag is disabled because a pre-#91 reader still enforces
+the new weighted-rate flag is disabled because a pre-GL-91 reader still enforces
 it during rollback. Overflow or a result greater than the carried
 `rate_burst_units` refuses publication; equality is valid. A table with no
 registered operation is valid only after the rate-domain check because no
@@ -609,9 +609,9 @@ have paid for capacity they are being refused.
 mode working — but it is the leading indicator of an invoice, the way
 `accounting.rejected` is the leading indicator of billing loss. It says this
 instance is admitting work the account has not paid for. Read it against
-`overage_spent` / `overage_cap`: the ratio is how much runway is left before a
-cap refusal starts. **Both are per instance.** Fleet exposure is `overage_cap`
-times the number of instances, so a cap that looks conservative on one box is
+`total_overage_spent` / `total_overage_cap`: the ratio is how much runway is
+left before a cap refusal starts. **Both are per instance.** Fleet exposure is
+the cap times the number of instances, so a cap that looks conservative on one box is
 not, and a control-plane outage reaches every instance at once. Restore lease
 capacity first; add funding only when the allocator specifically reports
 `insufficient_balance`. Raising the cap only buys time.
@@ -1843,7 +1843,7 @@ full table rewrite for cosmetics — so the table is heterogeneous on purpose, a
 `a_vestigial_jsonb_generation_is_ignored_in_favour_of_the_column` pins that the
 reader ignores it.
 
-**One-way.** A pre-#54 binary cannot decode a row written after it, so rolling
+**One-way.** A pre-GL-54 binary cannot decode a row written after it, so rolling
 the binary back degrades availability — every live read for an affected
 principal returns a store error. It does not degrade authorization safety: the
 tombstone path reads the column, so revocation keeps working, and a failed
@@ -3097,7 +3097,7 @@ the new-field round trip.
 
 **The governor-domain correction is pre-release, not a migration.** GL-91's staged
 limit contract had not been released, so there was no installed state to
-preserve from the pre-#91 domain. Adding a forward migration for hypothetical
+preserve from the pre-GL-91 domain. Adding a forward migration for hypothetical
 rows would permanently duplicate admission semantics in the schema and create
 a rollback protocol for a rollout that cannot occur.
 
@@ -3729,8 +3729,8 @@ Google service-account bearer tokens use the existing `CredentialVerifier` seam,
 fixed issuer/algorithm/audience and stable subject mappings. Signing-key fetch is
 off the handler path, response/time bounded, and cached only through issuer
 freshness (at most one hour). Failed refresh cannot renew expired authority.
-On Cloud Run, the service's attached service account can supply tokens through
-the metadata provider, so no per-replica secret is required.
+On a Google Cloud workload, the attached service account can supply tokens
+through the metadata provider, so no per-replica secret is required.
 
 Verification, authorization and TLS configuration are one ArcSwap generation.
 The file loader stages referenced material, validates everything, and only marks
@@ -3763,8 +3763,9 @@ constructors, and receipt-returning backend methods. Wire DTOs, existing domain
 error codes, and PostgreSQL schemas are unchanged; authentication 401/403 codes
 are additive. The [operator runbook](CONTROL_PLANE_SECURITY.md) supplies the
 staged endpoint/client rollout and rotation procedure. A remote plaintext
-fallback would defeat the contract, including on a Cloud Run server container:
-the supported topology has Cloud Run clients connecting to a direct TLS endpoint.
+fallback would defeat the contract, including behind a platform front end that
+terminates TLS: the supported topology has clients connecting to a direct TLS
+endpoint.
 
 Dependencies are shared and locked. rustls/tokio-rustls and reqwest's rustls
 feature provide maintained TLS instead of an ad-hoc protocol. jsonwebtoken uses
@@ -4109,6 +4110,19 @@ it *can* pass. `--package <crate>` mutates one crate's whole surface, which is
 how code written before the gate existed gets measured at all. The bare form
 sweeps the workspace and requires `TOLLGATE_PG_URL`.
 
+Every scope accepts `MUTANTS_SHARD=k/n` (0-based `k`), which passes
+`--shard k/n` to cargo-mutants: the shards partition one deterministic mutant
+list, so running every `k` tests exactly what one unsharded run would. CI runs
+the diff gate as eight `assurance / mutation shard k/8` jobs, each with its own
+PostgreSQL service because the backend suite truncates its database, and one
+required aggregate, `assurance / mutation`. The aggregate runs under
+`always()` and fails unless every shard succeeded: GitHub reports a job
+skipped behind a failed dependency as passing, so an aggregate without
+`always()` would go green exactly when a shard failed. Sharding exists because
+a diff touching both backends is serial against PostgreSQL, and at one worker
+a few hundred mutants outran the job timeout (GL-67; #44's diff produced
+about 600).
+
 `test_workspace` stays on in every scope: a `tollgate-core` mutant is allowed
 to die to a `tollgate-client` test, because what matters is whether *anything*
 notices, not whether the owning crate does.
@@ -4342,7 +4356,7 @@ Provenance is per file, so a partial re-measure is not representable: the
 lists. Re-measuring five rows and carrying the rest forward therefore makes
 the file claim a recording fourteen rows did not get, which is how
 `admission/full_check_sharded` and `admission/full_check_contended_8` came to
-be gated against a pre-#91 denominator while the metadata said otherwise. A
+be gated against a pre-GL-91 denominator while the metadata said otherwise. A
 baseline update re-measures every row — which is why there is no longer a
 supported way to update one by hand (GL-114).
 

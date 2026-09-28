@@ -2,7 +2,7 @@
 //! happens to what it did not spend.
 //!
 //! Tollgate stores a schedule and applies it; it does not interpret product
-//! vocabulary. A plan that calls its allowance "included FCUs" and its period
+//! vocabulary. A plan that calls its allowance "included credits" and its period
 //! "a calendar month" compiles to a [`BudgetSchedule`] here, and the ledger
 //! knows only units and instants.
 //!
@@ -141,7 +141,10 @@ impl Rollover {
 pub struct BudgetSchedule {
     /// Units deposited at each period boundary.
     pub allowance: CostUnits,
+    /// How the calendar is divided into periods; each boundary deposits
+    /// `allowance`.
     pub period: Period,
+    /// What happens at a boundary to allowance left unspent.
     pub rollover: Rollover,
 }
 
@@ -195,6 +198,9 @@ pub struct BudgetView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BalanceExhaustion {
+    /// When the current period ends, after which a new allowance may fund
+    /// the account and this evidence no longer holds. `None` for an account
+    /// without a schedule, whose exhaustion lasts until a deposit.
     #[cfg_attr(feature = "serde", serde(deserialize_with = "required_period_end"))]
     pub period_end: Option<Timestamp>,
 }
@@ -210,7 +216,11 @@ pub struct BalanceExhaustion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BalanceShortfall {
+    /// The most the account can still spend, counting units held in leases.
+    /// An upper bound, never a balance to display.
     pub remaining: CostUnits,
+    /// When the current period ends, bounding how long this evidence holds;
+    /// `None` for an account without a schedule.
     #[cfg_attr(feature = "serde", serde(deserialize_with = "required_period_end"))]
     pub period_end: Option<Timestamp>,
 }

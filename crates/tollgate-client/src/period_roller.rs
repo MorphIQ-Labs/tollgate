@@ -47,13 +47,40 @@ use tollgate_store::{AdminStore, Clock, DEFAULT_ROLLOVER_BATCH_LIMIT, RolloverBa
 
 /// Cadence is measured from the end of a pass, so a slow pass or outage cannot
 /// cause catch-up bursts. The first pass starts without waiting for this interval.
+///
+/// [`Default`] gives a five-second poll, 256 accounts a batch, a five-second
+/// call timeout, a 30-second pass and a five-second shutdown timeout.
+/// [`validate`](Self::validate) runs before the task starts
+/// (INVARIANTS.md 16).
 #[derive(Debug, Clone)]
 pub struct PeriodRollerConfig {
+    /// Pause between the end of one pass and the start of the next.
+    ///
+    /// Bounds how late an account crosses its period boundary: a pass
+    /// crosses every account due at its cutoff, so a boundary is crossed
+    /// within about this long plus one pass while passes succeed. Too long
+    /// delays the new allowance and the expiry of the old one; too short
+    /// issues more store calls that usually select nothing. Must be
+    /// positive.
     pub poll_interval: Duration,
+    /// Accounts rolled per store call, each batch one transaction. A pass
+    /// repeats saturated batches until one comes back partial. Too small
+    /// makes a boundary that brings many accounts due take many calls; too
+    /// large makes each transaction, and each call, heavier.
     pub batch_limit: NonZeroUsize,
+    /// Bound on one `roll_due_periods` call. A timed-out call ends the pass
+    /// as failed, and its effects are unknown: the batch may have committed
+    /// (counted in `uncertain_calls`). Set it above the store's slowest
+    /// legitimate batch. Must be positive.
     pub call_timeout: Duration,
     /// One budget across all batches, including yields between them.
+    ///
+    /// Must cover the largest boundary's batches, or the pass ends degraded
+    /// and the remaining accounts wait for the next pass. Must be positive.
     pub pass_timeout: Duration,
+    /// How long [`PeriodRoller::shutdown`] waits for the task to stop before
+    /// reporting `deadline_expired`. Include it in the application's
+    /// shutdown budget. Must be positive.
     pub shutdown_timeout: Duration,
 }
 
@@ -69,6 +96,7 @@ impl Default for PeriodRollerConfig {
     }
 }
 
+/// Why a [`PeriodRollerConfig`] was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeriodRollerConfigError(pub &'static str);
 impl std::fmt::Display for PeriodRollerConfigError {
@@ -79,6 +107,12 @@ impl std::fmt::Display for PeriodRollerConfigError {
 impl std::error::Error for PeriodRollerConfigError {}
 
 impl PeriodRollerConfig {
+    /// Check that every duration is positive and representable on the
+    /// monotonic clock.
+    ///
+    /// # Errors
+    ///
+    /// [`PeriodRollerConfigError`] when one is not.
     pub fn validate(&self) -> Result<(), PeriodRollerConfigError> {
         for duration in [
             self.poll_interval,
@@ -96,14 +130,21 @@ impl PeriodRollerConfig {
     }
 }
 
+/// The period roller task's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeriodRollerHealth {
+    /// The first pass has not ended yet.
     Starting,
     /// The last pass reached a partial batch. This is maintenance health,
     /// not proof that every account is current (other replicas may hold locks).
     Healthy,
+    /// The last pass failed or timed out. Rollover
+    /// retries on the next pass; confirmed batches remain committed.
     Degraded,
+    /// The task stopped: on request, or after a counter overflow ended it.
     Stopped,
+    /// The task exited without reaching `Stopped` (it panicked or was
+    /// aborted), or shutdown's deadline expired.
     Failed,
 }
 
@@ -112,15 +153,28 @@ pub enum PeriodRollerHealth {
 /// because a single batch can contain several full u64 allowances.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PeriodRollerStats {
+    /// Passes begun, each with one frozen cutoff.
     pub passes_started: u64,
+    /// Passes that drained every due account to a partial batch.
     pub passes_completed: u64,
+    /// Passes that ended early: failed, timed out, or interrupted by
+    /// shutdown or task exit. Their accounts are retried on the next pass.
     pub passes_incomplete: u64,
+    /// Store calls that returned a batch, saturated or partial.
     pub batches: u64,
+    /// Account period crossings confirmed by the store.
     pub accounts_rolled: u64,
+    /// Units deposited as new period allowances, across confirmed crossings.
     pub deposited_units: u128,
+    /// Unspent units removed as closed periods expired, across confirmed
+    /// crossings.
     pub expired_units: u128,
+    /// Store calls that returned an error. Each also counts as uncertain.
     pub failures: u64,
+    /// Store calls abandoned at `call_timeout`.
     pub call_timeouts: u64,
+    /// Passes abandoned because `pass_timeout` expired. Sustained nonzero
+    /// means a boundary's batches do not fit the pass budget.
     pub pass_timeouts: u64,
     /// Calls with unknown effects: store errors, timeouts, or interrupted calls.
     pub uncertain_calls: u64,
@@ -146,10 +200,17 @@ impl PeriodRollerStats {
     }
 }
 
+/// A reading of the period roller for readiness and metrics, from
+/// [`PeriodRollerMonitor::report`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeriodRollerReport {
+    /// The task's state.
     pub health: PeriodRollerHealth,
+    /// Confirmed progress since the task started.
     pub stats: PeriodRollerStats,
+    /// Cutoff of the last pass that completed: every account due at that
+    /// instant had been crossed, by this replica or another. `None` until a
+    /// pass completes. A stale value is maintenance falling behind.
     pub last_successful_cutoff: Option<Timestamp>,
     /// Totals are incomplete after overflow, never silently wrapped.
     pub counter_overflow: bool,
@@ -194,6 +255,9 @@ pub struct PeriodRollerMonitor {
 }
 
 impl PeriodRollerMonitor {
+    /// The latest published state. When the task has exited without a
+    /// requested stop, reports `Failed` and counts any interrupted pass and
+    /// unanswered call.
     #[must_use]
     pub fn report(&self) -> PeriodRollerReport {
         // Check closure before reading: if closed, the last publication is final.
@@ -212,9 +276,14 @@ impl PeriodRollerMonitor {
     }
 }
 
+/// What [`PeriodRoller::shutdown`] observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeriodRollerShutdownReport {
+    /// The final report, with any interrupted pass and unanswered call
+    /// counted.
     pub report: PeriodRollerReport,
+    /// The task did not stop within `shutdown_timeout`; health is reported
+    /// as `Failed` and the task is aborted as `shutdown` returns.
     pub deadline_expired: bool,
 }
 
@@ -228,6 +297,14 @@ pub struct PeriodRoller {
 }
 
 impl PeriodRoller {
+    /// Validate `config` and start the rollover task; the first pass starts
+    /// immediately. Run it only where the application reaches an
+    /// `AdminStore` directly. Must be called within a Tokio runtime.
+    ///
+    /// # Errors
+    ///
+    /// [`PeriodRollerConfigError`] when `config` fails validation; nothing
+    /// is started.
     pub fn spawn(
         store: Arc<dyn AdminStore>,
         clock: Arc<dyn Clock>,
@@ -255,6 +332,8 @@ impl PeriodRoller {
         })
     }
 
+    /// A read-only monitor that outlives this owner, for readiness and
+    /// metrics state.
     #[must_use]
     pub fn monitor(&self) -> PeriodRollerMonitor {
         self.monitor.clone()

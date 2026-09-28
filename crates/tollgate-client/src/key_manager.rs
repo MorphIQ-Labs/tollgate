@@ -19,18 +19,59 @@ use tollgate_auth::{CredentialVerifier, HmacRegistry, Verified};
 use tollgate_store::{Clock, CredentialSet, KeySource, StoreError};
 use zeroize::Zeroizing;
 
+/// Credential-projection refresh timing and paging budgets.
+///
+/// [`Default`] gives a five-second refresh pause and per-call timeout, a
+/// ten-second pass, 256 records a page, 1024 page calls a pass, a 30-second
+/// `max_age` and a five-second shutdown timeout. [`validate`](Self::validate)
+/// runs before the task starts (INVARIANTS.md 16). `docs/CREDENTIAL_PROJECTION.md`
+/// covers sizing against revocation tolerance.
 #[derive(Debug, Clone)]
 pub struct KeyManagerConfig {
     /// Pause after each completed attempt. The first fetch starts immediately.
+    ///
+    /// Bounds how soon a key added, rotated or removed at the source reaches
+    /// new verifications. Set it no longer than the snapshot
+    /// `refresh_interval`. Too long delays key changes; too short re-reads
+    /// the whole credential set more often. Must be positive, and
+    /// `max_age` must exceed `refresh_interval + 2 * pass_timeout`.
     pub refresh_interval: Duration,
+    /// Bound on one page call to the key source. A timeout fails the pass
+    /// (counted in [`KeyManagerStats::timeouts`], or in `pass_timeouts` when
+    /// the pass budget ran out first) and keeps the previous
+    /// projection. Set it above the source's slowest legitimate page. Must
+    /// be positive and no longer than `pass_timeout`.
     pub fetch_timeout: Duration,
     /// One budget for every page, restart, and projection build.
+    ///
+    /// Must cover reading the whole credential set, including revision
+    /// restarts, or no pass ever publishes (counted in
+    /// [`KeyManagerStats::pass_timeouts`]). Larger values also force a larger
+    /// `max_age`. Must be positive and at least `fetch_timeout`.
     pub pass_timeout: Duration,
+    /// Records requested per page call. Larger pages mean fewer calls per
+    /// pass, each heavier. At most 4096.
     pub page_limit: NonZeroUsize,
     /// Total page calls per pass, including revision-conflict retries.
+    ///
+    /// A catalogue that needs more pages than this never publishes (counted
+    /// in [`KeyManagerStats::page_budget_exceeded`]); size it above the
+    /// credential count divided by `page_limit`, with room for restarts.
     pub max_pages: NonZeroUsize,
     /// Maximum evidence lifetime, measured from fetch START, including I/O.
+    ///
+    /// Every credential verified from a projection, including one cached in
+    /// a session, stops verifying at the earlier of its own expiry and the
+    /// fetch start plus this. It is therefore the revocation bound for
+    /// cached sessions and how long authentication survives a feed outage.
+    /// Too short withdraws readiness on any slow pass; too long lets a
+    /// removed key keep authenticating. Must strictly exceed
+    /// `refresh_interval + 2 * pass_timeout`, and the resulting deadline must
+    /// fit a [`Timestamp`].
     pub max_age: Duration,
+    /// How long [`KeyManager::shutdown`] waits for the task to stop before
+    /// reporting `deadline_expired`. Include it in the application's
+    /// shutdown budget. Must be positive.
     pub shutdown_timeout: Duration,
 }
 
@@ -48,6 +89,8 @@ impl Default for KeyManagerConfig {
     }
 }
 
+/// Why a [`KeyManagerConfig`] or HMAC secret was refused: the first rule
+/// broken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyManagerConfigError(pub &'static str);
 impl std::fmt::Display for KeyManagerConfigError {
@@ -58,6 +101,15 @@ impl std::fmt::Display for KeyManagerConfigError {
 impl std::error::Error for KeyManagerConfigError {}
 
 impl KeyManagerConfig {
+    /// Check the configuration without starting anything: every duration
+    /// positive and representable, `page_limit` at most 4096,
+    /// `fetch_timeout <= pass_timeout`, and
+    /// `max_age > refresh_interval + 2 * pass_timeout`, so the previous
+    /// pass, the pause and the next pass all fit inside one evidence window.
+    ///
+    /// # Errors
+    ///
+    /// The first rule the configuration breaks.
     pub fn validate(&self) -> Result<(), KeyManagerConfigError> {
         for duration in [
             self.refresh_interval,
@@ -119,25 +171,49 @@ impl CredentialVerifier for KeyVerifier {
     }
 }
 
+/// The key manager task's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyManagerHealth {
+    /// The first pass has not finished yet.
     Starting,
+    /// The last pass published a complete projection.
     Healthy,
+    /// The last pass failed. The previous projection, if any, stays in use
+    /// until its own deadline; readiness falls when that passes.
     Degraded,
+    /// The task stopped on request.
     Stopped,
+    /// The task exited without reaching `Stopped`: it panicked or was
+    /// aborted. Readiness is withdrawn.
     Failed,
 }
 
+/// Cumulative key-refresh counters since the manager started.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct KeyManagerStats {
+    /// Passes started.
     pub attempts: u64,
+    /// Passes that published a projection.
     pub refreshes: u64,
+    /// Passes that published nothing, for any reason. Each keeps the
+    /// previous projection and marks the manager `Degraded`; a rising count
+    /// with flat `refreshes` means keys are aging toward `max_age`.
     pub failures: u64,
+    /// Page calls abandoned at `fetch_timeout`: a slow source.
     pub timeouts: u64,
+    /// Pages read, including pages discarded by a revision restart.
     pub pages: u64,
+    /// Times the credential set changed mid-pass, discarding what had been
+    /// read and restarting from the first page. Frequent conflicts on a busy
+    /// catalogue can exhaust `pass_timeout` or `max_pages`.
     pub revision_conflicts: u64,
+    /// Passes abandoned because `pass_timeout` expired.
     pub pass_timeouts: u64,
+    /// Passes abandoned because they used up `max_pages` page calls. Nonzero
+    /// means the catalogue has outgrown the page budget.
     pub page_budget_exceeded: u64,
+    /// A counter reached `u64::MAX` and stopped counting; values are lower
+    /// bounds.
     pub counter_overflow: bool,
 }
 
@@ -157,25 +233,40 @@ struct Progress {
     stats: KeyManagerStats,
 }
 
+/// A reading of the key manager for readiness and metrics, from
+/// [`KeyManagerMonitor::report`]. Carries no customer labels.
 #[derive(Debug, Clone, Copy)]
 pub struct KeyManagerReport {
+    /// The task's state; `Failed` when it has exited without a requested
+    /// stop.
     pub health: KeyManagerHealth,
+    /// Cumulative refresh counters.
     pub stats: KeyManagerStats,
     /// Fresh feed and live task; an authoritative empty set is still fresh.
     pub ready: bool,
     /// Entries in the installed projection, not a count of usable customers.
     pub projected_keys: usize,
+    /// The key source revision of the installed projection, or `None`
+    /// before the first success. Never moves backward.
     pub revision: Option<u64>,
+    /// When the pass that built the installed projection started.
     pub fetched_at: Option<Timestamp>,
+    /// When the installed projection stops verifying: `fetched_at + max_age`.
+    /// Readiness is false from this instant unless a newer pass succeeds.
     pub usable_until: Option<Timestamp>,
 }
 
+/// Cloneable, read-only view of a [`KeyManager`], for readiness and metrics
+/// state. Detects task exit on its own.
 #[derive(Clone)]
 pub struct KeyManagerMonitor {
     progress: watch::Receiver<Progress>,
     verifier: KeyVerifier,
 }
 impl KeyManagerMonitor {
+    /// The manager's state at `now`. `ready` requires a running task and an
+    /// installed projection still inside its `usable_until`. Combine it with
+    /// the runtime's readiness before exposing authenticated traffic.
     pub fn report(&self, now: Timestamp) -> KeyManagerReport {
         let exited = self.progress.has_changed().is_err();
         let mut progress = *self.progress.borrow();
@@ -198,18 +289,38 @@ impl KeyManagerMonitor {
         }
     }
 
+    /// Wait for the manager to publish progress or exit. Read
+    /// [`report`](Self::report) after either outcome.
+    ///
+    /// # Errors
+    ///
+    /// [`RecvError`](watch::error::RecvError) once the task has exited and
+    /// nothing further will be published.
     pub async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
         self.progress.changed().await
     }
 }
 
+/// What [`KeyManager::shutdown`] observed.
 #[derive(Debug, Clone, Copy)]
 pub struct KeyManagerShutdownReport {
+    /// The final refresh counters.
     pub stats: KeyManagerStats,
+    /// The task panicked or was cancelled, or did not stop within
+    /// `shutdown_timeout`.
     pub task_failed: bool,
+    /// The task did not stop within `shutdown_timeout`; it is aborted as
+    /// `shutdown` returns.
     pub deadline_expired: bool,
 }
 
+/// Owner of the credential-projection refresh task.
+///
+/// Reads the active credential set from a read-only `KeySource`, builds an
+/// HMAC verification table from it, and publishes that table to its
+/// [`KeyVerifier`] with a bounded lifetime. Retain it beside the
+/// [`InstanceRuntime`](crate::InstanceRuntime) and shut it down with the
+/// application; dropping it aborts the task and withdraws the table.
 #[must_use = "retain the key manager to own credential refresh"]
 pub struct KeyManager {
     task: Option<tokio::task::JoinHandle<()>>,
@@ -219,6 +330,16 @@ pub struct KeyManager {
 }
 
 impl KeyManager {
+    /// Validate `config` and `secret`, then start the refresh task. The first
+    /// pass starts immediately. `secret` is the HMAC secret the credential
+    /// issuer uses, at least 32 bytes; it is copied and wiped when the task
+    /// ends. Must be called within a Tokio runtime.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyManagerConfigError`] for an invalid configuration, a secret
+    /// shorter than 32 bytes, or a `max_age` whose deadline would not fit a
+    /// [`Timestamp`]. Nothing is started.
     pub fn spawn(
         source: Arc<dyn KeySource>,
         secret: &[u8],
@@ -268,13 +389,21 @@ impl KeyManager {
         })
     }
 
+    /// The verification capability for HTTP authentication state. Use it
+    /// with `tollgate_auth::SessionCredential`; it verifies nothing before
+    /// the first successful pass or after the task ends.
     pub fn verifier(&self) -> KeyVerifier {
         self.monitor.verifier.clone()
     }
+    /// A read-only monitor for readiness and metrics state.
     pub fn monitor(&self) -> KeyManagerMonitor {
         self.monitor.clone()
     }
 
+    /// Signal the task to stop, cancelling any pending fetch, and wait up to
+    /// `shutdown_timeout` for it. Owns no leases or usage, so it can run
+    /// concurrently with the runtime's shutdown. Cancelling this future
+    /// aborts the task.
     pub async fn shutdown(mut self) -> KeyManagerShutdownReport {
         crate::signal(&self.stop, true, "key-manager shutdown");
         let joined = tokio::time::timeout(
