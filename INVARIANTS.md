@@ -662,8 +662,11 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    sheds; sheds are counted at `try_reserve`, the only place a refusal can
    happen, so no embedder can forget to; and the time the sink last answered
    separates a quiet writer from an unreachable one — a distinction `lost`
-   cannot make while the process runs, since the steady-state path retries
-   forever and declares loss only at the final flush. The drain's budget is
+   cannot make while the process runs, since the steady-state path retries an
+   unavailable sink forever and declares that loss only at the final flush. A
+   batch the sink refuses outright is the exception: it is counted lost and
+   dropped when refused, so a permanent error cannot stall every event queued
+   behind it. The drain's budget is
    total wall clock, so its retry backoffs sleep into whatever remains and
    never past it: an overrun spends the margin `expiry_safety_margin +
    reclaim_grace` reserves (GL-12), and bounding by attempt count alone is not a

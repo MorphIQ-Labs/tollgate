@@ -408,9 +408,12 @@ impl Default for WriterCounters {
 /// A reading of the writer's accounting health, safe to serialise.
 ///
 /// Note what `lost` does *not* tell you at runtime: the steady-state path
-/// retries a failing sink forever, so nothing is declared lost until the final
-/// flush gives up. A healthy-but-cut-off process reports `lost == 0` for its
-/// whole life. The leading indicators are [`WriterHealth::ingest_age`], a
+/// retries an *unavailable* sink forever, so an outage declares nothing lost
+/// until the final flush gives up. A healthy-but-cut-off process reports
+/// `lost == 0` for its whole life. The one steady-state loss is a batch the
+/// sink *refuses* (a permanent error, such as an accounting overflow): it is
+/// counted in `lost` and dropped at once, because replaying it would earn the
+/// same refusal forever and block every event behind it. The leading indicators are [`WriterHealth::ingest_age`], a
 /// `queue_depth` approaching `queue_capacity`, and `stats.rejected` — which the
 /// sink has already refused, and which is bounded billing loss.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
