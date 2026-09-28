@@ -3,7 +3,7 @@
 use core::fmt;
 
 /// A quantity of abstract cost units — the generic stand-in for a consumer's
-/// compute-unit vocabulary (FerroRisk's FCUs, another product's credits).
+/// compute-unit vocabulary (one product's compute units, another's credits).
 ///
 /// All arithmetic is checked: overflow returns `None` and callers must treat
 /// it as a denial (INVARIANTS.md GL-11). There are deliberately no `Add`/`Mul`

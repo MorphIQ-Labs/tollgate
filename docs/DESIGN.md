@@ -7,7 +7,7 @@ and the findings the PoC produced. The testable contract lives in
 
 ## Problem
 
-A latency-sensitive API service (FerroRisk's pricing service is the motivating
+A latency-sensitive API service (an options-pricing API is the motivating
 consumer, with a microsecond-scale in-process request budget) must enforce
 account policy, rate limits, quota, and billing **without any synchronous I/O
 on the request path**. One database round-trip per request would be two to
@@ -3729,8 +3729,8 @@ Google service-account bearer tokens use the existing `CredentialVerifier` seam,
 fixed issuer/algorithm/audience and stable subject mappings. Signing-key fetch is
 off the handler path, response/time bounded, and cached only through issuer
 freshness (at most one hour). Failed refresh cannot renew expired authority.
-On Cloud Run, the service's attached service account can supply tokens through
-the metadata provider, so no per-replica secret is required.
+On a Google Cloud workload, the attached service account can supply tokens
+through the metadata provider, so no per-replica secret is required.
 
 Verification, authorization and TLS configuration are one ArcSwap generation.
 The file loader stages referenced material, validates everything, and only marks
@@ -3763,8 +3763,9 @@ constructors, and receipt-returning backend methods. Wire DTOs, existing domain
 error codes, and PostgreSQL schemas are unchanged; authentication 401/403 codes
 are additive. The [operator runbook](CONTROL_PLANE_SECURITY.md) supplies the
 staged endpoint/client rollout and rotation procedure. A remote plaintext
-fallback would defeat the contract, including on a Cloud Run server container:
-the supported topology has Cloud Run clients connecting to a direct TLS endpoint.
+fallback would defeat the contract, including behind a platform front end that
+terminates TLS: the supported topology has clients connecting to a direct TLS
+endpoint.
 
 Dependencies are shared and locked. rustls/tokio-rustls and reqwest's rustls
 feature provide maintained TLS instead of an ad-hoc protocol. jsonwebtoken uses

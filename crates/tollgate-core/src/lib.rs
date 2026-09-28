@@ -11,7 +11,7 @@
 //!   path to fall back to.
 //! - **Checked arithmetic only.** Cost math never wraps (INVARIANTS.md GL-11).
 //! - **Domain-agnostic.** Cost units, operations, and permissions are generic;
-//!   consumers (e.g. FerroRisk) map their own vocabulary onto them at startup.
+//!   consumers map their own vocabulary onto them at startup.
 //!
 //! The pieces compose in request order: an [`AccountSnapshot`] admits the
 //! principal, a [`CostTable`] quotes the work, a [`LocalLease`] reserves the

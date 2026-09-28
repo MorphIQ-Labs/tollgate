@@ -2,7 +2,7 @@
 //! happens to what it did not spend.
 //!
 //! Tollgate stores a schedule and applies it; it does not interpret product
-//! vocabulary. A plan that calls its allowance "included FCUs" and its period
+//! vocabulary. A plan that calls its allowance "included credits" and its period
 //! "a calendar month" compiles to a [`BudgetSchedule`] here, and the ledger
 //! knows only units and instants.
 //!
