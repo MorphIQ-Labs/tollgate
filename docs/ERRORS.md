@@ -48,7 +48,7 @@ The [HTTP API reference](HTTP_API.md) lists which routes return which codes.
 | `invalid-json` | 400, 415 or 422 | the body is not JSON (400), is not sent as `application/json` (415), or does not match the endpoint's type, including a missing required field or an unknown field where refused (422). The status is axum's rejection status | no — fix the body |
 | `invalid-query` | 400 | query parameters are malformed or unknown | no — fix the query |
 | `invalid-limit` | 422 | a credential page `limit` outside 1–4096 | no — fix the limit |
-| `batch-too-large` | 413 | the body exceeds the endpoint's limit: 2 MiB for usage ingest and other routes, 4 MiB for snapshot publication | never unchanged — split the batch |
+| `batch-too-large` | 413 | the body exceeds the endpoint's limit: 2 MiB for usage ingest and other routes, 4 MiB for snapshot publication. Title: "request body exceeds this endpoint's limit"; only usage ingest appends the usage-batch event cap | never unchanged — reduce the body or split a usage batch |
 
 ### Leases
 
@@ -57,7 +57,7 @@ name. See [`LeaseAllocator`](../crates/tollgate-store/src/traits.rs).
 
 | code | status | meaning | retry |
 | --- | --- | --- | --- |
-| `unknown-account` | 404 | no such account | no — fix the id |
+| `unknown-account` | 404 | no such account, including when listing its credentials; an existing account with no matching keys returns an empty page | no — fix the id |
 | `account-inactive` | 409 | the account exists but is not in a state that may spend | after its status changes |
 | `insufficient-balance` | 409 | no grant is possible now. With `balance_shortfall`, the ledger attests how much funding remains, all of it held in other leases | yes, polling: settlement, lease release or a top-up can restore balance |
 | `balance-exhausted` | 409 | the ledger confirms no funding remains, including in leases | after a deposit, or after `balance_exhaustion.period_end` for a scheduled account |

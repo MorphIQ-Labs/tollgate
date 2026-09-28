@@ -7809,6 +7809,51 @@ new fields and can retain their old permissive generation. Reload affects new
 authentications, not in-flight grants or previously published snapshots;
 operators withdraw or replace those explicitly when removing an entitlement.
 
+## Account key listing preserves owner absence (GH-41)
+
+The credential directory previously returned only a vector or `StoreError`.
+Both stores filtered keys by account, so a missing account looked exactly like
+an existing account with no credentials. Tests covered ordering, paging,
+expiry and revocation but never the missing-owner boundary; the HTTP handler
+therefore returned `200` with an empty page for a mistyped account ID.
+
+`KeyDirectory::account_keys` now returns the existing `KeyError` vocabulary,
+including `UnknownAccount`. Memory tests account existence while holding the
+same lock used to assemble the page. PostgreSQL anchors one SELECT on the
+account and left-joins a bounded lateral credential page: zero rows means no
+account, while a NULL key means an existing account's empty page. Both facts
+come from one statement snapshot, including when creation overlaps the read.
+A creation committed after that snapshot becomes visible on the next read;
+a completed creation cannot be hidden by a stale HTTP preflight. Separate
+cursor query shapes preserve the account/key index range and page bound.
+
+The sibling caller is credential revocation. It intentionally retains its
+credential-scoped `unknown-credential` response for an absent owner. Other
+callers propagate the typed refusal; database corruption remains `Storage`.
+Shared backend scenarios and an HTTP regression cover absence, creation,
+empty pages with and without cursors, and exhaustion of an existing key page.
+
+Callers relying on `200 []` for a missing account must handle
+`404 unknown-account`. Custom Rust directory implementations must change the
+return error type from `StoreError` to `KeyError`. Deploy updated clients before
+the server where that behavior matters. There is no schema migration,
+authentication change, extra round trip, or request-path work.
+
+## Body-limit advice belongs to the route (GH-42)
+
+The shared JSON rejection converter appended the usage-batch event cap to
+all `413 batch-too-large` responses, including snapshot publication and account
+creation. Its existing regression exercised only ingest, where that advice was
+correct, so the misuse on other routes went unnoticed.
+
+The converter now supplies a route-neutral title. The ingest handler accepts
+the extractor result and adds its event cap only to a body-size rejection,
+before any store call. Snapshot and default-limit route tests pin the neutral
+message; ingest tests retain the cap and keep malformed JSON distinct.
+Status, code, byte limits, event limits, authentication and schemas are unchanged.
+Only human-readable error advice changes; there is no migration or request-path
+cost.
+
 ## Deposit overflow is a permanent refusal (GH-40)
 
 Deposit arithmetic already refused overflow atomically, but memory wrapped its
@@ -7836,3 +7881,13 @@ problem codes before the server so they recognize the permanent refusal.
 There is no schema migration or request-path work. Boundary tests cover exact
 fit, both overflowing counters, repeat refusals and PostgreSQL's input domain;
 the HTTP regression pins status and code as well as unchanged accounting.
+
+## Mutation diff runs and PostgreSQL requirements
+
+The diff gate intentionally disables PostgreSQL when no backend files change,
+to let independent mutation workers run without sharing a database. After the
+credential expiry integration test began enforcing `TOLLGATE_REQUIRE_PG`, the
+gate still removed only the URL, leaving a contradictory required-but-unavailable
+backend. Server-only changes therefore failed the unmutated baseline. The gate
+now clears both variables together only in that intentional optional-backend
+branch; backend changes and full sweeps retain the PostgreSQL requirement.

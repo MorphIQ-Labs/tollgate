@@ -684,8 +684,19 @@ async fn list_principals<S: Backend>(
 async fn ingest<S: Backend>(
     _identity: InstanceIdentity,
     State(state): State<ServerState<S>>,
-    ApiJson(request): ApiJson<IngestRequest>,
+    body: Result<ApiJson<IngestRequest>, ApiError>,
 ) -> Result<Json<IngestReport>, ApiError> {
+    let ApiJson(request) = body.map_err(|mut error| {
+        // Only this route accepts usage batches. The shared JSON rejection
+        // describes the byte limit without advice about another route's data.
+        if error.status == StatusCode::PAYLOAD_TOO_LARGE {
+            error.title.push_str(&format!(
+                "; usage batches are capped at {} events",
+                tollgate_store::MAX_INGEST_BATCH
+            ));
+        }
+        error
+    })?;
     Ok(Json(
         state
             .store
@@ -1153,12 +1164,16 @@ async fn revoke_account_key<S: Backend>(
             state.clock.as_ref(),
         )
         .await?;
-    let owned = state
+    let owned = match state
         .store
         .account_keys(account, key.0.checked_sub(1).map(KeyId), one())
-        .await?
-        .into_iter()
-        .any(|summary| summary.key_id == key);
+        .await
+    {
+        Ok(keys) => keys.into_iter().any(|summary| summary.key_id == key),
+        // Keep revocation credential-scoped, including a missing owner.
+        Err(tollgate_store::KeyError::UnknownAccount) => false,
+        Err(error) => return Err(error.into()),
+    };
     if !owned {
         return Err(ApiError::not_found(
             "unknown-credential",

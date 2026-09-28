@@ -1332,16 +1332,19 @@ async fn both_credential_listings_validate_queries_before_backend_reads() {
     let reads = Arc::new(AtomicUsize::new(0));
     let directory_reads = Arc::clone(&reads);
     let projection_reads = Arc::clone(&reads);
-    let store =
-        delegating::DelegatingStore::wrapping(MemoryStore::new(GrantPolicy::default()).unwrap())
-            .on_account_keys(move |inner, account, after, limit| {
-                directory_reads.fetch_add(1, Ordering::SeqCst);
-                async move { inner.account_keys(account, after, limit).await }
-            })
-            .on_active_keys_page(move |inner, now, after, limit| {
-                projection_reads.fetch_add(1, Ordering::SeqCst);
-                async move { inner.active_keys_page(now, after, limit).await }
-            });
+    let inner = MemoryStore::new(GrantPolicy::default()).unwrap();
+    // Valid query boundaries exercise an existing account; missing accounts
+    // have their own 404 contract, distinct from query validation.
+    make_account(&inner, 1).await;
+    let store = delegating::DelegatingStore::wrapping(inner)
+        .on_account_keys(move |inner, account, after, limit| {
+            directory_reads.fetch_add(1, Ordering::SeqCst);
+            async move { inner.account_keys(account, after, limit).await }
+        })
+        .on_active_keys_page(move |inner, now, after, limit| {
+            projection_reads.fetch_add(1, Ordering::SeqCst);
+            async move { inner.active_keys_page(now, after, limit).await }
+        });
     let app = router(ServerState {
         security: common::security(),
         issuer: None,
@@ -1764,6 +1767,97 @@ async fn an_issuer_minting_an_unpresentable_secret_is_refused_before_storage() {
             assert!(stored.is_empty(), "nothing was stored for {secret:?}");
         }
     }
+}
+
+#[tokio::test]
+async fn account_key_listing_distinguishes_unknown_from_empty() {
+    let (store, app) = state();
+    let path = api(&format!("/admin/accounts/{}/keys", id(41)));
+    for suffix in [String::new(), format!("?after={}&limit=1", id(99))] {
+        let (status, body) = call(&app, "GET", &format!("{path}{suffix}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "unknown-account");
+        assert_eq!(body["status"], 404);
+    }
+    // Revocation keeps its credential-scoped refusal for a missing owner.
+    let (status, body) = call(&app, "DELETE", &format!("{path}/{}", id(99)), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "unknown-credential");
+
+    make_account(&store, 41).await;
+    for suffix in [String::new(), format!("?after={}&limit=1", id(99))] {
+        let (status, body) = call(&app, "GET", &format!("{path}{suffix}"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["keys"], json!([]));
+        assert!(body["next_after"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn oversized_non_usage_bodies_have_route_neutral_titles() {
+    let (_store, router) = state();
+    // Both explicit snapshot limits and the default JSON limit share the
+    // converter. Neither kind of route accepts a batch of usage events.
+    for (method, path, limit) in [
+        (
+            "PUT",
+            api(&format!("/admin/snapshots/{}", id(1))),
+            tollgate_store::wire::MAX_SNAPSHOT_BODY_BYTES,
+        ),
+        (
+            "PUT",
+            api(&format!(
+                "/admin/accounts/{}/keys/{}/snapshot",
+                id(1),
+                id(2)
+            )),
+            tollgate_store::wire::MAX_SNAPSHOT_BODY_BYTES,
+        ),
+        ("POST", api("/admin/accounts"), 2 * 1024 * 1024),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(&path)
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", common::OPERATOR),
+            )
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(" ".repeat(limit + 1)))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let problem: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(problem["status"], 413);
+        assert_eq!(problem["code"], "batch-too-large");
+        assert_eq!(
+            problem["title"],
+            "request body exceeds this endpoint's limit"
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_ingest_body_does_not_get_size_advice() {
+    let (_store, router) = state();
+    let (status, problem) = call(
+        &router,
+        "POST",
+        &api("/usage/ingest"),
+        Some(json!({"events": "not a batch"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(problem["code"], "invalid-json");
+    assert_eq!(
+        problem["title"],
+        "request body is not valid JSON for this endpoint"
+    );
 }
 
 #[tokio::test]

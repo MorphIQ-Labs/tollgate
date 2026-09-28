@@ -15,6 +15,18 @@ release from that section when the merge request lands.
   `403 scope-forbidden` (#43). Missing/invalid template configuration fails
   closed; `ProvisionerLimits::new` now takes templates and returns `Result`.
 
+### Fixed
+
+- Account key listing now returns `404 unknown-account` for an absent account,
+  replacing `200` with an empty page (#41). Existing accounts with no matching
+  credentials still return an empty page. `KeyDirectory::account_keys` now
+  returns `KeyError` instead of `StoreError`; custom backends and Rust callers
+  must update their signatures and handle `UnknownAccount`.
+
+- Oversized request bodies now receive a route-neutral error title; only usage
+  ingest includes the usage-batch event cap. `413 batch-too-large` is unchanged
+  (#42).
+
 ## [0.30.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.30.2...v0.30.3) - 2026-09-28
 
 ### Fixed
