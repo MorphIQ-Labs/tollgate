@@ -7767,3 +7767,31 @@ that exercised the unreleased vulnerable role must retire an exhausted
 credential, withdraw its snapshot, and issue a fresh key/principal before
 publishing again. Never lower a stored generation to recover it: instances
 retain the higher watermark.
+
+## Deposit overflow is a permanent refusal (GH-40)
+
+Deposit arithmetic already refused overflow atomically, but memory wrapped its
+checked-add failures in `Storage` and PostgreSQL treated both input conversion
+and SQL arithmetic failures as storage outages. The server therefore returned
+`503 storage`, whose retry advice can never repair a full lifetime deposited
+counter. The existing mirrored test asserted only that the deposit failed and
+moved neither column; it did not distinguish domain refusal from outage.
+The HTTP diagnostics fixture also used overflow as a stand-in for an outage;
+it now injects a storage failure explicitly, preserving its 503 privacy checks.
+
+`AllocateError::BalanceOverflow` now owns that distinction in both backends.
+Memory checks both sums before applying either. PostgreSQL rejects an amount
+outside nonnegative `BIGINT`, and maps only numeric-value-out-of-range SQLSTATE
+22003 from the deposit UPDATE to the permanent refusal. Other database errors
+retain `Storage`; the single-statement atomicity and locking are unchanged.
+The sibling lifetime-total overflow uses the same classification as top-up
+balance overflow. Lease settlement and other operations' arithmetic failures
+are outside the deposit contract and retain their existing classifications.
+
+The wire code `422 balance-overflow` is additive and the request/receipt shapes
+are unchanged. Rust exhaustive matches need the new variant; existing metric
+indices stay fixed and the new label is appended. Upgrade clients that classify
+problem codes before the server so they recognize the permanent refusal.
+There is no schema migration or request-path work. Boundary tests cover exact
+fit, both overflowing counters, repeat refusals and PostgreSQL's input domain;
+the HTTP regression pins status and code as well as unchanged accounting.
