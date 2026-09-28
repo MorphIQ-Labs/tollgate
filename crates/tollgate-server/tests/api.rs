@@ -1332,16 +1332,19 @@ async fn both_credential_listings_validate_queries_before_backend_reads() {
     let reads = Arc::new(AtomicUsize::new(0));
     let directory_reads = Arc::clone(&reads);
     let projection_reads = Arc::clone(&reads);
-    let store =
-        delegating::DelegatingStore::wrapping(MemoryStore::new(GrantPolicy::default()).unwrap())
-            .on_account_keys(move |inner, account, after, limit| {
-                directory_reads.fetch_add(1, Ordering::SeqCst);
-                async move { inner.account_keys(account, after, limit).await }
-            })
-            .on_active_keys_page(move |inner, now, after, limit| {
-                projection_reads.fetch_add(1, Ordering::SeqCst);
-                async move { inner.active_keys_page(now, after, limit).await }
-            });
+    let inner = MemoryStore::new(GrantPolicy::default()).unwrap();
+    // Valid query boundaries exercise an existing account; missing accounts
+    // have their own 404 contract, distinct from query validation.
+    make_account(&inner, 1).await;
+    let store = delegating::DelegatingStore::wrapping(inner)
+        .on_account_keys(move |inner, account, after, limit| {
+            directory_reads.fetch_add(1, Ordering::SeqCst);
+            async move { inner.account_keys(account, after, limit).await }
+        })
+        .on_active_keys_page(move |inner, now, after, limit| {
+            projection_reads.fetch_add(1, Ordering::SeqCst);
+            async move { inner.active_keys_page(now, after, limit).await }
+        });
     let app = router(ServerState {
         security: common::security(),
         issuer: None,
