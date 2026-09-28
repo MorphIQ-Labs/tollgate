@@ -4,20 +4,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use axum::extract::{FromRequestParts, Request, State};
+use axum::extract::{FromRequestParts, MatchedPath, OriginalUri, Request, State};
 use axum::http::{header, request::Parts};
 use axum::middleware::Next;
 use axum::response::Response;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tollgate_auth::CredentialVerifier;
-use tollgate_core::Principal;
+use tollgate_core::{CostUnits, Principal};
 use tollgate_store::Clock;
 
 use crate::error::ApiError;
 use crate::transport::{PeerIdentity, TlsConfig};
 
-/// Roles are disjoint. An operator credential cannot fund an instance.
+/// Roles are disjoint. An operator credential cannot fund an instance, and a
+/// provisioner reaches only the self-service subset of the admin API (#39).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -27,24 +28,103 @@ pub enum Role {
     /// An operator: every route under `/v1/admin`, including account
     /// funding, status, budgets, credentials and snapshot publication.
     Operator,
+    /// A self-service account service (#39): creates unfunded, suspended,
+    /// best-effort accounts, activates them, sets budgets within its
+    /// ceiling, and manages their credentials, on accounts a provisioner
+    /// created only. It can never fund, suspend, close, grant `Assured`, or
+    /// publish principal snapshots.
+    Provisioner,
+}
+
+impl Role {
+    /// The configuration spelling, which is also the audit spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Instance => "instance",
+            Role::Operator => "operator",
+            Role::Provisioner => "provisioner",
+        }
+    }
+}
+
+/// What a provisioner identity may grant beyond its fixed route and argument
+/// scope (#39).
+///
+/// Required rather than optional: a budget allowance funds admission, so an
+/// unbounded one would be a deposit by another name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProvisionerLimits {
+    max_budget_allowance: CostUnits,
+}
+
+impl ProvisionerLimits {
+    /// `max_budget_allowance` is the largest periodic allowance this
+    /// identity may set on an account, inclusive.
+    pub fn new(max_budget_allowance: CostUnits) -> Self {
+        Self {
+            max_budget_allowance,
+        }
+    }
+
+    /// The largest periodic allowance this identity may set, inclusive.
+    pub fn max_budget_allowance(&self) -> CostUnits {
+        self.max_budget_allowance
+    }
+}
+
+/// A role with whatever it carries. Limits exist exactly for a provisioner,
+/// so an operator with a ceiling or a provisioner without one is
+/// unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grant {
+    Instance,
+    Operator,
+    Provisioner(ProvisionerLimits),
 }
 
 /// A stable, non-secret audit identity chosen by the deployment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlIdentity {
     name: String,
-    role: Role,
+    grant: Grant,
 }
 
 impl ControlIdentity {
-    /// An identity named `name` holding `role`.
+    /// An instance or operator identity named `name`. A provisioner needs its
+    /// limits, so it is built with [`ControlIdentity::provisioner`].
     ///
     /// # Errors
     ///
-    /// Returns a [`SecurityError`] unless `name` is 1 to 128 ASCII
-    /// characters, each alphanumeric or one of `@ . _ : / -`.
+    /// Returns a [`SecurityError`] for [`Role::Provisioner`], or unless
+    /// `name` is 1 to 128 ASCII characters, each alphanumeric or one of
+    /// `@ . _ : / -`.
     pub fn new(name: impl Into<String>, role: Role) -> Result<Self, SecurityError> {
-        let name = name.into();
+        let grant = match role {
+            Role::Instance => Grant::Instance,
+            Role::Operator => Grant::Operator,
+            Role::Provisioner => {
+                return Err(SecurityError(
+                    "a provisioner identity requires max_budget_allowance",
+                ));
+            }
+        };
+        Self::with_grant(name.into(), grant)
+    }
+
+    /// A provisioner identity named `name`, bounded by `limits` (#39).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SecurityError`] for a `name` [`ControlIdentity::new`]
+    /// would refuse.
+    pub fn provisioner(
+        name: impl Into<String>,
+        limits: ProvisionerLimits,
+    ) -> Result<Self, SecurityError> {
+        Self::with_grant(name.into(), Grant::Provisioner(limits))
+    }
+
+    fn with_grant(name: String, grant: Grant) -> Result<Self, SecurityError> {
         if name.is_empty()
             || name.len() > 128
             || !name
@@ -55,7 +135,7 @@ impl ControlIdentity {
                 "identity must be 1..=128 ASCII identifier characters",
             ));
         }
-        Ok(Self { name, role })
+        Ok(Self { name, grant })
     }
 
     /// The audit name, recorded as the actor on authentication and
@@ -65,7 +145,18 @@ impl ControlIdentity {
     }
     /// The one role this identity holds.
     pub fn role(&self) -> Role {
-        self.role
+        match self.grant {
+            Grant::Instance => Role::Instance,
+            Grant::Operator => Role::Operator,
+            Grant::Provisioner(_) => Role::Provisioner,
+        }
+    }
+    /// The provisioner's limits; `None` for every other role.
+    pub fn provisioner_limits(&self) -> Option<ProvisionerLimits> {
+        match self.grant {
+            Grant::Provisioner(limits) => Some(limits),
+            Grant::Instance | Grant::Operator => None,
+        }
     }
 }
 
@@ -233,7 +324,9 @@ fn validate(policy: &SecurityPolicy, tls: Option<&TlsConfig>) -> Result<(), Secu
 pub(crate) struct Authorization {
     pub security: Arc<ServerSecurity>,
     pub clock: Arc<dyn Clock>,
-    pub role: Role,
+    /// The roles this router admits. Each route sits under exactly one
+    /// router, so each route admits exactly one fixed set.
+    pub roles: &'static [Role],
 }
 
 /// Transport framing is bounded and singular. Never log a rejected header.
@@ -302,16 +395,42 @@ pub(crate) async fn authorize(
         (Some(identity), _) | (_, Some(identity)) => identity,
         (None, None) => return Err(ApiError::unauthorized()),
     };
-    if identity.role != auth.role {
+    if !auth.roles.contains(&identity.role()) {
+        // Audited, because a refused role is the signature of a credential
+        // used outside its purpose: a provisioner reaching for a deposit is
+        // what a compromised signup service looks like (#39). The route
+        // template names the action and the path is the resource; the
+        // credential itself is never logged.
+        let action = request
+            .extensions()
+            .get::<MatchedPath>()
+            .map_or("unmatched", MatchedPath::as_str);
+        tracing::warn!(target: "tollgate::audit", actor = identity.name(),
+            role = identity.role().as_str(), action = %format_args!("{} {action}", request.method()),
+            resource = request.extensions().get::<OriginalUri>().map_or_else(|| request.uri().path(), |uri| uri.path()),
+            at = %now, outcome = "refused",
+            code = "scope-forbidden", "control-plane request refused for its role");
         return Err(ApiError::forbidden());
     }
-    tracing::debug!(actor = identity.name(), role = ?identity.role(), "control-plane request authenticated");
-    match identity.role {
-        Role::Instance => {
+    tracing::debug!(
+        actor = identity.name(),
+        role = identity.role().as_str(),
+        "control-plane request authenticated"
+    );
+    match identity.grant {
+        Grant::Instance => {
             request.extensions_mut().insert(InstanceIdentity);
         }
-        Role::Operator => {
+        Grant::Operator => {
+            request
+                .extensions_mut()
+                .insert(AdminIdentity::Operator(identity.clone()));
             request.extensions_mut().insert(OperatorIdentity(identity));
+        }
+        Grant::Provisioner(limits) => {
+            request
+                .extensions_mut()
+                .insert(AdminIdentity::Provisioner(identity, limits));
         }
     }
     Ok(next.run(request).await)
@@ -323,6 +442,14 @@ pub(crate) async fn authorize(
 pub(crate) struct InstanceIdentity;
 #[derive(Clone)]
 pub(crate) struct OperatorIdentity(pub ControlIdentity);
+/// Evidence for a route operators and provisioners share. The router decided
+/// only that this identity may ask; the handler decides what a provisioner
+/// may send (#39).
+#[derive(Clone)]
+pub(crate) enum AdminIdentity {
+    Operator(ControlIdentity),
+    Provisioner(ControlIdentity, ProvisionerLimits),
+}
 
 macro_rules! identity_extractor {
     ($name:ident) => {
@@ -340,6 +467,7 @@ macro_rules! identity_extractor {
 }
 identity_extractor!(InstanceIdentity);
 identity_extractor!(OperatorIdentity);
+identity_extractor!(AdminIdentity);
 
 #[cfg(test)]
 mod framing_tests {
@@ -425,8 +553,7 @@ mod framing_tests {
 }
 
 impl OperatorIdentity {
-    /// The receipt is the backend's proof. Errors and cancellation never
-    /// manufacture a before/after pair or claim that an ambiguous write rolled back.
+    /// See [`audited`].
     pub(crate) async fn run<T, E: Into<ApiError>>(
         &self,
         action: &'static str,
@@ -434,59 +561,144 @@ impl OperatorIdentity {
         clock: &dyn Clock,
         operation: impl Future<Output = Result<tollgate_store::AdminReceipt<T>, E>>,
     ) -> Result<T, ApiError> {
-        struct Attempt<'a> {
-            id: tollgate_core::RequestId,
-            identity: &'a ControlIdentity,
-            action: &'static str,
-            target: String,
-            clock: &'a dyn Clock,
-            finished: bool,
+        audited(&self.0, action, target, clock, operation).await
+    }
+}
+
+impl AdminIdentity {
+    pub(crate) fn identity(&self) -> &ControlIdentity {
+        match self {
+            AdminIdentity::Operator(identity) | AdminIdentity::Provisioner(identity, _) => identity,
         }
-        impl Drop for Attempt<'_> {
-            fn drop(&mut self) {
-                if !self.finished {
-                    tracing::warn!(target: "tollgate::audit", actor = self.identity.name(), action = self.action,
+    }
+
+    /// See [`audited`].
+    pub(crate) async fn run<T, E: Into<ApiError>>(
+        &self,
+        action: &'static str,
+        target: impl std::fmt::Display,
+        clock: &dyn Clock,
+        operation: impl Future<Output = Result<tollgate_store::AdminReceipt<T>, E>>,
+    ) -> Result<T, ApiError> {
+        audited(self.identity(), action, target, clock, operation).await
+    }
+
+    /// Refuse a request outside this identity's scope before any store call,
+    /// and audit the refusal: an attempt a role may not make is evidence,
+    /// not noise (#39).
+    pub(crate) fn refuse(
+        &self,
+        action: &'static str,
+        target: impl std::fmt::Display,
+        clock: &dyn Clock,
+        code: &'static str,
+        title: &'static str,
+    ) -> ApiError {
+        let identity = self.identity();
+        tracing::warn!(target: "tollgate::audit", actor = identity.name(),
+            role = identity.role().as_str(), action, resource = %target, at = %clock.now(),
+            outcome = "refused", code, reason = title, "administrative operation refused for its scope");
+        ApiError::refused_scope(code, title)
+    }
+
+    /// A provisioner may act only on an account a provisioner created (#39);
+    /// an operator passes unconditionally.
+    ///
+    /// A read separate from the operation it guards is sound here, where it
+    /// would not be for status: `origin` is written once at creation and
+    /// never changes, so no write can slip between this check and the
+    /// operation. The mutable fact, who set the status, is checked inside
+    /// the store's own transaction instead.
+    pub(crate) async fn check_account<S: tollgate_store::AdminStore + ?Sized>(
+        &self,
+        store: &S,
+        account: tollgate_core::AccountId,
+        action: &'static str,
+        target: impl std::fmt::Display,
+        clock: &dyn Clock,
+    ) -> Result<(), ApiError> {
+        if let AdminIdentity::Operator(_) = self {
+            return Ok(());
+        }
+        match store.account_view(account).await? {
+            None => Err(tollgate_store::SetStatusError::UnknownAccount.into()),
+            Some(view) if view.origin == tollgate_store::AdminAuthority::Provisioner => Ok(()),
+            Some(_) => Err(self.refuse(
+                action,
+                target,
+                clock,
+                "account-not-provisioned",
+                "account was not created by a provisioner",
+            )),
+        }
+    }
+}
+
+/// The receipt is the backend's proof. Errors and cancellation never
+/// manufacture a before/after pair or claim that an ambiguous write rolled back.
+async fn audited<T, E: Into<ApiError>>(
+    identity: &ControlIdentity,
+    action: &'static str,
+    target: impl std::fmt::Display,
+    clock: &dyn Clock,
+    operation: impl Future<Output = Result<tollgate_store::AdminReceipt<T>, E>>,
+) -> Result<T, ApiError> {
+    struct Attempt<'a> {
+        id: tollgate_core::RequestId,
+        identity: &'a ControlIdentity,
+        action: &'static str,
+        target: String,
+        clock: &'a dyn Clock,
+        finished: bool,
+    }
+    impl Drop for Attempt<'_> {
+        fn drop(&mut self) {
+            if !self.finished {
+                tracing::warn!(target: "tollgate::audit", actor = self.identity.name(),
+                        role = self.identity.role().as_str(), action = self.action,
                         operation_id = %self.id,
                         resource = self.target, at = %self.clock.now(), outcome = "cancelled_unknown",
                         "administrative operation abandoned; commit outcome may be unknown");
-                }
             }
         }
-        let mut identifier = [0u8; 16];
-        getrandom::fill(&mut identifier).map_err(|_| {
-            ApiError::from(tollgate_store::StoreError(
-                "audit identity entropy unavailable".into(),
-            ))
-        })?;
-        let mut attempt = Attempt {
-            id: tollgate_core::RequestId(u128::from_be_bytes(identifier)),
-            identity: &self.0,
-            action,
-            target: target.to_string(),
-            clock,
-            finished: false,
-        };
-        tracing::info!(target: "tollgate::audit", actor = self.0.name(), action,
+    }
+    let mut identifier = [0u8; 16];
+    getrandom::fill(&mut identifier).map_err(|_| {
+        ApiError::from(tollgate_store::StoreError(
+            "audit identity entropy unavailable".into(),
+        ))
+    })?;
+    let mut attempt = Attempt {
+        id: tollgate_core::RequestId(u128::from_be_bytes(identifier)),
+        identity,
+        action,
+        target: target.to_string(),
+        clock,
+        finished: false,
+    };
+    tracing::info!(target: "tollgate::audit", actor = identity.name(),
+            role = identity.role().as_str(), action,
             operation_id = %attempt.id,
             resource = attempt.target, at = %clock.now(), outcome = "started", "administrative operation started");
-        let result = operation.await;
-        attempt.finished = true;
-        match result {
-            Ok(receipt) => {
-                tracing::info!(target: "tollgate::audit", actor = self.0.name(), action,
+    let result = operation.await;
+    attempt.finished = true;
+    match result {
+        Ok(receipt) => {
+            tracing::info!(target: "tollgate::audit", actor = identity.name(),
+            role = identity.role().as_str(), action,
                     operation_id = %attempt.id,
                     resource = attempt.target, at = %clock.now(), outcome = "confirmed",
                     before = ?receipt.before, after = ?receipt.after, "administrative operation completed");
-                Ok(receipt.outcome)
-            }
-            Err(error) => {
-                let error = error.into();
-                tracing::warn!(target: "tollgate::audit", actor = self.0.name(), action,
+            Ok(receipt.outcome)
+        }
+        Err(error) => {
+            let error = error.into();
+            tracing::warn!(target: "tollgate::audit", actor = identity.name(),
+            role = identity.role().as_str(), action,
                     operation_id = %attempt.id,
                     resource = attempt.target, at = %clock.now(), outcome = "failed",
                     code = error.code, status = error.status.as_u16(), "administrative operation failed; storage errors may conceal a commit");
-                Err(error)
-            }
+            Err(error)
         }
     }
 }

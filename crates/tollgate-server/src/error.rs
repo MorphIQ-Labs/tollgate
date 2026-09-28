@@ -120,6 +120,21 @@ impl ApiError {
         }
     }
 
+    /// A `403` naming why an authenticated identity may not do this (#39):
+    /// `scope-forbidden` for an argument its role may not send,
+    /// `account-not-provisioned` or `operator-hold` for an account outside a
+    /// provisioner's reach.
+    pub(crate) fn refused_scope(code: &'static str, title: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code,
+            title: title.into(),
+            generation: None,
+            balance_exhaustion: None,
+            balance_shortfall: None,
+        }
+    }
+
     /// `403 scope-forbidden`: the credential is valid, but its identity lacks
     /// the role this route requires.
     pub fn forbidden() -> Self {
@@ -378,6 +393,12 @@ impl From<SetStatusError> for ApiError {
                 balance_exhaustion: None,
                 balance_shortfall: None,
             },
+            // 403, not 409: a provisioner is outside its scope, and retrying
+            // cannot help. An operator can act where a provisioner cannot (#39).
+            SetStatusError::NotProvisioned => {
+                ApiError::refused_scope("account-not-provisioned", e.to_string())
+            }
+            SetStatusError::OperatorHold => ApiError::refused_scope("operator-hold", e.to_string()),
             SetStatusError::Storage(inner) => ApiError::from(inner),
         }
     }

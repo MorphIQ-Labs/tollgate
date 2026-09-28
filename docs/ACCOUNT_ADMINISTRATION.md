@@ -13,11 +13,21 @@ re-implementing credential and budget authority in a second service (GL-121).
 
 ## Authority and transport
 
-Every route below requires the **operator** role from the
-[control-plane security runbook](CONTROL_PLANE_SECURITY.md). An instance
-credential authenticates the request path and cannot administer accounts: it
-must not reach a customer's funding position or credential list. Anonymous
-callers are refused. TLS is required outside loopback.
+Every route below admits the **operator** role from the
+[control-plane security runbook](CONTROL_PLANE_SECURITY.md), and every route
+but `deposit` also admits the **provisioner** role. An instance credential
+authenticates the request path and cannot administer accounts: it must not
+reach a customer's funding position or credential list. Anonymous callers are
+refused. TLS is required outside loopback.
+
+A self-service signup service should hold a **provisioner**, not an operator.
+It can run this whole sequence except deposits, and nothing else: it cannot
+fund an account, suspend or close one, grant `Assured`, set a budget above its
+`max_budget_allowance`, publish an `Elastic` snapshot, or touch an account an
+operator created. An operator's suspension holds against it — a customer cannot
+undo an abuse suspension by retrying signup. The
+[provisioner scope](HTTP_API.md#the-provisioner-scope) lists every limit;
+each refusal is `403` and is audited.
 
 Identifiers — `account_id`, `key_id` — are 32 lowercase hexadecimal
 characters, as elsewhere in this API.
@@ -36,13 +46,16 @@ discloses a secret again.
 
 `201` on creation, `409 account-exists` if it already exists — which is the
 retry answer, not a failure: the account is there and creation is never
-destructive. Creation always assigns `CapacityClass::Assured`; step 2 changes
-it if the plan calls for something else.
+destructive. An operator's creation assigns `CapacityClass::Assured`; step 2
+changes it if the plan calls for something else. A provisioner must send
+exactly this body — zero balance, `Suspended` — and its account is created
+`BestEffort`, so step 2 is already done.
 
 Create suspended and activate in step 4, so an account cannot lease before its
 budget and credentials exist.
 
-**2. Set the capacity class**, if not `Assured`.
+**2. Set the capacity class**, if not `Assured`. A provisioner may only set
+`BestEffort`.
 `POST /v1/admin/accounts/{account}/capacity-class` with
 `{"capacity_class": "BestEffort"}`. Idempotent; the response reports how many
 live snapshots the change republished.
@@ -75,7 +88,10 @@ needs both.
 
 **4. Activate.** `POST /v1/admin/accounts/{account}/status` with
 `{"status": "Active"}`. Idempotent. `Closed` is terminal: no transition leaves
-it, and the request is refused with `409 account-closed`.
+it, and the request is refused with `409 account-closed`. A provisioner's
+activation is refused with `403 operator-hold` when an operator set the
+account's current status — typically an abuse suspension — and only an
+operator can lift it.
 
 **5. Issue a credential.** See below. Do this last: a credential that exists
 before the account is active authenticates into denials.
@@ -216,11 +232,16 @@ generation and whether it is withdrawn, and never a principal.
 
 ```json
 { "account_id": "…", "as_of": "…", "status": "Active",
-  "capacity_class": "Assured", "budget": { … }, "period_start": "…",
+  "capacity_class": "Assured", "origin": "Operator", "status_set_by": "Operator",
+  "budget": { … }, "period_start": "…",
   "balance": 600, "outstanding_lease_grants": 400, "settled_usage": 0,
   "expired_allowance": 0, "settlement_loss": 0,
   "deposited": 1000, "overage_recorded": 0 }
 ```
+
+`origin` names the authority that created the account and `status_set_by` the
+one that set its current status, each `Operator` or `Provisioner`. They are
+what a provisioner's scope and an operator hold are decided from.
 
 Authoritative as of `as_of`, from one consistent backend snapshot, so the
 figures agree with each other. It is **not a live feed**: an admission

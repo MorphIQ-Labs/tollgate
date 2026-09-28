@@ -968,6 +968,13 @@ pub enum SetStatusError {
     /// status and leaves it never. The refusal changes nothing — not the
     /// ledger, not one snapshot, not one generation.
     AccountClosed,
+    /// A provisioner addressed an account an operator created. Only
+    /// [`AdminStore::activate_provisioned`] returns it (#39).
+    NotProvisioned,
+    /// An operator set the account's current status, and a provisioner may
+    /// not undo it. Only [`AdminStore::activate_provisioned`] returns it, so an
+    /// abuse suspension cannot be reversed by retrying signup (#39).
+    OperatorHold,
     /// A backend failure unrelated to domain rules; see [`StoreError`].
     Storage(StoreError),
 }
@@ -977,6 +984,10 @@ impl std::fmt::Display for SetStatusError {
         match self {
             SetStatusError::UnknownAccount => f.write_str("unknown account"),
             SetStatusError::AccountClosed => f.write_str("account is closed"),
+            SetStatusError::NotProvisioned => {
+                f.write_str("account was not created by a provisioner")
+            }
+            SetStatusError::OperatorHold => f.write_str("an operator set this account's status"),
             SetStatusError::Storage(e) => write!(f, "{e}"),
         }
     }
@@ -1085,6 +1096,11 @@ pub struct AccountView {
     pub status: AccountStatus,
     /// Execution-capacity class, from the ledger.
     pub capacity_class: CapacityClass,
+    /// Which authority created the account. Immutable, which is what lets a
+    /// caller check it before a separate write without a race (#39).
+    pub origin: crate::AdminAuthority,
+    /// Which authority set the current `status`.
+    pub status_set_by: crate::AdminAuthority,
     /// The periodic allowance, if this account has one. `None` is "no
     /// schedule, the balance does not expire" — not "unknown".
     pub schedule: Option<BudgetSchedule>,
@@ -1119,6 +1135,19 @@ pub trait AdminStore: Send + Sync {
     async fn create_account(
         &self,
         config: AccountConfig,
+    ) -> Result<crate::AdminReceipt<()>, CreateAccountError>;
+    /// Create an account on behalf of a provisioner (#39): zero balance,
+    /// [`AccountStatus::Suspended`], [`CapacityClass::BestEffort`], and
+    /// [`AdminAuthority::Provisioner`](crate::AdminAuthority::Provisioner) as
+    /// both its origin and the author of its status.
+    ///
+    /// Every value is fixed here rather than taken from the caller, so a
+    /// provisioner cannot create a funded, active or assured account whatever
+    /// it sends. The same creation rules as [`create_account`](Self::create_account)
+    /// apply otherwise, including [`CreateAccountError::AlreadyExists`].
+    async fn create_provisioned_account(
+        &self,
+        account: AccountId,
     ) -> Result<crate::AdminReceipt<()>, CreateAccountError>;
     /// Add `units` to an existing account as a top-up, which survives period
     /// boundaries, raising its balance and its `deposited` total together.
@@ -1156,10 +1185,37 @@ pub trait AdminStore: Send + Sync {
     ///   at once, but admission stops only when the new snapshot installs —
     ///   one `SnapshotManager` refresh interval, and already-debited units
     ///   settle at release or TTL reclaim (GL-9).
+    /// - Every call, a repeat included, records
+    ///   [`AdminAuthority::Operator`](crate::AdminAuthority::Operator) as the
+    ///   status author, so an operator re-suspending an account a provisioner
+    ///   created holds it against [`activate_provisioned`](Self::activate_provisioned) (#39).
     async fn set_account_status(
         &self,
         account: AccountId,
         status: AccountStatus,
+    ) -> Result<crate::AdminReceipt<StatusChange>, SetStatusError>;
+
+    /// Activate an account on behalf of a provisioner (#39), under the same
+    /// serialization point and with the same republication as
+    /// [`set_account_status`](Self::set_account_status).
+    ///
+    /// Rules, checked in this order inside that serialization point:
+    /// - A missing account is [`SetStatusError::UnknownAccount`].
+    /// - An account an operator created is [`SetStatusError::NotProvisioned`].
+    /// - A closed account is [`SetStatusError::AccountClosed`].
+    /// - An account an operator suspended is [`SetStatusError::OperatorHold`]:
+    ///   the check reads the status author in the same transaction as the
+    ///   write, so a concurrent operator suspension either lands first and
+    ///   holds, or lands second and wins.
+    /// - An already active account is an idempotent no-op that keeps its
+    ///   status author.
+    ///
+    /// A successful activation records
+    /// [`AdminAuthority::Provisioner`](crate::AdminAuthority::Provisioner) as
+    /// the status author.
+    async fn activate_provisioned(
+        &self,
+        account: AccountId,
     ) -> Result<crate::AdminReceipt<StatusChange>, SetStatusError>;
 
     /// Set an existing account's execution-capacity class, in one
@@ -1755,6 +1811,23 @@ pub trait KeyDirectory: crate::KeySource {
     /// [`PublishSnapshotError::CredentialMismatch`]. Every other rule is
     /// [`AdminStore::publish_snapshot`]'s, including the generation no-op.
     async fn publish_key_snapshot(
+        &self,
+        account: AccountId,
+        key: KeyId,
+        snapshot: PublishableSnapshot,
+    ) -> Result<crate::AdminReceipt<()>, KeySnapshotError>;
+
+    /// Publish key policy with a store-allocated generation. The submitted
+    /// generation is ignored: first publication uses 1, and each later write
+    /// uses the live snapshot or tombstone's generation plus one. Allocation,
+    /// validation, publication and receipt capture are one atomic operation.
+    /// Overflow fails without changing the snapshot or emitting a push.
+    ///
+    /// Provisioner HTTP publication must use this operation so an untrusted
+    /// caller cannot exhaust generations with an arbitrary jump. Repeats are
+    /// new publications, ordered by the store. All credential and ledger
+    /// checks from [`Self::publish_key_snapshot`] still apply.
+    async fn publish_key_snapshot_next(
         &self,
         account: AccountId,
         key: KeyId,

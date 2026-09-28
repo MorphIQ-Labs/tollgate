@@ -145,6 +145,99 @@ async fn malformed_or_ambiguous_credentials_cannot_become_authoritative() {
     }
 }
 
+/// A provisioner entry needs its budget ceiling, and no other role may carry
+/// one, whichever credential source names it (#39). Google subjects are
+/// covered beside the loader's key fetch in `config.rs`.
+#[tokio::test]
+async fn a_provisioner_entry_requires_its_ceiling_and_no_other_role_takes_one() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("security.json");
+    std::fs::write(directory.path().join("token"), common::PROVISIONER).unwrap();
+    let certificates = common::certificates();
+    std::fs::write(directory.path().join("client.pem"), &certificates.client).unwrap();
+    for (entry, valid) in [
+        (
+            json!({"bearers": [{"identity": "signup", "role": "provisioner", "token_file": "token", "max_budget_allowance": 1000}]}),
+            true,
+        ),
+        (
+            json!({"bearers": [{"identity": "signup", "role": "provisioner", "token_file": "token"}]}),
+            false,
+        ),
+        (
+            json!({"bearers": [{"identity": "ops", "role": "operator", "token_file": "token", "max_budget_allowance": 1000}]}),
+            false,
+        ),
+        (
+            json!({"bearers": [{"identity": "svc", "role": "instance", "token_file": "token", "max_budget_allowance": 1000}]}),
+            false,
+        ),
+        (
+            json!({"certificates": [{"identity": "signup", "role": "provisioner", "certificate": "client.pem", "max_budget_allowance": 1000}]}),
+            true,
+        ),
+        (
+            json!({"certificates": [{"identity": "signup", "role": "provisioner", "certificate": "client.pem"}]}),
+            false,
+        ),
+        (
+            json!({"certificates": [{"identity": "ops", "role": "operator", "certificate": "client.pem", "max_budget_allowance": 1000}]}),
+            false,
+        ),
+    ] {
+        std::fs::write(&path, entry.to_string()).unwrap();
+        assert_eq!(
+            SecurityLoader::new(&path)
+                .load(SystemClock.now())
+                .await
+                .is_ok(),
+            valid,
+            "{entry}"
+        );
+    }
+
+    // A loaded provisioner bearer reaches the shared admin routes and no other.
+    std::fs::write(
+        &path,
+        json!({"bearers": [{"identity": "signup", "role": "provisioner", "token_file": "token", "max_budget_allowance": 1000}]})
+            .to_string(),
+    )
+    .unwrap();
+    let mut loader = SecurityLoader::new(&path);
+    let loaded = loader.load(SystemClock.now()).await.unwrap().unwrap();
+    let app = router(ServerState {
+        store: MemoryStore::new(GrantPolicy::default()).unwrap(),
+        clock: Arc::new(SystemClock),
+        security: loader.start(loaded).unwrap(),
+        issuer: None,
+    });
+    for (path, expected) in [
+        ("/v1/admin/accounts", StatusCode::CREATED),
+        (
+            "/v1/admin/accounts/00000000000000000000000000000001/deposit",
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("authorization", format!("Bearer {}", common::PROVISIONER))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"account_id": "00000000000000000000000000000001", "initial_balance": 0, "status": "Suspended", "units": 1})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{path}");
+    }
+}
+
 #[tokio::test]
 async fn static_credential_files_enforce_both_length_bounds_and_visible_framing() {
     let directory = tempfile::tempdir().unwrap();

@@ -2139,9 +2139,12 @@ exists to detect corrupt state and must not be able to launder it.
     `shutdown_distinguishes_settled_leases_from_unconfirmed_or_invalid_releases`.
 
 32. **Control-plane authority is verified before decoding or mutation.** Every
-    protected HTTP handler requires private instance or operator evidence;
-    middleware authenticates and authorizes before body/path extraction. The
-    roles are disjoint. A client certificate must pass TLS key possession and
+    protected HTTP handler requires private instance, operator or admin
+    (operator-or-provisioner) evidence; middleware authenticates and authorizes
+    before body/path extraction. The roles are disjoint: each route admits one
+    fixed role set, and a credential outside it is refused with
+    `403 scope-forbidden` and a `refused` audit event naming the actor, role
+    and route before any extractor runs (41). A client certificate must pass TLS key possession and
     current CA/time validation, and its leaf fingerprint must have a role.
     Bearer schemes return verified principals with validity bounds, mapped to
     roles in the same immutable generation. Conflicting evidence, expired
@@ -2177,8 +2180,9 @@ exists to detect corrupt state and must not be able to launder it.
 
     Enforcement: private handler extractors, `ServerSecurity`, `SecureListener`,
     `SecurityLoader`, and the generation-owning `HttpRequest`. Exact-model proof:
-    `formal/lean/Tollgate/ControlPlane.lean` proves role separation and agreement
-    of presented evidence, assuming verification and atomic generation selection.
+    `formal/lean/Tollgate/ControlPlane.lean` proves role separation, route
+    role-set admission (`admission_requires_a_listed_role`) and agreement of
+    presented evidence, assuming verification and atomic generation selection.
     It does not prove cryptography, rustls, Tokio, clock accuracy or Rust refinement.
     Implementation witnesses: `every_control_plane_route_requires_its_own_role_before_decoding`,
     `ambiguous_framing_and_forged_peer_headers_authenticate_nobody`,
@@ -2208,6 +2212,7 @@ exists to detect corrupt state and must not be able to launder it.
     `certificate_configuration_checks_trust_key_pairs_and_handshake_bounds`,
     `the_binary_refuses_an_exposed_plaintext_listener_before_opening_the_backend`,
     `pending_tls_handshakes_are_bounded_expire_and_drop_with_the_listener`,
+    `a_refused_role_is_audited_with_its_actor_role_and_action`,
     `full_stack_over_tls_bearer` and `full_stack_over_mtls`.
 
 33. **An administrative audit receipt describes its own serialized mutation.**
@@ -2238,16 +2243,21 @@ exists to detect corrupt state and must not be able to launder it.
     are witnessed by `account_key_listing_distinguishes_unknown_from_empty`.
     Revocation retains `404 unknown-credential` for an absent owner.
 
-    The HTTP operator guard emits actor, operation ID, action, resource and time
-    before a store call, then confirms with the receipt, or reports failure or
+    The HTTP admin guard emits actor, role, operation ID, action, resource and
+    time before a store call, then confirms with the receipt, or reports failure or
     cancellation without inventing a state transition. Storage errors and
     cancellation can conceal a commit. Delivery uses the embedder's tracing
     subscriber; this contract does not claim transactional durability across
     process death or logging failure. The binary retains audit events separately
     from normal verbosity; operators retain and monitor their log delivery.
 
+    A request refused for its scope never reaches that guard: it emits one
+    `refused` event with the actor, role, action, resource, time and code, and
+    no `started`, because nothing was attempted (41).
+
     Enforcement: `AdminReceipt` in trait return types, receipt creation inside
-    both backends, and `OperatorIdentity::run` around every admin mutation.
+    both backends, and the shared `audited` guard behind `OperatorIdentity::run`
+    and `AdminIdentity::run` around every admin mutation.
     `formal/lean/Tollgate/ControlPlane.lean` proves abstract deposit receipt
     conservation and predecessor composition; checked arithmetic and database
     serialization are separate implementation evidence. Mirrored backend tests:
@@ -2564,3 +2574,73 @@ exists to detect corrupt state and must not be able to launder it.
     `observing_a_publication_does_not_consume_an_affinity`,
     `an_observed_slot_read_answers_without_claiming_an_affinity`, and
     `a_runtime_report_carries_the_effective_shard_layout`.
+
+41. **A provisioner can neither fund, close, grant `Assured`, exceed its budget
+    ceiling, extend credit, reach an operator's account, nor undo an operator's
+    status or exhaust snapshot generations through caller-selected jumps.**
+    A `provisioner` identity (#39) reaches every admin route except
+    deposit and principal-snapshot publication. On those it reaches, it may
+    create only an unfunded, suspended, best-effort account; move status only to
+    `Active`; set only `BestEffort`; set an allowance no larger than its
+    identity's `max_budget_allowance`; and publish only `Strict` key snapshots.
+    Key-snapshot generations are store-allocated: first publication is 1,
+    then the locked live or revoked watermark plus one, regardless of the
+    submitted generation. A repeat is a new publication; arithmetic overflow
+    changes nothing. This removes arbitrary jumps that could block the
+    operator's status or capacity-class republishing.
+    Every account-scoped route requires the account's `origin` to be
+    `Provisioner`, and activation refuses an account whose current status an
+    operator set. Every scope refusal is `403` and audited; none moves the store.
+
+    Enforcement, top of the ladder first. *Unrepresentable:* a provisioner
+    `ControlIdentity` cannot be built without `ProvisionerLimits`, nor any other
+    role with them, and the manifest refuses a missing or misplaced
+    `max_budget_allowance`; `AdminStore::create_provisioned_account` takes only
+    an id, so the balance, status, class and origin it writes are the store's,
+    not the caller's. *Component-owned:* the router admits deposit and
+    principal publication to `[operator]` only; the store's
+    `activate_provisioned` checks provenance and the status author under the
+    same row lock or mutex as the write, and every `set_account_status` records
+    the operator as author, so a racing suspension either lands first and
+    holds or lands second and wins. `KeyDirectory::publish_key_snapshot_next`
+    allocates and publishes under the same mutex or snapshot-row lock, with
+    insert conflicts resolved against the winning row before allocation.
+    `origin` is immutable, so the handlers'
+    `AdminIdentity::check_account` may read it before a separate write without
+    a race. Argument refusals (balance, status, class, ceiling, enforcement
+    mode) are handler checks made before any store call — tested convention,
+    hardened by the witnesses below. Existing rows default to `Operator` in
+    migration 0020, so upgrading grants a provisioner nothing.
+    Exact-model proof: `formal/lean/Tollgate/ControlPlane.lean` proves
+    `a_provisioner_cannot_fund_or_publish_principals`,
+    `an_operator_suspension_holds`, `activation_only_activates` and
+    `an_operators_account_is_out_of_reach`, assuming each transition is atomic;
+    it does not model balances, snapshot policy or the handler argument checks.
+    `allocated_generation_advances_exactly_once`, `exhausted_generation_refuses`
+    and `first_allocated_generation_is_one` prove bounded successor allocation
+    in the same model. Finite-width and concurrency witnesses in both backends:
+    `store_allocated_generations_ignore_input_and_follow_tombstones`,
+    `store_allocated_generations_preserve_operator_transitions`,
+    `concurrent_store_allocated_publications_have_distinct_generations`,
+    `exhausted_store_allocated_generation_changes_nothing`, and
+    `store_allocated_publication_preserves_binding_retirement_and_ledger_checks`.
+    The HTTP dispatch witness is
+    `provisioner_generation_extremes_cannot_block_operator_transitions`.
+    Mirrored backend tests:
+    `a_provisioned_account_is_born_unfunded_suspended_and_best_effort` and
+    `provisioned_activation_honours_provenance_and_operator_holds` and
+    `repeating_operator_suspension_establishes_a_hold`; PostgreSQL:
+    `stored_authorities_reject_unknown_vocabulary` and
+    `accounts_predating_provenance_belong_to_operators`. HTTP witnesses:
+    `a_provisioner_completes_every_self_service_call`,
+    `a_provisioner_is_refused_and_audited_before_the_store_moves`,
+    `a_provisioner_cannot_reach_an_account_an_operator_created`,
+    `an_operator_suspension_holds_against_provisioner_activation`, and
+    `a_refused_role_is_audited_with_its_actor_role_and_action`. Configuration:
+    `a_provisioner_entry_requires_its_ceiling_and_no_other_role_takes_one` and
+    `a_google_provisioner_subject_requires_its_ceiling`.
+
+    Not covered: a provisioner's key snapshot still carries its own cost
+    table, limits and permissions. Constraining those to operator-approved
+    policy is tracked in #43; until then the provisioner's policy source is
+    trusted.

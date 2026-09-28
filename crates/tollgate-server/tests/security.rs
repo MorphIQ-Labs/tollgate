@@ -29,51 +29,47 @@ fn state(security: Arc<ServerSecurity>) -> ServerState<MemoryStore> {
 
 #[tokio::test]
 async fn every_control_plane_route_requires_its_own_role_before_decoding() {
+    const INSTANCE_ONLY: &[Role] = &[Role::Instance];
+    const OPERATOR_ONLY: &[Role] = &[Role::Operator];
+    const ADMIN: &[Role] = &[Role::Operator, Role::Provisioner];
     let app = router(state(common::security()));
-    for (method, path, expected_role) in [
-        ("POST", "/v1/leases/acquire", Role::Instance),
-        ("POST", "/v1/leases/release", Role::Instance),
-        ("POST", "/v1/leases/consolidate", Role::Instance),
-        ("POST", "/v1/leases/reclaim", Role::Instance),
-        ("GET", "/v1/snapshots", Role::Instance),
-        ("GET", "/v1/keys", Role::Instance),
-        ("GET", "/v1/snapshots/invalid", Role::Instance),
-        ("POST", "/v1/usage/ingest", Role::Instance),
-        ("POST", "/v1/admin/accounts", Role::Operator),
-        ("POST", "/v1/admin/accounts/invalid/deposit", Role::Operator),
-        ("POST", "/v1/admin/accounts/invalid/status", Role::Operator),
-        (
-            "POST",
-            "/v1/admin/accounts/invalid/capacity-class",
-            Role::Operator,
-        ),
-        ("GET", "/v1/admin/accounts/invalid", Role::Operator),
-        ("PUT", "/v1/admin/accounts/invalid/budget", Role::Operator),
-        ("POST", "/v1/admin/accounts/invalid/keys", Role::Operator),
-        ("GET", "/v1/admin/accounts/invalid/keys", Role::Operator),
-        (
-            "DELETE",
-            "/v1/admin/accounts/invalid/keys/invalid",
-            Role::Operator,
-        ),
+    for (method, path, roles) in [
+        ("POST", "/v1/leases/acquire", INSTANCE_ONLY),
+        ("POST", "/v1/leases/release", INSTANCE_ONLY),
+        ("POST", "/v1/leases/consolidate", INSTANCE_ONLY),
+        ("POST", "/v1/leases/reclaim", INSTANCE_ONLY),
+        ("GET", "/v1/snapshots", INSTANCE_ONLY),
+        ("GET", "/v1/keys", INSTANCE_ONLY),
+        ("GET", "/v1/snapshots/invalid", INSTANCE_ONLY),
+        ("POST", "/v1/usage/ingest", INSTANCE_ONLY),
+        ("POST", "/v1/admin/accounts", ADMIN),
+        ("POST", "/v1/admin/accounts/invalid/deposit", OPERATOR_ONLY),
+        ("POST", "/v1/admin/accounts/invalid/status", ADMIN),
+        ("POST", "/v1/admin/accounts/invalid/capacity-class", ADMIN),
+        ("GET", "/v1/admin/accounts/invalid", ADMIN),
+        ("PUT", "/v1/admin/accounts/invalid/budget", ADMIN),
+        ("POST", "/v1/admin/accounts/invalid/keys", ADMIN),
+        ("GET", "/v1/admin/accounts/invalid/keys", ADMIN),
+        ("DELETE", "/v1/admin/accounts/invalid/keys/invalid", ADMIN),
         (
             "PUT",
             "/v1/admin/accounts/invalid/keys/invalid/snapshot",
-            Role::Operator,
+            ADMIN,
         ),
         (
             "DELETE",
             "/v1/admin/accounts/invalid/keys/invalid/snapshot",
-            Role::Operator,
+            ADMIN,
         ),
-        ("PUT", "/v1/admin/snapshots/invalid", Role::Operator),
-        ("DELETE", "/v1/admin/snapshots/invalid", Role::Operator),
+        ("PUT", "/v1/admin/snapshots/invalid", OPERATOR_ONLY),
+        ("DELETE", "/v1/admin/snapshots/invalid", OPERATOR_ONLY),
     ] {
         for token in [
             None,
             Some("bad-token"),
             Some(common::INSTANCE),
             Some(common::OPERATOR),
+            Some(common::PROVISIONER),
         ] {
             let mut request = Request::builder()
                 .method(method)
@@ -89,10 +85,13 @@ async fn every_control_plane_route_requires_its_own_role_before_decoding() {
                 .unwrap();
             let expected = match token {
                 None | Some("bad-token") => Some(StatusCode::UNAUTHORIZED),
-                Some(common::INSTANCE) if expected_role == Role::Operator => {
+                Some(common::INSTANCE) if !roles.contains(&Role::Instance) => {
                     Some(StatusCode::FORBIDDEN)
                 }
-                Some(common::OPERATOR) if expected_role == Role::Instance => {
+                Some(common::OPERATOR) if !roles.contains(&Role::Operator) => {
+                    Some(StatusCode::FORBIDDEN)
+                }
+                Some(common::PROVISIONER) if !roles.contains(&Role::Provisioner) => {
                     Some(StatusCode::FORBIDDEN)
                 }
                 _ => None,

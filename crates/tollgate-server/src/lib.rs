@@ -47,7 +47,10 @@ use axum::{Json, Router};
 use tracing::Instrument as _;
 
 use tollgate_auth::CredentialIssuer;
-use tollgate_core::{AccountId, CapacityClass, CostUnits, KeyId, Principal, PublishableSnapshot};
+use tollgate_core::{
+    AccountId, AccountStatus, CapacityClass, CostUnits, EnforcementMode, KeyId, Principal,
+    PublishableSnapshot,
+};
 use tollgate_store::wire::{
     API_PREFIX, AccountKeyResponse, AccountKeysResponse, AccountResponse, AcquireRequest,
     AcquireResponse, ConsolidateRequest, ConsolidateResponse, CreateAccountRequest, DepositRequest,
@@ -64,7 +67,9 @@ use tollgate_store::{
 };
 
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery};
-use crate::security::{Authorization, InstanceIdentity, OperatorIdentity, Role, ServerSecurity};
+use crate::security::{
+    AdminIdentity, Authorization, InstanceIdentity, OperatorIdentity, Role, ServerSecurity,
+};
 
 /// Everything the handlers need. `S` is the storage backend; the clock is the
 /// single place wall time enters the server.
@@ -143,10 +148,10 @@ fn router_with_maintenance<S: Backend>(
     state: ServerState<S>,
     maintenance: maintenance::Monitor,
 ) -> Router {
-    let authorization = |role| Authorization {
+    let authorization = |roles| Authorization {
         security: Arc::clone(&state.security),
         clock: Arc::clone(&state.clock),
-        role,
+        roles,
     };
     let instance = Router::new()
         .route("/leases/acquire", post(acquire::<S>))
@@ -161,10 +166,27 @@ fn router_with_maintenance<S: Backend>(
             post(ingest::<S>).layer(DefaultBodyLimit::max(MAX_INGEST_BODY_BYTES)),
         )
         .route_layer(axum::middleware::from_fn_with_state(
-            authorization(Role::Instance),
+            authorization(&[Role::Instance]),
             security::authorize,
         ));
+    // Two admin routers, split by who may call them rather than by what
+    // they touch. Funding and principal-level publication are operator-only
+    // at the router, so a provisioner is refused before any extractor runs;
+    // every other admin route is shared, and its handler narrows what a
+    // provisioner may send (#39).
     let operator = Router::new()
+        .route("/accounts/{account}/deposit", post(deposit::<S>))
+        .route(
+            "/snapshots/{principal}",
+            put(publish_snapshot::<S>)
+                .delete(remove_snapshot::<S>)
+                .layer(DefaultBodyLimit::max(MAX_SNAPSHOT_BODY_BYTES)),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            authorization(&[Role::Operator]),
+            security::authorize,
+        ));
+    let shared = Router::new()
         .route("/accounts", post(create_account::<S>))
         .route("/accounts/{account}", get(account::<S>))
         .route("/accounts/{account}/budget", put(set_budget::<S>))
@@ -182,20 +204,13 @@ fn router_with_maintenance<S: Backend>(
                 .delete(remove_key_snapshot::<S>)
                 .layer(DefaultBodyLimit::max(MAX_SNAPSHOT_BODY_BYTES)),
         )
-        .route("/accounts/{account}/deposit", post(deposit::<S>))
         .route("/accounts/{account}/status", post(set_status::<S>))
         .route(
             "/accounts/{account}/capacity-class",
             post(set_capacity_class::<S>),
         )
-        .route(
-            "/snapshots/{principal}",
-            put(publish_snapshot::<S>)
-                .delete(remove_snapshot::<S>)
-                .layer(DefaultBodyLimit::max(MAX_SNAPSHOT_BODY_BYTES)),
-        )
         .route_layer(axum::middleware::from_fn_with_state(
-            authorization(Role::Operator),
+            authorization(&[Role::Operator, Role::Provisioner]),
             security::authorize,
         ));
     Router::new()
@@ -204,7 +219,7 @@ fn router_with_maintenance<S: Backend>(
             "/readyz",
             get(readyz::<S>).layer(axum::Extension(maintenance)),
         )
-        .nest(API_PREFIX, instance.nest("/admin", operator))
+        .nest(API_PREFIX, instance.nest("/admin", operator.merge(shared)))
         .with_state(state)
         .layer(axum::middleware::from_fn(error::report_http_failure))
 }
@@ -732,24 +747,62 @@ async fn active_keys<S: Backend>(
     ))
 }
 
+/// Create an account. An operator states its opening balance and status; a
+/// provisioner may only restate the one account shape it is allowed to make —
+/// unfunded and suspended — and the store fixes that shape, `BestEffort`
+/// included, whatever arrives (#39).
 async fn create_account<S: Backend>(
-    operator: OperatorIdentity,
+    admin: AdminIdentity,
     State(state): State<ServerState<S>>,
     ApiJson(request): ApiJson<CreateAccountRequest>,
 ) -> Result<StatusCode, ApiError> {
-    operator
-        .run(
-            "create_account",
-            request.account_id,
-            state.clock.as_ref(),
-            state.store.create_account(AccountConfig {
-                account_id: request.account_id,
-                initial_balance: request.initial_balance,
-                status: request.status,
-                capacity_class: CapacityClass::Assured,
-            }),
-        )
-        .await?;
+    let clock = state.clock.as_ref();
+    let account = request.account_id;
+    match &admin {
+        AdminIdentity::Operator(_) => {
+            admin
+                .run(
+                    "create_account",
+                    account,
+                    clock,
+                    state.store.create_account(AccountConfig {
+                        account_id: account,
+                        initial_balance: request.initial_balance,
+                        status: request.status,
+                        capacity_class: CapacityClass::Assured,
+                    }),
+                )
+                .await?;
+        }
+        AdminIdentity::Provisioner(..) => {
+            if request.initial_balance != CostUnits::ZERO {
+                return Err(admin.refuse(
+                    "create_account",
+                    account,
+                    clock,
+                    "scope-forbidden",
+                    "a provisioner may only create an unfunded account",
+                ));
+            }
+            if request.status != AccountStatus::Suspended {
+                return Err(admin.refuse(
+                    "create_account",
+                    account,
+                    clock,
+                    "scope-forbidden",
+                    "a provisioner may only create a suspended account",
+                ));
+            }
+            admin
+                .run(
+                    "create_account",
+                    account,
+                    clock,
+                    state.store.create_provisioned_account(account),
+                )
+                .await?;
+        }
+    }
     Ok(StatusCode::CREATED)
 }
 
@@ -777,22 +830,49 @@ async fn deposit<S: Backend>(
 }
 
 async fn set_status<S: Backend>(
-    operator: OperatorIdentity,
+    admin: AdminIdentity,
     State(state): State<ServerState<S>>,
     ApiPath(account): ApiPath<AccountId>,
     ApiJson(request): ApiJson<SetStatusRequest>,
 ) -> Result<Json<SetStatusResponse>, ApiError> {
+    let clock = state.clock.as_ref();
     // 200 with the blast radius, not 204: the ledger half is one row, but the
     // snapshot half is however many credentials the account has, and an
     // operator has no other way to learn which (GL-51).
-    let change = operator
-        .run(
-            "set_account_status",
-            account,
-            state.clock.as_ref(),
-            state.store.set_account_status(account, request.status),
-        )
-        .await?;
+    let change = match &admin {
+        AdminIdentity::Operator(_) => {
+            admin
+                .run(
+                    "set_account_status",
+                    account,
+                    clock,
+                    state.store.set_account_status(account, request.status),
+                )
+                .await?
+        }
+        // Activation only, and through the store operation that checks the
+        // account's provenance and the operator hold inside the same
+        // transaction as the write (#39).
+        AdminIdentity::Provisioner(..) => {
+            if request.status != AccountStatus::Active {
+                return Err(admin.refuse(
+                    "set_account_status",
+                    account,
+                    clock,
+                    "scope-forbidden",
+                    "a provisioner may only activate an account",
+                ));
+            }
+            admin
+                .run(
+                    "set_account_status",
+                    account,
+                    clock,
+                    state.store.activate_provisioned(account),
+                )
+                .await?
+        }
+    };
     Ok(Json(SetStatusResponse {
         republished: change.republished,
         unreadable: change.unreadable,
@@ -810,7 +890,7 @@ async fn set_status<S: Backend>(
 /// 404 for an unknown account rather than a zeroed body, so a caller cannot
 /// read "does not exist" as "exists with no funding".
 async fn account<S: Backend>(
-    _operator: OperatorIdentity,
+    admin: AdminIdentity,
     State(state): State<ServerState<S>>,
     ApiPath(account): ApiPath<AccountId>,
 ) -> Result<Json<AccountResponse>, ApiError> {
@@ -820,12 +900,27 @@ async fn account<S: Backend>(
         .account_view(account)
         .await?
         .ok_or_else(|| ApiError::not_found("unknown-account", "no such account"))?;
+    // The view itself is the provenance evidence, so a provisioner's scope
+    // check needs no second read here.
+    if matches!(admin, AdminIdentity::Provisioner(..))
+        && view.origin != tollgate_store::AdminAuthority::Provisioner
+    {
+        return Err(admin.refuse(
+            "account_view",
+            account,
+            state.clock.as_ref(),
+            "account-not-provisioned",
+            "account was not created by a provisioner",
+        ));
+    }
     let funding = view.conservation;
     Ok(Json(AccountResponse {
         account_id: view.account_id,
         as_of,
         status: view.status,
         capacity_class: view.capacity_class,
+        origin: view.origin,
+        status_set_by: view.status_set_by,
         budget: view.schedule,
         period_start: view.period_start,
         balance: funding.balance,
@@ -845,17 +940,43 @@ async fn account<S: Backend>(
 /// success with equal `previous` and `current`: the caller's intent is
 /// satisfied, and saying so is more useful than a conflict.
 async fn set_budget<S: Backend>(
-    operator: OperatorIdentity,
+    admin: AdminIdentity,
     State(state): State<ServerState<S>>,
     ApiPath(account): ApiPath<AccountId>,
     ApiJson(request): ApiJson<SetBudgetRequest>,
 ) -> Result<Json<SetBudgetResponse>, ApiError> {
+    let clock = state.clock.as_ref();
+    // A periodic allowance funds admission, so a provisioner's is bounded by
+    // its identity's ceiling (#39). Clearing a schedule funds nothing and is
+    // always allowed.
+    if let AdminIdentity::Provisioner(_, limits) = &admin
+        && request
+            .budget
+            .is_some_and(|budget| budget.allowance > limits.max_budget_allowance())
+    {
+        return Err(admin.refuse(
+            "set_budget_schedule",
+            account,
+            clock,
+            "scope-forbidden",
+            "budget allowance exceeds this provisioner's ceiling",
+        ));
+    }
+    admin
+        .check_account(
+            &*state.store,
+            account,
+            "set_budget_schedule",
+            account,
+            clock,
+        )
+        .await?;
     // The receipt carries what this call actually replaced, so the outcome is
     // mapped to it rather than re-read. Reporting `request.budget` as
     // `previous` would echo the caller's own input back as history, and a
     // separate read afterwards would be a different snapshot — either way the
     // response would stop describing what committed here.
-    let previous = operator
+    let previous = admin
         .run(
             "set_budget_schedule",
             account,
@@ -894,11 +1015,22 @@ async fn set_budget<S: Backend>(
 /// exists, and its secret is gone. The remedy is to revoke and issue a new
 /// one, never to ask for the same secret again.
 async fn issue_key<S: Backend>(
-    operator: OperatorIdentity,
+    admin: AdminIdentity,
     State(state): State<ServerState<S>>,
     ApiPath(account): ApiPath<AccountId>,
     ApiJson(request): ApiJson<IssueKeyRequest>,
 ) -> Result<(StatusCode, Json<IssuedKeyResponse>), ApiError> {
+    // Before minting: a refused provisioner must not cost entropy, and a key
+    // for an account it does not own must never exist even briefly (#39).
+    admin
+        .check_account(
+            &*state.store,
+            account,
+            "issue_key",
+            format!("{account}/keys/{}", request.key_id),
+            state.clock.as_ref(),
+        )
+        .await?;
     let issuer = state.issuer.as_ref().ok_or_else(|| {
         ApiError::not_implemented(
             "issuance-unsupported",
@@ -941,7 +1073,7 @@ async fn issue_key<S: Backend>(
         digest: minted.digest,
         not_after: request.not_after,
     };
-    operator
+    admin
         .run(
             "issue_key",
             format!("{account}/keys/{}", minted.key_id),
@@ -974,12 +1106,21 @@ async fn issue_key<S: Backend>(
 /// is the digest's leading 128 bits, so a listing carrying it would leak half
 /// of what the verifier compares against.
 async fn list_account_keys<S: Backend>(
-    _operator: OperatorIdentity,
+    admin: AdminIdentity,
     State(state): State<ServerState<S>>,
     ApiPath(account): ApiPath<AccountId>,
     ApiQuery(page): ApiQuery<KeyQuery>,
 ) -> Result<Json<AccountKeysResponse>, ApiError> {
     let limit = credential_page_limit(page.limit)?;
+    admin
+        .check_account(
+            &*state.store,
+            account,
+            "list_keys",
+            format!("{account}/keys"),
+            state.clock.as_ref(),
+        )
+        .await?;
     let as_of = state.clock.now();
     let summaries = state.store.account_keys(account, page.after, limit).await?;
     // A full page may or may not be the last; a short one certainly is. Saying
@@ -1011,10 +1152,19 @@ async fn list_account_keys<S: Backend>(
 /// guessing or mistyping an id. The check is a read of the account's own
 /// listing, so it cannot be satisfied by a credential the account does not own.
 async fn revoke_account_key<S: Backend>(
-    operator: OperatorIdentity,
+    admin: AdminIdentity,
     State(state): State<ServerState<S>>,
     ApiPath((account, key)): ApiPath<(AccountId, KeyId)>,
 ) -> Result<Json<RevokeKeyResponse>, ApiError> {
+    admin
+        .check_account(
+            &*state.store,
+            account,
+            "revoke_key",
+            format!("{account}/keys/{key}"),
+            state.clock.as_ref(),
+        )
+        .await?;
     let owned = match state
         .store
         .account_keys(account, key.0.checked_sub(1).map(KeyId), one())
@@ -1032,7 +1182,7 @@ async fn revoke_account_key<S: Backend>(
         ));
     }
     let now = state.clock.now();
-    let outcome = operator
+    let outcome = admin
         .run(
             "revoke_key",
             format!("{account}/keys/{key}"),
@@ -1054,22 +1204,58 @@ async fn revoke_account_key<S: Backend>(
 /// `key_id` is filled in. One naming a different credential is left as
 /// stated, and the store refuses it rather than this handler rewriting it.
 async fn publish_key_snapshot<S: Backend>(
-    operator: OperatorIdentity,
+    admin: AdminIdentity,
     State(state): State<ServerState<S>>,
     ApiPath((account, key)): ApiPath<(AccountId, KeyId)>,
     ApiJson(request): ApiJson<PublishSnapshotRequest>,
 ) -> Result<StatusCode, ApiError> {
+    let clock = state.clock.as_ref();
+    let target = format!("{account}/keys/{key}/snapshot");
+    // Elastic enforcement extends unfunded credit, which is funding by
+    // another name; a provisioner publishes strict policy only (#39).
+    if matches!(admin, AdminIdentity::Provisioner(..))
+        && request.snapshot.enforcement_mode != EnforcementMode::Strict
+    {
+        return Err(admin.refuse(
+            "publish_key_snapshot",
+            target,
+            clock,
+            "scope-forbidden",
+            "a provisioner may only publish strict enforcement",
+        ));
+    }
+    admin
+        .check_account(
+            &*state.store,
+            account,
+            "publish_key_snapshot",
+            &target,
+            clock,
+        )
+        .await?;
     let mut snapshot = request.snapshot;
     if snapshot.key_id.is_none() {
         Arc::make_mut(&mut snapshot).key_id = Some(key);
     }
     let snapshot = PublishableSnapshot::try_new(snapshot)?;
-    operator
+    admin
         .run(
             "publish_key_snapshot",
-            format!("{account}/keys/{key}/snapshot"),
+            target,
             state.clock.as_ref(),
-            state.store.publish_key_snapshot(account, key, snapshot),
+            async {
+                if matches!(admin, AdminIdentity::Provisioner(..)) {
+                    state
+                        .store
+                        .publish_key_snapshot_next(account, key, snapshot)
+                        .await
+                } else {
+                    state
+                        .store
+                        .publish_key_snapshot(account, key, snapshot)
+                        .await
+                }
+            },
         )
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1080,14 +1266,24 @@ async fn publish_key_snapshot<S: Backend>(
 /// Revocation does not withdraw it, so this is part of revoking a key; it is
 /// allowed for a revoked credential for exactly that reason.
 async fn remove_key_snapshot<S: Backend>(
-    operator: OperatorIdentity,
+    admin: AdminIdentity,
     State(state): State<ServerState<S>>,
     ApiPath((account, key)): ApiPath<(AccountId, KeyId)>,
 ) -> Result<StatusCode, ApiError> {
-    operator
+    let target = format!("{account}/keys/{key}/snapshot");
+    admin
+        .check_account(
+            &*state.store,
+            account,
+            "remove_key_snapshot",
+            &target,
+            state.clock.as_ref(),
+        )
+        .await?;
+    admin
         .run(
             "remove_key_snapshot",
-            format!("{account}/keys/{key}/snapshot"),
+            target,
             state.clock.as_ref(),
             state.store.remove_key_snapshot(account, key),
         )
@@ -1117,15 +1313,31 @@ fn one() -> std::num::NonZeroUsize {
 }
 
 async fn set_capacity_class<S: Backend>(
-    operator: OperatorIdentity,
+    admin: AdminIdentity,
     State(state): State<ServerState<S>>,
     ApiPath(account): ApiPath<AccountId>,
     ApiJson(request): ApiJson<SetCapacityClassRequest>,
 ) -> Result<Json<SetStatusResponse>, ApiError> {
+    let clock = state.clock.as_ref();
+    // `Assured` is unconditional capacity, an operator's grant (#39).
+    if matches!(admin, AdminIdentity::Provisioner(..))
+        && request.capacity_class != CapacityClass::BestEffort
+    {
+        return Err(admin.refuse(
+            "set_capacity_class",
+            account,
+            clock,
+            "scope-forbidden",
+            "a provisioner may only set the best-effort class",
+        ));
+    }
+    admin
+        .check_account(&*state.store, account, "set_capacity_class", account, clock)
+        .await?;
     // 200 with the blast radius, for the reason `set_status` returns one: the
     // ledger half is one row and the snapshot half is however many credentials
     // the account has (GL-99).
-    let change = operator
+    let change = admin
         .run(
             "set_capacity_class",
             account,

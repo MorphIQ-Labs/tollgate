@@ -735,6 +735,20 @@ where
         }
     }
 
+    async fn create_provisioned_account(
+        &self,
+        account: AccountId,
+    ) -> Result<AdminReceipt<()>, CreateAccountError> {
+        AdminStore::create_provisioned_account(&*self.inner, account).await
+    }
+
+    async fn activate_provisioned(
+        &self,
+        account: AccountId,
+    ) -> Result<AdminReceipt<StatusChange>, SetStatusError> {
+        AdminStore::activate_provisioned(&*self.inner, account).await
+    }
+
     async fn set_capacity_class(
         &self,
         account: AccountId,
@@ -859,6 +873,15 @@ where
         snapshot: PublishableSnapshot,
     ) -> Result<AdminReceipt<()>, KeySnapshotError> {
         KeyDirectory::publish_key_snapshot(&*self.inner, account, key, snapshot).await
+    }
+
+    async fn publish_key_snapshot_next(
+        &self,
+        account: AccountId,
+        key: KeyId,
+        snapshot: PublishableSnapshot,
+    ) -> Result<AdminReceipt<()>, KeySnapshotError> {
+        KeyDirectory::publish_key_snapshot_next(&*self.inner, account, key, snapshot).await
     }
 
     async fn remove_key_snapshot(
@@ -1050,6 +1073,20 @@ impl AdminStore for RejectingStore {
         unreachable!("{}: AdminStore::set_account_status", self.reason)
     }
 
+    async fn create_provisioned_account(
+        &self,
+        _account: AccountId,
+    ) -> Result<AdminReceipt<()>, CreateAccountError> {
+        unreachable!("{}: AdminStore::create_provisioned_account", self.reason)
+    }
+
+    async fn activate_provisioned(
+        &self,
+        _account: AccountId,
+    ) -> Result<AdminReceipt<StatusChange>, SetStatusError> {
+        unreachable!("{}: AdminStore::activate_provisioned", self.reason)
+    }
+
     async fn set_capacity_class(
         &self,
         _account: AccountId,
@@ -1135,6 +1172,15 @@ impl KeyDirectory for RejectingStore {
         _snapshot: PublishableSnapshot,
     ) -> Result<AdminReceipt<()>, KeySnapshotError> {
         unreachable!("{}: KeyDirectory::publish_key_snapshot", self.reason)
+    }
+
+    async fn publish_key_snapshot_next(
+        &self,
+        _account: AccountId,
+        _key: KeyId,
+        _snapshot: PublishableSnapshot,
+    ) -> Result<AdminReceipt<()>, KeySnapshotError> {
+        unreachable!("{}: KeyDirectory::publish_key_snapshot_next", self.reason)
     }
 
     async fn remove_key_snapshot(

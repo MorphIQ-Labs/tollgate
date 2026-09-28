@@ -10,7 +10,7 @@ assumed by the receipt model. Arithmetic here is exact Nat, not SQL BIGINT.
 -/
 namespace Tollgate.ControlPlane
 
-inductive Role | instance | operator
+inductive Role | instance | operator | provisioner
   deriving DecidableEq, Repr
 
 structure Identity where
@@ -51,6 +51,123 @@ theorem an_operator_cannot_fund_an_instance (name : Nat) :
 
 theorem an_instance_cannot_administer (name : Nat) :
     allowed (some ⟨name, .instance⟩) none .operator = false := by rfl
+
+/-! Each route accepts a fixed role set (#39): the operator-only admin routes accept
+`[operator]`, the shared ones `[operator, provisioner]`. A route belongs to
+exactly one set, so disjointness is per route rather than per role pair. -/
+def admitted (bearer certificate : Option Identity) (roles : List Role) : Bool :=
+  match select bearer certificate with
+  | none => false
+  | some identity => roles.contains identity.role
+
+def operatorOnly : List Role := [.operator]
+def sharedAdmin : List Role := [.operator, .provisioner]
+
+theorem no_evidence_is_never_admitted (roles : List Role) :
+    admitted none none roles = false := by rfl
+
+theorem admission_requires_a_listed_role
+    (bearer certificate : Option Identity) (roles : List Role)
+    (accepted : admitted bearer certificate roles = true) :
+    ∃ identity, select bearer certificate = some identity ∧ identity.role ∈ roles := by
+  cases selected : select bearer certificate with
+  | none => simp [admitted, selected] at accepted
+  | some identity =>
+    exact ⟨identity, rfl, by simpa [admitted, selected] using accepted⟩
+
+theorem a_provisioner_cannot_fund_or_publish_principals (name : Nat) :
+    admitted (some ⟨name, .provisioner⟩) none operatorOnly = false := by rfl
+
+theorem a_provisioner_reaches_the_shared_routes (name : Nat) :
+    admitted (some ⟨name, .provisioner⟩) none sharedAdmin = true := by rfl
+
+theorem an_instance_cannot_provision (name : Nat) :
+    admitted (some ⟨name, .instance⟩) none sharedAdmin = false := by rfl
+
+theorem an_operator_reaches_every_admin_route (name : Nat) :
+    admitted (some ⟨name, .operator⟩) none operatorOnly = true ∧
+    admitted (some ⟨name, .operator⟩) none sharedAdmin = true := ⟨rfl, rfl⟩
+
+/-! Account provenance and the operator hold (#39). `origin` is written once
+at creation; `setBy` is rewritten by every status write. Both are read inside
+the serialization point of the write that depends on them — the backends'
+row lock or mutex, witnessed by the mirrored store tests — which this model
+takes as given by treating each transition as atomic. -/
+inductive Authority | operator | provisioner
+  deriving DecidableEq, Repr
+
+inductive Status | active | suspended | closed
+  deriving DecidableEq, Repr
+
+structure Account where
+  origin : Authority
+  status : Status
+  setBy : Authority
+  deriving DecidableEq, Repr
+
+inductive Refusal | notProvisioned | closed | operatorHold
+  deriving DecidableEq, Repr
+
+/-- The only account a provisioner can create: suspended, and its own. Balance
+and capacity class are fixed by the backend and are not modelled here. -/
+def createProvisioned : Account := ⟨.provisioner, .suspended, .provisioner⟩
+
+/-- An operator's status write. Closed is terminal; every write, a repeat
+included, records the operator as the author. -/
+def operatorSetStatus (a : Account) (target : Status) : Except Refusal Account :=
+  if a.status = .closed ∧ target ≠ .closed then .error .closed
+  else .ok { a with status := target, setBy := .operator }
+
+/-- The provisioner's only status transition. -/
+def activate (a : Account) : Except Refusal Account :=
+  if a.origin ≠ .provisioner then .error .notProvisioned
+  else if a.status = .closed then .error .closed
+  else if a.status = .active then .ok a
+  else if a.setBy = .operator then .error .operatorHold
+  else .ok { a with status := .active, setBy := .provisioner }
+
+theorem a_provisioned_account_activates :
+    activate createProvisioned = .ok ⟨.provisioner, .active, .provisioner⟩ := by rfl
+
+theorem an_operators_account_is_out_of_reach (status : Status) (setBy : Authority) :
+    activate ⟨.operator, status, setBy⟩ = .error .notProvisioned := by rfl
+
+theorem activation_leaves_closed_terminal (setBy : Authority) :
+    activate ⟨.provisioner, .closed, setBy⟩ = .error .closed := by rfl
+
+theorem repeated_activation_keeps_the_author (setBy : Authority) :
+    activate ⟨.provisioner, .active, setBy⟩ = .ok ⟨.provisioner, .active, setBy⟩ := by rfl
+
+theorem an_operator_suspension_refuses_activation :
+    activate ⟨.provisioner, .suspended, .operator⟩ = .error .operatorHold := by rfl
+
+theorem an_operator_can_suspend_and_lift (origin : Authority) (setBy : Authority) :
+    operatorSetStatus ⟨origin, .active, setBy⟩ .suspended =
+      .ok ⟨origin, .suspended, .operator⟩ ∧
+    operatorSetStatus ⟨origin, .suspended, setBy⟩ .active =
+      .ok ⟨origin, .active, .operator⟩ := ⟨rfl, rfl⟩
+
+theorem operator_closure_is_terminal (origin : Authority) (setBy : Authority) :
+    operatorSetStatus ⟨origin, .closed, setBy⟩ .active = .error .closed ∧
+    operatorSetStatus ⟨origin, .closed, setBy⟩ .closed =
+      .ok ⟨origin, .closed, .operator⟩ := ⟨rfl, rfl⟩
+
+/-- Whatever an account held, once an operator suspends it no provisioner
+activation succeeds until an operator writes the status again. -/
+theorem an_operator_suspension_holds (a t : Account)
+    (suspended : operatorSetStatus a .suspended = .ok t) :
+    ∃ r, activate t = .error r := by
+  obtain ⟨origin, status, setBy⟩ := a
+  cases status <;> cases origin <;>
+    simp [operatorSetStatus] at suspended <;> subst suspended <;> exact ⟨_, rfl⟩
+
+/-- A provisioner's activation can only produce an active account, and never
+changes who created it. -/
+theorem activation_only_activates (a t : Account) (activated : activate a = .ok t) :
+    t.status = .active ∧ t.origin = a.origin := by
+  obtain ⟨origin, status, setBy⟩ := a
+  cases origin <;> cases status <;> cases setBy <;>
+    simp [activate] at activated <;> subst activated <;> exact ⟨rfl, rfl⟩
 
 structure Funding where
   topup : Nat
@@ -124,5 +241,30 @@ theorem repeated_retirement_is_a_noop (before : CredentialState) :
 
 theorem retirement_is_terminal (before : CredentialState) :
     (retire (retire before).after).after.revoked = true := by rfl
+
+/-! Store-owned snapshot generations. The predecessor is the locked live or
+revoked watermark, or zero for first publication; limit is u64::MAX in memory
+and i64::MAX in PostgreSQL. No caller generation enters this transition.
+Atomicity and agreement between the SQL column, push and receipt are backend
+assumptions, witnessed separately by the mirrored integration tests. -/
+def nextGeneration (previous limit : Nat) : Option Nat :=
+  if previous < limit then some (previous + 1) else none
+
+theorem allocated_generation_advances_exactly_once (previous limit next : Nat)
+    (accepted : nextGeneration previous limit = some next) :
+    next = previous + 1 ∧ previous < next ∧ next ≤ limit := by
+  unfold nextGeneration at accepted
+  split at accepted
+  · simp only [Option.some.injEq] at accepted
+    omega
+  · cases accepted
+
+theorem exhausted_generation_refuses (previous limit : Nat) (full : limit ≤ previous) :
+    nextGeneration previous limit = none := by
+  simp [nextGeneration, Nat.not_lt.mpr full]
+
+theorem first_allocated_generation_is_one (limit : Nat) (positive : 0 < limit) :
+    nextGeneration 0 limit = some 1 := by
+  simp [nextGeneration, positive]
 
 end Tollgate.ControlPlane

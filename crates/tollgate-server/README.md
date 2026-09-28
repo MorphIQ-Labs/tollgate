@@ -16,8 +16,9 @@ credential pages; the snapshot catalogue and snapshot fetch; usage ingest; and
 account, key, and snapshot administration. `/livez` and `/readyz` are the
 probes.
 
-Every protected handler requires verified instance or operator evidence, with
-disjoint roles. The server owns TLS and refuses exposed plaintext; mutual TLS,
+Every protected handler requires verified instance, operator or provisioner
+evidence, with disjoint roles; a provisioner reaches only the self-service
+subset of the admin API, on accounts a provisioner created. The server owns TLS and refuses exposed plaintext; mutual TLS,
 rotating bearer credentials, and Google service identity are supported, and
 rotate without a restart. Administrative actions emit audit events carrying
 receipts the backend captured at mutation.

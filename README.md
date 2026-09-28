@@ -46,14 +46,15 @@ permission bits, never plan names, product currencies or SQL.
 - **Backends:** an in-memory store that is the executable specification, and
   a PostgreSQL store that passes the same scenario suite by name.
 - **A control-plane server** over rustls with mTLS, rotating bearer tokens or
-  Google service-account identity, disjoint instance and operator roles, and
-  an audit trail for every administrative change.
+  Google service-account identity, disjoint instance, operator and scoped
+  self-service provisioner roles, and an audit trail for every administrative
+  change and refusal.
 
 ## Guarantees, and how they're checked
 
 Tollgate is built so that its claims are checked, not asserted:
 
-- **[40 numbered invariants](INVARIANTS.md)** form the testable contract.
+- **[41 numbered invariants](INVARIANTS.md)** form the testable contract.
   Each one names the tests that enforce it, and CI fails if a named witness
   stops existing.
 - **Fail closed:** unknown, stale, exhausted or backpressured states deny with
@@ -62,7 +63,7 @@ Tollgate is built so that its claims are checked, not asserted:
   `deposited + overage_recorded == balance + active grants + settled usage +
   settlement loss + expired`.
 - **Machine-checked proofs:** [24 Lean 4 modules](formal/lean/README.md)
-  with 346 theorems, and no `sorry` or axioms, model a request's charge
+  with 364 theorems, and no `sorry` or axioms, model a request's charge
   lifecycle, lease timing and fencing, idempotent ingest, sharded counters,
   snapshot revocation, conservation and more. CI checks them on every pull
   request.

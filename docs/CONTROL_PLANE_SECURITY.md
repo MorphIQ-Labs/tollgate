@@ -65,7 +65,9 @@ valid generation.
     "client_ca": "instance-ca.pem"
   },
   "bearers": [
-    {"identity": "deployment-operator", "role": "operator", "token_file": "operator.token"}
+    {"identity": "deployment-operator", "role": "operator", "token_file": "operator.token"},
+    {"identity": "signup-service", "role": "provisioner", "token_file": "signup.token",
+     "max_budget_allowance": 100000}
   ],
   "certificates": [
     {"identity": "instance-service", "role": "instance", "certificate": "instance-leaf.pem"}
@@ -86,12 +88,35 @@ unique ID. `google`, `tls`, `client_ca` and `issuer` are optional; `bearers` and
 protected operations. Keep the TLS block when withdrawing all identities from
 an encrypted listener.
 
-Use separate instance and operator identities. Roles are disjoint:
+Use separate instance, operator and provisioner identities. Roles are disjoint:
 
 | Role | Routes under `/v1` |
 | --- | --- |
 | `instance` | `POST /leases/{acquire,release,consolidate,reclaim}`, `GET /snapshots`, `GET /snapshots/{principal}`, `GET /keys`, `POST /usage/ingest` |
 | `operator` | `POST /admin/accounts`, `GET /admin/accounts/{id}`, `POST /admin/accounts/{id}/{deposit,status,capacity-class}`, `PUT /admin/accounts/{id}/budget`, `POST`/`GET /admin/accounts/{id}/keys`, `DELETE /admin/accounts/{id}/keys/{key}`, `PUT`/`DELETE /admin/accounts/{id}/keys/{key}/snapshot`, `PUT /admin/snapshots/{principal}`, `DELETE /admin/snapshots/{principal}` |
+| `provisioner` | every `operator` route except `POST /admin/accounts/{id}/deposit` and `/admin/snapshots/{principal}`, within the [provisioner scope](HTTP_API.md#the-provisioner-scope) |
+
+**Give an internet-facing account service a `provisioner`, never an
+`operator`.** A provisioner creates only unfunded, suspended, best-effort
+accounts; activates them; sets budgets up to its `max_budget_allowance`; and
+manages credentials and strict key snapshots — all on accounts a provisioner
+created. It cannot deposit, suspend, close, grant `Assured`, publish a
+principal snapshot, reach an account an operator created, or lift a status an
+operator set. Compromising it therefore cannot fund an account or undo an abuse
+suspension. Keep `operator` for people and trusted tooling.
+
+`max_budget_allowance` is required on every `provisioner` entry and refused on
+any other role, so a missing or misplaced ceiling rejects the configuration.
+Set it to the largest allowance any self-service plan grants: a periodic
+allowance funds admission, so the ceiling bounds what a compromised provisioner
+can hand an account each period. A provisioner's key snapshots still carry its
+own cost table, limits and permissions; only `Elastic` enforcement is refused.
+
+A provisioner reaches only accounts whose `origin` is `Provisioner`. Every
+account that existed before the role did is an operator's, so a signup service
+moved from an operator credential to a provisioner cannot administer the
+accounts it created under the old credential. Keep administering those with
+operator tooling, or re-create them through the provisioner.
 
 `GET /keys` serves customer credential digests from the store's `KeyDirectory`.
 That key space is separate from this server's control-plane bearer credentials,
@@ -145,8 +170,9 @@ The server accepts a single `Authorization: Bearer …` header, bounded to 16 Ki
 Bearer verification uses `tollgate-auth::CredentialVerifier`. The configured role
 map authorizes the verified principal. Invalid, missing, expired, or conflicting
 credentials return RFC-7807 `401 authentication-required` with a Bearer challenge;
-valid identities without the required role return `403 scope-forbidden`. These
-checks precede path/body decoding and store calls. Existing JSON errors and wire
+valid identities without the required role return `403 scope-forbidden`, and
+the refusal is written to the audit log. These checks precede path/body
+decoding and store calls. Existing JSON errors and wire
 DTOs retain their meanings.
 
 TLS uses rustls with safe protocol defaults. `TOLLGATE_BIND` defaults to
@@ -162,7 +188,8 @@ bearer-only callers and probes. A trusted certificate also needs an exact leaf
 SHA-256 fingerprint mapping to gain authority; the manifest derives that
 fingerprint from the configured leaf PEM. HTTP headers such as
 `X-Forwarded-Client-Cert` never create an identity. If bearer and certificate
-credentials are both supplied, they must resolve to the same name and role.
+credentials are both supplied, they must resolve to the same name, role and
+provisioner ceiling.
 
 TLS handshakes run concurrently, with at most 128 pending tasks and a five-second
 deadline each. Excess connections wait in the OS backlog. Library embedders may
@@ -368,20 +395,32 @@ disclosure defect.
 ## Administrative audit
 
 Every HTTP administrative operation reaching the store emits structured
-`tollgate::audit` events with a random operation ID, stable actor, action, resource and server time.
+`tollgate::audit` events with a random operation ID, stable actor, role, action, resource and server time.
 `started` precedes the store call. `confirmed` carries the backend's typed
 `AdminReceipt`: before/after values captured under the memory lock or inside the
 PostgreSQL transaction that serialized the mutation. It never substitutes a
 separate read that could describe somebody else's concurrent write.
 
-Receipts identify changed fields: creation balance/status/class, deposited and
-top-up totals, status, capacity class, or snapshot generation plus revocation
-state. The resource identifies the account or principal. Snapshot receipts name
+Receipts identify changed fields: creation balance/status/class/origin,
+deposited and top-up totals, status and the authority that set it, capacity
+class, or snapshot generation plus revocation state. The resource identifies the account or principal. Snapshot receipts name
 the immutable publication generation; they do not copy its full policy graph.
 No-op operations report equal states. `failed` carries a stable code/status;
 `cancelled_unknown` marks an interrupted operation. Neither invents a before/after
 pair or asserts that a storage error ruled out a commit. Unmatched `started`
 events after a process crash also require reconciliation.
+
+A request refused for its scope emits one `refused` event and no `started`,
+because it never reaches the store. It carries the actor, role, action,
+resource, time and code. A credential on a route its role does not reach is
+refused by the router: its action is the method and route template
+(`POST /v1/admin/accounts/{account}/deposit`) and its code `scope-forbidden`. A
+provisioner refused for an argument or an account is refused by the handler:
+its action is the operation name (`create_account`) and its code
+`scope-forbidden` or `account-not-provisioned`, with a `reason`. An operator
+hold is found inside the store transaction, so it is a `failed` event with code
+`operator-hold`. Alert on `refused` events from a provisioner: a signup
+service that asks for a deposit is not behaving like one.
 
 The binary keeps audit events enabled even with `RUST_LOG=error`; library
 embedders must install a subscriber that retains this target. Route these events

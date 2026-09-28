@@ -43,7 +43,7 @@ The [HTTP API reference](HTTP_API.md) lists which routes return which codes.
 | code | status | meaning | retry |
 | --- | --- | --- | --- |
 | `authentication-required` | 401 | no credential, a malformed or duplicate `Authorization` header, a credential that does not verify or has expired, a client certificate no longer trusted, or a certificate and bearer naming different identities | after the credential is fixed or rotated |
-| `scope-forbidden` | 403 | the credential verifies but maps to no identity, or to the other role | no — change the role map or the credential |
+| `scope-forbidden` | 403 | the credential verifies but maps to no identity, or to a role the route does not admit; or a `provisioner` sent an argument outside [its scope](HTTP_API.md#the-provisioner-scope) | no — change the role map, the credential or the request |
 | `invalid-id` | 400 | a path identifier is not exactly 32 lowercase hexadecimal digits | no — fix the path |
 | `invalid-json` | 400, 415 or 422 | the body is not JSON (400), is not sent as `application/json` (415), or does not match the endpoint's type, including a missing required field or an unknown field where refused (422). The status is axum's rejection status | no — fix the body |
 | `invalid-query` | 400 | query parameters are malformed or unknown | no — fix the query |
@@ -85,6 +85,8 @@ name. See [`LeaseAllocator`](../crates/tollgate-store/src/traits.rs).
 | --- | --- | --- | --- |
 | `account-exists` | 409 | the account is already created | no — creation already succeeded |
 | `account-closed` | 409 | the account is `Closed`, which no status or class change leaves | no |
+| `account-not-provisioned` | 403 | a `provisioner` addressed an account an operator created | no — an operator administers it |
+| `operator-hold` | 403 | a `provisioner` tried to activate an account whose current status an operator set | no — only an operator lifts the hold |
 | `zero-deposit` | 400 | a deposit of zero units | no — deposit a positive amount |
 | `balance-overflow` | 422 | a deposit exceeds the backend's unit domain or would overflow the top-up balance or lifetime deposited total; nothing changes | never |
 | `unknown-credential` | 404 | no such credential for this account, including another account's key | no |

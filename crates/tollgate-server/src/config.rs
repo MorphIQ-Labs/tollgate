@@ -13,8 +13,11 @@ use tollgate_auth::{CredentialIssuer, CredentialVerifier, HmacRegistry};
 use zeroize::Zeroizing;
 
 use crate::google::GoogleVerifier;
-use crate::security::{ControlIdentity, Role, SecurityError, SecurityPolicy, ServerSecurity};
+use crate::security::{
+    ControlIdentity, ProvisionerLimits, Role, SecurityError, SecurityPolicy, ServerSecurity,
+};
 use crate::transport::{TlsConfig, certificate_fingerprint};
+use tollgate_core::CostUnits;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,6 +53,8 @@ struct BearerFile {
     identity: String,
     role: Role,
     token_file: PathBuf,
+    /// Required for, and only for, a `provisioner` (#39).
+    max_budget_allowance: Option<CostUnits>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +62,8 @@ struct CertificateFile {
     identity: String,
     role: Role,
     certificate: PathBuf,
+    /// Required for, and only for, a `provisioner` (#39).
+    max_budget_allowance: Option<CostUnits>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,6 +77,8 @@ struct GoogleSubject {
     subject: String,
     identity: String,
     role: Role,
+    /// Required for, and only for, a `provisioner` (#39).
+    max_budget_allowance: Option<CostUnits>,
 }
 
 /// Loader state retains Google keys for at most one hour after a successful
@@ -280,7 +289,11 @@ impl SecurityLoader {
                     "static bearer credentials must contain 32..=16377 visible ASCII bytes",
                 ));
             }
-            actors.push(ControlIdentity::new(bearer.identity, bearer.role)?);
+            actors.push(identity(
+                bearer.identity,
+                bearer.role,
+                bearer.max_budget_allowance,
+            )?);
             tokens.push(token);
         }
         registry.install_credentials(tokens.iter().map(|token| token.as_bytes()));
@@ -315,7 +328,11 @@ impl SecurityLoader {
             record_digest(&mut digest, pem.as_slice());
             policy = policy.with_certificate(
                 certificate_fingerprint(&pem)?,
-                ControlIdentity::new(certificate.identity, certificate.role)?,
+                identity(
+                    certificate.identity,
+                    certificate.role,
+                    certificate.max_budget_allowance,
+                )?,
             )?;
         }
         let tls = match manifest.tls {
@@ -377,7 +394,7 @@ impl SecurityLoader {
                 }
                 mapped.push((
                     GoogleVerifier::principal(&subject.subject),
-                    ControlIdentity::new(subject.identity, subject.role)?,
+                    identity(subject.identity, subject.role, subject.max_budget_allowance)?,
                 ));
             }
             policy = policy.with_bearer(verifier, mapped)?;
@@ -392,6 +409,28 @@ impl SecurityLoader {
             issuer,
             digest,
         }))
+    }
+}
+
+/// One manifest entry's identity. The ceiling is required for a provisioner
+/// and refused for any other role, so a misplaced field is an error rather
+/// than a silently ignored limit (#39).
+fn identity(
+    name: String,
+    role: Role,
+    max_budget_allowance: Option<CostUnits>,
+) -> Result<ControlIdentity, SecurityError> {
+    match (role, max_budget_allowance) {
+        (Role::Provisioner, Some(max)) => {
+            ControlIdentity::provisioner(name, ProvisionerLimits::new(max))
+        }
+        (Role::Provisioner, None) => Err(SecurityError(
+            "a provisioner identity requires max_budget_allowance",
+        )),
+        (Role::Instance | Role::Operator, Some(_)) => Err(SecurityError(
+            "max_budget_allowance applies only to a provisioner identity",
+        )),
+        (Role::Instance | Role::Operator, None) => ControlIdentity::new(name, role),
     }
 }
 
@@ -572,6 +611,57 @@ mod tests {
                 .await
                 .unwrap();
             assert!(retried);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_google_provisioner_subject_requires_its_ceiling() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/google-tokens.json")).unwrap();
+        let keys = serde_json::to_vec(&fixture["jwks"]).unwrap();
+        let now = Timestamp::from_second(1_700_000_100).unwrap();
+        for (subject, valid) in [
+            (
+                serde_json::json!({"subject": "1", "identity": "signup", "role": "provisioner", "max_budget_allowance": 1000}),
+                true,
+            ),
+            (
+                serde_json::json!({"subject": "1", "identity": "signup", "role": "provisioner"}),
+                false,
+            ),
+            (
+                serde_json::json!({"subject": "1", "identity": "ops", "role": "operator", "max_budget_allowance": 1000}),
+                false,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("security.json");
+            std::fs::write(
+                &path,
+                serde_json::json!({"google": {"audience": "https://control.example.test", "subjects": [subject]}})
+                    .to_string(),
+            )
+            .unwrap();
+            let loaded = SecurityLoader::new(path)
+                .load_with_keys(now, || async {
+                    Ok((keys.clone(), Duration::from_secs(60)))
+                })
+                .await;
+            assert_eq!(loaded.is_ok(), valid, "{subject}");
+        }
+    }
+
+    #[test]
+    fn a_manifest_ceiling_reaches_only_the_provisioner_identity() {
+        let provisioner =
+            identity("signup".into(), Role::Provisioner, Some(CostUnits(1000))).unwrap();
+        assert_eq!(
+            provisioner.provisioner_limits(),
+            Some(ProvisionerLimits::new(CostUnits(1000)))
+        );
+        for role in [Role::Instance, Role::Operator] {
+            let other = identity("ops".into(), role, None).unwrap();
+            assert_eq!(other.provisioner_limits(), None);
         }
     }
 

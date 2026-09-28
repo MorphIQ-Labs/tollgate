@@ -52,12 +52,12 @@ use tollgate_core::{
     Rollover, UsageEvent,
 };
 use tollgate_store::{
-    AccountConfig, AccountView, AdminReceipt, AdminState, AdminStore, AllocateError, Allocation,
-    BudgetError, Conservation, CreateAccountError, GrantPolicy, IngestError, IngestReport,
-    KeyDirectory, KeyError, KeyRecord, KeySnapshotError, KeySummary, LeaseAllocator,
-    PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease, Revocation,
-    RolledAccount, RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource,
-    StatusChange, StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
+    AccountConfig, AccountView, AdminAuthority, AdminReceipt, AdminState, AdminStore,
+    AllocateError, Allocation, BudgetError, Conservation, CreateAccountError, GrantPolicy,
+    IngestError, IngestReport, KeyDirectory, KeyError, KeyRecord, KeySnapshotError, KeySummary,
+    LeaseAllocator, PUSH_CHANNEL_CAPACITY, PublishSnapshotError, ReclaimBatch, ReclaimedLease,
+    Revocation, RolledAccount, RolloverBatch, SetStatusError, SnapshotPush, SnapshotResolution,
+    SnapshotSource, StatusChange, StoreError, StoreHealth, UsageSink, pushes_exceed_capacity,
     validate_key_page_limit,
 };
 
@@ -253,31 +253,18 @@ impl KeyDirectory for PostgresStore {
         key: KeyId,
         snapshot: PublishableSnapshot,
     ) -> Result<AdminReceipt<()>, KeySnapshotError> {
-        let generation = i64::try_from(snapshot.generation.0).map_err(|_| {
-            StoreError("snapshot generation exceeds PostgreSQL BIGINT range".into())
-        })?;
-        let mut tx = self.pool.begin().await.map_err(storage)?;
-        let result = async {
-            let (principal, revoked) = lock_account_key(&mut tx, account, key).await?;
-            if revoked {
-                return Err(KeySnapshotError::Retired { key_id: key });
-            }
-            if snapshot.key_id != Some(key) {
-                return Err(PublishSnapshotError::CredentialMismatch { key_id: key }.into());
-            }
-            let published = publish_in_tx(&mut tx, principal, generation, snapshot).await?;
-            Ok((principal, published))
-        }
-        .await;
-        let (principal, (written, published, before, after)) =
-            finish_transaction(tx, result).await?;
-        if written {
-            self.push_to_subscribers(SnapshotPush {
-                principal,
-                resolution: SnapshotResolution::Present(published),
-            });
-        }
-        Ok(AdminReceipt::new((), before, after))
+        self.publish_key_snapshot_with_generation(account, key, snapshot, false)
+            .await
+    }
+
+    async fn publish_key_snapshot_next(
+        &self,
+        account: AccountId,
+        key: KeyId,
+        snapshot: PublishableSnapshot,
+    ) -> Result<AdminReceipt<()>, KeySnapshotError> {
+        self.publish_key_snapshot_with_generation(account, key, snapshot, true)
+            .await
     }
 
     async fn remove_key_snapshot(
@@ -391,6 +378,180 @@ impl KeyDirectory for PostgresStore {
 }
 
 impl PostgresStore {
+    async fn publish_key_snapshot_with_generation(
+        &self,
+        account: AccountId,
+        key: KeyId,
+        snapshot: PublishableSnapshot,
+        allocate_generation: bool,
+    ) -> Result<AdminReceipt<()>, KeySnapshotError> {
+        let generation = if allocate_generation {
+            None
+        } else {
+            Some(i64::try_from(snapshot.generation.0).map_err(|_| {
+                StoreError("snapshot generation exceeds PostgreSQL BIGINT range".into())
+            })?)
+        };
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let result = async {
+            let (principal, revoked) = lock_account_key(&mut tx, account, key).await?;
+            if revoked {
+                return Err(KeySnapshotError::Retired { key_id: key });
+            }
+            if snapshot.key_id != Some(key) {
+                return Err(PublishSnapshotError::CredentialMismatch { key_id: key }.into());
+            }
+            let published = publish_in_tx(&mut tx, principal, generation, snapshot).await?;
+            Ok((principal, published))
+        }
+        .await;
+        let (principal, (written, published, before, after)) =
+            finish_transaction(tx, result).await?;
+        if written {
+            self.push_to_subscribers(SnapshotPush {
+                principal,
+                resolution: SnapshotResolution::Present(published),
+            });
+        }
+        Ok(AdminReceipt::new((), before, after))
+    }
+
+    /// Account creation for either authority (#39). `origin` is written once
+    /// here, as both the creator and the author of the opening status.
+    async fn create_account_as(
+        &self,
+        config: AccountConfig,
+        origin: AdminAuthority,
+    ) -> Result<tollgate_store::AdminReceipt<()>, CreateAccountError> {
+        let result = sqlx::query(
+            "INSERT INTO tollgate_accounts
+             (account_id, balance, deposited, status, capacity_class, next_fence,
+              usage_recorded, settlement_loss, overage_recorded, origin, status_set_by)
+             VALUES ($1, $2, $2, $3, $4, 1, 0, 0, 0, $5, $5)
+             ON CONFLICT (account_id) DO NOTHING",
+        )
+        .bind(id_bytes(config.account_id.0))
+        .bind(to_i64(config.initial_balance, "balance").map_err(CreateAccountError::Storage)?)
+        .bind(config.status.as_str())
+        .bind(config.capacity_class.as_str())
+        .bind(origin.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CreateAccountError::Storage(storage(e)))?;
+        if result.rows_affected() == 0 {
+            return Err(CreateAccountError::AlreadyExists);
+        }
+        Ok(AdminReceipt::new(
+            (),
+            AdminState::Absent,
+            AdminState::AccountCreated {
+                initial_balance: config.initial_balance,
+                status: config.status,
+                capacity_class: config.capacity_class,
+                origin,
+            },
+        ))
+    }
+
+    /// The one status transition, for either authority (#39). The hold and the
+    /// write share the account row's `FOR UPDATE` lock, so an operator
+    /// suspension racing a provisioner activation is ordered, never lost.
+    async fn set_status_as(
+        &self,
+        account: AccountId,
+        status: AccountStatus,
+        authority: AdminAuthority,
+    ) -> Result<tollgate_store::AdminReceipt<StatusChange>, SetStatusError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let result = async {
+            // The account row first, and its lock is the serialization point:
+            // two concurrent status changes cannot interleave their snapshot
+            // updates, so "ledger says Active, snapshots say Suspended" is
+            // unrepresentable rather than merely unlikely.
+            let row = sqlx::query(
+                "SELECT status, origin, status_set_by
+                 FROM tollgate_accounts WHERE account_id = $1 FOR UPDATE",
+            )
+            .bind(id_bytes(account.0))
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(storage)?
+            .ok_or(SetStatusError::UnknownAccount)?;
+
+            let before = decode_status(row.get::<String, _>(0))?;
+            let origin = decode_authority(row.get::<String, _>(1))?;
+            let before_set_by = decode_authority(row.get::<String, _>(2))?;
+            if authority == AdminAuthority::Provisioner && origin != AdminAuthority::Provisioner {
+                return Err(SetStatusError::NotProvisioned);
+            }
+            if before == AccountStatus::Closed && status != AccountStatus::Closed {
+                // Terminal, and the refusal changes nothing: no ledger write,
+                // no generation bump. Rolling back here is what makes that so.
+                return Err(SetStatusError::AccountClosed);
+            }
+            if authority == AdminAuthority::Provisioner
+                && before != status
+                && before_set_by == AdminAuthority::Operator
+            {
+                return Err(SetStatusError::OperatorHold);
+            }
+            // A provisioner repeating an activation changes nothing, not even
+            // the author: an operator who reactivated keeps that authorship.
+            let set_by = if authority == AdminAuthority::Provisioner && before == status {
+                before_set_by
+            } else {
+                authority
+            };
+
+            sqlx::query(
+                "UPDATE tollgate_accounts SET status = $2, status_set_by = $3 WHERE account_id = $1",
+            )
+                .bind(id_bytes(account.0))
+                .bind(status.as_str())
+                .bind(set_by.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?;
+
+            let (republished, unreadable) =
+                republish_patched_snapshots(&mut tx, account, "{status}", status.as_str()).await?;
+            Ok(((before, before_set_by, set_by), republished, unreadable))
+        }
+        .await;
+
+        let ((before, before_set_by, set_by), republished, unreadable) =
+            finish_transaction(tx, result).await?;
+        // Publish only after commit, as with snapshot publication itself.
+        if pushes_exceed_capacity(republished.len()) {
+            tracing::warn!(
+                %account,
+                principals = republished.len(),
+                capacity = PUSH_CHANNEL_CAPACITY,
+                "status change emitted more pushes than the channel holds; subscribers will resync"
+            );
+        }
+        let count = republished.len();
+        for (principal, snapshot) in republished {
+            self.push_to_subscribers(SnapshotPush {
+                principal,
+                resolution: SnapshotResolution::Present(snapshot),
+            });
+        }
+        Ok(AdminReceipt::new(
+            StatusChange {
+                // Rows that changed durably: the ones pushed, plus any that could
+                // not be decoded to push. The caller is told both numbers.
+                republished: count + unreadable,
+                unreadable,
+            },
+            AdminState::Status {
+                status: before,
+                set_by: before_set_by,
+            },
+            AdminState::Status { status, set_by },
+        ))
+    }
+
     /// Both issuance APIs enter the same account-first transaction. The lock
     /// covers the optional bound check, unique-index insertion, foreign-key
     /// check and revision trigger through commit. Acquiring it after inserting
@@ -2365,6 +2526,22 @@ fn decode_capacity_class(stored: String) -> Result<CapacityClass, StoreError> {
     }
 }
 
+/// The authority that created an account or set its status (#39), or a
+/// refusal for a spelling the vocabulary does not contain.
+///
+/// Never defaults to `Provisioner`, and never to `Operator` either: an unknown
+/// value is a row written outside this code, and reading it as either would
+/// decide who may administer the account by accident.
+fn decode_authority(stored: String) -> Result<AdminAuthority, StoreError> {
+    match stored.as_str() {
+        s if s == AdminAuthority::Operator.as_str() => Ok(AdminAuthority::Operator),
+        s if s == AdminAuthority::Provisioner.as_str() => Ok(AdminAuthority::Provisioner),
+        other => Err(StoreError(format!(
+            "unrecognized admin authority {other:?}"
+        ))),
+    }
+}
+
 /// Rebuild an account's schedule from its three stored columns.
 ///
 /// `None` is "no schedule", and it is only reachable when all three are NULL:
@@ -2676,32 +2853,24 @@ impl AdminStore for PostgresStore {
         &self,
         config: AccountConfig,
     ) -> Result<tollgate_store::AdminReceipt<()>, CreateAccountError> {
-        let result = sqlx::query(
-            "INSERT INTO tollgate_accounts
-             (account_id, balance, deposited, status, capacity_class, next_fence,
-              usage_recorded, settlement_loss, overage_recorded)
-             VALUES ($1, $2, $2, $3, $4, 1, 0, 0, 0)
-             ON CONFLICT (account_id) DO NOTHING",
-        )
-        .bind(id_bytes(config.account_id.0))
-        .bind(to_i64(config.initial_balance, "balance").map_err(CreateAccountError::Storage)?)
-        .bind(config.status.as_str())
-        .bind(config.capacity_class.as_str())
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CreateAccountError::Storage(storage(e)))?;
-        if result.rows_affected() == 0 {
-            return Err(CreateAccountError::AlreadyExists);
-        }
-        Ok(AdminReceipt::new(
-            (),
-            AdminState::Absent,
-            AdminState::AccountCreated {
-                initial_balance: config.initial_balance,
-                status: config.status,
-                capacity_class: config.capacity_class,
+        self.create_account_as(config, AdminAuthority::Operator)
+            .await
+    }
+
+    async fn create_provisioned_account(
+        &self,
+        account: AccountId,
+    ) -> Result<tollgate_store::AdminReceipt<()>, CreateAccountError> {
+        self.create_account_as(
+            AccountConfig {
+                account_id: account,
+                initial_balance: CostUnits::ZERO,
+                status: AccountStatus::Suspended,
+                capacity_class: CapacityClass::BestEffort,
             },
-        ))
+            AdminAuthority::Provisioner,
+        )
+        .await
     }
 
     async fn deposit(
@@ -2822,7 +2991,7 @@ impl AdminStore for PostgresStore {
             let account_row = sqlx::query(
                 "SELECT deposited, balance, usage_recorded, settlement_loss, overage_recorded,
                         expired, status, capacity_class, budget_allowance, budget_period,
-                        budget_rollover, period_start_us
+                        budget_rollover, period_start_us, origin, status_set_by
                  FROM tollgate_accounts WHERE account_id = $1",
             )
             .bind(id_bytes(account.0))
@@ -2849,6 +3018,8 @@ impl AdminStore for PostgresStore {
             account_id: account,
             status: decode_status(row.get::<String, _>(6))?,
             capacity_class: decode_capacity_class(row.get::<String, _>(7))?,
+            origin: decode_authority(row.get::<String, _>(12))?,
+            status_set_by: decode_authority(row.get::<String, _>(13))?,
             schedule: decode_schedule(
                 row.get::<Option<i64>, _>(8),
                 row.get::<Option<String>, _>(9),
@@ -2950,68 +3121,16 @@ impl AdminStore for PostgresStore {
         account: AccountId,
         status: AccountStatus,
     ) -> Result<tollgate_store::AdminReceipt<StatusChange>, SetStatusError> {
-        let mut tx = self.pool.begin().await.map_err(storage)?;
-        let result = async {
-            // The account row first, and its lock is the serialization point:
-            // two concurrent status changes cannot interleave their snapshot
-            // updates, so "ledger says Active, snapshots say Suspended" is
-            // unrepresentable rather than merely unlikely.
-            let row = sqlx::query(
-                "SELECT status FROM tollgate_accounts WHERE account_id = $1 FOR UPDATE",
-            )
-            .bind(id_bytes(account.0))
-            .fetch_optional(&mut *tx)
+        self.set_status_as(account, status, AdminAuthority::Operator)
             .await
-            .map_err(storage)?
-            .ok_or(SetStatusError::UnknownAccount)?;
+    }
 
-            let before = decode_status(row.get::<String, _>(0))?;
-            if before == AccountStatus::Closed && status != AccountStatus::Closed {
-                // Terminal, and the refusal changes nothing: no ledger write,
-                // no generation bump. Rolling back here is what makes that so.
-                return Err(SetStatusError::AccountClosed);
-            }
-
-            sqlx::query("UPDATE tollgate_accounts SET status = $2 WHERE account_id = $1")
-                .bind(id_bytes(account.0))
-                .bind(status.as_str())
-                .execute(&mut *tx)
-                .await
-                .map_err(storage)?;
-
-            let (republished, unreadable) =
-                republish_patched_snapshots(&mut tx, account, "{status}", status.as_str()).await?;
-            Ok((before, republished, unreadable))
-        }
-        .await;
-
-        let (before, republished, unreadable) = finish_transaction(tx, result).await?;
-        // Publish only after commit, as with snapshot publication itself.
-        if pushes_exceed_capacity(republished.len()) {
-            tracing::warn!(
-                %account,
-                principals = republished.len(),
-                capacity = PUSH_CHANNEL_CAPACITY,
-                "status change emitted more pushes than the channel holds; subscribers will resync"
-            );
-        }
-        let count = republished.len();
-        for (principal, snapshot) in republished {
-            self.push_to_subscribers(SnapshotPush {
-                principal,
-                resolution: SnapshotResolution::Present(snapshot),
-            });
-        }
-        Ok(AdminReceipt::new(
-            StatusChange {
-                // Rows that changed durably: the ones pushed, plus any that could
-                // not be decoded to push. The caller is told both numbers.
-                republished: count + unreadable,
-                unreadable,
-            },
-            AdminState::Status { status: before },
-            AdminState::Status { status },
-        ))
+    async fn activate_provisioned(
+        &self,
+        account: AccountId,
+    ) -> Result<tollgate_store::AdminReceipt<StatusChange>, SetStatusError> {
+        self.set_status_as(account, AccountStatus::Active, AdminAuthority::Provisioner)
+            .await
     }
 
     async fn set_capacity_class(
@@ -3102,7 +3221,7 @@ impl AdminStore for PostgresStore {
         })?;
 
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        let result = publish_in_tx(&mut tx, principal, generation, snapshot).await;
+        let result = publish_in_tx(&mut tx, principal, Some(generation), snapshot).await;
 
         let (written, published, before, after) = finish_transaction(tx, result).await?;
         if written {
@@ -3175,11 +3294,13 @@ async fn lock_account_key(
 /// stated credential binding (GL-35), the ledger status and capacity-class
 /// guards (GL-51, GL-99), the budget stamp (GL-97), and the generation-ordered
 /// write. Returns whether a row was written, the stamped snapshot to push
-/// after commit, and the audited predecessor and successor.
+/// after commit, and the audited predecessor and successor. `None` requests
+/// generation allocation under the snapshot write lock; `Some` retains the
+/// operator's generation-ordered publication contract.
 async fn publish_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     principal: Principal,
-    generation: i64,
+    generation: Option<i64>,
     snapshot: PublishableSnapshot,
 ) -> Result<(bool, PublishableSnapshot, AdminState, AdminState), PublishSnapshotError> {
     if let Some(key_id) = snapshot.key_id {
@@ -3254,6 +3375,14 @@ async fn publish_in_tx(
         .map_err(|e| StoreError(format!("snapshot encode: {e}")))?;
 
     let (written, before, after) = write_snapshot_audited(tx, principal, generation, value).await?;
+    let published = if generation.is_none() {
+        let AdminState::Snapshot { generation, .. } = after else {
+            return Err(StoreError("published snapshot has no generation".into()).into());
+        };
+        published.restamped(published.status, generation)
+    } else {
+        published
+    };
     Ok((written, published, before, after))
 }
 
@@ -3309,21 +3438,22 @@ async fn snapshot_audit_row(
 async fn write_snapshot_audited(
     tx: &mut Transaction<'_, Postgres>,
     principal: Principal,
-    generation: i64,
+    generation: Option<i64>,
     value: serde_json::Value,
 ) -> Result<(bool, AdminState, AdminState), StoreError> {
     let mut before = snapshot_audit_row(tx, principal).await?;
-    let after = AdminState::Snapshot {
-        generation: generation_from(generation)?,
-        revoked: false,
-    };
     if before == AdminState::Absent {
+        let initial = generation.unwrap_or(1);
+        let after = AdminState::Snapshot {
+            generation: generation_from(initial)?,
+            revoked: false,
+        };
         let inserted = sqlx::query(
             "INSERT INTO tollgate_snapshots (principal, generation, snapshot, deleted)
             VALUES ($1, $2, $3, FALSE) ON CONFLICT (principal) DO NOTHING",
         )
         .bind(id_bytes(principal.0))
-        .bind(generation)
+        .bind(initial)
         .bind(&value)
         .execute(&mut **tx)
         .await
@@ -3342,6 +3472,19 @@ async fn write_snapshot_audited(
     else {
         return Err(StoreError("snapshot disappeared during publication".into()));
     };
+    // Recompute after an insert conflict as well: the locked predecessor,
+    // including a tombstone, is the only authority for the next generation.
+    let generation = match generation {
+        Some(stated) => stated,
+        None => i64::try_from(previous.0)
+            .ok()
+            .and_then(|previous| previous.checked_add(1))
+            .ok_or_else(|| StoreError("snapshot generation overflow".into()))?,
+    };
+    let after = AdminState::Snapshot {
+        generation: generation_from(generation)?,
+        revoked: false,
+    };
     if previous >= generation_from(generation)? {
         return Ok((false, before, before));
     }
@@ -3354,6 +3497,27 @@ async fn write_snapshot_audited(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_authorities_reject_unknown_vocabulary() {
+        assert_eq!(
+            decode_authority("Operator".into()).unwrap(),
+            AdminAuthority::Operator
+        );
+        assert_eq!(
+            decode_authority("Provisioner".into()).unwrap(),
+            AdminAuthority::Provisioner
+        );
+        for invalid in [
+            "",
+            "operator",
+            "provisioner",
+            "Administrator",
+            "Provisioner ",
+        ] {
+            assert!(decode_authority(invalid.into()).is_err(), "{invalid:?}");
+        }
+    }
 
     #[test]
     fn stored_fences_use_the_exact_positive_bigint_domain() {

@@ -553,3 +553,246 @@ pub async fn a_retired_credential_is_never_granted_a_snapshot_but_can_be_withdra
         Some((1, false))
     );
 }
+
+/// Caller-selected extremes cannot consume the generation domain in one jump.
+/// Receipts, pushes and subsequent reads must all describe the allocated value.
+pub async fn store_allocated_generations_ignore_input_and_follow_tombstones(store: &impl Backend) {
+    let mut pushes = store.subscribe();
+    let mut before = tollgate_store::AdminState::Absent;
+    for (index, offered) in [u64::MAX, i64::MAX as u64, 0, 1, u64::MAX]
+        .into_iter()
+        .enumerate()
+    {
+        let next = index as u64 + 1;
+        let receipt = store
+            .publish_key_snapshot_next(
+                AccountId(1),
+                KeyId(1),
+                snapshot(Some(KeyId(1)), AccountId(1), offered),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.before, before);
+        assert_eq!(receipt.after, snapshot_state(next, false));
+        let push = pushes.try_recv().unwrap();
+        assert_eq!(push.principal, Principal(101));
+        assert_eq!(generation_of(push.resolution), Some((next, false)));
+        assert_eq!(
+            generation_of(store.snapshot(Principal(101)).await.unwrap()),
+            Some((next, false))
+        );
+        before = receipt.after;
+        if next == 2 {
+            let removed = store
+                .remove_key_snapshot(AccountId(1), KeyId(1))
+                .await
+                .unwrap();
+            assert_eq!(removed.before, before);
+            before = removed.after;
+            assert_eq!(before, snapshot_state(next, true));
+            assert_eq!(
+                generation_of(pushes.try_recv().unwrap().resolution),
+                Some((next, true))
+            );
+        }
+    }
+    assert!(pushes.try_recv().is_err());
+}
+
+pub async fn store_allocated_generations_preserve_operator_transitions(store: &impl Backend) {
+    use tollgate_store::SnapshotResolution;
+    store
+        .publish_key_snapshot_next(
+            AccountId(1),
+            KeyId(1),
+            snapshot(Some(KeyId(1)), AccountId(1), u64::MAX),
+        )
+        .await
+        .unwrap();
+    AdminStore::set_capacity_class(store, AccountId(1), CapacityClass::BestEffort)
+        .await
+        .unwrap();
+    AdminStore::set_account_status(store, AccountId(1), AccountStatus::Suspended)
+        .await
+        .unwrap();
+    let SnapshotResolution::Present(held) = store.snapshot(Principal(101)).await.unwrap() else {
+        panic!("suspension must retain the snapshot");
+    };
+    assert_eq!(held.generation, Generation(3));
+    assert_eq!(held.status, AccountStatus::Suspended);
+    assert_eq!(held.capacity_class, CapacityClass::BestEffort);
+    AdminStore::set_account_status(store, AccountId(1), AccountStatus::Closed)
+        .await
+        .unwrap();
+    let SnapshotResolution::Present(closed) = store.snapshot(Principal(101)).await.unwrap() else {
+        panic!("closure must retain the snapshot");
+    };
+    assert_eq!(closed.generation, Generation(4));
+    assert_eq!(closed.status, AccountStatus::Closed);
+    assert_eq!(
+        AdminStore::account_view(store, AccountId(1))
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        AccountStatus::Closed
+    );
+}
+
+/// Both missing-row creation and replacement must serialize: no duplicate
+/// generation and no silently discarded publication, even across a tombstone.
+pub async fn concurrent_store_allocated_publications_have_distinct_generations(
+    store: &impl Backend,
+) {
+    for base in [0, 2] {
+        let (a, b) = tokio::join!(
+            store.publish_key_snapshot_next(
+                AccountId(1),
+                KeyId(1),
+                snapshot(Some(KeyId(1)), AccountId(1), u64::MAX)
+            ),
+            store.publish_key_snapshot_next(
+                AccountId(1),
+                KeyId(1),
+                snapshot(Some(KeyId(1)), AccountId(1), 0)
+            ),
+        );
+        let mut receipts = [a.unwrap(), b.unwrap()];
+        receipts.sort_by_key(|r| match r.after {
+            tollgate_store::AdminState::Snapshot { generation, .. } => generation.0,
+            _ => panic!("publication must have a generation"),
+        });
+        assert_eq!(receipts[0].after, snapshot_state(base + 1, false));
+        assert_eq!(receipts[1].before, receipts[0].after);
+        assert_eq!(receipts[1].after, snapshot_state(base + 2, false));
+        assert_eq!(
+            generation_of(store.snapshot(Principal(101)).await.unwrap()),
+            Some((base + 2, false))
+        );
+        store
+            .remove_key_snapshot(AccountId(1), KeyId(1))
+            .await
+            .unwrap();
+    }
+}
+
+pub async fn exhausted_store_allocated_generation_changes_nothing(
+    store: &impl Backend,
+    ceiling: u64,
+) {
+    store
+        .publish_key_snapshot(
+            AccountId(1),
+            KeyId(1),
+            snapshot(Some(KeyId(1)), AccountId(1), ceiling),
+        )
+        .await
+        .unwrap();
+    let mut pushes = store.subscribe();
+    for revoked in [false, true] {
+        assert!(matches!(
+            store
+                .publish_key_snapshot_next(
+                    AccountId(1),
+                    KeyId(1),
+                    snapshot(Some(KeyId(1)), AccountId(1), 0)
+                )
+                .await,
+            Err(tollgate_store::KeySnapshotError::Storage(_))
+                | Err(tollgate_store::KeySnapshotError::Publish(
+                    PublishSnapshotError::Storage(_)
+                ))
+        ));
+        assert_eq!(
+            generation_of(store.snapshot(Principal(101)).await.unwrap()),
+            Some((ceiling, revoked))
+        );
+        assert!(pushes.try_recv().is_err());
+        store
+            .remove_key_snapshot(AccountId(1), KeyId(1))
+            .await
+            .unwrap();
+        if !revoked {
+            pushes.try_recv().unwrap();
+        }
+    }
+}
+
+pub async fn store_allocated_publication_preserves_binding_retirement_and_ledger_checks(
+    store: &impl Backend,
+) {
+    use tollgate_store::KeySnapshotError;
+    for (account, key) in [(2, 1), (1, 404), (1, 3)] {
+        assert_eq!(
+            store
+                .publish_key_snapshot_next(
+                    AccountId(account),
+                    KeyId(key),
+                    snapshot(Some(KeyId(key)), AccountId(account), u64::MAX)
+                )
+                .await
+                .unwrap_err(),
+            KeySnapshotError::UnknownCredential
+        );
+    }
+    for stated in [
+        snapshot(None, AccountId(1), 0),
+        snapshot(Some(KeyId(2)), AccountId(1), 0),
+        snapshot(Some(KeyId(1)), AccountId(2), 0),
+    ] {
+        assert!(matches!(
+            store
+                .publish_key_snapshot_next(AccountId(1), KeyId(1), stated)
+                .await,
+            Err(KeySnapshotError::Publish(
+                PublishSnapshotError::CredentialMismatch { .. }
+            ))
+        ));
+    }
+    AdminStore::set_capacity_class(store, AccountId(1), CapacityClass::BestEffort)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .publish_key_snapshot_next(
+                AccountId(1),
+                KeyId(1),
+                snapshot(Some(KeyId(1)), AccountId(1), 0)
+            )
+            .await,
+        Err(KeySnapshotError::Publish(
+            PublishSnapshotError::CapacityClassMismatch { .. }
+        ))
+    ));
+    AdminStore::set_account_status(store, AccountId(1), AccountStatus::Suspended)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .publish_key_snapshot_next(
+                AccountId(1),
+                KeyId(1),
+                snapshot(Some(KeyId(1)), AccountId(1), 0)
+            )
+            .await,
+        Err(KeySnapshotError::Publish(
+            PublishSnapshotError::StatusMismatch { .. }
+        ))
+    ));
+    store.revoke_key(KeyId(1), t(1)).await.unwrap();
+    assert_eq!(
+        store
+            .publish_key_snapshot_next(
+                AccountId(1),
+                KeyId(1),
+                snapshot(Some(KeyId(1)), AccountId(1), 0)
+            )
+            .await
+            .unwrap_err(),
+        KeySnapshotError::Retired { key_id: KeyId(1) }
+    );
+    assert_eq!(
+        generation_of(store.snapshot(Principal(101)).await.unwrap()),
+        None
+    );
+}
