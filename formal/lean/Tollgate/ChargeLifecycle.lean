@@ -86,7 +86,7 @@ def reserve (s : Sys) (i : Nat) : Option Sys :=
 
 /-- Admission debits the lease; a lease that cannot fund it refuses, which
 releases the slot and charges nothing. -/
-def admit (s : Sys) (i u : Nat) : Option Sys :=
+def admitRequest (s : Sys) (i u : Nat) : Option Sys :=
   match s.reqs[i]? with
   | some .reserved =>
     if u ≤ s.lease then some { update s i (.pending u) with lease := s.lease - u }
@@ -196,8 +196,8 @@ theorem uncommitted_charges_nothing (p : Phase)
   | delivered u => exact absurd rfl (h u).2.2
   | _ => rfl
 
-theorem admit_wf (s s' : Sys) (i u : Nat) (h : Wf s) (hr : admit s i u = some s') : Wf s' := by
-  unfold admit at hr
+theorem admit_wf (s s' : Sys) (i u : Nat) (h : Wf s) (hr : admitRequest s i u = some s') : Wf s' := by
+  unfold admitRequest at hr
   split at hr
   · rename_i hq
     have ho := fun p => sumBy_set occupies s.reqs i .reserved p hq
@@ -221,9 +221,9 @@ theorem admit_wf (s s' : Sys) (i u : Nat) (h : Wf s) (hr : admit s i u = some s'
   · cases hr
 
 /-- Admission charges nothing: the debit is held, not billed. -/
-theorem admit_charges_nothing (s s' : Sys) (i u : Nat) (hr : admit s i u = some s') :
+theorem admit_charges_nothing (s s' : Sys) (i u : Nat) (hr : admitRequest s i u = some s') :
     charged s' = charged s := by
-  unfold admit at hr
+  unfold admitRequest at hr
   split at hr
   · rename_i hq
     have hc := fun p => sumBy_set charge s.reqs i .reserved p hq
@@ -375,12 +375,12 @@ theorem charged_within_grant (s : Sys) (h : Wf s) : charged s ≤ s.grant := by
 is funded: the request becomes pending and the lease drops by its units. -/
 theorem a_fundable_admission_is_funded (s : Sys) (i u : Nat) (hq : s.reqs[i]? = some .reserved)
     (hu : u ≤ s.lease) :
-    ∃ s', admit s i u = some s' ∧ s'.lease = s.lease - u ∧ s'.reqs[i]? = some (.pending u) := by
+    ∃ s', admitRequest s i u = some s' ∧ s'.lease = s.lease - u ∧ s'.reqs[i]? = some (.pending u) := by
   have hlen : i < s.reqs.length := by
     rcases Nat.lt_or_ge i s.reqs.length with h | h
     · exact h
     · rw [List.getElem?_eq_none h] at hq; cases hq
-  refine ⟨{ update s i (.pending u) with lease := s.lease - u }, by simp [admit, hq, hu], rfl, ?_⟩
+  refine ⟨{ update s i (.pending u) with lease := s.lease - u }, by simp [admitRequest, hq, hu], rfl, ?_⟩
   simp [update, hlen]
 
 end Tollgate.ChargeLifecycle
