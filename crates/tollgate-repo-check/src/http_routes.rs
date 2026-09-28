@@ -127,8 +127,10 @@ pub fn compare(expected: &[Route], table: &[Route]) -> Vec<String> {
             None => problems.push(format!("missing row: {}", route.render())),
         }
     }
+    // Every documented method the router does not serve is stale, whether or
+    // not its path survives under another method.
     for (k, row) in &have {
-        if !want.contains_key(k) && methods(&want, &row.path).is_empty() {
+        if !want.contains_key(k) {
             problems.push(format!("row with no route: {}", row.render()));
         }
     }
@@ -624,11 +626,29 @@ mod tests {
                 route("GET", "/a", "operator"),
             ],
         );
-        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert_eq!(problems.len(), 4, "{problems:?}");
         assert!(problems[0].starts_with("role differs for GET /a"));
         assert!(problems[1].starts_with("method differs for /b"));
-        assert!(problems[2].starts_with("row with no route: | GET | /c"));
+        assert!(problems[2].starts_with("row with no route: | GET | /b"));
+        assert!(problems[3].starts_with("row with no route: | GET | /c"));
         let missing = compare(&router, &[route("GET", "/a", "none")]);
         assert_eq!(missing, ["missing row: | POST | /b | instance |"]);
+    }
+
+    /// A path that keeps one method but loses another still has a stale row,
+    /// and the check must name it rather than accept it because the path
+    /// survives (#36 review).
+    #[test]
+    fn a_documented_method_the_router_no_longer_serves_is_reported() {
+        let route = |method: &str, path: &str| Route {
+            path: path.into(),
+            method: method.into(),
+            role: "none".into(),
+        };
+        let problems = compare(
+            &[route("GET", "/livez")],
+            &[route("GET", "/livez"), route("POST", "/livez")],
+        );
+        assert_eq!(problems, ["row with no route: | POST | /livez | none |"]);
     }
 }
