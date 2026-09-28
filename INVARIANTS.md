@@ -594,6 +594,16 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    the whole batch with `IngestError::Refused`; a retry cannot recover capacity.
    Stored corruption and operational failures remain retryable store errors.
 
+   Deposits outside the backend's unit domain or overflowing either funding
+   counter return `AllocateError::BalanceOverflow`, mapped to HTTP
+   `422 balance-overflow`; the unchanged request must never be retried.
+   Both counters remain unchanged. Memory checks both sums before applying
+   either; PostgreSQL's single UPDATE rolls back on numeric overflow.
+   Witnesses: `deposits_accept_the_unit_ceiling_and_refuse_overflow` and
+   `a_refused_deposit_moves_neither_column` (both backends),
+   `a_deposit_outside_bigint_is_a_permanent_refusal` (PostgreSQL), and
+   `deposit_overflow_is_a_permanent_client_error` (HTTP).
+
    Credential activity consumes that accepted set too (35); a duplicate's
    changed key ID or timestamp cannot become fresh evidence.
 

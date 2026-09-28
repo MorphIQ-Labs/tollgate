@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -1763,5 +1763,43 @@ async fn an_issuer_minting_an_unpresentable_secret_is_refused_before_storage() {
             assert!(body.get("secret").is_none());
             assert!(stored.is_empty(), "nothing was stored for {secret:?}");
         }
+    }
+}
+
+#[tokio::test]
+async fn deposit_overflow_is_a_permanent_client_error() {
+    let (store, router) = state();
+    store.create_account(AccountConfig {
+        account_id: AccountId(1),
+        initial_balance: CostUnits(u64::MAX),
+        status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
+    });
+    // Both the top-up overflow and, after a grant, the lifetime-total
+    // overflow must retain the same permanent refusal over HTTP.
+    for acquire_first in [false, true] {
+        if acquire_first {
+            store
+                .acquire(
+                    AccountId(1),
+                    CostUnits(10),
+                    SignedDuration::from_secs(60),
+                    t(0),
+                )
+                .await
+                .unwrap();
+        }
+        let before = store.conservation(AccountId(1)).unwrap();
+        let (status, problem) = call(
+            &router,
+            "POST",
+            &api(&format!("/admin/accounts/{}/deposit", AccountId(1))),
+            Some(json!({"units": 1})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(problem["status"], 422);
+        assert_eq!(problem["code"], "balance-overflow");
+        assert_eq!(store.conservation(AccountId(1)).unwrap(), before);
     }
 }

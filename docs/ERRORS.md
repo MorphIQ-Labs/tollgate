@@ -86,6 +86,7 @@ name. See [`LeaseAllocator`](../crates/tollgate-store/src/traits.rs).
 | `account-exists` | 409 | the account is already created | no — creation already succeeded |
 | `account-closed` | 409 | the account is `Closed`, which no status or class change leaves | no |
 | `zero-deposit` | 400 | a deposit of zero units | no — deposit a positive amount |
+| `balance-overflow` | 422 | a deposit exceeds the backend's unit domain or would overflow the top-up balance or lifetime deposited total; nothing changes | never |
 | `unknown-credential` | 404 | no such credential for this account, including another account's key | no |
 | `credential-exists` | 409 | this `key_id` is already recorded | no — the first issuance succeeded; its secret is not disclosed again |
 | `active-key-limit` | 409 | the account already holds `max_active_keys` live credentials | after revoking one |
@@ -100,7 +101,7 @@ name. See [`LeaseAllocator`](../crates/tollgate-store/src/traits.rs).
 | --- | --- | --- | --- |
 | `usage-refused` | 422 | the store examined the usage batch and will refuse it again unchanged, for example an accounting total that cannot absorb its units | never unchanged |
 | `credential-source-unavailable` | 503 | the credential feed could not produce a valid page | yes, with backoff |
-| `storage` | 503 | the backend could not answer, or refused an operation for a reason it does not classify (a deposit that would overflow the balance is one). A mutation's outcome is unknown | yes, with backoff; reconcile a mutation against its audit receipt |
+| `storage` | 503 | the backend could not answer, or refused an operation for a reason it does not classify. A mutation's outcome is unknown | yes, with backoff; reconcile a mutation against its audit receipt |
 
 `tollgate-client` treats an ingest answer of `401`, `403`, `408`, `429` or any
 5xx as retryable, and every other 4xx as a refusal it must not replay; see

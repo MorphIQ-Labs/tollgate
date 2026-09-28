@@ -1,5 +1,7 @@
 //! Backend diagnostics are untrusted data, even after HTTP authentication.
 mod common;
+#[path = "../../tollgate-store/tests/support/delegating.rs"]
+mod delegating;
 
 use axum::response::IntoResponse;
 use http_body_util::BodyExt;
@@ -135,6 +137,15 @@ async fn router_correlates_backend_failures_without_logging_request_or_error_pay
         )
     };
     store.ingest(&[event(1, u64::MAX)], at).await.unwrap();
+    // A permanent deposit overflow is not a backend outage. Inject a real
+    // storage-class failure so this fixture continues testing 503 diagnostics.
+    let store = Arc::new(delegating::DelegatingStore::wrapping(store).on_deposit(
+        |_, _, _| async {
+            Err(AllocateError::Storage(StoreError(
+                "private-backend-fixture-sensitive-70".into(),
+            )))
+        },
+    ));
     let app = router(ServerState {
         store,
         clock: Arc::new(SystemClock),
@@ -244,6 +255,7 @@ async fn router_correlates_backend_failures_without_logging_request_or_error_pay
     let logs = format!("{events:?}");
     for private in [
         "fixture-request-sensitive-70",
+        "private-backend-fixture-sensitive-70",
         FORGED_ID,
         common::OPERATOR,
         common::INSTANCE,
