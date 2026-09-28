@@ -11,8 +11,8 @@ I/O on the request path.**
 
 A metered API has to answer "may this caller do this, and what does it cost?"
 on every request, and record the answer for billing. The usual answers put a
-database or a shared counter on the request path, which costs two to three
-orders of magnitude more than the work it guards when that work takes
+database or a shared counter on the request path, which costs orders of
+magnitude more than the work it guards when that work takes nanoseconds or
 microseconds. Rate limiters remove the round trip but don't bill anything.
 
 Tollgate splits the problem into two planes:
