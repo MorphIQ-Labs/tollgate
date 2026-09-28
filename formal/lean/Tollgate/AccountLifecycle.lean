@@ -94,6 +94,38 @@ theorem every_trace_is_safe (events : List Event) : safe (run events) := by
   | nil => rfl
   | cons e es ih => exact ownership_preserved (run es) e ih
 
+/-! ### What each event does to intent
+
+Ownership safety above says nothing about *why* a manager starts or stops.
+These pin the intent flags each event sets, so a transition that ignored
+`live`, `idle` or `stop` could not keep its proofs. -/
+
+theorem stop_stops_and_clears_intent (s : State) :
+    (step s .stop).stopping = true ∧ (step s .stop).desired = false ∧
+    (step s .stop).phase = (if owned s.phase = 1 then .retiring else .dormant) := by
+  simp [step]
+
+theorem live_sets_intent_unless_stopping (s : State) (h : s.stopping = false) :
+    (step s .live).desired = true := by
+  cases hp : s.phase <;> simp [step, start, h, hp]
+
+theorem idle_clears_intent (s : State) : (step s .idle).desired = false := by
+  simp [step]
+
+/-- A joined task restarts, through backoff, exactly when the account is
+still wanted and the runtime is not stopping. -/
+theorem join_restarts_iff_wanted (s : State) (h : s.phase = .retiring) :
+    (step s .joined).phase = .backoff ↔ (s.desired = true ∧ s.stopping = false) := by
+  cases hd : s.desired <;> cases hs : s.stopping <;> simp [step, h, hd, hs]
+
+theorem initial_is_unwanted_and_running (_u : Unit) :
+    initial.desired = false ∧ initial.stopping = false ∧ initial.phase = .dormant := by
+  simp [initial]
+
+/-- The first demand starts exactly one manager. -/
+theorem first_live_starts_one_manager : (run [.live]).starts = 1 ∧ (run [.live]).phase = .running := by
+  simp [run, initial, step, start]
+
 /-- The worst possible in-memory sum on a target with at most 64-bit usize.
 Every slot contributes at most one u64 value to each diagnostic sum. -/
 theorem catalogue_total_fits (accounts units : Nat)

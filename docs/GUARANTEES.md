@@ -33,7 +33,8 @@ Tests verify enforcement; they don't replace it.
 | Unit, property and integration tests | The behavior. Property tests (`proptest`) cover the interleavings fixed tests miss. | Every pull request |
 | Backend parity | `MemoryStore` is the executable specification. `PostgresStore` passes the same scenario suite, test by test and name by name, and a check fails if a mirrored test drives a different contract on each side. | Every pull request |
 | Mutation testing | Code a pull request changes is mutated with `cargo-mutants`. A mutant that no test catches fails the build, so a test that doesn't bite can't pass as coverage. | Every pull request |
-| Machine-checked proofs | 24 Lean 4 modules with 314 theorems prove exact models of the critical accounting and concurrency state machines. The gate rejects any `sorry` or `admit`. | Every pull request |
+| Machine-checked proofs | 24 Lean 4 modules with 346 theorems prove exact models of the critical accounting and concurrency state machines. The gate rejects any `sorry` or `admit`. | Every pull request |
+| Proof mutation testing | Every transition in the Lean models is mutated, one change at a time: a flipped guard, a dropped update, a loosened bound. Some theorem must fail for each, so a proof cannot pass against a model it doesn't pin down. An equivalent mutant is excused only by name, with a written reason. | Every pull request |
 | Allocation assertions | The steady-state admission path allocates nothing it owns; counted deterministically. | Every pull request |
 | Performance gates | Hot-path benchmarks and loopback load tests against calibrated thresholds, with the host and revision recorded. See [performance](PERFORMANCE.md). | Locally, on a controlled host |
 | Supply chain | RustSec advisories, permissive licenses only, a secret scan, and the declared MSRV. | Every pull request |
@@ -102,6 +103,19 @@ theorem or invariant count stated on this page or in the README goes stale.
 
 ## What the proofs cover, and what they don't
 
+A proof is only as strong as what it states. So the models are themselves
+mutation-tested: `check_lean_mutants` changes one operator in one transition
+at a time, checks the mutated model with Lean, and requires a theorem to
+fail. Only definition bodies are mutated; signatures are types, and
+specifications (definitions of type `Prop`) are what the theorems claim, so
+weakening one would prove nothing. When the gate was introduced, 43 of the
+233 mutants survived, which exposed properties that no proof pinned down. The
+biggest group was that a limit was proved refused, but not that the exact
+limit was accepted. Each survivor now fails a theorem, apart from one mutant
+that is equivalent by construction and is listed in
+[`formal/lean/mutants-allowed.txt`](../formal/lean/mutants-allowed.txt)
+with its reason.
+
 The Lean models use exact integer arithmetic and atomic transitions. A green
 proof says that a modeled transition preserves its property. It does not say
 that the Rust or SQL implements that transition faithfully; the Rust
@@ -136,6 +150,7 @@ by module.
 ```sh
 cargo test --workspace --all-features         # tests, witnesses, parity, docs checks
 ./scripts/check_formal.sh                     # the Lean proofs
+./scripts/check_formal_mutants.sh             # mutation testing of the Lean models
 ./scripts/check_mutations.sh --diff main      # mutation testing on a branch
 ./scripts/check_perf_thresholds.sh            # timed gates, on your own host
 ```

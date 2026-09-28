@@ -67,7 +67,40 @@ theorem incomplete_pass_is_not_healthy (s : State) (h : s.phase ≠ .stopped) :
     (step s .failed).healthy = false ∧ (step s .expired).healthy = false := by
   simp [step, h, finish]
 
+/-- A batch call is issued only inside a pass and only when none is owned. -/
+theorem call_issues_iff_draining_and_idle (s : State) (h : s.phase ≠ .stopped) :
+    (step s .call).calls = s.calls + 1 ↔ (s.phase = .draining ∧ s.pending = false) := by
+  cases hp : s.phase <;> cases hq : s.pending <;> simp_all [step]
+
+/-- A full batch settles the owned call and continues the same pass, keeping
+its health; with no owned call it changes nothing. -/
+theorem full_continues_the_pass (s : State) (h : s.phase = .draining) (hp : s.pending = true) :
+    (step s .full).phase = .draining ∧ (step s .full).pending = false ∧
+    (step s .full).healthy = s.healthy := by
+  simp [step, h, hp, finish]
+
+theorem full_without_a_call_changes_nothing (s : State) (hp : s.pending = false) :
+    step s .full = s := by
+  unfold step; split <;> simp [hp]
+
+/-- Completion ends the pass healthy, and only for the owned call of a pass. -/
+theorem completed_ends_the_pass_healthy (s : State) (h : s.phase = .draining) (hp : s.pending = true) :
+    (step s .completed).phase = .waiting ∧ (step s .completed).healthy = true := by
+  simp [step, h, hp, finish]
+
+theorem completed_outside_a_pass_changes_nothing (s : State) (h : s.phase ≠ .draining) :
+    step s .completed = s := by
+  unfold step; split <;> simp [h]
+
+theorem full_outside_a_pass_changes_nothing (s : State) (h : s.phase ≠ .draining) :
+    step s .full = s := by
+  unfold step; split <;> simp [h]
+
 def initial : State := ⟨.waiting, 0, false, false, 0, 0⟩
+
+/-- Nothing is healthy before a pass has completed. -/
+theorem initially_unhealthy_and_idle : initial.healthy = false ∧ initial.pending = false := by
+  simp [initial]
 def run : List Event → State
   | [] => initial
   | e :: es => step (run es) e

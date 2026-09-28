@@ -231,4 +231,7 @@ theorem revoked_then_evicted_rejects_replay
       simp [installRevoked, Watermark.generation, h, evictVisible, installPositive,
         acceptsPositive, Watermark.isRevoked, this, hmax]
 
+theorem isPresent_is_exact (v : Visible) : v.isPresent = true ↔ ∃ g, v = .present g := by
+  cases v <;> simp [Visible.isPresent]
+
 end Tollgate.SnapshotCache

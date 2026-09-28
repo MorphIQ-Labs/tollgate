@@ -40,3 +40,7 @@ path = "src/bin/check_seam_contract.rs"
 [[bin]]
 name = "mdbook-repo-links"
 path = "src/bin/mdbook_repo_links.rs"
+
+[[bin]]
+name = "check_lean_mutants"
+path = "src/bin/check_lean_mutants.rs"

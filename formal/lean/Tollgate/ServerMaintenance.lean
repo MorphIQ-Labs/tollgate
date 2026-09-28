@@ -35,6 +35,14 @@ def initial : State := ⟨true, false, false, false⟩
 
 theorem startup_is_not_ready : ready initial = false := by rfl
 
+/-- Startup becomes ready once both passes have succeeded, and not before:
+neither pass alone is enough. -/
+theorem startup_needs_both_passes :
+    ready (run initial [.reclaim true, .rollover true]) = true ∧
+    ready (run initial [.reclaim true]) = false ∧
+    ready (run initial [.rollover true]) = false := by
+  simp [ready, run, step, initial]
+
 theorem a_failed_pass_withdraws_readiness (s : State) :
     ready (step s (.reclaim false)) = false ∧
     ready (step s (.rollover false)) = false := by

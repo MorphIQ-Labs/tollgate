@@ -31,6 +31,7 @@ TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
 
 ./scripts/check_advisories.sh              # RustSec, yanked and informational advisories
 ./scripts/check_formal.sh                  # the Lean proofs
+./scripts/check_formal_mutants.sh          # mutation testing of the Lean models
 ./scripts/check_perf_thresholds.sh         # hot-path microbenchmark gate
 ./scripts/check_load_thresholds.sh         # local ratios and controlled-host absolutes
 

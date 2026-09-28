@@ -100,4 +100,16 @@ theorem acknowledgement_partitions_each_input (r : Report) (o : Outcome) (n : Na
   | duplicate => simp_all [valid, tally] <;> omega
   | rejected => simp_all [valid, tally] <;> omega
 
+/-- An accepted event counts once, and as unattributed exactly when it has no
+attribution. -/
+theorem tally_accepted_is_exact (r : Report) (attributed : Bool) :
+    (tally r (.accepted attributed)).accepted = r.accepted + 1 ∧
+    (tally r (.accepted attributed)).unattributed =
+      r.unattributed + (if attributed then 0 else 1) := by
+  simp [tally]
+
+theorem an_unattributed_event_is_counted (r : Report) :
+    (tally r (.accepted false)).unattributed = r.unattributed + 1 := by
+  simp [tally]
+
 end Tollgate.CredentialActivity
