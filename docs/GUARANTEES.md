@@ -33,7 +33,7 @@ Tests verify enforcement; they don't replace it.
 | Unit, property and integration tests | The behavior. Property tests (`proptest`) cover the interleavings fixed tests miss. | Every pull request |
 | Backend parity | `MemoryStore` is the executable specification. `PostgresStore` passes the same scenario suite, test by test and name by name, and a check fails if a mirrored test drives a different contract on each side. | Every pull request |
 | Mutation testing | Code a pull request changes is mutated with `cargo-mutants`. A mutant that no test catches fails the build, so a test that doesn't bite can't pass as coverage. | Every pull request |
-| Machine-checked proofs | 24 Lean 4 modules with 364 theorems prove exact models of the critical accounting and concurrency state machines. The gate rejects any `sorry` or `admit`. | Every pull request |
+| Machine-checked proofs | 24 Lean 4 modules with 369 theorems prove exact models of the critical accounting and concurrency state machines. The gate rejects any `sorry` or `admit`. | Every pull request |
 | Proof mutation testing | Every transition in the Lean models is mutated, one change at a time: a flipped guard, a dropped update, a loosened bound. Some theorem must fail for each, so a proof cannot pass against a model it doesn't pin down. An equivalent mutant is excused only by name, with a written reason. | Every pull request |
 | Allocation assertions | The steady-state admission path allocates nothing it owns; counted deterministically. | Every pull request |
 | Performance gates | Hot-path benchmarks and loopback load tests against calibrated thresholds, with the host and revision recorded. See [performance](PERFORMANCE.md). | Locally, on a controlled host |
@@ -99,7 +99,7 @@ theorem or invariant count stated on this page or in the README goes stale.
 | 38 | CLI information requests precede application startup and validation. | — |
 | 39 | Load execution failures remain reportable under the deployment panic policy. | — |
 | 40 | Instance-local sharding separates request-serving threads only while affinities outnumber neither the shards nor their holders. | — |
-| 41 | A provisioner can neither fund, close, grant `Assured`, exceed its budget ceiling, extend credit, reach an operator's account, nor undo an operator's status or exhaust snapshot generations through caller-selected jumps. | [ControlPlane](../formal/lean/Tollgate/ControlPlane.lean) |
+| 41 | A provisioner can neither fund, close, grant `Assured`, exceed its budget ceiling, extend credit, reach an operator's account, nor undo an operator's status, exhaust snapshot generations through caller-selected jumps, or publish unapproved policy. | [ControlPlane](../formal/lean/Tollgate/ControlPlane.lean) |
 <!-- invariant-map:end -->
 
 ## What the proofs cover, and what they don't
