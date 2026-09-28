@@ -15,6 +15,13 @@ release from that section when the merge request lands.
   `403 scope-forbidden` (#43). Missing/invalid template configuration fails
   closed; `ProvisionerLimits::new` now takes templates and returns `Result`.
 
+## [0.31.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.30.3...v0.31.0) - 2026-09-28
+
+### Fixed
+
+- *(store)* [**breaking**] reject key listings for unknown accounts (#51)
+- *(server)* keep body-limit advice specific to the route (#52)
+
 ### Fixed
 
 - Account key listing now returns `404 unknown-account` for an absent account,

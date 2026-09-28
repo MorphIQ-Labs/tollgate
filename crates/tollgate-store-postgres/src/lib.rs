@@ -3508,7 +3508,13 @@ mod tests {
             decode_authority("Provisioner".into()).unwrap(),
             AdminAuthority::Provisioner
         );
-        for invalid in ["", "operator", "provisioner", "Administrator", "Provisioner "] {
+        for invalid in [
+            "",
+            "operator",
+            "provisioner",
+            "Administrator",
+            "Provisioner ",
+        ] {
             assert!(decode_authority(invalid.into()).is_err(), "{invalid:?}");
         }
     }
