@@ -472,10 +472,9 @@ before anything is minted.
 
 Roles `operator` and `provisioner`. One page of the account's credentials,
 revoked and expired ones included: metadata only, never a secret, digest or
-principal. Query: `after` and `limit`, as for `GET /v1/keys`. An account with
-no credentials answers an empty page, and so does one that does not exist when
-an operator asks; a provisioner gets `404 unknown-account`, because its scope
-check reads the account first.
+principal. Query: `after` and `limit`, as for `GET /v1/keys`. An existing account
+with no matching credentials answers an empty page. An unknown account returns
+`404 unknown-account`; existence and the page are read in one store operation.
 
 `200` with `AccountKeysResponse`, whose entries are `AccountKeyResponse`.
 `next_after` is `null` on the last page.
@@ -485,8 +484,8 @@ check reads the account first.
   "revoked_at": null, "live": true}], "next_after": null}
 ```
 
-Errors: `400 invalid-query`, `422 invalid-limit`; for a provisioner,
-`404 unknown-account` and `403 account-not-provisioned`.
+Errors: `400 invalid-query`, `422 invalid-limit`, `404 unknown-account`;
+for a provisioner, `403 account-not-provisioned`.
 
 ### `DELETE /v1/admin/accounts/{account}/keys/{key}`
 
