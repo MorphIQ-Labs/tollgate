@@ -223,3 +223,24 @@ fn the_binary_supports_every_renderer_and_fails_on_a_dead_link() {
     assert!(out.stdout.is_empty(), "a failed build must not emit a book");
     assert!(String::from_utf8_lossy(&out.stderr).contains("nothing.md"));
 }
+
+/// Inline links and reference definitions are collected separately, so their
+/// rewrites must be applied by position, not by collection order: applying a
+/// later edit first shifts every earlier offset (#36 review).
+#[test]
+fn inline_links_and_reference_definitions_are_rewritten_together() {
+    let dir = repo(&[
+        ("asset.txt", "x"),
+        (
+            "docs/A.md",
+            "# A\n\n[inline](../asset.txt)\n\n[r]: ../asset.txt\n",
+        ),
+    ]);
+    let output = tollgate_repo_check::book::preprocess(&input(dir.path(), &["A.md"]))
+        .expect("every link resolves");
+    assert_eq!(
+        contents(&output)[0],
+        "# A\n\n[inline](https://github.com/o/r/blob/main/asset.txt)\n\n\
+         [r]: https://github.com/o/r/blob/main/asset.txt\n"
+    );
+}

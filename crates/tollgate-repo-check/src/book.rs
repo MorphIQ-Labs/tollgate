@@ -309,8 +309,12 @@ fn rewrite(
     if !errors.is_empty() {
         return Err(errors);
     }
+    // Applied last-first by position, so each replacement leaves every earlier
+    // offset valid. `links` reports inline links and reference definitions
+    // from separate passes, so its order is not source order.
+    edits.sort_unstable_by_key(|(span, _): &(Range<usize>, String)| std::cmp::Reverse(span.start));
     let mut content = chapter.content.clone();
-    for (span, replacement) in edits.into_iter().rev() {
+    for (span, replacement) in edits {
         content.replace_range(span, &replacement);
     }
     Ok(content)
