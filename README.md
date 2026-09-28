@@ -1,171 +1,278 @@
-# tollgate
+# Tollgate
 
-Abstract quota admission and usage accounting for latency-critical web
-services: centrally allocated, **fenced quota leases** spent by **local atomic
-counters**, immutable **compiled account snapshots** for admission, and
-**idempotent batched usage events** for billing — so a request path with a
-microsecond budget never performs synchronous I/O.
+[![crates.io](https://img.shields.io/crates/v/tollgate-core.svg)](https://crates.io/crates/tollgate-core)
+[![docs.rs](https://img.shields.io/docsrs/tollgate-core)](https://docs.rs/tollgate-core)
+[![CI](https://github.com/MorphIQ-Labs/tollgate/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MorphIQ-Labs/tollgate/actions/workflows/ci.yml)
+[![MSRV 1.89](https://img.shields.io/badge/MSRV-1.89-blue.svg)](#status)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-Domain-agnostic by construction: the core knows cost units, operations-by-index,
-and permission bits — never plan names, product currencies, or SQL.
+**Quota admission and usage accounting for latency-critical services, with no
+I/O on the request path.**
 
-## Layout
+A metered API has to answer "may this caller do this, and what does it cost?"
+on every request, and record the answer for billing. The usual answers put a
+database or a shared counter on the request path, which costs two to three
+orders of magnitude more than the work it guards when that work takes
+microseconds. Rate limiters remove the round trip but don't bill anything.
+
+Tollgate splits the problem into two planes:
+
+- **The request path** admits against an immutable compiled snapshot of the
+  account and debits a *fenced quota lease* through local atomic counters. It
+  performs no I/O, takes no blocking locks, and reads no clock for a policy
+  decision.
+- **The control plane** does everything slow in the background: it allocates
+  leases from a central balance, distributes snapshots and revocations, and
+  ingests idempotent, batched usage events as the billing record.
+
+The core is domain-agnostic. It knows cost units, operations by index and
+permission bits, never plan names, product currencies or SQL.
+
+## What you get
+
+- **Admission in one call chain:** snapshot lookup, status and permission
+  checks, a direct-indexed cost quote, weighted rate limiting, concurrency
+  limits, and a lease debit that opens a pending charge.
+- **Charging at execution start:** success, failure and timeout are all
+  charged, and cancelling before execution releases the debit for zero units.
+  A committed charge is recorded even across a panic.
+- **Strict or elastic enforcement:** a strict account never spends past its
+  allocation. An elastic account may run past an unfunded lease, and every
+  unit it does is recorded as overage.
+- **Budgets and periods:** allowances roll per period, with expired units
+  accounted for rather than lost.
+- **Credentials:** HMAC API keys with digests at rest, session-scoped caching,
+  and bounded revocation windows.
+- **Backends:** an in-memory store that is the executable specification, and
+  a PostgreSQL store that passes the same scenario suite by name.
+- **A control-plane server** over rustls with mTLS, rotating bearer tokens or
+  Google service-account identity, disjoint instance and operator roles, and
+  an audit trail for every administrative change.
+
+## Guarantees, and how they're checked
+
+Tollgate is built so that its claims are checked, not asserted:
+
+- **[40 numbered invariants](INVARIANTS.md)** form the testable contract.
+  Each one names the tests that enforce it, and CI fails if a named witness
+  stops existing.
+- **Fail closed:** unknown, stale, exhausted or backpressured states deny with
+  zero units charged. There is no slower fallback path to fail open into.
+- **Exact conservation:** every backend's suite asserts, per account,
+  `deposited + overage_recorded == balance + active grants + settled usage +
+  settlement loss + expired`.
+- **Machine-checked proofs:** [18 Lean 4 modules](formal/lean/README.md)
+  with 217 theorems, and no `sorry` or axioms, model lease timing, sharded
+  counters, snapshot revocation, conservation and more. CI checks them on
+  every pull request.
+- **Mutation testing:** every pull request is mutation-tested, so a test that
+  doesn't bite fails the build.
+- **Measured performance:** hot-path benchmarks and allocation counts are
+  gated. In September 2026, full admission measured about 134 ns on an Apple
+  M1 Pro, cached credential authentication about 38 ns, and HMAC verification
+  on a cache miss about 800 ns. Those are host-specific microbenchmarks, not
+  end-to-end HTTP latency; [the performance workflow](docs/PERFORMANCE.md)
+  records the workloads and their limits.
+
+## Install
+
+The library crates release together at one version. Depend on the ones you
+need, at the same version:
+
+```toml
+[dependencies]
+tollgate-core = "0.30"
+tollgate-admission = "0.30"
+# The managed runtime: snapshot distribution, lease renewal, usage batching.
+tollgate-client = "0.30"
+```
 
 | Crate | Role |
 |---|---|
-| `crates/tollgate-core` | Zero-I/O, clock-free hot path: `CostUnits` (checked), `CostTable` (direct-indexed), `AccountSnapshot`, `LocalLease` (fenced, CAS), `Reservation` (pending → committed-at-execution-start \| released) |
-| `crates/tollgate-admission` | One-call pipeline: snapshot map (arc-swap and moka candidates) → permissions → quote → weighted `governor` rate token → lease reservation |
-| `crates/tollgate-auth` | Credential verification: `CredentialVerifier` scheme seam, `HmacRegistry` (digests at rest), `SessionCredential` session cache with a validity bound |
-| `crates/tollgate-store` | `LeaseAllocator` / `SnapshotSource` / `KeySource` / `UsageSink` / `AdminStore` traits, `GrantPolicy`, `MemoryStore` reference backend, wire DTOs, `Clock` |
-| `crates/tollgate-store-postgres` | Transactional Postgres backend (row-locked acquire, set-wise usage ingest, bounded set-wise SKIP LOCKED reclaim) |
-| `crates/tollgate-server` | Authenticated rustls control plane, disjoint instance/operator roles, rotating mTLS/bearer/Google identity, administrative audit |
-| `crates/tollgate-client` | `InstanceRuntime` (dynamic account supervision, readiness, bounded shutdown), staged `RuntimeHandle`, credential `KeyManager`, direct-store `PeriodRoller`, lower-level lease/snapshot/usage managers, `HttpStore` with rotatable TLS and service identity |
-| `crates/tollgate-perf-gate` | Benchmark threshold checker (criterion estimates vs manifest, staleness-guarded) |
-| `examples/pricing-api` | Concrete API embedding the stack: connection-cached HMAC-verified keys, admission, commit-at-execution-start, billing |
+| [`tollgate-core`](https://docs.rs/tollgate-core) | Zero-I/O, clock-free types: cost units and tables, account snapshots, fenced leases, reservations |
+| [`tollgate-admission`](https://docs.rs/tollgate-admission) | The per-request admission pipeline |
+| [`tollgate-auth`](https://docs.rs/tollgate-auth) | Credential verification: the HMAC registry and session credentials |
+| [`tollgate-store`](https://docs.rs/tollgate-store) | Backend traits, the in-memory reference store, wire types |
+| [`tollgate-store-postgres`](https://docs.rs/tollgate-store-postgres) | The transactional PostgreSQL backend |
+| [`tollgate-client`](https://docs.rs/tollgate-client) | `InstanceRuntime`, the HTTP store client, key and period management |
+| [`tollgate-server`](https://docs.rs/tollgate-server) | The authenticated control-plane server |
 
-Documentation: <https://morphiq-labs.github.io/tollgate/> (guides, the
-invariants, proofs and design record) and [docs.rs](https://docs.rs/tollgate-core)
-for the API.
+## A request, end to end
 
-Contract: [`INVARIANTS.md`](INVARIANTS.md). Architecture and findings:
-[`docs/DESIGN.md`](docs/DESIGN.md).
-The techniques Tollgate composes are published as prior art, without patent
-claims: [technique disclosures](docs/DISCLOSURES.md).
+`begin` looks the caller up and pins its snapshot, `admit` quotes the
+operation and debits the lease, `commit` charges at execution start, and
+dropping the committed guard records the billing event. In a service, the
+snapshot and lease below arrive from the control plane.
 
-Putting Tollgate in front of your own service: [embedding
-guide](docs/EMBEDDING.md) — the supported request order, what you implement,
-what is sealed, and how to shut down without losing usage.
+```rust
+use std::sync::{Arc, Mutex};
 
-Direct-store applications using budget schedules run a `PeriodRoller` beside
-their admission runtime. It funds schedules at startup, rolls due periods in
-bounded batches, and exposes health and shutdown reports. See the
-[direct-store lifecycle example](crates/tollgate-client/src/period_roller.rs).
-`InstanceRuntime` does not receive administrative authority; applications using
-`HttpStore` leave period maintenance to `tollgate-server`.
+use jiff::Timestamp;
+use tollgate_admission::{
+    AdmissionEngine, ArcSwapSnapshotMap, LeaseSlot, NoGate, Principal, SnapshotMap,
+};
+use tollgate_core::{
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, FencingToken, Generation,
+    LeaseGrant, LeaseId, LocalLease, OpIndex, PermissionBits, PublishableSnapshot, RequestId,
+    ResolvedLimits, UsageEvent, UsageSlot,
+};
 
-HTTP-backed applications authenticate customer keys through a read-only
-`KeySource` and own a `KeyManager` beside the runtime. Its immutable
-verifier bounds cached evidence by feed freshness and each key's expiry. See
-[credential projection](docs/CREDENTIAL_PROJECTION.md) for lifecycle composition,
-readiness, revocation windows and rollout.
+/// The one operation this API meters.
+struct Price;
 
-See [usage accounting](docs/USAGE_ACCOUNTING.md) for batch rejection semantics,
-PostgreSQL numeric limits, and database-guard migration and recovery.
-See [snapshot operations](docs/SNAPSHOT_OPERATIONS.md) for generation-refusal
-diagnostics and retained readiness after task exit.
-See [lease ownership and test support](docs/LEASE_OWNERSHIP.md) for explicit
-grant retirement and PostgreSQL fixture API migration.
+impl OpIndex for Price {
+    fn index(&self) -> usize {
+        0
+    }
+}
 
-## Quickstart
+/// Where committed charges go. In a service, a permit from the usage writer.
+struct Billing(Arc<Mutex<Vec<UsageEvent>>>);
+
+impl UsageSlot for Billing {
+    fn record(self, event: UsageEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+let now = Timestamp::from_second(1_755_600_000).unwrap();
+let expires = Timestamp::from_second(1_755_600_060).unwrap();
+
+// From the control plane: the account's compiled snapshot (1 unit per
+// request plus 2 per priced item) and a 1,000-unit lease.
+let costs = CostTable::builder(CostUnits(1), CostUnits(1))
+    .weight(&Price, CostUnits(2))
+    .build();
+let snapshot = AccountSnapshot::builder(
+    AccountId(1),
+    Generation(1),
+    AccountStatus::Active,
+    expires,
+    PermissionBits::bit(0),
+    ResolvedLimits::new(64),
+    Arc::new(costs),
+)
+.build();
+let lease = LocalLease::new(
+    LeaseGrant {
+        lease_id: LeaseId(1),
+        account_id: AccountId(1),
+        fencing_token: FencingToken(1),
+        units: CostUnits(1_000),
+        expires_at: expires,
+    },
+    CostUnits(100),
+);
+
+let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+let slot = LeaseSlot::for_account(AccountId(1));
+drop(slot.replace(Arc::new(lease)));
+engine
+    .map()
+    .install_publishable(
+        Principal(42),
+        PublishableSnapshot::try_new(Arc::new(snapshot)).expect("valid snapshot"),
+        slot,
+    )
+    .expect("installed");
+
+// The request path: no I/O from here on.
+let billed = Arc::new(Mutex::new(Vec::new()));
+let committed = engine
+    .begin(Principal(42), PermissionBits::bit(0), now)
+    .expect("known, active, permitted caller")
+    .admit(&[(Price, 3)], Billing(Arc::clone(&billed)), now)
+    .expect("within limits and funded")
+    .acquire_capacity(&NoGate)
+    .expect("no capacity gate configured")
+    .commit(RequestId(1), now)
+    .map_err(|(error, _released)| error)
+    .expect("inside the lease window");
+
+// ... do the work ...
+drop(committed);
+
+assert_eq!(billed.lock().unwrap()[0].units, CostUnits(7)); // 1 + 2 × 3
+```
+
+[Embedding Tollgate](docs/EMBEDDING.md) gives the supported request order,
+what you implement, what is sealed, and how to shut down without losing
+usage.
+
+## Beyond the request path
+
+- **`InstanceRuntime`** (in `tollgate-client`) supervises accounts
+  dynamically: it distributes snapshots, acquires and renews leases, batches
+  usage, reports continuous readiness, and shuts down within a bound.
+- **HTTP-backed services** authenticate customer keys through a read-only
+  `KeySource`, with a `KeyManager` beside the runtime whose verifier bounds
+  cached evidence by feed freshness and each key's expiry. See
+  [credential projection](docs/CREDENTIAL_PROJECTION.md).
+- **Direct-store services with budget schedules** run a `PeriodRoller`, which
+  funds schedules at startup and rolls due periods in bounded batches. See
+  [its lifecycle example](crates/tollgate-client/src/period_roller.rs). With
+  `HttpStore`, the server does period maintenance instead.
+- **Batch rejection, PostgreSQL limits and recovery** are covered in
+  [usage accounting](docs/USAGE_ACCOUNTING.md), and generation refusals in
+  [snapshot operations](docs/SNAPSHOT_OPERATIONS.md).
+
+## Try the example service
+
+[`examples/pricing-api`](examples/pricing-api) is a complete metered API with
+HMAC-verified keys, admission, commit at execution start, and billing:
 
 ```sh
-git config core.hooksPath .githooks         # once per clone: rustfmt check on commit
-
-cargo test --workspace                     # correctness (Postgres DB cases are env-gated)
-./scripts/check_advisories.sh              # RustSec + yanked/informational dependency gate
-./scripts/check_formal.sh                  # Lean lease/snapshot proofs
-./scripts/check_perf_thresholds.sh         # hot-path microbench gate
-./scripts/check_load_thresholds.sh         # local ratios + controlled-host absolutes
-
-# Postgres correctness suite:
-docker compose up -d
-TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate cargo test -p tollgate-store-postgres
-TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate ./scripts/check_mutations.sh --diff main
-
-# One crate's whole surface, rather than only what a branch changed:
-./scripts/check_mutations.sh --package tollgate-core
-
-# Run the example service:
-cargo run -p pricing-api --bin pricing-api -- --help
 cargo run -p pricing-api --bin pricing-api
-# Opt in only after profiling sustained same-account cross-core contention:
-TOLLGATE_LOCAL_SHARDS=8 cargo run -p pricing-api --bin pricing-api
 curl -s -H 'Authorization: Bearer demo-key-1' -H 'Content-Type: application/json' \
      -d '{"contracts":[{"spot":100,"strike":105,"rate":0.05,"vol":0.2,"tte_years":0.25}]}' \
      http://127.0.0.1:8081/v1/price
-
-# What that instance admitted and refused, by reason:
-curl -s http://127.0.0.1:8081/metrics
-
-# Configure control-plane identities/TLS first; see docs/CONTROL_PLANE_SECURITY.md:
-TOLLGATE_SECURITY_CONFIG=/path/to/security.json cargo run -p tollgate-server
+curl -s http://127.0.0.1:8081/metrics   # what it admitted and refused, by reason
 ```
 
-The [control-plane security runbook](docs/CONTROL_PLANE_SECURITY.md) covers TLS,
-Google service-account identity, credential rotation, audit collection, and the Rust
-API/configuration rollout. Remote plaintext and anonymous control-plane calls
-are refused.
+Set `TOLLGATE_LOCAL_SHARDS=8` only after profiling sustained same-account
+contention across cores; [instance-local sharding](docs/LOCAL_SHARDING.md)
+explains how to size it. The control-plane server starts with
+`TOLLGATE_SECURITY_CONFIG=/path/to/security.json cargo run -p tollgate-server`
+once identities and TLS are configured, and refuses remote plaintext and
+anonymous calls.
 
-[Instance-local sharding](docs/LOCAL_SHARDING.md) covers what the opt-in above
-buys, how to size it against your worker pool, and how to read the occupancy an
-instance reports — sharding separates threads only while the affinities issued
-do not outnumber the shards, and an instance says when they do.
+Every binary answers `--help` and `--version` before reading any
+configuration. `pricing-api` and `tollgate-server` take no positional
+arguments, and exit with status 2 on any they are given.
 
-Every binary accepts `--help`/`-h` and `--version`/`-V` before validating other
-arguments or application configuration. The first information flag before `--`
-wins; everything after that marker is positional. `pricing-api` and
-`tollgate-server` take no positional arguments: no arguments or a bare `--`
-starts the service, and other arguments exit with status 2. Information commands
-exit successfully without starting the application, binding its listener or
-running measurements. The gate tools retain their documented positional inputs.
+## Documentation
 
-## Supported Rust toolchains
+The documentation site is at **<https://morphiq-labs.github.io/tollgate/>**,
+and the API reference is on [docs.rs](https://docs.rs/tollgate-core).
 
-The workspace declares Rust 1.89 as its minimum supported Rust version
-(MSRV). Every pull request checks the locked workspace, including all
-features and targets, with Rust 1.89.0 so dependency updates cannot silently
-raise that floor.
+- **Using Tollgate:** [embedding](docs/EMBEDDING.md),
+  [account administration](docs/ACCOUNT_ADMINISTRATION.md),
+  [usage accounting](docs/USAGE_ACCOUNTING.md),
+  [snapshot operations](docs/SNAPSHOT_OPERATIONS.md),
+  [lease timing](docs/LEASE_TIMING.md),
+  [lease ownership](docs/LEASE_OWNERSHIP.md),
+  [local sharding](docs/LOCAL_SHARDING.md), and
+  [credential projection](docs/CREDENTIAL_PROJECTION.md).
+- **Operating it:** the [control-plane security runbook](docs/CONTROL_PLANE_SECURITY.md)
+  covers TLS, service identity, credential rotation and audit collection.
+  Signals, what normal looks like, and the ledger reconciliation query are in
+  [Observability](docs/DESIGN.md#observability).
+- **Why it's built this way:** the [design record](docs/DESIGN.md), and the
+  [technique disclosures](docs/DISCLOSURES.md), published as prior art with no
+  patent claims.
 
-`rust-toolchain.toml` separately pins Rust 1.97.1 for local development and
-the primary CI jobs. That pin provides reproducible formatting, linting,
-testing, and release tooling; it does not replace the MSRV contract. Changes
-to the declared minimum and the dedicated `msrv` job must land together.
+## Status
 
-## Performance measurements
+Tollgate is pre-1.0. A breaking change moves the minor version, so a caret
+requirement (`"0.30"`) never crosses one; the [changelog](CHANGELOG.md) marks
+every break. The minimum supported Rust version is 1.89, and CI checks it on
+every pull request.
 
-Timed Criterion and production-profile loopback load tests run locally.
-Performance-sensitive pull requests and releases carry the reports and their
-host/revision provenance. CI compiles the benchmarks and checks allocation
-counts; remote timing does not decide whether a change can merge. See
-[the local performance workflow](docs/PERFORMANCE.md).
+## Contributing
 
-The September 9 GL-105 run on an Apple M1 Pro measured full admission at about
-134 ns and the separate owned admission/commit/emission fixtures at 118–126 ns.
-Those fixtures have different workloads and their times are not additive.
-Cached managed credential authentication measured about 38 ns; HMAC verification
-on a cache miss was about 800 ns, with session setup measured separately.
-These are host-specific measurements, not end-to-end HTTP latency guarantees.
-The [credential activity evidence](testing/credential_activity_evidence.json)
-and [projection evidence](docs/CREDENTIAL_PROJECTION_EVIDENCE.md) record the
-workloads and limitations. Gate manifests live in `testing/`; changes to their
-thresholds require deliberate calibration evidence.
-
-## Design rules
-
-- The request path performs no I/O, takes no blocking locks, and reads no
-  wall clock for a policy decision (`now` is an argument). Everything slow is
-  a background plane. Moka's cache housekeeping and governor's bucket
-  arithmetic do read their own monotonic clocks, and moka's takes a
-  non-blocking `try_lock` on roughly every sixty-fourth lookup; those are
-  measured mechanism costs, never sources of truth.
-- Fail closed: unknown, stale, exhausted, or backpressured states deny with
-  zero units charged — there is no slower fallback path.
-- Snapshot revocations are durable, generation-ordered tombstones; delayed
-  control-plane messages cannot resurrect an older authorization state.
-- Readiness is continuous, covering snapshot freshness/task health, lease
-  usability, and accounting-writer health rather than only initial loading.
-- Leases bound spend; usage events are the billing truth; per-account
-  conservation (`deposited + overage_recorded == balance + active grants +
-  settled usage + settlement loss + expired`) is asserted exactly in every
-  backend's suite. The [ledger contract](INVARIANTS.md) explains overage
-  funding and expired allowances.
-- Backends are honest trait implementations: the memory store is the
-  executable spec, and Postgres passes the same scenario suite by name.
-- Every failure here is silent and recoverable by design, so the signals are
-  the only way to tell "working" from "broken for twenty minutes": what is
-  emitted, what normal looks like, and what to do about each reading are in
-  [Observability](docs/DESIGN.md#observability), along with the reconciliation
-  query for checking the two ledgers agree on a live system.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the local gates and the
+pull-request process. [AGENTS.md](AGENTS.md) is the full engineering contract.
+Report security issues privately; see [SECURITY.md](SECURITY.md).
 
 ## License
 
@@ -177,9 +284,5 @@ for inclusion in Tollgate by you, as defined in the Apache-2.0 license, shall be
 dual licensed as above, without any additional terms or conditions.
 
 Tollgate is a product of MorphIQ Labs, a trade name of Prophetizo LLC.
-
-Report security issues privately; see [`SECURITY.md`](SECURITY.md).
-
-`cargo deny --locked check licenses` (the `licenses` CI job) gates the dependency graph against
-[`deny.toml`](deny.toml): every dependency must be available under a permissive
-license.
+`cargo deny --locked check licenses` gates every dependency against
+[`deny.toml`](deny.toml), which admits only permissive licenses.

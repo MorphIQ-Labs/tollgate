@@ -2929,11 +2929,14 @@ dependencies = [
 name = "tollgate-repo-check"
 version = "0.30.1"
 dependencies = [
+ "jiff",
  "proc-macro2",
  "pulldown-cmark",
  "serde_json",
  "syn 2.0.119",
  "tempfile",
+ "tollgate-admission",
+ "tollgate-core",
 ]
 
 [[package]]
