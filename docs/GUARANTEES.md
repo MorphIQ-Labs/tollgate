@@ -108,11 +108,10 @@ mutation-tested: `check_lean_mutants` changes one operator in one transition
 at a time, checks the mutated model with Lean, and requires a theorem to
 fail. Only definition bodies are mutated; signatures are types, and
 specifications (definitions of type `Prop`) are what the theorems claim, so
-weakening one would prove nothing. When the gate was introduced, 43 of the
-233 mutants survived, which exposed properties that no proof pinned down. The
-biggest group was that a limit was proved refused, but not that the exact
-limit was accepted. Each survivor now fails a theorem, apart from one mutant
-that is equivalent by construction and is listed in
+weakening one would prove nothing. This pushes the proofs to pin down exact
+behaviour: not only that a limit refuses what exceeds it, but that it accepts
+exactly what fits. Every mutant that typechecks fails a theorem, apart from one that is
+equivalent by construction and is listed in
 [`formal/lean/mutants-allowed.txt`](../formal/lean/mutants-allowed.txt)
 with its reason.
 
