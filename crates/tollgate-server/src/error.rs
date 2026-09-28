@@ -270,6 +270,9 @@ impl From<AllocateError> for ApiError {
                 (StatusCode::CONFLICT, "insufficient-balance")
             }
             AllocateError::BalanceExhausted(_) => (StatusCode::CONFLICT, "balance-exhausted"),
+            AllocateError::BalanceOverflow => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "balance-overflow")
+            }
             AllocateError::InvalidTtl => (StatusCode::UNPROCESSABLE_ENTITY, "invalid-ttl"),
             AllocateError::UnknownLease => (StatusCode::NOT_FOUND, "unknown-lease"),
             AllocateError::Fenced => (StatusCode::CONFLICT, "fenced"),

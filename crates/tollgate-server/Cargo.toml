@@ -18,7 +18,7 @@ postgres = ["dep:tollgate-store-postgres"]
 test-support = ["tollgate-store-postgres?/test-support"]
 
 [dependencies]
-tollgate-auth = { path = "../tollgate-auth", version = "=0.30.1" }
+tollgate-auth = { path = "../tollgate-auth", version = "=0.30.3" }
 arc-swap = { workspace = true }
 getrandom = { workspace = true }
 sha2 = { workspace = true }
@@ -29,9 +29,9 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }
-tollgate-core = { path = "../tollgate-core", version = "=0.30.1", features = ["serde"] }
-tollgate-store = { path = "../tollgate-store", version = "=0.30.1", features = ["wire"] }
-tollgate-store-postgres = { path = "../tollgate-store-postgres", version = "=0.30.1", optional = true }
+tollgate-core = { path = "../tollgate-core", version = "=0.30.3", features = ["serde"] }
+tollgate-store = { path = "../tollgate-store", version = "=0.30.3", features = ["wire"] }
+tollgate-store-postgres = { path = "../tollgate-store-postgres", version = "=0.30.3", optional = true }
 axum = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true }
@@ -51,8 +51,8 @@ tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 rcgen = { workspace = true }
 async-trait = { workspace = true }
-tollgate-admission = { path = "../tollgate-admission", version = "=0.30.1" }
-tollgate-client = { path = "../tollgate-client", version = "=0.30.1", features = ["http"] }
+tollgate-admission = { path = "../tollgate-admission", version = "=0.30.3" }
+tollgate-client = { path = "../tollgate-client", version = "=0.30.3", features = ["http"] }
 http-body-util = { workspace = true }
 tower = { workspace = true }
 

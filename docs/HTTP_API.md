@@ -409,7 +409,10 @@ Request `DepositRequest`: `{"units": 1000}`. `204` with no body.
 
 Errors: `400 zero-deposit`, `404 unknown-account`. A deposit that would
 overflow the account's balance or deposited total is refused as
-`503 storage` and changes nothing.
+`422 balance-overflow` and changes nothing. An amount outside the backend's
+unit domain is refused the same way (`u64` for memory, nonnegative `BIGINT`
+through `i64::MAX` for PostgreSQL). Never retry the unchanged request.
+Backend outages remain `503 storage`.
 
 ### `POST /v1/admin/accounts/{account}/status`
 

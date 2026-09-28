@@ -15,6 +15,26 @@ release from that section when the merge request lands.
   `403 scope-forbidden` (#43). Missing/invalid template configuration fails
   closed; `ProvisionerLimits::new` now takes templates and returns `Result`.
 
+## [0.30.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.30.2...v0.30.3) - 2026-09-28
+
+### Fixed
+
+- *(store)* classify deposit overflow as a permanent refusal (#50)
+
+### Fixed
+
+- Deposit overflow now returns the additive `422 balance-overflow` problem
+  code instead of retryable `503 storage`, in both backends (#40). Deposits
+  outside PostgreSQL's unit range are refused the same way; neither funding
+  counter changes. Rust callers matching `AllocateError` exhaustively must
+  handle the new `BalanceOverflow` variant.
+
+## [0.30.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.30.1...v0.30.2) - 2026-09-28
+
+### Other
+
+- prepare the public launch (#36)
+
 ## [0.30.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.30.0...v0.30.1) - 2026-09-27
 
 ### Fixed

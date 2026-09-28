@@ -58,6 +58,9 @@ pub enum AllocateError {
     /// (`unspent + recorded usage > granted`) — a client accounting bug,
     /// surfaced rather than absorbed.
     InvalidRelease,
+    /// A deposit exceeds the backend's unit domain or would overflow its
+    /// top-up balance or lifetime deposited total. Nothing changes; do not retry.
+    BalanceOverflow,
     /// A backend failure unrelated to domain rules; see [`StoreError`].
     Storage(StoreError),
 }
@@ -80,10 +83,11 @@ impl AllocateError {
         "storage",
         "balance_exhausted",
         "balance_insufficient",
+        "balance_overflow",
     ];
 
     /// How many distinct refusals exist — the width of a per-reason tally.
-    pub const COUNT: usize = 11;
+    pub const COUNT: usize = 12;
 
     /// This refusal's dense slot, for direct-indexed per-reason counters.
     ///
@@ -105,6 +109,7 @@ impl AllocateError {
             AllocateError::Storage(_) => 8,
             AllocateError::BalanceExhausted(_) => 9,
             AllocateError::BalanceInsufficient(_) => 10,
+            AllocateError::BalanceOverflow => 11,
         }
     }
 
@@ -134,6 +139,9 @@ impl std::fmt::Display for AllocateError {
             AllocateError::Fenced => f.write_str("fencing token mismatch"),
             AllocateError::LeaseNotActive => f.write_str("lease not active"),
             AllocateError::InvalidRelease => f.write_str("invalid release"),
+            AllocateError::BalanceOverflow => {
+                f.write_str("deposit exceeds account funding capacity")
+            }
             AllocateError::Storage(e) => write!(f, "{e}"),
         }
     }
@@ -1145,7 +1153,8 @@ pub trait AdminStore: Send + Sync {
     /// boundaries, raising its balance and its `deposited` total together.
     ///
     /// A missing account is [`AllocateError::UnknownAccount`]. An overflow of
-    /// either counter is [`AllocateError::Storage`] and moves neither. Account
+    /// either counter, or units outside the backend's numeric domain, is
+    /// [`AllocateError::BalanceOverflow`] and moves neither. Account
     /// status is not checked. The receipt carries
     /// [`AdminState::Funding`](crate::AdminState::Funding) before and after.
     async fn deposit(
@@ -2014,6 +2023,7 @@ mod tests {
                 remaining: CostUnits(1),
                 period_end: None,
             }),
+            AllocateError::BalanceOverflow,
         ]
     }
 

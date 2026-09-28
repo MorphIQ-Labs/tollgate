@@ -640,11 +640,11 @@ impl MemoryStore {
             .balance
             .topup
             .checked_add(units)
-            .ok_or_else(|| AllocateError::Storage(StoreError("balance overflow".into())))?;
+            .ok_or(AllocateError::BalanceOverflow)?;
         let deposited = record
             .deposited
             .checked_add(units)
-            .ok_or_else(|| AllocateError::Storage(StoreError("deposit overflow".into())))?;
+            .ok_or(AllocateError::BalanceOverflow)?;
         let before = AdminState::Funding {
             topup: record.balance.topup,
             deposited: record.deposited,
