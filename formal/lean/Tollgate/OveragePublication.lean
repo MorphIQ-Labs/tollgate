@@ -110,4 +110,18 @@ theorem refunding_all_pending_units_leaves_exactly_committed
   simp only [State.WellFormed] at valid
   omega
 
+/-- A finished commit moves exactly its units to committed and ends its
+publication. -/
+theorem finish_commit_is_exact (state : State) (units : Nat) :
+    (finishCommit state units).committed = state.committed + units ∧
+    (finishCommit state units).publications = state.publications - 1 := by
+  simp [finishCommit]
+
+/-- A publication begun and then finished, either way, leaves the count where
+it started. -/
+theorem a_publication_round_trip_restores_the_count (state : State) (units : Nat) :
+    (finishCommit (beginPublication state) units).publications = state.publications ∧
+    (finishLostClaim (beginPublication state)).publications = state.publications := by
+  simp [finishCommit, finishLostClaim, beginPublication]
+
 end Tollgate.OveragePublication

@@ -395,4 +395,16 @@ theorem ingest_refuses_past_capacity (s : Store) (id account fence units : Nat) 
   intros
   omega
 
+/-- The exact capability is accepted: release of an active lease with a claim
+that fits the grant, and usage that fits what is left, both succeed. -/
+theorem release_accepts_the_exact_capability (s : Store) (id unspent : Nat) (l : Lease)
+    (hl : s.leases id = some l) (ha : l.status = .active) (fits : l.used + unspent ≤ l.granted) :
+    (release s id l.fence unspent).isSome = true := by
+  simp [release, hl, ha, fits]
+
+theorem ingest_accepts_the_exact_capability (s : Store) (id units : Nat) (l : Lease)
+    (hl : s.leases id = some l) (fits : l.used + l.credited + units ≤ l.granted) :
+    (ingest s id l.account l.fence units).isSome = true := by
+  simp [ingest, hl, fits]
+
 end Tollgate.LeaseFencing

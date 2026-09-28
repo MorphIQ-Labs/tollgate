@@ -190,4 +190,12 @@ theorem sessions_isolated (verify : Verifier) (c : Cache) (session cred now othe
     · exact fresh_other verify c session cred now other h
   · exact fresh_other verify c session cred now other h
 
+/-- A verification with no expiry is reusable, so a key with no `not_after`
+is accepted and cached until withdrawal reaches it by snapshot. -/
+theorem an_indefinite_verification_is_accepted (verify : Verifier) (c : Cache)
+    (session cred now p : Nat) (hv : verify cred = some (p, none)) :
+    (fresh verify c session cred now).2 = some p ∧
+    (fresh verify c session cred now).1 session = some ⟨cred, p, none⟩ := by
+  simp [fresh, hv, reusable, put]
+
 end Tollgate.SessionCredential

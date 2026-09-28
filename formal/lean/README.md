@@ -142,7 +142,17 @@ Run from the repository root:
 
 ```sh
 ./scripts/check_formal.sh
+./scripts/check_formal_mutants.sh
 ```
+
+The second command mutates every transition definition, one operator at a
+time, and requires some theorem to fail for each: a proof that still passes
+against a broken model states less than it appears to. A surviving mutant
+fails the gate unless `mutants-allowed.txt` names it as equivalent, with a
+reason. When you add or change a model, add the theorems that kill its
+mutants. In practice these are the liveness and exactness facts beside the
+safety ones: that the exact limit is accepted, not only that exceeding it is
+refused.
 
 The models use exact natural-number or integer arithmetic and atomic transitions. Rust
 property, cache, manager, HTTP, and backend-parity tests establish the

@@ -381,6 +381,14 @@ jobs:
             | sh -s -- -y --default-toolchain "$(cat formal/lean/lean-toolchain)"
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       - run: ./scripts/check_formal.sh
+      # Mutation testing for the models: each transition definition is
+      # mutated and some theorem must fail. A survivor fails unless
+      # formal/lean/mutants-allowed.txt names it as equivalent, with a reason.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: tools
+          save-if: false
+      - run: ./scripts/check_formal_mutants.sh
 
   # Blocking assurance gate: diff-scoped mutation testing, including the
   # Postgres backend.

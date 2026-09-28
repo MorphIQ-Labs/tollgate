@@ -371,4 +371,16 @@ theorem charged_within_grant (s : Sys) (h : Wf s) : charged s ≤ s.grant := by
   simp only [charged, debited] at *
   omega
 
+/-- An admission the lease can fund, including one that spends it exactly,
+is funded: the request becomes pending and the lease drops by its units. -/
+theorem a_fundable_admission_is_funded (s : Sys) (i u : Nat) (hq : s.reqs[i]? = some .reserved)
+    (hu : u ≤ s.lease) :
+    ∃ s', admit s i u = some s' ∧ s'.lease = s.lease - u ∧ s'.reqs[i]? = some (.pending u) := by
+  have hlen : i < s.reqs.length := by
+    rcases Nat.lt_or_ge i s.reqs.length with h | h
+    · exact h
+    · rw [List.getElem?_eq_none h] at hq; cases hq
+  refine ⟨{ update s i (.pending u) with lease := s.lease - u }, by simp [admit, hq, hu], rfl, ?_⟩
+  simp [update, hlen]
+
 end Tollgate.ChargeLifecycle

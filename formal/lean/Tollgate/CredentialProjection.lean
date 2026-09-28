@@ -185,4 +185,9 @@ theorem a_reset_session_cannot_outlive_conservative_source_expiry
   have := source_expiry_is_never_extended started maxAge lower
   omega
 
+/-- A catalogue that fits in one page drains in a single call. -/
+theorem one_page_drains_at_once (limit fuel : Nat) (records : List Nat)
+    (fits : records.length ≤ limit) : drain limit (fuel + 1) records = some records := by
+  simp [drain, fits]
+
 end Tollgate.CredentialProjection

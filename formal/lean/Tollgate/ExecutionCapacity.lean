@@ -247,4 +247,13 @@ theorem uniform_gives_both_classes_the_same_headroom (shared : Nat) :
     (start shared 0).assuredHeadroom = (start shared 0).bestEffortHeadroom := by
   simp [start, State.assuredHeadroom, State.bestEffortHeadroom]
 
+/-- The reserve is reachable: assured work may use it. Isolation alone would
+hold for a reserve nothing could reach. -/
+theorem assured_work_reaches_the_reserve : mayUseReserve .assured = true := rfl
+
+/-- A reserve acquisition takes exactly one unit. -/
+theorem acquire_reserve_takes_one_unit (s : State) (room : s.reserveInFlight < s.reserveCapacity) :
+    (acquireReserve s .assured assured_work_reaches_the_reserve room).reserveInFlight =
+      s.reserveInFlight + 1 := rfl
+
 end Tollgate.ExecutionCapacity
