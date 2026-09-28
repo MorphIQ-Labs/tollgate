@@ -88,7 +88,9 @@ case "${1:-}" in
       # GL-67 is why this exists: 159 mutants at one worker ran past the job's
       # 90-minute limit, and a gate that cannot finish reports nothing at all.
       echo "mutation gate: no PostgreSQL change in this diff; the backend suite skips and the run uses $PARALLEL workers"
-      unset TOLLGATE_PG_URL
+      # Both flags describe the same optional backend. Keeping REQUIRE_PG
+      # after removing its URL makes the unmutated server baseline fail.
+      unset TOLLGATE_PG_URL TOLLGATE_REQUIRE_PG
       JOBS=$PARALLEL
     fi
     cargo mutants --workspace -j "$JOBS" --line-col true --in-diff "$diff" --output "$OUTPUT" $SHARD_ARGS \

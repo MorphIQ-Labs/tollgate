@@ -48,7 +48,7 @@ The [HTTP API reference](HTTP_API.md) lists which routes return which codes.
 | `invalid-json` | 400, 415 or 422 | the body is not JSON (400), is not sent as `application/json` (415), or does not match the endpoint's type, including a missing required field or an unknown field where refused (422). The status is axum's rejection status | no — fix the body |
 | `invalid-query` | 400 | query parameters are malformed or unknown | no — fix the query |
 | `invalid-limit` | 422 | a credential page `limit` outside 1–4096 | no — fix the limit |
-| `batch-too-large` | 413 | the body exceeds the endpoint's limit: 2 MiB for usage ingest and other routes, 4 MiB for snapshot publication | never unchanged — split the batch |
+| `batch-too-large` | 413 | the body exceeds the endpoint's limit: 2 MiB for usage ingest and other routes, 4 MiB for snapshot publication. Title: "request body exceeds this endpoint's limit"; only usage ingest appends the usage-batch event cap | never unchanged — reduce the body or split a usage batch |
 
 ### Leases
 

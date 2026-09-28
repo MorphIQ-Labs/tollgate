@@ -13,11 +13,11 @@ use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
 
 use tollgate_core::{Generation, SnapshotValidationError};
+use tollgate_store::IngestError;
 use tollgate_store::wire::Problem;
 use tollgate_store::{
     AllocateError, CreateAccountError, PublishSnapshotError, SetStatusError, StoreError,
 };
-use tollgate_store::{IngestError, MAX_INGEST_BATCH};
 
 /// A refused control-plane request, rendered as an RFC-7807
 /// `application/problem+json` body in the [`Problem`] shape.
@@ -217,10 +217,7 @@ impl From<JsonRejection> for ApiError {
             return ApiError {
                 status,
                 code: "batch-too-large",
-                title: format!(
-                    "request body exceeds this endpoint's limit; \
-                     usage batches are capped at {MAX_INGEST_BATCH} events"
-                ),
+                title: "request body exceeds this endpoint's limit".into(),
                 generation: None,
                 balance_exhaustion: None,
                 balance_shortfall: None,
