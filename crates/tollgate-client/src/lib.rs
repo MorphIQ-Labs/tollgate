@@ -45,6 +45,8 @@
 //! [`UsageSink`]: tollgate_store::UsageSink
 //! [`LeaseSlot`]: tollgate_admission::LeaseSlot
 
+#![deny(missing_docs)]
+
 pub mod key_manager;
 pub mod lease_manager;
 pub mod period_roller;

@@ -81,16 +81,46 @@ use tollgate_core::{DenyReason, LocalSharding, Locality, UsageEvent};
 use tollgate_store::Clock;
 use tollgate_store::{MAX_INGEST_BATCH, UsageSink};
 
+/// The usage queue's size and the writer's batching, retry and shutdown
+/// timing.
+///
+/// There are no defaults; every value is a deployment decision.
+/// [`validate`](Self::validate) runs before the task starts
+/// (INVARIANTS.md 16).
 #[derive(Debug, Clone, Copy)]
 pub struct UsageWriterConfig {
     /// Channel capacity — the shed point. Size it to cover the sink's worst
     /// tolerable outage at peak admission rate.
+    ///
+    /// Counted in usage events, one per in-flight or committed-but-unwritten
+    /// request. Every reserved permit holds a slot, so it also caps
+    /// concurrent admitted requests. Too small sheds
+    /// (`AccountingBackpressure`, zero charge) during brief sink hiccups or
+    /// bursts; too large lets a longer outage pile up unbilled events in
+    /// memory and in the shutdown drain. The writer splits it exactly into
+    /// lanes by host parallelism, with at least 64 slots a lane when there is
+    /// more than one. Must be positive.
     pub queue_capacity: usize,
     /// Largest batch handed to one `ingest` call.
+    ///
+    /// Counted in events. Too small multiplies sink calls under load; too
+    /// large makes each call, and each retry of a failing one, heavier. It
+    /// also sets how full a lane gets before it wakes the writer early. Must
+    /// be positive and at most [`MAX_INGEST_BATCH`], the ingest endpoint's
+    /// limit.
     pub max_batch: usize,
     /// A partial batch is flushed after at most this long.
+    ///
+    /// The latency between a charge being recorded and the sink seeing it at
+    /// low traffic. Too long delays billing and leaves more events in the
+    /// queue when a process dies; too short sends many small batches. Must be
+    /// positive.
     pub flush_interval: std::time::Duration,
     /// Backoff between retries of a failing ingest.
+    ///
+    /// A failing sink is retried forever at this pace while the queue fills
+    /// and sheds upstream. Too short hot-spins against a failing sink; too
+    /// long delays recovery after it returns. Must be positive.
     pub retry_backoff: std::time::Duration,
     /// Wall-clock bound on the shutdown drain: how long `shutdown` waits for
     /// outstanding permits (slots reserved by in-flight requests or committed
@@ -98,13 +128,26 @@ pub struct UsageWriterConfig {
     /// the way. Must be positive. Size it within
     /// `expiry_safety_margin + reclaim_grace` so an event landing at the end
     /// of the drain is still billable against its lease.
+    ///
+    /// Too short reports permits as [`WriterStats::unresolved`] and batches
+    /// as [`WriterStats::lost`] that a longer drain would have billed; too
+    /// long risks events landing after their lease settled, which the sink
+    /// rejects. Under an [`InstanceRuntime`](crate::InstanceRuntime) the
+    /// runtime's `shutdown_deadline` must cover it.
     pub shutdown_drain_deadline: std::time::Duration,
     /// Wall-clock bound on one `UsageSink::ingest` call. A sink that hangs
     /// rather than erroring would otherwise park the writer task forever, and
     /// with it every later shutdown step. Must be positive.
+    ///
+    /// A timed-out call is a failed attempt and is retried; the sink may
+    /// still have recorded the batch, which the retry then reports as
+    /// `duplicate`. Set it above the sink's slowest legitimate ingest of a
+    /// full batch: too short turns a slow sink into endless retries; too long
+    /// holds the queue behind a hung call.
     pub ingest_timeout: std::time::Duration,
 }
 
+/// Why a [`UsageWriterConfig`] was refused: the first rule it broke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsageWriterConfigError(pub &'static str);
 
@@ -219,6 +262,7 @@ pub struct WriterCounters {
 }
 
 impl WriterCounters {
+    /// A counter set that has recorded nothing and is attached to no lanes.
     #[must_use]
     pub const fn new() -> Self {
         WriterCounters {
@@ -532,6 +576,10 @@ pub struct UsagePermit {
 }
 
 impl UsagePermit {
+    /// Send the committed request's event into the reserved slot. Never
+    /// blocks and cannot fail: the slot was reserved before admission. The
+    /// event counts as unaccounted until the writer gives it a billing
+    /// outcome.
     pub fn record(mut self, event: UsageEvent) {
         let permit = self
             .permit
@@ -592,9 +640,25 @@ pub struct WriterStats {
     pub attribution_unreported_batches: u64,
     /// At least one cumulative outcome exceeded u64; its value is saturated.
     pub counter_overflow: bool,
+    /// Events the sink newly recorded: billed.
     pub accepted: u64,
+    /// Events whose request id the sink had already recorded, from a retried
+    /// batch whose acknowledgement was lost. Ingest is idempotent
+    /// (INVARIANTS.md 7), so these are not double charges; a steady rate
+    /// points at acknowledgements lost to timeouts.
     pub duplicate: u64,
+    /// Events the sink refused: unknown lease, lease-capability mismatch, no
+    /// remaining accounting capacity, or units outside its storage domain.
+    /// Bounded billing loss that has already happened, left for
+    /// reconciliation. Normal is zero; a trickle usually means events land
+    /// after their lease settled, so the drain deadline sits too close to
+    /// `expiry_safety_margin + reclaim_grace`.
     pub rejected: u64,
+    /// Events that will never reach the ledger: batches the sink refused
+    /// with a non-retryable error, and events the final flush could not
+    /// deliver before its deadline. Any nonzero value is committed charges
+    /// that went unbilled. A healthy but unreachable sink leaves this at zero
+    /// until shutdown, so alert on [`WriterHealth::ingest_age`] instead.
     pub lost: u64,
     /// Permits (in-flight requests or committed guards) that neither sent
     /// nor dropped before the drain deadline. Their charges are locally
@@ -622,6 +686,8 @@ impl WriterStats {
 /// an outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriterShutdownError {
+    /// Lower bound on committed charges that entered the queue and received
+    /// no billing outcome before the task ended.
     pub unaccounted: u64,
     /// True when the task panicked, false when it was cancelled or aborted.
     pub panicked: bool,
@@ -682,6 +748,15 @@ fn lane_capacity(total: usize, count: usize, index: usize) -> usize {
 }
 
 impl UsageWriter {
+    /// Validate `config` and start the writer task. Returns the cloneable
+    /// request-side [`UsageRecorder`] and this owning handle, which must be
+    /// retained and shut down; dropping it aborts the task and loses
+    /// whatever is queued. Must be called within a Tokio runtime.
+    ///
+    /// # Errors
+    ///
+    /// [`UsageWriterConfigError`] when `config` fails validation; nothing is
+    /// started.
     pub fn spawn(
         sink: Arc<dyn UsageSink>,
         clock: Arc<dyn Clock>,

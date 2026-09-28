@@ -79,12 +79,30 @@ impl TrackedPrincipals {
     }
 }
 
+/// Which principals to serve and how to keep their snapshots fresh.
+///
+/// There are no defaults; every value is a deployment decision.
+/// [`validate`](Self::validate) runs before the task starts
+/// (INVARIANTS.md 16). `docs/SNAPSHOT_OPERATIONS.md` covers operating it.
 #[derive(Debug, Clone)]
 pub struct SnapshotManagerConfig {
     /// The principals this instance serves — a fixed list, or everything the
     /// source knows (GL-48).
+    ///
+    /// Also decides the readiness rule: `Fixed` needs every listed principal
+    /// resolved, `All` needs at least one. Neither a `Fixed` list nor an
+    /// `All` seed may contain duplicates, and a `Fixed` list must fit the
+    /// snapshot map's generation capacity.
     pub principals: TrackedPrincipals,
     /// Full refetch cadence — also the revocation propagation bound.
+    ///
+    /// Each refresh re-fetches every tracked principal (and, with `All`,
+    /// re-enumerates the catalogue), which is how a withdrawn principal is
+    /// removed. Too long lets a revoked principal keep admitting for up to
+    /// this long, bounded also by its snapshot's `valid_until`; too short
+    /// multiplies source load by the tracked set on every instance. Keep it
+    /// well below snapshot validity so a live principal is refreshed before
+    /// its snapshot expires. Must be positive.
     pub refresh_interval: std::time::Duration,
     /// How long a principal the source returned no row for stays negative
     /// before the manager rechecks it.
@@ -95,6 +113,10 @@ pub struct SnapshotManagerConfig {
     /// years as absent too. This is the ceiling on how long such a gap can
     /// deny a live customer, so it is an availability bound, not just
     /// onboarding latency.
+    ///
+    /// Too long denies a customer whose row was briefly missing for that
+    /// long; too short rechecks every absent tracked principal more often,
+    /// one source fetch each on every instance. Must be positive.
     pub unknown_ttl: SignedDuration,
     /// How long a *published revocation tombstone* stays negative before the
     /// manager rechecks it (GL-52).
@@ -111,10 +133,21 @@ pub struct SnapshotManagerConfig {
     /// absent row is an unknown principal and takes `unknown_ttl`, however
     /// long this instance has served that principal: a tombstone is a durable
     /// statement, an absence is not.
+    ///
+    /// Must be positive.
     pub revoked_ttl: SignedDuration,
     /// Backoff between initial-load retries while the source is down.
+    ///
+    /// Also the delay before a failed or timed-out fetch is retried. Too
+    /// short hammers a source that is already failing; too long delays
+    /// readiness after the source recovers. Must be positive.
     pub retry_backoff: std::time::Duration,
     /// Maximum snapshot fetches in flight during a full refresh.
+    ///
+    /// Too low makes a refresh of a large tracked set take many round trips,
+    /// stretching it toward or past `refresh_interval`; too high bursts
+    /// concurrent load at the source on every instance at once. Must be
+    /// positive.
     pub max_concurrent_fetches: usize,
     /// How long one source fetch may run before it is abandoned.
     ///
@@ -133,7 +166,7 @@ pub struct SnapshotManagerConfig {
     /// previous resolution and retries with backoff, so a value below real
     /// source latency turns a slow catalogue into one that never refreshes.
     /// It is independent of `refresh_interval`, which is a freshness cadence
-    /// rather than a statement about call latency.
+    /// rather than a statement about call latency. Must be positive.
     pub fetch_timeout: std::time::Duration,
     /// How long one principal enumeration may run before it is abandoned.
     ///
@@ -150,9 +183,12 @@ pub struct SnapshotManagerConfig {
     /// An abandoned enumeration keeps the set it already had, so a value under
     /// real catalogue latency freezes discovery while everything already
     /// tracked keeps working — the failure GL-48 exists to make visible.
+    /// Must be positive.
     pub enumeration_timeout: std::time::Duration,
 }
 
+/// Why a [`SnapshotManagerConfig`] was refused, or why [`SnapshotManager::spawn`]
+/// refused its map and slot registry: the first rule broken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotManagerConfigError(pub &'static str);
 
@@ -165,6 +201,14 @@ impl std::fmt::Display for SnapshotManagerConfigError {
 impl std::error::Error for SnapshotManagerConfigError {}
 
 impl SnapshotManagerConfig {
+    /// Check the configuration on its own: every duration and TTL positive,
+    /// `max_concurrent_fetches` positive, and no duplicate in the starting
+    /// principal set. Checks that need the map, such as capacity, happen in
+    /// [`SnapshotManager::spawn`].
+    ///
+    /// # Errors
+    ///
+    /// The first rule the configuration breaks.
     pub fn validate(&self) -> Result<(), SnapshotManagerConfigError> {
         if self.refresh_interval.is_zero() {
             return Err(SnapshotManagerConfigError(
@@ -238,6 +282,7 @@ pub struct SnapshotCounters {
 }
 
 impl SnapshotCounters {
+    /// A counter set that has recorded nothing.
     #[must_use]
     pub const fn new() -> Self {
         SnapshotCounters {
@@ -292,6 +337,8 @@ impl SnapshotCounters {
         self.unresolved.store(principals, Ordering::Relaxed);
     }
 
+    /// Read every counter. Each is read independently, so a reading taken
+    /// while the task runs is not one atomic instant across fields.
     #[must_use]
     pub fn snapshot(&self) -> SnapshotStats {
         SnapshotStats {
@@ -354,6 +401,18 @@ pub struct SnapshotManager {
 }
 
 impl SnapshotManager {
+    /// Validate `config` and start the snapshot task, which keeps `map`
+    /// stocked for the tracked principals and binds each account to its
+    /// slot in `slots`. Must be called within a Tokio runtime.
+    ///
+    /// Retain the handle and call [`shutdown`](Self::shutdown); dropping it
+    /// aborts the task.
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotManagerConfigError`] when `config` fails validation, when a
+    /// `Fixed` principal list exceeds the map's generation capacity, or when
+    /// the map and `slots` use different local sharding. Nothing is started.
     pub fn spawn(
         source: Arc<dyn SnapshotSource>,
         map: Arc<dyn SnapshotMap>,

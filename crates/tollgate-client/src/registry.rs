@@ -19,9 +19,21 @@ const _: () = assert!(usize::BITS <= 64);
 /// No admission reads this view.
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeFundingReport {
+    /// Units remaining on every retained account's current lease, summed.
+    /// `None` when no slot holds a lease.
     pub total_lease_remaining: Option<u128>,
+    /// Overage units spent under elastic enforcement across every retained
+    /// slot, for the process's life. Irreversible: it never falls, and a
+    /// rising value is work admitted past funding that will be invoiced.
     pub total_overage_spent: u128,
+    /// Per-instance overage caps summed over eligible accounts, taking each
+    /// account's largest cap among its active, unexpired snapshots. `None`
+    /// when no eligible account has a cap. Fleet exposure is this times the
+    /// number of instances.
     pub total_overage_cap: Option<u128>,
+    /// The earliest `usable_until` among eligible accounts' current leases:
+    /// when the next lease stops funding work unless refill replaces it.
+    /// `None` when no eligible account holds a lease.
     pub earliest_lease_usable_until: Option<Timestamp>,
 }
 
@@ -177,11 +189,15 @@ impl SlotRegistry {
         }
         report
     }
+    /// An empty registry with the unsharded layout.
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
+    /// An empty registry whose slots use `sharding`. It must match the
+    /// snapshot map's layout, or [`SnapshotManager::spawn`](crate::SnapshotManager::spawn)
+    /// refuses the pair.
     #[must_use]
     pub fn with_sharding(sharding: LocalSharding) -> Arc<Self> {
         Arc::new(Self {
@@ -216,6 +232,7 @@ impl SlotRegistry {
         )
     }
 
+    /// The shard layout every slot in this registry is created with.
     #[must_use]
     pub fn sharding(&self) -> LocalSharding {
         self.sharding
