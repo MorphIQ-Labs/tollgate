@@ -330,11 +330,16 @@ answers `404 unknown-account`. Activation additionally answers
 operator's suspension holds until an operator lifts it. The account's
 `origin` and `status_set_by` report both facts.
 
-A provisioner's snapshot still carries its own cost table, limits and
-permissions; the enforcement mode is constrained and the store owns generations
-([#43](https://github.com/MorphIQ-Labs/tollgate/issues/43) tracks
-operator-approved policy templates). Deploy a provisioner whose policy source
-you trust.
+A provisioner's snapshot must match one complete operator-approved template
+from its identity's `allowed_policy_templates` in the security manifest:
+`cost_table`, `limits`, `permissions` and `policy_revision` are compared exactly
+as typed values. `Strict` enforcement is mandatory. Mismatches return audited
+`403 scope-forbidden` before any store call. Account/key binding and
+status/class remain subject to the existing store checks; the caller chooses
+`valid_until`, and the store owns generations and budget views. Templates do
+not revoke previously published snapshots. See the
+[security manifest](CONTROL_PLANE_SECURITY.md#security-manifest) for configuration,
+reload semantics and the fail-closed rollout.
 
 ### `POST /v1/admin/accounts`
 
@@ -523,7 +528,8 @@ without a publication; the generation never wraps or resets.
 Errors: `404 unknown-credential`, `409 credential-retired`,
 `422 invalid-credential-binding`, `422 invalid-snapshot-limits`,
 `409 snapshot-status-mismatch`, `409 snapshot-capacity-class-mismatch`; for a
-provisioner, `403 scope-forbidden` for an `Elastic` snapshot,
+provisioner, `403 scope-forbidden` for a snapshot outside its approved templates
+(including `Elastic` enforcement),
 `404 unknown-account` and `403 account-not-provisioned`.
 
 ### `DELETE /v1/admin/accounts/{account}/keys/{key}/snapshot`

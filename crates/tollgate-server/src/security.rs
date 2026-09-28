@@ -1,4 +1,4 @@
-//! Control-plane identities and route authorization. No application policy lives here.
+//! Control-plane identities, route authorization, and operator-approved provisioner policies.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,7 +11,10 @@ use axum::response::Response;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tollgate_auth::CredentialVerifier;
-use tollgate_core::{CostUnits, Principal};
+use tollgate_core::{
+    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, Generation,
+    PermissionBits, PolicyRevision, Principal, PublishableSnapshot, ResolvedLimits,
+};
 use tollgate_store::Clock;
 
 use crate::error::ApiError;
@@ -47,35 +50,118 @@ impl Role {
     }
 }
 
-/// What a provisioner identity may grant beyond its fixed route and argument
-/// scope (#39).
+/// The exact policy an operator permits a provisioner to publish.
 ///
-/// Required rather than optional: a budget allowance funds admission, so an
-/// unbounded one would be a deposit by another name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Runtime binding, validity and store-owned fields are not template inputs.
+/// Strict enforcement is mandatory even when a template otherwise matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisionerPolicyTemplate {
+    /// Complete pricing schedule, including per-operation permissions.
+    pub cost_table: Arc<CostTable>,
+    /// Every shape, rate, compatibility and concurrency limit.
+    pub limits: ResolvedLimits,
+    /// Routes/work the credential may access.
+    pub permissions: PermissionBits,
+    /// Policy attribution must name the approved policy too.
+    #[serde(default)]
+    pub policy_revision: PolicyRevision,
+}
+
+impl ProvisionerPolicyTemplate {
+    pub(crate) fn validate(&self) -> Result<(), SecurityError> {
+        let snapshot = AccountSnapshot::builder(
+            AccountId(0),
+            Generation(0),
+            AccountStatus::Active,
+            Timestamp::UNIX_EPOCH,
+            self.permissions,
+            self.limits,
+            Arc::clone(&self.cost_table),
+        )
+        .build();
+        PublishableSnapshot::try_new(Arc::new(snapshot))
+            .map(|_| ())
+            .map_err(|_| SecurityError("invalid provisioner policy template"))
+    }
+
+    fn matches(&self, snapshot: &AccountSnapshot) -> bool {
+        snapshot.enforcement_mode == EnforcementMode::Strict
+            && snapshot.cost_table == self.cost_table
+            && snapshot.limits == self.limits
+            && snapshot.permissions == self.permissions
+            && snapshot.policy_revision == self.policy_revision
+    }
+}
+
+/// What a provisioner identity may grant beyond its fixed route scope.
+///
+/// A budget ceiling and a nonempty approved policy set are mandatory. An
+/// identity without either cannot be constructed (#39, #43).
+#[derive(Debug, Clone, Eq)]
 pub struct ProvisionerLimits {
     max_budget_allowance: CostUnits,
+    policy_templates: Arc<[ProvisionerPolicyTemplate]>,
+}
+
+// Credential schemes naming one identity must agree on its authority. List
+// ordering and duplicate approvals do not change that authority.
+impl PartialEq for ProvisionerLimits {
+    fn eq(&self, other: &Self) -> bool {
+        self.max_budget_allowance == other.max_budget_allowance
+            && self
+                .policy_templates
+                .iter()
+                .all(|policy| other.policy_templates.contains(policy))
+            && other
+                .policy_templates
+                .iter()
+                .all(|policy| self.policy_templates.contains(policy))
+    }
 }
 
 impl ProvisionerLimits {
-    /// `max_budget_allowance` is the largest periodic allowance this
-    /// identity may set on an account, inclusive.
-    pub fn new(max_budget_allowance: CostUnits) -> Self {
-        Self {
-            max_budget_allowance,
+    /// Bound the periodic allowance and approve complete snapshot policies.
+    ///
+    /// # Errors
+    /// Refuses an empty policy set or a policy that cannot pass snapshot
+    /// validation. Zero-cost policy is permitted only by explicitly approving it.
+    pub fn new(
+        max_budget_allowance: CostUnits,
+        policy_templates: Vec<ProvisionerPolicyTemplate>,
+    ) -> Result<Self, SecurityError> {
+        if policy_templates.is_empty() {
+            return Err(SecurityError(
+                "a provisioner identity requires approved policy templates",
+            ));
         }
+        for template in &policy_templates {
+            template.validate()?;
+        }
+        Ok(Self {
+            max_budget_allowance,
+            policy_templates: policy_templates.into(),
+        })
     }
 
     /// The largest periodic allowance this identity may set, inclusive.
     pub fn max_budget_allowance(&self) -> CostUnits {
         self.max_budget_allowance
     }
+
+    /// Whether one complete approved template matches this strict snapshot.
+    /// Fields from different templates cannot be mixed into a new policy.
+    pub fn allows_snapshot(&self, snapshot: &AccountSnapshot) -> bool {
+        self.policy_templates
+            .iter()
+            .any(|template| template.matches(snapshot))
+    }
 }
 
 /// A role with whatever it carries. Limits exist exactly for a provisioner,
 /// so an operator with a ceiling or a provisioner without one is
 /// unrepresentable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Grant {
     Instance,
     Operator,
@@ -104,7 +190,7 @@ impl ControlIdentity {
             Role::Operator => Grant::Operator,
             Role::Provisioner => {
                 return Err(SecurityError(
-                    "a provisioner identity requires max_budget_allowance",
+                    "a provisioner identity requires budget and approved policy limits",
                 ));
             }
         };
@@ -145,7 +231,7 @@ impl ControlIdentity {
     }
     /// The one role this identity holds.
     pub fn role(&self) -> Role {
-        match self.grant {
+        match &self.grant {
             Grant::Instance => Role::Instance,
             Grant::Operator => Role::Operator,
             Grant::Provisioner(_) => Role::Provisioner,
@@ -153,8 +239,8 @@ impl ControlIdentity {
     }
     /// The provisioner's limits; `None` for every other role.
     pub fn provisioner_limits(&self) -> Option<ProvisionerLimits> {
-        match self.grant {
-            Grant::Provisioner(limits) => Some(limits),
+        match &self.grant {
+            Grant::Provisioner(limits) => Some(limits.clone()),
             Grant::Instance | Grant::Operator => None,
         }
     }
@@ -417,7 +503,7 @@ pub(crate) async fn authorize(
         role = identity.role().as_str(),
         "control-plane request authenticated"
     );
-    match identity.grant {
+    match identity.grant.clone() {
         Grant::Instance => {
             request.extensions_mut().insert(InstanceIdentity);
         }
@@ -761,5 +847,92 @@ mod tests {
                 && log.contains("operation_id=")
         );
         assert!(!log.contains("confirmed") && !log.contains("before=") && !log.contains("after="));
+    }
+}
+
+#[cfg(test)]
+mod provisioner_policy_tests {
+    use super::*;
+
+    fn template(cost: u64, permissions: u64) -> ProvisionerPolicyTemplate {
+        ProvisionerPolicyTemplate {
+            cost_table: Arc::new(CostTable::builder(CostUnits(cost), CostUnits(cost)).build()),
+            limits: ResolvedLimits::new(1),
+            permissions: PermissionBits(permissions),
+            policy_revision: PolicyRevision::UNSTATED,
+        }
+    }
+
+    fn snapshot(template: &ProvisionerPolicyTemplate) -> AccountSnapshot {
+        AccountSnapshot::builder(
+            AccountId(1),
+            Generation(1),
+            AccountStatus::Active,
+            Timestamp::UNIX_EPOCH,
+            template.permissions,
+            template.limits,
+            Arc::clone(&template.cost_table),
+        )
+        .build()
+    }
+
+    #[test]
+    fn provisioner_templates_match_whole_policies_and_are_identity_scoped() {
+        let first = template(1, 1);
+        let second = template(2, 2);
+        let limits =
+            ProvisionerLimits::new(CostUnits(100), vec![first.clone(), second.clone()]).unwrap();
+        assert_eq!(
+            limits,
+            ProvisionerLimits::new(
+                CostUnits(100),
+                vec![second.clone(), first.clone(), first.clone()]
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            limits,
+            ProvisionerLimits::new(CostUnits(101), vec![first.clone(), second.clone()]).unwrap()
+        );
+        let subset = ProvisionerLimits::new(CostUnits(100), vec![first.clone()]).unwrap();
+        assert_ne!(limits, subset);
+        assert_ne!(subset, limits);
+        let mut candidate = snapshot(&first);
+        assert!(limits.allows_snapshot(&candidate));
+        candidate.generation = Generation(u64::MAX);
+        candidate.valid_until = Timestamp::MAX;
+        candidate.account_id = AccountId(2);
+        candidate.key_id = Some(tollgate_core::KeyId(3));
+        assert!(
+            limits.allows_snapshot(&candidate),
+            "binding and publication metadata are separate store contracts"
+        );
+        candidate.cost_table = Arc::clone(&second.cost_table);
+        assert!(
+            !limits.allows_snapshot(&candidate),
+            "a mixed policy is not an approved policy"
+        );
+        candidate.permissions = second.permissions;
+        assert!(
+            limits.allows_snapshot(&candidate),
+            "the second complete policy is approved too"
+        );
+        let other_identity = ProvisionerLimits::new(CostUnits(100), vec![first]).unwrap();
+        assert!(!other_identity.allows_snapshot(&candidate));
+        candidate.enforcement_mode = EnforcementMode::Elastic {
+            overage_cap: CostUnits(10),
+        };
+        assert!(
+            !limits.allows_snapshot(&candidate),
+            "templates cannot approve unfunded credit"
+        );
+    }
+
+    #[test]
+    fn provisioner_limits_refuse_missing_or_unpublishable_templates() {
+        assert!(ProvisionerLimits::new(CostUnits(100), vec![]).is_err());
+        let mut invalid = template(1, 1);
+        invalid.limits = ResolvedLimits::new(1).with_weighted_rate(0, 1);
+        assert!(ProvisionerLimits::new(CostUnits(100), vec![invalid]).is_err());
     }
 }

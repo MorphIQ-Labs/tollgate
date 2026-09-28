@@ -2561,12 +2561,14 @@ exists to detect corrupt state and must not be able to launder it.
 
 41. **A provisioner can neither fund, close, grant `Assured`, exceed its budget
     ceiling, extend credit, reach an operator's account, nor undo an operator's
-    status or exhaust snapshot generations through caller-selected jumps.**
+    status, exhaust snapshot generations through caller-selected jumps, or
+    publish unapproved policy.**
     A `provisioner` identity (#39) reaches every admin route except
     deposit and principal-snapshot publication. On those it reaches, it may
     create only an unfunded, suspended, best-effort account; move status only to
     `Active`; set only `BestEffort`; set an allowance no larger than its
-    identity's `max_budget_allowance`; and publish only `Strict` key snapshots.
+    identity's `max_budget_allowance`; and publish only `Strict` key snapshots
+    matching one whole policy template approved for that identity.
     Key-snapshot generations are store-allocated: first publication is 1,
     then the locked live or revoked watermark plus one, regardless of the
     submitted generation. A repeat is a new publication; arithmetic overflow
@@ -2599,7 +2601,8 @@ exists to detect corrupt state and must not be able to launder it.
     `a_provisioner_cannot_fund_or_publish_principals`,
     `an_operator_suspension_holds`, `activation_only_activates` and
     `an_operators_account_is_out_of_reach`, assuming each transition is atomic;
-    it does not model balances, snapshot policy or the handler argument checks.
+    it does not model balances or the handler argument checks. The policy
+    approval model is described below.
     `allocated_generation_advances_exactly_once`, `exhausted_generation_refuses`
     and `first_allocated_generation_is_one` prove bounded successor allocation
     in the same model. Finite-width and concurrency witnesses in both backends:
@@ -2622,7 +2625,31 @@ exists to detect corrupt state and must not be able to launder it.
     `a_provisioner_entry_requires_its_ceiling_and_no_other_role_takes_one` and
     `a_google_provisioner_subject_requires_its_ceiling`.
 
-    Not covered: a provisioner's key snapshot still carries its own cost
-    table, limits and permissions. Constraining those to operator-approved
-    policy is tracked in #43; until then the provisioner's policy source is
-    trusted.
+    **Policy approval (#43).** `ProvisionerLimits` owns a nonempty, validated
+    set of operator-approved templates. A manifest's per-identity
+    `allowed_policy_templates` resolves only named entries from its
+    `policy_templates`; missing, empty or unknown references fail closed.
+    Complete cost tables (including per-operation permissions), limits
+    (including compatibility fallbacks), permissions and policy revision must
+    equal one template, with strict enforcement. Mixing approved fields from
+    different templates is not approval. The handler refuses mismatches before
+    any store call and audits `403 scope-forbidden`. Operators are exempt.
+    Binding, account status/class, budget stamping and generation allocation
+    retain their store-owned contracts; validity is caller-supplied.
+
+    Approval is captured in the immutable authorization generation. Reloading
+    changes future authentications; an in-flight request keeps its generation,
+    and published snapshots are not retroactively revoked. Failed reloads keep
+    the last valid generation. Exact-model witnesses in `ControlPlane.lean`:
+    `approved_policy_is_one_whole_template`,
+    `an_approved_strict_policy_can_publish`,
+    `an_empty_template_set_grants_nothing`, `templates_never_authorize_elastic`
+    and `removing_approval_refuses_future_publication`. These assume complete
+    field equality and do not prove Rust/serde refinement. Implementation tests:
+    `provisioner_templates_match_whole_policies_and_are_identity_scoped`,
+    `provisioner_limits_refuse_missing_or_unpublishable_templates`,
+    `unapproved_snapshot_fields_are_audited_before_any_store_call`,
+    `template_reload_changes_future_publications_and_bad_reload_preserves_approval`,
+    `operators_can_publish_policies_outside_provisioner_templates`,
+    `manifest_policy_allowlists_fail_closed_for_bearers_and_certificates`, and
+    `a_google_provisioner_subject_requires_its_ceiling`.

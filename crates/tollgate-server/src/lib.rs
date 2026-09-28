@@ -48,8 +48,7 @@ use tracing::Instrument as _;
 
 use tollgate_auth::CredentialIssuer;
 use tollgate_core::{
-    AccountId, AccountStatus, CapacityClass, CostUnits, EnforcementMode, KeyId, Principal,
-    PublishableSnapshot,
+    AccountId, AccountStatus, CapacityClass, CostUnits, KeyId, Principal, PublishableSnapshot,
 };
 use tollgate_store::wire::{
     API_PREFIX, AccountKeyResponse, AccountKeysResponse, AccountResponse, AcquireRequest,
@@ -1196,17 +1195,17 @@ async fn publish_key_snapshot<S: Backend>(
 ) -> Result<StatusCode, ApiError> {
     let clock = state.clock.as_ref();
     let target = format!("{account}/keys/{key}/snapshot");
-    // Elastic enforcement extends unfunded credit, which is funding by
-    // another name; a provisioner publishes strict policy only (#39).
-    if matches!(admin, AdminIdentity::Provisioner(..))
-        && request.snapshot.enforcement_mode != EnforcementMode::Strict
+    // Approval belongs to the authenticated identity's security generation.
+    // Refuse before even reading account provenance or reaching publication.
+    if let AdminIdentity::Provisioner(_, limits) = &admin
+        && !limits.allows_snapshot(&request.snapshot)
     {
         return Err(admin.refuse(
             "publish_key_snapshot",
             target,
             clock,
             "scope-forbidden",
-            "a provisioner may only publish strict enforcement",
+            "snapshot does not match an approved policy template",
         ));
     }
     admin

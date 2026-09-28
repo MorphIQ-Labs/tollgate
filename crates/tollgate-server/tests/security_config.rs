@@ -157,31 +157,31 @@ async fn a_provisioner_entry_requires_its_ceiling_and_no_other_role_takes_one() 
     std::fs::write(directory.path().join("client.pem"), &certificates.client).unwrap();
     for (entry, valid) in [
         (
-            json!({"bearers": [{"identity": "signup", "role": "provisioner", "token_file": "token", "max_budget_allowance": 1000}]}),
+            json!({"policy_templates": {"standard": common::provisioner_template()}, "bearers": [{"identity": "signup", "role": "provisioner", "token_file": "token", "max_budget_allowance": 1000, "allowed_policy_templates": ["standard"]}]}),
             true,
         ),
         (
-            json!({"bearers": [{"identity": "signup", "role": "provisioner", "token_file": "token"}]}),
+            json!({"policy_templates": {"standard": common::provisioner_template()}, "bearers": [{"identity": "signup", "role": "provisioner", "token_file": "token"}]}),
             false,
         ),
         (
-            json!({"bearers": [{"identity": "ops", "role": "operator", "token_file": "token", "max_budget_allowance": 1000}]}),
+            json!({"bearers": [{"identity": "ops", "role": "operator", "token_file": "token", "max_budget_allowance": 1000, "allowed_policy_templates": ["standard"]}]}),
             false,
         ),
         (
-            json!({"bearers": [{"identity": "svc", "role": "instance", "token_file": "token", "max_budget_allowance": 1000}]}),
+            json!({"bearers": [{"identity": "svc", "role": "instance", "token_file": "token", "max_budget_allowance": 1000, "allowed_policy_templates": ["standard"]}]}),
             false,
         ),
         (
-            json!({"certificates": [{"identity": "signup", "role": "provisioner", "certificate": "client.pem", "max_budget_allowance": 1000}]}),
+            json!({"policy_templates": {"standard": common::provisioner_template()}, "certificates": [{"identity": "signup", "role": "provisioner", "certificate": "client.pem", "max_budget_allowance": 1000, "allowed_policy_templates": ["standard"]}]}),
             true,
         ),
         (
-            json!({"certificates": [{"identity": "signup", "role": "provisioner", "certificate": "client.pem"}]}),
+            json!({"policy_templates": {"standard": common::provisioner_template()}, "certificates": [{"identity": "signup", "role": "provisioner", "certificate": "client.pem"}]}),
             false,
         ),
         (
-            json!({"certificates": [{"identity": "ops", "role": "operator", "certificate": "client.pem", "max_budget_allowance": 1000}]}),
+            json!({"certificates": [{"identity": "ops", "role": "operator", "certificate": "client.pem", "max_budget_allowance": 1000, "allowed_policy_templates": ["standard"]}]}),
             false,
         ),
     ] {
@@ -199,7 +199,7 @@ async fn a_provisioner_entry_requires_its_ceiling_and_no_other_role_takes_one() 
     // A loaded provisioner bearer reaches the shared admin routes and no other.
     std::fs::write(
         &path,
-        json!({"bearers": [{"identity": "signup", "role": "provisioner", "token_file": "token", "max_budget_allowance": 1000}]})
+        json!({"policy_templates": {"standard": common::provisioner_template()}, "bearers": [{"identity": "signup", "role": "provisioner", "token_file": "token", "max_budget_allowance": 1000, "allowed_policy_templates": ["standard"]}]})
             .to_string(),
     )
     .unwrap();
@@ -569,5 +569,82 @@ async fn an_invalid_issuer_on_reload_keeps_the_live_generation() {
             .status();
         assert_eq!(status, StatusCode::OK, "the live generation still serves");
         assert!(!loader.issuer_change_pending());
+    }
+}
+
+#[tokio::test]
+async fn manifest_policy_allowlists_fail_closed_for_bearers_and_certificates() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("security.json");
+    std::fs::write(directory.path().join("token"), common::PROVISIONER).unwrap();
+    std::fs::write(
+        directory.path().join("client.pem"),
+        common::certificates().client,
+    )
+    .unwrap();
+    for (source, credential) in [
+        ("bearers", json!({"token_file": "token"})),
+        ("certificates", json!({"certificate": "client.pem"})),
+    ] {
+        let mut entry = credential;
+        entry["identity"] = json!("signup");
+        entry["role"] = json!("provisioner");
+        entry["max_budget_allowance"] = json!(1000);
+        let mut manifest =
+            json!({"policy_templates": {"standard": common::provisioner_template()}});
+        for allowed in [None, Some(json!([])), Some(json!(["missing"]))] {
+            entry
+                .as_object_mut()
+                .unwrap()
+                .remove("allowed_policy_templates");
+            if let Some(allowed) = allowed {
+                entry["allowed_policy_templates"] = allowed;
+            }
+            manifest[source] = json!([entry.clone()]);
+            std::fs::write(&path, manifest.to_string()).unwrap();
+            assert!(
+                SecurityLoader::new(&path)
+                    .load(SystemClock.now())
+                    .await
+                    .is_err(),
+                "{manifest}"
+            );
+        }
+        entry["allowed_policy_templates"] = json!(["standard"]);
+        manifest[source] = json!([entry.clone()]);
+        std::fs::write(&path, manifest.to_string()).unwrap();
+        assert!(
+            SecurityLoader::new(&path)
+                .load(SystemClock.now())
+                .await
+                .is_ok()
+        );
+        // A valid allowlist belongs only to provisioners, even without a ceiling.
+        entry
+            .as_object_mut()
+            .unwrap()
+            .remove("max_budget_allowance");
+        for role in ["operator", "instance"] {
+            entry["role"] = json!(role);
+            manifest[source] = json!([entry.clone()]);
+            std::fs::write(&path, manifest.to_string()).unwrap();
+            assert!(
+                SecurityLoader::new(&path)
+                    .load(SystemClock.now())
+                    .await
+                    .is_err()
+            );
+        }
+        entry["role"] = json!("provisioner");
+        entry["max_budget_allowance"] = json!(1000);
+        manifest[source] = json!([entry]);
+        manifest["policy_templates"]["standard"]["limits"]["rate_units_per_second"] = json!(0);
+        std::fs::write(&path, manifest.to_string()).unwrap();
+        assert!(
+            SecurityLoader::new(&path)
+                .load(SystemClock.now())
+                .await
+                .is_err()
+        );
     }
 }

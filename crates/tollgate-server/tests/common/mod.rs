@@ -7,7 +7,8 @@ use std::sync::Arc;
 use tollgate_auth::{CredentialVerifier, HmacRegistry};
 use tollgate_client::{BearerToken, HttpStore, HttpStoreConfig, StaticBearer};
 use tollgate_server::security::{
-    ControlIdentity, ProvisionerLimits, Role, SecurityPolicy, ServerSecurity,
+    ControlIdentity, ProvisionerLimits, ProvisionerPolicyTemplate, Role, SecurityPolicy,
+    ServerSecurity,
 };
 
 pub const INSTANCE: &str = "fixture-instance-credential-98-only";
@@ -15,6 +16,16 @@ pub const OPERATOR: &str = "fixture-operator-credential-98-only";
 pub const PROVISIONER: &str = "fixture-provisioner-credential-39-only";
 /// The fixture provisioner's budget ceiling.
 pub const PROVISIONER_MAX_BUDGET: u64 = 1_000;
+
+pub fn provisioner_template() -> ProvisionerPolicyTemplate {
+    use tollgate_core::{CostTable, CostUnits, PermissionBits, PolicyRevision, ResolvedLimits};
+    ProvisionerPolicyTemplate {
+        cost_table: Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+        limits: ResolvedLimits::new(1),
+        permissions: PermissionBits(0),
+        policy_revision: PolicyRevision::UNSTATED,
+    }
+}
 
 pub fn policy() -> SecurityPolicy {
     let verifier = Arc::new(HmacRegistry::new(b"fixture-server-secret"));
@@ -36,7 +47,11 @@ pub fn policy() -> SecurityPolicy {
             verifier.verify(PROVISIONER.as_bytes()).unwrap().principal,
             ControlIdentity::provisioner(
                 "test-provisioner",
-                ProvisionerLimits::new(tollgate_core::CostUnits(PROVISIONER_MAX_BUDGET)),
+                ProvisionerLimits::new(
+                    tollgate_core::CostUnits(PROVISIONER_MAX_BUDGET),
+                    vec![provisioner_template()],
+                )
+                .unwrap(),
             )
             .unwrap(),
         ),

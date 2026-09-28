@@ -7,6 +7,14 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** provisioner identities require a nonempty allowlist of approved
+  manifest policy templates. Key-snapshot publication outside an approved
+  cost table, limits, permissions and policy revision returns audited
+  `403 scope-forbidden` (#43). Missing/invalid template configuration fails
+  closed; `ProvisionerLimits::new` now takes templates and returns `Result`.
+
 ## [0.30.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.30.0...v0.30.1) - 2026-09-27
 
 ### Fixed
