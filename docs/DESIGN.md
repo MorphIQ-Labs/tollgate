@@ -7637,3 +7637,41 @@ message; ingest tests retain the cap and keep malformed JSON distinct.
 Status, code, byte limits, event limits, authentication and schemas are unchanged.
 Only human-readable error advice changes; there is no migration or request-path
 cost.
+
+## Deposit overflow is a permanent refusal (GH-40)
+
+Deposit arithmetic already refused overflow atomically, but memory wrapped its
+checked-add failures in `Storage` and PostgreSQL treated both input conversion
+and SQL arithmetic failures as storage outages. The server therefore returned
+`503 storage`, whose retry advice can never repair a full lifetime deposited
+counter. The existing mirrored test asserted only that the deposit failed and
+moved neither column; it did not distinguish domain refusal from outage.
+The HTTP diagnostics fixture also used overflow as a stand-in for an outage;
+it now injects a storage failure explicitly, preserving its 503 privacy checks.
+
+`AllocateError::BalanceOverflow` now owns that distinction in both backends.
+Memory checks both sums before applying either. PostgreSQL rejects an amount
+outside nonnegative `BIGINT`, and maps only numeric-value-out-of-range SQLSTATE
+22003 from the deposit UPDATE to the permanent refusal. Other database errors
+retain `Storage`; the single-statement atomicity and locking are unchanged.
+The sibling lifetime-total overflow uses the same classification as top-up
+balance overflow. Lease settlement and other operations' arithmetic failures
+are outside the deposit contract and retain their existing classifications.
+
+The wire code `422 balance-overflow` is additive and the request/receipt shapes
+are unchanged. Rust exhaustive matches need the new variant; existing metric
+indices stay fixed and the new label is appended. Upgrade clients that classify
+problem codes before the server so they recognize the permanent refusal.
+There is no schema migration or request-path work. Boundary tests cover exact
+fit, both overflowing counters, repeat refusals and PostgreSQL's input domain;
+the HTTP regression pins status and code as well as unchanged accounting.
+
+## Mutation diff runs and PostgreSQL requirements
+
+The diff gate intentionally disables PostgreSQL when no backend files change,
+to let independent mutation workers run without sharing a database. After the
+credential expiry integration test began enforcing `TOLLGATE_REQUIRE_PG`, the
+gate still removed only the URL, leaving a contradictory required-but-unavailable
+backend. Server-only changes therefore failed the unmutated baseline. The gate
+now clears both variables together only in that intentional optional-backend
+branch; backend changes and full sweeps retain the PostgreSQL requirement.
