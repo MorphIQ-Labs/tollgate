@@ -8,6 +8,10 @@ Tollgate provides quota admission and usage accounting for latency-critical serv
 
 `INVARIANTS.md` is the testable contract and `docs/DESIGN.md` records architecture and rationale. This page covers only setup and process.
 
+## Documentation
+
+The [documentation site](https://morphiq-labs.github.io/tollgate/) is built from `docs/` with [mdBook](https://rust-lang.github.io/mdBook/); `docs/SUMMARY.md` is its table of contents. Write documents as ordinary repository Markdown: links to files outside `docs/` work on GitHub and are rewritten for the site. `mdbook build` fails on a link to a path or heading that does not exist, and on a document under `docs/` that `SUMMARY.md` does not list, so a new document goes into `SUMMARY.md` in the same change. A file outside `docs/` can appear as a page through a stub whose first line is `<!-- repo-page: PATH -->` (see `docs/site/`). Build locally with `cargo install --locked mdbook --version "$(cat .cargo/mdbook-version)"` and then `mdbook serve --open`.
+
 ## Setup
 
 ```sh

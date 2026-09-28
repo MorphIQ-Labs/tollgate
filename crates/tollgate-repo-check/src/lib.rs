@@ -1,6 +1,7 @@
 //! Declaration resolution for current invariant documentation. This is not a
 //! coverage check, a Rust name resolver, or a substitute for executing proofs.
 
+pub mod book;
 pub mod cli;
 pub mod parity;
 pub mod seam;

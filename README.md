@@ -23,6 +23,10 @@ and permission bits — never plan names, product currencies, or SQL.
 | `crates/tollgate-perf-gate` | Benchmark threshold checker (criterion estimates vs manifest, staleness-guarded) |
 | `examples/pricing-api` | Concrete API embedding the stack: connection-cached HMAC-verified keys, admission, commit-at-execution-start, billing |
 
+Documentation: <https://morphiq-labs.github.io/tollgate/> (guides, the
+invariants, proofs and design record) and [docs.rs](https://docs.rs/tollgate-core)
+for the API.
+
 Contract: [`INVARIANTS.md`](INVARIANTS.md). Architecture and findings:
 [`docs/DESIGN.md`](docs/DESIGN.md).
 The techniques Tollgate composes are published as prior art, without patent

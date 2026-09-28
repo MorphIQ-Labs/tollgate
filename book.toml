@@ -1,0 +1,30 @@
+# The documentation site: https://morphiq-labs.github.io/tollgate/
+#
+# Built from docs/ by `mdbook build`; the Pages workflow publishes it from
+# main. The repo-links preprocessor keeps links out of docs/ working on both
+# the site and GitHub, and fails the build on a dead link or anchor.
+
+[book]
+title = "Tollgate"
+description = "Quota admission and usage accounting for latency-critical services."
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "target/book"
+create-missing = false
+
+[preprocessor.repo-links]
+command = "cargo run --locked --quiet -p tollgate-repo-check --bin mdbook-repo-links"
+after = ["links", "index"]
+repository = "https://github.com/MorphIQ-Labs/tollgate"
+branch = "main"
+
+[output.html]
+git-repository-url = "https://github.com/MorphIQ-Labs/tollgate"
+site-url = "/tollgate/"
+no-section-label = true
+
+[output.html.fold]
+enable = true
+level = 1
