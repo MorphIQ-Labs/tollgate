@@ -12,7 +12,7 @@ keywords = ["quota", "ledger", "billing", "metering", "storage"]
 categories = ["database", "data-structures"]
 
 [dependencies]
-tollgate-core = { path = "../tollgate-core", version = "=0.31.0" }
+tollgate-core = { path = "../tollgate-core", version = "=0.32.0" }
 async-trait = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true, optional = true }
