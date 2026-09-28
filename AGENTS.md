@@ -24,6 +24,7 @@ git config core.hooksPath .githooks
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+mdbook build                      # the documentation site; fails on a dead link or unlisted document
 cargo test --workspace --all-features
 ./scripts/check_advisories.sh
 cargo deny --locked check licenses
@@ -46,7 +47,7 @@ cargo run -p pricing-api --bin pricing-api
 cargo run -p tollgate-server
 ```
 
-CI runs as GitHub Actions (`.github/workflows/ci.yml`): format, Clippy, title convention, repository hygiene, a secret scan (`.gitleaks.toml`), all-feature workspace tests, the PostgreSQL suite, benchmark compilation, and deterministic allocation assertions run on every pull request. The blocking dependency-advisory and license scans run on pull requests and the default branch. Mutation and formal assurance run on **every** pull request, whatever it targets (GL-106). Timed Criterion and loopback load tests run **locally**, including for release validation; remote runners do not execute them or decide performance acceptance. `./scripts/check_ci_rules.sh` enforces the remaining assurance gates and this local-only measurement policy. Performance-sensitive pull requests include local reports with the tested revision, host, toolchain, profile and verdict; unreadable evidence is reported explicitly and is not a successful performance validation. See `docs/PERFORMANCE.md` for commands and review requirements. Releases run from `.github/workflows/release.yml`; see Pull Requests and Releases. The `production` profile (fat LTO, `panic=abort`) is for deployment and the local load gate; Criterion runs the release profile with `codegen-units = 1` pinned, because the default sixteen repartition a crate as its code grows and move benchmark rows whose own source has not changed (GL-114). CI installs exactly the toolchain `rust-toolchain.toml` pins, so there is no second pin to keep in lockstep; the MSRV job selects the declared minimum explicitly.
+CI runs as GitHub Actions (`.github/workflows/ci.yml`): format, Clippy, title convention, repository hygiene, a secret scan (`.gitleaks.toml`), the documentation site build (`check / docs`: every link resolves, every document under `docs/` is listed in `docs/SUMMARY.md`), all-feature workspace tests, the PostgreSQL suite, benchmark compilation, and deterministic allocation assertions run on every pull request. The blocking dependency-advisory and license scans run on pull requests and the default branch. Mutation and formal assurance run on **every** pull request, whatever it targets (GL-106). Timed Criterion and loopback load tests run **locally**, including for release validation; remote runners do not execute them or decide performance acceptance. `./scripts/check_ci_rules.sh` enforces the remaining assurance gates and this local-only measurement policy. Performance-sensitive pull requests include local reports with the tested revision, host, toolchain, profile and verdict; unreadable evidence is reported explicitly and is not a successful performance validation. See `docs/PERFORMANCE.md` for commands and review requirements. Releases run from `.github/workflows/release.yml`; see Pull Requests and Releases. `.github/workflows/pages.yml` publishes the documentation site from `main`. The `production` profile (fat LTO, `panic=abort`) is for deployment and the local load gate; Criterion runs the release profile with `codegen-units = 1` pinned, because the default sixteen repartition a crate as its code grows and move benchmark rows whose own source has not changed (GL-114). CI installs exactly the toolchain `rust-toolchain.toml` pins, so there is no second pin to keep in lockstep; the MSRV job selects the declared minimum explicitly.
 
 ## Design Constraints
 
@@ -85,7 +86,7 @@ Invariants live in `INVARIANTS.md`, the testable contract, with rationale in `do
 - For defects caused by regressions, perform a root-cause analysis. Identify how the regression entered, why existing safeguards missed it, and what test, invariant, tooling, or process change will prevent recurrence. Use each regression to strengthen the system.
 - Fix problems at the layer where their contract is first violated. Do not mask a downstream defect with an upstream workaround or symptom-specific patch.
 - Optimize for simplicity and maintainability. Prefer clear designs over incidental compatibility with awkward internals, and refactor when doing so removes complexity or restores sound boundaries.
-- Documentation and design artifacts ship in the same change that invalidates them: `INVARIANTS.md`, `docs/DESIGN.md`, operator-facing docs, and embedded diagrams. A doc that no longer describes the current system is a defect, not deferred polish. Keep standards documents current-state only; discovery history belongs in `docs/DESIGN.md`.
+- Documentation and design artifacts ship in the same change that invalidates them: `INVARIANTS.md`, `docs/DESIGN.md`, operator-facing docs, and embedded diagrams. A new document under `docs/` is listed in `docs/SUMMARY.md` in the same change; the site build refuses one that is not. A doc that no longer describes the current system is a defect, not deferred polish. Keep standards documents current-state only; discovery history belongs in `docs/DESIGN.md`.
 
 ## Assurance
 
@@ -136,6 +137,7 @@ Trunk-based, one long-lived branch. The workflow above is prose until these sett
 | Conversation resolution | required | |
 | Delete head branches | on | |
 | Approving reviews | 0 | One maintainer, and GitHub does not let an author approve their own pull request; the required checks are the gate. Raise it when a second maintainer joins. |
+| Pages | source: GitHub Actions (`pages.yml`) | The site is built by the same pinned mdBook and link check as `check / docs`, never from a branch. |
 | Auto-merge | allowed | Merge-when-green. Safe only because checks are required: without branch protection, auto-merge merges at once. |
 
 Check them with `gh api repos/MorphIQ-Labs/tollgate` and `gh api repos/MorphIQ-Labs/tollgate/branches/main/protection` rather than assuming.

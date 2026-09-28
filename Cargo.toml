@@ -40,6 +40,9 @@ serde_json = "1.0"
 # Both packages already occur in Cargo.lock; this adds no runtime dependency.
 syn = { version = "2", features = ["full", "visit"] }
 proc-macro2 = "1"
+# The documentation site's link preprocessor parses Markdown the way mdBook
+# does. Tooling only; no published crate depends on it.
+pulldown-cmark = { version = "0.13", default-features = false }
 
 # Dev/bench
 criterion = "0.5"
