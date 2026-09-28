@@ -7891,3 +7891,13 @@ gate still removed only the URL, leaving a contradictory required-but-unavailabl
 backend. Server-only changes therefore failed the unmutated baseline. The gate
 now clears both variables together only in that intentional optional-backend
 branch; backend changes and full sweeps retain the PostgreSQL requirement.
+
+### Mutation evidence for operator holds and stored authority
+
+The provisioner CI mutation run exposed two missing boundary witnesses: the
+operator hold test changed Active to Suspended, so it did not establish that an
+operator repeating a provisioner's initial Suspended status must take authorship;
+authority parsing tests also omitted unknown stored values. Mirrored backend
+tests now verify the repeated suspension's receipt, durable authorship and
+refused activation. The PostgreSQL decoder test covers both valid authorities
+and rejects unknown or near-match spellings. Production behavior is unchanged.

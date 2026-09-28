@@ -2631,7 +2631,9 @@ exists to detect corrupt state and must not be able to launder it.
     `provisioner_generation_extremes_cannot_block_operator_transitions`.
     Mirrored backend tests:
     `a_provisioned_account_is_born_unfunded_suspended_and_best_effort` and
-    `provisioned_activation_honours_provenance_and_operator_holds`; PostgreSQL:
+    `provisioned_activation_honours_provenance_and_operator_holds` and
+    `repeating_operator_suspension_establishes_a_hold`; PostgreSQL:
+    `stored_authorities_reject_unknown_vocabulary` and
     `accounts_predating_provenance_belong_to_operators`. HTTP witnesses:
     `a_provisioner_completes_every_self_service_call`,
     `a_provisioner_is_refused_and_audited_before_the_store_moves`,
