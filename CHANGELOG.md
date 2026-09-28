@@ -7,6 +7,14 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+### Fixed
+
+- Account key listing now returns `404 unknown-account` for an absent account,
+  replacing `200` with an empty page (#41). Existing accounts with no matching
+  credentials still return an empty page. `KeyDirectory::account_keys` now
+  returns `KeyError` instead of `StoreError`; custom backends and Rust callers
+  must update their signatures and handle `UnknownAccount`.
+
 ## [0.30.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.30.1...v0.30.2) - 2026-09-28
 
 ### Other

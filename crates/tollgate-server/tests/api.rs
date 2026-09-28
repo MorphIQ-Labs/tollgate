@@ -1765,3 +1765,27 @@ async fn an_issuer_minting_an_unpresentable_secret_is_refused_before_storage() {
         }
     }
 }
+
+#[tokio::test]
+async fn account_key_listing_distinguishes_unknown_from_empty() {
+    let (store, app) = state();
+    let path = api(&format!("/admin/accounts/{}/keys", id(41)));
+    for suffix in [String::new(), format!("?after={}&limit=1", id(99))] {
+        let (status, body) = call(&app, "GET", &format!("{path}{suffix}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "unknown-account");
+        assert_eq!(body["status"], 404);
+    }
+    // Revocation keeps its credential-scoped refusal for a missing owner.
+    let (status, body) = call(&app, "DELETE", &format!("{path}/{}", id(99)), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "unknown-credential");
+
+    make_account(&store, 41).await;
+    for suffix in [String::new(), format!("?after={}&limit=1", id(99))] {
+        let (status, body) = call(&app, "GET", &format!("{path}{suffix}"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["keys"], json!([]));
+        assert!(body["next_after"].is_null());
+    }
+}

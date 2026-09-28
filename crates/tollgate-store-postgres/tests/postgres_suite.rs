@@ -7452,3 +7452,12 @@ async fn exhaustion_evidence_names_the_stored_period_and_rollover_restores_fundi
     );
     assert_conserved(&store).await;
 }
+
+#[tokio::test]
+async fn account_key_listing_distinguishes_unknown_from_empty() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    account_keys::listing_distinguishes_unknown_from_empty(&*store).await;
+}

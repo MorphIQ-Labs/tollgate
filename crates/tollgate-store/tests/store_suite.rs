@@ -5079,3 +5079,9 @@ async fn exhaustion_evidence_names_the_stored_period_and_rollover_restores_fundi
     );
     assert_conserved(&store);
 }
+
+#[tokio::test]
+async fn account_key_listing_distinguishes_unknown_from_empty() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    account_keys::listing_distinguishes_unknown_from_empty(&*store).await;
+}

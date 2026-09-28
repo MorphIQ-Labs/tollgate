@@ -2015,9 +2015,12 @@ impl KeyDirectory for MemoryStore {
         account: AccountId,
         after: Option<KeyId>,
         limit: NonZeroUsize,
-    ) -> Result<Vec<KeySummary>, StoreError> {
+    ) -> Result<Vec<KeySummary>, KeyError> {
         crate::validate_key_page_limit(limit)?;
         let inner = self.lock();
+        if !inner.accounts.contains_key(&account) {
+            return Err(KeyError::UnknownAccount);
+        }
         // Revoked credentials are included, so `unrevoked_keys` is not the
         // index to read here; `keys` is a `HashMap`, so the order is imposed
         // rather than inherited. Sorting before truncating is what makes the

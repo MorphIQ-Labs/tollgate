@@ -1678,12 +1678,16 @@ pub trait KeyDirectory: crate::KeySource {
     /// Revoked and expired credentials are included, because an administrator
     /// deciding whether to issue a replacement needs to see what became of the
     /// last one; [`KeySummary::is_live`] separates them.
+    ///
+    /// Account existence and the page are read in one consistent store
+    /// operation. An absent account returns [`KeyError::UnknownAccount`]; an
+    /// existing account with no matching credentials returns an empty page.
     async fn account_keys(
         &self,
         account: AccountId,
         after: Option<KeyId>,
         limit: NonZeroUsize,
-    ) -> Result<Vec<KeySummary>, StoreError>;
+    ) -> Result<Vec<KeySummary>, KeyError>;
 
     /// Record a credential only if the account holds fewer than `max_active`
     /// live ones, counting and inserting indivisibly (GL-121).

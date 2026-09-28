@@ -7622,3 +7622,33 @@ lock, issuance only inserts new rows, and ingest reads credentials with a plain
 `SELECT` and writes activity rows whose foreign key takes `FOR KEY SHARE`,
 which `FOR SHARE` does not block. The audit is recorded on `lock_account_key`,
 and a status-change race test witnesses it.
+
+## Account key listing preserves owner absence (GH-41)
+
+The credential directory previously returned only a vector or `StoreError`.
+Both stores filtered keys by account, so a missing account looked exactly like
+an existing account with no credentials. Tests covered ordering, paging,
+expiry and revocation but never the missing-owner boundary; the HTTP handler
+therefore returned `200` with an empty page for a mistyped account ID.
+
+`KeyDirectory::account_keys` now returns the existing `KeyError` vocabulary,
+including `UnknownAccount`. Memory tests account existence while holding the
+same lock used to assemble the page. PostgreSQL anchors one SELECT on the
+account and left-joins a bounded lateral credential page: zero rows means no
+account, while a NULL key means an existing account's empty page. Both facts
+come from one statement snapshot, including when creation overlaps the read.
+A creation committed after that snapshot becomes visible on the next read;
+a completed creation cannot be hidden by a stale HTTP preflight. Separate
+cursor query shapes preserve the account/key index range and page bound.
+
+The sibling caller is credential revocation. It intentionally retains its
+credential-scoped `unknown-credential` response for an absent owner. Other
+callers propagate the typed refusal; database corruption remains `Storage`.
+Shared backend scenarios and an HTTP regression cover absence, creation,
+empty pages with and without cursors, and exhaustion of an existing key page.
+
+Callers relying on `200 []` for a missing account must handle
+`404 unknown-account`. Custom Rust directory implementations must change the
+return error type from `StoreError` to `KeyError`. Deploy updated clients before
+the server where that behavior matters. There is no schema migration,
+authentication change, extra round trip, or request-path work.

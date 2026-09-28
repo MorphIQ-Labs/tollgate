@@ -2220,7 +2220,13 @@ exists to detect corrupt state and must not be able to launder it.
     and it never reaches a receipt, response or audit event. Expiry is
     independent of the retirement flag. Repeated retirement returns equal states.
     Both credential listings reject malformed or oversized queries as structured
-    client errors before a backend read.
+    client errors before a backend read. Account-scoped listing distinguishes an
+    absent owner (`KeyError::UnknownAccount`, HTTP `404 unknown-account`) from
+    an existing account's empty page. The owning store reads existence and keys
+    under the same memory lock or PostgreSQL statement snapshot; a separate
+    HTTP preflight cannot establish that consistency. Both backends and HTTP
+    are witnessed by `account_key_listing_distinguishes_unknown_from_empty`.
+    Revocation retains `404 unknown-credential` for an absent owner.
 
     The HTTP operator guard emits actor, operation ID, action, resource and time
     before a store call, then confirms with the receipt, or reports failure or

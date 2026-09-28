@@ -110,7 +110,7 @@ type RevokeKeyAuditedHook<S> =
     Hook<S, (KeyId, Timestamp), Result<AdminReceipt<Revocation>, KeyError>>;
 type ActiveKeysHook<S> = Hook<S, Timestamp, Result<Vec<KeyRecord>, StoreError>>;
 type AccountKeysHook<S> =
-    Hook<S, (AccountId, Option<KeyId>, NonZeroUsize), Result<Vec<KeySummary>, StoreError>>;
+    Hook<S, (AccountId, Option<KeyId>, NonZeroUsize), Result<Vec<KeySummary>, KeyError>>;
 type InsertKeyWithinHook<S> = Hook<S, (KeyRecord, NonZeroUsize, Timestamp), Result<(), KeyError>>;
 type InsertKeyWithinAuditedHook<S> =
     Hook<S, (KeyRecord, NonZeroUsize, Timestamp), Result<AdminReceipt<()>, KeyError>>;
@@ -499,7 +499,7 @@ impl<S: Send + Sync + 'static> DelegatingStore<S> {
     pub fn on_account_keys<F, Fut>(mut self, f: F) -> Self
     where
         F: Fn(Arc<S>, AccountId, Option<KeyId>, NonZeroUsize) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<Vec<KeySummary>, StoreError>> + Send + 'static,
+        Fut: Future<Output = Result<Vec<KeySummary>, KeyError>> + Send + 'static,
     {
         self.account_keys = Some(Arc::new(move |inner, (account, after, limit)| {
             Box::pin(f(inner, account, after, limit))
@@ -881,7 +881,7 @@ where
         account: AccountId,
         after: Option<KeyId>,
         limit: NonZeroUsize,
-    ) -> Result<Vec<KeySummary>, StoreError> {
+    ) -> Result<Vec<KeySummary>, KeyError> {
         match &self.account_keys {
             Some(hook) => hook(Arc::clone(&self.inner), (account, after, limit)).await,
             None => KeyDirectory::account_keys(&*self.inner, account, after, limit).await,
@@ -1154,7 +1154,7 @@ impl KeyDirectory for RejectingStore {
         _account: AccountId,
         _after: Option<KeyId>,
         _limit: NonZeroUsize,
-    ) -> Result<Vec<KeySummary>, StoreError> {
+    ) -> Result<Vec<KeySummary>, KeyError> {
         unreachable!("{}: KeyDirectory::account_keys", self.reason)
     }
 
