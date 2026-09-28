@@ -328,6 +328,8 @@ impl LeaseSlot {
             .then_some((until, remaining))
     }
 
+    /// The instance-local layout of this slot's lease views, fixed at
+    /// construction; an installed lease is published to every view.
     #[must_use]
     pub fn sharding(&self) -> LocalSharding {
         self.sharding
@@ -480,6 +482,11 @@ impl LeaseSlot {
         }
     }
 
+    /// The installed lease as seen from the calling thread's locality, or
+    /// `None` when no lease is installed (the cold-start or lost-lease
+    /// state). Resolves [`Locality::current`], which assigns the thread an
+    /// affinity on first use; a control-plane reader should use
+    /// [`load_observed`](Self::load_observed) instead.
     #[must_use]
     pub fn load(&self) -> Option<Arc<LocalLease>> {
         self.load_at(Locality::current())
@@ -1085,10 +1092,14 @@ impl AccountLimiter {
 #[derive(Debug)]
 #[repr(align(128))]
 pub struct AccountAdmissionState {
+    /// The compiled principal snapshot this state was built from; immutable
+    /// for the state's lifetime.
     pub snapshot: Arc<AccountSnapshot>,
     pub(crate) counters: Arc<AdmissionCounters>,
     pub(crate) limiter: Arc<AccountLimiter>,
     pub(crate) principal_gauge: Arc<PrincipalGauge>,
+    /// The account's lease slot, shared by every principal of the account and
+    /// surviving snapshot installs.
     pub lease: Arc<LeaseSlot>,
     /// The instance's admitted-unit total at the instant this snapshot was
     /// installed, so the balance estimate can subtract only what has been
@@ -1671,28 +1682,42 @@ pub enum MapEntry {
     /// the request path deliberately does not read a clock and denies both a
     /// live negative and a missing entry. Generation watermarks live outside
     /// this evictable entry so expiry cannot enable stale resurrection.
-    NegativeUntil { until: Timestamp },
+    NegativeUntil {
+        /// When the negative answer lapses and the control plane should
+        /// resolve the principal again.
+        until: Timestamp,
+    },
 }
 
 /// One control-plane mutation. Mixed positive and negative batches let a
 /// copy-on-write map apply an entire refresh with one clone.
 #[derive(Debug, Clone)]
 pub enum SnapshotUpdate {
+    /// Install a positive snapshot, subject to generation monotonicity.
     Present {
+        /// The principal the snapshot authorizes.
         principal: Principal,
+        /// The compiled snapshot to install.
         snapshot: Arc<AccountSnapshot>,
+        /// The account's lease slot, shared by all of the account's
+        /// principals.
         lease: Arc<LeaseSlot>,
     },
     /// A revocation the source published, which always carries its generation.
     Revoked {
+        /// The revoked principal.
         principal: Principal,
+        /// When the negative entry lapses.
         until: Timestamp,
+        /// The generation revoked; a positive at or below it is refused.
         generation: Generation,
     },
     /// An absent row, which carries no generation and asserts nothing about
     /// any (GL-53).
     Unknown {
+        /// The principal the source has no row for.
         principal: Principal,
+        /// When the negative entry lapses.
         until: Timestamp,
     },
 }
@@ -1704,26 +1729,37 @@ pub enum SnapshotUpdate {
 /// the proof at the boundary.
 #[derive(Debug, Clone)]
 pub enum PublishableSnapshotUpdate {
+    /// Install a positive snapshot, subject to generation monotonicity.
     Present {
+        /// The principal the snapshot authorizes.
         principal: Principal,
+        /// The snapshot, with its publication-validation proof.
         snapshot: PublishableSnapshot,
+        /// The account's lease slot, shared by all of the account's
+        /// principals.
         lease: Arc<LeaseSlot>,
     },
     /// A revocation the source published, which always carries its generation.
     Revoked {
+        /// The revoked principal.
         principal: Principal,
+        /// When the negative entry lapses.
         until: Timestamp,
+        /// The generation revoked; a positive at or below it is refused.
         generation: Generation,
     },
     /// An absent row, which carries no generation and asserts nothing about
     /// any (GL-53).
     Unknown {
+        /// The principal the source has no row for.
         principal: Principal,
+        /// When the negative entry lapses.
         until: Timestamp,
     },
 }
 
 impl PublishableSnapshotUpdate {
+    /// The principal this update targets, whatever its variant.
     #[must_use]
     pub fn principal(&self) -> Principal {
         match self {
@@ -1827,6 +1863,9 @@ pub trait SnapshotMap: Send + Sync {
         )
     }
 
+    /// The request-visible entry for `principal`, or `None` when the map
+    /// holds none. The admission engine denies both `None` and a negative
+    /// entry as an unknown principal. Must not block or perform I/O.
     fn get(&self, principal: &Principal) -> Option<MapEntry>;
 
     /// Lookup using locality already resolved by the admission engine, so a
@@ -1941,6 +1980,14 @@ pub trait SnapshotMap: Send + Sync {
         )
     }
 
+    /// Apply a mixed batch of positive and negative updates. The default
+    /// applies each through [`install`](SnapshotMap::install),
+    /// [`install_revoked`](SnapshotMap::install_revoked) or
+    /// [`install_unknown`](SnapshotMap::install_unknown) in order and stops at
+    /// the first error, leaving earlier updates applied. The maps in this
+    /// crate override it to validate the whole batch before changing
+    /// anything; the copy-on-write map also clones once per batch rather than
+    /// once per update.
     fn apply_many(&self, updates: Vec<SnapshotUpdate>) -> Result<(), crate::PublicationError> {
         for update in updates {
             match update {
@@ -1973,6 +2020,10 @@ pub trait SnapshotMap: Send + Sync {
         self.apply_many(updates)
     }
 
+    /// [`apply_many`](SnapshotMap::apply_many) for updates whose positive
+    /// snapshots carry their publication proof; the default installs them
+    /// through [`install_publishable`](SnapshotMap::install_publishable) and
+    /// likewise stops at the first error.
     fn apply_publishable_many(
         &self,
         updates: Vec<PublishableSnapshotUpdate>,
@@ -1997,6 +2048,9 @@ pub trait SnapshotMap: Send + Sync {
         Ok(())
     }
 
+    /// [`apply_publishable_many`](SnapshotMap::apply_publishable_many) at an
+    /// explicit time, as [`apply_many_at`](SnapshotMap::apply_many_at) is to
+    /// [`apply_many`](SnapshotMap::apply_many). The default ignores `now`.
     fn apply_publishable_many_at(
         &self,
         updates: Vec<PublishableSnapshotUpdate>,
