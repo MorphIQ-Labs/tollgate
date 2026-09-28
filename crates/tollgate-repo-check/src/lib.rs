@@ -4,6 +4,7 @@
 pub mod book;
 pub mod cli;
 pub mod excerpts;
+pub mod guarantees;
 pub mod parity;
 pub mod seam;
 

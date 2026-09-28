@@ -22,6 +22,7 @@
 
 # Guarantees and evidence
 
+- [Guarantees](GUARANTEES.md)
 - [Invariants](site/invariants.md)
   - [Invariant references](INVARIANT_REFERENCES.md)
 - [Formal proofs](site/formal.md)
