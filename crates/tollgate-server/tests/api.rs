@@ -1765,3 +1765,70 @@ async fn an_issuer_minting_an_unpresentable_secret_is_refused_before_storage() {
         }
     }
 }
+
+#[tokio::test]
+async fn oversized_non_usage_bodies_have_route_neutral_titles() {
+    let (_store, router) = state();
+    // Both explicit snapshot limits and the default JSON limit share the
+    // converter. Neither kind of route accepts a batch of usage events.
+    for (method, path, limit) in [
+        (
+            "PUT",
+            api(&format!("/admin/snapshots/{}", id(1))),
+            tollgate_store::wire::MAX_SNAPSHOT_BODY_BYTES,
+        ),
+        (
+            "PUT",
+            api(&format!(
+                "/admin/accounts/{}/keys/{}/snapshot",
+                id(1),
+                id(2)
+            )),
+            tollgate_store::wire::MAX_SNAPSHOT_BODY_BYTES,
+        ),
+        ("POST", api("/admin/accounts"), 2 * 1024 * 1024),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(&path)
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", common::OPERATOR),
+            )
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(" ".repeat(limit + 1)))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let problem: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(problem["status"], 413);
+        assert_eq!(problem["code"], "batch-too-large");
+        assert_eq!(
+            problem["title"],
+            "request body exceeds this endpoint's limit"
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_ingest_body_does_not_get_size_advice() {
+    let (_store, router) = state();
+    let (status, problem) = call(
+        &router,
+        "POST",
+        &api("/usage/ingest"),
+        Some(json!({"events": "not a batch"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(problem["code"], "invalid-json");
+    assert_eq!(
+        problem["title"],
+        "request body is not valid JSON for this endpoint"
+    );
+}

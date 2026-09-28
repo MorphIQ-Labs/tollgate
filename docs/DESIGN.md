@@ -7622,3 +7622,18 @@ lock, issuance only inserts new rows, and ingest reads credentials with a plain
 `SELECT` and writes activity rows whose foreign key takes `FOR KEY SHARE`,
 which `FOR SHARE` does not block. The audit is recorded on `lock_account_key`,
 and a status-change race test witnesses it.
+
+## Body-limit advice belongs to the route (GH-42)
+
+The shared JSON rejection converter appended the usage-batch event cap to
+all `413 batch-too-large` responses, including snapshot publication and account
+creation. Its existing regression exercised only ingest, where that advice was
+correct, so the misuse on other routes went unnoticed.
+
+The converter now supplies a route-neutral title. The ingest handler accepts
+the extractor result and adds its event cap only to a body-size rejection,
+before any store call. Snapshot and default-limit route tests pin the neutral
+message; ingest tests retain the cap and keep malformed JSON distinct.
+Status, code, byte limits, event limits, authentication and schemas are unchanged.
+Only human-readable error advice changes; there is no migration or request-path
+cost.
