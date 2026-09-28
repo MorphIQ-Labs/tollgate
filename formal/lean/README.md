@@ -68,6 +68,14 @@ This Lean package contains exact models for critical contracts:
   an absent row, revoked for a tombstone); and that a present answer clears
   it. Pull scheduling, retry backoff and broadcast-lag recovery are the
   snapshot manager's, witnessed by its tests.
+- `StatusPropagation` models an account's status as one ledger value and the
+  status inside each of its snapshots, written together by one operation. It
+  proves that the ledger and every live snapshot always agree; that a status
+  change republishes exactly the account's live snapshots not already at the
+  target, each at generation + 1, never a revocation tombstone and never
+  backward; that repeating a change republishes nothing; that publication
+  contradicting the ledger is refused; and that `closed` is terminal. The
+  operation's atomicity is an assumption the backend suites witness.
 - [`Conservation`](Tollgate/Conservation.lean) models the per-account ledger equation
   `deposited + overage = balance + activeGrants + settledUsage + loss + expired`,
   where `balance = allowanceBalance + topupBalance`, and

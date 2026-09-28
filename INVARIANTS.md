@@ -1444,7 +1444,21 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `SnapshotManager` refresh interval, not zero. The operation reports what it
     changed: how many snapshots it republished, and how many changed durably
     but could not be decoded to push, so a partial result is surfaced rather
-    than absorbed. *Tests:*
+    than absorbed. `StatusPropagation.lean` proves the exact model: the ledger
+    and every live snapshot always agree
+    (`Tollgate.StatusPropagation.setStatus_agrees`,
+    `Tollgate.StatusPropagation.publish_agrees`); a change republishes exactly
+    the account's live snapshots not already at the target, each at
+    generation + 1 (`Tollgate.StatusPropagation.setStatus_restamps_exactly`),
+    never a tombstone (`Tollgate.StatusPropagation.revoked_never_republished`)
+    and never backward (`Tollgate.StatusPropagation.generation_monotone`);
+    repeating it changes nothing
+    (`Tollgate.StatusPropagation.repeat_changes_nothing`); a contradicting
+    publication is refused
+    (`Tollgate.StatusPropagation.contradicting_publication_refused`); and
+    `Closed` is terminal (`Tollgate.StatusPropagation.closed_is_terminal`,
+    `Tollgate.StatusPropagation.closed_stays_closed`). The operation is atomic
+    by assumption. *Tests:*
     `suspending_an_account_stops_leases_and_republishes_its_snapshots`,
     `suspension_republishes_only_the_suspended_accounts_snapshots`,
     `suspending_an_account_does_not_resurrect_revoked_principals`,

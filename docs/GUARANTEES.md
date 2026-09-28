@@ -33,7 +33,7 @@ Tests verify enforcement; they don't replace it.
 | Unit, property and integration tests | The behavior. Property tests (`proptest`) cover the interleavings fixed tests miss. | Every pull request |
 | Backend parity | `MemoryStore` is the executable specification. `PostgresStore` passes the same scenario suite, test by test and name by name, and a check fails if a mirrored test drives a different contract on each side. | Every pull request |
 | Mutation testing | Code a pull request changes is mutated with `cargo-mutants`. A mutant that no test catches fails the build, so a test that doesn't bite can't pass as coverage. | Every pull request |
-| Machine-checked proofs | 22 Lean 4 modules with 290 theorems prove exact models of the critical accounting and concurrency state machines. The gate rejects any `sorry` or `admit`. | Every pull request |
+| Machine-checked proofs | 23 Lean 4 modules with 302 theorems prove exact models of the critical accounting and concurrency state machines. The gate rejects any `sorry` or `admit`. | Every pull request |
 | Allocation assertions | The steady-state admission path allocates nothing it owns; counted deterministically. | Every pull request |
 | Performance gates | Hot-path benchmarks and loopback load tests against calibrated thresholds, with the host and revision recorded. See [performance](PERFORMANCE.md). | Locally, on a controlled host |
 | Supply chain | RustSec advisories, permissive licenses only, a secret scan, and the declared MSRV. | Every pull request |
@@ -46,7 +46,7 @@ allocation counts.
 
 ## The invariant map
 
-Each invariant, and the Lean modules whose theorems it cites. 24 of the 40
+Each invariant, and the Lean modules whose theorems it cites. 25 of the 40
 rest partly on a machine-checked proof. The others are enforced by types, by
 their owning component, or by tested convention, as each one states. A dash
 means no proof is claimed, not that the invariant is unchecked.
@@ -79,7 +79,7 @@ theorem or invariant count stated on this page or in the README goes stale.
 | 19 | A control-plane failure is never silent. | — |
 | 20 | Every admission outcome is counted, exactly once, under its own reason. | — |
 | 21 | Every opaque identifier has one portable wire spelling. | — |
-| 22 | An account's status has one writer and one propagation path. | — |
+| 22 | An account's status has one writer and one propagation path. | [StatusPropagation](../formal/lean/Tollgate/StatusPropagation.lean) |
 | 23 | A cached credential proves identity, never authorization, and never outlives its own validity. | — |
 | 24 | Steady-state embedding admission allocates nothing it owns and performs exactly one snapshot lookup. | — |
 | 25 | Concurrency ceilings are exact, per instance, and released once. | [ConcurrencyGauge](../formal/lean/Tollgate/ConcurrencyGauge.lean) |
