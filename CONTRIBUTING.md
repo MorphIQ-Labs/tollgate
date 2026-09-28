@@ -63,6 +63,10 @@ which is not public. The reasoning each one records is in the surrounding
 text or in [`docs/DESIGN.md`](docs/DESIGN.md). Plain `#N` references are
 issues in this repository.
 
+## Code of conduct
+
+Participation is governed by the [code of conduct](CODE_OF_CONDUCT.md). Report conduct concerns to conduct@morphiqlabs.com.
+
 ## Reporting a vulnerability
 
 Do not open a public issue. See [`SECURITY.md`](SECURITY.md).

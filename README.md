@@ -273,7 +273,8 @@ every pull request.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the local gates and the
 pull-request process. [AGENTS.md](AGENTS.md) is the full engineering contract.
-Report security issues privately; see [SECURITY.md](SECURITY.md).
+Report security issues privately; see [SECURITY.md](SECURITY.md). Participation
+is governed by the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## License
 

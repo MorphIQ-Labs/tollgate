@@ -37,5 +37,6 @@
 # Project
 
 - [Contributing](site/contributing.md)
+- [Code of conduct](site/code-of-conduct.md)
 - [Security policy](site/security.md)
 - [Changelog](site/changelog.md)
