@@ -31,6 +31,25 @@ pub struct TlsConfig {
 }
 
 impl TlsConfig {
+    /// Builds a server configuration from the PEM certificate chain, its PEM
+    /// private key and, optionally, a PEM bundle of client CAs.
+    ///
+    /// The server uses rustls's safe default protocol versions and offers
+    /// only HTTP/1.1. It accepts no 0-RTT data and does not resume sessions.
+    /// With a client CA, the handshake requests a client certificate and
+    /// verifies any that is presented, but does not require one, so bearer
+    /// callers and probes share the listener. A verified certificate grants
+    /// nothing until its leaf fingerprint is mapped to an identity with
+    /// [`SecurityPolicy::with_certificate`](crate::security::SecurityPolicy::with_certificate).
+    ///
+    /// Handshake limits default to five seconds and 128 pending handshakes;
+    /// see [`with_handshake_limits`](Self::with_handshake_limits).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SecurityError`] for empty or malformed PEM, an invalid
+    /// client CA, or a private key that does not match the certificate. The
+    /// error never contains key material.
     pub fn from_pem(
         certificates: &[u8],
         private_key: &[u8],
@@ -140,6 +159,16 @@ pub(crate) fn parse_certificates(
     Ok(certificates)
 }
 
+/// The SHA-256 fingerprint of a client's DER leaf certificate, given as PEM.
+///
+/// This is the key [`SecurityPolicy::with_certificate`] maps to an identity;
+/// the security manifest derives it from each configured leaf file.
+///
+/// # Errors
+///
+/// Returns a [`SecurityError`] unless the PEM holds exactly one certificate.
+///
+/// [`SecurityPolicy::with_certificate`]: crate::security::SecurityPolicy::with_certificate
 pub fn certificate_fingerprint(pem: &[u8]) -> Result<[u8; 32], SecurityError> {
     let certificates = parse_certificates(pem)?;
     if certificates.len() != 1 {
