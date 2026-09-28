@@ -17,8 +17,8 @@ categories = ["database"]
 test-support = []
 
 [dependencies]
-tollgate-core = { path = "../tollgate-core", version = "=0.30.2", features = ["serde"] }
-tollgate-store = { path = "../tollgate-store", version = "=0.30.2", features = ["wire"] }
+tollgate-core = { path = "../tollgate-core", version = "=0.30.3", features = ["serde"] }
+tollgate-store = { path = "../tollgate-store", version = "=0.30.3", features = ["wire"] }
 async-trait = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true }
