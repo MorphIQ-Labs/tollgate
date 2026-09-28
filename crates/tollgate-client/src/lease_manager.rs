@@ -1014,6 +1014,7 @@ fn release_failure(error: &AllocateError) -> ReleaseFailure {
         | AllocateError::InsufficientBalance
         | AllocateError::BalanceExhausted(_)
         | AllocateError::BalanceInsufficient(_)
+        | AllocateError::BalanceOverflow
         | AllocateError::InvalidTtl => ReleaseFailure::Integrity,
     }
 }
@@ -1109,7 +1110,9 @@ fn consolidation_failure(error: &AllocateError) -> ConsolidationFailure {
         | AllocateError::UnknownAccount
         | AllocateError::AccountInactive
         | AllocateError::InvalidTtl => ConsolidationFailure::RolledBack,
-        AllocateError::InvalidRelease => ConsolidationFailure::Integrity,
+        AllocateError::InvalidRelease | AllocateError::BalanceOverflow => {
+            ConsolidationFailure::Integrity
+        }
         AllocateError::Storage(_) => ConsolidationFailure::Ambiguous,
     }
 }
@@ -1513,6 +1516,7 @@ mod tests {
             AllocateError::LeaseNotActive,
             AllocateError::InvalidRelease,
             AllocateError::InvalidTtl,
+            AllocateError::BalanceOverflow,
         ] {
             counters.record_acquire_refused(&error);
         }

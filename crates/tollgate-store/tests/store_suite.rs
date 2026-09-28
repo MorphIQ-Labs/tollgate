@@ -2792,7 +2792,7 @@ async fn a_refused_deposit_moves_neither_column() {
     assert!(before.holds(), "fixture must start conserved: {before:?}");
 
     let refused = AdminStore::deposit(&*store, ACCOUNT, CostUnits(500)).await;
-    assert!(refused.is_err(), "the deposit cannot be represented");
+    assert_eq!(refused.unwrap_err(), AllocateError::BalanceOverflow);
 
     let after = store.conservation(ACCOUNT).unwrap();
     assert_eq!(
@@ -5084,4 +5084,35 @@ async fn exhaustion_evidence_names_the_stored_period_and_rollover_restores_fundi
 async fn account_key_listing_distinguishes_unknown_from_empty() {
     let store = MemoryStore::new(GrantPolicy::default()).unwrap();
     account_keys::listing_distinguishes_unknown_from_empty(&*store).await;
+}
+
+#[tokio::test]
+async fn deposits_accept_the_unit_ceiling_and_refuse_overflow() {
+    let ceiling = u64::MAX;
+    let store = store_with_balance(full_grant_policy(), ceiling - 1).await;
+    // Exact fit is valid; one more unit must fail without changing any ledger term.
+    AdminStore::deposit(&*store, ACCOUNT, CostUnits(1))
+        .await
+        .unwrap();
+    let before = store.conservation(ACCOUNT).unwrap();
+    assert_eq!(before.balance, CostUnits(ceiling));
+    assert_eq!(before.deposited, CostUnits(ceiling));
+    assert!(before.holds());
+    for units in [1, u64::MAX] {
+        for _ in 0..2 {
+            assert_eq!(
+                AdminStore::deposit(&*store, ACCOUNT, CostUnits(units))
+                    .await
+                    .unwrap_err(),
+                AllocateError::BalanceOverflow,
+            );
+            assert_eq!(store.conservation(ACCOUNT).unwrap(), before);
+        }
+    }
+    assert_eq!(
+        AdminStore::deposit(&*store, AccountId(999), CostUnits(1))
+            .await
+            .unwrap_err(),
+        AllocateError::UnknownAccount,
+    );
 }

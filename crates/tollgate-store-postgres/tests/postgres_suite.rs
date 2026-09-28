@@ -4723,7 +4723,7 @@ async fn a_refused_deposit_moves_neither_column() {
     assert!(before.holds(), "fixture must start conserved: {before:?}");
 
     let refused = AdminStore::deposit(&*store, ACCOUNT, CostUnits(500)).await;
-    assert!(refused.is_err(), "the deposit cannot be represented");
+    assert_eq!(refused.unwrap_err(), AllocateError::BalanceOverflow);
 
     let after = store.conservation(ACCOUNT).await.unwrap().unwrap();
     assert_eq!(
@@ -7460,4 +7460,56 @@ async fn account_key_listing_distinguishes_unknown_from_empty() {
         return;
     };
     account_keys::listing_distinguishes_unknown_from_empty(&*store).await;
+}
+
+#[tokio::test]
+async fn deposits_accept_the_unit_ceiling_and_refuse_overflow() {
+    let _guard = DB_LOCK.lock().await;
+    let ceiling = u64::try_from(i64::MAX).unwrap();
+    let Some(store) = store_with_balance(full_grant_policy(), ceiling - 1).await else {
+        return;
+    };
+    // Exact fit is valid; one more unit must fail without changing any ledger term.
+    AdminStore::deposit(&*store, ACCOUNT, CostUnits(1))
+        .await
+        .unwrap();
+    let before = store.conservation(ACCOUNT).await.unwrap().unwrap();
+    assert_eq!(before.balance, CostUnits(ceiling));
+    assert_eq!(before.deposited, CostUnits(ceiling));
+    assert!(before.holds());
+    for units in [1, u64::MAX] {
+        for _ in 0..2 {
+            assert_eq!(
+                AdminStore::deposit(&*store, ACCOUNT, CostUnits(units))
+                    .await
+                    .unwrap_err(),
+                AllocateError::BalanceOverflow,
+            );
+            assert_eq!(store.conservation(ACCOUNT).await.unwrap().unwrap(), before);
+        }
+    }
+    assert_eq!(
+        AdminStore::deposit(&*store, AccountId(999), CostUnits(1))
+            .await
+            .unwrap_err(),
+        AllocateError::UnknownAccount,
+    );
+}
+
+#[tokio::test]
+async fn a_deposit_outside_bigint_is_a_permanent_refusal() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+        return;
+    };
+    let before = store.conservation(ACCOUNT).await.unwrap().unwrap();
+    for units in [i64::MAX as u64 + 1, u64::MAX] {
+        assert_eq!(
+            AdminStore::deposit(&*store, ACCOUNT, CostUnits(units))
+                .await
+                .unwrap_err(),
+            AllocateError::BalanceOverflow,
+        );
+        assert_eq!(store.conservation(ACCOUNT).await.unwrap().unwrap(), before);
+    }
 }

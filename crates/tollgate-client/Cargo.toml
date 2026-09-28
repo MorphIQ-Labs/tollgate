@@ -12,10 +12,10 @@ keywords = ["quota", "metering", "billing", "usage", "runtime"]
 categories = ["asynchronous", "concurrency"]
 
 [dependencies]
-tollgate-auth = { path = "../tollgate-auth", version = "=0.30.2" }
-tollgate-core = { path = "../tollgate-core", version = "=0.30.2" }
-tollgate-admission = { path = "../tollgate-admission", version = "=0.30.2" }
-tollgate-store = { path = "../tollgate-store", version = "=0.30.2" }
+tollgate-auth = { path = "../tollgate-auth", version = "=0.30.3" }
+tollgate-core = { path = "../tollgate-core", version = "=0.30.3" }
+tollgate-admission = { path = "../tollgate-admission", version = "=0.30.3" }
+tollgate-store = { path = "../tollgate-store", version = "=0.30.3" }
 async-trait = { workspace = true }
 atomic-waker = { workspace = true }
 jiff = { workspace = true }

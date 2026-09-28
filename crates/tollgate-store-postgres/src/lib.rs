@@ -2717,10 +2717,24 @@ impl AdminStore for PostgresStore {
                        balance AS new_topup, deposited AS new_deposited",
         )
         .bind(id_bytes(account.0))
-        .bind(to_i64(units, "deposit").map_err(AllocateError::Storage)?)
+        .bind(i64::try_from(units.get()).map_err(|_| AllocateError::BalanceOverflow)?)
         .fetch_optional(&self.pool)
         .await
-        .map_err(alloc_storage)?
+        .map_err(|error| {
+            // Only this deposit's arithmetic refusal is permanent. Connection,
+            // constraint and other database failures retain Storage semantics.
+            // The single UPDATE rolls back both counters on numeric overflow.
+            if error
+                .as_database_error()
+                .and_then(|db| db.code())
+                .as_deref()
+                == Some("22003")
+            {
+                AllocateError::BalanceOverflow
+            } else {
+                alloc_storage(error)
+            }
+        })?
         .ok_or(AllocateError::UnknownAccount)?;
         let state = |topup: &str, deposited: &str| -> Result<AdminState, StoreError> {
             Ok(AdminState::Funding {
@@ -3367,5 +3381,9 @@ mod tests {
         };
 
         assert!(store.ping().await.is_err());
+        assert!(matches!(
+            AdminStore::deposit(&store, AccountId(1), CostUnits(1)).await,
+            Err(AllocateError::Storage(_))
+        ));
     }
 }
