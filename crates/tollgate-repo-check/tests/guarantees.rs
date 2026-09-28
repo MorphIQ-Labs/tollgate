@@ -17,6 +17,13 @@ fn the_guarantees_invariant_map_matches_the_contract() {
 }
 
 #[test]
+fn the_stated_proof_figures_are_current() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let problems = tollgate_repo_check::guarantees::check_figures(&root).expect("readable");
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
 fn a_theorem_citation_is_a_proof_and_a_definition_name_is_not() {
     let dir = tempfile::tempdir().expect("scratch repository");
     let root = dir.path();
