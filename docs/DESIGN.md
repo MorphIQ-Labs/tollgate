@@ -4110,6 +4110,19 @@ it *can* pass. `--package <crate>` mutates one crate's whole surface, which is
 how code written before the gate existed gets measured at all. The bare form
 sweeps the workspace and requires `TOLLGATE_PG_URL`.
 
+Every scope accepts `MUTANTS_SHARD=k/n` (0-based `k`), which passes
+`--shard k/n` to cargo-mutants: the shards partition one deterministic mutant
+list, so running every `k` tests exactly what one unsharded run would. CI runs
+the diff gate as eight `assurance / mutation shard k/8` jobs, each with its own
+PostgreSQL service because the backend suite truncates its database, and one
+required aggregate, `assurance / mutation`. The aggregate runs under
+`always()` and fails unless every shard succeeded: GitHub reports a job
+skipped behind a failed dependency as passing, so an aggregate without
+`always()` would go green exactly when a shard failed. Sharding exists because
+a diff touching both backends is serial against PostgreSQL, and at one worker
+a few hundred mutants outran the job timeout (GL-67; #44's diff produced
+about 600).
+
 `test_workspace` stays on in every scope: a `tollgate-core` mutant is allowed
 to die to a `tollgate-client` test, because what matters is whether *anything*
 notices, not whether the owning crate does.

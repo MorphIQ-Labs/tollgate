@@ -23,6 +23,20 @@ fi
 # never reaches cargo-mutants.
 status=0
 
+# One shard of the mutant list, as `k/n` (0-based `k`), for CI's matrix. The
+# shards partition the same deterministic list, so running every `k` tests
+# exactly what one unsharded run would. Empty runs everything.
+SHARD_ARGS=""
+if [ -n "${MUTANTS_SHARD:-}" ]; then
+  k=${MUTANTS_SHARD%/*}
+  n=${MUTANTS_SHARD#*/}
+  if ! printf '%s' "$MUTANTS_SHARD" | grep -qE '^[0-9]+/[1-9][0-9]*$' || [ "$k" -ge "$n" ]; then
+    echo "mutation gate: MUTANTS_SHARD must be k/n with 0 <= k < n, found '$MUTANTS_SHARD'" >&2
+    exit 2
+  fi
+  SHARD_ARGS="--shard $MUTANTS_SHARD"
+fi
+
 required=$(cat "$VERSION_FILE")
 installed=$(cargo mutants --version 2>/dev/null || true)
 if [ "$installed" != "cargo-mutants $required" ]; then
@@ -77,7 +91,7 @@ case "${1:-}" in
       unset TOLLGATE_PG_URL
       JOBS=$PARALLEL
     fi
-    cargo mutants --workspace -j "$JOBS" --line-col true --in-diff "$diff" --output "$OUTPUT" \
+    cargo mutants --workspace -j "$JOBS" --line-col true --in-diff "$diff" --output "$OUTPUT" $SHARD_ARGS \
       || status=$?
     ;;
   # One crate's whole surface, rather than only what a branch touched. The
@@ -94,14 +108,14 @@ case "${1:-}" in
       echo "mutation gate: $package needs TOLLGATE_PG_URL, or its tests skip and every mutant reads as missed" >&2
       exit 1
     fi
-    cargo mutants -p "$package" -j "$JOBS" --line-col true --output "$OUTPUT" || status=$?
+    cargo mutants -p "$package" -j "$JOBS" --line-col true --output "$OUTPUT" $SHARD_ARGS || status=$?
     ;;
   "")
     if [ -z "${TOLLGATE_PG_URL:-}" ]; then
       echo "mutation gate: full sweep requires TOLLGATE_PG_URL" >&2
       exit 1
     fi
-    cargo mutants --workspace -j "$JOBS" --line-col true --output "$OUTPUT" || status=$?
+    cargo mutants --workspace -j "$JOBS" --line-col true --output "$OUTPUT" $SHARD_ARGS || status=$?
     ;;
   *)
     echo "usage: $0 [--diff [base-ref] | --package <crate>]" >&2
