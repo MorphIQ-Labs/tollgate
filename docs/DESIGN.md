@@ -609,9 +609,9 @@ have paid for capacity they are being refused.
 mode working — but it is the leading indicator of an invoice, the way
 `accounting.rejected` is the leading indicator of billing loss. It says this
 instance is admitting work the account has not paid for. Read it against
-`overage_spent` / `overage_cap`: the ratio is how much runway is left before a
-cap refusal starts. **Both are per instance.** Fleet exposure is `overage_cap`
-times the number of instances, so a cap that looks conservative on one box is
+`total_overage_spent` / `total_overage_cap`: the ratio is how much runway is
+left before a cap refusal starts. **Both are per instance.** Fleet exposure is
+the cap times the number of instances, so a cap that looks conservative on one box is
 not, and a control-plane outage reaches every instance at once. Restore lease
 capacity first; add funding only when the allocator specifically reports
 `insufficient_balance`. Raising the cap only buys time.
