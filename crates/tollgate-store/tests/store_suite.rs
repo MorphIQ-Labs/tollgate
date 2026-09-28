@@ -5081,6 +5081,12 @@ async fn exhaustion_evidence_names_the_stored_period_and_rollover_restores_fundi
 }
 
 #[tokio::test]
+async fn account_key_listing_distinguishes_unknown_from_empty() {
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    account_keys::listing_distinguishes_unknown_from_empty(&*store).await;
+}
+
+#[tokio::test]
 async fn deposits_accept_the_unit_ceiling_and_refuse_overflow() {
     let ceiling = u64::MAX;
     let store = store_with_balance(full_grant_policy(), ceiling - 1).await;

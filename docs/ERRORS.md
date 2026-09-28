@@ -57,7 +57,7 @@ name. See [`LeaseAllocator`](../crates/tollgate-store/src/traits.rs).
 
 | code | status | meaning | retry |
 | --- | --- | --- | --- |
-| `unknown-account` | 404 | no such account | no — fix the id |
+| `unknown-account` | 404 | no such account, including when listing its credentials; an existing account with no matching keys returns an empty page | no — fix the id |
 | `account-inactive` | 409 | the account exists but is not in a state that may spend | after its status changes |
 | `insufficient-balance` | 409 | no grant is possible now. With `balance_shortfall`, the ledger attests how much funding remains, all of it held in other leases | yes, polling: settlement, lease release or a top-up can restore balance |
 | `balance-exhausted` | 409 | the ledger confirms no funding remains, including in leases | after a deposit, or after `balance_exhaustion.period_end` for a scheduled account |

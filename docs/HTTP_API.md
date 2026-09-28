@@ -418,8 +418,9 @@ credential issuer, `503 entropy-unavailable`, `500 issuer-misconfigured`.
 
 Role `operator`. One page of the account's credentials, revoked and expired
 ones included: metadata only, never a secret, digest or principal. Query:
-`after` and `limit`, as for `GET /v1/keys`. An account with no credentials,
-including one that does not exist, answers an empty page.
+`after` and `limit`, as for `GET /v1/keys`. An existing account with no matching
+credentials answers an empty page. An unknown account returns
+`404 unknown-account`; existence and the page are read in one store operation.
 
 `200` with `AccountKeysResponse`, whose entries are `AccountKeyResponse`.
 `next_after` is `null` on the last page.
@@ -429,7 +430,7 @@ including one that does not exist, answers an empty page.
   "revoked_at": null, "live": true}], "next_after": null}
 ```
 
-Errors: `400 invalid-query`, `422 invalid-limit`.
+Errors: `400 invalid-query`, `422 invalid-limit`, `404 unknown-account`.
 
 ### `DELETE /v1/admin/accounts/{account}/keys/{key}`
 

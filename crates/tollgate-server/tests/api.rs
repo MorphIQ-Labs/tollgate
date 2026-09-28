@@ -1332,16 +1332,19 @@ async fn both_credential_listings_validate_queries_before_backend_reads() {
     let reads = Arc::new(AtomicUsize::new(0));
     let directory_reads = Arc::clone(&reads);
     let projection_reads = Arc::clone(&reads);
-    let store =
-        delegating::DelegatingStore::wrapping(MemoryStore::new(GrantPolicy::default()).unwrap())
-            .on_account_keys(move |inner, account, after, limit| {
-                directory_reads.fetch_add(1, Ordering::SeqCst);
-                async move { inner.account_keys(account, after, limit).await }
-            })
-            .on_active_keys_page(move |inner, now, after, limit| {
-                projection_reads.fetch_add(1, Ordering::SeqCst);
-                async move { inner.active_keys_page(now, after, limit).await }
-            });
+    let inner = MemoryStore::new(GrantPolicy::default()).unwrap();
+    // Valid query boundaries exercise an existing account; missing accounts
+    // have their own 404 contract, distinct from query validation.
+    make_account(&inner, 1).await;
+    let store = delegating::DelegatingStore::wrapping(inner)
+        .on_account_keys(move |inner, account, after, limit| {
+            directory_reads.fetch_add(1, Ordering::SeqCst);
+            async move { inner.account_keys(account, after, limit).await }
+        })
+        .on_active_keys_page(move |inner, now, after, limit| {
+            projection_reads.fetch_add(1, Ordering::SeqCst);
+            async move { inner.active_keys_page(now, after, limit).await }
+        });
     let app = router(ServerState {
         security: common::security(),
         issuer: None,
@@ -1763,6 +1766,30 @@ async fn an_issuer_minting_an_unpresentable_secret_is_refused_before_storage() {
             assert!(body.get("secret").is_none());
             assert!(stored.is_empty(), "nothing was stored for {secret:?}");
         }
+    }
+}
+
+#[tokio::test]
+async fn account_key_listing_distinguishes_unknown_from_empty() {
+    let (store, app) = state();
+    let path = api(&format!("/admin/accounts/{}/keys", id(41)));
+    for suffix in [String::new(), format!("?after={}&limit=1", id(99))] {
+        let (status, body) = call(&app, "GET", &format!("{path}{suffix}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "unknown-account");
+        assert_eq!(body["status"], 404);
+    }
+    // Revocation keeps its credential-scoped refusal for a missing owner.
+    let (status, body) = call(&app, "DELETE", &format!("{path}/{}", id(99)), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "unknown-credential");
+
+    make_account(&store, 41).await;
+    for suffix in [String::new(), format!("?after={}&limit=1", id(99))] {
+        let (status, body) = call(&app, "GET", &format!("{path}{suffix}"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["keys"], json!([]));
+        assert!(body["next_after"].is_null());
     }
 }
 

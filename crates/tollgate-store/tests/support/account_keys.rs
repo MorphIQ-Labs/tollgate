@@ -378,3 +378,49 @@ where
         2
     );
 }
+
+/// An absent owner is not an empty page, including with a cursor past all keys.
+pub async fn listing_distinguishes_unknown_from_empty(store: &impl Backend) {
+    let account = AccountId(41);
+    for after in [None, Some(KeyId(u128::MAX))] {
+        assert_eq!(
+            store
+                .account_keys(account, after, limit(1))
+                .await
+                .unwrap_err(),
+            KeyError::UnknownAccount,
+        );
+    }
+    AdminStore::create_account(
+        store,
+        AccountConfig {
+            account_id: account,
+            initial_balance: CostUnits::ZERO,
+            status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
+        },
+    )
+    .await
+    .unwrap();
+    for after in [None, Some(KeyId(u128::MAX))] {
+        assert!(
+            store
+                .account_keys(account, after, limit(1))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    store.insert_key(key(41, 1, None)).await.unwrap();
+    assert_eq!(
+        store.account_keys(account, None, limit(1)).await.unwrap()[0].key_id,
+        KeyId(41_001)
+    );
+    assert!(
+        store
+            .account_keys(account, Some(KeyId(41_001)), limit(1))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

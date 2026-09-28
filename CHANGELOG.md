@@ -9,6 +9,12 @@ release from that section when the merge request lands.
 
 ### Fixed
 
+- Account key listing now returns `404 unknown-account` for an absent account,
+  replacing `200` with an empty page (#41). Existing accounts with no matching
+  credentials still return an empty page. `KeyDirectory::account_keys` now
+  returns `KeyError` instead of `StoreError`; custom backends and Rust callers
+  must update their signatures and handle `UnknownAccount`.
+
 - Oversized request bodies now receive a route-neutral error title; only usage
   ingest includes the usage-batch event cap. `413 batch-too-large` is unchanged
   (#42).

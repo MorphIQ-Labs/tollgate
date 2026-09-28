@@ -325,22 +325,32 @@ impl KeyDirectory for PostgresStore {
         account: AccountId,
         after: Option<KeyId>,
         limit: NonZeroUsize,
-    ) -> Result<Vec<KeySummary>, StoreError> {
+    ) -> Result<Vec<KeySummary>, KeyError> {
         validate_key_page_limit(limit)?;
-        // Separate SQL shapes preserve an indexable range in prepared plans,
-        // as `active_keys_page` does for the same reason.
+        // The account anchors the result in one statement snapshot: no rows
+        // means no account, while a NULL key marks an existing, empty page.
+        // LATERAL keeps the bounded credential scan on the account/key index;
+        // separate cursor shapes preserve an indexable range in prepared plans.
         let sql = if after.is_some() {
-            "SELECT key_id, not_after_floor_us, not_after_submicro_ns,
-                    not_after_is_lower_bound, revoked_at_us
-             FROM tollgate_credential_keys
-             WHERE account_id = $1 AND key_id > $3
-             ORDER BY key_id LIMIT $2"
+            "SELECT page.* FROM tollgate_accounts AS account
+             LEFT JOIN LATERAL (
+                 SELECT key_id, not_after_floor_us, not_after_submicro_ns,
+                        not_after_is_lower_bound, revoked_at_us
+                 FROM tollgate_credential_keys
+                 WHERE account_id = account.account_id AND key_id > $3
+                 ORDER BY key_id LIMIT $2
+             ) AS page ON TRUE
+             WHERE account.account_id = $1 ORDER BY page.key_id"
         } else {
-            "SELECT key_id, not_after_floor_us, not_after_submicro_ns,
-                    not_after_is_lower_bound, revoked_at_us
-             FROM tollgate_credential_keys
-             WHERE account_id = $1
-             ORDER BY key_id LIMIT $2"
+            "SELECT page.* FROM tollgate_accounts AS account
+             LEFT JOIN LATERAL (
+                 SELECT key_id, not_after_floor_us, not_after_submicro_ns,
+                        not_after_is_lower_bound, revoked_at_us
+                 FROM tollgate_credential_keys
+                 WHERE account_id = account.account_id
+                 ORDER BY key_id LIMIT $2
+             ) AS page ON TRUE
+             WHERE account.account_id = $1 ORDER BY page.key_id"
         };
         let mut query = sqlx::query(sql)
             .bind(id_bytes(account.0))
@@ -349,7 +359,13 @@ impl KeyDirectory for PostgresStore {
             query = query.bind(id_bytes(cursor.0));
         }
         let rows = query.fetch_all(&self.pool).await.map_err(storage)?;
-        rows.into_iter().map(summary_from_row).collect()
+        if rows.is_empty() {
+            return Err(KeyError::UnknownAccount);
+        }
+        rows.into_iter()
+            .filter(|row| row.get::<Option<&[u8]>, _>(0).is_some())
+            .map(|row| summary_from_row(row).map_err(KeyError::Storage))
+            .collect()
     }
 
     async fn insert_key_within(
