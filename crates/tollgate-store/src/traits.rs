@@ -28,6 +28,7 @@ impl std::error::Error for StoreError {}
 /// Domain refusals from the allocator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AllocateError {
+    /// No such account.
     UnknownAccount,
     /// The account exists but is not in a state that may spend.
     AccountInactive,
@@ -44,6 +45,7 @@ pub enum AllocateError {
     BalanceInsufficient(tollgate_core::BalanceShortfall),
     /// A lease must specify one unambiguous, strictly positive lifetime.
     InvalidTtl,
+    /// No lease record has this `lease_id`.
     UnknownLease,
     /// The fencing token does not match the lease record named by `lease_id`.
     /// Token ordering across different active leases is irrelevant
@@ -56,6 +58,7 @@ pub enum AllocateError {
     /// (`unspent + recorded usage > granted`) — a client accounting bug,
     /// surfaced rather than absorbed.
     InvalidRelease,
+    /// A backend failure unrelated to domain rules; see [`StoreError`].
     Storage(StoreError),
 }
 
@@ -147,7 +150,10 @@ impl From<StoreError> for AllocateError {
 /// Admin-side inputs when creating an account.
 #[derive(Debug, Clone, Copy)]
 pub struct AccountConfig {
+    /// The new account's identifier.
     pub account_id: AccountId,
+    /// Opening balance. Deposited as a top-up, so it counts toward
+    /// [`Conservation::deposited`] and never expires at a period boundary.
     pub initial_balance: CostUnits,
     /// The account's administrative status at birth. Anything but
     /// [`AccountStatus::Active`] refuses leases while keeping the ledger, and
@@ -177,6 +183,8 @@ pub struct AccountConfig {
 /// and units already consumed or written off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Conservation {
+    /// Every unit ever deposited: the opening balance, top-ups, and periodic
+    /// allowances. Monotonic.
     pub deposited: CostUnits,
     /// Unfunded units billed under [`EnforcementMode::Elastic`]: spend no
     /// deposit paid for and no lease debited.
@@ -189,13 +197,19 @@ pub struct Conservation {
     ///
     /// [`EnforcementMode::Elastic`]: tollgate_core::EnforcementMode::Elastic
     pub overage_recorded: CostUnits,
+    /// Spendable units not out on lease: allowance plus top-up.
     pub balance: CostUnits,
+    /// Units granted to leases that have not settled, including usage already
+    /// recorded against them.
     pub active_lease_grants: CostUnits,
     /// Usage billed against leases that have settled (released or expired),
     /// plus all overage usage — which belongs to no lease and is therefore
     /// settled the moment it is recorded. Usage on active leases is inside
     /// `active_lease_grants`.
     pub settled_usage: CostUnits,
+    /// Units granted to leases that settled without usage accounting for them:
+    /// unclaimed at release or forfeited at expiry reclaim. Usage for such a lease
+    /// that arrives later moves units from here into `settled_usage`.
     pub settlement_loss: CostUnits,
     /// Units that were funded but will never be spent, because the period
     /// that funded them ended (GL-97).
@@ -253,7 +267,12 @@ impl Conservation {
 /// is demand rather than hoarding.
 #[derive(Debug, Clone, Copy)]
 pub struct GrantPolicy {
+    /// Divisor applied to the balance to cap a grant: the cap is
+    /// `balance / shrink_divisor`, floored at `min_grant`. `1` caps at the whole
+    /// balance. Must be positive.
     pub shrink_divisor: u64,
+    /// Floor for the shrink cap, so a shrinking balance still grants leases of a
+    /// useful size; a grant never exceeds the balance. Must be positive.
     pub min_grant: CostUnits,
     /// Hard cap on any single lease's TTL; requests beyond it are clamped.
     pub max_ttl: SignedDuration,
@@ -300,6 +319,13 @@ impl GrantPolicy {
         now.checked_sub(self.reclaim_grace).ok()
     }
 
+    /// Check that the policy is safe to allocate with: `shrink_divisor`,
+    /// `min_grant` and `max_ttl` positive, and `reclaim_grace` nonnegative. Backends
+    /// call this at construction.
+    ///
+    /// # Errors
+    ///
+    /// A [`GrantPolicyError`] naming the first invalid field.
     pub fn validate(&self) -> Result<(), GrantPolicyError> {
         if self.shrink_divisor == 0 {
             return Err(GrantPolicyError("shrink_divisor must be positive"));
@@ -370,7 +396,9 @@ impl GrantPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 pub struct ReclaimedLease {
+    /// The lease the sweep settled.
     pub lease_id: LeaseId,
+    /// The account the lease was drawn from.
     pub account_id: AccountId,
     /// Units recorded as provisional settlement loss: `granted - recorded
     /// usage` at the sweep. Nothing is credited back, because a holder that
@@ -417,26 +445,32 @@ impl ReclaimBatch {
         })
     }
 
+    /// The leases this batch settled.
     #[must_use]
     pub fn reclaimed(&self) -> &[ReclaimedLease] {
         &self.reclaimed
     }
 
+    /// How many leases this batch settled.
     #[must_use]
     pub fn len(&self) -> usize {
         self.reclaimed.len()
     }
 
+    /// Whether this batch settled nothing.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.reclaimed.is_empty()
     }
 
+    /// Whether the batch reached its limit, so more expired leases may remain and
+    /// the caller should run another batch.
     #[must_use]
     pub fn is_saturated(&self) -> bool {
         self.saturated
     }
 
+    /// Consume the batch, returning the leases it settled.
     #[must_use]
     pub fn into_reclaimed(self) -> Vec<ReclaimedLease> {
         self.reclaimed
@@ -455,8 +489,11 @@ impl ReclaimBatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "wire", derive(serde::Serialize, serde::Deserialize))]
 pub struct Allocation {
+    /// The lease capability. Its fields are flattened into the wire object.
     #[cfg_attr(feature = "wire", serde(flatten))]
     pub grant: LeaseGrant,
+    /// The account's remaining funding after this grant, or `None` when the
+    /// allocator attested nothing. Omitted from the wire when `None`.
     #[cfg_attr(
         feature = "wire",
         serde(default, skip_serializing_if = "Option::is_none")
@@ -649,7 +686,11 @@ pub enum SnapshotResolution {
     Present(PublishableSnapshot),
     /// The principal existed but was revoked at this generation. Sources must
     /// retain this watermark so a delayed older positive cannot resurrect it.
-    Revoked { generation: Generation },
+    Revoked {
+        /// The generation the tombstone was published at. A positive snapshot
+        /// at or below it cannot resurrect the principal (INVARIANTS.md 15).
+        generation: Generation,
+    },
     /// The source has never observed this principal.
     Unknown,
 }
@@ -683,7 +724,9 @@ pub fn pushes_exceed_capacity(principals: usize) -> bool {
 /// One pushed snapshot update.
 #[derive(Debug, Clone)]
 pub struct SnapshotPush {
+    /// The principal whose authoritative state changed.
     pub principal: Principal,
+    /// Its new authoritative state.
     pub resolution: SnapshotResolution,
 }
 
@@ -733,6 +776,12 @@ pub trait SnapshotSource: Send + Sync {
 /// GL-11).
 #[async_trait]
 pub trait StoreHealth: Send + Sync {
+    /// Succeed only when the backing store can currently answer.
+    /// `MemoryStore` always succeeds; `PostgresStore` runs a trivial query.
+    ///
+    /// # Errors
+    ///
+    /// A [`StoreError`] when the store cannot be reached.
     async fn ping(&self) -> Result<(), StoreError>;
 }
 
@@ -744,7 +793,9 @@ pub trait StoreHealth: Send + Sync {
 /// workflow, not a create.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateAccountError {
+    /// An account with this id already exists. It is left untouched.
     AlreadyExists,
+    /// A backend failure unrelated to domain rules; see [`StoreError`].
     Storage(StoreError),
 }
 
@@ -792,6 +843,7 @@ pub struct StatusChange {
 /// One account moved across a period boundary by a rollover pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RolledAccount {
+    /// The account whose period boundary was crossed.
     pub account_id: AccountId,
     /// The new period's allowance, deposited by this pass.
     pub deposited: CostUnits,
@@ -839,21 +891,26 @@ impl RolloverBatch {
         })
     }
 
+    /// The accounts this batch rolled.
     #[must_use]
     pub fn rolled(&self) -> &[RolledAccount] {
         &self.rolled
     }
 
+    /// How many accounts this batch rolled.
     #[must_use]
     pub fn len(&self) -> usize {
         self.rolled.len()
     }
 
+    /// Whether this batch rolled nothing.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.rolled.is_empty()
     }
 
+    /// Whether the batch reached its limit, so more due accounts may remain and
+    /// the caller should run another batch.
     #[must_use]
     pub fn is_saturated(&self) -> bool {
         self.saturated
@@ -866,6 +923,7 @@ pub enum BudgetError {
     /// No such account. Never a silent no-op: an operator setting a schedule
     /// on a mistyped id has to learn it now rather than at the next boundary.
     UnknownAccount,
+    /// A backend failure unrelated to domain rules; see [`StoreError`].
     Storage(StoreError),
 }
 
@@ -902,6 +960,7 @@ pub enum SetStatusError {
     /// status and leaves it never. The refusal changes nothing — not the
     /// ledger, not one snapshot, not one generation.
     AccountClosed,
+    /// A backend failure unrelated to domain rules; see [`StoreError`].
     Storage(StoreError),
 }
 
@@ -932,6 +991,7 @@ impl From<StoreError> for SetStatusError {
 pub enum PublishSnapshotError {
     /// The stated credential is missing or belongs to another principal/account.
     CredentialMismatch {
+        /// The credential the snapshot states.
         key_id: KeyId,
     },
     /// The snapshot's status disagrees with the account ledger. An account's
@@ -939,7 +999,9 @@ pub enum PublishSnapshotError {
     /// republishes; a publish may carry the current status but may not change
     /// it.
     StatusMismatch {
+        /// The status the account ledger holds.
         ledger: AccountStatus,
+        /// The status the snapshot carried.
         submitted: AccountStatus,
     },
     /// The snapshot's execution-capacity class disagrees with the account
@@ -949,9 +1011,12 @@ pub enum PublishSnapshotError {
     /// fact is the divergence the status guard above already exists to
     /// abolish, and a second field must not reintroduce it.
     CapacityClassMismatch {
+        /// The class the account ledger holds.
         ledger: CapacityClass,
+        /// The class the snapshot carried.
         submitted: CapacityClass,
     },
+    /// A backend failure unrelated to domain rules; see [`StoreError`].
     Storage(StoreError),
 }
 
@@ -1006,8 +1071,11 @@ impl From<StoreError> for PublishSnapshotError {
 /// is exactly what GL-121 asks not to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountView {
+    /// The account read.
     pub account_id: AccountId,
+    /// Administrative status, from the ledger.
     pub status: AccountStatus,
+    /// Execution-capacity class, from the ledger.
     pub capacity_class: CapacityClass,
     /// The periodic allowance, if this account has one. `None` is "no
     /// schedule, the balance does not expire" — not "unknown".
@@ -1033,10 +1101,24 @@ pub struct AccountView {
 /// Direct callers attach their own actor and audit delivery policy.
 #[async_trait]
 pub trait AdminStore: Send + Sync {
+    /// Create an account from `config`, with its opening balance deposited as a
+    /// top-up and its fencing sequence starting at one.
+    ///
+    /// Never destructive and never silently idempotent (INVARIANTS.md 14): an
+    /// existing account is refused with [`CreateAccountError::AlreadyExists`] and
+    /// left untouched, including its balance, ledger totals, fencing sequence and
+    /// leases. The receipt's `before` is [`AdminState::Absent`](crate::AdminState::Absent).
     async fn create_account(
         &self,
         config: AccountConfig,
     ) -> Result<crate::AdminReceipt<()>, CreateAccountError>;
+    /// Add `units` to an existing account as a top-up, which survives period
+    /// boundaries, raising its balance and its `deposited` total together.
+    ///
+    /// A missing account is [`AllocateError::UnknownAccount`]. An overflow of
+    /// either counter is [`AllocateError::Storage`] and moves neither. Account
+    /// status is not checked. The receipt carries
+    /// [`AdminState::Funding`](crate::AdminState::Funding) before and after.
     async fn deposit(
         &self,
         account: AccountId,
@@ -1168,6 +1250,13 @@ pub trait AdminStore: Send + Sync {
         principal: Principal,
         snapshot: PublishableSnapshot,
     ) -> Result<crate::AdminReceipt<()>, PublishSnapshotError>;
+    /// Withdraw a principal's snapshot by tombstoning it at its current
+    /// generation, and push the revocation to subscribers. The tombstone is
+    /// durable, so no positive snapshot at or below that generation can resurrect
+    /// the principal (INVARIANTS.md 15).
+    ///
+    /// A principal with no snapshot, or one already tombstoned, is left unchanged
+    /// and the receipt's states are equal.
     async fn remove_snapshot(
         &self,
         principal: Principal,
@@ -1264,7 +1353,9 @@ pub trait UsageSink: Send + Sync {
 /// is `install_revoked` for exactly this value.
 #[derive(Clone, PartialEq, Eq)]
 pub struct KeyRecord {
+    /// The credential's non-secret identifier, chosen by its issuer.
     pub key_id: KeyId,
+    /// The account the credential authenticates for.
     pub account_id: AccountId,
     /// The principal this credential authenticates as: the leading 128 bits
     /// of `digest`.
@@ -1291,17 +1382,25 @@ impl std::fmt::Debug for KeyRecord {
 /// One requested key's activity. No observation is not proof of non-use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CredentialActivity {
+    /// The requested key.
     pub key_id: KeyId,
+    /// What the store has recorded for it.
     pub state: CredentialActivityState,
 }
 
+/// A credential's recorded commitment activity (INVARIANTS.md 35).
+/// It is never authentication or authorization evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialActivityState {
+    /// The directory holds no credential with this id.
     Unknown,
+    /// The credential exists, but no accepted, attributable usage has been
+    /// recorded for it. Not proof that it was never used.
     Unobserved,
     /// Maximum accepted, attributable execution-start time, at microsecond
     /// precision. Never an authorization or independent server-clock fact.
     Committed {
+        /// The latest recorded execution-start time.
         last_committed_at: Timestamp,
     },
 }
@@ -1410,8 +1509,10 @@ pub enum KeyError {
     /// bound that counted expired credentials would strand an account behind
     /// keys nobody can authenticate with.
     ActiveKeyLimit {
+        /// The bound the caller supplied.
         limit: NonZeroUsize,
     },
+    /// A backend failure unrelated to domain rules; see [`StoreError`].
     Storage(StoreError),
 }
 
@@ -1442,10 +1543,12 @@ pub enum KeySnapshotError {
     /// GL-27), so it is never granted positive authorization again; withdrawal
     /// remains allowed.
     Retired {
+        /// The revoked credential.
         key_id: KeyId,
     },
     /// Publication refused as [`AdminStore::publish_snapshot`] would refuse it.
     Publish(PublishSnapshotError),
+    /// A backend failure unrelated to domain rules; see [`StoreError`].
     Storage(StoreError),
 }
 
@@ -1497,6 +1600,7 @@ impl From<StoreError> for KeyError {
 /// is deciding whether to issue a replacement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeySummary {
+    /// The credential's non-secret identifier.
     pub key_id: KeyId,
     /// When the credential stops being valid of its own accord, if ever.
     pub not_after: Option<Timestamp>,
