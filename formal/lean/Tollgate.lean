@@ -16,3 +16,4 @@ import Tollgate.ControlPlane
 import Tollgate.CredentialProjection
 import Tollgate.CredentialActivity
 import Tollgate.BalanceExhaustion
+import Tollgate.LeaseFencing

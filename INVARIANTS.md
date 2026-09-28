@@ -321,6 +321,22 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    monotonic audit trail. If release rejects the token attached to a grant the
    client believed valid, the client clears its slot and fails closed because
    its local lease identity can no longer be trusted relative to the store.
+   `LeaseFencing.lean` proves the exact model: fences are positive, unique per
+   account and increasing (`Tollgate.LeaseFencing.capability_names_one_lease`,
+   `Tollgate.LeaseFencing.acquire_fence_exceeds_existing`); a newer lease
+   leaves existing ones untouched
+   (`Tollgate.LeaseFencing.acquire_preserves_existing`); a mismatched pair or
+   triple is refused (`Tollgate.LeaseFencing.release_refuses_wrong_fence`,
+   `Tollgate.LeaseFencing.ingest_refuses_wrong_fence`,
+   `Tollgate.LeaseFencing.ingest_refuses_wrong_account`); each operation
+   changes only the lease it names (`Tollgate.LeaseFencing.ingest_scoped`,
+   `Tollgate.LeaseFencing.release_scoped`); a settled lease never revives
+   (`Tollgate.LeaseFencing.settled_lease_never_revives`); and billed plus
+   returned units stay within the grant
+   (`Tollgate.LeaseFencing.billed_and_returned_within_grant`,
+   `Tollgate.LeaseFencing.ingest_refuses_past_capacity`). It assumes atomic
+   store operations and does not prove the Rust or SQL refinement, which the
+   tests below witness.
    *Tests:* `newer_lease_does_not_invalidate_older_active_capability`,
    `wrong_token_release_leaves_lease_reclaimable`, and
    `usage_rejects_mismatched_lease_capability` (store suites);

@@ -145,26 +145,99 @@ fn theorems(dir: &Path) -> Result<Theorems, String> {
             .unwrap_or_default();
         modules.insert(module.clone());
         for line in read(&file)?.lines() {
-            let line = line.trim_start();
-            let Some(rest) = line
-                .strip_prefix("theorem ")
-                .or_else(|| line.strip_prefix("lemma "))
-            else {
+            let Some(name) = declared_theorem(line) else {
                 continue;
             };
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
-                .collect();
-            if name.is_empty() {
-                continue;
-            }
             let bare = name.rsplit('.').next().unwrap_or(&name).to_owned();
             found.insert(name, module.clone());
             found.insert(bare, module.clone());
         }
     }
     Ok((found, modules))
+}
+
+/// The theorem or lemma a line declares, past any attributes (`@[simp]`) and
+/// visibility modifiers.
+fn declared_theorem(line: &str) -> Option<String> {
+    let mut rest = line.trim_start();
+    while let Some(after) = rest.strip_prefix("@[") {
+        rest = after.split_once(']')?.1.trim_start();
+    }
+    for modifier in ["private ", "protected "] {
+        rest = rest.strip_prefix(modifier).unwrap_or(rest);
+    }
+    let rest = rest
+        .strip_prefix("theorem ")
+        .or_else(|| rest.strip_prefix("lemma "))?;
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// The figures the documentation states about the contract and its proofs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Figures {
+    pub invariants: usize,
+    pub proven: usize,
+    pub modules: usize,
+    pub theorems: usize,
+}
+
+pub fn figures(root: &Path) -> Result<Figures, String> {
+    let rows = expected(root)?;
+    let (_, modules) = theorems(&root.join(LEAN))?;
+    let mut theorems = 0;
+    for module in &modules {
+        theorems += read(&root.join(LEAN).join(format!("{module}.lean")))?
+            .lines()
+            .filter(|line| declared_theorem(line).is_some())
+            .count();
+    }
+    Ok(Figures {
+        invariants: rows.len(),
+        proven: rows.iter().filter(|row| !row.modules.is_empty()).count(),
+        modules: modules.len(),
+        theorems,
+    })
+}
+
+/// Every figure the README and the guarantees page state must be current.
+/// Whitespace, including line breaks, is collapsed before matching.
+pub fn check_figures(root: &Path) -> Result<Vec<String>, String> {
+    let f = figures(root)?;
+    let required = [
+        (
+            "README.md",
+            vec![
+                format!("{} numbered invariants", f.invariants),
+                format!("{} Lean 4 modules", f.modules),
+                format!("with {} theorems", f.theorems),
+            ],
+        ),
+        (
+            "docs/GUARANTEES.md",
+            vec![
+                format!("{} numbered statements", f.invariants),
+                format!("{} Lean 4 modules with {} theorems", f.modules, f.theorems),
+                format!("{} of the {}", f.proven, f.invariants),
+            ],
+        ),
+    ];
+    let mut problems = Vec::new();
+    for (file, phrases) in required {
+        let text = read(&root.join(file))?
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for phrase in phrases {
+            if !text.contains(&phrase) {
+                problems.push(format!("{file} must state \"{phrase}\""));
+            }
+        }
+    }
+    Ok(problems)
 }
 
 /// Each top-level numbered invariant: number, bold title (whitespace
@@ -214,6 +287,24 @@ mod tests {
         assert_eq!(found[0].1, "One.");
         assert_eq!(found[1].1, "Two wraps.");
         assert!(found[0].2.contains("nested"));
+    }
+
+    #[test]
+    fn theorems_are_found_past_attributes_and_modifiers() {
+        assert_eq!(
+            declared_theorem("  theorem a_b : True").as_deref(),
+            Some("a_b")
+        );
+        assert_eq!(
+            declared_theorem("@[simp] theorem x.y (s : S)").as_deref(),
+            Some("x.y")
+        );
+        assert_eq!(
+            declared_theorem("private lemma z : True").as_deref(),
+            Some("z")
+        );
+        assert_eq!(declared_theorem("-- theorem in a comment"), None);
+        assert_eq!(declared_theorem("def theorem_like : Nat"), None);
     }
 
     #[test]

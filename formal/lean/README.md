@@ -32,6 +32,16 @@ This Lean package contains exact models for critical contracts:
   proves that transfer retains occupancy and that only finishing either the
   pending or execution owner releases it; Rust's private fields, behavior
   witness, and compile-fail witness connect that model to the API.
+- `LeaseFencing` models lease capabilities: a store of leases keyed by ID with
+  a per-account fence counter starting at one. It proves that fences are
+  positive, unique per account and increasing; that acquiring a lease leaves
+  every existing lease unchanged, so the sequence is an audit order and not a
+  validity epoch; that release and ingest refuse a mismatched `(lease, fence)`
+  pair or `(lease, account, fence)` triple; that each operation changes only
+  the lease it names; that a settled lease is never active again; and that
+  billed plus returned units never exceed the grant. Expiry reclaim is
+  modeled as forfeiture. Operations are atomic by assumption; the store
+  suites' capability tests witness the Rust and SQL.
 - [`Conservation`](Tollgate/Conservation.lean) models the per-account ledger equation
   `deposited + overage = balance + activeGrants + settledUsage + loss + expired`,
   where `balance = allowanceBalance + topupBalance`, and
