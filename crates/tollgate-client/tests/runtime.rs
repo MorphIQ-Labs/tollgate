@@ -1772,7 +1772,7 @@ async fn a_refill_does_not_wait_behind_the_release_pass() {
     // leases must not cost five timeouts.
     // Generous enough to absorb finishing a pass already in flight plus the
     // next one's head lease; five parked leases at one timeout each — the
-    // pre-#78 cost — is 25s and does not fit.
+    // pre-GL-78 cost — is 25s and does not fit.
     let ceiling = manager_config().store_call_timeout * 3;
     assert!(
         waited < ceiling,

@@ -207,7 +207,7 @@ mod tests {
             );
             // Only an accepted revocation makes a generation dead. A delayed
             // older one is refused and leaves the observation it found --
-            // which is a change from the pre-#53 model, where refusing still
+            // which is a change from the pre-GL-53 model, where refusing still
             // left something the next positive read as a tombstone.
             let expected = if revoked < current {
                 Watermark::Positive(Generation(current))

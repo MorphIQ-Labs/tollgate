@@ -1843,7 +1843,7 @@ full table rewrite for cosmetics — so the table is heterogeneous on purpose, a
 `a_vestigial_jsonb_generation_is_ignored_in_favour_of_the_column` pins that the
 reader ignores it.
 
-**One-way.** A pre-#54 binary cannot decode a row written after it, so rolling
+**One-way.** A pre-GL-54 binary cannot decode a row written after it, so rolling
 the binary back degrades availability — every live read for an affected
 principal returns a store error. It does not degrade authorization safety: the
 tombstone path reads the column, so revocation keeps working, and a failed
@@ -3097,7 +3097,7 @@ the new-field round trip.
 
 **The governor-domain correction is pre-release, not a migration.** GL-91's staged
 limit contract had not been released, so there was no installed state to
-preserve from the pre-#91 domain. Adding a forward migration for hypothetical
+preserve from the pre-GL-91 domain. Adding a forward migration for hypothetical
 rows would permanently duplicate admission semantics in the schema and create
 a rollback protocol for a rollout that cannot occur.
 
@@ -4343,7 +4343,7 @@ Provenance is per file, so a partial re-measure is not representable: the
 lists. Re-measuring five rows and carrying the rest forward therefore makes
 the file claim a recording fourteen rows did not get, which is how
 `admission/full_check_sharded` and `admission/full_check_contended_8` came to
-be gated against a pre-#91 denominator while the metadata said otherwise. A
+be gated against a pre-GL-91 denominator while the metadata said otherwise. A
 baseline update re-measures every row — which is why there is no longer a
 supported way to update one by hand (GL-114).
 

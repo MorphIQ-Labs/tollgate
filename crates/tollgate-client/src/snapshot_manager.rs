@@ -2078,7 +2078,7 @@ mod tests {
 
     // ---- GL-22: the indexed set must answer what the scans answered --------
 
-    /// The pre-#22 implementations, kept verbatim as the reference the
+    /// The pre-GL-22 implementations, kept verbatim as the reference the
     /// indexed set is checked against. If these and `Resolutions` ever
     /// disagree, the refactor changed behaviour — which is the one thing it
     /// must not do.
