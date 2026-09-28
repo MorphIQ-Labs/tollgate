@@ -52,7 +52,7 @@ theorem an_operator_cannot_fund_an_instance (name : Nat) :
 theorem an_instance_cannot_administer (name : Nat) :
     allowed (some ⟨name, .instance⟩) none .operator = false := by rfl
 
-/-! Routes admit a fixed role set (#39): the operator-only admin routes admit
+/-! Each route accepts a fixed role set (#39): the operator-only admin routes accept
 `[operator]`, the shared ones `[operator, provisioner]`. A route belongs to
 exactly one set, so disjointness is per route rather than per role pair. -/
 def admitted (bearer certificate : Option Identity) (roles : List Role) : Bool :=
