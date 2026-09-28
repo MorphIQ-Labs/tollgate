@@ -6,9 +6,8 @@ counters**, immutable **compiled account snapshots** for admission, and
 **idempotent batched usage events** for billing — so a request path with a
 microsecond budget never performs synchronous I/O.
 
-Started as a proof of concept for FerroRisk's admission layer; built as a
-domain-agnostic product: the core knows cost units, operations-by-index, and
-permission bits — never plan names, FCUs, or SQL.
+Domain-agnostic by construction: the core knows cost units, operations-by-index,
+and permission bits — never plan names, product currencies, or SQL.
 
 ## Layout
 
@@ -89,7 +88,7 @@ TOLLGATE_SECURITY_CONFIG=/path/to/security.json cargo run -p tollgate-server
 ```
 
 The [control-plane security runbook](docs/CONTROL_PLANE_SECURITY.md) covers TLS,
-Cloud Run service identity, credential rotation, audit collection, and the Rust
+Google service-account identity, credential rotation, audit collection, and the Rust
 API/configuration rollout. Remote plaintext and anonymous control-plane calls
 are refused.
 

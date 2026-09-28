@@ -75,7 +75,8 @@ impl BearerProvider for StaticBearer {
     }
 }
 
-/// Cloud Run uses its attached service account; there is no per-instance secret.
+/// A Google Cloud workload uses its attached service account; there is no
+/// per-instance secret.
 /// The metadata endpoint is fixed, never supplied by an untrusted URL or header.
 pub struct GoogleIdentity {
     client: reqwest::Client,
