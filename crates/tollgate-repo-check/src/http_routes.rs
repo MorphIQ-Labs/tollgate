@@ -290,6 +290,11 @@ impl<'ast> Visit<'ast> for Functions<'ast> {
 }
 
 /// Whether a method-call chain registers routes anywhere along it.
+///
+/// Parentheses are looked through here, in [`Eval::router`] and in
+/// [`methods`]. `syn` produces `Expr::Group` only for macro-expanded tokens,
+/// never from source text parsed with `parse_file`, so it has no arm: a router
+/// built inside a macro is reported as unsupported rather than guessed at.
 fn registers(expr: &syn::Expr) -> bool {
     let mut current = expr;
     loop {
@@ -304,7 +309,6 @@ fn registers(expr: &syn::Expr) -> bool {
                 current = &call.receiver;
             }
             syn::Expr::Paren(inner) => current = &inner.expr,
-            syn::Expr::Group(inner) => current = &inner.expr,
             _ => return false,
         }
     }
@@ -355,7 +359,6 @@ impl Eval<'_, '_> {
     fn router(&mut self, expr: &syn::Expr) -> Result<Vec<Entry>, String> {
         match expr {
             syn::Expr::Paren(inner) => self.router(&inner.expr),
-            syn::Expr::Group(inner) => self.router(&inner.expr),
             syn::Expr::Call(call) if last_segment(&call.func).as_deref() == Some("new") => {
                 Ok(Vec::new())
             }
@@ -465,7 +468,6 @@ impl Eval<'_, '_> {
 fn methods(expr: &syn::Expr) -> Result<Vec<String>, String> {
     match expr {
         syn::Expr::Paren(inner) => methods(&inner.expr),
-        syn::Expr::Group(inner) => methods(&inner.expr),
         syn::Expr::Call(call) => match last_segment(&call.func) {
             Some(name) if METHODS.contains(&name.as_str()) => Ok(vec![name.to_uppercase()]),
             Some(name) => Err(format!("unrecognised method router `{name}(…)`")),
@@ -568,6 +570,110 @@ mod tests {
                 "| POST | /v2/things | instance |",
                 "| DELETE | /v2/things/{id} | instance |",
             ]
+        );
+    }
+
+    fn found(sources: &[(&str, &str)]) -> Vec<String> {
+        let mut consts = BTreeMap::new();
+        for (_, source) in sources {
+            string_consts(source, &mut consts).expect("parses");
+        }
+        routes(sources, &consts)
+            .expect("evaluates")
+            .iter()
+            .map(Route::render)
+            .collect()
+    }
+
+    fn refused(source: &str) -> String {
+        let mut consts = BTreeMap::new();
+        string_consts(source, &mut consts).expect("parses");
+        match routes(&[("a.rs", source)], &consts) {
+            Ok(routes) => panic!("expected a refusal, found {} routes", routes.len()),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn routers_and_constants_inside_modules_and_impls_are_found() {
+        let source = r#"
+            mod paths { pub const API: &str = "/v9"; }
+            #[cfg(test)]
+            mod tests { const API: &str = "/test-only"; }
+            mod api {
+                fn router() -> Router {
+                    Router::new().nest(API, Router::new().route("/m", get(h)))
+                }
+            }
+            struct Server;
+            impl Server {
+                fn routes() -> Router { Router::new().route("/i", post(h)) }
+                #[cfg(test)]
+                fn test_routes() -> Router { Router::new().route("/t", get(h)) }
+            }
+            #[cfg(feature = "http")]
+            fn feature_gated() -> Router { Router::new().route("/f", put(h)) }
+        "#;
+        assert_eq!(
+            found(&[("a.rs", source)]),
+            [
+                "| PUT | /f | none |",
+                "| POST | /i | none |",
+                "| GET | /v9/m | none |",
+            ]
+        );
+    }
+
+    #[test]
+    fn parentheses_are_looked_through_and_merged_routers_are_kept() {
+        let source = r#"
+            fn router() -> Router {
+                (Router::new().route("/p", (get(h))))
+                    .merge(Router::new().route("/q", delete(h)))
+                    .layer(trace())
+            }
+        "#;
+        assert_eq!(
+            found(&[("a.rs", source)]),
+            ["| GET | /p | none |", "| DELETE | /q | none |"]
+        );
+    }
+
+    #[test]
+    fn one_role_twice_is_that_role_and_two_roles_are_refused() {
+        let same = r#"
+            fn router() -> Router {
+                Router::new()
+                    .route("/a", get(h))
+                    .route_layer(auth(Role::Operator))
+                    .layer(audit(Role::Operator))
+            }
+        "#;
+        assert_eq!(found(&[("a.rs", same)]), ["| GET | /a | operator |"]);
+        let both = r#"
+            fn router() -> Router {
+                Router::new()
+                    .route("/a", get(h))
+                    .route_layer(auth(Role::Instance))
+                    .layer(auth(Role::Operator))
+            }
+        "#;
+        assert!(
+            refused(both).contains("is behind both"),
+            "{}",
+            refused(both)
+        );
+    }
+
+    #[test]
+    fn only_router_new_and_bound_locals_start_a_router() {
+        let built = r#"fn f() -> Router { build().route("/a", get(h)) }"#;
+        assert!(refused(built).contains("unsupported router expression"));
+        let qualified = r#"fn f() -> Router { crate::ROUTER.route("/a", get(h)) }"#;
+        assert!(
+            refused(qualified).contains("unsupported router expression"),
+            "{}",
+            refused(qualified)
         );
     }
 

@@ -338,11 +338,15 @@ fn is_external(dest: &str) -> bool {
 fn options() -> Options {
     // The extensions mdBook's renderer enables; a construct it parses must
     // be one this parses, or a link inside it would be missed.
-    Options::ENABLE_TABLES
-        | Options::ENABLE_FOOTNOTES
-        | Options::ENABLE_STRIKETHROUGH
-        | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_HEADING_ATTRIBUTES
+    [
+        Options::ENABLE_TABLES,
+        Options::ENABLE_FOOTNOTES,
+        Options::ENABLE_STRIKETHROUGH,
+        Options::ENABLE_TASKLISTS,
+        Options::ENABLE_HEADING_ATTRIBUTES,
+    ]
+    .into_iter()
+    .collect()
 }
 
 /// Every link and image destination in `content`, with the byte range of the

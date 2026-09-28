@@ -244,3 +244,41 @@ fn inline_links_and_reference_definitions_are_rewritten_together() {
          [r]: https://github.com/o/r/blob/main/asset.txt\n"
     );
 }
+
+#[test]
+fn every_external_form_is_left_exactly_as_written() {
+    let text = "# A\n\n[mail](mailto:a@example.com) [phone](tel:+15550100) \
+                [cdn](//cdn.example.com/x.js) [site](/absolute/path) \
+                [web](https://example.com/a.md)\n";
+    let dir = repo(&[("docs/A.md", text)]);
+    let output = tollgate_repo_check::book::preprocess(&input(dir.path(), &["A.md"]))
+        .expect("external links need no repository path");
+    assert_eq!(contents(&output)[0], text);
+}
+
+#[test]
+fn a_link_inside_a_footnote_is_rewritten() {
+    // Parsed without footnotes, `[^1]: [data](../f.txt)` would read as a link
+    // reference definition whose destination is `[data](../f.txt)`, a path
+    // that does not exist; the book renders footnotes, so this must too.
+    let dir = repo(&[
+        ("f.txt", "data"),
+        ("docs/A.md", "# A\n\nText[^1].\n\n[^1]: [data](../f.txt)\n"),
+    ]);
+    let output = tollgate_repo_check::book::preprocess(&input(dir.path(), &["A.md"]))
+        .expect("the footnote's link resolves");
+    assert!(
+        contents(&output)[0].contains("[data](https://github.com/o/r/blob/main/f.txt)"),
+        "{}",
+        contents(&output)[0]
+    );
+}
+
+#[test]
+fn only_supports_selects_the_renderer_handshake() {
+    let wrong = Command::new(env!("CARGO_BIN_EXE_mdbook-repo-links"))
+        .args(["junk", "html"])
+        .status()
+        .expect("run");
+    assert_eq!(wrong.code(), Some(2));
+}

@@ -176,11 +176,10 @@ pub fn line_kinds(source: &str) -> Vec<Kind> {
         if !line.starts_with(' ') && !line.is_empty() {
             current = top_level_kind(line);
         }
-        kinds.push(if trimmed.starts_with("--") {
-            Kind::Other
-        } else {
-            current
-        });
+        // An indented `--` comment belongs to the declaration around it, so a
+        // comment inside a definition does not end its body; only its code
+        // part (none) is ever mutated.
+        kinds.push(current);
     }
     kinds
 }
@@ -270,7 +269,7 @@ pub fn body_spans(source: &str) -> Vec<Option<usize>> {
         let mut body_start: Option<(usize, usize)> = None;
         for (line, text) in lines.iter().enumerate().take(end).skip(index) {
             let code = code_part(text);
-            if line > index && code.trim_start().starts_with('|') {
+            if code.trim_start().starts_with('|') {
                 body_start = Some((line, 0));
                 break;
             }
@@ -291,11 +290,6 @@ pub fn body_spans(source: &str) -> Vec<Option<usize>> {
         }
         index = end;
     }
-    for (span, kind) in spans.iter_mut().zip(&kinds) {
-        if *kind != Kind::Definition {
-            *span = None;
-        }
-    }
     spans
 }
 
@@ -309,11 +303,11 @@ pub fn mutants(module: &str, source: &str) -> Vec<Mutant> {
             continue;
         };
         let code = code_part(line);
-        if from > code.len() {
+        let Some(body) = code.get(from..) else {
             continue;
-        }
+        };
         for &op in OPERATORS {
-            for (occurrence, at) in occurrences(&code[from..], op).into_iter().enumerate() {
+            for (occurrence, at) in occurrences(body, op).into_iter().enumerate() {
                 let at = at + from;
                 let mut mutated_line = String::with_capacity(line.len());
                 mutated_line.push_str(&line[..at]);
@@ -456,6 +450,102 @@ end M
                 .filter(|m| m.line == 14)
                 .all(|m| m.operator.from == "+")
         );
+    }
+
+    fn lines_of(found: &[Mutant]) -> Vec<usize> {
+        found.iter().map(|m| m.line).collect()
+    }
+
+    fn mutated_line(mutant: &Mutant) -> &str {
+        mutant
+            .mutated_source
+            .lines()
+            .nth(mutant.line - 1)
+            .expect("the mutated line exists")
+    }
+
+    #[test]
+    fn a_comment_inside_a_definition_does_not_end_its_body() {
+        let model = "def f (a : Nat) : Nat :=\n  -- a note: x = y\n  a + 1\n";
+        let found = mutants("M", model);
+        assert_eq!(
+            lines_of(&found),
+            [3],
+            "the line after the comment is still body"
+        );
+        assert_eq!(found[0].operator.from, "+");
+    }
+
+    #[test]
+    fn a_theorem_is_never_a_definition_body() {
+        let model = "theorem t (a : Nat) : a + 1 = 1 + a := by\n  omega\n";
+        assert!(mutants("M", model).is_empty());
+    }
+
+    #[test]
+    fn a_definition_on_the_last_line_is_read_to_the_end() {
+        let found = mutants("M", "def f (a : Nat) : Nat :=\n  a + 1");
+        assert_eq!(lines_of(&found), [2]);
+    }
+
+    #[test]
+    fn the_next_definition_ends_the_body_before_it() {
+        let model =
+            "def f (a : Nat) : Nat :=\n  a + 1\ndef g (a : Nat) (h : a ≤ 3) : Nat :=\n  a\n";
+        assert_eq!(
+            lines_of(&mutants("M", model)),
+            [2],
+            "g's signature is not f's body"
+        );
+    }
+
+    #[test]
+    fn a_mutation_lands_exactly_where_its_token_is() {
+        let one_line = mutants("M", "def h (a : Nat) : Nat := a + 2\n");
+        assert_eq!(one_line.len(), 1);
+        assert_eq!(mutated_line(&one_line[0]), "def h (a : Nat) : Nat := a - 2");
+        let wrapped = mutants("M", "def f (a : Nat) : Nat\n := a + 1\n");
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(mutated_line(&wrapped[0]), " := a - 1");
+    }
+
+    #[test]
+    fn word_boundaries_exclude_identifier_characters_on_both_sides() {
+        let op = Operator {
+            from: "max",
+            to: "min",
+        };
+        assert!(occurrences("x_max", op).is_empty());
+        assert!(occurrences("a.max", op).is_empty());
+        assert!(occurrences("max_x", op).is_empty());
+        assert!(occurrences("max2", op).is_empty());
+        let not = Operator { from: "!", to: "" };
+        assert_eq!(occurrences("!_x", not), vec![0]);
+        assert_eq!(occurrences("!(x)", not), vec![0]);
+        assert!(occurrences("!", not).is_empty());
+    }
+
+    #[test]
+    fn a_comment_is_not_an_allowlist_entry_even_when_it_looks_like_one() {
+        let text = "# M :: a :: ≤ -> < #0 :: reason: commented out\n";
+        assert!(allowlist(text).is_empty());
+    }
+
+    #[test]
+    fn modules_are_the_lean_files_in_sorted_order() {
+        let dir = tempfile::tempdir().expect("scratch repository");
+        let models = dir.path().join("formal/lean/Tollgate");
+        std::fs::create_dir_all(&models).expect("models dir");
+        for name in ["B.lean", "A.lean", "notes.txt"] {
+            std::fs::write(models.join(name), "").expect("file");
+        }
+        let names: Vec<String> = modules(dir.path())
+            .expect("readable")
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["A.lean", "B.lean"]);
+        assert!(modules(&dir.path().join("missing")).is_err());
     }
 
     #[test]
