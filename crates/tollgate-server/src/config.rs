@@ -651,6 +651,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_manifest_ceiling_reaches_only_the_provisioner_identity() {
+        let provisioner =
+            identity("signup".into(), Role::Provisioner, Some(CostUnits(1000))).unwrap();
+        assert_eq!(
+            provisioner.provisioner_limits(),
+            Some(ProvisionerLimits::new(CostUnits(1000)))
+        );
+        for role in [Role::Instance, Role::Operator] {
+            let other = identity("ops".into(), role, None).unwrap();
+            assert_eq!(other.provisioner_limits(), None);
+        }
+    }
+
     #[tokio::test]
     async fn initial_signing_key_failure_preserves_the_dependency_error() {
         let directory = tempfile::tempdir().unwrap();
