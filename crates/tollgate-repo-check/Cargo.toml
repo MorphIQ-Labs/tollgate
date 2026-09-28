@@ -16,6 +16,11 @@ pulldown-cmark.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The repository README's example is compiled and run as a doctest here: this
+# crate is never published, so it can include a file outside its package.
+jiff.workspace = true
+tollgate-core = { path = "../tollgate-core" }
+tollgate-admission = { path = "../tollgate-admission" }
 
 [lints]
 workspace = true

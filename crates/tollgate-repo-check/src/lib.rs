@@ -446,3 +446,11 @@ pub fn check(root: &Path) -> Result<Report, String> {
         Err(errors.join("\n"))
     }
 }
+
+// Compiles and runs the repository README's example as a doctest, so the
+// first code a reader sees cannot drift from the API. The published crates
+// cannot include a file outside their own package; this crate is never
+// published.
+#[doc = include_str!("../../../README.md")]
+#[cfg(doctest)]
+pub struct RepositoryReadmeDoctests;
