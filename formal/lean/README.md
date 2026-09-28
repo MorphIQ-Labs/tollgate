@@ -42,6 +42,15 @@ This Lean package contains exact models for critical contracts:
   billed plus returned units never exceed the grant. Expiry reclaim is
   modeled as forfeiture. Operations are atomic by assumption; the store
   suites' capability tests witness the Rust and SQL.
+- `IdempotentIngest` models batched usage ingest keyed by request ID, with
+  acceptance left as an arbitrary decision over the ledger planned so far. It
+  proves that every input is classified exactly once; that a duplicate is
+  recognized from its ID before its payload or the decision is consulted;
+  that the ledger only appends accepted events, so no settled event is
+  replaced and no request ID is billed twice across any replay; that the
+  billed total grows by exactly the accepted units; that a rejected event
+  does not claim its ID; and that a failed batch changes nothing. Batch
+  atomicity is an assumption; the mirrored store suites witness it.
 - [`Conservation`](Tollgate/Conservation.lean) models the per-account ledger equation
   `deposited + overage = balance + activeGrants + settledUsage + loss + expired`,
   where `balance = allowanceBalance + topupBalance`, and
