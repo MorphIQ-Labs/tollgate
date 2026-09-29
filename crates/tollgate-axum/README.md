@@ -23,6 +23,26 @@ the adapter never widens it. Readiness and diagnostic reports come from the
 existing runtime. Stop HTTP admission and start runtime shutdown together,
 allowing owned request permits to participate in the bounded drain.
 
-This crate is being assembled on the Axum integration branch. The metered
-route wrapper and end-to-end guide follow the staging boundary; the current
-API does not automatically commit or execute application work.
+Declare a metered POST with `post_json(operation, permissions, limits,
+validate, execute)`. Validation returns `Validated<T>` with the checked item
+quantity; the pinned account cost table supplies the price. The wrapper
+reserves funding, acquires its typed capacity gate, and commits immediately
+before constructing the execution future. The callback receives authoritative
+`ChargeMetadata` from that committed guard. `post` supports bodyless fixed
+workloads. A request cannot select its own price or capacity class.
+
+Return `BufferedResponse::bytes` or `BufferedResponse::json` after work and
+serialization finish. The wrapper retains the charge guard across the future,
+including handler errors, cancellation and panic unwinding. Streaming bodies,
+upgrades, detached tasks, blocking work surviving cancellation, and automatic
+retry layers require an explicit low-level integration. Network transmission
+of already completed output is outside the billable execution lifetime.
+
+`post_json_with_error_handler` customizes local HTTP errors. Its renderer gets
+`None` before execution and committed metadata after execution; it must never
+retry work. The default renderer distinguishes capacity saturation from rate
+limiting and reports the committed units for serialization failures.
+
+Request IDs must be unique across instances and restarts. Inject a local,
+nonblocking `RequestIdSource` (a closure is supported); a source failure refuses
+before admission. A process-local counter is only suitable for tests.

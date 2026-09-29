@@ -265,6 +265,14 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    `a_fallback_commit_refunds_its_lease_exactly_once`, and
    `lease_units_are_conserved`.
 
+   The Axum wrapper commits before constructing the business future and owns
+   the guard through buffered response construction. Adapter witnesses:
+   `validation_and_admission_refuse_without_constructing_business_future`,
+   `unavailable_request_ids_release_the_slot_without_starting_work`,
+   `body_and_fixed_quantities_preserve_committed_metadata_and_charge_errors`,
+   `factory_panic_future_panic_and_abort_each_record_one_charge`, and
+   `custom_error_renderer_receives_charge_only_after_execution`.
+
 3. **Atomic commit-vs-cancel.** Commit and cancel race on a single atomic
    transition; exactly one wins. A cancelled reservation can never later
    commit; a committed reservation reports its full charge to a late
@@ -2114,6 +2122,9 @@ exists to detect corrupt state and must not be able to launder it.
     carries the class through the whole embedding, and
     `a_capacity_refusal_is_a_retryable_503_and_not_a_rate_limit` pins what a
     caller is told.
+    The reusable route wrapper preserves account-selected reserve access and
+    returns execution slots after cancellation:
+    `reserved_capacity_uses_account_class_and_returns_slots_after_abort`.
     *Proof:* `formal/lean/Tollgate/ExecutionCapacity.lean`.
 
 
