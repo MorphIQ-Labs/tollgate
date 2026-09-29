@@ -365,6 +365,11 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    (1). Nothing else in this list is mode-dependent. The request path performs no database, file, lock-file, or network
    access — not even on a miss.
 
+   The Axum adapter authenticates, begins the pinned context, and reserves
+   accounting capacity before polling the body. Refusals never invoke a
+   fallback store. `identity_permission_and_backpressure_refuse_before_body_poll`
+   witnesses the ordering and exact denial counts through the adapter.
+
    This is a rule about I/O, and it is worth saying what it is *not*, because
    two other documents used to cite it as forbidding locks outright. The hot
    path takes no *blocking* lock and reads no wall or business clock for a
@@ -1557,6 +1562,12 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `cached_principal_still_observes_snapshot_revocation` (pricing-api, the
     wiring).
 
+    The reusable Axum bearer authenticator requires connection-scoped evidence
+    and delegates reuse/expiry to the same session cache.
+    `cached_identity_still_expires_and_shutdown_closes_admission` and
+    `identity_permission_and_backpressure_refuse_before_body_poll` witness its
+    wiring without introducing a second credential cache.
+
 24. **Steady-state embedding admission allocates nothing it owns and performs
     exactly one snapshot lookup.** After the measuring thread has initialised
     dependency-owned thread-local state and the bounded usage queue has a
@@ -1734,6 +1745,14 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `a_staged_context_observes_account_rate_published_after_begin`,
     `limit_change_is_one_account_authority_for_every_principal`, and
     `admit_consults_the_map_exactly_once`.
+
+    Axum's owned prepared input carries this same context and the original
+    queue permit through a bounded body read. Decode/timeout/drop failures
+    neither debit funding nor retain a queue slot. Adapter witnesses:
+    `prepared_input_keeps_its_original_context_and_one_permit`,
+    `malformed_oversized_and_timed_out_input_release_accounting_capacity`,
+    `dropping_a_body_read_releases_the_reserved_slot`, and
+    `an_outer_body_limit_is_not_widened_and_unmatched_routes_are_unmetered`.
 
 Ledger roles (context for 1 and 7): leases **bound** spend; usage events **are**
 the billing record; reconciliation compares the two and steady-state drift is

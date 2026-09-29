@@ -8134,3 +8134,40 @@ toolchain, profile and workload for manual and adapter integrations and follow
 new latency claim or threshold. Full release acceptance cannot substitute CI
 wall time for controlled-host evidence. Reusing proven core transitions does
 not turn the Axum orchestration into a Lean-to-Rust refinement proof.
+
+### Adapter application setup and input staging (GH-61)
+
+The new leaf crate implements the target configuration and pre-body boundary.
+`AdapterConfig` owns the shared runtime handle, authenticator, injected clock
+and request-ID source, and typed capacity gate. `Tollgate` clones only its
+configuration Arc. Runtime and gate validity remain enforced by their owning
+constructors; positive byte limits and representable positive body-read
+deadlines are checked by `InputLimits::new` before accepting traffic.
+
+`prepare_json` owns authentication, `begin`, and usage-slot reservation before
+polling any body frame. Its `Prepared` value has private fields and transfers
+the decoded input, original context, and original permit together through
+`into_parts`; no lookup or second reservation occurs. It does not commit a
+charge. The ordinary route wrapper is the next implementation issue.
+
+The bearer implementation uses `ConnectInfo<TollgateConnection>` and the
+existing credential verifier/session cache; absence of connection state is a
+typed configuration rejection. Authentication denials and accounting-capacity
+denials each increment the engine counter exactly once, while begin owns its
+own domain tally. Invalid JSON, size, media type, and read timeout stay input
+rejections rather than invented admission reasons.
+
+The explicit route body bound wraps the body before Axum's existing extractor
+limit, so the smaller bound wins. No global layer is installed or replaced.
+`http-body-util` moves from test scaffolding to this adapter's runtime graph;
+it is already a transitive Axum dependency. `http-body` is a direct dev-only
+dependency for body-poll witnesses. No new external package or version enters
+the lockfile. Memory-backed runtime tests exercise the shared handle, queue
+capacity recovery, body cancellation, credential expiry, and shutdown closure;
+the adapter names no store implementation in its production API.
+
+The publish-order list gains the new leaf immediately because CI compares it
+with all publishable manifests. Production publishing permission, end-to-end
+guide and example migration remain #64. Timed adapter-overhead evidence
+belongs to #63 before the complete integration is proposed to main; staging
+alone makes no latency claim and changes no performance threshold.

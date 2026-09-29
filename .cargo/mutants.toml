@@ -30,7 +30,7 @@ exclude_re = [
   # cache (INVARIANTS.md GL-23). Replacing the explicit `Self::default()` with
   # inferred `Default::default()` calls the same implementation and returns
   # the same type; no request or connection can distinguish the spellings.
-  "replace <impl Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>> for PricingConnection>::connect_info -> Self with Default::default\\(\\)",
+  "replace <impl Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>> for (PricingConnection|TollgateConnection)>::connect_info -> Self with Default::default\\(\\)",
   # `ConcurrencyGauge::release_shard` short-circuits on
   # `decrement() == 0 && phase == DRAINING` before calling
   # `promote_if_drained`, whose own guard — `phase == DRAINING &&

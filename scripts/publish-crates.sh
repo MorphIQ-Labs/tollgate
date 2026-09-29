@@ -21,7 +21,7 @@ DRY_RUN="${PUBLISH_DRY_RUN:-0}"
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
 
-ORDER="tollgate-core tollgate-auth tollgate-store tollgate-admission tollgate-store-postgres tollgate-client tollgate-server"
+ORDER="tollgate-core tollgate-auth tollgate-store tollgate-admission tollgate-store-postgres tollgate-client tollgate-server tollgate-axum"
 
 publishable=$(cargo metadata --locked --format-version 1 --no-deps \
   | jq -r '.packages[] | select(.publish == null) | .name' | sort | tr '\n' ' ')

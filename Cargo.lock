@@ -2880,6 +2880,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "tollgate-axum"
+version = "0.32.1"
+dependencies = [
+ "axum",
+ "http-body",
+ "http-body-util",
+ "jiff",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tollgate-admission",
+ "tollgate-auth",
+ "tollgate-client",
+ "tollgate-core",
+ "tollgate-store",
+ "tower",
+]
+
+[[package]]
 name = "tollgate-client"
 version = "0.32.1"
 dependencies = [
