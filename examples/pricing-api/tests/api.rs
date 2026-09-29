@@ -1239,3 +1239,28 @@ async fn demo_credentials_are_durable_and_revocation_reaches_new_verification() 
         tollgate_store::CredentialActivityState::Committed { .. }
     ));
 }
+
+#[tokio::test]
+async fn adapter_body_limit_accepts_the_boundary_and_cannot_be_disabled_by_an_outer_layer() {
+    let (router, runtime) = build_test_app(10_000, true).await;
+    wait_ready(&router).await;
+    let store = runtime.store.clone();
+    let router = router.layer(axum::extract::DefaultBodyLimit::disable());
+    let mut body = price_body(1).to_string();
+    body.push_str(&" ".repeat(2_097_152 - body.len()));
+    let (status, response) = send(
+        &router,
+        price_request(Some(DEMO_API_KEY), Body::from(body.clone())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let charged = response["metadata"]["units_charged"].as_u64().unwrap();
+    body.push(' ');
+    let (status, response) =
+        send(&router, price_request(Some(DEMO_API_KEY), Body::from(body))).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(response["code"], "body-too-large");
+    assert_eq!(response["units_charged"], 0);
+    runtime.shutdown().await;
+    assert_eq!(store.usage_recorded(DEMO_ACCOUNT), CostUnits(charged));
+}
