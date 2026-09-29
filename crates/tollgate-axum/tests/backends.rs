@@ -100,5 +100,5 @@ async fn http_store_runtime_executes_from_local_state_and_drains_committed_usage
     assert_eq!(runtime.shutdown().await.unwrap().usage.unwrap().accepted, 1);
     assert_eq!(store.usage_recorded(AccountId(1)), CostUnits(3));
     server_task.abort();
-    let _ = server_task.await;
+    assert!(server_task.await.unwrap_err().is_cancelled());
 }
