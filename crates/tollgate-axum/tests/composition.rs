@@ -312,7 +312,7 @@ async fn strict_refuses_expired_funding_while_elastic_records_explicit_overage()
         );
         if elastic {
             let event = store.settled_event(tollgate_core::RequestId(1)).unwrap();
-            assert!(matches!(event.source, UsageSource::Overage { .. }));
+            assert!(matches!(event.source, UsageSource::Overage));
             assert_eq!(event.units, CostUnits(3));
         } else {
             assert_eq!(store.usage_recorded(AccountId(1)), CostUnits::ZERO);
