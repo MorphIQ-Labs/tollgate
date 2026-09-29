@@ -33,6 +33,9 @@ permission bits, never plan names, product currencies or SQL.
 - **Admission in one call chain:** snapshot lookup, status and permission
   checks, a direct-indexed cost quote, weighted rate limiting, concurrency
   limits, and a lease debit that opens a pending charge.
+- **[Fast lane](docs/CONCEPTS.md#fast-lane-reserved-execution-capacity):** reserve
+  execution capacity for priority customers, protected from best-effort traffic
+  saturation. Assured traffic can use shared capacity plus its protected reserve.
 - **Charging at execution start:** success, failure and timeout are all
   charged, and cancelling before execution releases the debit for zero units.
   A committed charge is recorded even across a panic.

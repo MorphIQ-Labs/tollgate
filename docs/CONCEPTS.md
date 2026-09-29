@@ -106,6 +106,29 @@ Cancelling at any stage before `commit` releases the debit and charges
 nothing. After `commit`, success, failure and timeout are all charged. The
 exact contract is in [Embedding Tollgate](EMBEDDING.md).
 
+## Fast lane: reserved execution capacity
+
+Tollgate's **fast lane** protects execution capacity for priority customers
+when best-effort traffic saturates an instance. Enable
+`ExecutionCapacityMode::Reserved` and classify priority accounts as `Assured`.
+An operator sets each account's capacity class through
+[account administration](ACCOUNT_ADMINISTRATION.md).
+
+- **BestEffort** requests can use only the shared pool.
+- **Assured** requests try the shared pool first, then their protected reserve.
+  Best-effort traffic cannot consume that reserve, even while it is idle.
+
+For example, an instance with 100 capacity units and a 20-unit reserve allows
+best-effort work to occupy at most 80 units. Assured work can use the shared
+80 plus the protected 20, subject to available capacity and request size.
+
+The reserve is per instance and does not preempt running work or queue requests.
+An assured request is still refused if neither eligible pool has enough room,
+and the usual permission, rate, concurrency and funding rules still apply.
+The feature protects capacity under contention; it does not guarantee a fixed
+latency or that every priority request will succeed. See the
+[design record](DESIGN.md) for pool sizing and deployment details.
+
 ## Refusals
 
 Every refusal is a `DenyReason` with retry advice, and every refusal charges
