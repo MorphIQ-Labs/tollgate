@@ -272,6 +272,7 @@ async fn price_route_requires_connection_context() {
     wait_ready(&router).await;
 
     let response = router
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -292,6 +293,13 @@ async fn price_route_requires_connection_context() {
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["code"], "missing-connection-state");
     assert_eq!(body["units_charged"], 0);
+    assert_eq!(
+        body["title"],
+        "Connection authentication state is unavailable"
+    );
+    let counters = metrics(&router).await;
+    assert_eq!(counters["input_rejections"]["missing-connection-state"], 1);
+    assert_eq!(counters["admitted"], 0);
 
     runtime.shutdown().await;
 }
@@ -1041,56 +1049,58 @@ async fn a_disabled_instance_reports_no_capacity_rather_than_an_empty_one() {
 
 #[tokio::test]
 async fn extractor_failures_are_zero_charge_problem_json_with_fixed_counters() {
-    for (content_type, body, status, code) in [
-        (
-            "application/json",
-            "{".to_owned(),
-            StatusCode::BAD_REQUEST,
-            "malformed-body",
-        ),
-        (
-            "text/plain",
-            "{}".to_owned(),
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported-media-type",
-        ),
-        (
-            "application/json",
-            " ".repeat(2 * 1024 * 1024 + 1),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "body-too-large",
-        ),
-    ] {
-        let (router, runtime) = build_test_app(10_000, true).await;
-        wait_ready(&router).await;
-        let response = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/price")
-                    .header(header::AUTHORIZATION, format!("Bearer {DEMO_API_KEY}"))
-                    .header(header::CONTENT_TYPE, content_type)
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), status);
-        assert_eq!(
-            response.headers()[header::CONTENT_TYPE],
-            "application/problem+json"
-        );
-        let body: Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+    for admission_enabled in [true, false] {
+        for (content_type, body, status, code) in [
+            (
+                "application/json",
+                "{".to_owned(),
+                StatusCode::BAD_REQUEST,
+                "malformed-body",
+            ),
+            (
+                "text/plain",
+                "{}".to_owned(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported-media-type",
+            ),
+            (
+                "application/json",
+                " ".repeat(2 * 1024 * 1024 + 1),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body-too-large",
+            ),
+        ] {
+            let (router, runtime) = build_test_app(10_000, admission_enabled).await;
+            wait_ready(&router).await;
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/price")
+                        .header(header::AUTHORIZATION, format!("Bearer {DEMO_API_KEY}"))
+                        .header(header::CONTENT_TYPE, content_type)
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
                 .unwrap();
-        assert_eq!(body["code"], code);
-        assert_eq!(body["units_charged"], 0);
-        let counters = metrics(&router).await;
-        assert_eq!(counters["input_rejections"][code], 1);
-        assert_eq!(counters["contexts_abandoned"], 1);
-        assert_eq!(counters["admitted"], 0);
-        runtime.shutdown().await;
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/problem+json"
+            );
+            let body: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(body["code"], code);
+            assert_eq!(body["units_charged"], 0);
+            let counters = metrics(&router).await;
+            assert_eq!(counters["input_rejections"][code], 1);
+            assert_eq!(counters["contexts_abandoned"], u64::from(admission_enabled));
+            assert_eq!(counters["admitted"], 0);
+            runtime.shutdown().await;
+        }
     }
 }
 

@@ -1216,6 +1216,81 @@ mod tests {
     use std::collections::BTreeSet;
     use tollgate_store::{SnapshotResolution, SnapshotSource};
 
+    /// The adapter's defaults share most status codes with the example but
+    /// not its titles or canceled-commit code. Pin the application's complete
+    /// pre-execution response contract at the custom renderer boundary.
+    #[tokio::test]
+    async fn adapter_rejections_preserve_the_pricing_problem_contract() {
+        let state = AppState {
+            auth: tollgate_client::KeyVerifier::default(),
+            keys: None,
+            baseline_counters: tollgate_admission::AdmissionCounters::default(),
+            capacity: None,
+            admission: None,
+            input_rejections: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+        };
+        for (error, status, code, title, units) in [
+            (
+                Rejection::Denied(DenyReason::UnknownPrincipal),
+                StatusCode::UNAUTHORIZED,
+                "unknown-principal",
+                DenyReason::UnknownPrincipal.to_string(),
+                serde_json::json!(0),
+            ),
+            (
+                Rejection::Commit(CommitError::Denied(DenyReason::FundingExpiredAtStart)),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "funding-expired-at-start",
+                DenyReason::FundingExpiredAtStart.to_string(),
+                serde_json::json!(0),
+            ),
+            (
+                Rejection::Commit(CommitError::Cancelled),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "funding-expired-at-start",
+                DenyReason::FundingExpiredAtStart.to_string(),
+                serde_json::json!(0),
+            ),
+            (
+                Rejection::Commit(CommitError::AlreadyReleased),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "funding-expired-at-start",
+                DenyReason::FundingExpiredAtStart.to_string(),
+                serde_json::json!(0),
+            ),
+            (
+                Rejection::Commit(CommitError::AlreadyCommitted),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "charge-state-invalid",
+                "charge-state-invalid".to_owned(),
+                serde_json::Value::Null,
+            ),
+        ] {
+            let response = pricing_rejection(&state, &error, None).into_response();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/problem+json"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "status": status.as_u16(), "code": code, "title": title, "units_charged": units,
+                })
+            );
+        }
+        assert!(
+            state
+                .input_rejections
+                .iter()
+                .all(|counter| counter.load(std::sync::atomic::Ordering::Relaxed) == 0)
+        );
+    }
+
     #[test]
     fn stale_policy_is_a_transient_service_failure() {
         assert_eq!(
