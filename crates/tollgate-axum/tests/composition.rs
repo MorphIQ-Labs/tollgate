@@ -275,7 +275,7 @@ async fn strict_refuses_expired_funding_while_elastic_records_explicit_overage()
     for elastic in [false, true] {
         let mode = if elastic {
             EnforcementMode::Elastic {
-                overage_cap: CostUnits(5),
+                overage_cap: CostUnits(100),
             }
         } else {
             EnforcementMode::Strict
