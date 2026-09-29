@@ -1136,7 +1136,9 @@ fn pricing_rejection(
         Rejection::Denied(reason) | Rejection::Commit(CommitError::Denied(reason)) => {
             deny_buffered(*reason)
         }
-        Rejection::Commit(_) => deny_buffered(DenyReason::FundingExpiredAtStart),
+        Rejection::Commit(CommitError::Cancelled | CommitError::AlreadyReleased) => {
+            deny_buffered(DenyReason::FundingExpiredAtStart)
+        }
         Rejection::Json(error) => {
             let status = error.status();
             let (index, code) = match status {
