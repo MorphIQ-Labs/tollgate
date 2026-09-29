@@ -7,6 +7,7 @@ members = [
     "crates/tollgate-admission",
     "crates/tollgate-alloc-count",
     "crates/tollgate-auth",
+    "crates/tollgate-axum",
     "crates/tollgate-client",
     "crates/tollgate-core",
     "crates/tollgate-perf-gate",
@@ -55,6 +56,7 @@ tollgate-alloc-count = { path = "crates/tollgate-alloc-count" }
 # Axum/tower test scaffolding: `oneshot` against a built router, and the body
 # collector that reads its response. Dev-only in every member that takes them.
 http-body-util = "0.1"
+http-body = "1"
 tower = { version = "0.5", features = ["util"] }
 
 # Later members (admission/store/server/client) — declared centrally so every
