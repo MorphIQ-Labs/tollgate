@@ -9,6 +9,8 @@
 
 mod auth;
 mod input;
+mod response;
+mod route;
 
 use std::sync::Arc;
 
@@ -19,8 +21,11 @@ use tollgate_core::{DenyReason, PermissionBits, RequestId};
 
 pub use auth::{BearerAuth, RequestAuthenticator, TollgateConnection};
 pub use input::{InputLimits, InputLimitsError, Prepared};
+pub use response::{BufferedResponse, ChargeMetadata, ResponseError, render_rejection};
+pub use route::{InputError, Validated};
 
-/// A request-local failure before business execution starts. Always uncharged.
+/// A transport or execution failure. Error renderers receive charge metadata
+/// when execution has started; an execution failure does not refund its charge.
 #[derive(Debug)]
 pub enum Rejection {
     /// A domain refusal, already classified by the admission engine.
@@ -33,6 +38,16 @@ pub enum Rejection {
     BodyTooLarge,
     /// The configured body-read deadline elapsed.
     BodyTimeout,
+    /// Application input validation failed before admission.
+    InvalidInput(InputError),
+    /// A bodyless route received a body that could contain work.
+    UnexpectedBody,
+    /// Accounting identity could not be generated before commit.
+    RequestIdUnavailable,
+    /// The core refused the transition into execution.
+    Commit(tollgate_core::CommitError),
+    /// Business execution could not construct its buffered response.
+    Response(ResponseError),
 }
 
 /// Generates accounting IDs unique across service instances and restarts.
@@ -47,6 +62,15 @@ pub trait RequestIdSource: Send + Sync + 'static {
 /// A request-ID source could not safely produce an ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestIdUnavailable;
+
+impl<F> RequestIdSource for F
+where
+    F: Fn() -> Result<RequestId, RequestIdUnavailable> + Send + Sync + 'static,
+{
+    fn next_id(&self) -> Result<RequestId, RequestIdUnavailable> {
+        self()
+    }
+}
 
 /// Shared application configuration. Construction starts no tasks.
 ///

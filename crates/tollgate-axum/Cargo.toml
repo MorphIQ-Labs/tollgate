@@ -20,12 +20,12 @@ axum = { workspace = true }
 http-body-util = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
 http-body = { workspace = true }
 tollgate-store = { path = "../tollgate-store", version = "=0.32.1" }
-serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }
 

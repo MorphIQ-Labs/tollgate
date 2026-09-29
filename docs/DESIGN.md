@@ -8171,3 +8171,36 @@ with all publishable manifests. Production publishing permission, end-to-end
 guide and example migration remain #64. Timed adapter-overhead evidence
 belongs to #63 before the complete integration is proposed to main; staging
 alone makes no latency claim and changes no performance threshold.
+
+### Metered buffered Axum routes (GH-62)
+
+`post_json` and bodyless `post` implement the execution protocol established in
+GH-60. Validation returns owned business input and an item quantity. The
+wrapper uses the original prepared context/permit, obtains an accounting ID,
+admits the operation against its pinned price table, acquires the typed gate,
+and commits before constructing the business future. There is no suspension
+point between commit and callback construction. Core admission owns policy and
+funding checks; this adapter adds no second lookup or accounting state machine.
+
+The committed guard encloses callback construction, polling and response
+serialization. A synchronous factory panic, future panic, cancellation or
+business error all preserve one usage event. Returned `BufferedResponse` owns
+only status, headers and bytes; informational/upgrade status is rejected. A
+streaming body, response extension or upgrade callback cannot be returned
+through this API. Detached tasks and blocking work that outlive cancellation
+remain unsupported and require explicit ownership of the low-level guard.
+
+Error rendering is a local callback, with authoritative charge metadata when
+execution started. Default problem responses distinguish capacity, funding,
+rate, accounting and input failures without exposing input or backend text.
+The default renderer cannot infer a refund from an impossible AlreadyCommitted
+error, so it reports unknown units in that case. Applications can preserve
+existing wire contracts using `post_json_with_error_handler`.
+
+Real runtime/HTTP tests compare callback metadata with settled events, verify
+fixed and body-derived quantities, refuse work before callback construction,
+and cancel running requests in shared/reserved capacity pools for both account
+classes. Test IDs are monotonic fixture values; production sources must provide
+cross-instance/restart uniqueness. No new external dependency version or proof
+claim is introduced. Framework composition, allocation and controlled-host
+comparison remain the acceptance work of GH-63 before main integration.
