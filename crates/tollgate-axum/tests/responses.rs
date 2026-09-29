@@ -193,3 +193,47 @@ async fn buffered_responses_preserve_headers_and_bytes_but_refuse_upgrades() {
         "[1,2,3]"
     );
 }
+
+#[tokio::test]
+async fn axum_json_errors_keep_their_status_and_stable_input_code() {
+    use axum::{
+        Json,
+        body::Body,
+        extract::{DefaultBodyLimit, FromRequest, Request},
+    };
+    use tower::ServiceExt;
+    for (body, content_type, limit, status, code) in [
+        ("{", Some("application/json"), 100, 400, "malformed-body"),
+        ("true", Some("application/json"), 100, 422, "malformed-body"),
+        ("1", None, 100, 415, "unsupported-media-type"),
+        ("123", Some("application/json"), 1, 413, "body-too-large"),
+    ] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .body(Body::from(body))
+            .unwrap();
+        if let Some(value) = content_type {
+            request
+                .headers_mut()
+                .insert("content-type", value.parse().unwrap());
+        }
+        // Obtain Axum's public rejection independently of the adapter's
+        // nested-limit normalization, including its native size rejection.
+        let route = axum::routing::post(|request: Request| async {
+            let error = Json::<u64>::from_request(request, &()).await.unwrap_err();
+            render_rejection(&Rejection::Json(error), None)
+        })
+        .layer(DefaultBodyLimit::max(limit));
+        let response = axum::Router::new()
+            .route("/", route)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), status);
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["code"], code);
+        assert_eq!(value["units_charged"], 0);
+    }
+}
