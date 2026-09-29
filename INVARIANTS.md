@@ -271,7 +271,11 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    `unavailable_request_ids_release_the_slot_without_starting_work`,
    `body_and_fixed_quantities_preserve_committed_metadata_and_charge_errors`,
    `factory_panic_future_panic_and_abort_each_record_one_charge`, and
-   `custom_error_renderer_receives_charge_only_after_execution`.
+   `custom_error_renderer_receives_charge_only_after_execution`,
+   `funding_expiry_at_commit_never_constructs_the_handler`,
+   `expiry_during_body_read_and_outer_timeout_before_start_charge_nothing`,
+   `canceling_timeout_after_start_records_once_and_unmetered_routes_bypass_admission`,
+   and `shutdown_drains_a_running_charge_and_refuses_new_execution`.
 
 3. **Atomic commit-vs-cancel.** Commit and cancel race on a single atomic
    transition; exactly one wins. A cancelled reservation can never later
@@ -1760,7 +1764,9 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `prepared_input_keeps_its_original_context_and_one_permit`,
     `malformed_oversized_and_timed_out_input_release_accounting_capacity`,
     `dropping_a_body_read_releases_the_reserved_slot`, and
-    `an_outer_body_limit_is_not_widened_and_unmatched_routes_are_unmetered`.
+    `an_outer_body_limit_is_not_widened_and_unmatched_routes_are_unmetered`,
+    `policy_republication_during_body_read_does_not_reprice_the_pinned_request`,
+    and `revocation_during_read_preserves_pinned_identity_and_refuses_the_next_request`.
 
 Ledger roles (context for 1 and 7): leases **bound** spend; usage events **are**
 the billing record; reconciliation compares the two and steady-state drift is
