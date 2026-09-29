@@ -269,3 +269,28 @@ async fn cached_identity_still_expires_and_shutdown_closes_admission() {
     ));
     assert_eq!(runtime.shutdown().await.unwrap().usage.unwrap().accepted, 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn axums_mock_connection_layer_is_supported_for_in_process_requests() {
+    use axum::extract::connect_info::MockConnectInfo;
+    let (adapter, runtime, _, _) = fixture().await;
+    let route = post(move |req: Request| {
+        let adapter = adapter.clone();
+        async move {
+            let prepared = adapter
+                .prepare_json::<Input>(req, PermissionBits::bit(0), limits(100))
+                .await
+                .unwrap();
+            assert_eq!(prepared.into_parts().0.items, 3);
+            StatusCode::OK
+        }
+    });
+    let app = axum::Router::new()
+        .route("/", route)
+        .layer(MockConnectInfo(TollgateConnection::default()));
+    let mut req = request(Body::from(r#"{"items":3}"#));
+    req.extensions_mut()
+        .remove::<ConnectInfo<TollgateConnection>>();
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(runtime.shutdown().await.unwrap().usage.unwrap().accepted, 0);
+}

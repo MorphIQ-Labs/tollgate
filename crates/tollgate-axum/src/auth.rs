@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use axum::extract::{ConnectInfo, connect_info::Connected};
+use axum::extract::{
+    ConnectInfo,
+    connect_info::{Connected, MockConnectInfo},
+};
 use axum::http::{header, request::Parts};
 use jiff::Timestamp;
 use tollgate_auth::{CredentialVerifier, SessionCredential};
@@ -53,6 +56,15 @@ impl<V: CredentialVerifier + Send + Sync + ?Sized + 'static> RequestAuthenticato
         let connection = parts
             .extensions
             .get::<ConnectInfo<TollgateConnection>>()
+            .map(|info| &info.0)
+            // Match Axum's ConnectInfo extractor: real connection data wins;
+            // MockConnectInfo is the supported in-process test fallback.
+            .or_else(|| {
+                parts
+                    .extensions
+                    .get::<MockConnectInfo<TollgateConnection>>()
+                    .map(|info| &info.0)
+            })
             .ok_or(Rejection::MissingConnection)?;
         let credential = parts
             .headers
@@ -60,7 +72,6 @@ impl<V: CredentialVerifier + Send + Sync + ?Sized + 'static> RequestAuthenticato
             .map(axum::http::HeaderValue::as_bytes)
             .and_then(|value| value.strip_prefix(b"Bearer "));
         connection
-            .0
             .session
             .authenticate(credential, self.verifier.as_ref(), now)
             .ok_or(Rejection::Denied(DenyReason::UnknownPrincipal))
