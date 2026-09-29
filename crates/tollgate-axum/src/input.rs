@@ -87,11 +87,26 @@ where
             tokio::time::timeout(limits.timeout, Json::<T>::from_request(request, &()))
                 .await
                 .map_err(|_| Rejection::BodyTimeout)?
-                .map_err(Rejection::Json)?;
+                .map_err(classify_json_rejection)?;
         Ok(Prepared {
             input,
             context,
             permit,
         })
+    }
+}
+
+// Axum unwraps a fixed number of body-error layers. Composed limits can add
+// more; inspect the source chain so an inner byte limit remains a 413.
+fn classify_json_rejection(error: axum::extract::rejection::JsonRejection) -> Rejection {
+    let mut source: &(dyn std::error::Error + 'static) = &error;
+    loop {
+        if source.is::<http_body_util::LengthLimitError>() {
+            return Rejection::BodyTooLarge;
+        }
+        match source.source() {
+            Some(inner) => source = inner,
+            None => return Rejection::Json(error),
+        }
     }
 }

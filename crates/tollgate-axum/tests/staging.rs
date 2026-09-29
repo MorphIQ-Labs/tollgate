@@ -257,11 +257,11 @@ async fn malformed_oversized_and_timed_out_input_release_accounting_capacity() {
             .prepare_json::<Input>(req, PermissionBits::bit(0), limits(100))
             .await;
         match result {
+            Err(Rejection::BodyTooLarge) => assert_eq!(case, 1),
             Err(Rejection::Json(error)) => assert_eq!(
                 error.status(),
                 match case {
                     0 => StatusCode::BAD_REQUEST,
-                    1 => StatusCode::PAYLOAD_TOO_LARGE,
                     3 => StatusCode::UNSUPPORTED_MEDIA_TYPE,
                     _ => panic!("wrong JSON error"),
                 }
@@ -340,6 +340,7 @@ async fn an_outer_body_limit_is_not_widened_and_unmatched_routes_are_unmetered()
                 .prepare_json::<Input>(req, PermissionBits::bit(0), limits(100))
                 .await
             {
+                Err(Rejection::BodyTooLarge) => StatusCode::PAYLOAD_TOO_LARGE,
                 Err(Rejection::Json(error)) => error.status(),
                 _ => StatusCode::OK,
             }

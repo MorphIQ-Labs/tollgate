@@ -29,6 +29,8 @@ pub enum Rejection {
     MissingConnection,
     /// Axum refused the bounded JSON input.
     Json(axum::extract::rejection::JsonRejection),
+    /// A configured or outer body byte limit was exceeded.
+    BodyTooLarge,
     /// The configured body-read deadline elapsed.
     BodyTimeout,
 }
