@@ -203,7 +203,7 @@ async fn axum_json_errors_keep_their_status_and_stable_input_code() {
     };
     use tower::ServiceExt;
     for (body, content_type, limit, status, code) in [
-        ("{", Some("application/json"), 100, 400, "malformed-body"),
+        ("!", Some("application/json"), 100, 400, "malformed-body"),
         ("true", Some("application/json"), 100, 422, "malformed-body"),
         ("1", None, 100, 415, "unsupported-media-type"),
         ("123", Some("application/json"), 1, 413, "body-too-large"),
