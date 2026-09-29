@@ -53,8 +53,8 @@ tempfile = "3"
 # `cargo publish` strips a path-only dev-dependency but would require a
 # versioned one to exist on crates.io. The crate itself is never published.
 tollgate-alloc-count = { path = "crates/tollgate-alloc-count" }
-# Axum/tower test scaffolding: `oneshot` against a built router, and the body
-# collector that reads its response. Dev-only in every member that takes them.
+# HTTP body utilities: the Axum adapter uses http-body-util for bounded input.
+# http-body and tower also support body-poll and in-process route test fixtures.
 http-body-util = "0.1"
 http-body = "1"
 tower = { version = "0.5", features = ["util"] }

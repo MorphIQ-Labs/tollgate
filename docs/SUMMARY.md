@@ -5,6 +5,7 @@
 # Using Tollgate
 
 - [Getting started](GETTING_STARTED.md)
+- [Axum integration](AXUM.md)
 - [Concepts](CONCEPTS.md)
 - [Embedding Tollgate](EMBEDDING.md)
 - [Account administration](ACCOUNT_ADMINISTRATION.md)

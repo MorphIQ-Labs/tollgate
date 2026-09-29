@@ -99,6 +99,7 @@ tollgate-client = "0.30"
 | [`tollgate-auth`](https://docs.rs/tollgate-auth) | Credential verification: the HMAC registry and session credentials |
 | [`tollgate-store`](https://docs.rs/tollgate-store) | Backend traits, the in-memory reference store, wire types |
 | [`tollgate-store-postgres`](https://docs.rs/tollgate-store-postgres) | The transactional PostgreSQL backend |
+| [`tollgate-axum`](docs/AXUM.md) | Metered Axum routes, bounded input and owned charge lifetime (new; pending release) |
 | [`tollgate-client`](https://docs.rs/tollgate-client) | `InstanceRuntime`, the HTTP store client, key and period management |
 | [`tollgate-server`](https://docs.rs/tollgate-server) | The authenticated control-plane server |
 

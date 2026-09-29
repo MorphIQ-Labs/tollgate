@@ -1742,6 +1742,7 @@ dependencies = [
  "tokio",
  "tollgate-admission",
  "tollgate-auth",
+ "tollgate-axum",
  "tollgate-client",
  "tollgate-core",
  "tollgate-store",
@@ -2899,6 +2900,7 @@ dependencies = [
  "tollgate-server",
  "tollgate-store",
  "tower",
+ "uuid",
 ]
 
 [[package]]

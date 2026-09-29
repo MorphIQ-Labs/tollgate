@@ -46,3 +46,7 @@ limiting and reports the committed units for serialization failures.
 Request IDs must be unique across instances and restarts. Inject a local,
 nonblocking `RequestIdSource` (a closure is supported); a source failure refuses
 before admission. A process-local counter is only suitable for tests.
+
+See the [Axum guide](../../docs/AXUM.md) for complete runtime setup and tested
+fixed/JSON routes. This new crate awaits its first registry release; use the
+workspace checkout until publication.
