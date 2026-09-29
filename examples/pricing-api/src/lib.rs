@@ -1154,7 +1154,7 @@ fn pricing_rejection(
             buffered_problem(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "body-too-large",
-                "Failed to buffer the request body",
+                "Failed to buffer the request body: length limit exceeded",
             )
         }
         Rejection::MissingConnection => {

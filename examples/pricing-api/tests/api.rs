@@ -1260,6 +1260,10 @@ async fn adapter_body_limit_accepts_the_boundary_and_cannot_be_disabled_by_an_ou
         send(&router, price_request(Some(DEMO_API_KEY), Body::from(body))).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(response["code"], "body-too-large");
+    assert_eq!(
+        response["title"],
+        "Failed to buffer the request body: length limit exceeded"
+    );
     assert_eq!(response["units_charged"], 0);
     runtime.shutdown().await;
     assert_eq!(store.usage_recorded(DEMO_ACCOUNT), CostUnits(charged));
