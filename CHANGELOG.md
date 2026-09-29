@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.32.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.32.0...v0.32.1) - 2026-09-29
+
+### Other
+
+- highlight the fast lane capacity feature (#57)
+
 ## [0.32.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.31.0...v0.32.0) - 2026-09-28
 
 ### Added
