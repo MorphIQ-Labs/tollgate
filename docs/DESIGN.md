@@ -8204,3 +8204,34 @@ classes. Test IDs are monotonic fixture values; production sources must provide
 cross-instance/restart uniqueness. No new external dependency version or proof
 claim is introduced. Framework composition, allocation and controlled-host
 comparison remain the acceptance work of GH-63 before main integration.
+
+### Axum composition and transport witnesses (GH-63)
+
+The wrapper tests drive real routes through paused body reads, policy
+republication and tombstones, expiry immediately before commit, canceling
+outer timeouts, and shutdown with a live committed guard. Revocation after
+`begin` governs the next request; the old context is neither re-authenticated
+nor re-priced. Strict funding expiry refuses, while Elastic preserves the
+existing commit-time overage transition. Two accounts share an instance but
+retain independent concurrency budgets. These are orchestration witnesses for
+existing contracts, not new core semantics or refinement proofs.
+
+A loopback `HttpStore` runtime test requires a buffered request to finish in
+one synchronous poll after readiness, then checks the remotely ingested usage.
+The adapter therefore exercises the same API over direct and HTTP stores;
+backend parity remains owned by the existing store contracts. A compile-fail
+example forbids returning an Axum streaming body as `BufferedResponse`.
+
+The allocation gate now compares equivalent manual and wrapped HTTP routes
+under identical parsing/work/output and checks no incremental allocation
+calls. A separate prepared-admission-through-record scope must allocate zero.
+Framework/body allocations remain attributed to the caller and visible in the
+report. `tollgate-alloc-count` remains dev-only. The new Criterion `routes`
+benchmark compares manual and wrapped orchestration using the same configured
+limits, verifier, clock, operation and output; request construction and writer
+draining are outside each interval. It uses a priceable zero-cost operation to
+avoid making a finite fixture deposit a benchmark duration limit. This is an
+incremental orchestration comparison, not an HTTP latency or kernel benchmark.
+The existing complete performance/load gates remain release acceptance gates;
+CI compiles this benchmark but never substitutes timing on a shared runner for
+controlled-host evidence. No threshold is changed by these witnesses.

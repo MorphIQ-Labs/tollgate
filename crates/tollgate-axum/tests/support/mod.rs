@@ -1,3 +1,7 @@
+#![allow(
+    dead_code,
+    reason = "shared fixture module; each test binary uses a subset"
+)]
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request};
 use jiff::{SignedDuration, Timestamp};
@@ -65,6 +69,26 @@ pub async fn fixture_with<G: tollgate_admission::CapacityGate>(
     Arc<MemoryStore>,
     Arc<ManualClock>,
 ) {
+    fixture_mode(
+        capacity,
+        queue_capacity,
+        class,
+        tollgate_core::EnforcementMode::Strict,
+    )
+    .await
+}
+
+pub async fn fixture_mode<G: tollgate_admission::CapacityGate>(
+    capacity: G,
+    queue_capacity: usize,
+    class: CapacityClass,
+    mode: tollgate_core::EnforcementMode,
+) -> (
+    Tollgate<BearerAuth<Verifier>, ManualClock, TestIds, G>,
+    InstanceRuntime,
+    Arc<MemoryStore>,
+    Arc<ManualClock>,
+) {
     let store = MemoryStore::new(GrantPolicy::default()).unwrap();
     store.create_account(AccountConfig {
         account_id: AccountId(1),
@@ -86,6 +110,7 @@ pub async fn fixture_with<G: tollgate_admission::CapacityGate>(
         ),
     )
     .capacity_class(class)
+    .enforcement_mode(mode)
     .build();
     store
         .publish_snapshot(
@@ -94,40 +119,7 @@ pub async fn fixture_with<G: tollgate_admission::CapacityGate>(
         )
         .unwrap();
     let clock = Arc::new(ManualClock::new(time(100)));
-    let config = InstanceRuntimeConfig {
-        snapshots: SnapshotManagerConfig {
-            principals: TrackedPrincipals::Fixed(vec![Principal(1)]),
-            refresh_interval: Duration::from_millis(20),
-            unknown_ttl: SignedDuration::from_secs(1),
-            revoked_ttl: SignedDuration::from_secs(1),
-            retry_backoff: Duration::from_millis(5),
-            max_concurrent_fetches: 1,
-            fetch_timeout: Duration::from_millis(100),
-            enumeration_timeout: Duration::from_millis(100),
-        },
-        leases: AccountLeaseConfig {
-            target_grant: CostUnits(100),
-            low_water: CostUnits(10),
-            lease_ttl: SignedDuration::from_secs(300),
-            expiry_safety_margin: SignedDuration::from_secs(2),
-            poll_interval: Duration::from_millis(5),
-            store_call_timeout: Duration::from_millis(100),
-            shutdown_release_deadline: Duration::from_millis(100),
-        },
-        usage: UsageWriterConfig {
-            queue_capacity,
-            max_batch: 1,
-            flush_interval: Duration::from_millis(5),
-            retry_backoff: Duration::from_millis(5),
-            shutdown_drain_deadline: Duration::from_millis(100),
-            ingest_timeout: Duration::from_millis(100),
-        },
-        sharding: LocalSharding::SINGLE,
-        snapshot_history_capacity: ArcSwapSnapshotMap::DEFAULT_GENERATION_CAPACITY,
-        idle_account_linger: Duration::from_millis(30),
-        manager_restart_backoff: Duration::from_millis(20),
-        shutdown_deadline: Duration::from_millis(250),
-    };
+    let config = runtime_config(queue_capacity);
     let (runtime, handle) = InstanceRuntime::spawn(
         store.clone(),
         store.clone(),
@@ -165,4 +157,41 @@ pub fn request(body: Body) -> Request {
         .extensions_mut()
         .insert(ConnectInfo(TollgateConnection::default()));
     request
+}
+
+pub fn runtime_config(queue_capacity: usize) -> InstanceRuntimeConfig {
+    InstanceRuntimeConfig {
+        snapshots: SnapshotManagerConfig {
+            principals: TrackedPrincipals::Fixed(vec![Principal(1)]),
+            refresh_interval: Duration::from_millis(20),
+            unknown_ttl: SignedDuration::from_secs(1),
+            revoked_ttl: SignedDuration::from_secs(1),
+            retry_backoff: Duration::from_millis(5),
+            max_concurrent_fetches: 1,
+            fetch_timeout: Duration::from_millis(100),
+            enumeration_timeout: Duration::from_millis(100),
+        },
+        leases: AccountLeaseConfig {
+            target_grant: CostUnits(100),
+            low_water: CostUnits(10),
+            lease_ttl: SignedDuration::from_secs(300),
+            expiry_safety_margin: SignedDuration::from_secs(2),
+            poll_interval: Duration::from_millis(5),
+            store_call_timeout: Duration::from_millis(100),
+            shutdown_release_deadline: Duration::from_millis(100),
+        },
+        usage: UsageWriterConfig {
+            queue_capacity,
+            max_batch: 1,
+            flush_interval: Duration::from_millis(5),
+            retry_backoff: Duration::from_millis(5),
+            shutdown_drain_deadline: Duration::from_millis(100),
+            ingest_timeout: Duration::from_millis(100),
+        },
+        sharding: LocalSharding::SINGLE,
+        snapshot_history_capacity: ArcSwapSnapshotMap::DEFAULT_GENERATION_CAPACITY,
+        idle_account_linger: Duration::from_millis(30),
+        manager_restart_backoff: Duration::from_millis(20),
+        shutdown_deadline: Duration::from_millis(250),
+    }
 }

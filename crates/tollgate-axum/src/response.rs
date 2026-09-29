@@ -32,6 +32,13 @@ pub enum ResponseError {
 /// Application work, including serialization, must finish before returning.
 /// Detached tasks and blocking work surviving cancellation require the explicit
 /// low-level guard API instead. Buffered network transmission is not execution.
+///
+/// Streaming bodies cannot cross this boundary:
+/// ```compile_fail
+/// use axum::{body::Body, http::StatusCode};
+/// use tollgate_axum::BufferedResponse;
+/// let response = BufferedResponse::bytes(StatusCode::OK, Body::empty());
+/// ```
 #[derive(Debug)]
 pub struct BufferedResponse {
     status: StatusCode,
