@@ -36,20 +36,21 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{ConnectInfo, FromRequest, FromRequestParts, State, connect_info::Connected};
+use axum::extract::{FromRequest, State};
 use axum::http::{Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use tollgate_admission::{
-    CapacityPermit, ExecutionCapacityGate, ExecutionCapacityMode, NoGate, ReadyToStart,
-    RequestContext,
+use tollgate_admission::{CapacityGate, ExecutionCapacityGate, ExecutionCapacityMode, NoGate};
+use tollgate_auth::HmacRegistry;
+use tollgate_axum::{
+    AdapterConfig, BearerAuth, BufferedResponse, ChargeMetadata, InputError, InputLimits,
+    Rejection, Tollgate, Validated,
 };
-use tollgate_auth::{HmacRegistry, SessionCredential};
 use tollgate_client::{
-    Clock, SnapshotManagerConfig, SystemClock, TrackedPrincipals, UsagePermit, UsageWriterConfig,
+    Clock, SnapshotManagerConfig, SystemClock, TrackedPrincipals, UsageWriterConfig,
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CapacityClass, CommitError, CostTable, CostUnits,
@@ -73,45 +74,9 @@ impl OpIndex for Op {
 
 const PERMISSION_PRICE: PermissionBits = PermissionBits(1);
 
-// ---- credential verification (the auth seam) ---------------------------
-
-/// Per-connection authentication state, bound to an accepted TCP connection
-/// by Axum's `ConnectInfo`.
-///
-/// The whole of the mechanism lives in `tollgate-auth`; what an embedder
-/// supplies is the two transport-specific parts the library deliberately does
-/// not know about — what a "session" is here (one accepted connection) and how
-/// to get credential bytes out of the wire format (strip `Bearer `).
-#[derive(Clone, Default)]
-pub struct PricingConnection {
-    session: SessionCredential,
-}
-
-impl Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>> for PricingConnection {
-    fn connect_info(_stream: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
-        Self::default()
-    }
-}
-
-impl PricingConnection {
-    /// Resolve an `Authorization` header to a principal for this connection.
-    ///
-    /// The bearer prefix is stripped *before* the library sees anything, so
-    /// what is cached and what is verified are the same bytes by construction.
-    fn authenticate(
-        &self,
-        authorization: Option<&axum::http::HeaderValue>,
-        verifier: &impl tollgate_auth::CredentialVerifier,
-        now: Timestamp,
-    ) -> Option<Principal> {
-        let credential = authorization
-            .map(axum::http::HeaderValue::as_bytes)
-            .and_then(|value| value.strip_prefix(b"Bearer "));
-        // A header that is present but not a bearer token authenticates as
-        // nobody *and* clears any prior proof, which `None` is exactly.
-        self.session.authenticate(credential, verifier, now)
-    }
-}
+/// Per-connection cache supplied by the reusable Axum adapter. The alias keeps
+/// existing listener setup compatible with this example.
+pub use tollgate_axum::TollgateConnection as PricingConnection;
 
 // ---- wire types --------------------------------------------------------
 
@@ -181,88 +146,6 @@ impl<T: serde::de::DeserializeOwned + Send> FromRequest<Arc<AppState>> for ApiJs
                 state.input_rejections[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 problem(status, code, error.body_text())
             })
-    }
-}
-
-/// The request body plus the evidence obtained before Axum consumes it.
-struct PriceInput {
-    request: PriceRequest,
-    staged: Option<Staged>,
-}
-
-/// What admission produced before Axum consumed the body, plus the state the
-/// handler needs to finish the request.
-///
-/// The handler takes no `State` extractor — everything reaches it through this
-/// — so the gate has to travel with the evidence. One `Arc` clone per admitted
-/// request, which is a refcount bump.
-struct Staged {
-    context: RequestContext,
-    permit: UsagePermit,
-    state: Arc<AppState>,
-}
-
-impl FromRequest<Arc<AppState>> for PriceInput {
-    type Rejection = Response;
-
-    async fn from_request(
-        request: Request<axum::body::Body>,
-        state: &Arc<AppState>,
-    ) -> Result<Self, Self::Rejection> {
-        if state.admission.is_none() {
-            let ApiJson(request) = ApiJson::<PriceRequest>::from_request(request, state).await?;
-            return Ok(Self {
-                request,
-                staged: None,
-            });
-        }
-
-        let (mut parts, body) = request.into_parts();
-        let ConnectInfo(connection) =
-            ConnectInfo::<PricingConnection>::from_request_parts(&mut parts, state)
-                .await
-                .map_err(|_| {
-                    state.input_rejections[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    problem(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "missing-connection-state",
-                        "Connection authentication state is unavailable",
-                    )
-                })?;
-        let now = Timestamp::now();
-        let Some(principal) =
-            connection.authenticate(parts.headers.get(header::AUTHORIZATION), &state.auth, now)
-        else {
-            state.counters().record_deny(&DenyReason::UnknownPrincipal);
-            return Err(deny_response(DenyReason::UnknownPrincipal));
-        };
-        let context = state
-            .admission
-            .as_ref()
-            .expect("admission enabled")
-            .begin(principal, PERMISSION_PRICE, now)
-            .map_err(deny_response)?;
-        let admission = state
-            .admission
-            .as_ref()
-            .expect("the branch above proved admission is enabled");
-        let permit = admission.recorder().try_reserve().map_err(|_| {
-            state
-                .counters()
-                .record_deny(&DenyReason::AccountingBackpressure);
-            deny_response(DenyReason::AccountingBackpressure)
-        })?;
-
-        let request = Request::from_parts(parts, body);
-        let ApiJson(request) = ApiJson::<PriceRequest>::from_request(request, state).await?;
-        Ok(Self {
-            request,
-            staged: Some(Staged {
-                context,
-                permit,
-                state: Arc::clone(state),
-            }),
-        })
     }
 }
 
@@ -749,11 +632,19 @@ async fn build_app_with(
         admission,
     });
 
+    let price_route = match state.admission.clone() {
+        Some(runtime) => match state.capacity.clone() {
+            Some(gate) => metered_price(state.clone(), runtime, gate),
+            None => metered_price(state.clone(), runtime, NoGate),
+        },
+        None => post(baseline_price),
+    };
+
     let router = axum::Router::new()
         .route("/livez", get(async || StatusCode::OK))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
-        .route("/v1/price", post(price))
+        .route("/v1/price", price_route)
         .with_state(state);
     (router, AppRuntime { store, background })
 }
@@ -1103,21 +994,36 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Json<Metrics> {
 }
 
 fn problem(status: StatusCode, code: &'static str, title: impl Into<String>) -> Response {
-    let body = Problem {
-        status: status.as_u16(),
-        code,
-        title: title.into(),
-        units_charged: 0,
-    };
-    let mut response = (status, Json(body)).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("application/problem+json"),
-    );
-    response
+    buffered_problem(status, code, title).into_response()
 }
 
+fn buffered_problem(
+    status: StatusCode,
+    code: &'static str,
+    title: impl Into<String>,
+) -> BufferedResponse {
+    BufferedResponse::json(
+        status,
+        &Problem {
+            status: status.as_u16(),
+            code,
+            title: title.into(),
+            units_charged: 0,
+        },
+    )
+    .expect("primitive problem fields serialize")
+    .with_header(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/problem+json"),
+    )
+}
+
+#[cfg(test)]
 fn deny_response(reason: DenyReason) -> Response {
+    deny_buffered(reason).into_response()
+}
+
+fn deny_buffered(reason: DenyReason) -> BufferedResponse {
     let (status, code) = match reason {
         DenyReason::UnknownPrincipal => (StatusCode::UNAUTHORIZED, "unknown-principal"),
         DenyReason::AccountSuspended
@@ -1177,92 +1083,98 @@ fn deny_response(reason: DenyReason) -> Response {
             (StatusCode::SERVICE_UNAVAILABLE, "capacity-unavailable")
         }
     };
-    problem(status, code, reason.to_string())
+    buffered_problem(status, code, reason.to_string())
 }
 
-async fn price(input: PriceInput) -> Response {
-    // One destructuring, not a flag check followed by an unwrap that has to
-    // agree with it: the same `let` that rules out the baseline is what hands
-    // this handler the recorder (GL-16).
-    let PriceInput { request, staged } = input;
-    let Some(Staged {
-        context,
-        permit,
-        state,
-    }) = staged
-    else {
-        // Load-gate baseline: transport + kernel only.
-        let prices: Vec<f64> = request.contracts.iter().map(black_scholes_call).collect();
-        return Json(PriceResponse {
-            prices,
-            metadata: ResponseMetadata {
-                request_id: "baseline".to_string(),
-                units_charged: 0,
-                policy_revision: PolicyRevision::UNSTATED.to_string(),
+fn metered_price<G: CapacityGate>(
+    state: Arc<AppState>,
+    runtime: tollgate_client::RuntimeHandle,
+    capacity: G,
+) -> axum::routing::MethodRouter<Arc<AppState>> {
+    let adapter = Tollgate::new(AdapterConfig {
+        runtime,
+        authenticator: BearerAuth::new(Arc::new(state.auth.clone())),
+        clock: Arc::new(SystemClock),
+        request_ids: || Ok(RequestId(uuid::Uuid::new_v4().as_u128())),
+        capacity,
+    });
+    adapter
+        .post_json_with_error_handler(
+            Op::Price,
+            PERMISSION_PRICE,
+            InputLimits::new(2 * 1024 * 1024, std::time::Duration::from_secs(30))
+                .expect("positive bounded route limits"),
+            |request: PriceRequest| {
+                let quantity = u64::try_from(request.contracts.len())
+                    .map_err(|_| InputError("too many contracts"))?;
+                Ok(Validated::new(request, quantity))
             },
-        })
-        .into_response();
-    };
+            |request, charge| async move {
+                BufferedResponse::json(
+                    StatusCode::OK,
+                    &PriceResponse {
+                        prices: request.contracts.iter().map(black_scholes_call).collect(),
+                        metadata: ResponseMetadata {
+                            request_id: charge.request_id.to_string(),
+                            units_charged: charge.units_charged.get(),
+                            policy_revision: charge.policy_revision.to_string(),
+                        },
+                    },
+                )
+            },
+            move |error, charge| pricing_rejection(&state, error, charge),
+        )
+        .with_state(())
+}
 
-    // Authentication, begin, accounting backpressure, and body decoding have
-    // already occurred in `PriceInput`, in that order. The owned context is
-    // the proof that this body is still governed by the same generation.
-    let items = request.contracts.len() as u64;
-    let pending = match context.admit(&[(Op::Price, items)], permit, Timestamp::now()) {
-        Ok(pending) => pending,
-        Err(reason) => return deny_response(reason),
-    };
-    // Two gate types, one execution path. The library monomorphizes over the
-    // gate chosen at startup; this example must serve both configurations from
-    // one binary because the load gate compares them, so it branches once here
-    // and hands both arms to the same generic function rather than keeping two
-    // copies of the commit sequence that would have to agree.
-    match state.capacity.as_ref() {
-        Some(gate) => match pending.acquire_capacity(gate) {
-            Ok(ready) => execute(ready, &request),
-            Err((reason, _released)) => deny_response(reason),
-        },
-        None => match pending.acquire_capacity(&NoGate) {
-            Ok(ready) => execute(ready, &request),
-            Err((reason, _released)) => deny_response(reason),
-        },
+fn pricing_rejection(
+    state: &AppState,
+    error: &Rejection,
+    charge: Option<ChargeMetadata>,
+) -> BufferedResponse {
+    match error {
+        Rejection::Denied(reason) | Rejection::Commit(CommitError::Denied(reason)) => {
+            deny_buffered(*reason)
+        }
+        Rejection::Commit(_) => deny_buffered(DenyReason::FundingExpiredAtStart),
+        Rejection::Json(error) => {
+            let status = error.status();
+            let (index, code) = match status {
+                StatusCode::UNSUPPORTED_MEDIA_TYPE => (1, "unsupported-media-type"),
+                StatusCode::PAYLOAD_TOO_LARGE => (2, "body-too-large"),
+                _ => (0, "malformed-body"),
+            };
+            state.input_rejections[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            buffered_problem(status, code, error.body_text())
+        }
+        Rejection::BodyTooLarge => {
+            state.input_rejections[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            buffered_problem(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body-too-large",
+                "Failed to buffer the request body",
+            )
+        }
+        Rejection::MissingConnection => {
+            state.input_rejections[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            buffered_problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "missing-connection-state",
+                "Connection authentication state is unavailable",
+            )
+        }
+        _ => tollgate_axum::render_rejection(error, charge),
     }
 }
 
-/// Commit, run the kernel, and answer — the part that does not care which gate
-/// issued the permit.
-fn execute<P: CapacityPermit>(
-    ready: ReadyToStart<UsagePermit, P>,
-    request: &PriceRequest,
-) -> Response {
-    // Execution starts only after the type-state owns funding, accounting,
-    // account concurrency, and the selected execution-capacity permit.
-    // Random 128-bit ids: idempotency keys are global, so ids must be
-    // collision-free across instances and restarts — a process-local counter
-    // would make a second instance's legitimate usage read as duplicates
-    // (review finding GL-6).
-    let request_id = RequestId(uuid::Uuid::new_v4().as_u128());
-    let committed = match ready.commit(request_id, Timestamp::now()) {
-        Ok(committed) => committed,
-        Err((CommitError::Denied(reason), _released)) => return deny_response(reason),
-        Err((_cancelled, _released)) => {
-            return deny_response(DenyReason::FundingExpiredAtStart);
-        }
-    };
-    let units = committed.units();
-    // Taken from the guard, which reads it off the event it will emit — so
-    // the response cannot name a policy the bill does not.
-    let policy_revision = committed.policy_revision();
-
-    let prices: Vec<f64> = request.contracts.iter().map(black_scholes_call).collect();
-    drop(committed);
-
+async fn baseline_price(ApiJson(request): ApiJson<PriceRequest>) -> Response {
+    // Load-gate baseline: transport + kernel, with admission explicitly off.
     Json(PriceResponse {
-        prices,
+        prices: request.contracts.iter().map(black_scholes_call).collect(),
         metadata: ResponseMetadata {
-            request_id: request_id.to_string(),
-            units_charged: units.get(),
-            policy_revision: policy_revision.to_string(),
+            request_id: "baseline".to_string(),
+            units_charged: 0,
+            policy_revision: PolicyRevision::UNSTATED.to_string(),
         },
     })
     .into_response()

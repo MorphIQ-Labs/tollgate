@@ -8235,3 +8235,31 @@ incremental orchestration comparison, not an HTTP latency or kernel benchmark.
 The existing complete performance/load gates remain release acceptance gates;
 CI compiles this benchmark but never substitutes timing on a shared runner for
 controlled-host evidence. No threshold is changed by these witnesses.
+
+### Axum adoption and example migration (GH-64)
+
+The pricing example now selects its typed gate and route once at startup.
+`Tollgate` owns authentication, staging, bounded decoding and committed-guard
+lifetime; the application retains its operation vocabulary, quantity
+validation, pricing kernel, response schema and error metrics. The public
+`PricingConnection` name remains an alias of `TollgateConnection`, so listener
+setup and existing HTTP fixtures remain compatible. The admission-disabled
+comparison baseline still bypasses Tollgate entirely.
+
+The executable Axum guide initializes an account, verifier, runtime and optional
+reserved capacity once, serves fixed/body-derived quantities, and leaves health
+unmetered. Its snippets are source-checked by the existing documentation gate.
+It distinguishes distributed lease funding from local execution/overage caps
+and documents the low-level escape hatch for unsupported response lifetimes.
+The crate remains lockstep-versioned and appears after its dependencies in the
+publish order. It is a new registry name: the current 0.32.1 release does not
+contain it, and documentation makes no availability claim before publication.
+
+The first publication requires a `TOLLGATE_AXUM_BOOTSTRAP_TOKEN` Actions secret
+in the `crates-io` environment, with a short expiry and publish-new/publish-update
+permission restricted to the `tollgate-axum` name. The release script checks this
+before publishing any crate, uses it only while that name is absent, and keeps
+Trusted Publishing for the seven existing crates. After initial publication,
+configure the new crate's trusted publisher for `MorphIQ-Labs/tollgate`, workflow
+`release.yml`, environment `crates-io`, then remove the bootstrap secret. A
+package dry run does not prove this external permission exists.
