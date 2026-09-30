@@ -295,6 +295,9 @@ jobs:
       # Workspace feature unification can enable core's optional serde support;
       # check the standalone crate before the combined workspace suite.
       - run: cargo test --locked -p tollgate-core --no-default-features
+      # The adapter's HttpStore witness must declare its own test features;
+      # workspace peers must not supply them through feature unification.
+      - run: cargo test --locked -p tollgate-axum --no-default-features
       - run: cargo test --locked --workspace --no-default-features
 
   # The env-gated Postgres suite, which skips on machines without a database,
