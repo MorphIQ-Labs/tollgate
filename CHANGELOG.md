@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.32.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.32.1...v0.32.2) - 2026-09-30
+
+### Added
+
+- *(axum)* add reusable metered route integration (#70)
+
 ## [0.32.1](https://github.com/MorphIQ-Labs/tollgate/compare/v0.32.0...v0.32.1) - 2026-09-29
 
 ### Other
