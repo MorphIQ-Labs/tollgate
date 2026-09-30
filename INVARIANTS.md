@@ -265,6 +265,18 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    `a_fallback_commit_refunds_its_lease_exactly_once`, and
    `lease_units_are_conserved`.
 
+   The Axum wrapper commits before constructing the business future and owns
+   the guard through buffered response construction. Adapter witnesses:
+   `validation_and_admission_refuse_without_constructing_business_future`,
+   `unavailable_request_ids_release_the_slot_without_starting_work`,
+   `body_and_fixed_quantities_preserve_committed_metadata_and_charge_errors`,
+   `factory_panic_future_panic_and_abort_each_record_one_charge`, and
+   `custom_error_renderer_receives_charge_only_after_execution`,
+   `funding_expiry_at_commit_never_constructs_the_handler`,
+   `expiry_during_body_read_and_outer_timeout_before_start_charge_nothing`,
+   `canceling_timeout_after_start_records_once_and_unmetered_routes_bypass_admission`,
+   and `shutdown_drains_a_running_charge_and_refuses_new_execution`.
+
 3. **Atomic commit-vs-cancel.** Commit and cancel race on a single atomic
    transition; exactly one wins. A cancelled reservation can never later
    commit; a committed reservation reports its full charge to a late
@@ -364,6 +376,11 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    is the one that says something about *funding* rather than about validity
    (1). Nothing else in this list is mode-dependent. The request path performs no database, file, lock-file, or network
    access — not even on a miss.
+
+   The Axum adapter authenticates, begins the pinned context, and reserves
+   accounting capacity before polling the body. Refusals never invoke a
+   fallback store. `identity_permission_and_backpressure_refuse_before_body_poll`
+   witnesses the ordering and exact denial counts through the adapter.
 
    This is a rule about I/O, and it is worth saying what it is *not*, because
    two other documents used to cite it as forbidding locks outright. The hot
@@ -1557,6 +1574,12 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `cached_principal_still_observes_snapshot_revocation` (pricing-api, the
     wiring).
 
+    The reusable Axum bearer authenticator requires connection-scoped evidence
+    and delegates reuse/expiry to the same session cache.
+    `cached_identity_still_expires_and_shutdown_closes_admission` and
+    `identity_permission_and_backpressure_refuse_before_body_poll` witness its
+    wiring without introducing a second credential cache.
+
 24. **Steady-state embedding admission allocates nothing it owns and performs
     exactly one snapshot lookup.** After the measuring thread has initialised
     dependency-owned thread-local state and the bounded usage queue has a
@@ -1734,6 +1757,16 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `a_staged_context_observes_account_rate_published_after_begin`,
     `limit_change_is_one_account_authority_for_every_principal`, and
     `admit_consults_the_map_exactly_once`.
+
+    Axum's owned prepared input carries this same context and the original
+    queue permit through a bounded body read. Decode/timeout/drop failures
+    neither debit funding nor retain a queue slot. Adapter witnesses:
+    `prepared_input_keeps_its_original_context_and_one_permit`,
+    `malformed_oversized_and_timed_out_input_release_accounting_capacity`,
+    `dropping_a_body_read_releases_the_reserved_slot`, and
+    `an_outer_body_limit_is_not_widened_and_unmatched_routes_are_unmetered`,
+    `policy_republication_during_body_read_does_not_reprice_the_pinned_request`,
+    and `revocation_during_read_preserves_pinned_identity_and_refuses_the_next_request`.
 
 Ledger roles (context for 1 and 7): leases **bound** spend; usage events **are**
 the billing record; reconciliation compares the two and steady-state drift is
@@ -2095,6 +2128,9 @@ exists to detect corrupt state and must not be able to launder it.
     carries the class through the whole embedding, and
     `a_capacity_refusal_is_a_retryable_503_and_not_a_rate_limit` pins what a
     caller is told.
+    The reusable route wrapper preserves account-selected reserve access and
+    returns execution slots after cancellation:
+    `reserved_capacity_uses_account_class_and_returns_slots_after_abort`.
     *Proof:* `formal/lean/Tollgate/ExecutionCapacity.lean`.
 
 

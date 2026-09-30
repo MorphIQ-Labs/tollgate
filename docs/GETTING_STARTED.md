@@ -21,7 +21,9 @@ drift apart. To run it:
 cargo test -p tollgate-client --test getting_started
 ```
 
-[Concepts](CONCEPTS.md) defines the terms used here.
+[Concepts](CONCEPTS.md) defines the terms used here. For route-level HTTP
+integration, use the [Axum guide](AXUM.md); this tutorial remains the
+transport-neutral lifecycle.
 
 ## Dependencies
 

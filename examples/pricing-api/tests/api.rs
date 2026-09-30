@@ -272,6 +272,7 @@ async fn price_route_requires_connection_context() {
     wait_ready(&router).await;
 
     let response = router
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -292,6 +293,13 @@ async fn price_route_requires_connection_context() {
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["code"], "missing-connection-state");
     assert_eq!(body["units_charged"], 0);
+    assert_eq!(
+        body["title"],
+        "Connection authentication state is unavailable"
+    );
+    let counters = metrics(&router).await;
+    assert_eq!(counters["input_rejections"]["missing-connection-state"], 1);
+    assert_eq!(counters["admitted"], 0);
 
     runtime.shutdown().await;
 }
@@ -1041,56 +1049,58 @@ async fn a_disabled_instance_reports_no_capacity_rather_than_an_empty_one() {
 
 #[tokio::test]
 async fn extractor_failures_are_zero_charge_problem_json_with_fixed_counters() {
-    for (content_type, body, status, code) in [
-        (
-            "application/json",
-            "{".to_owned(),
-            StatusCode::BAD_REQUEST,
-            "malformed-body",
-        ),
-        (
-            "text/plain",
-            "{}".to_owned(),
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported-media-type",
-        ),
-        (
-            "application/json",
-            " ".repeat(2 * 1024 * 1024 + 1),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "body-too-large",
-        ),
-    ] {
-        let (router, runtime) = build_test_app(10_000, true).await;
-        wait_ready(&router).await;
-        let response = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/price")
-                    .header(header::AUTHORIZATION, format!("Bearer {DEMO_API_KEY}"))
-                    .header(header::CONTENT_TYPE, content_type)
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), status);
-        assert_eq!(
-            response.headers()[header::CONTENT_TYPE],
-            "application/problem+json"
-        );
-        let body: Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+    for admission_enabled in [true, false] {
+        for (content_type, body, status, code) in [
+            (
+                "application/json",
+                "{".to_owned(),
+                StatusCode::BAD_REQUEST,
+                "malformed-body",
+            ),
+            (
+                "text/plain",
+                "{}".to_owned(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported-media-type",
+            ),
+            (
+                "application/json",
+                " ".repeat(2 * 1024 * 1024 + 1),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body-too-large",
+            ),
+        ] {
+            let (router, runtime) = build_test_app(10_000, admission_enabled).await;
+            wait_ready(&router).await;
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/price")
+                        .header(header::AUTHORIZATION, format!("Bearer {DEMO_API_KEY}"))
+                        .header(header::CONTENT_TYPE, content_type)
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
                 .unwrap();
-        assert_eq!(body["code"], code);
-        assert_eq!(body["units_charged"], 0);
-        let counters = metrics(&router).await;
-        assert_eq!(counters["input_rejections"][code], 1);
-        assert_eq!(counters["contexts_abandoned"], 1);
-        assert_eq!(counters["admitted"], 0);
-        runtime.shutdown().await;
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/problem+json"
+            );
+            let body: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(body["code"], code);
+            assert_eq!(body["units_charged"], 0);
+            let counters = metrics(&router).await;
+            assert_eq!(counters["input_rejections"][code], 1);
+            assert_eq!(counters["contexts_abandoned"], u64::from(admission_enabled));
+            assert_eq!(counters["admitted"], 0);
+            runtime.shutdown().await;
+        }
     }
 }
 
@@ -1238,4 +1248,33 @@ async fn demo_credentials_are_durable_and_revocation_reaches_new_verification() 
         activity[0].state,
         tollgate_store::CredentialActivityState::Committed { .. }
     ));
+}
+
+#[tokio::test]
+async fn adapter_body_limit_accepts_the_boundary_and_cannot_be_disabled_by_an_outer_layer() {
+    let (router, runtime) = build_test_app(10_000, true).await;
+    wait_ready(&router).await;
+    let store = runtime.store.clone();
+    let router = router.layer(axum::extract::DefaultBodyLimit::disable());
+    let mut body = price_body(1).to_string();
+    body.push_str(&" ".repeat(2_097_152 - body.len()));
+    let (status, response) = send(
+        &router,
+        price_request(Some(DEMO_API_KEY), Body::from(body.clone())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let charged = response["metadata"]["units_charged"].as_u64().unwrap();
+    body.push(' ');
+    let (status, response) =
+        send(&router, price_request(Some(DEMO_API_KEY), Body::from(body))).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(response["code"], "body-too-large");
+    assert_eq!(
+        response["title"],
+        "Failed to buffer the request body: length limit exceeded"
+    );
+    assert_eq!(response["units_charged"], 0);
+    runtime.shutdown().await;
+    assert_eq!(store.usage_recorded(DEMO_ACCOUNT), CostUnits(charged));
 }

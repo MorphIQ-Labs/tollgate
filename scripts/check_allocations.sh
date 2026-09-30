@@ -27,6 +27,7 @@ cargo test --locked -p tollgate-core --test allocations -- --test-threads=1
 cargo test --locked -p tollgate-auth --test allocations -- --test-threads=1
 cargo test --locked -p tollgate-admission --test allocations -- --test-threads=1
 cargo test --locked -p tollgate-client --test allocations -- --test-threads=1
+cargo test --locked -p tollgate-axum --test allocations -- --test-threads=1
 
 release_graph="$(cargo tree --locked -e normal -p pricing-api -p tollgate-server)"
 if printf '%s\n' "$release_graph" | grep -q 'tollgate-alloc-count v'; then
@@ -64,6 +65,8 @@ fi
 jq -s -e '
   length > 0
   and any(.[]; .scope == "embedding/attributed_commit_through_record" and .attribution == "tollgate")
+  and any(.[]; .scope == "axum/prepared_admission_through_record" and .attribution == "tollgate")
+  and any(.[]; .scope == "axum/wrapped_http" and .attribution == "caller")
   and any(.[]; .scope == "auth/projected_cache_hit" and .attribution == "tollgate")
   and any(.[]; .scope == "auth/projected_expiry" and .attribution == "tollgate")
   and any(.[]; .scope == "caller/request_buffer" and .attribution == "caller")

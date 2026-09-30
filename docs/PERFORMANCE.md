@@ -121,6 +121,11 @@ Every client must finish warmup before measurement starts; a warmup failure or
 coordinator cancellation releases waiting clients without measured requests.
 Partial client samples are discarded on failure. Clients use ten-second socket
 inactivity timeouts, and readiness has a five-second deadline covering its I/O.
+Before the HTTP readiness probe, admitted scenarios also allow up to five
+seconds for every named fixture account to become fundable with a healthy
+runtime. This setup barrier precedes warmup and timing: the service's `All`
+readiness permits a partially funded population, which cannot establish that
+every account in a fixed measurement workload is ready.
 
 Both report shapes are serialized, exclusively staged in the destination
 directory, read back and validated, then atomically renamed. Publication failure

@@ -1742,6 +1742,7 @@ dependencies = [
  "tokio",
  "tollgate-admission",
  "tollgate-auth",
+ "tollgate-axum",
  "tollgate-client",
  "tollgate-core",
  "tollgate-store",
@@ -2877,6 +2878,29 @@ dependencies = [
  "tollgate-alloc-count",
  "tollgate-core",
  "zeroize",
+]
+
+[[package]]
+name = "tollgate-axum"
+version = "0.32.1"
+dependencies = [
+ "axum",
+ "criterion",
+ "http-body",
+ "http-body-util",
+ "jiff",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tollgate-admission",
+ "tollgate-alloc-count",
+ "tollgate-auth",
+ "tollgate-client",
+ "tollgate-core",
+ "tollgate-server",
+ "tollgate-store",
+ "tower",
+ "uuid",
 ]
 
 [[package]]

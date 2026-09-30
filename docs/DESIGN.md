@@ -7901,3 +7901,383 @@ authority parsing tests also omitted unknown stored values. Mirrored backend
 tests now verify the repeated suspension's receipt, durable authorship and
 refused activation. The PostgreSQL decoder test covers both valid authorities
 and rejects unknown or near-match spellings. Production behavior is unchanged.
+
+## Reusable Axum adapter: execution boundary (GH-59, GH-60, 2026-09-29)
+
+This is the target design for issues #61–#64, not a claim that a published
+adapter exists. The issue integration branch is `feat/axum-integration`;
+each child lands there through a checked pull request before the completed
+integration is proposed for `main`. The temporary branch does not publish
+crates or Pages. An implementation that changes this design updates this
+section with the reason and evidence in the same change.
+
+The pricing example currently owns transport glue in `PriceInput`, `Staged`,
+`price`, and `execute`. Those sites implement one ordered protocol, so simply
+moving the debit into outer Tower middleware is insufficient. `next.run` still
+performs Axum extraction: JSON, state, or another extractor could reject after
+the middleware had charged. Likewise, an extractor that commits cannot know
+that every following extractor will succeed. The reusable boundary must own
+preparation and invoke application work only after preparation succeeds.
+
+### Public shape and one-time setup
+
+Add a leaf library, `tollgate-axum`, depending on the existing core, admission,
+auth, and client libraries and the workspace Axum 0.8 family. Neither the
+transport-neutral crates nor their APIs gain an Axum dependency. Match Rust
+1.89, edition 2024, workspace lints, dual licenses, exact lockstep versions,
+and the existing runtime feature/backend seams. Prefer existing workspace
+dependencies; no procedural-macro crate or async-trait layer is needed.
+
+The application retains the unique `InstanceRuntime` owner and its shutdown
+responsibility. A cloneable `Tollgate<A, C, I, G>` adapter holds one shared
+configuration containing a `RuntimeHandle`, authenticator, clock, request-ID
+source, and capacity gate. It starts no tasks, chooses no account policy, and
+does not silently supply operational defaults. The typed gate is selected at
+startup: `NoGate` or `ExecutionCapacityGate`, including Uniform and Reserved.
+Disabled capacity must not become a per-request enum branch (invariant 30).
+
+`RequestAuthenticator` receives borrowed HTTP request parts and the supplied
+timestamp and returns a verified principal or a typed adapter rejection. Its
+contract is the existing local-only credential-verifier contract. The shipped
+bearer implementation uses `CredentialVerifier` and `SessionCredential` with
+an explicitly installed connection context; absent required connection state
+is a configuration error, not a permissive fallback. Cache lifetime and
+credential-expiry checks remain owned by `tollgate-auth` (invariant 23).
+An application may implement another local authentication scheme. Caller
+headers can never directly supply an account ID or Assured classification.
+
+Reuse `tollgate_client::Clock`; sample it at the HTTP edge for begin, admission,
+and commit. An injected `RequestIdSource` generates IDs unique across instances
+and restarts, with a fallible interface so entropy failure refuses before
+commit. A production UUID implementation and a deterministic test source are
+distinct; a process-local counter is not a production default. No policy
+clock read moves into core/admission.
+
+The explicit wrapper produces an Axum `MethodRouter` for ordinary router
+composition. The initial API supports bodyless and JSON routes. A route binds
+its operation, required permission, body-byte limit, body-read timeout, a
+synchronous fallible validation/quantity function, and a business callback.
+Validation consumes decoded input and returns `Validated<V>` containing
+business input and a checked `u64` quantity. This separates validation from
+billable work without requiring the business callback to call commit itself.
+Prices remain in the pinned cost table. One operation per request is the
+initial convenience contract; heterogeneous workloads retain the low-level
+staged API rather than a new allocation-backed aggregate list.
+
+Illustrative destination syntax (names are not a published compatibility
+promise; the integration must supply executable examples before release):
+
+```rust,ignore
+// Fixed quantity: a successful request performs one report operation.
+let report_route = tollgate.post(
+    Op::Report,
+    PERMISSION_REPORT,
+    || Ok(Validated::new((), 1)),
+    |(), charge| async move { make_buffered_report(charge).await },
+);
+
+// Body-derived quantity: validation finishes before execution is billable.
+let price_route = tollgate.post_json(
+    Op::Price,
+    PERMISSION_PRICE,
+    input_limits,
+    |request: PriceRequest| {
+        validate_contracts(&request)?;
+        let quantity = u64::try_from(request.contracts.len())
+            .map_err(|_| InputError::invalid("too many contracts"))?;
+        Ok(Validated::new(request, quantity))
+    },
+    |request, charge| async move { make_buffered_prices(request, charge) },
+);
+let router = Router::new()
+    .route("/livez", get(livez))
+    .route("/report", report_route)
+    .route("/price", price_route);
+```
+
+Each route chooses its HTTP method at construction. Startup composition does
+not make unknown routes metered or convert a method mismatch into an auth
+failure. The application retains its own Router state; the adapter closure
+captures its shared configuration instead of requiring all handlers to adopt
+a Tollgate-specific state type.
+
+### Ordered protocol and ownership
+
+| Stage | Owner/evidence | Contract |
+| --- | --- | --- |
+| Authenticate | Verified principal, connection cache | Identity only; invariant 23 |
+| Begin | Owned `RequestContext` | Permission/status/freshness before body; 5, 26 |
+| Reserve recording | `UsagePermit` | Bounded accounting space before body; 8 |
+| Decode and validate | Context, permit, bounded input | No funding yet; 2, 11, 26 |
+| Admit | `Pending<UsagePermit>` | Existing permission, rate, concurrency and funding checks; 1, 5, 25 |
+| Acquire capacity | `ReadyToStart<UsagePermit, G::Permit>` | Account-owned class; zero-charge refusal; 30 |
+| Commit | `Committed<UsagePermit, G::Permit>` | Existing funding/time checks and atomic lifecycle; 3, 12 |
+| Execute and serialize | Future plus committed guard | Full charge after start; emission on guard drop; 13 |
+| Return buffered response | Charge metadata, completed bytes | Same units, ID and policy revision as usage; 29 |
+
+Byte/time limits are explicit positive route configuration, independent of the
+account's item/concurrency limits. Input extraction uses Axum's bounded body
+machinery and JSON decoder once; it does not collect once for pricing and again
+for the handler. Body-read timeout begins only after stage-one evidence exists
+and bounds the body-read await. Failed content type, decoding, size, timeout,
+or application validation drops the context and queue permit with no charge.
+Bodyless routes do not read a body. Their route contract must reject bodies
+requiring business processing rather than covertly running that work later.
+
+The wrapper deliberately supports a constrained callback shape, not arbitrary
+Axum `Handler` extractors. Input/metadata are ordinary typed arguments; shared
+application dependencies are captured at route construction. Path, query,
+state, or extension extraction is not silently run after commit. Additional
+extractor support requires an explicit pre-execution preparation seam and its
+tests; callers needing it initially use the existing low-level API.
+
+After validation, admission and capacity acquisition run synchronously. The
+wrapper obtains the request ID before commit, reads commit time, commits, and
+invokes the business callback without an intervening await. The callback
+factory itself may run synchronous work, so it is invoked **after** commit.
+Its returned future is first polled in the same wrapper poll. Dropping a
+wrapper future before its first poll performs no admission; dropping it while
+reading input releases only stage-one evidence. If a future implementation
+introduces an await after admission, the pending/ready guard must remain owned
+so cancellation refunds its debit. There is no second cancellation state
+machine in the adapter.
+
+The committed guard remains a local of the async execution scope until the
+callback and buffered serialization finish. Dropping that future after commit
+records usage and releases concurrency/capacity through existing guard Drop.
+Handler errors, timeout after start, and panic unwinding remain billable;
+panics in the callback factory are covered too. The adapter does not catch a
+panic or claim Drop runs after process abort. Abrupt process loss retains the
+documented lease-forfeiture and unflushed-usage boundary (9, 13).
+
+Do not add a new snapshot lookup at commit. The current core pins account
+policy at begin, rechecks snapshot expiry at admission, and checks the funding
+usability window at commit. Revocation after begin applies according to that
+existing bounded pinned-context contract, not an invented instantaneous
+revocation promise. Slow-body tests must pin this distinction (26).
+
+### Buffered responses and composition
+
+The business callback returns a library-owned `BufferedResponse` with private
+storage, built from status/headers plus owned bytes or JSON serialization. Do
+not accept arbitrary `IntoResponse`, `Body`, or an unrestricted response-parts
+constructor: those can carry streams or upgrade callbacks past the guard's
+scope. JSON serialization failure is a charged execution error and still
+emits the event. Reject upgrade responses through this convenience API.
+
+`ChargeMetadata` exposes request ID, charged units, and policy revision copied
+from the committed guard. It can be embedded in the application's response;
+the adapter must not recalculate it or perform another policy lookup. A
+structured rejection enum distinguishes input/configuration failures from
+domain `DenyReason` and commit failures. The default renderer produces safe
+problem responses; a local error-renderer seam lets the example preserve its
+wire contract and input-rejection counters. Never expose backend diagnostic
+text or raw credentials (37), and never double-count core outcomes (20).
+
+An outer timeout that drops the complete route future is supported: a timeout
+during input is uncharged; after execution begins it is charged. A timeout
+that spawns/detaches the inner work is not equivalent. Automatic retries are
+not supported around metered execution: each invocation is a new charge, and
+a generated request ID is an accounting idempotency key, not business-level
+retry deduplication. Do not replay a committed callback implicitly.
+
+Streaming responses, WebSocket upgrades, detached tasks, `spawn_blocking` work
+that survives dropping its handle, and work continuing after returning bytes
+are outside the initial convenience API. The buffered type prevents accidental
+streaming but cannot prevent arbitrary application code from spawning tasks;
+document that trust boundary honestly. Such applications must use the existing
+staged API and transfer the committed guard into the actual worker. Sending
+buffered bytes over the network occurs after capacity release: capacity covers
+business execution and serialization, not socket draining.
+
+Ordinary tracing/CORS/response layers may wrap routes, but are application
+costs. Body-limit configuration cannot be silently disabled or widened by the
+adapter; composition tests must establish the effective limit. Readiness
+delegates to the runtime. HTTP shutdown and runtime shutdown start together;
+queue closure prevents new staging and outstanding owned permits remain the
+existing drain barrier. The adapter neither waits for funding on requests nor
+starts extra workers (6, 8, 10, 31).
+
+### Evidence and implementation sequence
+
+`examples/pricing-api/tests/axum_adapter_spike.rs` is a focused, unpublished
+feasibility spike: generic JSON and fixed/body-derived quantities compose into
+an Axum route; real admission guards span the asynchronous callback and emit
+on task cancellation. Rejection tests show parsing/validation does not execute
+business work or debit funding. Fixture authentication and a recording usage
+slot are deliberately not a substitute for the production verifier, writer,
+error contract, and lifecycle tests in #61–#63. The spike is test-only; it does
+not add or change production behavior or claim the adapter is complete.
+
+#61 owns the publishable crate/configuration/pre-body boundary. #62 implements
+the metered wrapper over the same guards. #63 supplies adversarial composition,
+allocation and performance evidence beyond each issue's focused tests. #64
+migrates all four example glue sites and supplies runnable docs, backend
+configuration examples, and release integration. A decorator is deferred until
+the explicit API is usable; it must eventually delegate to this one protocol.
+
+The structural performance budget is zero new allocations owned by admission,
+no additional map lookup, no request-time route scan, no callback-future box,
+no new blocking lock or I/O, and no capacity-state/branch cost for NoGate.
+Axum's own dispatch/future boxing and bounded body/response buffers remain
+framework/transport costs and must be reported rather than hidden. Generic
+callbacks and gate types are monomorphized. At most one shared-config Arc clone
+per invocation is the target; production measurements decide whether another
+ownership shape is warranted. The fixed operation's quote remains O(1) in
+table size; decoding/validation necessarily scales with bounded input size.
+
+CI compiles the spike and runs its behavior tests under the existing workspace
+jobs. Later allocation scopes separate admission from HTTP parsing, credential
+cache misses, and response creation. Timed comparisons use the same host,
+toolchain, profile and workload for manual and adapter integrations and follow
+[the performance policy](PERFORMANCE.md). This design change establishes no
+new latency claim or threshold. Full release acceptance cannot substitute CI
+wall time for controlled-host evidence. Reusing proven core transitions does
+not turn the Axum orchestration into a Lean-to-Rust refinement proof.
+
+### Adapter application setup and input staging (GH-61)
+
+The new leaf crate implements the target configuration and pre-body boundary.
+`AdapterConfig` owns the shared runtime handle, authenticator, injected clock
+and request-ID source, and typed capacity gate. `Tollgate` clones only its
+configuration Arc. Runtime and gate validity remain enforced by their owning
+constructors; positive byte limits and representable positive body-read
+deadlines are checked by `InputLimits::new` before accepting traffic.
+
+`prepare_json` owns authentication, `begin`, and usage-slot reservation before
+polling any body frame. Its `Prepared` value has private fields and transfers
+the decoded input, original context, and original permit together through
+`into_parts`; no lookup or second reservation occurs. It does not commit a
+charge. The ordinary route wrapper is the next implementation issue.
+
+The bearer implementation uses `ConnectInfo<TollgateConnection>` and the
+existing credential verifier/session cache; absence of connection state is a
+typed configuration rejection. Authentication denials and accounting-capacity
+denials each increment the engine counter exactly once, while begin owns its
+own domain tally. Invalid JSON, size, media type, and read timeout stay input
+rejections rather than invented admission reasons.
+
+The explicit route body bound wraps the body before Axum's existing extractor
+limit, so the smaller bound wins. No global layer is installed or replaced.
+`http-body-util` moves from test scaffolding to this adapter's runtime graph;
+it is already a transitive Axum dependency. `http-body` is a direct dev-only
+dependency for body-poll witnesses. No new external package or version enters
+the lockfile. Memory-backed runtime tests exercise the shared handle, queue
+capacity recovery, body cancellation, credential expiry, and shutdown closure;
+the adapter names no store implementation in its production API.
+
+The publish-order list gains the new leaf immediately because CI compares it
+with all publishable manifests. Production publishing permission, end-to-end
+guide and example migration remain #64. Timed adapter-overhead evidence
+belongs to #63 before the complete integration is proposed to main; staging
+alone makes no latency claim and changes no performance threshold.
+
+### Metered buffered Axum routes (GH-62)
+
+`post_json` and bodyless `post` implement the execution protocol established in
+GH-60. Validation returns owned business input and an item quantity. The
+wrapper uses the original prepared context/permit, obtains an accounting ID,
+admits the operation against its pinned price table, acquires the typed gate,
+and commits before constructing the business future. There is no suspension
+point between commit and callback construction. Core admission owns policy and
+funding checks; this adapter adds no second lookup or accounting state machine.
+
+The committed guard encloses callback construction, polling and response
+serialization. A synchronous factory panic, future panic, cancellation or
+business error all preserve one usage event. Returned `BufferedResponse` owns
+only status, headers and bytes; informational/upgrade status is rejected. A
+streaming body, response extension or upgrade callback cannot be returned
+through this API. Detached tasks and blocking work that outlive cancellation
+remain unsupported and require explicit ownership of the low-level guard.
+
+Error rendering is a local callback, with authoritative charge metadata when
+execution started. Default problem responses distinguish capacity, funding,
+rate, accounting and input failures without exposing input or backend text.
+The default renderer cannot infer a refund from an impossible AlreadyCommitted
+error, so it reports unknown units in that case. Applications can preserve
+existing wire contracts using `post_json_with_error_handler`.
+
+Real runtime/HTTP tests compare callback metadata with settled events, verify
+fixed and body-derived quantities, refuse work before callback construction,
+and cancel running requests in shared/reserved capacity pools for both account
+classes. Test IDs are monotonic fixture values; production sources must provide
+cross-instance/restart uniqueness. No new external dependency version or proof
+claim is introduced. Framework composition, allocation and controlled-host
+comparison remain the acceptance work of GH-63 before main integration.
+
+### Axum composition and transport witnesses (GH-63)
+
+The wrapper tests drive real routes through paused body reads, policy
+republication and tombstones, expiry immediately before commit, canceling
+outer timeouts, and shutdown with a live committed guard. Revocation after
+`begin` governs the next request; the old context is neither re-authenticated
+nor re-priced. Strict funding expiry refuses, while Elastic preserves the
+existing commit-time overage transition. Two accounts share an instance but
+retain independent concurrency budgets. These are orchestration witnesses for
+existing contracts, not new core semantics or refinement proofs.
+
+A loopback `HttpStore` runtime test requires a buffered request to finish in
+one synchronous poll after readiness, then checks the remotely ingested usage.
+The adapter therefore exercises the same API over direct and HTTP stores;
+backend parity remains owned by the existing store contracts. A compile-fail
+example forbids returning an Axum streaming body as `BufferedResponse`.
+
+The allocation gate now compares equivalent manual and wrapped HTTP routes
+under identical parsing/work/output and checks no incremental allocation
+calls. A separate prepared-admission-through-record scope must allocate zero.
+Framework/body allocations remain attributed to the caller and visible in the
+report. `tollgate-alloc-count` remains dev-only. The new Criterion `routes`
+benchmark compares manual and wrapped orchestration using the same configured
+limits, verifier, clock, operation and output; request construction and writer
+draining are outside each interval. It uses a priceable zero-cost operation to
+avoid making a finite fixture deposit a benchmark duration limit. This is an
+incremental orchestration comparison, not an HTTP latency or kernel benchmark.
+The existing complete performance/load gates remain release acceptance gates;
+CI compiles this benchmark but never substitutes timing on a shared runner for
+controlled-host evidence. No threshold is changed by these witnesses.
+
+### Axum adoption and example migration (GH-64)
+
+The pricing example now selects its typed gate and route once at startup.
+`Tollgate` owns authentication, staging, bounded decoding and committed-guard
+lifetime; the application retains its operation vocabulary, quantity
+validation, pricing kernel, response schema and error metrics. The public
+`PricingConnection` name remains an alias of `TollgateConnection`, so listener
+setup and existing HTTP fixtures remain compatible. The admission-disabled
+comparison baseline still bypasses Tollgate entirely.
+
+The executable Axum guide initializes an account, verifier, runtime and optional
+reserved capacity once, serves fixed/body-derived quantities, and leaves health
+unmetered. Its snippets are source-checked by the existing documentation gate.
+It distinguishes distributed lease funding from local execution/overage caps
+and documents the low-level escape hatch for unsupported response lifetimes.
+The crate remains lockstep-versioned and appears after its dependencies in the
+publish order. It is a new registry name: the current 0.32.1 release does not
+contain it, and documentation makes no availability claim before publication.
+
+The first publication requires a `TOLLGATE_AXUM_BOOTSTRAP_TOKEN` Actions secret
+in the `crates-io` environment, with a short expiry and publish-new/publish-update
+permission restricted to the `tollgate-axum` name. The release script checks this
+before publishing any crate, uses it only while that name is absent, and keeps
+Trusted Publishing for the seven existing crates. After initial publication,
+configure the new crate's trusted publisher for `MorphIQ-Labs/tollgate`, workflow
+`release.yml`, environment `crates-io`, then remove the bootstrap secret. A
+package dry run does not prove this external permission exists.
+
+### Fixed load-workload startup barrier
+
+The integration mutation baseline exposed a race in the mixed load scenario:
+the service's `All` readiness may become true when one account has funding,
+before another fixture account receives its first lease. Starting all clients
+at that point could produce a non-capacity 503 during warmup. Workspace tests
+usually observed startup after both accounts had funding, so they did not
+reliably expose the missing prerequisite.
+
+The shared load-scenario setup now waits, with a bounded deadline, for a healthy
+runtime and fundable reports for every named fixture account before probing
+HTTP readiness and warming clients. Production readiness keeps its existing
+partial-population semantics. No request is retried or absorbed, and setup is
+outside every timed interval. Deterministic witnesses reject missing identities
+and partial funding, and exercise successful startup, an absent account's
+deadline, disabled admission and shutdown. The shared setup covers sequential,
+concurrent, distinct-account and mixed capacity scenarios.
