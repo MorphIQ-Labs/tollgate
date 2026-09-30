@@ -779,7 +779,17 @@ async fn measure(
 
     let samples = async {
         if admission {
-            // Wait for readiness: the lease slot must be stocked (GL-10).
+            // All-mode service readiness can succeed while another fixture
+            // account is still acquiring its first lease. Wait for the whole
+            // workload before warming any connection, outside timed work.
+            let accounts: Vec<_> = workload
+                .tenants
+                .iter()
+                .map(|tenant| tenant.account)
+                .collect();
+            runtime
+                .wait_for_accounts(&accounts, std::time::Duration::from_secs(5))
+                .await?;
             client::wait_ready(address, std::time::Duration::from_secs(5)).await?;
         }
         run_clients(address, admission, connections, warmup, measured, workload).await

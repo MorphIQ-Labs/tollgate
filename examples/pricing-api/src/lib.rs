@@ -188,6 +188,31 @@ impl Drop for ServerTask {
 }
 
 impl AppRuntime {
+    /// Wait for a fixed load-test fixture to be fully funded before warmup.
+    /// Production readiness deliberately permits partially funded `All`
+    /// populations; a controlled workload requires every named account.
+    pub async fn wait_for_accounts(
+        &self,
+        accounts: &[AccountId],
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        let background = self.background.as_ref().ok_or("admission is disabled")?;
+        let handle = background.runtime.handle();
+        tokio::time::timeout(timeout, async {
+            loop {
+                let now = Timestamp::now();
+                if handle.readiness(now).is_ready()
+                    && fixture_accounts_funded(accounts, &handle.account_reports(now))
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "fixture accounts did not become ready within their deadline".to_owned())
+    }
+
     pub async fn shutdown(self) {
         if let Some(mut background) = self.background {
             background.republishers.abort_all();
@@ -232,6 +257,17 @@ impl AppRuntime {
             result
         }
     }
+}
+
+fn fixture_accounts_funded(
+    accounts: &[AccountId],
+    reports: &[tollgate_client::AccountReport],
+) -> bool {
+    accounts.iter().all(|account| {
+        reports
+            .iter()
+            .any(|report| report.account == *account && report.fundable)
+    })
 }
 
 pub const DEMO_API_KEY: &str = "demo-key-1";
@@ -1215,6 +1251,89 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use tollgate_store::{SnapshotResolution, SnapshotSource};
+
+    #[test]
+    fn fixture_readiness_requires_each_named_account_to_be_funded() {
+        let report = |account, fundable| tollgate_client::AccountReport {
+            account: AccountId(account),
+            phase: tollgate_client::AccountPhase::Running,
+            eligible: true,
+            fundable,
+            task_healthy: true,
+            restarts: 0,
+            unrecovered_grants: 0,
+            uncertain_acquires: 0,
+            refill: None,
+        };
+        let accounts = [AccountId(1), AccountId(2)];
+        assert!(!fixture_accounts_funded(&accounts, &[]));
+        assert!(!fixture_accounts_funded(&accounts, &[report(1, true)]));
+        assert!(!fixture_accounts_funded(
+            &accounts,
+            &[report(1, true), report(2, false)]
+        ));
+        // An equally large funded population does not prove these identities.
+        assert!(!fixture_accounts_funded(
+            &accounts,
+            &[report(1, true), report(3, true)]
+        ));
+        assert!(fixture_accounts_funded(
+            &accounts,
+            &[report(2, true), report(1, true)]
+        ));
+    }
+
+    #[tokio::test]
+    async fn fixture_readiness_wait_is_bounded_and_observes_shutdown() {
+        let (_, baseline) = build_app(10_000, false).await;
+        assert_eq!(
+            baseline
+                .wait_for_accounts(&[DEMO_ACCOUNT], std::time::Duration::from_secs(1))
+                .await,
+            Err("admission is disabled".to_owned())
+        );
+        baseline.shutdown().await;
+
+        let tenants = demo_tenants(1, 1);
+        let (_, runtime) = build_app_with_capacity(
+            100_000,
+            true,
+            LocalSharding::SINGLE,
+            &tenants,
+            ExecutionCapacityMode::Disabled,
+        )
+        .await;
+        let accounts: Vec<_> = tenants.iter().map(|tenant| tenant.account).collect();
+        runtime
+            .wait_for_accounts(&accounts, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        // Aggregate readiness is already true, but this identity never exists.
+        assert_eq!(
+            runtime
+                .wait_for_accounts(
+                    &[AccountId(u128::MAX)],
+                    std::time::Duration::from_millis(20)
+                )
+                .await,
+            Err("fixture accounts did not become ready within their deadline".to_owned())
+        );
+        let _ = runtime
+            .background
+            .as_ref()
+            .unwrap()
+            .runtime
+            .handle()
+            .request_shutdown();
+        assert_eq!(
+            runtime
+                .wait_for_accounts(&accounts, std::time::Duration::from_millis(20))
+                .await,
+            Err("fixture accounts did not become ready within their deadline".to_owned())
+        );
+        runtime.shutdown().await;
+    }
 
     /// The adapter's defaults share most status codes with the example but
     /// not its titles or canceled-commit code. Pin the application's complete

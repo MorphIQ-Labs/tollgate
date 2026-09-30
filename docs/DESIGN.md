@@ -8263,3 +8263,21 @@ Trusted Publishing for the seven existing crates. After initial publication,
 configure the new crate's trusted publisher for `MorphIQ-Labs/tollgate`, workflow
 `release.yml`, environment `crates-io`, then remove the bootstrap secret. A
 package dry run does not prove this external permission exists.
+
+### Fixed load-workload startup barrier
+
+The integration mutation baseline exposed a race in the mixed load scenario:
+the service's `All` readiness may become true when one account has funding,
+before another fixture account receives its first lease. Starting all clients
+at that point could produce a non-capacity 503 during warmup. Workspace tests
+usually observed startup after both accounts had funding, so they did not
+reliably expose the missing prerequisite.
+
+The shared load-scenario setup now waits, with a bounded deadline, for a healthy
+runtime and fundable reports for every named fixture account before probing
+HTTP readiness and warming clients. Production readiness keeps its existing
+partial-population semantics. No request is retried or absorbed, and setup is
+outside every timed interval. Deterministic witnesses reject missing identities
+and partial funding, and exercise successful startup, an absent account's
+deadline, disabled admission and shutdown. The shared setup covers sequential,
+concurrent, distinct-account and mixed capacity scenarios.
