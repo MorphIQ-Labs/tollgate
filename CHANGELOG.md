@@ -7,6 +7,12 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.32.3](https://github.com/MorphIQ-Labs/tollgate/compare/v0.32.2...v0.32.3) - 2026-10-27
+
+### Fixed
+
+- *(deps)* update rustls, rustls-webpki, webpki-roots and quinn-proto for RustSec advisories (#74)
+
 ## [0.32.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.32.1...v0.32.2) - 2026-09-30
 
 ### Added
