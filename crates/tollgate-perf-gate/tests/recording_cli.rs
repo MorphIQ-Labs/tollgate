@@ -292,6 +292,48 @@ fn a_battery_run_is_unenforced_and_contributes_nothing() {
     assert_eq!(fixture.sample_paths().len(), 1);
 }
 
+/// An operating-system or compiler update leaves the host label matching while
+/// the recorded figures stop describing this machine (GH-85). The comparison is
+/// reported and not enforced, and the way out is a whole recording.
+#[test]
+fn a_changed_environment_is_unenforced_until_the_baseline_is_re_recorded() {
+    let fixture = Fixture::new();
+    let updated = [("TOLLGATE_GATE_OS", Some("test-os-updated"))];
+    // A mean far outside the recorded allowance is described, never judged.
+    fixture.measure(1, 150.0);
+    let output = fixture.run(&["--baseline", "baseline.json"], &updated);
+    assert_exit(&output, 4);
+    let report = fixture.read("report.json");
+    assert_eq!(report["passed"], false);
+    assert_eq!(report["baseline"]["enforced"], false);
+    assert_eq!(report["baseline"]["skip_reason"], "environment-mismatch");
+    assert_eq!(report["regressions"][0]["status"], "baseline-skipped");
+    assert_eq!(report["regressions"][0]["ratio"], 1.5);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("test-os-updated"), "{stderr}");
+    assert!(stderr.contains("Re-record"), "{stderr}");
+
+    for run in 2..=3 {
+        fixture.measure(run, 150.0);
+        assert_exit(&fixture.run(&["--baseline", "baseline.json"], &updated), 4);
+    }
+    fixture.measure(4, 150.0);
+    assert_exit(
+        &fixture.run(
+            &["--record", "baseline.json", "--baseline", "baseline.json"],
+            &updated,
+        ),
+        4,
+    );
+    assert_eq!(
+        fixture.read("baseline.json")["host"]["os"],
+        "test-os-updated"
+    );
+    fixture.measure(5, 150.0);
+    assert_exit(&fixture.run(&["--baseline", "baseline.json"], &updated), 0);
+    assert_eq!(fixture.read("report.json")["baseline"]["enforced"], true);
+}
+
 #[test]
 fn a_diagnostic_run_never_deposits_calibration_samples() {
     let fixture = Fixture::new();

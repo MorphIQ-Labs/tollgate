@@ -791,6 +791,44 @@ fn baseline_entries(baseline: &Baseline) -> Result<BTreeMap<String, &BaselineEnt
     Ok(entries)
 }
 
+/// Where a recorded figure is comparable with this run: the fields of the
+/// baseline's measurement environment this run does not reproduce (GH-85). A
+/// host label survives an operating-system or compiler update that moves what
+/// the figures mean. A value the run does not report counts as different.
+fn environment_differences(
+    baseline: &Baseline,
+    var: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let host = &baseline.host;
+    let mut differences: Vec<String> = [
+        ("architecture", "TOLLGATE_GATE_TARGET", &host.architecture),
+        ("cpu", "TOLLGATE_GATE_CPU", &host.cpu),
+        ("os", "TOLLGATE_GATE_OS", &host.os),
+        ("rustc", "TOLLGATE_GATE_RUSTC", &host.rustc),
+    ]
+    .into_iter()
+    .filter_map(|(field, name, recorded)| {
+        let current = var(name).unwrap_or_default();
+        let current = current.trim();
+        (current != recorded).then(|| {
+            let current = if current.is_empty() {
+                "unreported"
+            } else {
+                current
+            };
+            format!("{field}: recorded {recorded:?}, this run {current:?}")
+        })
+    })
+    .collect();
+    if baseline.profile != BASELINE_PROFILE {
+        differences.push(format!(
+            "profile: recorded {:?}, this gate {BASELINE_PROFILE:?}",
+            baseline.profile
+        ));
+    }
+    differences
+}
+
 /// The provenance a recorded baseline must carry, taken from the run that is
 /// about to become it.
 ///
@@ -1555,6 +1593,10 @@ fn on_battery(before: Option<&str>, after: Option<&str>) -> bool {
 fn unenforced_remedy(skip_reason: Option<&str>) -> &'static str {
     match skip_reason {
         Some("on-battery") => "Connect the host to AC power and run again.",
+        Some("environment-mismatch") => {
+            "The host no longer matches what the baseline was recorded in. Re-record the whole \
+             baseline (docs/PERFORMANCE.md)."
+        }
         _ => {
             "Set TOLLGATE_PERF_HOST to the host the baseline names, or run --ratios-only and \
              say so."
@@ -1562,22 +1604,20 @@ fn unenforced_remedy(skip_reason: Option<&str>) -> &'static str {
     }
 }
 
-fn should_enforce_baseline(
-    mode: GateMode,
-    configured_host: Option<&str>,
-    active_host: Option<&str>,
+/// What stops a run on the baseline's own host from being compared with it.
+#[derive(Clone, Copy, Debug, Default)]
+struct Disqualifiers {
+    environment_changed: bool,
     battery: bool,
     untrusted: bool,
-) -> bool {
-    baseline_skip_reason(mode, configured_host, active_host, battery, untrusted).is_none()
 }
 
+/// Why the recorded baseline is not enforced, or `None` when it is.
 fn baseline_skip_reason(
     mode: GateMode,
     configured_host: Option<&str>,
     active_host: Option<&str>,
-    battery: bool,
-    untrusted: bool,
+    run: Disqualifiers,
 ) -> Option<&'static str> {
     match (configured_host, mode, active_host) {
         (None, _, _) => Some("no-baseline-file"),
@@ -1586,10 +1626,14 @@ fn baseline_skip_reason(
         (Some(configured), GateMode::Full, Some(active)) if configured != active => {
             Some("host-mismatch")
         }
-        // Ahead of the trust verdict: a run on battery stays unenforced
-        // however steady its numbers were.
-        (Some(_), GateMode::Full, Some(_)) if battery => Some("on-battery"),
-        (Some(_), GateMode::Full, Some(_)) if untrusted => Some("untrusted-run"),
+        // Ahead of the trust verdict: a run on battery, or in an environment
+        // the baseline was not recorded in, stays unenforced however steady
+        // its numbers were.
+        (Some(_), GateMode::Full, Some(_)) if run.battery => Some("on-battery"),
+        (Some(_), GateMode::Full, Some(_)) if run.environment_changed => {
+            Some("environment-mismatch")
+        }
+        (Some(_), GateMode::Full, Some(_)) if run.untrusted => Some("untrusted-run"),
         (Some(_), GateMode::Full, Some(_)) => None,
     }
 }
@@ -1682,6 +1726,8 @@ struct BaselineReport {
     active_host: Option<String>,
     enforced: bool,
     skip_reason: Option<&'static str>,
+    /// Every field of the recorded environment this run does not reproduce.
+    environment_differences: Vec<String>,
 }
 
 /// What the machine looked like while measuring, so a suspect result can be
@@ -1968,13 +2014,20 @@ fn main() -> ExitCode {
     let untrusted = matches!(trust, Trust::Untrusted { .. });
     let run = RunContext::capture();
     let battery = on_battery(run.power_before.as_deref(), run.power_after.as_deref());
-    let baseline_enforced = should_enforce_baseline(
+    let environment_differences = baseline.as_ref().map_or_else(Vec::new, |baseline| {
+        environment_differences(baseline, |name| std::env::var(name).ok())
+    });
+    let skip_reason = baseline_skip_reason(
         mode,
         baseline.as_ref().map(|baseline| baseline.host.id.as_str()),
         active_host.as_deref(),
-        battery,
-        untrusted,
+        Disqualifiers {
+            environment_changed: !environment_differences.is_empty(),
+            battery,
+            untrusted,
+        },
     );
+    let baseline_enforced = skip_reason.is_none();
     let regressions: Vec<_> = manifest
         .benchmarks
         .iter()
@@ -1995,13 +2048,6 @@ fn main() -> ExitCode {
             eprintln!("{line}");
         }
     }
-    let skip_reason = baseline_skip_reason(
-        mode,
-        baseline.as_ref().map(|baseline| baseline.host.id.as_str()),
-        active_host.as_deref(),
-        battery,
-        untrusted,
-    );
     let drift = run_drift(&regressions);
     if let Some(drift) = drift {
         println!(
@@ -2026,6 +2072,7 @@ fn main() -> ExitCode {
             active_host,
             enforced: baseline_enforced,
             skip_reason,
+            environment_differences,
         },
         drift,
         trust: trust.clone(),
@@ -2201,6 +2248,9 @@ fn main() -> ExitCode {
     }
 
     if baseline_verdict_missing(mode, skip_reason) {
+        for difference in &report.baseline.environment_differences {
+            eprintln!("perf-gate: environment differs, {difference}");
+        }
         eprintln!(
             "perf-gate: UNENFORCED — a full run skipped the recorded baseline ({}). Absolute \
              bounds passing is not a passing baseline comparison, and this report is not \
@@ -3221,34 +3271,45 @@ mod tests {
 
     #[test]
     fn host_mismatch_untrusted_and_ratio_only_runs_skip_the_baseline() {
-        assert!(should_enforce_baseline(
-            GateMode::Full,
-            Some("controlled"),
-            Some("controlled"),
-            false,
-            false
-        ));
-        assert!(!should_enforce_baseline(
-            GateMode::Full,
-            Some("controlled"),
-            Some("another-host"),
-            false,
-            false
-        ));
-        assert!(!should_enforce_baseline(
-            GateMode::Full,
-            Some("controlled"),
-            Some("controlled"),
-            false,
-            true
-        ));
-        assert!(!should_enforce_baseline(
-            GateMode::RatiosOnly,
-            Some("controlled"),
-            Some("controlled"),
-            false,
-            false
-        ));
+        assert_eq!(
+            baseline_skip_reason(
+                GateMode::Full,
+                Some("controlled"),
+                Some("controlled"),
+                Disqualifiers::default()
+            ),
+            None
+        );
+        assert!(
+            baseline_skip_reason(
+                GateMode::Full,
+                Some("controlled"),
+                Some("another-host"),
+                Disqualifiers::default()
+            )
+            .is_some()
+        );
+        assert!(
+            baseline_skip_reason(
+                GateMode::Full,
+                Some("controlled"),
+                Some("controlled"),
+                Disqualifiers {
+                    untrusted: true,
+                    ..Default::default()
+                }
+            )
+            .is_some()
+        );
+        assert!(
+            baseline_skip_reason(
+                GateMode::RatiosOnly,
+                Some("controlled"),
+                Some("controlled"),
+                Disqualifiers::default()
+            )
+            .is_some()
+        );
 
         let entry = BaselineEntry {
             id: "a".to_owned(),
@@ -3260,7 +3321,12 @@ mod tests {
             "baseline-skipped"
         );
         assert_eq!(
-            baseline_skip_reason(GateMode::Full, None, Some("controlled"), false, false),
+            baseline_skip_reason(
+                GateMode::Full,
+                None,
+                Some("controlled"),
+                Disqualifiers::default()
+            ),
             Some("no-baseline-file")
         );
         assert_eq!(
@@ -3268,13 +3334,17 @@ mod tests {
                 GateMode::RatiosOnly,
                 Some("controlled"),
                 Some("controlled"),
-                false,
-                false
+                Disqualifiers::default()
             ),
             Some("ratios-only")
         );
         assert_eq!(
-            baseline_skip_reason(GateMode::Full, Some("controlled"), None, false, false),
+            baseline_skip_reason(
+                GateMode::Full,
+                Some("controlled"),
+                None,
+                Disqualifiers::default()
+            ),
             Some("host-unset")
         );
         assert_eq!(
@@ -3282,8 +3352,7 @@ mod tests {
                 GateMode::Full,
                 Some("controlled"),
                 Some("another-host"),
-                false,
-                false
+                Disqualifiers::default()
             ),
             Some("host-mismatch")
         );
@@ -3292,8 +3361,10 @@ mod tests {
                 GateMode::Full,
                 Some("controlled"),
                 Some("controlled"),
-                false,
-                true
+                Disqualifiers {
+                    untrusted: true,
+                    ..Default::default()
+                }
             ),
             Some("untrusted-run")
         );
@@ -3302,8 +3373,7 @@ mod tests {
                 GateMode::Full,
                 Some("controlled"),
                 Some("controlled"),
-                false,
-                false
+                Disqualifiers::default()
             ),
             None
         );
@@ -3327,14 +3397,84 @@ mod tests {
                     GateMode::Full,
                     Some("controlled"),
                     Some("controlled"),
-                    true,
-                    untrusted
+                    Disqualifiers {
+                        battery: true,
+                        untrusted,
+                        ..Default::default()
+                    }
                 ),
                 Some("on-battery")
             );
         }
         assert!(unenforced_remedy(Some("on-battery")).contains("AC power"));
+        assert!(unenforced_remedy(Some("environment-mismatch")).contains("Re-record"));
         assert!(unenforced_remedy(Some("host-unset")).contains("TOLLGATE_PERF_HOST"));
+    }
+
+    /// The host label alone does not make a recorded figure comparable (GH-85).
+    #[test]
+    fn a_changed_environment_is_named_field_by_field_and_never_enforced() {
+        let baseline: Baseline = serde_json::from_value(serde_json::json!({
+            "host": {
+                "id": "controlled", "architecture": "arch", "cpu": "cpu",
+                "os": "os 1", "rustc": "rustc 1"
+            },
+            "recorded_at": "then", "git_revision": "abc", "profile": BASELINE_PROFILE,
+            "benchmarks": []
+        }))
+        .unwrap();
+        let recorded = [
+            ("TOLLGATE_GATE_TARGET", "arch"),
+            ("TOLLGATE_GATE_CPU", "cpu"),
+            // The wrapper's values are trimmed when recorded, so also here.
+            ("TOLLGATE_GATE_OS", " os 1\n"),
+            ("TOLLGATE_GATE_RUSTC", "rustc 1"),
+        ];
+        let run = |changed: &str, value: Option<&str>| {
+            environment_differences(&baseline, |name| {
+                if name == changed {
+                    return value.map(str::to_owned);
+                }
+                recorded
+                    .iter()
+                    .find(|(known, _)| *known == name)
+                    .map(|(_, value)| (*value).to_owned())
+            })
+        };
+        assert!(run("", None).is_empty());
+        for (name, _) in recorded {
+            for value in [Some("other"), None] {
+                let differences = run(name, value);
+                assert_eq!(differences.len(), 1, "{name} {value:?}: {differences:?}");
+                assert!(differences[0].contains(value.unwrap_or("unreported")));
+            }
+        }
+        let mut other_profile = baseline;
+        other_profile.profile = "production".to_owned();
+        let differences = environment_differences(&other_profile, |name| {
+            recorded
+                .iter()
+                .find(|(known, _)| *known == name)
+                .map(|(_, value)| (*value).to_owned())
+        });
+        assert_eq!(differences.len(), 1);
+        assert!(differences[0].starts_with("profile"));
+
+        for untrusted in [false, true] {
+            assert_eq!(
+                baseline_skip_reason(
+                    GateMode::Full,
+                    Some("controlled"),
+                    Some("controlled"),
+                    Disqualifiers {
+                        environment_changed: true,
+                        untrusted,
+                        ..Default::default()
+                    },
+                ),
+                Some("environment-mismatch")
+            );
+        }
     }
 
     #[test]

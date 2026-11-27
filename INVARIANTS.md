@@ -2521,6 +2521,13 @@ exists to detect corrupt state and must not be able to launder it.
     Legacy samples lacking identity or environment contribute nothing. Ordinary
     gate verdicts remain independent of optional sample collection.
 
+    The recorded baseline is enforced only where it is comparable (GH-85): a
+    full Criterion run whose host label matches but whose target, CPU, OS,
+    compiler or profile differs from the baseline's, or goes unreported, is
+    unenforced and names each difference. Witnesses:
+    `a_changed_environment_is_named_field_by_field_and_never_enforced` and
+    `a_changed_environment_is_unenforced_until_the_baseline_is_re_recorded`.
+
     A timed gate that saw battery power before or after its measurements
     reaches no gating verdict (GH-86): the run is unenforced, contributes no
     sample or history and cannot record. An unreadable power source is not

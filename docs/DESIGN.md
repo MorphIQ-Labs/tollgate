@@ -8423,3 +8423,20 @@ The workflow is read line by line, accepting only the shapes this repository
 writes, rather than adding a YAML dependency. An unfamiliar shape is an error,
 because a job the reader missed would be one nothing requires.
 
+
+## A baseline is enforced only in the environment that recorded it (GH-85, 2026-11-27)
+
+The gate enforced the recorded baseline whenever `TOLLGATE_PERF_HOST` named the
+recorded host. After an operating-system update, one admission row failed by 15%
+against a figure that the baseline's own revision no longer reproduced: that
+revision and `main` measured the same. The label had stayed true while the
+machine it described changed.
+
+The gate now requires the recorded target, CPU, OS, compiler and profile as well,
+which calibration samples already had to share. A difference leaves the run
+unenforced rather than failed, because neither verdict is supported, and the
+ratios stay in the report so a large movement is still visible. The cost is that
+every OS patch or toolchain bump needs a recording of about an hour and a half
+before the baseline gates again. Matching on a coarser version, such as the OS
+minor release, was not taken: nothing establishes which updates leave these
+figures comparable.
