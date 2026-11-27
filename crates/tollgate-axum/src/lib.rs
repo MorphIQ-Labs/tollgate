@@ -151,13 +151,11 @@ where
             .runtime
             .begin(principal, required, now)
             .map_err(|reason| (Rejection::Denied(reason), E::Value::default()))?;
-        match self.config.runtime.recorder().try_reserve() {
-            Ok(permit) => Ok((context, permit)),
-            Err(reason) => {
-                self.config.runtime.counters().record_deny(&reason);
-                let budget = E::read(|| context.observed_budget());
-                Err((Rejection::Denied(reason), budget))
-            }
-        }
+        context
+            .reserve_usage_slot(|| self.config.runtime.recorder().try_reserve())
+            .map_err(|(reason, refused)| {
+                let budget = E::read(|| refused.observed_budget());
+                (Rejection::Denied(reason), budget)
+            })
     }
 }

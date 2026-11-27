@@ -206,10 +206,13 @@ The labels most worth watching, and what their rise means, are in
 `snapshots.unresolved`; `snapshot_expired` is an outage failing closed;
 `accounting_backpressure` is a sink falling behind.
 
-`accounting_backpressure` is decided by the embedder before admission, so it
-counts only if the service calls `AdmissionCounters::record_deny` when it
-sheds; `pricing-api` does. Refusals at execution start are never counted here;
-they are `commit_refusals`.
+`accounting_backpressure` is decided before admission, where the service
+reserves the usage slot. It is counted when the service reserves through
+`RequestContext::reserve_usage_slot`, as the Axum adapter does; a refusal there
+is a denial and not also an abandoned context. A refusal the engine never sees,
+such as a credential that fails verification, counts only if the service calls
+`AdmissionCounters::record_deny`. Refusals at execution start are never counted
+here; they are `commit_refusals`.
 
 The `AdmissionCounters` tallies are relaxed atomics that wrap at `u64::MAX`
 rather than saturate: a wrapped monitoring counter is not a correctness event,

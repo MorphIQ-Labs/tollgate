@@ -250,6 +250,50 @@ async fn the_budget_route_converges_on_settled_charges() {
     runtime.shutdown().await.unwrap();
 }
 
+/// A request shed on accounting backpressure has one outcome, the refusal. It
+/// is not also a context that was abandoned (INVARIANTS.md 20), on any route
+/// that stages a request.
+#[tokio::test(start_paused = true)]
+async fn a_backpressure_shed_is_one_denial_and_abandons_nothing() {
+    let (adapter, runtime, _, _) = fixture_with(NoGate, 8, CapacityClass::Assured).await;
+    let seen = Seen::default();
+    let silent = Router::new().route(
+        "/silent",
+        adapter.post(
+            Op,
+            ROUTE,
+            || Ok(Validated::new((), 1)),
+            |(), _| async { panic!("a shed request must not execute") },
+        ),
+    );
+    let app = reporting_routes(&adapter, &seen).merge(silent);
+    let held: Vec<_> = (0..8)
+        .map(|_| adapter.runtime().recorder().try_reserve().unwrap())
+        .collect();
+    for path in ["/", "/fixed", "/silent"] {
+        let response = app.clone().oneshot(to(path, "1")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let prepared = adapter
+        .prepare_json::<u64>(to("/", "1"), ROUTE, limits(100))
+        .await;
+    assert!(matches!(
+        prepared,
+        Err(Rejection::Denied(DenyReason::AccountingBackpressure))
+    ));
+
+    let counts = adapter.runtime().counters().snapshot();
+    assert_eq!(counts.denied(), 4);
+    assert_eq!(
+        counts.denials[DenyReason::AccountingBackpressure.index()],
+        4
+    );
+    assert_eq!(counts.contexts_abandoned, 0);
+    assert_eq!(counts.admitted, 0);
+    drop(held);
+    assert_eq!(runtime.shutdown().await.unwrap().usage.unwrap().accepted, 0);
+}
+
 /// What each callback of a reporting route was handed, in order.
 type Seen = Arc<Mutex<Vec<(&'static str, Option<BudgetView>)>>>;
 

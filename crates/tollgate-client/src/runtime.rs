@@ -563,7 +563,9 @@ impl RuntimeHandle {
     }
     /// The usage queue's request-side handle. Reserve a permit with
     /// [`UsageRecorder::try_reserve`] before admitting work, so a full queue
-    /// sheds before anything is charged (INVARIANTS.md 8).
+    /// sheds before anything is charged (INVARIANTS.md 8). For a begun
+    /// request, call it inside
+    /// [`RequestContext::reserve_usage_slot`], which counts a refusal once.
     #[must_use]
     pub fn recorder(&self) -> &UsageRecorder {
         &self.shared.recorder

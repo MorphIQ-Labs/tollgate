@@ -68,6 +68,7 @@ jq -s -e '
   and any(.[]; .scope == "axum/prepared_admission_through_record" and .attribution == "tollgate")
   and any(.[]; .scope == "axum/wrapped_http" and .attribution == "caller")
   and any(.[]; .scope == "admission/budget_read" and .attribution == "tollgate")
+  and any(.[]; .scope == "admission/slot_refused" and .attribution == "tollgate")
   and any(.[]; .scope == "axum/budget_read" and .attribution == "tollgate")
   and any(.[]; .scope == "axum/wrapped_http_with_budget" and .attribution == "caller")
   and any(.[]; .scope == "auth/projected_cache_hit" and .attribution == "tollgate")

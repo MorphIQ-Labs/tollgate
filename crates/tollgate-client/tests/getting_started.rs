@@ -144,9 +144,10 @@ async fn getting_started() {
         .expect("a known, active caller with the permission");
     // 2. Reserve room for the billing event before reading the request body,
     //    so a full usage queue sheds load before any work is done.
-    let slot = handle
-        .recorder()
-        .try_reserve()
+    //    A refusal here consumes the context and is counted for you.
+    let (context, slot) = context
+        .reserve_usage_slot(|| handle.recorder().try_reserve())
+        .map_err(|(reason, _refused)| reason)
         .expect("the usage queue has room");
     // 3. Quote the workload and debit the local lease: three quotes and one
     //    report cost 5 + 3 × 1 + 1 × 20 = 28 units.

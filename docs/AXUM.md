@@ -16,10 +16,10 @@ cargo test -p tollgate-axum --test getting_started
 cargo run -p pricing-api --bin pricing-api
 ```
 
-The adapter is new on the integration branch and is not part of the existing
-0.32.1 registry release. Use this workspace until the release publishes it;
-then add `tollgate-axum` at the same version as the other Tollgate libraries.
-The adapter targets Axum 0.8. An attribute macro is not provided.
+Add `tollgate-axum` at the same version as the other Tollgate libraries. It is
+published from release 0.32.2. A registry release can trail this page; the
+workspace checkout always matches it. The adapter targets Axum 0.8. An
+attribute macro is not provided.
 
 ## Set up the account and runtime once
 

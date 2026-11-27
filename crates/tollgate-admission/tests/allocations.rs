@@ -11,9 +11,9 @@ use tollgate_admission::{
 };
 use tollgate_alloc_count::AllocScope;
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, BudgetView, CostTable, CostUnits, EnforcementMode,
-    FencingToken, Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, Locality, OpIndex,
-    PermissionBits, ResolvedLimits, UsageEvent, UsageSlot,
+    AccountId, AccountSnapshot, AccountStatus, BudgetView, CostTable, CostUnits, DenyReason,
+    EnforcementMode, FencingToken, Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding,
+    Locality, OpIndex, PermissionBits, ResolvedLimits, UsageEvent, UsageSlot,
 };
 
 tollgate_alloc_count::install!();
@@ -298,6 +298,24 @@ fn a_budget_read_allocates_nothing() {
     let read = |principal| engine.read_budget(principal, PermissionBits::bit(0), now());
     assert_eq!(read(Principal(1)), Ok(Some(view)));
     assert!(read(Principal(2)).is_err());
+
+    let begin = || {
+        engine
+            .begin(Principal(1), PermissionBits::bit(0), now())
+            .unwrap()
+    };
+    let (reserving, refusing) = (begin(), begin());
+    assert_zero("admission/slot_reserved", || {
+        black_box(reserving.reserve_usage_slot(|| Ok(AllocationSlot)).unwrap());
+    });
+    assert_zero("admission/slot_refused", || {
+        let refused = refusing
+            .reserve_usage_slot(|| Err::<AllocationSlot, _>(DenyReason::AccountingBackpressure));
+        assert_eq!(
+            black_box(refused).unwrap_err().1.observed_budget(),
+            Some(view)
+        );
+    });
 
     assert_zero("admission/budget_read", || {
         assert_eq!(black_box(read(Principal(1))), Ok(Some(view)));

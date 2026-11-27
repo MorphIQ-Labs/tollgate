@@ -1094,11 +1094,11 @@ Three things fell out of building it that were not obvious from the issue:
 
 `units_admitted` counts what admission *quoted*, never what was billed: a
 reservation cancelled before execution charges zero, and usage events remain
-the billing record (see "Two ledgers, one truth"). Refusals decided before the
-engine is consulted — accounting backpressure under INVARIANTS GL-8, and a
-credential that fails verification — are recorded by the embedder against the
-same tally, so no reason exports a permanent zero that would read as "this
-never happens". The example exposes the tallies as JSON on `/metrics`
+the billing record (see "Two ledgers, one truth"). A refusal decided before the
+engine is consulted, such as a credential that fails verification, is recorded
+by the embedder against the same tally, and accounting backpressure under
+INVARIANTS GL-8 is recorded where the begun request reserves its usage slot, so
+no reason exports a permanent zero that would read as "this never happens". The example exposes the tallies as JSON on `/metrics`
 deliberately: naming the metrics is this change; choosing an exposition format
 and documenting it for operators belongs to GL-38 and GL-39.
 
@@ -2053,12 +2053,25 @@ impl RequestContext {
     pub fn estimate_remaining(&self) -> Option<CostUnits>;
     pub fn observed_budget(&self) -> Option<BudgetView>;
 
+    pub fn reserve_usage_slot<S: UsageSlot>(
+        self,
+        reserve: impl FnOnce() -> Result<S, DenyReason>,
+    ) -> Result<(Self, S), (DenyReason, RefusedContext)>;
+
     pub fn admit<O: OpIndex, S: UsageSlot>(
         self,
         workload: &[(O, u64)],
         slot: S,
         now: Timestamp,
     ) -> Result<Pending<S>, DenyReason>;
+}
+
+pub struct RefusedContext {
+    // The consumed context's state, for reporting only.
+}
+
+impl RefusedContext {
+    pub fn observed_budget(&self) -> Option<BudgetView>;
 }
 ```
 
@@ -2140,13 +2153,15 @@ event. A custom implementation inherits the same contract: it is verified
 capacity for exactly one event, not permission to perform fallible I/O from
 `Committed::drop`.
 
-The supported request order is authenticate, `begin`, reserve the usage slot,
-read/decode under `ctx.limits()`, then call `ctx.admit`. Reserving after
+The supported request order is authenticate, `begin`, reserve the usage slot
+through `ctx.reserve_usage_slot`, read/decode under `ctx.limits()`, then call
+`ctx.admit`. Reserving after
 `begin` means an unknown or unauthorized credential never occupies the usage
 queue, while reserving before body allocation still sheds backpressure before
 expensive input work and remains "before admission" for INVARIANTS GL-8: the
 stage that can create pending funding has not run. A body-read failure drops
-the context and slot and creates no funding reservation.
+the context and slot and creates no funding reservation. A refused reservation
+consumes the context and is counted as that request's denial.
 
 **A workload is a borrowed list of compiled class aggregates.** The public
 form is `&[(O, u64)]` with `O: OpIndex`: a caller may use a stack array or its
@@ -8546,3 +8561,29 @@ Compatibility: additions only to `tollgate-admission`, `tollgate-client` and
 `tollgate-axum`. `pricing-api`'s `GET /v1/budget` keeps its success shape and
 statuses; a `401` now has a problem body, and a server mounted without
 connection state answers `500`.
+
+### A refused reservation is one outcome (GH-81)
+
+The adapter shed a full usage queue by recording an `accounting_backpressure`
+denial and then dropping the context `begin` had returned, so each shed was also
+counted as `contexts_abandoned`: one request, two outcomes. It came in with the
+staged order, which put the one embedder-decided refusal after the context that
+counts its own disappearance, and left the two tallies to the caller to
+reconcile. The witnesses asserted the denial count and never the abandoned one,
+and the invariant's own text still described the refusal as one made before the
+engine was reached.
+
+`RequestContext::reserve_usage_slot` runs the reservation itself, so the
+refusal, its count and the context's consumption are one step, and a caller has
+no count to record or forget. A bare `refuse(reason)` on the context was weaker:
+nothing would tie it to the reservation, and the natural code, `?` on
+`try_reserve`, would still compile into an uncounted shed. The slot stays
+generic over `UsageSlot`, so admission gains no dependency on the writer. It is
+not unrepresentable: `try_reserve` and `record_deny` remain public for callers
+without a context. Success moves the context and allocates nothing.
+
+Instances report fewer `contexts_abandoned` under backpressure than before. The
+denial and the queue's own `shed` count are unchanged. Embedders that reserve
+beside the context keep working and keep the double count until they adopt the
+method.
+

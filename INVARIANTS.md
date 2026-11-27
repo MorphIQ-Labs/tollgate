@@ -1371,8 +1371,21 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     once, so its `Drop` records the zero-charge outcome for any request no
     later phase claimed, including a pending state that was simply abandoned.
 
-    A context dropped before stage two creates neither pending funding nor an
-    admission outcome, and is counted as `contexts_abandoned` — its own phase,
+    One refusal can come between the two stages: the usage-slot reservation
+    (8). `RequestContext::reserve_usage_slot` owns it. A refusal consumes the
+    context and records that request's one outcome, a denial under the
+    reservation's reason; success hands the context back with the slot and
+    records nothing. The returned `RefusedContext` can report the budget and
+    cannot admit, which a compile-fail doctest on the type witnesses. This is
+    rung 2: an embedder that reserves beside the context instead can still
+    count a request twice, which the method and `record_deny` document.
+    *Tests:* `a_refused_slot_reservation_is_one_denial_and_no_abandonment`,
+    `a_reserved_slot_leaves_the_outcome_to_the_context`, and
+    `a_backpressure_shed_is_one_denial_and_abandons_nothing`.
+
+    A context dropped before stage two with no outcome recorded creates neither
+    pending funding nor an admission outcome, and is counted as
+    `contexts_abandoned` — its own phase,
     neither an admission nor a denial. Counting it is the point: an instance
     authenticating a flood of requests whose bodies never arrive would
     otherwise be indistinguishable from one serving nothing.
@@ -1419,8 +1432,8 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     it is pinned by literal rather than left to the permutation check. Denials add no units, because a
     refusal charges zero (2). `units_admitted` counts what was *quoted*, not
     what was billed — usage events remain the billing record. Refusals decided
-    before the engine is reached (accounting backpressure, 8) are recorded by
-    the embedder against the same tally, so no reason exports a permanent zero
+    before the engine is reached (a credential that fails verification) are
+    recorded by the embedder against the same tally, so no reason exports a permanent zero
     that reads as "never happens". An admission that no lease funded is counted
     under `admitted` *and* under `admitted_overage`, a qualifier rather than a
     sibling, so a reader of `admitted` never has to add two numbers to get the

@@ -18,7 +18,8 @@ use crate::state::{AccountAdmissionState, ConcurrencyGuard, MapEntry, Principal,
 /// Generation-pinned stage-one evidence, owned across body decoding.
 #[derive(Debug)]
 pub struct RequestContext {
-    /// `Option` so `admit` can *move* the state out rather than clone it.
+    /// `Option` so a consuming stage can *move* the state out rather than clone
+    /// it.
     ///
     /// The counter below needs a `Drop`, and a type with `Drop` cannot be
     /// destructured — but cloning the `Arc` to work around that would put a
@@ -26,7 +27,7 @@ pub struct RequestContext {
     /// counter that only fires when the request ends early. `Option<Arc<_>>`
     /// is niche-optimized to the same size as the `Arc`, so taking it costs
     /// one null write and no atomic, and the `None` it leaves behind is
-    /// exactly the "this context was consumed" signal `Drop` needs.
+    /// exactly the "this context's outcome was decided" signal `Drop` needs.
     state: Option<Arc<AccountAdmissionState>>,
     locality: Locality,
 }
@@ -67,7 +68,7 @@ impl RequestContext {
     }
 
     /// The pinned state. Present for the whole of a context's public life:
-    /// only `admit` takes it, and `admit` consumes the context.
+    /// only a method that consumes the context takes it.
     #[inline]
     fn state(&self) -> &AccountAdmissionState {
         self.state
@@ -93,6 +94,41 @@ impl RequestContext {
     #[must_use]
     pub fn observed_budget(&self) -> Option<BudgetView> {
         self.state().observed_budget()
+    }
+
+    /// Reserve the request's usage slot, the step between stage one and the
+    /// body read that can still refuse it (INVARIANTS.md 8).
+    ///
+    /// On success the context and the slot come back together, to be read under
+    /// and then passed to [`admit`](Self::admit). On refusal the context is
+    /// consumed and `reserve`'s reason is **the request's one outcome**: it is
+    /// counted here as a denial, under that reason, and the request is not also
+    /// counted as an abandoned context (INVARIANTS.md 20). The caller records
+    /// nothing further. `reserve` runs once and must be local and nonblocking,
+    /// as `UsageRecorder::try_reserve` is.
+    ///
+    /// Reserving outside this method leaves the context to count the request a
+    /// second time when it is dropped.
+    ///
+    /// # Errors
+    ///
+    /// The reason `reserve` refused with, and the [`RefusedContext`] that can
+    /// still report the account's budget on the refusal.
+    pub fn reserve_usage_slot<S: UsageSlot>(
+        mut self,
+        reserve: impl FnOnce() -> Result<S, DenyReason>,
+    ) -> Result<(Self, S), (DenyReason, RefusedContext)> {
+        match reserve() {
+            Ok(slot) => Ok((self, slot)),
+            Err(reason) => {
+                let state = self
+                    .state
+                    .take()
+                    .expect("a request context holds its pinned state until it is consumed");
+                state.counters.record_deny_at(&reason, self.locality);
+                Err((reason, RefusedContext { state }))
+            }
+        }
     }
 
     /// Price the decoded workload and reserve funding for it: stage two of
@@ -151,18 +187,51 @@ impl RequestContext {
 impl Drop for RequestContext {
     fn drop(&mut self) {
         let Some(state) = &self.state else {
-            // `admit` took the state, so stage two ran and recorded its own
-            // outcome.
+            // `admit` or a refused slot reservation took the state, and
+            // recorded the request's outcome.
             return;
         };
-        // Reached only when the context was never consumed by `admit`: the
-        // request authenticated and pinned a generation, then ended before
-        // stage two — a failed body read, a client disconnect, a refused
+        // Reached only when nothing decided an outcome: the request
+        // authenticated and pinned a generation, then ended before stage two — a failed body read, a client disconnect, a refused
         // decode. No pending funding exists and no admission outcome was
         // decided, so this is neither an admission nor a denial. Counting it
         // is what keeps an instance that authenticates a flood it never admits
         // distinguishable from one serving nothing (INVARIANTS.md GL-20).
         state.counters.record_context_abandoned();
+    }
+}
+
+/// A request refused between stage one and stage two, already counted.
+///
+/// It holds what the consumed [`RequestContext`] pinned, so a refusal can
+/// still be answered with the account's budget, and offers no way to admit.
+///
+/// ```compile_fail,E0599
+/// # fn retry(refused: tollgate_admission::RefusedContext) {
+/// # use tollgate_core::DiscardedUsageSlot;
+/// # let (slot, now): (DiscardedUsageSlot, jiff::Timestamp) = unimplemented!();
+/// refused.admit::<usize, _>(&[], slot, now);
+/// # }
+/// ```
+///
+/// Its companion, so the refusal above is a refusal to *admit* rather than of
+/// a type that stopped existing:
+///
+/// ```
+/// # fn answer(refused: tollgate_admission::RefusedContext) {
+/// let _budget = refused.observed_budget();
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct RefusedContext {
+    state: Arc<AccountAdmissionState>,
+}
+
+impl RefusedContext {
+    /// See [`AccountAdmissionState::observed_budget`]. Read live.
+    #[must_use]
+    pub fn observed_budget(&self) -> Option<BudgetView> {
+        self.state.observed_budget()
     }
 }
 
@@ -2725,6 +2794,65 @@ mod tests {
             "an exhausted rate limit and a full concurrency gauge do not refuse a read"
         );
         let _released = pending.cancel();
+    }
+
+    // --- A refusal between the two stages -------------------------------------
+
+    /// A refused slot reservation is the request's one outcome: a denial under
+    /// the reservation's own reason, never also an abandoned context, and the
+    /// account's budget can still be reported on it.
+    #[test]
+    fn a_refused_slot_reservation_is_one_denial_and_no_abandonment() {
+        let engine = budgeted_engine(1_000, 1);
+        let context = engine
+            .begin(Principal(1), PermissionBits::bit(0), t(0))
+            .expect("begins");
+
+        let (reason, refused) = context
+            .reserve_usage_slot(|| Err::<DiscardedUsageSlot, _>(DenyReason::AccountingBackpressure))
+            .expect_err("the reservation refused");
+
+        assert_eq!(reason, DenyReason::AccountingBackpressure);
+        assert_eq!(
+            refused.observed_budget().map(|view| view.balance),
+            Some(CostUnits(1_000))
+        );
+        drop(refused);
+        let counters = engine.counters().snapshot();
+        assert_eq!(counters.denied(), 1);
+        assert_eq!(
+            counters.denials[DenyReason::AccountingBackpressure.index()],
+            1
+        );
+        assert_eq!(counters.contexts_abandoned, 0);
+        assert_eq!(counters.admitted, 0);
+    }
+
+    /// A reservation that succeeds decides nothing: the same context goes on,
+    /// to be admitted, or to be counted as abandoned if it ends here.
+    #[test]
+    fn a_reserved_slot_leaves_the_outcome_to_the_context() {
+        let engine = engine_with(AccountStatus::Active, Some(10_000));
+        let reserved = || {
+            engine
+                .begin(Principal(1), PermissionBits::bit(0), t(0))
+                .expect("begins")
+                .reserve_usage_slot(|| Ok(DiscardedUsage::new().slot()))
+                .expect("the reservation succeeds")
+        };
+
+        let (context, slot) = reserved();
+        assert_eq!(engine.counters().snapshot().contexts_abandoned, 0);
+        context
+            .admit(&[(Op::Price, 1)], slot, t(0))
+            .expect("admits")
+            .cancel();
+        drop(reserved());
+
+        let counters = engine.counters().snapshot();
+        assert_eq!(counters.admitted, 1);
+        assert_eq!(counters.contexts_abandoned, 1);
+        assert_eq!(counters.denied(), 0);
     }
 
     fn request(items: u64) -> TestRequest<'static, Op> {

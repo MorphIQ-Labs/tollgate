@@ -1,9 +1,10 @@
 # Changelog
 
-All notable Tollgate changes are recorded here. A release is prepared in an
-ordinary merge request that bumps the workspace version and writes the section
-below; the `tag-release` job then cuts the `v{version}` tag and the GitLab
-release from that section when the merge request lands.
+All notable Tollgate changes are recorded here. After each merge to `main`, the
+release workflow's `prepare` job opens or refreshes a release pull request that
+bumps the workspace version and writes the section below from the commit
+subjects. When that pull request lands, its `tag` job cuts the `v{version}` tag
+and the GitHub release from that section.
 
 ## [Unreleased]
 
