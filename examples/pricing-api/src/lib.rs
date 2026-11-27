@@ -734,10 +734,15 @@ fn runtime_config(
 pub struct RemoteConfig {
     /// The control plane's base URL.
     pub control_url: String,
-    /// This instance's `instance`-role bearer credential.
-    pub control_token: tollgate_client::BearerToken,
+    /// This instance's `instance`-role bearer credential. `None` when the
+    /// client certificate alone identifies the instance.
+    pub control_token: Option<tollgate_client::BearerToken>,
     /// The server's credential-issuer secret, which verifies customer keys.
     pub credential_secret: Vec<u8>,
+    /// CA certificates that replace the public roots for verifying the server.
+    pub control_ca_pem: Option<Vec<u8>>,
+    /// Client certificate chain and key this instance presents for mutual TLS.
+    pub control_identity_pem: Option<tollgate_client::Zeroizing<Vec<u8>>>,
     pub timing: ControlPlaneTiming,
     pub target_grant: CostUnits,
     pub low_water: CostUnits,
@@ -756,7 +761,12 @@ pub async fn build_remote_app(
     let store = tollgate_client::HttpStore::with_config(
         config.control_url,
         tollgate_client::HttpStoreConfig {
-            bearer: Some(tollgate_client::StaticBearer::new(config.control_token)),
+            bearer: config.control_token.map(|token| {
+                tollgate_client::StaticBearer::new(token)
+                    as Arc<dyn tollgate_client::BearerProvider>
+            }),
+            root_ca_pem: config.control_ca_pem,
+            identity_pem: config.control_identity_pem,
             ..Default::default()
         },
     )

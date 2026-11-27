@@ -246,6 +246,9 @@ With `PRICING_CONTROL_URL` set, the same service runs against that server
 instead of an embedded store, given an instance credential in
 `PRICING_CONTROL_TOKEN_FILE` and the server's issuer secret in
 `PRICING_CREDENTIAL_SECRET_FILE`; `--help` lists the timing settings.
+`PRICING_CONTROL_CA_FILE` trusts a private CA, and
+`PRICING_CONTROL_IDENTITY_FILE` presents a client certificate for mutual TLS,
+which can replace the bearer credential.
 `GET /v1/budget` reports the customer's balance estimate.
 `./scripts/check_e2e.sh` runs that deployment end to end over PostgreSQL.
 

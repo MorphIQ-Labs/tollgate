@@ -8440,3 +8440,17 @@ every OS patch or toolchain bump needs a recording of about an hour and a half
 before the baseline gates again. Matching on a coarser version, such as the OS
 minor release, was not taken: nothing establishes which updates leave these
 figures comparable.
+
+## Faults reach the deployment from outside it (GH-80, 2026-11-27)
+
+Outage and partition scenarios put a TCP forwarder between real processes: one
+between the server and its database, and one in front of the server for the
+instance to be isolated. Stalling it keeps connections open while nothing
+crosses; cutting it closes them. No process is told, so what is exercised is
+each component's own timeouts, retries and idempotency.
+
+Mutual TLS could not be exercised because the example application had no way to
+trust a private CA or present a client certificate, although `HttpStore`
+supported both. It now reads both from files, and `tollgate-client` re-exports
+the `Zeroizing` its configuration requires, so an embedder does not have to
+match the dependency's version itself.

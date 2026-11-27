@@ -2946,6 +2946,7 @@ name = "tollgate-e2e"
 version = "0.33.0"
 dependencies = [
  "jiff",
+ "rcgen",
  "reqwest",
  "serde",
  "serde_json",

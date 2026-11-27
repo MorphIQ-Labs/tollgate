@@ -245,6 +245,9 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    These proofs assume serialized ledger/publication transitions; backend,
    transport, arithmetic and allocation tests are separate implementation evidence.
 
+    Deployed witness, with the ledger holding every unfunded unit:
+    `elastic_overage_is_capped_per_instance_and_recorded`.
+
 2. **Zero charge before execution.** A reservation that never reaches
    `commit_at_execution_start` charges zero units, and its units return to the
    local lease. Dropping a pending reservation is a release, not a leak.
@@ -598,7 +601,9 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    `mismatched_local_sharding_is_rejected_before_tasks_start`.
 
     Deployed witness, through a server process stopped and restarted:
-    `instances_serve_through_a_server_restart_and_then_settle`.
+    `instances_serve_through_a_server_restart_and_then_settle`,
+    and through a severed or stalled network path:
+    `a_partitioned_instance_serves_locally_and_settles_after_healing`.
 
 7. **Idempotent partial accounting.** Replaying a usage batch (same request
    IDs) never double-bills. Every successful mixed batch classifies each
@@ -1028,6 +1033,8 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
 
     Deployed witness, from HTTP responses to the settled ledger:
     `traffic_across_instances_is_billed_to_the_ledger`.
+    Through a database outage, billed once:
+    `a_database_outage_delays_billing_without_losing_or_repeating_it`.
 
 14. **Account creation is never destructive.** Recreating an existing
     account is a surfaced `AlreadyExists` in every backend — never an
@@ -2317,6 +2324,10 @@ exists to detect corrupt state and must not be able to launder it.
     `pending_tls_handshakes_are_bounded_expire_and_drop_with_the_listener`,
     `a_refused_role_is_audited_with_its_actor_role_and_action`,
     `full_stack_over_tls_bearer` and `full_stack_over_mtls`.
+
+    Deployed witnesses, between separate processes:
+    `a_deployment_over_tls_bills_and_settles` and
+    `mutual_tls_serves_a_mapped_instance_and_nothing_else`.
 
 33. **An administrative audit receipt describes its own serialized mutation.**
     Each successful HTTP-facing store mutation returns a typed receipt

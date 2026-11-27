@@ -365,6 +365,24 @@ fn remote_configuration_is_validated_without_disclosing_credentials() {
             );
         }
     }
+    for setting in ["PRICING_CONTROL_CA_FILE", "PRICING_CONTROL_IDENTITY_FILE"] {
+        refused(
+            remote().env(setting, directory.path().join("absent")),
+            &format!("cannot read {setting}"),
+        );
+    }
+    // A private CA or a client certificate means nothing over plaintext.
+    for setting in ["PRICING_CONTROL_CA_FILE", "PRICING_CONTROL_IDENTITY_FILE"] {
+        refused(remote().env(setting, &secret), "control-plane transport");
+    }
+    // A client certificate identifies the instance, so no bearer is needed:
+    // the refusal is about the transport, not a missing token.
+    refused(
+        remote()
+            .env_remove("PRICING_CONTROL_TOKEN_FILE")
+            .env("PRICING_CONTROL_IDENTITY_FILE", &secret),
+        "control-plane transport",
+    );
     // A refresh slower than the credential evidence window allows.
     refused(
         remote().env("PRICING_REFRESH_MS", "600000"),
