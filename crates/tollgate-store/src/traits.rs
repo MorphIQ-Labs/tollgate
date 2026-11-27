@@ -1300,6 +1300,11 @@ pub trait AdminStore: Send + Sync {
     /// Bounded, and saturating means there is more: every scheduled account
     /// comes due at the same instant, so a caller must drain saturated batches
     /// until one comes back partial. Unscheduled accounts are never selected.
+    ///
+    /// Other work on a due account delays its crossing and does not cancel it:
+    /// a backend that sets such an account aside must come back for it within
+    /// the pass. An account in constant use, as an exhausted one is while its
+    /// instances ask for more, would otherwise never be crossed.
     async fn roll_due_periods(
         &self,
         now: Timestamp,

@@ -275,7 +275,9 @@ with backend records rather than inferring rollback from shutdown.
 
 This health policy observes completed outcomes and task liveness. It adds no
 timeout or cancellation deadline to a backend call that remains pending, and it
-does not certify that `SKIP LOCKED` left no rows with another replica. Backend
+does not certify that `SKIP LOCKED` left no leases with another replica. A
+rollover pass waits for an account row that other work holds, so a database
+session that holds one indefinitely stalls maintenance behind it. Backend
 futures must yield to the executor for task supervision and cancellation to run.
 
 There are no Rust signature, database or wire-schema changes. Readiness is

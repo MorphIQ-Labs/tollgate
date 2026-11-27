@@ -994,6 +994,45 @@ const RECLAIM_DUE_LEASES_SQL: &str = "SELECT lease_id, account_id, granted, used
      ORDER BY expires_at_floor_us, expires_at_submicro_ns
      LIMIT $3 FOR UPDATE SKIP LOCKED";
 
+/// Cross the boundary for the due accounts that `$selection` picks and locks.
+macro_rules! cross_periods {
+    ($selection:literal) => {
+        concat!(
+            "WITH due AS (
+         SELECT account_id, allowance_balance AS prior, budget_allowance AS allowance,
+                period_start_us AS crossed_from
+         FROM tollgate_accounts
+         WHERE budget_allowance IS NOT NULL
+           AND budget_period = $1 AND period_start_us < $2
+         ",
+            $selection,
+            "
+     )
+     UPDATE tollgate_accounts AS account SET
+         deposited = account.deposited + due.allowance,
+         expired = account.expired + due.prior,
+         balance = account.balance - due.prior + due.allowance,
+         allowance_balance = due.allowance,
+         period_start_us = $2
+     FROM due
+     WHERE account.account_id = due.account_id
+     RETURNING due.account_id, due.allowance, due.prior, due.crossed_from"
+        )
+    };
+}
+
+/// A crossing's result row, with the boundary it crossed from.
+fn rolled_account(row: &sqlx::postgres::PgRow) -> Result<(i64, RolledAccount), StoreError> {
+    Ok((
+        row.get::<i64, _>(3),
+        RolledAccount {
+            account_id: AccountId(id_from(&row.get::<Vec<u8>, _>(0))),
+            deposited: to_units(row.get::<i64, _>(1), "budget allowance")?,
+            expired: to_units(row.get::<i64, _>(2), "expiring allowance")?,
+        },
+    ))
+}
+
 /// The rollover sweep's selection, hoisted and fixed for the same reason
 /// (GL-65's sibling) — but it needed two changes, not one.
 ///
@@ -1022,23 +1061,21 @@ const RECLAIM_DUE_LEASES_SQL: &str = "SELECT lease_id, account_id, granted, used
 /// `the_rollover_sweep_reaches_its_index_instead_of_sorting_the_due_set`
 /// forbids (GL-65) — so the page is ordered in Rust instead, where it is bounded
 /// by the batch limit rather than by how many accounts are due.
-const DUE_PERIODS_SQL: &str = "WITH due AS (
-         SELECT account_id, allowance_balance AS prior, budget_allowance AS allowance,
-                period_start_us AS crossed_from
-         FROM tollgate_accounts
-         WHERE budget_allowance IS NOT NULL
-           AND budget_period = $1 AND period_start_us < $2
-         ORDER BY period_start_us LIMIT $3 FOR UPDATE SKIP LOCKED
-     )
-     UPDATE tollgate_accounts AS account SET
-         deposited = account.deposited + due.allowance,
-         expired = account.expired + due.prior,
-         balance = account.balance - due.prior + due.allowance,
-         allowance_balance = due.allowance,
-         period_start_us = $2
-     FROM due
-     WHERE account.account_id = due.account_id
-     RETURNING due.account_id, due.allowance, due.prior, due.crossed_from";
+const DUE_PERIODS_SQL: &str =
+    cross_periods!("ORDER BY period_start_us LIMIT $3 FOR UPDATE SKIP LOCKED");
+
+/// Accounts still behind their boundary, oldest first: what the page above left
+/// because something held the row.
+const OVERDUE_ACCOUNTS_SQL: &str = "SELECT account_id FROM tollgate_accounts
+     WHERE budget_allowance IS NOT NULL
+       AND budget_period = $1 AND period_start_us < $2
+     ORDER BY period_start_us LIMIT $3";
+
+/// One such account's crossing, waiting for its row. Autocommitted, so it holds
+/// no other row lock while it waits and cannot be part of a deadlock; the
+/// boundary test is re-applied to the row it eventually locks, so a pass that
+/// lost the race changes nothing.
+const OVERDUE_PERIOD_SQL: &str = cross_periods!("AND account_id = $3 FOR UPDATE");
 
 fn id_bytes(id: u128) -> Vec<u8> {
     id.to_be_bytes().to_vec()
@@ -3104,11 +3141,10 @@ impl AdminStore for PostgresStore {
                 break;
             }
             // One statement, so the selection and the crossing cannot be
-            // separated. `FOR UPDATE SKIP LOCKED` is what lets replicas
-            // cooperate: a concurrent pass skips the rows this one holds, and
-            // once this commits their `period_start_us < boundary` test is
-            // false — so a boundary is crossed exactly once however many
-            // passes race it.
+            // separated: once it commits, `period_start_us < boundary` is
+            // false for every row it took, so a boundary is crossed exactly
+            // once however many passes race it. The page skips locked rows so
+            // that one of them does not hold up the rest.
             //
             // The prior `allowance_balance` is read in the CTE because the
             // UPDATE cannot return it: PostgreSQL's RETURNING sees the new row
@@ -3121,15 +3157,39 @@ impl AdminStore for PostgresStore {
                 .await
                 .map_err(storage)?;
 
-            for row in rows {
-                rolled.push((
-                    row.get::<i64, _>(3),
-                    RolledAccount {
-                        account_id: AccountId(id_from(&row.get::<Vec<u8>, _>(0))),
-                        deposited: to_units(row.get::<i64, _>(1), "budget allowance")?,
-                        expired: to_units(row.get::<i64, _>(2), "expiring allowance")?,
-                    },
-                ));
+            let page = i64::try_from(rows.len())
+                .map_err(|_| StoreError("rollover batch row count exceeds i64 range".into()))?;
+            for row in &rows {
+                rolled.push(rolled_account(row)?);
+            }
+            if page >= remaining {
+                continue;
+            }
+
+            // A skipped row may be held by ordinary traffic rather than by
+            // another pass: every acquire locks its account, and instances
+            // asking for an exhausted account's next lease keep its row held
+            // almost continuously. Skipping it again on every tick would
+            // withhold the allowance from exactly the account waiting for it,
+            // so what is left is crossed one row at a time, queueing for each.
+            let overdue = sqlx::query_scalar::<_, Vec<u8>>(OVERDUE_ACCOUNTS_SQL)
+                .bind(period.as_str())
+                .bind(boundary_us)
+                .bind(remaining - page)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(storage)?;
+            for account in overdue {
+                let row = sqlx::query(OVERDUE_PERIOD_SQL)
+                    .bind(period.as_str())
+                    .bind(boundary_us)
+                    .bind(account)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(storage)?;
+                if let Some(row) = row {
+                    rolled.push(rolled_account(&row)?);
+                }
             }
         }
         // Oldest boundary first, account id breaking ties, which is the order
