@@ -8292,7 +8292,12 @@ map-wide counter: cancellations stayed deducted, one account's admissions
 lowered another's estimate, and instances disagreed according to their uptime.
 The GL-97 text claimed the error was bounded by the refresh interval and
 tightened by refreshing more often; neither was true. Its tests only ever
-exercised one account, one instance and an explicit republication.
+exercised one account, one instance and an explicit republication, and one
+asserted that a cancelled admission stayed deducted as the safe direction. The
+store witness spent before publishing, so its figure was always fresh. Mutation
+testing could not object: the tests did bite, on the wrong behaviour.
+`AGENTS.md` now requires convergence claims to be witnessed by production
+components alone, and treats an inaccuracy defended as safe as unproven.
 
 The estimate is now the ledger's figure and nothing else. Subtracting local
 spend requires knowing whether an observation already includes it, and an
