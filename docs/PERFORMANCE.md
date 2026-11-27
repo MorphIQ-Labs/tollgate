@@ -54,6 +54,17 @@ performance-sensitive change on, and one with every regression row marked
 `baseline-skipped` established nothing about this host. Do not treat it as
 evidence, and do not clear it by unsetting the host.
 
+Both timed gates also give no verdict for a run on battery power. The wrappers
+read the source through `scripts/power_source.sh` before and after the
+measurements; if either saw battery, the Criterion gate reports `UNENFORCED`
+with `on-battery`, deposits no calibration sample, refuses to record a baseline
+and leaves the run-to-run history alone, and the load gate reports `UNENFORCED`
+and exits `4` (its `--evidence` mode still exits `0`, with `passed: false`).
+Reports carry `power_before` and `power_after`. `unknown`, a host that exposes
+no power supply, is judged as any other run. A switch to battery and back
+between the two readings is not seen, and neither gate stops the host sleeping,
+so keep a long run awake.
+
 On another host, `./scripts/check_perf_thresholds.sh --ratios-only` can provide
 local diagnostic ratios while skipping absolute and recorded-baseline decisions.
 Its historical unreadable-run abstention remains part of the CLI contract: an

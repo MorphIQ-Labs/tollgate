@@ -377,6 +377,8 @@ enum MeasurementVerdict {
     Passed,
     EvidenceMiss,
     GateFailure,
+    /// The run was on battery, so a gating run reached no verdict.
+    Unenforced,
 }
 
 impl MeasurementVerdict {
@@ -384,6 +386,8 @@ impl MeasurementVerdict {
         match self {
             Self::Passed | Self::EvidenceMiss => 0,
             Self::GateFailure => 1,
+            // The performance gate's code for the same thing.
+            Self::Unenforced => 4,
         }
     }
 }
@@ -433,11 +437,28 @@ fn parse_args<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Result<Command, String> 
     }
 }
 
-fn measurement_verdict(passed: bool, verdict_mode: VerdictMode) -> MeasurementVerdict {
-    match (passed, verdict_mode) {
-        (true, _) => MeasurementVerdict::Passed,
-        (false, VerdictMode::Evidence) => MeasurementVerdict::EvidenceMiss,
-        (false, VerdictMode::Gate) => MeasurementVerdict::GateFailure,
+/// Whether either side of the run saw battery power. An unknown source is not
+/// battery.
+fn on_battery(before: Option<&str>, after: Option<&str>) -> bool {
+    [before, after].contains(&Some("battery"))
+}
+
+/// A report from a battery run is not a passing one, whatever the rows say.
+fn report_passed(passed: bool, battery: bool) -> bool {
+    passed && !battery
+}
+
+fn measurement_verdict(
+    passed: bool,
+    verdict_mode: VerdictMode,
+    on_battery: bool,
+) -> MeasurementVerdict {
+    match (passed, verdict_mode, on_battery) {
+        (_, VerdictMode::Gate, true) => MeasurementVerdict::Unenforced,
+        (_, VerdictMode::Evidence, true) => MeasurementVerdict::EvidenceMiss,
+        (true, _, false) => MeasurementVerdict::Passed,
+        (false, VerdictMode::Evidence, false) => MeasurementVerdict::EvidenceMiss,
+        (false, VerdictMode::Gate, false) => MeasurementVerdict::GateFailure,
     }
 }
 
@@ -1192,6 +1213,12 @@ async fn run(
         mixed_verdict,
     );
 
+    // Captured after the workload, so the probe sees the run's far side.
+    let context = RunContext::capture();
+    let battery = on_battery(
+        context.power_before.as_deref(),
+        context.power_after.as_deref(),
+    );
     let report = Report {
         baseline: baseline.latency,
         admitted: admitted.latency,
@@ -1267,8 +1294,8 @@ async fn run(
             throughput_requests_per_second: mixed.throughput_requests_per_second,
             verdict: mixed_verdict,
         },
-        passed,
-        run: RunContext::capture(),
+        passed: report_passed(passed, battery),
+        run: context,
     };
     println!(
         "load-gate sequential: baseline p50 {:.1}us p99 {:.1}us | admitted p50 {:.1}us p99 {:.1}us | overhead x{:.3} (max x{:.3})",
@@ -1346,12 +1373,16 @@ async fn run(
         return ExitCode::FAILURE;
     }
 
-    let verdict = measurement_verdict(passed, verdict_mode);
+    let verdict = measurement_verdict(passed, verdict_mode, battery);
     match verdict {
         MeasurementVerdict::Passed => println!("load-gate: PASS"),
         MeasurementVerdict::EvidenceMiss => eprintln!(
             "load-gate: THRESHOLD MISS (non-gating evidence) — see {}",
             report_path.display()
+        ),
+        MeasurementVerdict::Unenforced => eprintln!(
+            "load-gate: UNENFORCED — this run was on battery power, so its figures are not \
+             evidence either way. Connect the host to AC power and run again."
         ),
         MeasurementVerdict::GateFailure => {
             eprintln!("load-gate: FAIL — see {}", report_path.display());
@@ -1509,10 +1540,10 @@ mod tests {
 
     #[test]
     fn evidence_mode_keeps_only_measurement_misses_non_gating() {
-        let passed_gate = measurement_verdict(true, VerdictMode::Gate);
-        let passed_evidence = measurement_verdict(true, VerdictMode::Evidence);
-        let gate_failure = measurement_verdict(false, VerdictMode::Gate);
-        let evidence_miss = measurement_verdict(false, VerdictMode::Evidence);
+        let passed_gate = measurement_verdict(true, VerdictMode::Gate, false);
+        let passed_evidence = measurement_verdict(true, VerdictMode::Evidence, false);
+        let gate_failure = measurement_verdict(false, VerdictMode::Gate, false);
+        let evidence_miss = measurement_verdict(false, VerdictMode::Evidence, false);
 
         assert_eq!(passed_gate, MeasurementVerdict::Passed);
         assert_eq!(passed_evidence, MeasurementVerdict::Passed);
@@ -1735,6 +1766,39 @@ mod tests {
     fn throughput_divides_completed_requests_by_the_measured_window() {
         assert_eq!(throughput_for_window(100, 2.0), 50.0);
         assert_eq!(throughput_for_window(1, 0.5), 2.0);
+    }
+
+    #[test]
+    fn a_run_is_on_battery_when_either_side_saw_it() {
+        assert!(on_battery(Some("battery"), Some("ac")));
+        assert!(on_battery(Some("ac"), Some("battery")));
+        assert!(!on_battery(Some("ac"), Some("unknown")));
+        assert!(!on_battery(None, None));
+    }
+
+    #[test]
+    fn only_a_passing_run_off_battery_reports_a_pass() {
+        for (passed, battery, expected) in [
+            (true, false, true),
+            (true, true, false),
+            (false, false, false),
+            (false, true, false),
+        ] {
+            assert_eq!(report_passed(passed, battery), expected);
+        }
+    }
+
+    #[test]
+    fn a_battery_run_reaches_no_gating_verdict() {
+        for passed in [false, true] {
+            let gate = measurement_verdict(passed, VerdictMode::Gate, true);
+            assert_eq!(gate, MeasurementVerdict::Unenforced);
+            assert_eq!(gate.exit_code(), 4);
+            assert_eq!(
+                measurement_verdict(passed, VerdictMode::Evidence, true),
+                MeasurementVerdict::EvidenceMiss
+            );
+        }
     }
 
     #[test]
@@ -2309,6 +2373,8 @@ mod tests {
                 recorded_at_unix: 1,
                 available_parallelism: Some(4),
                 load_average: None,
+                power_before: None,
+                power_after: None,
             },
         };
         let json = serde_json::to_value(report).unwrap();

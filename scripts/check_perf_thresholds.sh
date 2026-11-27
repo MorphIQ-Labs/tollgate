@@ -62,6 +62,10 @@ mkdir -p "$(dirname "$MARKER")"
 # must reuse it; only starting a new benchmark suite advances it.
 touch "$MARKER"
 
+# Sampled on both sides of the benchmarks; the gate gives no verdict if either
+# saw battery power (GH-86). A switch away and back in between is not seen.
+power_before="$(./scripts/power_source.sh)"
+
 cargo bench --locked -p tollgate-core --bench core_hot_path
 cargo bench --locked -p tollgate-admission --bench admission_hot_path
 # Every id in the manifest must be produced by a benchmark this script runs, or
@@ -131,6 +135,8 @@ gate_revision() {
 }
 
 TOLLGATE_GATE_LOAD="$(load_average)" \
+    TOLLGATE_GATE_POWER_BEFORE="$power_before" \
+    TOLLGATE_GATE_POWER_AFTER="$(./scripts/power_source.sh)" \
     TOLLGATE_GATE_MEMORY="$(memory_state)" \
     TOLLGATE_GATE_REVISION="$(gate_revision)" \
     TOLLGATE_GATE_TARGET="$(rustc -vV | awk '/^host: / { print $2 }')" \
