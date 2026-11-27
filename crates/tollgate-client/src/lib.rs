@@ -76,6 +76,10 @@ pub use runtime::{
     RuntimeShutdownReport, RuntimeWriterError,
 };
 pub use tollgate_store::{Clock, ManualClock, SystemClock};
+/// Holds secret configuration such as [`HttpStoreConfig::identity_pem`], and
+/// wipes it when dropped.
+#[cfg(feature = "http")]
+pub use zeroize::Zeroizing;
 
 #[cfg(feature = "http")]
 pub use http::HttpStore;

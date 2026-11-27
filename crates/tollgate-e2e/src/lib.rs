@@ -15,6 +15,11 @@
               same wall clock the processes under test run on"
 )]
 
+mod link;
+mod pki;
+
+pub use link::Link;
+
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -26,8 +31,8 @@ use jiff::{SignedDuration, Timestamp};
 use reqwest::{Method, StatusCode};
 use sqlx::{Connection, PgConnection};
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CapacityClass, CostTable, CostUnits, Generation,
-    KeyId, OpIndex, PermissionBits, ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, CapacityClass, CostTable, CostUnits,
+    EnforcementMode, Generation, KeyId, OpIndex, PermissionBits, ResolvedLimits,
 };
 use tollgate_store::wire::{
     AccountResponse, CreateAccountRequest, IssueKeyRequest, IssuedKeyResponse,
@@ -41,6 +46,18 @@ const ISSUER_SECRET: &str = "e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e
 
 /// How long any single condition may take to become true.
 pub const DEADLINE: Duration = Duration::from_secs(30);
+
+/// How instances and operators reach the server, and how the server knows an
+/// instance.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Transport {
+    /// Loopback plaintext with a bearer credential.
+    Plaintext,
+    /// TLS from a private CA, with a bearer credential.
+    Tls,
+    /// TLS in both directions: the client certificate is the identity.
+    MutualTls,
+}
 
 /// Where the processes and the database come from.
 #[derive(Clone)]
@@ -143,6 +160,38 @@ impl Database {
             url,
         }
     }
+}
+
+impl Database {
+    /// `host:port` of the database server.
+    fn address(&self) -> &str {
+        authority(&self.url)
+    }
+
+    /// This database's URL, reaching the server at `address`.
+    fn url_via(&self, address: &str) -> String {
+        self.url.replacen(self.address(), address, 1)
+    }
+}
+
+/// The `host:port` of a `scheme://user:password@host:port/database` URL.
+///
+/// # Panics
+///
+/// Without an explicit port, naming neither the URL nor its credentials.
+fn authority(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?']).next().unwrap_or_default();
+    let address = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, address)| address);
+    assert!(
+        address
+            .rsplit_once(':')
+            .is_some_and(|(_, port)| port.parse::<u16>().is_ok()),
+        "TOLLGATE_PG_URL must name a host and port"
+    );
+    address
 }
 
 impl Drop for Database {
@@ -364,6 +413,27 @@ impl App {
         body["balance"].as_u64()
     }
 
+    /// The unfunded units this instance reports having extended, across every
+    /// account.
+    ///
+    /// # Panics
+    ///
+    /// When the instance does not report the figure.
+    pub async fn overage_spent(&self) -> u64 {
+        let body: serde_json::Value = self
+            .client
+            .get(self.url("/metrics"))
+            .send()
+            .await
+            .expect("the application answers")
+            .json()
+            .await
+            .expect("a metrics body");
+        body["total_overage_spent"]
+            .as_u64()
+            .expect("metrics report the overage spent")
+    }
+
     /// Whether the readiness probe passes.
     pub async fn ready(&self) -> bool {
         self.client
@@ -403,15 +473,22 @@ impl OpIndex for PriceOp {
 pub struct ControlPlane {
     settings: Settings,
     server: Option<Process>,
+    transport: Transport,
     bind: String,
     client: reqwest::Client,
     directory: tempfile::TempDir,
+    database_link: Link,
     database: Database,
 }
 
 impl ControlPlane {
     /// A fresh database, migrated by a `tollgate-server` started over it.
     pub async fn start(settings: Settings) -> Self {
+        Self::start_with(settings, Transport::Plaintext).await
+    }
+
+    /// As [`Self::start`], with the control plane served over `transport`.
+    pub async fn start_with(settings: Settings, transport: Transport) -> Self {
         let database = Database::create(&settings.pg_url).await;
         let directory = tempfile::tempdir().expect("a temporary directory");
         let write = |name: &str, contents: &str| {
@@ -420,25 +497,55 @@ impl ControlPlane {
         write("instance.token", INSTANCE_TOKEN);
         write("operator.token", OPERATOR_TOKEN);
         write("issuer.secret", ISSUER_SECRET);
-        write(
-            "security.json",
-            &serde_json::json!({
-                "bearers": [
-                    {"identity": "e2e-instance", "role": "instance",
-                     "token_file": "instance.token"},
-                    {"identity": "e2e-operator", "role": "operator",
-                     "token_file": "operator.token"},
-                ],
-                "issuer": {"secret_file": "issuer.secret"},
-            })
-            .to_string(),
-        );
+        let mut security = serde_json::json!({
+            "bearers": [
+                {"identity": "e2e-operator", "role": "operator",
+                 "token_file": "operator.token"},
+            ],
+            "issuer": {"secret_file": "issuer.secret"},
+        });
+        if transport != Transport::MutualTls {
+            security["bearers"]
+                .as_array_mut()
+                .expect("a bearer list")
+                .push(
+                    serde_json::json!({"identity": "e2e-instance", "role": "instance",
+                    "token_file": "instance.token"}),
+                );
+        }
+        let mut client = reqwest::Client::builder();
+        if transport != Transport::Plaintext {
+            let pki = pki::Pki::generate();
+            write("ca.pem", &pki.ca);
+            write("server.pem", &pki.server);
+            write("server.key", &pki.server_key);
+            write("instance.pem", &pki.instance.certificate);
+            write("instance.identity", &pki.instance.identity());
+            write("stranger.identity", &pki.stranger.identity());
+            security["tls"] = serde_json::json!({
+                "certificate": "server.pem", "private_key": "server.key",
+            });
+            if transport == Transport::MutualTls {
+                security["tls"]["client_ca"] = "ca.pem".into();
+                security["certificates"] = serde_json::json!([{
+                    "identity": "e2e-instance", "role": "instance",
+                    "certificate": "instance.pem",
+                }]);
+            }
+            client = client.use_rustls_tls().add_root_certificate(
+                reqwest::Certificate::from_pem(pki.ca.as_bytes()).expect("a CA certificate"),
+            );
+        }
+        write("security.json", &security.to_string());
+        let database_link = Link::to(database.address().to_owned()).await;
         let mut plane = ControlPlane {
             settings,
             server: None,
+            transport,
             bind: "127.0.0.1:0".to_owned(),
-            client: reqwest::Client::new(),
+            client: client.build().expect("an operator client"),
             directory,
+            database_link,
             database,
         };
         plane.start_server().await;
@@ -452,7 +559,10 @@ impl ControlPlane {
         command
             .env_clear()
             .env("TOLLGATE_STORE", "postgres")
-            .env("TOLLGATE_PG_URL", &self.database.url)
+            .env(
+                "TOLLGATE_PG_URL",
+                self.database.url_via(&self.database_link.address()),
+            )
             .env("TOLLGATE_BIND", &self.bind)
             .env("TOLLGATE_RECLAIM_INTERVAL_SECS", "1")
             .env(
@@ -470,15 +580,75 @@ impl ControlPlane {
         server.kill();
     }
 
+    /// The server's connection to its database, to break and restore.
+    #[must_use]
+    pub fn database_link(&self) -> &Link {
+        &self.database_link
+    }
+
+    /// A separate network path to the server, for an instance a scenario will
+    /// partition.
+    pub async fn link_to_server(&self) -> Link {
+        Link::to(self.bind.clone()).await
+    }
+
     /// An application instance against this control plane, once ready.
     pub async fn start_app(&self, name: &str, options: AppOptions) -> App {
+        self.start_app_at(name, options, &self.bind).await
+    }
+
+    /// As [`Self::start_app`], reaching the server only through `link`.
+    pub async fn start_app_via(&self, name: &str, options: AppOptions, link: &Link) -> App {
+        self.start_app_at(name, options, &link.address()).await
+    }
+
+    async fn start_app_at(&self, name: &str, options: AppOptions, server: &str) -> App {
+        let app = self
+            .spawn_app(name, options, server, "instance.identity")
+            .await;
+        eventually(&format!("{name} to become ready"), DEADLINE, || async {
+            app.ready()
+                .await
+                .then_some(())
+                .ok_or_else(|| "not ready".to_owned())
+        })
+        .await;
+        app
+    }
+
+    /// An instance whose client certificate the server does not know, under
+    /// [`Transport::MutualTls`]. It listens, and is not waited on.
+    ///
+    /// # Panics
+    ///
+    /// Under any other transport, where no certificate identifies an instance.
+    pub async fn start_unknown_app(&self, name: &str, options: AppOptions) -> App {
+        assert_eq!(self.transport, Transport::MutualTls);
+        self.spawn_app(name, options, &self.bind, "stranger.identity")
+            .await
+    }
+
+    fn url(&self, server: &str, path: &str) -> String {
+        let scheme = match self.transport {
+            Transport::Plaintext => "http",
+            Transport::Tls | Transport::MutualTls => "https",
+        };
+        format!("{scheme}://{server}{path}")
+    }
+
+    async fn spawn_app(
+        &self,
+        name: &str,
+        options: AppOptions,
+        server: &str,
+        identity: &str,
+    ) -> App {
         let mut command = Command::new(&self.settings.app);
         let path = |file: &str| self.directory.path().join(file);
         command
             .env_clear()
             .env("PRICING_BIND", "127.0.0.1:0")
-            .env("PRICING_CONTROL_URL", format!("http://{}", self.bind))
-            .env("PRICING_CONTROL_TOKEN_FILE", path("instance.token"))
+            .env("PRICING_CONTROL_URL", self.url(server, ""))
             .env("PRICING_CREDENTIAL_SECRET_FILE", path("issuer.secret"))
             .env(
                 "PRICING_REFRESH_MS",
@@ -493,18 +663,18 @@ impl ControlPlane {
                 "PRICING_USAGE_FLUSH_MS",
                 options.usage_flush.as_millis().to_string(),
             );
-        let app = App {
+        if self.transport != Transport::Plaintext {
+            command.env("PRICING_CONTROL_CA_FILE", path("ca.pem"));
+        }
+        if self.transport == Transport::MutualTls {
+            command.env("PRICING_CONTROL_IDENTITY_FILE", path(identity));
+        } else {
+            command.env("PRICING_CONTROL_TOKEN_FILE", path("instance.token"));
+        }
+        App {
             process: Process::start(name, command).await,
             client: reqwest::Client::new(),
-        };
-        eventually(&format!("{name} to become ready"), DEADLINE, || async {
-            app.ready()
-                .await
-                .then_some(())
-                .ok_or_else(|| "not ready".to_owned())
-        })
-        .await;
-        app
+        }
     }
 
     /// An operator call, requiring `expected`.
@@ -519,7 +689,7 @@ impl ControlPlane {
             .client
             .request(
                 method.clone(),
-                format!("http://{}/v1/admin{path}", self.bind),
+                self.url(&self.bind, &format!("/v1/admin{path}")),
             )
             .bearer_auth(OPERATOR_TOKEN);
         if let Some(body) = body {
@@ -536,6 +706,17 @@ impl ControlPlane {
     /// Create a funded account, issue it a credential and publish the policy
     /// that credential authorizes against.
     pub async fn onboard(&self, account: u128, balance: u64) -> Customer {
+        self.onboard_with(account, balance, EnforcementMode::Strict)
+            .await
+    }
+
+    /// As [`Self::onboard`], with the account's enforcement mode.
+    pub async fn onboard_with(
+        &self,
+        account: u128,
+        balance: u64,
+        mode: EnforcementMode,
+    ) -> Customer {
         let account = AccountId(account);
         let key = KeyId(account.0);
         let json = |value: Result<serde_json::Value, serde_json::Error>| {
@@ -581,6 +762,7 @@ impl ControlPlane {
             ),
         )
         .capacity_class(CapacityClass::Assured)
+        .enforcement_mode(mode)
         .build();
         self.operator(
             Method::PUT,
@@ -606,6 +788,23 @@ impl ControlPlane {
         );
         self.operator(Method::DELETE, &path, None, StatusCode::OK)
             .await;
+    }
+
+    /// Whether the control plane answers a ledger read within `within`. A
+    /// scenario that breaks its database uses this to show the fault is real.
+    pub async fn ledger_answers(&self, account: AccountId, within: Duration) -> bool {
+        let request = self
+            .client
+            .get(self.url(
+                &self.bind,
+                &format!("/v1/admin/accounts/{:032x}", account.0),
+            ))
+            .bearer_auth(OPERATOR_TOKEN)
+            .send();
+        matches!(
+            tokio::time::timeout(within, request).await,
+            Ok(Ok(response)) if response.status() == StatusCode::OK
+        )
     }
 
     /// The ledger's view of the account.

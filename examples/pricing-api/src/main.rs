@@ -50,7 +50,7 @@ fn main() -> ExitCode {
     match parse_startup(&args) {
         Ok(Startup::Help) => {
             println!(
-                "pricing-api {}\nUsage: pricing-api [--help | --version] [--]\n\nConfiguration (environment variables):\n  PRICING_BIND          Listener address (default 127.0.0.1:8081)\n  TOLLGATE_LOCAL_SHARDS Positive local shard count (default 1)\n  RUST_LOG              Log filter (default info)\n\nEmbedded control plane (PRICING_CONTROL_URL unset):\n  PRICING_DEPOSIT       Demo account deposit in units (default 1000000)\n\nRemote control plane:\n  PRICING_CONTROL_URL            tollgate-server base URL\n  PRICING_CONTROL_TOKEN_FILE     Instance bearer credential (required)\n  PRICING_CREDENTIAL_SECRET_FILE The server's issuer secret (required)\n  PRICING_REFRESH_MS             Snapshot and credential refresh (default 5000)\n  PRICING_LEASE_TTL_SECS         Lease lifetime (default 60)\n  PRICING_LEASE_UNITS            Units acquired per lease (default 10000)\n  PRICING_USAGE_FLUSH_MS         Longest wait for a usage batch (default 25)\n\nThe embedded mode uses the demo credential documented in README.md.",
+                "pricing-api {}\nUsage: pricing-api [--help | --version] [--]\n\nConfiguration (environment variables):\n  PRICING_BIND          Listener address (default 127.0.0.1:8081)\n  TOLLGATE_LOCAL_SHARDS Positive local shard count (default 1)\n  RUST_LOG              Log filter (default info)\n\nEmbedded control plane (PRICING_CONTROL_URL unset):\n  PRICING_DEPOSIT       Demo account deposit in units (default 1000000)\n\nRemote control plane:\n  PRICING_CONTROL_URL            tollgate-server base URL\n  PRICING_CONTROL_TOKEN_FILE     Instance bearer credential (required without a client certificate)\n  PRICING_CONTROL_CA_FILE        CA certificates that verify the server (default public roots)\n  PRICING_CONTROL_IDENTITY_FILE  Client certificate and key for mutual TLS\n  PRICING_CREDENTIAL_SECRET_FILE The server's issuer secret (required)\n  PRICING_REFRESH_MS             Snapshot and credential refresh (default 5000)\n  PRICING_LEASE_TTL_SECS         Lease lifetime (default 60)\n  PRICING_LEASE_UNITS            Units acquired per lease (default 10000)\n  PRICING_USAGE_FLUSH_MS         Longest wait for a usage batch (default 25)\n\nThe embedded mode uses the demo credential documented in README.md.",
                 env!("CARGO_PKG_VERSION")
             );
             ExitCode::SUCCESS
@@ -150,6 +150,16 @@ fn secret_file(name: &str) -> std::io::Result<String> {
     Ok(text.trim_end().to_owned())
 }
 
+/// The bytes of the file `name` points at, or `None` when it is unset. The
+/// error names the setting, never the contents.
+fn optional_file(name: &str) -> std::io::Result<Option<Vec<u8>>> {
+    std::env::var_os(name)
+        .map(|path| {
+            std::fs::read(path).map_err(|error| invalid(format!("cannot read {name}: {error}")))
+        })
+        .transpose()
+}
+
 fn remote_config(sharding: LocalSharding) -> std::io::Result<Option<RemoteConfig>> {
     let control_url = match std::env::var("PRICING_CONTROL_URL") {
         Ok(url) => url,
@@ -158,9 +168,20 @@ fn remote_config(sharding: LocalSharding) -> std::io::Result<Option<RemoteConfig
             return Err(invalid(format!("cannot read PRICING_CONTROL_URL: {error}")));
         }
     };
-    let control_token =
-        tollgate_client::BearerToken::new(secret_file("PRICING_CONTROL_TOKEN_FILE")?)
-            .map_err(|error| invalid(format!("PRICING_CONTROL_TOKEN_FILE: {error}")))?;
+    let control_ca_pem = optional_file("PRICING_CONTROL_CA_FILE")?;
+    let control_identity_pem =
+        optional_file("PRICING_CONTROL_IDENTITY_FILE")?.map(tollgate_client::Zeroizing::new);
+    // A client certificate identifies the instance by itself.
+    let control_token = if control_identity_pem.is_some()
+        && std::env::var_os("PRICING_CONTROL_TOKEN_FILE").is_none()
+    {
+        None
+    } else {
+        Some(
+            tollgate_client::BearerToken::new(secret_file("PRICING_CONTROL_TOKEN_FILE")?)
+                .map_err(|error| invalid(format!("PRICING_CONTROL_TOKEN_FILE: {error}")))?,
+        )
+    };
     let defaults = ControlPlaneTiming::REMOTE;
     let millis = |name, default: std::time::Duration| {
         let default = u64::try_from(default.as_millis()).expect("default fits");
@@ -175,6 +196,8 @@ fn remote_config(sharding: LocalSharding) -> std::io::Result<Option<RemoteConfig
         control_url,
         control_token,
         credential_secret: secret_file("PRICING_CREDENTIAL_SECRET_FILE")?.into_bytes(),
+        control_ca_pem,
+        control_identity_pem,
         timing: ControlPlaneTiming {
             refresh_interval: millis("PRICING_REFRESH_MS", defaults.refresh_interval)?,
             lease_ttl: SignedDuration::from_secs(

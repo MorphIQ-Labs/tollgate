@@ -115,8 +115,10 @@ async fn control_plane() -> (Arc<MemoryStore>, String) {
 fn config(control_url: String) -> RemoteConfig {
     RemoteConfig {
         control_url,
-        control_token: BearerToken::new(TOKEN).unwrap(),
+        control_token: Some(BearerToken::new(TOKEN).unwrap()),
         credential_secret: SECRET.to_vec(),
+        control_ca_pem: None,
+        control_identity_pem: None,
         timing: ControlPlaneTiming {
             refresh_interval: Duration::from_millis(50),
             ..ControlPlaneTiming::REMOTE
