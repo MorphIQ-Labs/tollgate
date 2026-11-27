@@ -18,21 +18,33 @@
 //! them, fill the queue and shed, and the row would price the writer's drain
 //! rate rather than the request path. A service sheds at that rate too, orders
 //! of magnitude above any request rate it serves.
+//!
+//! One recording thread can outrun the writer too, whenever the host starves
+//! it (GH-93). The recording rows therefore time chunks smaller than the queue
+//! and wait, off the clock, for the writer to take each one.
 
 use std::hint::black_box;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Bencher, Criterion, criterion_group, criterion_main};
 use jiff::Timestamp;
 use tollgate_client::{ManualClock, UsageRecorder, UsageWriter, UsageWriterConfig};
 use tollgate_core::{AccountId, CostUnits, PolicyRevision, RequestId, UsageEvent, UsageSource};
 use tollgate_store::{IngestError, IngestReport, UsageSink};
 
+/// The most events recorded before the writer must have taken them: a quarter
+/// of the queue, so it cannot fill however slowly the writer runs.
+const CHUNK: u64 = (QUEUE_CAPACITY / 4) as u64;
+const QUEUE_CAPACITY: usize = 65_536;
+
 /// Accepts every batch at once, so the rows price the queue and not a store.
-struct AcceptAll;
+#[derive(Default)]
+struct AcceptAll {
+    ingested: AtomicU64,
+}
 
 #[async_trait]
 impl UsageSink for AcceptAll {
@@ -41,6 +53,8 @@ impl UsageSink for AcceptAll {
         events: &[UsageEvent],
         _now: Timestamp,
     ) -> Result<IngestReport, IngestError> {
+        self.ingested
+            .fetch_add(events.len() as u64, Ordering::Release);
         Ok(IngestReport {
             accepted: events.len() as u64,
             ..IngestReport::default()
@@ -68,7 +82,7 @@ fn event() -> UsageEvent {
 /// rows, the same batch size and flush interval.
 fn config() -> UsageWriterConfig {
     UsageWriterConfig {
-        queue_capacity: 65_536,
+        queue_capacity: QUEUE_CAPACITY,
         max_batch: 256,
         flush_interval: Duration::from_millis(25),
         retry_backoff: Duration::from_millis(50),
@@ -86,6 +100,32 @@ fn reserve_record(recorder: &UsageRecorder, event: &UsageEvent) {
         .try_reserve()
         .expect("the queue never fills here")
         .record(*event);
+}
+
+/// Time `reserve_record` alone, never letting more than [`CHUNK`] events wait
+/// for the writer. `recorded` counts every event sent through `recorder`.
+fn record_bounded(b: &mut Bencher, recorder: &UsageRecorder, sink: &AcceptAll, recorded: &mut u64) {
+    let event = event();
+    b.iter_custom(|iterations| {
+        let mut spent = Duration::ZERO;
+        let mut left = iterations;
+        while left > 0 {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while sink.ingested.load(Ordering::Acquire) < *recorded {
+                assert!(Instant::now() < deadline, "the writer stopped draining");
+                std::thread::sleep(Duration::from_micros(50));
+            }
+            let chunk = left.min(CHUNK);
+            let start = Instant::now();
+            for _ in 0..chunk {
+                reserve_record(recorder, &event);
+            }
+            spent += start.elapsed();
+            *recorded += chunk;
+            left -= chunk;
+        }
+        spent
+    });
 }
 
 /// Seven threads running `work` until dropped, joined before the next row.
@@ -131,20 +171,16 @@ fn bench_usage_queue(c: &mut Criterion) {
         .enable_all()
         .build()
         .unwrap();
+    let sink = Arc::new(AcceptAll::default());
     let (recorder, writer) = rt.block_on(async {
-        UsageWriter::spawn(
-            Arc::new(AcceptAll),
-            Arc::new(ManualClock::new(now())),
-            config(),
-        )
-        .unwrap()
+        UsageWriter::spawn(sink.clone(), Arc::new(ManualClock::new(now())), config()).unwrap()
     });
-    let event = event();
+    let mut recorded = 0;
     let mut group = c.benchmark_group("usage_queue");
 
     group.bench_function("reserve_release", |b| b.iter(|| reserve_release(&recorder)));
     group.bench_function("reserve_record", |b| {
-        b.iter(|| reserve_record(&recorder, &event))
+        record_bounded(b, &recorder, &sink, &mut recorded)
     });
     {
         let _load = Background::spawn(&recorder, |recorder, _| reserve_release(recorder));
@@ -155,7 +191,7 @@ fn bench_usage_queue(c: &mut Criterion) {
     {
         let _load = Background::spawn(&recorder, |recorder, _| reserve_release(recorder));
         group.bench_function("reserve_record_contended_8", |b| {
-            b.iter(|| reserve_record(&recorder, &event))
+            record_bounded(b, &recorder, &sink, &mut recorded)
         });
     }
     group.finish();
