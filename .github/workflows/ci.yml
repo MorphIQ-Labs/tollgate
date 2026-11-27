@@ -104,6 +104,9 @@ jobs:
       # triggers, so it must run where those triggers have already decided
       # whether the assurance jobs exist (GL-106).
       - run: ./scripts/check_ci_rules.sh
+      # A job nothing requires blocks nothing, and the jobs skipped behind it
+      # read as passing (GH-88).
+      - run: ./scripts/check_required_checks.sh
       - run: ./scripts/check_invariant_witnesses.sh
       # The two backend suites must drive the same contract under one test
       # name; the drift is silent and recurring (GL-43, GL-85).

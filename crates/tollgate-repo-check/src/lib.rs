@@ -8,6 +8,7 @@ pub mod guarantees;
 pub mod http_routes;
 pub mod lean_mutants;
 pub mod parity;
+pub mod required_checks;
 pub mod seam;
 
 use proc_macro2::{TokenStream, TokenTree};
