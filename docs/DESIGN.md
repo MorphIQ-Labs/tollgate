@@ -8355,3 +8355,35 @@ Acquisition and consolidation keep GL-115's contract — dropped and reported as
 uncertain — because waiting on them would spend the budget that returns the
 grants the instance knows it holds.
 
+## Deployment scenarios run as separate processes (GH-79, 2026-11-27)
+
+Each piece of the stack had coverage and no test ran them as deployed: a
+customer calling an application over HTTP, the application embedding the
+library against a server process, PostgreSQL behind it. GH-77 passed every
+suite for that reason.
+
+`tollgate-e2e` starts a `tollgate-server` over a database of its own and
+`pricing-api` processes pointed at it, and acts only as an operator and a
+customer would. It depends on the wire types and nothing that could install,
+publish or restart on a scenario's behalf.
+
+The deployment is eventually consistent and the scenarios do not try to make
+it otherwise. They assert what holds at every observation — conservation, no
+estimate below the ledger's figure or rising without funding, no revoked
+credential served again by an instance that has refused it — and what holds
+once the system has converged and drained: charges stated in responses equal
+settled usage, or, after a kill, bound it. No scenario asserts how soon
+propagation happens; deadlines only stop a failed one from hanging.
+
+`pricing-api` therefore gained a remote control-plane mode, a budget route, and
+a drain on SIGTERM: it stopped only on SIGINT, so an orchestrator's stop would
+have lost queued usage. An unparseable `PRICING_DEPOSIT` is now refused where
+it was silently replaced by the default.
+
+The harness is its own unpublished crate rather than tests inside the server or
+example, because it needs both binaries and a database at once. It takes them
+from the environment, set by `scripts/check_e2e.sh`, which builds first so a
+scenario cannot run against a stale binary; the CI job runs that script and
+cannot skip. It is excluded from mutation testing, being test code that skips
+where that environment is absent.
+

@@ -10,6 +10,7 @@ members = [
     "crates/tollgate-axum",
     "crates/tollgate-client",
     "crates/tollgate-core",
+    "crates/tollgate-e2e",
     "crates/tollgate-perf-gate",
     "crates/tollgate-repo-check",
     "crates/tollgate-server",

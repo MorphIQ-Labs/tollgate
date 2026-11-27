@@ -293,3 +293,115 @@ fn native_arguments_cannot_panic_or_hide_information_flags() {
         assert_eq!(stderr(&output), expected_error);
     }
 }
+
+/// A pricing process that would otherwise start, so a refusal below is about
+/// the setting under test.
+fn startable() -> Command {
+    let mut command = pricing();
+    command.env("TOLLGATE_LOCAL_SHARDS", "1");
+    command
+}
+
+#[test]
+fn an_unreadable_setting_is_refused_rather_than_defaulted() {
+    let output = run(startable().env("PRICING_DEPOSIT", "a lot"));
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        stderr(&output).contains("PRICING_DEPOSIT must be an integer"),
+        "{output:?}"
+    );
+}
+
+/// Every remote setting is refused by name before the listener opens, and a
+/// refusal never repeats a credential.
+#[test]
+fn remote_configuration_is_validated_without_disclosing_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let token = directory.path().join("token");
+    // Public fixtures.
+    std::fs::write(&token, "fixture-remote-token-not-for-use\n").unwrap();
+    let secret = directory.path().join("secret");
+    std::fs::write(&secret, "5".repeat(64)).unwrap();
+    let remote = || {
+        let mut command = startable();
+        command
+            .env("PRICING_CONTROL_URL", "http://127.0.0.1:9")
+            .env("PRICING_CONTROL_TOKEN_FILE", &token)
+            .env("PRICING_CREDENTIAL_SECRET_FILE", &secret);
+        command
+    };
+    let refused = |command: &mut Command, expected: &str| {
+        let output = run(command);
+        assert!(!output.status.success(), "{output:?}");
+        let text = stderr(&output);
+        assert!(text.contains(expected), "{expected}: {output:?}");
+        assert!(!text.contains("fixture-remote-token"), "{output:?}");
+    };
+    refused(
+        remote().env_remove("PRICING_CONTROL_TOKEN_FILE"),
+        "PRICING_CONTROL_TOKEN_FILE is required",
+    );
+    refused(
+        remote().env_remove("PRICING_CREDENTIAL_SECRET_FILE"),
+        "PRICING_CREDENTIAL_SECRET_FILE is required",
+    );
+    refused(
+        remote().env(
+            "PRICING_CONTROL_TOKEN_FILE",
+            directory.path().join("absent"),
+        ),
+        "cannot read PRICING_CONTROL_TOKEN_FILE",
+    );
+    for setting in [
+        "PRICING_REFRESH_MS",
+        "PRICING_LEASE_TTL_SECS",
+        "PRICING_LEASE_UNITS",
+        "PRICING_USAGE_FLUSH_MS",
+    ] {
+        for value in ["0", "soon"] {
+            refused(
+                remote().env(setting, value),
+                &format!("{setting} must be a positive integer"),
+            );
+        }
+    }
+    // A refresh slower than the credential evidence window allows.
+    refused(
+        remote().env("PRICING_REFRESH_MS", "600000"),
+        "credential manager",
+    );
+}
+
+/// SIGTERM is how an orchestrator stops a service: it must drain and exit
+/// cleanly rather than die with usage queued.
+#[cfg(unix)]
+#[test]
+fn termination_drains_and_exits_cleanly() {
+    use std::io::{BufRead, BufReader};
+    let mut child = startable()
+        .env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    assert!(
+        lines
+            .by_ref()
+            .any(|line| line.unwrap().contains("pricing-api listening")),
+        "the service never listened"
+    );
+    let signalled = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(signalled.success());
+    let rest: Vec<String> = lines.map(Result::unwrap).collect();
+    assert!(child.wait().unwrap().success(), "{rest:?}");
+    assert!(
+        rest.iter()
+            .any(|line| line.contains("instance-runtime shutdown")),
+        "{rest:?}"
+    );
+}

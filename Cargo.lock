@@ -1745,6 +1745,7 @@ dependencies = [
  "tollgate-axum",
  "tollgate-client",
  "tollgate-core",
+ "tollgate-server",
  "tollgate-store",
  "tower",
  "tracing",
@@ -2938,6 +2939,21 @@ dependencies = [
  "serde",
  "serde_json",
  "tollgate-alloc-count",
+]
+
+[[package]]
+name = "tollgate-e2e"
+version = "0.32.2"
+dependencies = [
+ "jiff",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tollgate-core",
+ "tollgate-store",
 ]
 
 [[package]]

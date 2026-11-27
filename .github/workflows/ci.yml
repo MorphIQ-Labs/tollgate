@@ -331,6 +331,34 @@ jobs:
       - run: cargo test --locked -p tollgate-server --all-features --test lease_ttl
       - run: cargo test --locked -p tollgate-server --all-features --test credential_expiry
 
+  # The deployed topology: server and application processes over PostgreSQL.
+  # The script requires the environment, so a scenario cannot skip.
+  test-e2e:
+    name: test / test-e2e
+    needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv, docs]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tollgate
+          POSTGRES_PASSWORD: tollgate
+          POSTGRES_DB: tollgate
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tollgate" --health-interval 2s
+          --health-timeout 5s --health-retries 30
+    env:
+      TOLLGATE_PG_URL: postgres://tollgate:tollgate@localhost:5432/tollgate
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: workspace
+          save-if: false
+      - run: ./scripts/check_e2e.sh
+
   bench-compile:
     name: test / bench-compile
     needs: [commit-convention, repository-hygiene, secret-scan, fmt, clippy, audit, licenses, package, msrv, docs]
@@ -367,7 +395,7 @@ jobs:
   # Blocking assurance gate: the Lean model must build.
   formal:
     name: assurance / formal
-    needs: [test, allocation-assertions, test-no-default-features, test-postgres, bench-compile, load-failure-reporting]
+    needs: [test, allocation-assertions, test-no-default-features, test-postgres, test-e2e, bench-compile, load-failure-reporting]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
@@ -402,7 +430,7 @@ jobs:
   # unrelated failures into false "caught" mutants.
   mutation-shard:
     name: assurance / mutation shard ${{ matrix.shard }}/8
-    needs: [test, allocation-assertions, test-no-default-features, test-postgres, bench-compile, load-failure-reporting]
+    needs: [test, allocation-assertions, test-no-default-features, test-postgres, test-e2e, bench-compile, load-failure-reporting]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
