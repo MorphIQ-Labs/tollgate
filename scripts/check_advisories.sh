@@ -3,8 +3,15 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 VERSION_FILE="$ROOT/.cargo/audit-version"
-IGNORED_ADVISORY=RUSTSEC-2023-0071
-IGNORED_PACKAGE=rsa
+# Each exception is an advisory and the package it is filed against, and is
+# tolerated only while no workspace target compiles that package: Cargo.lock
+# records the optional MySQL and SQLite graphs of sqlx's published crates
+# although only PostgreSQL is enabled.
+#
+# RUSTSEC-2023-0071: rsa 0.9.10, through sqlx's MySQL graph; no fixed release.
+# RUSTSEC-2026-0459: libsqlite3-sys 0.30.1, through sqlx's SQLite graph; the
+# fixed releases need sqlx 0.9, whose minimum Rust is above this workspace's.
+EXCEPTIONS="RUSTSEC-2023-0071:rsa RUSTSEC-2026-0459:libsqlite3-sys"
 
 required=$(cat "$VERSION_FILE")
 installed=$(cargo-audit --version 2>/dev/null || true)
@@ -16,42 +23,57 @@ fi
 
 cd "$ROOT"
 
-# RUSTSEC-2023-0071 affects rsa 0.9.10 and has no fixed release. The package is
-# present only because Cargo.lock records sqlx-macros-core's optional MySQL
-# dependency graph; no workspace target or feature compiles it. The exception
-# stops being safe immediately if that reachability fact changes.
-reachable=$(cargo tree --quiet --locked --workspace --all-features --target all \
-  --edges normal,build,dev --prefix none -i "$IGNORED_PACKAGE")
-if [ -n "$reachable" ]; then
-  echo "advisory gate: $IGNORED_PACKAGE became reachable; $IGNORED_ADVISORY may not be ignored" >&2
-  printf '%s\n' "$reachable" >&2
-  exit 1
-fi
+# An exception stops being safe immediately if its reachability fact changes.
+for exception in $EXCEPTIONS; do
+  advisory=${exception%%:*}
+  package=${exception#*:}
+  reachable=$(cargo tree --quiet --locked --workspace --all-features --target all \
+    --edges normal,build,dev --prefix none -i "$package")
+  if [ -n "$reachable" ]; then
+    echo "advisory gate: $package became reachable; $advisory may not be ignored" >&2
+    printf '%s\n' "$reachable" >&2
+    exit 1
+  fi
+done
+
+# Every exception except the one named, as cargo-audit arguments.
+ignore_all_but() {
+  for exception in $EXCEPTIONS; do
+    if [ "${exception%%:*}" != "$1" ]; then
+      printf -- '--ignore %s ' "${exception%%:*}"
+    fi
+  done
+}
 
 # Vulnerabilities are errors by default; --deny warnings also blocks yanked,
-# unmaintained, and unsound dependencies. This is the sole exception.
-cargo audit --deny warnings --ignore "$IGNORED_ADVISORY"
+# unmaintained, and unsound dependencies. These exceptions are the only ones.
+# shellcheck disable=SC2046 # the arguments are split on purpose
+cargo audit --deny warnings $(ignore_all_but none)
 
-# Prove the exception is still necessary against the same freshly fetched
-# advisory database. If the unignored audit passes, the advisory no longer
-# applies and retaining the escape hatch is itself a gate failure.
-set +e
-unignored_output=$(cargo audit --no-fetch --deny warnings 2>&1)
-unignored_status=$?
-set -e
-case "$unignored_status" in
-  0)
-    echo "advisory gate: $IGNORED_ADVISORY no longer applies; remove its exception" >&2
-    exit 1
-    ;;
-  1)
-    # The ignored audit already proved there are no other findings.
-    ;;
-  *)
-    printf '%s\n' "$unignored_output" >&2
-    echo "advisory gate: could not verify whether $IGNORED_ADVISORY is still necessary" >&2
-    exit "$unignored_status"
-    ;;
-esac
+# Prove each exception is still necessary against the same freshly fetched
+# advisory database. If the audit passes with only that one unignored, the
+# advisory no longer applies and retaining it is itself a gate failure.
+for exception in $EXCEPTIONS; do
+  advisory=${exception%%:*}
+  set +e
+  # shellcheck disable=SC2046
+  output=$(cargo audit --no-fetch --deny warnings $(ignore_all_but "$advisory") 2>&1)
+  status=$?
+  set -e
+  case "$status" in
+    0)
+      echo "advisory gate: $advisory no longer applies; remove its exception" >&2
+      exit 1
+      ;;
+    1)
+      # The ignored audit already proved there are no other findings.
+      ;;
+    *)
+      printf '%s\n' "$output" >&2
+      echo "advisory gate: could not verify whether $advisory is still necessary" >&2
+      exit "$status"
+      ;;
+  esac
+done
 
-echo "advisory gate: OK ($IGNORED_ADVISORY is isolated to an unreachable lockfile package)"
+echo "advisory gate: OK (every exception is isolated to an unreachable lockfile package: $EXCEPTIONS)"
