@@ -249,7 +249,8 @@ instead of an embedded store, given an instance credential in
 `PRICING_CONTROL_CA_FILE` trusts a private CA, and
 `PRICING_CONTROL_IDENTITY_FILE` presents a client certificate for mutual TLS,
 which can replace the bearer credential.
-`GET /v1/budget` reports the customer's balance estimate.
+`GET /v1/budget` reports the customer's balance estimate, and counts as no
+admission.
 `./scripts/check_e2e.sh` runs that deployment end to end over PostgreSQL.
 
 Every binary answers `--help` and `--version` before reading any

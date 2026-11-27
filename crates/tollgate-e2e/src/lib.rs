@@ -413,6 +413,29 @@ impl App {
         body["balance"].as_u64()
     }
 
+    /// What this instance reports having admitted, refused and abandoned, in
+    /// that order.
+    ///
+    /// # Panics
+    ///
+    /// When the instance does not report the figures.
+    pub async fn admission_counters(&self) -> [u64; 3] {
+        let body: serde_json::Value = self
+            .client
+            .get(self.url("/metrics"))
+            .send()
+            .await
+            .expect("the application answers")
+            .json()
+            .await
+            .expect("a metrics body");
+        ["admitted", "denied", "contexts_abandoned"].map(|name| {
+            body[name]
+                .as_u64()
+                .unwrap_or_else(|| panic!("metrics report {name}"))
+        })
+    }
+
     /// The unfunded units this instance reports having extended, across every
     /// account.
     ///

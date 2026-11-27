@@ -221,6 +221,62 @@ Its UUID v4 request IDs use a userspace CSPRNG (`uuid`'s `fast-rng` feature),
 not a process counter. A custom `RequestIdSource` must be local, nonblocking
 and unique across instances and restarts; return an error when unavailable.
 
+## Report the budget estimate
+
+An instance holds the newest ledger observation its control plane delivered for
+each account: the remaining balance and the end of the period it belongs to,
+read together as one `BudgetView`. It lags the ledger by usage not yet
+ingested, including the charge of the request being answered, and by the
+snapshot refresh interval, so after spend it reads high until both pass. It is
+an estimate for the customer and never decides admission.
+
+To answer a balance question that admits nothing, declare `get_budget` with the
+permission the read requires:
+
+```rust
+// "How much is left", without admitting or counting anything.
+let app = app.route(
+    "/budget",
+    tollgate.get_budget(
+        CALL,
+        |budget| match budget {
+            Some(view) => BufferedResponse::json(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "estimated_balance": view.balance.get(),
+                    "period_end": view.period_end.map(|at| at.to_string()),
+                }),
+            ),
+            None => BufferedResponse::bytes(StatusCode::NO_CONTENT, ""),
+        },
+        |error| render_rejection(error, None),
+    ),
+);
+```
+
+The read authenticates and authorizes as a metered route does, so an unknown or
+expired credential, an inactive account, an expired snapshot or a missing
+permission is refused. It creates no admission context, takes no queue slot,
+rate token, concurrency slot or capacity permit, charges nothing, and moves no
+admission counter: answered or refused, it is neither an admission outcome nor
+an abandoned context. It therefore also answers while the usage queue is full.
+Because Tollgate neither limits nor counts it, apply any rate limit or
+telemetry you need to this route yourself. `None` means the control plane has
+reported no budget, which is not a zero balance. A handler this crate does not
+wrap calls `read_budget` with the request parts.
+
+To put the estimate on metered responses, use `post_json_with_budget` or
+`post_with_budget`. Their execution callback is
+`(input, charge, Option<BudgetView>)` and their error renderer is
+`(&Rejection, Option<ChargeMetadata>, Option<BudgetView>)`; pass
+`|error, charge, _| render_rejection(error, charge)` to keep the default
+problem response. The value is read at most once per request: for a request
+that reaches admission, after validation and before admission, and the same
+value reaches execution and any later failure. A refusal before that point
+receives it once the request is authorized; before then it is `None`. It does
+not include the request's own charge. Subtracting the charge yourself does not
+make it exact, because the observation may lack other spend too.
+
 ## Billing and middleware
 
 The adapter authenticates and checks permission, reserves accounting capacity,
@@ -280,7 +336,8 @@ with this adapter; `PricingConnection` remains an alias for listener compatibili
 The admission-disabled load baseline still contains only transport and kernel.
 
 The convenience API supports one fixed operation per route, a bodyless POST
-or bounded JSON POST, synchronous validation, and an owned buffered response.
+or bounded JSON POST, synchronous validation, and an owned buffered response,
+plus the unmetered budget GET.
 It deliberately does not accept arbitrary extractor combinations or streaming
 bodies, upgrades, detached jobs, and blocking tasks that survive cancellation.
 For those cases use `prepare_json().into_parts()` or the

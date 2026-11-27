@@ -8,6 +8,7 @@ use tollgate_admission::{CapacityGate, RequestContext};
 use tollgate_client::{Clock, UsagePermit};
 use tollgate_core::PermissionBits;
 
+use crate::budget::{Estimate, Unread};
 use crate::{Rejection, RequestAuthenticator, RequestIdSource, Tollgate};
 
 /// Explicit upper bounds on one route's buffered input.
@@ -79,21 +80,43 @@ where
         required: PermissionBits,
         limits: InputLimits,
     ) -> Result<Prepared<T>, Rejection> {
-        let (parts, body) = request.into_parts();
-        let (context, permit) = self.stage(&parts, required)?;
-        let body = Body::new(http_body_util::Limited::new(body, limits.bytes.get()));
-        let request = Request::from_parts(parts, body).with_limited_body();
-        let Json(input) =
-            tokio::time::timeout(limits.timeout, Json::<T>::from_request(request, &()))
-                .await
-                .map_err(|_| Rejection::BodyTimeout)?
-                .map_err(classify_json_rejection)?;
-        Ok(Prepared {
-            input,
-            context,
-            permit,
-        })
+        self.prepare::<T, Unread>(request, required, limits)
+            .await
+            .map_err(|(rejection, ())| rejection)
     }
+
+    /// [`Self::prepare_json`], with the route's estimate beside a refusal.
+    pub(crate) async fn prepare<T: serde::de::DeserializeOwned + Send, E: Estimate>(
+        &self,
+        request: Request,
+        required: PermissionBits,
+        limits: InputLimits,
+    ) -> Result<Prepared<T>, (Rejection, E::Value)> {
+        let (parts, body) = request.into_parts();
+        let (context, permit) = self.stage::<E>(&parts, required)?;
+        match decode(Request::from_parts(parts, body), limits).await {
+            Ok(input) => Ok(Prepared {
+                input,
+                context,
+                permit,
+            }),
+            Err(rejection) => Err((rejection, E::read(|| context.observed_budget()))),
+        }
+    }
+}
+
+async fn decode<T: serde::de::DeserializeOwned + Send>(
+    request: Request,
+    limits: InputLimits,
+) -> Result<T, Rejection> {
+    let (parts, body) = request.into_parts();
+    let body = Body::new(http_body_util::Limited::new(body, limits.bytes.get()));
+    let request = Request::from_parts(parts, body).with_limited_body();
+    let Json(input) = tokio::time::timeout(limits.timeout, Json::<T>::from_request(request, &()))
+        .await
+        .map_err(|_| Rejection::BodyTimeout)?
+        .map_err(classify_json_rejection)?;
+    Ok(input)
 }
 
 // Axum unwraps a fixed number of body-error layers. Composed limits can add

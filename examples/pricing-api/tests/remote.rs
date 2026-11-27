@@ -180,6 +180,11 @@ async fn a_remote_control_plane_funds_prices_reports_and_bills() {
     })
     .await;
     assert_eq!(send(&router, get("/readyz", None)).await.0, StatusCode::OK);
+    let counters = async || {
+        let (_, metrics) = send(&router, get("/metrics", None)).await;
+        ["admitted", "denials", "contexts_abandoned"].map(|name| metrics[name].clone())
+    };
+    let before_reads = counters().await;
     // One request was served, and the estimate converges on its charge.
     until("the estimate to include the charge", async || {
         let (status, body) = send(&router, get("/v1/budget", Some(CUSTOMER))).await;
@@ -194,6 +199,10 @@ async fn a_remote_control_plane_funds_prices_reports_and_bills() {
             StatusCode::UNAUTHORIZED
         );
     }
+
+    // However many reads it took, and with two refused, none of them is an
+    // admission, a refusal or an abandoned context.
+    assert_eq!(counters().await, before_reads);
 
     runtime.shutdown().await;
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(CHARGE));

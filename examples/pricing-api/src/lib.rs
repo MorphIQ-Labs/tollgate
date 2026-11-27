@@ -45,17 +45,17 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use tollgate_admission::{CapacityGate, ExecutionCapacityGate, ExecutionCapacityMode, NoGate};
-use tollgate_auth::{CredentialVerifier, HmacRegistry};
+use tollgate_auth::HmacRegistry;
 use tollgate_axum::{
     AdapterConfig, BearerAuth, BufferedResponse, ChargeMetadata, InputError, InputLimits,
-    Rejection, Tollgate, Validated,
+    Rejection, ResponseError, Tollgate, Validated,
 };
 use tollgate_client::{
     Clock, SnapshotManagerConfig, SystemClock, TrackedPrincipals, UsageWriterConfig,
 };
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CapacityClass, CommitError, CostTable, CostUnits,
-    DenyReason, EnforcementMode, Generation, LocalSharding, OpIndex, PermissionBits,
+    AccountId, AccountSnapshot, AccountStatus, BudgetView, CapacityClass, CommitError, CostTable,
+    CostUnits, DenyReason, EnforcementMode, Generation, LocalSharding, OpIndex, PermissionBits,
     PolicyRevision, Principal, PublishableSnapshot, RequestId, ResolvedLimits,
 };
 use tollgate_store::{AccountConfig, GrantPolicy, MemoryStore};
@@ -630,19 +630,20 @@ async fn build_app_with(
 }
 
 fn router(state: Arc<AppState>) -> axum::Router {
-    let price_route = match state.admission.clone() {
+    let (price_route, budget_route) = match state.admission.clone() {
         Some(runtime) => match state.capacity.clone() {
-            Some(gate) => metered_price(state.clone(), runtime, gate),
-            None => metered_price(state.clone(), runtime, NoGate),
+            Some(gate) => metered_routes(state.clone(), runtime, gate),
+            None => metered_routes(state.clone(), runtime, NoGate),
         },
-        None => post(baseline_price),
+        // With admission off there is no account to report on.
+        None => (post(baseline_price), get(async || StatusCode::NOT_FOUND)),
     };
 
     axum::Router::new()
         .route("/livez", get(async || StatusCode::OK))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
-        .route("/v1/budget", get(budget))
+        .route("/v1/budget", budget_route)
         .route("/v1/price", price_route)
         .with_state(state)
 }
@@ -835,30 +836,27 @@ pub struct Budget {
     pub period_end: Option<String>,
 }
 
-/// `GET /v1/budget`. Authorizes like any request and charges nothing; the
-/// context it opens is therefore counted under `contexts_abandoned`.
-async fn budget(State(state): State<Arc<AppState>>, headers: header::HeaderMap) -> Response {
-    let Some(runtime) = state.admission.as_ref() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let principal = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .and_then(|key| state.auth.verify(key.as_bytes()));
-    let Some(verified) = principal else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    match runtime.begin(verified.principal, PERMISSION_PRICE, Timestamp::now()) {
-        Ok(context) => match context.observed_budget() {
-            Some(view) => Json(Budget {
+/// `GET /v1/budget`'s answer: no content when the control plane has reported
+/// no budget.
+fn budget_response(view: Option<BudgetView>) -> Result<BufferedResponse, ResponseError> {
+    match view {
+        Some(view) => BufferedResponse::json(
+            StatusCode::OK,
+            &Budget {
                 balance: view.balance.get(),
                 period_end: view.period_end.map(|at| at.to_string()),
-            })
-            .into_response(),
-            None => StatusCode::NO_CONTENT.into_response(),
-        },
-        Err(reason) => deny_buffered(reason).into_response(),
+            },
+        ),
+        None => BufferedResponse::bytes(StatusCode::NO_CONTENT, ""),
+    }
+}
+
+/// A refused budget read, in the service's problem form. It moves none of the
+/// instance's counters, this service's own included.
+fn budget_rejection(error: &Rejection) -> BufferedResponse {
+    match error {
+        Rejection::Denied(reason) => deny_buffered(*reason),
+        _ => tollgate_axum::render_rejection(error, None),
     }
 }
 
@@ -1302,11 +1300,15 @@ fn deny_buffered(reason: DenyReason) -> BufferedResponse {
     buffered_problem(status, code, reason.to_string())
 }
 
-fn metered_price<G: CapacityGate>(
+/// The price and budget routes, sharing one adapter.
+fn metered_routes<G: CapacityGate>(
     state: Arc<AppState>,
     runtime: tollgate_client::RuntimeHandle,
     capacity: G,
-) -> axum::routing::MethodRouter<Arc<AppState>> {
+) -> (
+    axum::routing::MethodRouter<Arc<AppState>>,
+    axum::routing::MethodRouter<Arc<AppState>>,
+) {
     let adapter = Tollgate::new(AdapterConfig {
         runtime,
         authenticator: BearerAuth::new(Arc::new(state.auth.clone())),
@@ -1314,33 +1316,33 @@ fn metered_price<G: CapacityGate>(
         request_ids: || Ok(RequestId(uuid::Uuid::new_v4().as_u128())),
         capacity,
     });
-    adapter
-        .post_json_with_error_handler(
-            Op::Price,
-            PERMISSION_PRICE,
-            InputLimits::new(2 * 1024 * 1024, std::time::Duration::from_secs(30))
-                .expect("positive bounded route limits"),
-            |request: PriceRequest| {
-                let quantity = u64::try_from(request.contracts.len())
-                    .map_err(|_| InputError("too many contracts"))?;
-                Ok(Validated::new(request, quantity))
-            },
-            |request, charge| async move {
-                BufferedResponse::json(
-                    StatusCode::OK,
-                    &PriceResponse {
-                        prices: request.contracts.iter().map(black_scholes_call).collect(),
-                        metadata: ResponseMetadata {
-                            request_id: charge.request_id.to_string(),
-                            units_charged: charge.units_charged.get(),
-                            policy_revision: charge.policy_revision.to_string(),
-                        },
+    let budget = adapter.get_budget(PERMISSION_PRICE, budget_response, budget_rejection);
+    let price = adapter.post_json_with_error_handler(
+        Op::Price,
+        PERMISSION_PRICE,
+        InputLimits::new(2 * 1024 * 1024, std::time::Duration::from_secs(30))
+            .expect("positive bounded route limits"),
+        |request: PriceRequest| {
+            let quantity = u64::try_from(request.contracts.len())
+                .map_err(|_| InputError("too many contracts"))?;
+            Ok(Validated::new(request, quantity))
+        },
+        |request, charge| async move {
+            BufferedResponse::json(
+                StatusCode::OK,
+                &PriceResponse {
+                    prices: request.contracts.iter().map(black_scholes_call).collect(),
+                    metadata: ResponseMetadata {
+                        request_id: charge.request_id.to_string(),
+                        units_charged: charge.units_charged.get(),
+                        policy_revision: charge.policy_revision.to_string(),
                     },
-                )
-            },
-            move |error, charge| pricing_rejection(&state, error, charge),
-        )
-        .with_state(())
+                },
+            )
+        },
+        move |error, charge| pricing_rejection(&state, error, charge),
+    );
+    (price.with_state(()), budget.with_state(()))
 }
 
 fn pricing_rejection(
@@ -1461,6 +1463,14 @@ mod tests {
             &accounts,
             &[report(2, true), report(1, true)]
         ));
+    }
+
+    #[test]
+    fn an_unreported_budget_answers_with_no_content() {
+        let response = budget_response(None)
+            .expect("an empty response builds")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]

@@ -758,20 +758,58 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
         now: Timestamp,
     ) -> Result<RequestContext, DenyReason> {
         let locality = Locality::current();
-        let outcome = self.begin_inner(principal, required, now, locality);
-        if let Err(reason) = &outcome {
-            self.map.counters().record_deny_at(reason, locality);
+        match self.authorize(principal, required, now, locality) {
+            Ok(state) => Ok(RequestContext {
+                state: Some(state),
+                locality,
+            }),
+            Err(reason) => {
+                self.map.counters().record_deny_at(&reason, locality);
+                Err(reason)
+            }
         }
-        outcome
     }
 
-    fn begin_inner(
+    /// Read `principal`'s account budget observation without starting a
+    /// request: for answering "how much is left" where there is no work to
+    /// admit.
+    ///
+    /// It applies the checks [`begin`](Self::begin) applies — one lookup, the
+    /// account status, snapshot freshness at `now` and the `required`
+    /// permission — so it discloses a balance to no principal `begin` would
+    /// refuse. It creates no [`RequestContext`] and **counts nothing**:
+    /// neither an admission outcome nor an abandoned context, whether it
+    /// answers or refuses (INVARIANTS.md 20). Nothing is reserved or charged,
+    /// and no rate token or concurrency slot is taken. A caller that wants its
+    /// own refusals tallied tallies them itself.
+    ///
+    /// The `Ok` value is [`AccountAdmissionState::observed_budget`]: balance
+    /// and period end from one observation, `None` when the control plane has
+    /// reported none. It is an estimate and never decides admission
+    /// (INVARIANTS.md 28). Performs no I/O and does not block.
+    ///
+    /// # Errors
+    ///
+    /// The [`DenyReason`] `begin` would have returned.
+    pub fn read_budget(
+        &self,
+        principal: Principal,
+        required: PermissionBits,
+        now: Timestamp,
+    ) -> Result<Option<BudgetView>, DenyReason> {
+        self.authorize(principal, required, now, Locality::current())
+            .map(|state| state.observed_budget())
+    }
+
+    /// Stage-one authorization, counting nothing: the one set of checks behind
+    /// both [`begin`](Self::begin) and [`read_budget`](Self::read_budget).
+    fn authorize(
         &self,
         principal: Principal,
         required: PermissionBits,
         now: Timestamp,
         locality: Locality,
-    ) -> Result<RequestContext, DenyReason> {
+    ) -> Result<Arc<AccountAdmissionState>, DenyReason> {
         let state = match self.map.get_at(&principal, locality) {
             Some(MapEntry::Present(state)) => state,
             Some(MapEntry::NegativeUntil { .. }) | None => {
@@ -779,10 +817,7 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
             }
         };
         state.snapshot.admit(now, required)?;
-        Ok(RequestContext {
-            state: Some(state),
-            locality,
-        })
+        Ok(state)
     }
 }
 
@@ -2490,6 +2525,205 @@ mod tests {
             .expect("the lease funds this request whatever the published balance says");
 
         assert_eq!(pending.estimate_remaining(), Some(CostUnits::ZERO));
+        let _released = pending.cancel();
+    }
+
+    // --- Reading the budget outside admission ---------------------------------
+
+    /// The balance and period end of a read are one observation: while a writer
+    /// replaces observations whose two fields always agree, no read mixes one
+    /// observation's balance with another's period.
+    #[test]
+    fn a_budget_read_takes_balance_and_period_from_one_observation() {
+        const UPDATES: u64 = 100_000;
+        let paired = |n: u64| BudgetView {
+            balance: CostUnits(UPDATES - n),
+            period_end: Some(t(i64::try_from(n).unwrap())),
+            consumed: Some(CostUnits(n)),
+        };
+        let engine = budgeted_engine(UPDATES, 1);
+        let slot = slot_of(&engine);
+        assert!(slot.observe_budget(paired(0)));
+
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                for n in 1..=UPDATES {
+                    assert!(slot.observe_budget(paired(n)));
+                }
+            });
+            loop {
+                let finished = writer.is_finished();
+                let view = engine
+                    .read_budget(Principal(1), PermissionBits::bit(0), t(0))
+                    .expect("an active principal reads")
+                    .expect("an observation is held");
+                let n = view.consumed.expect("every observation is ordered").get();
+                assert_eq!(view, paired(n));
+                if finished {
+                    assert_eq!(n, UPDATES, "a read after the last write sees it");
+                    break;
+                }
+            }
+        });
+    }
+
+    /// A read reports the account's own newest observation: it moves without a
+    /// publication, every principal of the account shares it, and another
+    /// account's never appears in it.
+    #[test]
+    fn a_budget_read_reports_the_accounts_own_newest_observation() {
+        let engine = budgeted_engine(1_000, 1);
+        let slot = slot_of(&engine);
+        let install = |principal, account, slot: Arc<LeaseSlot>, view| {
+            let mut other = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
+            other.account_id = account;
+            other.budget = view;
+            engine
+                .map()
+                .install(principal, Arc::new(other), slot)
+                .expect("installs");
+        };
+        install(Principal(2), AccountId(1), Arc::clone(&slot), None);
+        install(
+            Principal(3),
+            AccountId(2),
+            LeaseSlot::for_account(AccountId(2)),
+            Some(observed(7, 0)),
+        );
+        let read = |principal| engine.read_budget(principal, PermissionBits::bit(0), t(0));
+
+        assert!(slot.observe_budget(observed(940, 60)));
+
+        assert_eq!(read(Principal(1)), Ok(Some(observed(940, 60))));
+        assert_eq!(read(Principal(2)), Ok(Some(observed(940, 60))));
+        assert_eq!(read(Principal(3)), Ok(Some(observed(7, 0))));
+    }
+
+    /// `Ok(None)` is "the control plane reported nothing", which is neither a
+    /// refusal nor a zero balance.
+    #[test]
+    fn a_budget_read_with_no_reported_budget_is_none_not_zero() {
+        let engine = engine_with(AccountStatus::Active, Some(1_000));
+        assert_eq!(
+            engine.read_budget(Principal(1), PermissionBits::bit(0), t(0)),
+            Ok(None)
+        );
+    }
+
+    /// A read is not a request: whether it answers or refuses, no counter
+    /// moves, so it is neither an admission outcome nor an abandoned context.
+    /// It refuses exactly where `begin` does, and for the same reason, so it
+    /// discloses a balance to nobody admission would turn away.
+    #[test]
+    fn a_budget_read_refuses_what_begin_refuses_and_counts_nothing() {
+        let refused = |status| {
+            let engine = engine_with(status, Some(1_000));
+            engine
+                .map()
+                .install_unknown(Principal(3), t(100))
+                .expect("a negative entry installs");
+            engine
+        };
+        let route = PermissionBits::bit(0);
+        for (status, principal, required, now, expected) in [
+            (
+                AccountStatus::Active,
+                Principal(2),
+                route,
+                t(0),
+                Some(DenyReason::UnknownPrincipal),
+            ),
+            (
+                AccountStatus::Active,
+                Principal(3),
+                route,
+                t(0),
+                Some(DenyReason::UnknownPrincipal),
+            ),
+            (
+                AccountStatus::Suspended,
+                Principal(1),
+                route,
+                t(0),
+                Some(DenyReason::AccountSuspended),
+            ),
+            (
+                AccountStatus::Closed,
+                Principal(1),
+                route,
+                t(0),
+                Some(DenyReason::AccountClosed),
+            ),
+            (
+                AccountStatus::Active,
+                Principal(1),
+                route,
+                t(10_000),
+                Some(DenyReason::SnapshotExpired),
+            ),
+            (
+                AccountStatus::Active,
+                Principal(1),
+                PermissionBits::bit(5),
+                t(0),
+                Some(DenyReason::MissingPermission),
+            ),
+            (AccountStatus::Active, Principal(1), route, t(0), None),
+        ] {
+            let engine = refused(status);
+            let untouched = engine.counters().snapshot();
+
+            assert_eq!(engine.read_budget(principal, required, now).err(), expected);
+            assert_eq!(
+                engine.counters().snapshot(),
+                untouched,
+                "a read must count nothing, refused for {expected:?}"
+            );
+
+            assert_eq!(
+                engine.begin(principal, required, now).err(),
+                expected,
+                "the read and stage one must agree"
+            );
+        }
+    }
+
+    /// A read takes nothing a request would: after any number of them the
+    /// lease is whole and the only rate token and concurrency slot are free.
+    #[test]
+    fn a_budget_read_reserves_nothing_and_takes_no_token_or_slot() {
+        let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
+        let slot = LeaseSlot::for_account(AccountId(1));
+        let funding = lease(10_000);
+        drop(slot.replace(Arc::clone(&funding)));
+        let one = NonZeroU32::new(1).unwrap();
+        let mut limited = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
+        limited.limits = ResolvedLimits::new(64)
+            .with_request_rate(one, one)
+            .with_concurrency(one, None)
+            .unwrap();
+        limited.budget = Some(observed(1_000, 0));
+        engine
+            .map()
+            .install(Principal(1), Arc::new(limited), slot)
+            .unwrap();
+
+        for _ in 0..100 {
+            assert_eq!(
+                engine.read_budget(Principal(1), PermissionBits::bit(0), t(0)),
+                Ok(Some(observed(1_000, 0)))
+            );
+        }
+
+        assert_eq!(funding.remaining(), CostUnits(10_000));
+        let pending = engine
+            .admit_one(request(1), t(0))
+            .expect("the one token and the one slot were never taken");
+        assert_eq!(
+            engine.read_budget(Principal(1), PermissionBits::bit(0), t(0)),
+            Ok(Some(observed(1_000, 0))),
+            "an exhausted rate limit and a full concurrency gauge do not refuse a read"
+        );
         let _released = pending.cancel();
     }
 

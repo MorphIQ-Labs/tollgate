@@ -2032,6 +2032,13 @@ impl<M: SnapshotMap> AdmissionEngine<M> {
         required: PermissionBits,
         now: Timestamp,
     ) -> Result<RequestContext, DenyReason>;
+
+    pub fn read_budget(
+        &self,
+        principal: Principal,
+        required: PermissionBits,
+        now: Timestamp,
+    ) -> Result<Option<BudgetView>, DenyReason>;
 }
 
 pub struct RequestContext {
@@ -2292,6 +2299,11 @@ is not "spendable right now"**: the two diverge observably, which is what the
 `GrantPolicy` tail-grant finding below records — `estimate_remaining` reported
 58 units while every 51-unit request met `LeaseExhausted { remaining: 49 }`
 until the lease's TTL.
+
+**A question with no work attached does not start a request.** `read_budget`
+applies stage one's checks and returns the observation without a
+`RequestContext`, counting nothing (INVARIANTS 20); see
+[Budget reads outside admission](#budget-reads-outside-admission-gh-81-2026-11-27).
 
 It was published by GL-97 without this section being amended first, and GL-126 is
 that correction. `scripts/check_seam_contract.sh` now fails a public seam
@@ -8478,3 +8490,59 @@ off the clock, until the writer has taken the last. The precondition holds by
 construction; retrying until a slot freed would instead have priced the
 writer's drain rate. The change alters what the two recording rows measure, so
 the baseline is re-recorded with it.
+
+## Budget reads outside admission (GH-81, 2026-11-27)
+
+The admission guards expose the account's budget observation, but the Axum
+adapter handed its callbacks only `ChargeMetadata`, and the one way to read the
+estimate without work was to `begin` a request and drop the context. That is
+counted as `contexts_abandoned`, so an application reporting balances made its
+instance look as though requests were failing between authorization and
+admission. A product returning the estimate on responses needed both.
+
+**The read is its own operation.** `AdmissionEngine::read_budget` and
+`begin` share one private authorization step, and only `begin` records its
+refusal and constructs a context. Sharing the step rather than repeating it
+keeps the read from disclosing a balance to a principal admission would refuse.
+It counts nothing on either outcome: a read is not an admission decision, so
+adding it to `denials` would make an instance polled for balances look like one
+refusing traffic. A separate read tally was not added: nothing consumes one,
+and the embedder, which also owns any rate limit on the route, can count what
+it wants. A `begin` variant that returned an uncounted context was rejected
+because the context could then be admitted, putting admissions outside the
+partition of invariant 20.
+
+**The adapter's change is additive.** Two shapes would have broken callers: a
+field on `ChargeMetadata`, whose public fields applications construct and
+destructure, and a third argument on the existing callbacks. A field would also
+have mixed an estimate into a type that promises authoritative values copied
+from the committed guard, and could not have reached a refusal, which carries no
+charge. `post_json_with_budget`, `post_with_budget`, `get_budget` and
+`read_budget` are new; existing routes keep their signatures. Both metered
+shapes take their own error renderer, because a refusal is a response too. A
+bodyless or JSON route that wants the default renderer passes it explicitly
+rather than doubling the method set again.
+
+**One read per request, chosen at route construction.** The metered protocol is
+monomorphized over whether it reports, so a route that does not report performs
+no load, and both kinds run the same admission, capacity and commit steps. A
+reporting route reads once: after validation and before admission, or at the
+earlier refusal that ends the request. Reading again after commit could pair an
+execution response and its failure with different figures. The value is passed
+to callbacks only. A request refused before authorization, including a failed
+`begin`, receives none.
+
+`BearerAuth` now verifies the example's budget route, so it fails closed on a
+credential that has expired since the last projection refresh and requires
+connection state, where the earlier handler called the verifier directly and
+did neither. Its refusals carry the service's problem body.
+
+Performance: `read_budget` is one snapshot lookup, the stage-one checks and one
+wait-free load; the allocation gate holds it, and the reporting route's
+difference from the silent one, to zero. `begin` keeps one lookup and the same
+checks. No benchmark row or threshold is added or changed.
+
+Compatibility: additions only to `tollgate-admission`, `tollgate-client` and
+`tollgate-axum`. `pricing-api`'s `GET /v1/budget` keeps its success shape and
+statuses; a `401` now has a problem body, and a server mounted without
+connection state answers `500`.
