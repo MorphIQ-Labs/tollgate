@@ -41,9 +41,9 @@ async fn fixture(expiries: &[Option<i64>]) -> Option<(PgConnection, String, Stri
         "tollgate_credential_expiry_{}",
         uuid::Uuid::new_v4().simple()
     );
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE SCHEMA {schema}; SET search_path TO {schema}"
-    ))
+    )))
     .execute(&mut connection)
     .await
     .unwrap();
@@ -59,7 +59,9 @@ async fn fixture(expiries: &[Option<i64>]) -> Option<(PgConnection, String, Stri
             .execute(&mut connection).await.unwrap();
     }
     connection
-        .prepare("SELECT not_after_us FROM tollgate_credential_keys")
+        .prepare(sqlx::SqlStr::from_static(
+            "SELECT not_after_us FROM tollgate_credential_keys",
+        ))
         .await
         .unwrap();
     let separator = if url.contains('?') { '&' } else { '?' };
@@ -68,9 +70,9 @@ async fn fixture(expiries: &[Option<i64>]) -> Option<(PgConnection, String, Stri
 }
 
 async fn cleanup(mut connection: PgConnection, schema: &str) {
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "SET search_path TO public; DROP SCHEMA {schema} CASCADE"
-    ))
+    )))
     .execute(&mut connection)
     .await
     .unwrap();

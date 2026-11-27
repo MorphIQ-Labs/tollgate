@@ -22,7 +22,7 @@ members = [
 [workspace.package]
 version = "0.33.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/MorphIQ-Labs/tollgate"
 # Refuses a stray `cargo publish` whatever tooling is driving. This is the plain
@@ -92,7 +92,7 @@ moka = { version = "0.12", features = ["sync"] }
 governor = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
 axum = "0.8"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "uuid", "json"] }
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "uuid", "json"] }
 getrandom = "0.3"
 hmac = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

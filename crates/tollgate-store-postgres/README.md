@@ -28,6 +28,24 @@ repository checks keep the two suites driving one contract.
 The conservation equation holds on this backend as on every other, and a
 reconciliation query checks it on a live database.
 
+## Connecting
+
+`PostgresStore::connect` takes a PostgreSQL URL, which
+[sqlx](https://docs.rs/sqlx/0.9/sqlx/postgres/struct.PgConnectOptions.html)
+reads together with the `PG*` environment variables and the password file.
+
+- The crate enables no TLS backend for sqlx. Unless another dependency of the
+  same build enables one, connections are plaintext: `sslmode=prefer`, the
+  default, falls back to plaintext, and `require`, `verify-ca` and
+  `verify-full` are refused. Keep the database on a trusted network or put a
+  TLS-terminating proxy beside the application.
+- `hostaddr` and `PGHOSTADDR` give the address to connect to without replacing
+  the host name. `PGHOSTADDR` applies even when the URL names a host.
+- A password or user name that SASLprep prohibits, such as one containing a
+  control character, is refused under SCRAM authentication.
+- Values given as `options[name]=value` are escaped for the server, so write
+  them unescaped. A raw `options=` value is passed through.
+
 ## Features
 
 - `test-support`: destructive fixture reset and query-plan inspection, for

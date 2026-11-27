@@ -213,10 +213,10 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     env:
-      RUSTUP_TOOLCHAIN: "1.89.0"
+      RUSTUP_TOOLCHAIN: "1.94.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: rustup toolchain install 1.89.0 --profile minimal
+      - run: rustup toolchain install 1.94.0 --profile minimal
       - run: rustc --version && cargo --version
       - run: cargo check --locked --workspace --all-features --all-targets
 

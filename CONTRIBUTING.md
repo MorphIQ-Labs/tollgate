@@ -57,7 +57,7 @@ TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
   ./scripts/check_coverage.sh
 ```
 
-The workspace's minimum supported Rust version is 1.89, and every pull request checks the locked workspace, with all features and targets, on Rust 1.89.0. `rust-toolchain.toml` separately pins a newer toolchain for development and the primary CI jobs, so formatting, linting and release tooling are reproducible; that pin does not replace the MSRV. A change to the declared minimum and the `msrv` job land together.
+The workspace's minimum supported Rust version is 1.94, and every pull request checks the locked workspace, with all features and targets, on Rust 1.94.0. `rust-toolchain.toml` separately pins a newer toolchain for development and the primary CI jobs, so formatting, linting and release tooling are reproducible; that pin does not replace the MSRV. A change to the declared minimum and the `msrv` job land together.
 
 Run timed performance checks locally and include their reports in performance-sensitive pull requests and release validation. Remote CI compiles benchmarks and enforces deterministic allocation counts; it does not execute Criterion or load measurements. Absolute thresholds and recorded baselines require their calibrated host, and even ratios need comparable measurement conditions. See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for commands, provenance and review requirements. `AGENTS.md` has the full command inventory.
 

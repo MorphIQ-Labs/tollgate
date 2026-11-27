@@ -7960,10 +7960,11 @@ preparation and invoke application work only after preparation succeeds.
 
 Add a leaf library, `tollgate-axum`, depending on the existing core, admission,
 auth, and client libraries and the workspace Axum 0.8 family. Neither the
-transport-neutral crates nor their APIs gain an Axum dependency. Match Rust
-1.89, edition 2024, workspace lints, dual licenses, exact lockstep versions,
-and the existing runtime feature/backend seams. Prefer existing workspace
-dependencies; no procedural-macro crate or async-trait layer is needed.
+transport-neutral crates nor their APIs gain an Axum dependency. Match the
+workspace's Rust version, edition 2024, workspace lints, dual licenses, exact
+lockstep versions, and the existing runtime feature/backend seams. Prefer
+existing workspace dependencies; no procedural-macro crate or async-trait layer
+is needed.
 
 The application retains the unique `InstanceRuntime` owner and its shutdown
 responsibility. A cloneable `Tollgate<A, C, I, G>` adapter holds one shared
@@ -8708,3 +8709,120 @@ wiring to the extracted example. The script refuses a patch touching anything
 else, so the libraries exercised are the released ones. The suite needs extra
 builds and the tags, so it runs locally. The release list is in the script and
 in the test; each new release is added there.
+
+## sqlx 0.9 and the Rust 1.94 minimum (GH-82, 2026-11-27)
+
+The workspace uses sqlx 0.9.1 and declares Rust 1.94, sqlx 0.9's own minimum.
+Both are compatibility changes for consumers of the published crates: every
+library crate inherits the workspace version requirement, so all of them need
+1.94, including those with no database dependency. Per-crate minimums were not
+introduced; the `msrv` job checks one toolchain, and a split would need one job
+and one claim per group.
+
+Neither advisory exception remains. `rsa` (RUSTSEC-2023-0071) has left
+`Cargo.lock`, because MySQL's RSA exchange is now an opt-in sqlx feature.
+`libsqlite3-sys` is still recorded through the SQLite graph no target compiles,
+at 0.40.0, which RUSTSEC-2026-0459 does not cover. 0.9.1 is required rather than
+0.9.0, which cannot resolve a fixed release and does not roll back a cancelled
+`BEGIN` (below). The gate keeps its checks for a future exception, and also fails
+one whose package has left the lockfile.
+
+**What does not change.** The schema, every migration file and the SQL the store
+sends. Migrations are identified by the same SHA-384 of each file in the same
+`_sqlx_migrations` table under the same advisory lock, so a database migrated by
+0.33.0 opens as it is, 0.33.0 opens a database first migrated by this build, and
+the two may run against one database during a rollout or a rollback. The enabled
+features are unchanged, no TLS backend among them. `sqlx-toml`, which can rename
+the migration table or change checksums, stays disabled.
+
+**What the driver does differently**, and what it means here:
+
+- Query functions accept only `'static` text or an explicit `AssertSqlSafe`.
+  One statement the store sends is built at run time: the queued rollover
+  crossing, whose message cannot bind parameters. The function that formats it
+  takes only a `Period`, two integers and an account id it writes as hex, and
+  the wrapper is applied at its one call. Elsewhere the wrapper appears in test, benchmark and fixture code that builds
+  identifiers, `EXPLAIN` prefixes or statements from constants.
+- A transaction cancelled during `BEGIN` is rolled back (below). Transactions
+  are still finished explicitly, because dropping one only queues its rollback.
+- A cached statement that PostgreSQL reports as stale (`26000`, or `0A000` from
+  plan revalidation) is discarded; outside a transaction it is prepared and run
+  once more, and inside one the error is returned. Both errors precede
+  execution, so nothing runs twice. The column renames that fence older writers
+  fail with `42703`, which is not retried.
+- A database error's message ends with `at line N`, the line in the server's
+  source. It reaches `StoreError` text and logs. Error classification uses
+  SQLSTATE and constraint names, which are unchanged.
+- The pool's slow-acquire log field `aquired_after_secs` is now spelled
+  `acquired_after_secs`. A query matching the old name must change.
+- SCRAM authentication applies SASLprep to the password and refuses one it
+  prohibits, where the bytes were sent unchanged. Its key derivation yields to
+  the runtime while it iterates.
+- `hostaddr` and `PGHOSTADDR` no longer replace the host name, and
+  `PGHOSTADDR` now takes effect when the URL names a host. `options[name]=value`
+  values are escaped, and backslash escapes in a password file's password field
+  are decoded.
+- Pool idle accounting no longer underflows into a busy maintenance loop, and
+  closing a pool closes every connection before returning. The store does not
+  close its pool.
+
+sqlx's hashing stack moved to `sha2` 0.11 and `hmac` 0.13, so a build with the
+PostgreSQL backend compiles those beside the `sha2` 0.10 and `hmac` 0.12 that
+credential verification uses. No request-path crate depends on sqlx.
+
+No performance claim is made: no timed measurement covers this change, and the
+PostgreSQL ingest benchmark is not gated.
+
+## A cancelled begin left its transaction open (GH-101, 2026-11-27)
+
+A store future can be dropped at any await: `tollgate-server` drops a handler
+whose client leaves and aborts maintenance at shutdown, and an embedded
+instance's allocator, sink and snapshot calls carry timeouts (18). Up to sqlx
+0.9.0 the PostgreSQL driver counted a transaction as open only after the reply to
+`BEGIN`. A call dropped before that reply queued no rollback, and the pool took
+the connection back inside a transaction. Statements run on it afterwards joined
+that transaction: an autocommit write reported success and was invisible to other
+sessions, a `SET TRANSACTION` failed, and its row locks were held. sqlx 0.9.1
+counts the transaction before waiting, so the drop queues the rollback.
+
+**Why nothing caught it.** The store finishes every transaction it holds, and its
+tests exercised the errors that path handles. No test dropped a call with a
+statement in flight, so the guarantee was assumed of the driver. The witnesses
+now do that against the locked driver, through a TCP hop that withholds replies
+from a chosen statement, which places the drop without timing. On a one-connection
+pool, the `BEGIN` case fails on sqlx 0.8.6 and 0.9.0 with the next write never
+committed; the cases for a statement inside the transaction and for `COMMIT`
+pass there too. The manifest's 0.9.1 floor keeps a consumer from resolving an
+affected release.
+
+A pool-level guard on the older driver, which would have kept Rust 1.89, was not
+taken: it adds a check to every acquisition to repair what the driver now owns.
+The rollover's queued crossing opens no client-side transaction, partly for this
+reason (above). It keeps that shape, which also ends its timeout with the
+statement.
+
+**What else a dropped call can leave**, from the driver's source and this store's:
+
+- Dropped while acquiring, the connection is closed or never added to the pool.
+- Dropped inside a transaction, the rollback is queued and sent when the
+  connection returns. Behind a statement waiting on a lock, it runs after that
+  statement, and the connection stays out of the pool until then: apart from a
+  queued rollover crossing, the store sets no `statement_timeout`.
+- A queued crossing has no client-side transaction to abandon. Dropped while it
+  waits, it still commits if it gets its row in time. If its timeout ends it
+  first, the connection reads that error on return and is closed.
+- Dropped during `COMMIT` or `ROLLBACK`, a second `ROLLBACK` may follow, which
+  PostgreSQL answers with a warning that no transaction is in progress.
+- A statement outside a transaction may already be buffered or sent, and then
+  runs. `deposit`, account creation and period rollover are such statements; the
+  caller learns nothing, and a rollover's report of the accounts it crossed is
+  lost though the crossing stands.
+- A committed change whose caller was dropped is not pushed to in-process
+  subscribers; their next pull observes it.
+- The store holds no session state outside a transaction: no advisory lock of
+  its own, `LISTEN`, or session `SET`; a crossing's `SET LOCAL` ends with its
+  implicit transaction. A migration dropped during connect goes
+  down with that connection's pool.
+
+Every one of those outcomes is the ordinary uncertainty of a lost reply. An
+administrative operation's audit event already reports an unknown commit (33).

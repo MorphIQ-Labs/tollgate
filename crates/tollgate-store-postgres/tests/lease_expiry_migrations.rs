@@ -39,9 +39,9 @@ async fn legacy_fixture() -> Option<(PgConnection, String, String)> {
         .await
         .expect("connect to test database");
     let schema = format!("tollgate_expiry_upgrade_{}", uuid::Uuid::new_v4().simple());
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE SCHEMA {schema}; SET search_path TO {schema}"
-    ))
+    )))
     .execute(&mut connection)
     .await
     .unwrap();
@@ -55,7 +55,9 @@ async fn legacy_fixture() -> Option<(PgConnection, String, String)> {
     }
     // Keep the original connection (and its statement cache) across upgrade.
     connection
-        .prepare("SELECT expires_at_us FROM tollgate_leases")
+        .prepare(sqlx::SqlStr::from_static(
+            "SELECT expires_at_us FROM tollgate_leases",
+        ))
         .await
         .unwrap();
     let separator = if url.contains('?') { '&' } else { '?' };
@@ -64,9 +66,9 @@ async fn legacy_fixture() -> Option<(PgConnection, String, String)> {
 }
 
 async fn cleanup(mut connection: PgConnection, schema: &str) {
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "SET search_path TO public; DROP SCHEMA {schema} CASCADE"
-    ))
+    )))
     .execute(&mut connection)
     .await
     .unwrap();

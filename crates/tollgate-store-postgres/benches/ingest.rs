@@ -56,7 +56,7 @@ fn bench_ingest(c: &mut Criterion) {
         // Generated locally from a UUID, so the unquoted identifier contains
         // only ASCII letters, digits, and underscores.
         let schema = format!("tollgate_bench_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
             .execute(&admin_pool)
             .await
             .unwrap();
@@ -161,7 +161,7 @@ fn bench_ingest(c: &mut Criterion) {
     drop(leases);
     drop(store);
     runtime.block_on(async {
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&admin_pool)
             .await
             .unwrap();
