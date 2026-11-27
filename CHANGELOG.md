@@ -7,6 +7,20 @@ release from that section when the merge request lands.
 
 ## [Unreleased]
 
+## [0.33.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.32.2...v0.33.0) - 2026-11-27
+
+### Fixed
+
+- *(gates)* #85 enforce the baseline only in the environment that recorded it (#90)
+- *(gates)* #86 give no timed verdict for a run on battery (#87)
+- *(core)* [**breaking**] #77 converge budget estimates through snapshot refresh (#78)
+- *(deps)* update rustls, rustls-webpki, webpki-roots and quinn-proto for RustSec advisories (#74)
+
+### Other
+
+- #88 require every CI job, checked against a declared list (#89)
+- #79 end-to-end suite that runs Tollgate as deployed (#84)
+
 ## [0.32.2](https://github.com/MorphIQ-Labs/tollgate/compare/v0.32.1...v0.32.2) - 2026-09-30
 
 ### Added
