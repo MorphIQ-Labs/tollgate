@@ -1,0 +1,268 @@
+--- a/examples/pricing-api/Cargo.toml
++++ b/examples/pricing-api/Cargo.toml
+@@ -12,7 +12,7 @@
+ tollgate-axum = { path = "../../crates/tollgate-axum", version = "=0.32.2" }
+ tollgate-core = { path = "../../crates/tollgate-core", version = "=0.32.2" }
+ tollgate-admission = { path = "../../crates/tollgate-admission", version = "=0.32.2" }
+-tollgate-client = { path = "../../crates/tollgate-client", version = "=0.32.2" }
++tollgate-client = { path = "../../crates/tollgate-client", version = "=0.32.2", features = ["http"] }
+ tollgate-store = { path = "../../crates/tollgate-store", version = "=0.32.2" }
+ tollgate-auth = { path = "../../crates/tollgate-auth", version = "=0.32.2" }
+ axum = { workspace = true }
+--- a/examples/pricing-api/src/lib.rs
++++ b/examples/pricing-api/src/lib.rs
+@@ -72,6 +72,10 @@
+     }
+ }
+ 
++// Added by tollgate-e2e: see the module.
++mod remote;
++pub use remote::{RemoteConfig, build_remote_app};
++
+ const PERMISSION_PRICE: PermissionBits = PermissionBits(1);
+ 
+ /// Per-connection cache supplied by the reusable Axum adapter. The alias keeps
+@@ -168,8 +172,8 @@
+     }
+ }
+ 
+-pub struct AppRuntime {
+-    pub store: Arc<MemoryStore>,
++pub struct AppRuntime<S = Arc<MemoryStore>> {
++    pub store: S,
+     background: Option<Background>,
+ }
+ 
+@@ -187,7 +191,7 @@
+     }
+ }
+ 
+-impl AppRuntime {
++impl<S> AppRuntime<S> {
+     /// Wait for a fixed load-test fixture to be fully funded before warmup.
+     /// Production readiness deliberately permits partially funded `All`
+     /// populations; a controlled workload requires every named account.
+--- a/examples/pricing-api/src/main.rs
++++ b/examples/pricing-api/src/main.rs
+@@ -13,8 +13,10 @@
+ 
+ use std::{ffi::OsString, num::NonZeroUsize, process::ExitCode};
+ 
+-use pricing_api::{PricingConnection, build_app_with_sharding};
+-use tollgate_core::LocalSharding;
++use pricing_api::{
++    AppRuntime, PricingConnection, RemoteConfig, build_app_with_sharding, build_remote_app,
++};
++use tollgate_core::{CostUnits, LocalSharding};
+ 
+ enum Startup {
+     Help,
+@@ -98,9 +100,69 @@
+         )
+         .init();
+ 
++    // Added by tollgate-e2e: serve from a `tollgate-server` when one is named.
++    if let Ok(control_url) = std::env::var("PRICING_CONTROL_URL") {
++        let (router, runtime) = build_remote_app(remote_config(control_url)?)
++            .await
++            .map_err(std::io::Error::other)?;
++        return run(&bind, router, runtime).await;
++    }
+     let (router, runtime) = build_app_with_sharding(deposit, true, sharding).await;
+-    let listener = tokio::net::TcpListener::bind(&bind).await?;
+-    tracing::info!(%bind, deposit, local_shards = sharding.get(), "pricing-api listening");
++    tracing::info!(
++        deposit,
++        local_shards = sharding.get(),
++        "embedded demo control plane"
++    );
++    run(&bind, router, runtime).await
++}
++
++fn setting(name: &str) -> std::io::Result<String> {
++    std::env::var(name).map_err(|error| std::io::Error::other(format!("{name}: {error}")))
++}
++
++fn number(name: &str) -> std::io::Result<u64> {
++    setting(name)?
++        .parse()
++        .map_err(|error| std::io::Error::other(format!("{name}: {error}")))
++}
++
++fn secret_file(name: &str) -> std::io::Result<String> {
++    Ok(std::fs::read_to_string(setting(name)?)?
++        .trim_end()
++        .to_owned())
++}
++
++fn remote_config(control_url: String) -> std::io::Result<RemoteConfig> {
++    let units = number("PRICING_LEASE_UNITS")?;
++    let token = secret_file("PRICING_CONTROL_TOKEN_FILE")?;
++    Ok(RemoteConfig {
++        control_url,
++        control_token: tollgate_client::BearerToken::new(token).map_err(std::io::Error::other)?,
++        credential_secret: secret_file("PRICING_CREDENTIAL_SECRET_FILE")?.into_bytes(),
++        refresh_interval: std::time::Duration::from_millis(number("PRICING_REFRESH_MS")?),
++        lease_ttl: jiff::SignedDuration::from_secs(
++            i64::try_from(number("PRICING_LEASE_TTL_SECS")?).map_err(std::io::Error::other)?,
++        ),
++        usage_flush_interval: std::time::Duration::from_millis(number("PRICING_USAGE_FLUSH_MS")?),
++        target_grant: CostUnits(units),
++        low_water: CostUnits(units / 4),
++    })
++}
++
++/// Serves until SIGINT or SIGTERM: the harness stops instances as an
++/// orchestrator would.
++async fn run<S>(bind: &str, router: axum::Router, runtime: AppRuntime<S>) -> std::io::Result<()> {
++    let listener = tokio::net::TcpListener::bind(bind).await?;
++    let bind = listener.local_addr()?;
++    tracing::info!(%bind, "pricing-api listening");
++    let mut termination =
++        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
++    let stop_requested = async move {
++        tokio::select! {
++            signal = tokio::signal::ctrl_c() => signal,
++            _ = termination.recv() => Ok(()),
++        }
++    };
+     // `into_make_service_with_connect_info` is what gives each accepted
+     // connection its own `PricingConnection`, and therefore its own credential
+     // cache. Serving the router directly would silently fall back to
+@@ -117,7 +179,7 @@
+         .await
+     });
+     tokio::select! {
+-        signal = tokio::signal::ctrl_c() => {
++        signal = stop_requested => {
+             if let Err(error) = signal {
+                 runtime.shutdown_server(server, stop).await.map_err(std::io::Error::other)?;
+                 return Err(error);
+--- a/examples/pricing-api/src/remote.rs
++++ b/examples/pricing-api/src/remote.rs
+@@ -0,0 +1,125 @@
++//! Test wiring added by `tollgate-e2e`, not part of the 0.32.2 release. That
++//! release's example had no remote mode, so a deployed 0.32.2 instance is its
++//! unmodified libraries composed against a `tollgate-server` here, with the
++//! timing 0.33.0's example uses.
++
++use std::sync::Arc;
++
++use axum::http::StatusCode;
++use axum::routing::get;
++use jiff::SignedDuration;
++use tollgate_admission::NoGate;
++use tollgate_client::{SnapshotManagerConfig, SystemClock, TrackedPrincipals, UsageWriterConfig};
++use tollgate_core::{CostUnits, LocalSharding};
++
++use crate::{AppRuntime, AppState, Background, metered_price, metrics, readyz};
++
++pub struct RemoteConfig {
++    pub control_url: String,
++    pub control_token: tollgate_client::BearerToken,
++    pub credential_secret: Vec<u8>,
++    pub refresh_interval: std::time::Duration,
++    pub lease_ttl: SignedDuration,
++    pub usage_flush_interval: std::time::Duration,
++    pub target_grant: CostUnits,
++    pub low_water: CostUnits,
++}
++
++pub async fn build_remote_app(
++    config: RemoteConfig,
++) -> Result<(axum::Router, AppRuntime<()>), String> {
++    let store = tollgate_client::HttpStore::with_config(
++        config.control_url,
++        tollgate_client::HttpStoreConfig {
++            bearer: Some(tollgate_client::StaticBearer::new(config.control_token)),
++            ..Default::default()
++        },
++    )
++    .map_err(|error| format!("control-plane transport: {error}"))?;
++    let clock: Arc<SystemClock> = Arc::new(SystemClock);
++    let (runtime, admission) = tollgate_client::InstanceRuntime::spawn(
++        store.clone(),
++        store.clone(),
++        store.clone(),
++        clock.clone(),
++        tollgate_client::InstanceRuntimeConfig {
++            snapshot_history_capacity:
++                tollgate_admission::ArcSwapSnapshotMap::DEFAULT_GENERATION_CAPACITY,
++            snapshots: SnapshotManagerConfig {
++                principals: TrackedPrincipals::All { seed: Vec::new() },
++                refresh_interval: config.refresh_interval,
++                unknown_ttl: SignedDuration::from_secs(60),
++                revoked_ttl: SignedDuration::from_secs(3_600),
++                retry_backoff: std::time::Duration::from_millis(200),
++                max_concurrent_fetches: 16,
++                fetch_timeout: std::time::Duration::from_secs(5),
++                enumeration_timeout: std::time::Duration::from_secs(30),
++            },
++            leases: tollgate_client::AccountLeaseConfig {
++                target_grant: config.target_grant,
++                low_water: config.low_water,
++                lease_ttl: config.lease_ttl,
++                expiry_safety_margin: SignedDuration::from_secs(2),
++                poll_interval: std::time::Duration::from_millis(20),
++                store_call_timeout: std::time::Duration::from_secs(5),
++                shutdown_release_deadline: std::time::Duration::from_secs(10),
++            },
++            usage: UsageWriterConfig {
++                queue_capacity: 4_096,
++                max_batch: 256,
++                flush_interval: config.usage_flush_interval,
++                retry_backoff: std::time::Duration::from_millis(50),
++                shutdown_drain_deadline: std::time::Duration::from_secs(5),
++                ingest_timeout: std::time::Duration::from_secs(5),
++            },
++            sharding: LocalSharding::SINGLE,
++            idle_account_linger: std::time::Duration::from_secs(1),
++            manager_restart_backoff: std::time::Duration::from_millis(200),
++            shutdown_deadline: std::time::Duration::from_secs(15),
++        },
++    )
++    .map_err(|error| format!("instance runtime: {error}"))?;
++    let key_manager = match tollgate_client::KeyManager::spawn(
++        store,
++        &config.credential_secret,
++        clock,
++        tollgate_client::KeyManagerConfig {
++            refresh_interval: config.refresh_interval,
++            ..Default::default()
++        },
++    ) {
++        Ok(manager) => manager,
++        Err(error) => {
++            if let Err(shutdown) = runtime.shutdown().await {
++                tracing::warn!(error = %shutdown, "instance supervisor died during startup abort");
++            }
++            return Err(format!("credential manager: {error}"));
++        }
++    };
++    let state = Arc::new(AppState {
++        auth: key_manager.verifier(),
++        keys: Some(key_manager.monitor()),
++        baseline_counters: tollgate_admission::AdmissionCounters::default(),
++        input_rejections: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
++        capacity: None,
++        admission: Some(admission.clone()),
++    });
++    let router = axum::Router::new()
++        .route("/livez", get(async || StatusCode::OK))
++        .route("/readyz", get(readyz))
++        .route("/metrics", get(metrics))
++        .route("/v1/price", metered_price(state.clone(), admission, NoGate))
++        .with_state(state);
++    let background = Background {
++        keys: key_manager,
++        runtime,
++        republishers: tokio::task::JoinSet::new(),
++    };
++    Ok((
++        router,
++        AppRuntime {
++            store: (),
++            background: Some(background),
++        },
++    ))
++}

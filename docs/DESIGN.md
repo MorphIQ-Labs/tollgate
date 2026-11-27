@@ -3471,7 +3471,7 @@ stuck rollover stranding quota would be strictly worse than a late allowance.
 
 Idempotency is the store's, not the caller's. The pass runs on every replica,
 so two of them race the boundary; the crossing is done under a row lock guarded
-on the stored period — a mutex in `MemoryStore`, `FOR UPDATE SKIP LOCKED` in
+on the stored period — a mutex in `MemoryStore`, `FOR UPDATE` in
 `PostgresStore` — so one rolls and the other finds the account already current.
 A caller that read the period first and then rolled would produce two deposits
 under exactly that race, and nothing in the arithmetic would notice:
@@ -4835,8 +4835,8 @@ memory backend's repeated account scans into an indexed operation.
 
 The store remains the authority for calendars, locking, idempotency, allowance
 expiry, and top-ups. Driver health means a recent pass reached a partial batch,
-not proof that every account is current: `SKIP LOCKED` can leave work with another
-replica. Readiness and metrics can retain a cloneable `PeriodRollerMonitor` while
+not proof that every account is current: accounts come due, and other replicas
+cross them, while a pass runs. Readiness and metrics can retain a cloneable `PeriodRollerMonitor` while
 the application moves the unique owner into shutdown. The monitor owns the
 liveness interpretation, deriving failure from channel closure even if the
 last publication was healthy. Cancellation of either an unpolled or polled
@@ -8623,3 +8623,70 @@ and the repair is publishing a valid snapshot above the new generation
 (INVARIANTS GL-22). Having the source answer such a row with a withdrawal would
 close the window at the price of denying on corruption that today leaves the
 instance serving; it is not decided here.
+## Sustained load, and a boundary without a clock seam (GH-80, 2026-11-27)
+
+The only budget period is a UTC calendar month, and every process reads the
+host's clock. Crossing one on demand meant a clock seam, a faked system clock,
+waiting for the first of a month, or moving what the ledger has stored.
+
+A seam in the server alone is unsound: it would disagree with the instances
+about lease expiry, which the lease protocol assumes they do not. One in every
+process puts a way to move billing time into the binaries a deployment runs,
+and owes an audit trail, remediation and operator documentation. Interposing on
+the system clock needs a Linux container around every process and shifts
+timeouts and certificate validity with it. A run at month end cannot be
+repeated.
+
+The scenario instead moves the stored period markers back one month, for each
+account and for the leases it funded, which is all that settlement compares.
+Production code gains nothing, and everything after the move is the
+deployment's: the maintenance pass deposits and expires, straddling leases
+settle against the new period, instances refresh and are funded again. The move
+locks one account's active leases and then the account, the server's own order,
+and gives up before the database's deadlock detector would run if a lease
+granted meanwhile makes it wait, so no server transaction is aborted for it.
+What it does not reproduce is an instance's own clock passing a period end,
+which retires held exhaustion evidence early; the
+scenario requires recovery without that, through a new grant.
+
+## A rollover pass starved the account that needed it (GH-80, 2026-11-27)
+
+The first sustained runs waited tens of seconds, at one maintenance tick a
+second, for an exhausted account's boundary to cross. The pass selected due
+accounts `FOR UPDATE SKIP LOCKED`, intended to let replicas cooperate, and so
+also skipped rows held by ordinary work. An instance with no usable lease asks
+for one on every poll, each request locking the account to find little or
+nothing to grant; with three instances, samples found the row free about one
+time in twenty. The delay had no bound, grows with the number of instances
+waiting, and falls on the accounts that have run out. `MemoryStore` takes a
+mutex and never had it.
+
+The existing witnesses held no competing lock: they showed one crossing among
+racing passes, never that a pass reached a busy row. The pass now takes the free
+rows of its page as before, then queues for each account still behind, one
+autocommitted statement at a time, so it holds no other row lock while waiting
+and the boundary test is repeated on the row it gets. Replacing `SKIP LOCKED`
+outright was not taken: the page locks several accounts in boundary order while
+ingest and reclaim lock them in account order, so waiting inside it could
+deadlock. Backing off a refused refill would lower contention without
+guaranteeing a crossing. The cost is one indexed query per period on a tick
+whose page is partial, and that a row held indefinitely now stalls the pass, as
+it already stalls any ingest or reclaim touching that account.
+
+The other `SKIP LOCKED` selection, expiry reclaim, locks expired lease rows,
+which only late usage from their holder contends, and waits for account rows.
+
+## Earlier releases are built from their tags (GH-80, 2026-11-27)
+
+The upgrade scenarios extract each earlier release from its tag and build it
+with its own toolchain and lockfile. They assert the invariants, which no
+mixture may break, and the compatibility a release stated: for GH-77, control
+plane first, older instances ignoring the added total, an older control plane's
+budget figures taken only from publications, and no migration. Nothing is
+asserted of an older instance's estimate.
+
+The 0.32.2 example service could not run against a server, so a patch adds that
+wiring to the extracted example. The script refuses a patch touching anything
+else, so the libraries exercised are the released ones. The suite needs extra
+builds and the tags, so it runs locally. The release list is in the script and
+in the test; each new release is added there.

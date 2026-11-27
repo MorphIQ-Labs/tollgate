@@ -252,6 +252,10 @@ which can replace the bearer credential.
 `GET /v1/budget` reports the customer's balance estimate, and counts as no
 admission.
 `./scripts/check_e2e.sh` runs that deployment end to end over PostgreSQL.
+Two longer suites run locally and are not part of the pull-request gate:
+`./scripts/check_e2e_soak.sh` sustains load across lease renewal, snapshot
+refresh and budget-period boundaries, and `./scripts/check_e2e_upgrade.sh`
+runs earlier releases, built from their tags, against this one.
 
 Every binary answers `--help` and `--version` before reading any
 configuration. `pricing-api` and `tollgate-server` take no positional
