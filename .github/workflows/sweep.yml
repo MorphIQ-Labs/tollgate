@@ -1,0 +1,96 @@
+# What no pull request measures (GH-91): mutation testing of the whole
+# workspace, where ci.yml mutates only a branch's diff, and line coverage.
+# Neither blocks a merge. A survivor or a failure is work to file.
+#
+# Runs weekly and on demand. Pushing a `sweep/**` branch measures that revision.
+
+name: sweep
+
+on:
+  schedule:
+    - cron: "17 3 * * 6"
+  workflow_dispatch:
+  push:
+    branches: ["sweep/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sweep-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "3"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mutation:
+    name: sweep / mutation shard ${{ matrix.shard }}/32
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      # Leaves runners free for pull requests while the sweep is going.
+      max-parallel: 12
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tollgate
+          POSTGRES_PASSWORD: tollgate
+          POSTGRES_DB: tollgate
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tollgate" --health-interval 2s
+          --health-timeout 5s --health-retries 30
+    env:
+      TOLLGATE_PG_URL: postgres://tollgate:tollgate@localhost:5432/tollgate
+      TOLLGATE_REQUIRE_PG: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mutation
+          save-if: false
+      - run: cargo install --locked cargo-mutants --version "$(cat .cargo/mutants-version)"
+      - run: cargo install --locked cargo-nextest --version "$(cat .cargo/nextest-version)"
+      - run: ./scripts/check_mutations.sh
+        env:
+          MUTANTS_SHARD: ${{ matrix.shard }}/32
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: sweep-mutation-${{ matrix.shard }}
+          path: reports/mutations
+
+  coverage:
+    name: sweep / coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tollgate
+          POSTGRES_PASSWORD: tollgate
+          POSTGRES_DB: tollgate
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tollgate" --health-interval 2s
+          --health-timeout 5s --health-retries 30
+    env:
+      TOLLGATE_PG_URL: postgres://tollgate:tollgate@localhost:5432/tollgate
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup component add llvm-tools-preview
+      - run: cargo install --locked cargo-llvm-cov --version "$(cat .cargo/llvm-cov-version)"
+      - run: ./scripts/check_coverage.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: sweep-coverage
+          path: reports/coverage

@@ -8454,3 +8454,16 @@ trust a private CA or present a client certificate, although `HttpStore`
 supported both. It now reads both from files, and `tollgate-client` re-exports
 the `Zeroizing` its configuration requires, so an embedder does not have to
 match the dependency's version itself.
+
+## The whole workspace is swept apart from pull requests (GH-91, 2026-11-27)
+
+Pull requests mutate only their diff, so code older than that gate had no
+standing evidence that any test pins it, and nothing listed paths that no test
+executes. A scheduled workflow now mutates the whole workspace in shards and
+measures coverage over the unit, PostgreSQL and end-to-end suites, with the
+spawned processes instrumented.
+
+It does not block merges: the sweep takes hours, and a survivor is usually in
+code the pull request did not touch. No coverage threshold is set, because an
+executed line is not an asserted one; the report is read for paths that carry an
+invariant and run nowhere.

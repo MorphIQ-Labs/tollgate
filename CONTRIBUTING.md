@@ -43,6 +43,14 @@ TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
 TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
   ./scripts/check_mutations.sh --diff main
 ./scripts/check_mutations.sh --package tollgate-core
+
+# What pull requests do not measure: the whole workspace, and line coverage.
+# `.github/workflows/sweep.yml` runs both weekly, on demand, and on a push to
+# any `sweep/**` branch; survivors and uncovered contract paths are filed.
+TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
+  ./scripts/check_mutations.sh             # every mutant; many hours on one machine
+TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
+  ./scripts/check_coverage.sh
 ```
 
 The workspace's minimum supported Rust version is 1.89, and every pull request checks the locked workspace, with all features and targets, on Rust 1.89.0. `rust-toolchain.toml` separately pins a newer toolchain for development and the primary CI jobs, so formatting, linting and release tooling are reproducible; that pin does not replace the MSRV. A change to the declared minimum and the `msrv` job land together.

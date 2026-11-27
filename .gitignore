@@ -8,3 +8,6 @@
 
 # Local control-plane keys and demonstration configuration
 /.local-control/
+
+# Scratch worktrees made by coding agents.
+/.claude/worktrees/
