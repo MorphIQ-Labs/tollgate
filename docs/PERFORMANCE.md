@@ -48,6 +48,17 @@ baseline identifies `mistral-apple-m1-pro`; only that actual host should set
 activate its baseline comparisons. Never set a host label to make foreign
 measurements appear comparable.
 
+The label is not enough on its own. The gate also compares the run's target
+architecture, CPU, operating system, compiler and Criterion profile with the
+ones the baseline records, the same fields calibration samples must agree on. If
+any differs, or the run cannot report it, the full run is `UNENFORCED` with
+`environment-mismatch`: the report lists each difference and still shows every
+row's ratio to the recorded figure, but judges none of them. An operating-system
+or toolchain update therefore requires a whole re-recording
+([below](#recalibrating-the-baseline)). A change that bumps the toolchain
+records the new baseline in the same change, and compares the old and new
+builds side by side if it needs to know what the bump cost.
+
 A full run that does not enforce the baseline exits `4` and reports
 `UNENFORCED`. That is deliberate: a full report is what a reviewer accepts a
 performance-sensitive change on, and one with every regression row marked
