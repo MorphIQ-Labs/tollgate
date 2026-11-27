@@ -8467,3 +8467,14 @@ It does not block merges: the sweep takes hours, and a survivor is usually in
 code the pull request did not touch. No coverage threshold is set, because an
 executed line is not an asserted one; the report is read for paths that carry an
 invariant and run nowhere.
+
+## The recording benchmark cannot fill its own queue (GH-93, 2026-11-27)
+
+`usage_queue/reserve_record` assumed the single writer keeps pace with a thread
+recording in a tight loop. Under an unrelated build it did not, the queue
+filled, and the benchmark panicked, ending the whole performance run without a
+report. It now times chunks a quarter of the queue long and waits between them,
+off the clock, until the writer has taken the last. The precondition holds by
+construction; retrying until a slot freed would instead have priced the
+writer's drain rate. The change alters what the two recording rows measure, so
+the baseline is re-recorded with it.
