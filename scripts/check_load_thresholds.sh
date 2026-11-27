@@ -37,6 +37,10 @@ if [ "$load_gate_evidence" = true ]; then
     load_gate_args=(--evidence "${load_gate_args[@]}")
 fi
 
+# The gate reads the power source before the workload and, through the probe,
+# after it, and gives no verdict if either saw battery power (GH-86).
 TOLLGATE_GATE_LOAD="$(load_average)" \
+    TOLLGATE_GATE_POWER_BEFORE="$(./scripts/power_source.sh)" \
+    TOLLGATE_GATE_POWER_PROBE="$PWD/scripts/power_source.sh" \
     exec cargo run --locked --profile production -p pricing-api --bin load_gate -- \
     "${load_gate_args[@]}"

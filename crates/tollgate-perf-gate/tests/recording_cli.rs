@@ -80,6 +80,9 @@ impl Fixture {
 
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_check_benchmark_thresholds"));
+        command
+            .env_remove("TOLLGATE_GATE_POWER_BEFORE")
+            .env_remove("TOLLGATE_GATE_POWER_AFTER");
         command.current_dir(&self.root).args(args).envs([
             ("TOLLGATE_PERF_HOST", "controlled"),
             ("TOLLGATE_GATE_REVISION", REVISION),
@@ -239,6 +242,54 @@ fn optional_samples_preserve_gate_verdicts_without_recordable_provenance() {
         ),
         1,
     );
+}
+
+/// A run seen on battery gives no verdict, contributes no sample, cannot
+/// record a baseline and does not become the next run's yardstick (GH-86). An
+/// unknown source is judged as before.
+#[test]
+fn a_battery_run_is_unenforced_and_contributes_nothing() {
+    let fixture = Fixture::new();
+    let baseline = std::fs::read(fixture.root.join("baseline.json")).unwrap();
+    for side in ["TOLLGATE_GATE_POWER_BEFORE", "TOLLGATE_GATE_POWER_AFTER"] {
+        let output = fixture.run(
+            &["--baseline", "baseline.json", "--history", "history.json"],
+            &[(side, Some("battery"))],
+        );
+        assert_exit(&output, 4);
+        let report = fixture.read("report.json");
+        assert_eq!(report["passed"], false);
+        assert_eq!(report["baseline"]["enforced"], false);
+        assert_eq!(report["baseline"]["skip_reason"], "on-battery");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("AC power"));
+        assert!(!fixture.root.join("samples").exists());
+        assert!(!fixture.root.join("history.json").exists());
+    }
+    let recording = fixture.run(
+        &["--record", "baseline.json"],
+        &[("TOLLGATE_GATE_POWER_AFTER", Some("battery"))],
+    );
+    assert_error(&recording, "battery power");
+    assert_eq!(
+        std::fs::read(fixture.root.join("baseline.json")).unwrap(),
+        baseline
+    );
+    assert!(!fixture.root.join("samples").exists());
+
+    let output = fixture.run(
+        &["--baseline", "baseline.json", "--history", "history.json"],
+        &[
+            ("TOLLGATE_GATE_POWER_BEFORE", Some("unknown")),
+            ("TOLLGATE_GATE_POWER_AFTER", Some("ac")),
+        ],
+    );
+    assert_exit(&output, 0);
+    assert_eq!(
+        fixture.read("report.json")["run"]["power_before"],
+        "unknown"
+    );
+    assert!(fixture.root.join("history.json").exists());
+    assert_eq!(fixture.sample_paths().len(), 1);
 }
 
 #[test]

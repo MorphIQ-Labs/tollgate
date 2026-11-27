@@ -8387,3 +8387,16 @@ scenario cannot run against a stale binary; the CI job runs that script and
 cannot skip. It is excluded from mutation testing, being test code that skips
 where that environment is absent.
 
+## A battery run is not a measurement (GH-86, 2026-11-27)
+
+A full Criterion run and a load run made on battery were read as evidence until
+the power state was noticed by hand: neither gate recorded it, so the reports
+were indistinguishable from runs on AC. The failing rows in that run could be
+neither believed nor dismissed.
+
+Both gates now treat battery as they treat a host they cannot compare against:
+no verdict, rather than a pass or a failure. Two readings, around the
+measurements, keep the wrapper simple; continuous sampling would catch a brief
+switch at the cost of a second process running beside the benchmarks. A source
+that cannot be determined is judged as before, so servers without a battery
+are unaffected.

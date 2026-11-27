@@ -2521,6 +2521,16 @@ exists to detect corrupt state and must not be able to launder it.
     Legacy samples lacking identity or environment contribute nothing. Ordinary
     gate verdicts remain independent of optional sample collection.
 
+    A timed gate that saw battery power before or after its measurements
+    reaches no gating verdict (GH-86): the run is unenforced, contributes no
+    sample or history and cannot record. An unreadable power source is not
+    battery. Witnesses: `a_run_seen_on_battery_at_either_end_is_never_enforced`,
+    `a_battery_run_is_unenforced_and_contributes_nothing`,
+    `a_battery_run_reaches_no_gating_verdict`,
+    `a_run_is_on_battery_when_either_side_saw_it`,
+    `only_a_passing_run_off_battery_reports_a_pass`, and
+    `a_probe_that_cannot_answer_reads_as_unknown`.
+
     Enforcement: argument validation requires a samples directory for recording;
     sample publication is atomic and exclusive; loading deduplicates run IDs and
     matches complete recording contexts. The recorder reserves exclusive staging

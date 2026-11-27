@@ -18,6 +18,10 @@ pub(super) struct RunContext {
     pub(super) recorded_at_unix: u64,
     pub(super) available_parallelism: Option<usize>,
     pub(super) load_average: Option<String>,
+    /// The power source before the workload, from the wrapper, and after it,
+    /// from the probe the wrapper names (GH-86).
+    pub(super) power_before: Option<String>,
+    pub(super) power_after: Option<String>,
 }
 
 impl RunContext {
@@ -29,8 +33,23 @@ impl RunContext {
                 .unwrap_or_default(),
             available_parallelism: std::thread::available_parallelism().ok().map(Into::into),
             load_average: std::env::var("TOLLGATE_GATE_LOAD").ok(),
+            power_before: std::env::var("TOLLGATE_GATE_POWER_BEFORE").ok(),
+            power_after: std::env::var_os("TOLLGATE_GATE_POWER_PROBE")
+                .map(|probe| probe_power(Path::new(&probe))),
         }
     }
+}
+
+/// What `probe` prints, or `unknown` when it cannot answer.
+fn probe_power(probe: &Path) -> String {
+    std::process::Command::new(probe)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|printed| printed.trim().to_owned())
+        .filter(|printed| !printed.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 #[derive(Serialize)]
@@ -105,6 +124,18 @@ pub(super) fn write_report(path: &Path, report: &impl Serialize) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_that_cannot_answer_reads_as_unknown() {
+        assert_eq!(probe_power(Path::new("/bin/echo")), "unknown");
+        assert_eq!(probe_power(Path::new("/usr/bin/false")), "unknown");
+        assert_eq!(probe_power(Path::new("/nonexistent/probe")), "unknown");
+        assert_eq!(probe_power(Path::new("/bin/pwd")), {
+            let cwd = std::env::current_dir().unwrap();
+            cwd.to_str().unwrap().to_owned()
+        });
+    }
 
     #[test]
     fn reports_replace_atomically_and_failures_keep_the_previous_file() {

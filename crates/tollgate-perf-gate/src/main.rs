@@ -1543,30 +1543,54 @@ fn baseline_verdict_missing(mode: GateMode, skip_reason: Option<&str>) -> bool {
     }
 }
 
+/// Whether either side of the run saw battery power, where clocks and core
+/// placement differ from the conditions any recorded figure describes. An
+/// unknown source is not battery: a host that cannot answer is judged as
+/// before (GH-86).
+fn on_battery(before: Option<&str>, after: Option<&str>) -> bool {
+    [before, after].contains(&Some("battery"))
+}
+
+/// What the operator does about an unenforced run.
+fn unenforced_remedy(skip_reason: Option<&str>) -> &'static str {
+    match skip_reason {
+        Some("on-battery") => "Connect the host to AC power and run again.",
+        _ => {
+            "Set TOLLGATE_PERF_HOST to the host the baseline names, or run --ratios-only and \
+             say so."
+        }
+    }
+}
+
 fn should_enforce_baseline(
     mode: GateMode,
     configured_host: Option<&str>,
     active_host: Option<&str>,
+    battery: bool,
     untrusted: bool,
 ) -> bool {
-    baseline_skip_reason(mode, configured_host, active_host, untrusted).is_none()
+    baseline_skip_reason(mode, configured_host, active_host, battery, untrusted).is_none()
 }
 
 fn baseline_skip_reason(
     mode: GateMode,
     configured_host: Option<&str>,
     active_host: Option<&str>,
+    battery: bool,
     untrusted: bool,
 ) -> Option<&'static str> {
-    match (configured_host, mode, active_host, untrusted) {
-        (None, _, _, _) => Some("no-baseline-file"),
-        (Some(_), GateMode::RatiosOnly, _, _) => Some("ratios-only"),
-        (Some(_), GateMode::Full, None, _) => Some("host-unset"),
-        (Some(configured), GateMode::Full, Some(active), _) if configured != active => {
+    match (configured_host, mode, active_host) {
+        (None, _, _) => Some("no-baseline-file"),
+        (Some(_), GateMode::RatiosOnly, _) => Some("ratios-only"),
+        (Some(_), GateMode::Full, None) => Some("host-unset"),
+        (Some(configured), GateMode::Full, Some(active)) if configured != active => {
             Some("host-mismatch")
         }
-        (Some(_), GateMode::Full, Some(_), true) => Some("untrusted-run"),
-        (Some(_), GateMode::Full, Some(_), false) => None,
+        // Ahead of the trust verdict: a run on battery stays unenforced
+        // however steady its numbers were.
+        (Some(_), GateMode::Full, Some(_)) if battery => Some("on-battery"),
+        (Some(_), GateMode::Full, Some(_)) if untrusted => Some("untrusted-run"),
+        (Some(_), GateMode::Full, Some(_)) => None,
     }
 }
 
@@ -1677,6 +1701,9 @@ struct RunContext {
     /// while the machine is paging is not a measurement of the code, and the
     /// report said nothing that would have shown it.
     memory: Option<String>,
+    /// The power source the wrapper saw before and after the benchmarks.
+    power_before: Option<String>,
+    power_after: Option<String>,
 }
 
 impl RunContext {
@@ -1689,6 +1716,8 @@ impl RunContext {
             available_parallelism: std::thread::available_parallelism().ok().map(Into::into),
             load_average: std::env::var("TOLLGATE_GATE_LOAD").ok(),
             memory: std::env::var("TOLLGATE_GATE_MEMORY").ok(),
+            power_before: std::env::var("TOLLGATE_GATE_POWER_BEFORE").ok(),
+            power_after: std::env::var("TOLLGATE_GATE_POWER_AFTER").ok(),
         }
     }
 }
@@ -1937,10 +1966,13 @@ fn main() -> ExitCode {
 
     let active_host = std::env::var("TOLLGATE_PERF_HOST").ok();
     let untrusted = matches!(trust, Trust::Untrusted { .. });
+    let run = RunContext::capture();
+    let battery = on_battery(run.power_before.as_deref(), run.power_after.as_deref());
     let baseline_enforced = should_enforce_baseline(
         mode,
         baseline.as_ref().map(|baseline| baseline.host.id.as_str()),
         active_host.as_deref(),
+        battery,
         untrusted,
     );
     let regressions: Vec<_> = manifest
@@ -1967,6 +1999,7 @@ fn main() -> ExitCode {
         mode,
         baseline.as_ref().map(|baseline| baseline.host.id.as_str()),
         active_host.as_deref(),
+        battery,
         untrusted,
     );
     let drift = run_drift(&regressions);
@@ -1997,7 +2030,7 @@ fn main() -> ExitCode {
         drift,
         trust: trust.clone(),
         policy: manifest.trust,
-        run: RunContext::capture(),
+        run,
         wide_allowances: wide_allowances(baseline.as_ref().filter(|_| baseline_enforced)),
     };
     if !report.wide_allowances.is_empty() {
@@ -2067,6 +2100,9 @@ fn main() -> ExitCode {
         .all(|entry| current.contains_key(&entry.id));
     if let Some(dir) = samples_dir.as_ref().filter(|_| mode == GateMode::Full) {
         let deposited = (|| {
+            if battery {
+                return Err("this run was on battery power".to_owned());
+            }
             if !complete {
                 return Err(format!(
                     "this run measured {} of {} benchmarks; every sample must cover the whole manifest",
@@ -2151,10 +2187,12 @@ fn main() -> ExitCode {
     }
 
     // Only a believable run is worth remembering.
-    if let Err(e) = std::fs::write(
-        &history_path,
-        serde_json::to_string_pretty(&History { means: current }).expect("history serializes"),
-    ) {
+    if !battery
+        && let Err(e) = std::fs::write(
+            &history_path,
+            serde_json::to_string_pretty(&History { means: current }).expect("history serializes"),
+        )
+    {
         eprintln!(
             "perf-gate: cannot write history {}: {e} (the next run has nothing to \
              compare against)",
@@ -2166,9 +2204,9 @@ fn main() -> ExitCode {
         eprintln!(
             "perf-gate: UNENFORCED — a full run skipped the recorded baseline ({}). Absolute \
              bounds passing is not a passing baseline comparison, and this report is not \
-             performance evidence. Set TOLLGATE_PERF_HOST to the host the baseline names, or \
-             run --ratios-only and say so.",
-            skip_reason.unwrap_or("unknown")
+             performance evidence. {}",
+            skip_reason.unwrap_or("unknown"),
+            unenforced_remedy(skip_reason)
         );
         return ExitCode::from(UNENFORCED_EXIT);
     }
@@ -3187,24 +3225,28 @@ mod tests {
             GateMode::Full,
             Some("controlled"),
             Some("controlled"),
+            false,
             false
         ));
         assert!(!should_enforce_baseline(
             GateMode::Full,
             Some("controlled"),
             Some("another-host"),
+            false,
             false
         ));
         assert!(!should_enforce_baseline(
             GateMode::Full,
             Some("controlled"),
             Some("controlled"),
+            false,
             true
         ));
         assert!(!should_enforce_baseline(
             GateMode::RatiosOnly,
             Some("controlled"),
             Some("controlled"),
+            false,
             false
         ));
 
@@ -3218,7 +3260,7 @@ mod tests {
             "baseline-skipped"
         );
         assert_eq!(
-            baseline_skip_reason(GateMode::Full, None, Some("controlled"), false),
+            baseline_skip_reason(GateMode::Full, None, Some("controlled"), false, false),
             Some("no-baseline-file")
         );
         assert_eq!(
@@ -3226,12 +3268,13 @@ mod tests {
                 GateMode::RatiosOnly,
                 Some("controlled"),
                 Some("controlled"),
+                false,
                 false
             ),
             Some("ratios-only")
         );
         assert_eq!(
-            baseline_skip_reason(GateMode::Full, Some("controlled"), None, false),
+            baseline_skip_reason(GateMode::Full, Some("controlled"), None, false, false),
             Some("host-unset")
         );
         assert_eq!(
@@ -3239,12 +3282,19 @@ mod tests {
                 GateMode::Full,
                 Some("controlled"),
                 Some("another-host"),
+                false,
                 false
             ),
             Some("host-mismatch")
         );
         assert_eq!(
-            baseline_skip_reason(GateMode::Full, Some("controlled"), Some("controlled"), true),
+            baseline_skip_reason(
+                GateMode::Full,
+                Some("controlled"),
+                Some("controlled"),
+                false,
+                true
+            ),
             Some("untrusted-run")
         );
         assert_eq!(
@@ -3252,10 +3302,39 @@ mod tests {
                 GateMode::Full,
                 Some("controlled"),
                 Some("controlled"),
+                false,
                 false
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_run_seen_on_battery_at_either_end_is_never_enforced() {
+        for (before, after, expected) in [
+            (Some("ac"), Some("ac"), false),
+            (Some("battery"), Some("ac"), true),
+            (Some("ac"), Some("battery"), true),
+            // A host that cannot answer is judged as before.
+            (Some("unknown"), Some("unknown"), false),
+            (None, None, false),
+        ] {
+            assert_eq!(on_battery(before, after), expected, "{before:?} {after:?}");
+        }
+        for untrusted in [false, true] {
+            assert_eq!(
+                baseline_skip_reason(
+                    GateMode::Full,
+                    Some("controlled"),
+                    Some("controlled"),
+                    true,
+                    untrusted
+                ),
+                Some("on-battery")
+            );
+        }
+        assert!(unenforced_remedy(Some("on-battery")).contains("AC power"));
+        assert!(unenforced_remedy(Some("host-unset")).contains("TOLLGATE_PERF_HOST"));
     }
 
     #[test]
