@@ -11,8 +11,9 @@ use governor::{Quota, RateLimiter};
 use jiff::Timestamp;
 
 use tollgate_core::{
-    AccountId, AccountOverage, AccountRatePolicy, AccountSnapshot, CostUnits, DenyReason,
-    Generation, LocalLease, LocalSharding, Locality, PublishableSnapshot, ResolvedLimits,
+    AccountId, AccountOverage, AccountRatePolicy, AccountSnapshot, BudgetView, CostUnits,
+    DenyReason, Generation, LocalLease, LocalSharding, Locality, PublishableSnapshot,
+    ResolvedLimits,
 };
 
 use crate::counters::AdmissionCounters;
@@ -82,6 +83,11 @@ pub struct LeaseSlot {
     /// Deadlines cannot serve as the sequence, because two publications may
     /// share one and bracket a third (see [`LeaseSlot::funding_evidence`]).
     evidence_sequence: AtomicU64,
+    /// The newest ledger observation delivered for the account, which every
+    /// principal's estimate reads. Ordered by ledger totals and independent of
+    /// authorization generations (GL-77). Nothing that decides admission reads
+    /// it.
+    budget: ArcSwapOption<BudgetView>,
     /// Lost debit races handed over by leases that have left this slot: the
     /// account's contention history, which outlives any one grant. Written on
     /// the control plane only, at publication.
@@ -236,6 +242,7 @@ impl LeaseSlot {
             evidence_until: AtomicI64::new(i64::MIN),
             evidence_remaining: AtomicU64::new(0),
             evidence_sequence: AtomicU64::new(0),
+            budget: ArcSwapOption::const_empty(),
             contention_retired: AtomicU64::new(0),
             contention_gauges: PaddedCount::default(),
         })
@@ -294,6 +301,39 @@ impl LeaseSlot {
             self.invalidate_funding(&mut current);
         }
         current.snapshot = Some(next);
+    }
+
+    /// Offer a ledger observation for the account, keeping it unless the one
+    /// already held is newer ([`BudgetView::supersedes`]). Returns whether the
+    /// offered observation is now the one held, or equals it.
+    ///
+    /// Control plane only. It touches no authorization state: a snapshot
+    /// refresh the map ignores because its generation is unchanged still
+    /// delivers its observation here.
+    pub fn observe_budget(&self, view: BudgetView) -> bool {
+        if self.budget() == Some(view) {
+            return true;
+        }
+        let next = Arc::new(view);
+        let mut accepted = false;
+        // `rcu` reruns the closure after a lost race, so the last verdict is
+        // the one against the value actually replaced.
+        self.budget.rcu(|held| {
+            accepted = held.as_deref().is_none_or(|held| view.supersedes(*held));
+            if accepted {
+                Some(Arc::clone(&next))
+            } else {
+                held.clone()
+            }
+        });
+        accepted
+    }
+
+    /// The newest ledger observation delivered for this account, or `None` when
+    /// the control plane has reported none. One wait-free load, no allocation.
+    #[must_use]
+    pub fn budget(&self) -> Option<BudgetView> {
+        self.budget.load().as_deref().copied()
     }
 
     /// The account's evidenced remaining funding, read only after local
@@ -1101,18 +1141,6 @@ pub struct AccountAdmissionState {
     /// The account's lease slot, shared by every principal of the account and
     /// surviving snapshot installs.
     pub lease: Arc<LeaseSlot>,
-    /// The instance's admitted-unit total at the instant this snapshot was
-    /// installed, so the balance estimate can subtract only what has been
-    /// spent *since* the ledger reported it (GL-97).
-    ///
-    /// Captured here rather than reset on the counter because the counter is
-    /// account-wide, monotonic, and shared by every principal and every
-    /// generation — an exported tally nothing may rewind. A per-snapshot
-    /// baseline gets the same subtraction without touching it, and the
-    /// baseline and `snapshot.budget` are then true of exactly the same
-    /// instant, which is the only thing that makes their difference mean
-    /// anything.
-    units_admitted_at_publish: u64,
 }
 
 impl AccountAdmissionState {
@@ -1130,8 +1158,10 @@ impl AccountAdmissionState {
         principal_gauge: Arc<PrincipalGauge>,
     ) -> Arc<Self> {
         lease.observe_funding(&snapshot);
+        if let Some(view) = snapshot.budget {
+            lease.observe_budget(view);
+        }
         Arc::new(AccountAdmissionState {
-            units_admitted_at_publish: counters.units_admitted(),
             snapshot,
             counters,
             limiter,
@@ -1140,40 +1170,41 @@ impl AccountAdmissionState {
         })
     }
 
-    /// What the account can still spend this period, as well as this instance
-    /// can know it.
+    /// The newest ledger observation this instance holds for the account: the
+    /// remaining balance and the end of the period it belongs to, read
+    /// together. `snapshot.budget` is only what arrived with this publication,
+    /// and goes stale while the generation is unchanged.
+    #[must_use]
+    pub fn observed_budget(&self) -> Option<BudgetView> {
+        self.lease.budget()
+    }
+
+    /// What the account could still spend, as of the newest ledger observation
+    /// this instance holds.
     ///
-    /// `None` when the control plane published no budget view — an older
+    /// `None` when the control plane has reported no budget view — an older
     /// control plane, or a snapshot that did not come from a store. A
     /// fabricated zero would tell every caller they were out of quota.
     ///
-    /// **An estimate, and the name is the contract.** It is what the ledger
-    /// last reported minus what this instance has admitted since, so it is
-    /// wrong by two bounded terms: the fleet's spend elsewhere since the
-    /// publication, and this instance's own admissions that were later
-    /// cancelled. The first dominates, and its bound is the snapshot refresh
-    /// interval times the fleet's spend rate — so an operator sizing a
-    /// customer-visible number tightens it by refreshing more often, not by
-    /// asking here for a guarantee this cannot give.
+    /// **An estimate, and the name is the contract.** It is the ledger's own
+    /// figure ([`BudgetView::balance`]) with nothing subtracted locally, so
+    /// every principal of the account reads the same value from it and it
+    /// converges once the ledger stops moving. It lags the ledger by usage not
+    /// yet ingested — including the asking request's own charge — and by the
+    /// snapshot refresh interval, so after spend it reads high until both have
+    /// passed. A failing source or usage writer extends that lag without bound;
+    /// the last observation is kept.
     ///
-    /// Both errors point the same way: cancellations are counted as spent and
-    /// other instances' spend is missed, so this reads low against the ledger
-    /// far more often than high. Under-reporting remaining quota is the safe
-    /// direction for a number a customer acts on.
+    /// It subtracts nothing because an instance cannot know which of its own
+    /// admissions an observation already includes, nor what other instances
+    /// have spent.
     ///
     /// It is never an authorization input. Admission denies from the lease and
     /// the ledger (INVARIANTS.md GL-1), never from this — a stale estimate that
     /// could deny would turn a refresh delay into an outage.
     #[must_use]
     pub fn estimate_remaining(&self) -> Option<CostUnits> {
-        let budget = self.snapshot.budget?;
-        let spent = self
-            .counters
-            .units_admitted()
-            .wrapping_sub(self.units_admitted_at_publish);
-        Some(CostUnits(
-            budget.balance_at_publish.get().saturating_sub(spent),
-        ))
+        self.observed_budget().map(|view| view.balance)
     }
 
     /// Record principal occupancy followed by account occupancy, enforcing

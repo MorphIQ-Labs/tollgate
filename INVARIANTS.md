@@ -1226,7 +1226,15 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     loop's body is raced against that task's shutdown watch, so the signal is
     acted on where it arrives rather than at the next loop top — this is what
     makes `LeaseManager::shutdown`'s documented `shutdown_release_deadline`
-    bound true. A bound must also let the loop *return*: a fetch future that
+    bound true. Racing the signal starts the shutdown budget; it does not by
+    itself justify dropping the call. An idempotent write already in flight — a
+    usage ingest or a lease release — is finished inside that budget, because
+    the backend may have committed it: dropping it discards the answer, sends
+    the write again, and misreports the outcome (a billed batch counted only as
+    `duplicate`). The writer refuses new reservations from the signal, not from
+    the end of that call. Reads are dropped, and an unanswered acquisition or
+    consolidation is dropped and reported as uncertain (6). A bound must also
+    let the loop *return*: a fetch future that
     never resolves is abandoned at `fetch_timeout` rather than awaited
     forever, because a `JoinSet` that cannot empty stops the snapshot sweep
     from returning at all, and readiness then falls without ever recovering
@@ -1253,7 +1261,12 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `a_zero_fetch_timeout_is_rejected`,
     `lease_manager::tests::{a_release_pass_costs_one_budget_whatever_the_parked_count,
     a_lease_that_eats_the_budget_yields_its_place,
-    shutdown_during_a_release_reparks_every_lease}`, and
+    shutdown_during_a_release_reparks_every_lease,
+    a_release_in_flight_at_shutdown_is_finished_not_resent}`,
+    `an_ingest_in_flight_at_shutdown_is_finished_not_resent`,
+    `a_hung_ingest_in_flight_at_shutdown_spends_one_drain_budget`,
+    `a_failure_answered_after_the_signal_skips_the_retry_backoff`,
+    `a_begun_budget_is_not_restarted_by_a_later_phase`, and
     `invalid_pool_config_is_rejected_before_connecting`.
 
     `PeriodRoller` bounds each administrative rollover call and the entire
@@ -1956,20 +1969,43 @@ exists to detect corrupt state and must not be able to launder it.
     event bills against the period its lease was granted in.
 
     **What an instance is told is a projection, never an authority.** A
-    published snapshot carries a [`BudgetView`] — what the account could still
-    spend at publication, its balance *plus* every active lease's unspent
-    remainder, and when the period ends. The store stamps it on every publish
-    and is its only writer: `AccountSnapshot`'s builder has no setter, and the
-    overwrite is unconditional, so a value arriving over the wire cannot
-    survive publication. Absent means the control plane said nothing, which a
-    reader reports as nothing rather than as a zero balance.
+    snapshot carries a [`BudgetView`]: what the account could still spend —
+    its balance *plus* every active lease's unspent remainder — when the
+    period ends, and what the ledger had consumed. The store stamps it on
+    every publish and every `SnapshotSource::snapshot` read and is its only
+    writer: `AccountSnapshot`'s builder has no setter, and the overwrite is
+    unconditional, so a value arriving over the wire cannot survive
+    publication. Absent means the control plane said nothing, which a reader
+    reports as nothing rather than as a zero balance. A backend that cannot
+    read the ledger row reports it and serves the snapshot without a view: a
+    reporting value never withholds authorization.
 
-    `estimate_remaining` subtracts what the instance has admitted since that
-    publication, saturating at zero. It is an *estimate*, wrong by the fleet's
-    spend elsewhere and by this instance's cancelled admissions, both of which
-    make it read low rather than high. It never decides admission: quota comes
-    from the lease and the ledger (1), so a stale figure cannot turn a refresh
-    delay into an outage.
+    **An account's observations converge without publication, and never move
+    backwards.** The instance keeps one observation per account, shared by all
+    its principals and independent of authorization generations: a refresh at
+    an unchanged generation delivers it, while the generation itself is refused
+    exactly as before (15). Funding (`balance + consumed`) and consumption
+    (usage, settlement loss and expired units) only grow, so an offered view
+    replaces the held one only when neither total is smaller
+    (`BudgetView::supersedes`); a smaller one is refused and counted. A failed
+    fetch keeps the held observation. A view without `consumed`, from an older
+    control plane, is taken only from an installed publication and never
+    displaces an ordered one. `BudgetObservation.lean` proves the held totals
+    never move backwards (`Tollgate.BudgetObservation.observeAll_monotone`),
+    that a stale reading is refused
+    (`Tollgate.BudgetObservation.stale_refused`), that the latest reading wins
+    in every arrival order
+    (`Tollgate.BudgetObservation.latest_reading_wins`) and that equal totals
+    report one balance
+    (`Tollgate.BudgetObservation.equal_totals_equal_balance`), assuming the
+    ledger's totals only grow, which the store suites witness.
+
+    `estimate_remaining` is that observation's balance with nothing subtracted
+    locally: not pending, cancelled or committed admissions, and no other
+    account's. It is an *estimate*, lagging the ledger by usage not yet
+    ingested and by the refresh interval, so after spend it reads high until
+    both pass. It never decides admission: quota comes from the lease and the
+    ledger (1), so a stale figure cannot turn a refresh delay into an outage.
 
     This is rung 2 of the enforcement ladder: the store owns the crossing, the
     settlement decision, and the published view, and none is expressible by a
@@ -1989,11 +2025,26 @@ exists to detect corrupt state and must not be able to launder it.
     `the_budget_view_does_not_report_expired_units_as_spendable`,
     `the_budget_view_writes_off_settlement_loss`,
     `a_supplied_budget_never_survives_publication`,
+    `a_snapshot_read_reports_the_ledger_as_it_is_now` (both store suites),
+    `an_unreadable_ledger_row_does_not_withhold_the_snapshot`,
+    `an_observation_supersedes_only_one_no_later_in_ledger_order`,
+    `an_unordered_observation_replaces_only_another_unordered_one`,
+    `later_ledger_reads_always_supersede_earlier_ones`,
+    `a_view_without_a_consumed_total_decodes_as_unordered`,
     `an_instance_reports_no_estimate_when_the_control_plane_reported_no_budget`,
-    `an_estimate_subtracts_what_this_instance_admitted_since_publication`,
-    `a_republish_rebases_the_estimate`,
-    `an_estimate_saturates_at_zero_rather_than_wrapping`,
-    `a_committed_request_reports_the_estimate_its_response_carries`,
+    `an_estimate_is_the_ledger_observation_at_every_stage`,
+    `a_newer_observation_moves_the_estimate_without_a_publication`,
+    `a_stale_observation_does_not_replace_a_newer_one`,
+    `an_unordered_budget_follows_the_latest_publication`,
+    `settled_spend_converges_after_refresh_without_policy_republication`,
+    `cancelled_admission_does_not_leave_a_permanent_budget_deduction`,
+    `a_late_instance_observes_usage_settled_before_it_started`,
+    `arc_swap_budget_does_not_subtract_another_accounts_admissions`,
+    `moka_budget_does_not_subtract_another_accounts_admissions`,
+    `arc_swap_principals_of_one_account_converge`,
+    `moka_principals_of_one_account_converge`,
+    `failed_and_stale_refreshes_keep_the_newest_observation`,
+    `full_stack_over_loopback_http`,
     `an_exhausted_estimate_does_not_deny`,
     `a_snapshot_without_a_budget_key_decodes_as_no_budget`,
     `a_partially_populated_schedule_is_reported_not_interpreted`, and

@@ -741,6 +741,7 @@ async fn run(
             health,
             counters,
             &mut shutdown,
+            shutdown_deadline,
             pass_deadline,
         )
         .await
@@ -773,6 +774,7 @@ async fn run(
                     health,
                     counters,
                     &mut shutdown,
+                    shutdown_deadline,
                     pass_deadline,
                 )
                 .await
@@ -1375,6 +1377,7 @@ async fn release_quiesced(
     health: &watch::Sender<bool>,
     counters: &LeaseCounters,
     shutdown: &mut watch::Receiver<bool>,
+    shutdown_deadline: &crate::ShutdownDeadline,
     deadline: tokio::time::Instant,
 ) -> ReleasePass {
     // Ownership discipline for the whole pass: `queue` holds what has not
@@ -1415,20 +1418,24 @@ async fn release_quiesced(
         );
         let lease_id = grant.lease_id;
         // Racing the signal here is what makes the documented shutdown bound
-        // true: a signal arriving inside a hung release is acted on now, not
-        // after this call's timeout and the rest of the pass. The abandoned
-        // call settles nothing locally, so the lease is re-parked exactly as
-        // a timeout would leave it and the shutdown phase releases it again
-        // under its own budget.
-        let call_outcome = tokio::select! {
-            outcome = call => outcome,
+        // true: a signal arriving inside a hung release starts the shutdown
+        // budget now, not after this call's timeout and the rest of the pass.
+        // The call itself is finished inside that budget rather than dropped:
+        // the allocator may have settled the lease, and discarding its answer
+        // would release it a second time and learn only that it is gone.
+        tokio::pin!(call);
+        let (call_outcome, stopping) = tokio::select! {
+            outcome = &mut call => (outcome, false),
             _ = shutdown.changed() => {
                 tracing::debug!(
                     lease = %lease_id,
-                    "shutdown observed during a release; entering the shutdown release phase"
+                    "shutdown observed during a release; finishing it before the release phase"
                 );
-                *parked = std::iter::once(lease).chain(queue).chain(retry).collect();
-                return ReleasePass::ShutdownObserved;
+                let budget = shutdown_deadline.begin(config.shutdown_release_deadline);
+                match tokio::time::timeout_at(budget, call).await {
+                    Ok(outcome) => (outcome, true),
+                    Err(expired) => (Err(expired), true),
+                }
             }
         };
         match call_outcome {
@@ -1464,6 +1471,12 @@ async fn release_quiesced(
                         "release violated the allocator contract; grant abandoned and readiness withdrawn");
                 }
             },
+        }
+        if stopping {
+            // The leases this pass never reached go first; one that did not
+            // settle has had its turn.
+            *parked = queue.chain(retry).collect();
+            return ReleasePass::ShutdownObserved;
         }
     }
     // Reached only by examining every lease; the two early returns above own
@@ -1604,6 +1617,8 @@ mod tests {
         UnknownLease,
         /// Never resolves — stands in for a wedged backend.
         Hang,
+        /// Succeeds, 20ms after being asked.
+        Slow,
     }
 
     /// Records successful releases; answers scripted lease ids with the
@@ -1652,6 +1667,11 @@ mod tests {
                 Some(Refusal::Fenced) => Err(AllocateError::Fenced),
                 Some(Refusal::InvalidRelease) => Err(AllocateError::InvalidRelease),
                 Some(Refusal::LeaseNotActive) => Err(AllocateError::LeaseNotActive),
+                Some(Refusal::Slow) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    self.released.lock().unwrap().push(lease_id);
+                    Ok(())
+                }
                 Some(Refusal::UnknownLease) => Err(AllocateError::UnknownLease),
                 Some(Refusal::Hang) => std::future::pending().await,
                 None => {
@@ -2113,6 +2133,7 @@ mod tests {
                 &self.health,
                 &self.counters,
                 &mut shutdown,
+                &crate::ShutdownDeadline::default(),
                 tokio::time::Instant::now() + budget,
             )
             .await
@@ -2393,6 +2414,43 @@ mod tests {
         assert_eq!(scripted.released(), [], "nothing settled under a hung head");
     }
 
+    /// A release already asked for is finished, not dropped: the allocator may
+    /// have settled it, and asking again would only learn that it is gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_release_in_flight_at_shutdown_is_finished_not_resent() {
+        let scripted = ScriptedAllocator::new([(LeaseId(1), Refusal::Slow)]);
+        let allocator: Arc<dyn LeaseAllocator> = Arc::clone(&scripted) as _;
+        let harness = Harness::new();
+        let mut parked = vec![parked_lease(1), parked_lease(2)];
+        let (tx, mut shutdown) = watch::channel(false);
+        let clock = clock();
+        let deadline = crate::ShutdownDeadline::default();
+
+        let pass = release_quiesced(
+            &allocator,
+            &mut parked,
+            &clock,
+            &harness.config,
+            &harness.slot,
+            &harness.health,
+            &harness.counters,
+            &mut shutdown,
+            &deadline,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(3_600),
+        );
+        let signal = async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tx.send(true).unwrap();
+        };
+        let (outcome, ()) = tokio::join!(pass, signal);
+
+        assert_eq!(outcome, ReleasePass::ShutdownObserved);
+        assert_eq!(scripted.released(), [LeaseId(1)], "asked exactly once");
+        assert_eq!(harness.stats().released, 1);
+        let order: Vec<_> = parked.iter().map(|l| l.grant().lease_id).collect();
+        assert_eq!(order, [LeaseId(2)], "only the unasked lease remains");
+    }
+
     /// Issue GL-78: the signal is observed inside a hung release, and every
     /// lease — the one in flight included — stays parked for the shutdown
     /// release phase to attempt under its own budget.
@@ -2404,6 +2462,7 @@ mod tests {
         let mut parked = vec![parked_lease(1), parked_lease(2), parked_lease(3)];
         let (tx, mut shutdown) = watch::channel(false);
         let clock = clock();
+        let deadline = crate::ShutdownDeadline::default();
 
         let pass = release_quiesced(
             &allocator,
@@ -2414,6 +2473,7 @@ mod tests {
             &harness.health,
             &harness.counters,
             &mut shutdown,
+            &deadline,
             // A budget far past the signal, so the signal is what ends it.
             tokio::time::Instant::now() + std::time::Duration::from_secs(3_600),
         );
@@ -2429,6 +2489,11 @@ mod tests {
             3,
             "the in-flight lease and the unexamined ones all survive the pass"
         );
-        assert_eq!(parked[0].grant().lease_id, LeaseId(1));
+        let order: Vec<_> = parked.iter().map(|l| l.grant().lease_id).collect();
+        assert_eq!(
+            order,
+            [LeaseId(2), LeaseId(3), LeaseId(1)],
+            "the lease that did not answer yields to the ones never asked"
+        );
     }
 }

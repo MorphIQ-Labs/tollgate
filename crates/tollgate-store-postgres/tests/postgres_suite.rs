@@ -5737,12 +5737,123 @@ async fn a_published_snapshot_carries_the_ledgers_budget() {
         panic!("the snapshot must be present");
     };
     let budget = fetched.budget.expect("the store stamps a budget view");
-    assert_eq!(budget.balance_at_publish, CostUnits(500));
+    assert_eq!(budget.balance, CostUnits(500));
     assert_eq!(
         budget.period_end,
         Some(t(FEB)),
         "the current period ends at the next boundary"
     );
+}
+
+/// Spend publishes nothing, so a read has to report the ledger as it is now,
+/// under the unchanged authorization generation (GL-77).
+#[tokio::test]
+async fn a_snapshot_read_reports_the_ledger_as_it_is_now() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 1_000).await else {
+        return;
+    };
+    let principal = Principal(0x5A);
+    AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            1,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+    let read = async || {
+        let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+            panic!("the snapshot must be present");
+        };
+        assert_eq!(fetched.generation, Generation(1), "nothing was republished");
+        fetched.budget.expect("the store stamps a budget view")
+    };
+    let published = read().await;
+    assert_eq!(
+        (published.balance, published.consumed),
+        (CostUnits(1_000), Some(CostUnits::ZERO))
+    );
+
+    let lease = store
+        .acquire(ACCOUNT, CostUnits(400), TTL, t(0))
+        .await
+        .unwrap()
+        .grant;
+    store
+        .ingest(&[usage(&lease, 1, 150, 1)], t(1))
+        .await
+        .unwrap();
+    let spent = read().await;
+    assert_eq!(
+        (spent.balance, spent.consumed),
+        (CostUnits(850), Some(CostUnits(150)))
+    );
+    assert!(spent.supersedes(published) && !published.supersedes(spent));
+
+    // Written off at release, then reclassified as usage when the event
+    // arrives late: the totals the ordering rests on never move backwards.
+    store
+        .release(lease.lease_id, lease.fencing_token, CostUnits(200), t(2))
+        .await
+        .unwrap();
+    let released = read().await;
+    assert_eq!(
+        (released.balance, released.consumed),
+        (CostUnits(800), Some(CostUnits(200)))
+    );
+    let late = store
+        .ingest(&[usage(&lease, 2, 30, 2)], t(3))
+        .await
+        .unwrap();
+    assert_eq!(late.accepted, 1);
+    assert_eq!(read().await, released);
+
+    AdminStore::deposit(&*store, ACCOUNT, CostUnits(500))
+        .await
+        .unwrap();
+    let funded = read().await;
+    assert_eq!(
+        (funded.balance, funded.consumed),
+        (CostUnits(1_300), Some(CostUnits(200)))
+    );
+    assert!(funded.supersedes(released) && !released.supersedes(funded));
+    assert_conserved(&store).await;
+}
+
+/// A ledger row that cannot be read costs the observation, never the
+/// authorization: failing the fetch would let a reporting value deny once the
+/// held snapshot expired. PostgreSQL only — `MemoryStore` cannot hold one.
+#[tokio::test]
+async fn an_unreadable_ledger_row_does_not_withhold_the_snapshot() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    let principal = Principal(0x5B);
+    AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            1,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+    let pool = corruption_pool().await;
+    set_account_column(&pool, "usage_recorded", -1).await;
+
+    let SnapshotResolution::Present(fetched) = store.snapshot(principal).await.unwrap() else {
+        panic!("the snapshot must still be served");
+    };
+    assert_eq!(fetched.generation, Generation(1));
+    assert_eq!(fetched.budget, None);
+    set_account_column(&pool, "usage_recorded", 0).await;
 }
 
 #[tokio::test]
@@ -5778,7 +5889,7 @@ async fn the_budget_view_counts_units_out_on_lease() {
         panic!("the snapshot must be present");
     };
     assert_eq!(
-        fetched.budget.unwrap().balance_at_publish,
+        fetched.budget.unwrap().balance,
         CostUnits(850),
         "600 in the balance plus the lease's unspent 250; only the 150 spent is gone"
     );
@@ -5796,8 +5907,9 @@ async fn a_supplied_budget_never_survives_publication() {
         return;
     };
     let fabricated = BudgetView {
-        balance_at_publish: CostUnits(999_999),
+        balance: CostUnits(999_999),
         period_end: Some(t(MAR)),
+        consumed: None,
     };
 
     let known = publishable(Arc::new(account_snapshot(
@@ -5814,7 +5926,7 @@ async fn a_supplied_budget_never_survives_publication() {
         panic!("the snapshot must be present");
     };
     assert_eq!(
-        fetched.budget.unwrap().balance_at_publish,
+        fetched.budget.unwrap().balance,
         CostUnits(700),
         "the ledger's number, not the publisher's"
     );
@@ -5869,7 +5981,7 @@ async fn the_budget_view_does_not_report_expired_units_as_spendable() {
         panic!("the snapshot must be present");
     };
     assert_eq!(
-        fetched.budget.unwrap().balance_at_publish,
+        fetched.budget.unwrap().balance,
         CostUnits(600),
         "the new allowance plus the surviving top-up, and not a unit of the expired 500"
     );
@@ -5914,7 +6026,7 @@ async fn the_budget_view_writes_off_settlement_loss() {
         panic!("the snapshot must be present");
     };
     assert_eq!(
-        fetched.budget.unwrap().balance_at_publish,
+        fetched.budget.unwrap().balance,
         CostUnits(800),
         "1000 funded, less the 150 billed and the 50 written off"
     );

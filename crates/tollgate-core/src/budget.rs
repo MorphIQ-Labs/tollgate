@@ -162,14 +162,15 @@ impl BudgetSchedule {
     }
 }
 
-/// What an instance is told about its account's budget, carried by the
-/// snapshot (GL-97).
+/// What an instance is told about its account's budget: one observation of the
+/// ledger, carried by a snapshot (GL-97).
 ///
-/// A *projection of the ledger at publication*, not a live balance: the
-/// request path performs no I/O, so this is the last thing the control plane
-/// said, and it ages between refreshes. Readers combine it with what the
-/// instance has spent since — see `estimate_remaining` in
-/// `tollgate-admission` — and the result is an estimate that names itself one.
+/// A *projection of the ledger when the store produced it*, not a live balance.
+/// A store stamps it at publication and again on every
+/// `SnapshotSource::snapshot` read; the request path performs no I/O, so an
+/// instance reports the newest observation its control plane delivered. It
+/// lags the ledger by usage that has not been ingested and by the refresh
+/// interval.
 ///
 /// The store stamps it. A publisher cannot supply it, because a balance is not
 /// a compiled policy decision the way permissions and limits are: it moves
@@ -179,17 +180,28 @@ impl BudgetSchedule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BudgetView {
-    /// Everything the account could still spend when this snapshot was
-    /// published — its balance *plus* the unspent remainder of every active
-    /// lease, because units out on lease are still the account's.
+    /// Everything the account could still spend when this was observed — its
+    /// balance *plus* the unspent remainder of every active lease, because
+    /// units out on lease are still the account's.
     ///
     /// Equivalently, and this is how a backend computes it in one row read:
-    /// what the account was funded with, minus what it has consumed or lost.
-    pub balance_at_publish: CostUnits,
+    /// what the account was funded with, minus [`consumed`](Self::consumed).
+    ///
+    /// Serialized as `balance`, the key every earlier release reads.
+    #[cfg_attr(feature = "serde", serde(rename = "balance_at_publish"))]
+    pub balance: CostUnits,
     /// When the current period's allowance stops being spendable, for an
     /// account that has a [`BudgetSchedule`]. `None` means no schedule — the
     /// balance does not expire — and is not the same as "unknown".
     pub period_end: Option<Timestamp>,
+    /// Everything the ledger had consumed or lost when this was observed:
+    /// recorded usage, settlement loss and expired allowance. It places the
+    /// observation in ledger order — see [`supersedes`](Self::supersedes).
+    ///
+    /// `None` from a control plane that predates it. Such a view cannot be
+    /// ordered against another.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub consumed: Option<CostUnits>,
 }
 
 /// Allocator evidence that all account funding has been consumed or lost,
@@ -259,8 +271,36 @@ impl BudgetView {
     #[must_use]
     pub fn shortfall(self) -> BalanceShortfall {
         BalanceShortfall {
-            remaining: self.balance_at_publish,
+            remaining: self.balance,
             period_end: self.period_end,
+        }
+    }
+
+    /// Whether this observation may replace `held` as an account's latest.
+    ///
+    /// Both of an account's ledger totals only grow: what it has been funded
+    /// with, `balance + consumed`, and what it has [`consumed`](Self::consumed)
+    /// (usage arriving after its lease was written off moves units from loss to
+    /// usage, leaving the total). So an observation read later is at least as
+    /// large in both, and one that is smaller in either is older — or came from
+    /// a ledger that moved backwards — and is refused. Authorization
+    /// generations play no part: they order policy, which spend never changes.
+    ///
+    /// Equal totals are the same balance, and replace `held` so a changed
+    /// `period_end` is picked up. An unordered view (`consumed` absent)
+    /// replaces only another unordered one.
+    #[must_use]
+    pub fn supersedes(self, held: BudgetView) -> bool {
+        match (self.consumed, held.consumed) {
+            (Some(next), Some(prior)) => {
+                // `u128`: two `u64` terms cannot overflow it.
+                let funded = |view: BudgetView, consumed: CostUnits| {
+                    u128::from(view.balance.get()) + u128::from(consumed.get())
+                };
+                next >= prior && funded(self, next) >= funded(held, prior)
+            }
+            (None, Some(_)) => false,
+            (_, None) => true,
         }
     }
 }
@@ -271,6 +311,95 @@ mod tests {
 
     fn at(s: &str) -> Timestamp {
         s.parse().expect("a valid RFC 3339 instant")
+    }
+
+    fn view(balance: u64, consumed: Option<u64>) -> BudgetView {
+        BudgetView {
+            balance: CostUnits(balance),
+            period_end: None,
+            consumed: consumed.map(CostUnits),
+        }
+    }
+
+    #[test]
+    fn an_observation_supersedes_only_one_no_later_in_ledger_order() {
+        let held = view(940, Some(60));
+        // Later spend, a deposit, and both at once.
+        assert!(view(900, Some(100)).supersedes(held));
+        assert!(view(1_940, Some(60)).supersedes(held));
+        assert!(view(1_900, Some(100)).supersedes(held));
+        // The same totals, which a new period boundary may carry.
+        assert!(
+            BudgetView {
+                period_end: Some(at("2026-05-01T00:00:00Z")),
+                ..held
+            }
+            .supersedes(held)
+        );
+        // Less consumed, even with more funding.
+        assert!(!view(1_000, Some(0)).supersedes(held));
+        assert!(!view(5_000, Some(59)).supersedes(held));
+        // Less funding, even with more consumed.
+        assert!(!view(100, Some(61)).supersedes(held));
+        assert!(!view(939, Some(60)).supersedes(held));
+        // Totals past `u64` still compare.
+        assert!(view(u64::MAX, Some(61)).supersedes(held));
+        assert!(!held.supersedes(view(u64::MAX, Some(60))));
+    }
+
+    #[test]
+    fn an_unordered_observation_replaces_only_another_unordered_one() {
+        let ordered = view(940, Some(60));
+        let unordered = view(1_000, None);
+        assert!(ordered.supersedes(unordered));
+        assert!(!unordered.supersedes(ordered));
+        assert!(unordered.supersedes(view(1, None)));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_view_without_a_consumed_total_decodes_as_unordered() {
+        let decoded: BudgetView =
+            serde_json::from_str(r#"{"balance_at_publish":7,"period_end":null}"#)
+                .expect("an older control plane's view");
+        assert_eq!(decoded, view(7, None));
+        let encoded = serde_json::to_value(view(7, Some(3))).expect("encodes");
+        assert_eq!(encoded["balance_at_publish"], 7);
+        assert_eq!(encoded["consumed"], 3);
+    }
+
+    proptest::proptest! {
+        /// Any two reads of one ledger are ordered the way they happened, and
+        /// whatever order they arrive in, the later one is what is held.
+        #[test]
+        fn later_ledger_reads_always_supersede_earlier_ones(
+            funded in 0_u64..1_000_000,
+            steps in proptest::collection::vec((0_u64..10_000, 0_u64..10_000), 1..20),
+            order in proptest::collection::vec(proptest::num::usize::ANY, 0..40),
+        ) {
+            let (mut funded, mut consumed) = (funded, 0_u64);
+            let mut reads = vec![view(funded, Some(consumed))];
+            for (deposit, spend) in steps {
+                funded += deposit;
+                consumed = (consumed + spend).min(funded);
+                reads.push(view(funded - consumed, Some(consumed)));
+            }
+            let latest = *reads.last().expect("non-empty");
+            for earlier in &reads {
+                proptest::prop_assert!(latest.supersedes(*earlier));
+            }
+            let mut held = reads[0];
+            for index in order {
+                let offered = reads[index % reads.len()];
+                if offered.supersedes(held) {
+                    held = offered;
+                }
+            }
+            if latest.supersedes(held) {
+                held = latest;
+            }
+            proptest::prop_assert_eq!(held, latest);
+        }
     }
 
     #[test]

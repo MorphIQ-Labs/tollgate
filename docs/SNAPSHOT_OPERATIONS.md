@@ -27,6 +27,7 @@ snapshot counters under `snapshots` in `/metrics`:
 | `discovery_failures` | Failed or timed-out catalogue enumerations |
 | `refused_updates` | Pushes or fetched updates refused by generation ordering |
 | `history_evictions` | Histories reclaimed under capacity pressure; visible entries also removed |
+| `refused_observations` | Fetched budget observations older than the one held |
 | `publication_failures` | Reservation or publication refused by a retention/fence check |
 | `unresolved` | Principals unresolved at the last resolution pass |
 
@@ -43,6 +44,30 @@ Use these fields to identify a delayed publisher or lagging source replica.
 Recover the source's authoritative generation; do not clear tombstones or lower
 watermarks to make a replay pass. The aggregate counter supports alerting even
 when event collection is disabled, and carries no per-principal metric labels.
+
+## Budget observations
+
+Every snapshot fetch also reads the account's ledger, and the instance keeps the
+newest observation per account. `estimate_remaining` reports it unchanged, so
+the figure lags the ledger by usage not yet ingested plus up to one
+`refresh_interval`, and reads high until both have passed. An unchanged
+generation still delivers a newer observation; nothing has to be republished,
+and republishing to refresh a balance only adds writes. A failed or timed-out
+fetch keeps the last observation, with no age limit of its own — watch
+`refresh_failures`, `refresh_timeouts` and the usage writer's backlog. The
+figure never decides admission.
+
+Observations are ordered by the ledger's own totals, so a delayed read cannot
+restore spent units. Restoring the ledger from an older backup moves those totals
+backwards: instances keep their newer figure and `refused_observations` rises
+until each is restarted. A ledger row that cannot be read is logged by the
+PostgreSQL store (`ledger row unreadable`) and the snapshot is served without a
+budget view; authorization still refreshes.
+
+Upgrade the control plane first. An older control plane sends no ordering
+total: new instances then take the figure only from publications they install,
+as before. Older instances ignore the added field. There is no database
+migration.
 
 Interpret counters with task health. A stopped manager may retain
 `unresolved = 0` while readiness is false. All mode can remain ready with a

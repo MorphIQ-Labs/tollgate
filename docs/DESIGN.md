@@ -1471,6 +1471,15 @@ escape hatch both an immediate safety boundary and an automatic exit.
 The change is CI-only: it alters no public API, wire contract, migration,
 runtime behavior, allocation, or request-path performance.
 
+RUSTSEC-2026-0459 against `libsqlite3-sys 0.30.1` joined it with GH-77
+(2026-11-27), on the same grounds: SQLite is another optional SQLx graph the
+lockfile records and no target compiles. Its fixed releases (0.39 and later)
+need SQLx 0.9, which requires Rust 1.94 against this workspace's declared 1.89,
+so raising the minimum is a compatibility decision of its own rather than a
+side effect of clearing an unreachable finding. The wrapper applies the same
+three checks to each exception separately, including proving that each one is
+still needed with the others ignored.
+
 ## GitLab Cargo cache policy (GL-30, 2026-08-24)
 
 The GitLab migration replaced Woodpecker's within-run shared `target/` with a
@@ -2035,6 +2044,7 @@ impl RequestContext {
     pub fn generation(&self) -> Generation;
     pub fn policy_revision(&self) -> PolicyRevision;
     pub fn estimate_remaining(&self) -> Option<CostUnits>;
+    pub fn observed_budget(&self) -> Option<BudgetView>;
 
     pub fn admit<O: OpIndex, S: UsageSlot>(
         self,
@@ -2188,6 +2198,7 @@ impl<S: UsageSlot> Pending<S> {
     pub fn limits(&self) -> &ResolvedLimits;
     pub fn policy_revision(&self) -> PolicyRevision;
     pub fn estimate_remaining(&self) -> Option<CostUnits>;
+    pub fn observed_budget(&self) -> Option<BudgetView>;
 
     pub fn acquire_capacity<G: CapacityGate>(
         self,
@@ -2239,6 +2250,7 @@ impl<S: UsageSlot, P: CapacityPermit> Committed<S, P> {
     pub fn request_id(&self) -> RequestId;
     pub fn policy_revision(&self) -> PolicyRevision;
     pub fn estimate_remaining(&self) -> Option<CostUnits>;
+    pub fn observed_budget(&self) -> Option<BudgetView>;
     pub fn is_cancelled(&self) -> bool;
 }
 ```
@@ -2263,13 +2275,14 @@ denial too.** `RequestContext` is the stage a denied request still holds,
 holds; a caller that could only ask after committing could not put the number
 on the responses that most need it.
 
-The name is the contract. It is what the ledger last reported minus what this
-instance has admitted since, so it is wrong by the fleet's spend elsewhere and
-by this instance's own cancellations, and it reads low against the ledger far
-more often than high — the safe direction for a number a customer acts on.
-`AccountAdmissionState::estimate_remaining` states the two error terms and
-their bound; that doc comment is the definition and is deliberately not
-duplicated here.
+The name is the contract. It is the ledger's own figure from the newest
+observation the instance holds, with nothing subtracted locally, so it lags the
+ledger by usage not yet ingested — the asking request's charge included — and by
+the refresh interval. `AccountAdmissionState::estimate_remaining` states the
+definition and is deliberately not duplicated here. `observed_budget` returns
+the whole observation, so a balance and the period it belongs to are read
+together; `snapshot().budget` is only what arrived with the pinned publication.
+Both read the account's current observation rather than a pinned one.
 
 Two rules follow, and a consumer that breaks either has misread the seam.
 **It is never an authorization input** — admission denies from the lease and
@@ -3434,8 +3447,9 @@ is one tick.
 
 **The instance-visible balance is a projection, and naming it one is the
 design.** A product that returns balance and period end on every response
-cannot get them from an instance: it holds a lease slice, not the account. The snapshot now carries a `BudgetView`, and the runtime subtracts
-what the instance has admitted since that publication.
+cannot get them from an instance: it holds a lease slice, not the account. The
+snapshot carries a `BudgetView`, and the runtime reports the newest one it has
+been given (see *Budget observations converge through refresh*, GH-77).
 
 What it reports is deliberately *balance plus every active lease's unspent
 remainder*, not the balance column. Units out on lease are still the account's.
@@ -3459,31 +3473,15 @@ unconditionally, clearing the field for an account the ledger does not hold.
 Overwriting always is what makes the store the only writer rather than usually
 the only writer.
 
-The estimate's baseline is captured per snapshot install rather than by
-resetting a counter. `units_admitted` is account-wide, monotonic, shared across
-principals and generations, and exported — nothing may rewind it. Recording its
-value when a snapshot is installed gets the same subtraction and has a property
-resetting would not: the baseline and `balance_at_publish` are then true of
-exactly the same instant, which is the only thing that makes their difference
-mean anything. A republish moves both together.
-
-Both of the estimate's error terms point the same way. Cancelled admissions are
-counted as spent, and other instances' spend is missed, so it reads low against
-the ledger far more often than high — under-reporting remaining quota is the
-safe direction for a number a customer acts on. Its bound is stated where it
-belongs, in the method's own docs: the refresh interval times the fleet's spend
-rate. An operator who needs it tighter refreshes more often.
-
 It is never an authorization input, and `an_exhausted_estimate_does_not_deny`
-is the witness. Quota comes from the lease and the ledger; if a published zero
+is the witness. Quota comes from the lease and the ledger; if a reported zero
 could refuse, a snapshot refresh delay would become an outage.
 
 Spatially free: `Option<BudgetView>` lands in the tail padding
 `#[repr(align(128))]` already reserved, so `AccountSnapshot` stays 256 bytes
 and the request path touches no line it did not already touch. The estimate
-itself is opt-in per call — one relaxed counter read and a saturating
-subtraction, on no admission path — so the allocation gate and the request
-budget are unchanged.
+itself is opt-in per call — one wait-free load of the account's observation, on
+no admission path.
 
 `Period` and `Rollover` are single-variant enums rather than a "monthly" flag
 and a "carry over" bool. Month arithmetic differs per period in ways a duration
@@ -8281,3 +8279,74 @@ outside every timed interval. Deterministic witnesses reject missing identities
 and partial funding, and exercise successful startup, an absent account's
 deadline, disabled admission and shutdown. The shared setup covers sequential,
 concurrent, distinct-account and mixed capacity scenarios.
+
+## Budget observations converge through refresh (GH-77, 2026-11-26)
+
+An integrator saw one account's remaining estimate alternate between two values
+six units apart across zero-charge requests. Three defects combined. The stores
+stamped `BudgetView` only when publishing a newer generation, and settlement
+publishes nothing, so a refresh returned a frozen figure. The manager and maps
+treat an equal generation as a no-op, so even a fresh figure would not have
+arrived. And the local subtraction GL-97 added to cover the gap read a
+map-wide counter: cancellations stayed deducted, one account's admissions
+lowered another's estimate, and instances disagreed according to their uptime.
+The GL-97 text claimed the error was bounded by the refresh interval and
+tightened by refreshing more often; neither was true. Its tests only ever
+exercised one account, one instance and an explicit republication.
+
+The estimate is now the ledger's figure and nothing else. Subtracting local
+spend requires knowing whether an observation already includes it, and an
+instance does not: usage is ingested asynchronously, and acknowledgements race
+refreshes. Subtracting only the committed request's own charge was exact, but
+makes a charged response and the next zero-charge one disagree — the reported
+symptom. Tracking unacknowledged usage per account would put atomics on the
+request path, couple admission to the usage writer, and still miss every other
+instance's spend. The cost accepted is that the figure reads high after spend
+until ingestion and refresh catch up, reversing GL-97's preference for reading
+low; it decides no admission either way.
+
+Stores stamp the view on read as well as on publish. PostgreSQL does it in the
+one statement that already read the snapshot, joined to the account row, so a
+refresh adds no round trip. The instance holds the observation on the account's
+`LeaseSlot` and the manager delivers it before generation acceptance, so
+authorization replay protection is untouched.
+
+Ordering cannot use generations, and a read sequence assigned by the instance
+would not order publications against reads from several server replicas. The
+ledger already has an order: funding and consumption only grow, late usage
+moving units from settlement loss to usage within the latter. Carrying
+`consumed` beside the balance gives both totals with no migration and no counter
+that could overflow. A ledger restored from backup moves them backwards;
+instances then keep their newer figure, count each refusal, and recover on
+restart, the same way retained generations treat a rewound catalogue.
+
+Performance: `estimate_remaining` went from summing every counter shard to one
+load, publication no longer sums them to record a baseline, and admission is
+untouched. `BudgetView` grew by a `consumed` field; `AccountSnapshot` keeps its
+asserted size.
+
+Compatibility: `BudgetView::balance_at_publish` is renamed `balance` and keeps
+its serialized key; `consumed` is a new public field; `estimate_remaining`
+changes meaning. Deploy the control plane first. An older control plane's views
+are unordered and applied only from installed publications. Older instances
+ignore the new key. No database migration.
+
+### A shutdown finishes the idempotent write it interrupts (GH-77)
+
+The reusable adapter's HTTP test failed intermittently with `accepted: 0,
+duplicate: 1`: one charge, billed once, reported as a replay. The usage writer
+raced its in-flight ingest against the shutdown watch and dropped it when the
+signal won. The server had committed the batch; the final flush sent it again.
+The lease manager's release pass did the same and re-parked the lease for a
+second release. GL-78 introduced the race so a hung call could not outlast the
+shutdown budget, and its witnesses all used calls that never answered, where
+dropping and waiting out the budget are indistinguishable.
+
+Both calls are idempotent and bounded, so the signal now starts the one
+shutdown budget and the call is finished inside it. A hung call costs no more
+than before: the later phase shares the same deadline instead of starting its
+own. The release that does not answer yields its place to leases not yet asked.
+Acquisition and consolidation keep GL-115's contract — dropped and reported as
+uncertain — because waiting on them would spend the budget that returns the
+grants the instance knows it holds.
+

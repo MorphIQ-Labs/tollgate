@@ -33,7 +33,7 @@ Tests verify enforcement; they don't replace it.
 | Unit, property and integration tests | The behavior. Property tests (`proptest`) cover the interleavings fixed tests miss. | Every pull request |
 | Backend parity | `MemoryStore` is the executable specification. `PostgresStore` passes the same scenario suite, test by test and name by name, and a check fails if a mirrored test drives a different contract on each side. | Every pull request |
 | Mutation testing | Code a pull request changes is mutated with `cargo-mutants`. A mutant that no test catches fails the build, so a test that doesn't bite can't pass as coverage. | Every pull request |
-| Machine-checked proofs | 24 Lean 4 modules with 369 theorems prove exact models of the critical accounting and concurrency state machines. The gate rejects any `sorry` or `admit`. | Every pull request |
+| Machine-checked proofs | 25 Lean 4 modules with 381 theorems prove exact models of the critical accounting and concurrency state machines. The gate rejects any `sorry` or `admit`. | Every pull request |
 | Proof mutation testing | Every transition in the Lean models is mutated, one change at a time: a flipped guard, a dropped update, a loosened bound. Some theorem must fail for each, so a proof cannot pass against a model it doesn't pin down. An equivalent mutant is excused only by name, with a written reason. | Every pull request |
 | Allocation assertions | The steady-state admission path allocates nothing it owns; counted deterministically. | Every pull request |
 | Performance gates | Hot-path benchmarks and loopback load tests against calibrated thresholds, with the host and revision recorded. See [performance](PERFORMANCE.md). | Locally, on a controlled host |
@@ -86,7 +86,7 @@ theorem or invariant count stated on this page or in the README goes stale.
 | 25 | Concurrency ceilings are exact, per instance, and released once. | [ConcurrencyGauge](../formal/lean/Tollgate/ConcurrencyGauge.lean) |
 | 26 | A staged request retains its principal generation and reads one current account authority at admission. | [Conservation](../formal/lean/Tollgate/Conservation.lean) |
 | 27 | A credential is durable before it is disclosed, and its digest table is a projection. | [CredentialProjection](../formal/lean/Tollgate/CredentialProjection.lean) |
-| 28 | A budget period is crossed exactly once, and only its allowance expires. | [Conservation](../formal/lean/Tollgate/Conservation.lean), [PeriodRoller](../formal/lean/Tollgate/PeriodRoller.lean) |
+| 28 | A budget period is crossed exactly once, and only its allowance expires. | [BudgetObservation](../formal/lean/Tollgate/BudgetObservation.lean), [Conservation](../formal/lean/Tollgate/Conservation.lean), [PeriodRoller](../formal/lean/Tollgate/PeriodRoller.lean) |
 | 29 | The application's policy identity is carried, never interpreted. | — |
 | 30 | Execution capacity is conserved, and the reserve is reachable. | [ExecutionCapacity](../formal/lean/Tollgate/ExecutionCapacity.lean) |
 | 31 | An account has at most one owned refill manager, including retirement. | [AccountLifecycle](../formal/lean/Tollgate/AccountLifecycle.lean) |

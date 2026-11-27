@@ -184,4 +184,4 @@ decides admission.
   `memory.rs`, and `crates/tollgate-store-postgres/src/lib.rs`;
   `crates/tollgate-client/src/period_roller.rs` (`PeriodRoller`)
 - Invariant: 28
-- Lean: `PeriodRoller.lean`, `Conservation.lean`
+- Lean: `PeriodRoller.lean`, `Conservation.lean`, `BudgetObservation.lean`

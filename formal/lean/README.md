@@ -114,6 +114,11 @@ This Lean package contains exact models for critical contracts:
   pools and excludes best-effort work from the assured reserve.
 - `AccountLifecycle` models at most one account-manager owner, retirement before
   replacement, and inert duplicate joins.
+- `BudgetObservation` models the ordering of an account's budget
+  observations: an instance keeps a ledger reading only when neither growing
+  total is smaller, so what it holds never moves backwards and the latest
+  reading wins in every arrival order. It assumes the totals only grow, and
+  says nothing about when a reading arrives.
 - `PeriodRoller` models bounded independent maintenance: one pending call,
   a fixed cutoff per pass, and terminal stopping.
 - `ServerMaintenance` models independent reclaim/rollover outcomes and terminal
