@@ -8,6 +8,12 @@ test_workspace = true
 timeout_multiplier = 4.0
 minimum_test_timeout = 60
 
+# The end-to-end harness is test code: it drives separate processes and its
+# scenarios run only where those binaries and PostgreSQL are provided
+# (./scripts/check_e2e.sh), so a mutant of it has no test to fail here. The
+# behaviour it exercises is mutated in the crates that own it.
+exclude_globs = ["crates/tollgate-e2e/**"]
+
 exclude_re = [
   # Formatting has no authorization, accounting, or operational semantics.
   "impl (std::)?fmt::(Debug|Display)",

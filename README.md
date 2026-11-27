@@ -242,6 +242,13 @@ explains how to size it. The control-plane server starts with
 once identities and TLS are configured, and refuses remote plaintext and
 anonymous calls.
 
+With `PRICING_CONTROL_URL` set, the same service runs against that server
+instead of an embedded store, given an instance credential in
+`PRICING_CONTROL_TOKEN_FILE` and the server's issuer secret in
+`PRICING_CREDENTIAL_SECRET_FILE`; `--help` lists the timing settings.
+`GET /v1/budget` reports the customer's balance estimate.
+`./scripts/check_e2e.sh` runs that deployment end to end over PostgreSQL.
+
 Every binary answers `--help` and `--version` before reading any
 configuration. `pricing-api` and `tollgate-server` take no positional
 arguments, and exit with status 2 on any they are given.

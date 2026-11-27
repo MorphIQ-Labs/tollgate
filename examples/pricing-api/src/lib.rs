@@ -17,10 +17,11 @@
 //!   → respond { prices, metadata: { request_id, units_charged } }
 //! ```
 //!
-//! The embedded topology runs `MemoryStore` in-process; pointing the same
-//! stack at a `tollgate-server` is a one-line swap to `HttpStore` (see the
-//! loopback test in tollgate-server). Readiness reports 503 until the account's
-//! lease slot is stocked (INVARIANTS.md GL-10).
+//! The embedded topology runs `MemoryStore` in-process ([`build_app`]). The
+//! deployed one runs the same request path against a `tollgate-server` over
+//! `HttpStore` ([`build_remote_app`]); `tollgate-e2e` drives it as separate
+//! processes. Readiness reports 503 until the account's lease slot is stocked
+//! (INVARIANTS.md GL-10).
 
 #![allow(
     clippy::disallowed_methods,
@@ -44,7 +45,7 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use tollgate_admission::{CapacityGate, ExecutionCapacityGate, ExecutionCapacityMode, NoGate};
-use tollgate_auth::HmacRegistry;
+use tollgate_auth::{CredentialVerifier, HmacRegistry};
 use tollgate_axum::{
     AdapterConfig, BearerAuth, BufferedResponse, ChargeMetadata, InputError, InputLimits,
     Rejection, Tollgate, Validated,
@@ -168,8 +169,10 @@ impl AppState {
     }
 }
 
-pub struct AppRuntime {
-    pub store: Arc<MemoryStore>,
+/// The running service's owned tasks. `S` is the store the process holds: the
+/// in-memory one when embedded, nothing when the control plane is remote.
+pub struct AppRuntime<S = Arc<MemoryStore>> {
+    pub store: S,
     background: Option<Background>,
 }
 
@@ -187,7 +190,7 @@ impl Drop for ServerTask {
     }
 }
 
-impl AppRuntime {
+impl<S> AppRuntime<S> {
     /// Wait for a fixed load-test fixture to be fully funded before warmup.
     /// Production readiness deliberately permits partially funded `All`
     /// populations; a controlled workload requires every named account.
@@ -587,56 +590,12 @@ async fn build_app_with(
             store.clone(),
             store.clone(),
             clock,
-            tollgate_client::InstanceRuntimeConfig {
-                snapshot_history_capacity:
-                    tollgate_admission::ArcSwapSnapshotMap::DEFAULT_GENERATION_CAPACITY,
-                snapshots: SnapshotManagerConfig {
-                    // Stateless: any instance may serve any customer, so this
-                    // one tracks everything the store knows rather than a list
-                    // fixed at boot (GL-48). Seeded with the demo key so the
-                    // example still works against a source that cannot
-                    // enumerate.
-                    principals: TrackedPrincipals::All {
-                        seed: principals.clone(),
-                    },
-                    refresh_interval: std::time::Duration::from_secs(30),
-                    unknown_ttl: SignedDuration::from_secs(60),
-                    revoked_ttl: SignedDuration::from_secs(3_600),
-                    retry_backoff: std::time::Duration::from_millis(200),
-                    max_concurrent_fetches: 16,
-                    // Above the slowest fetch this deployment's source
-                    // legitimately makes, not against its fast path: an
-                    // abandoned fetch keeps the principal's previous resolution
-                    // and retries with backoff, so a value under real source
-                    // latency would refresh nothing while looking healthy. Five
-                    // seconds against an in-process store that answers in
-                    // microseconds is deliberate headroom — the bound exists to
-                    // keep the sweep returning (GL-103), not to police latency.
-                    fetch_timeout: std::time::Duration::from_secs(5),
-                    enumeration_timeout: std::time::Duration::from_secs(30),
-                },
-                leases: tollgate_client::AccountLeaseConfig {
-                    target_grant,
-                    low_water,
-                    lease_ttl: SignedDuration::from_secs(60),
-                    expiry_safety_margin: SignedDuration::from_secs(2),
-                    poll_interval: std::time::Duration::from_millis(20),
-                    store_call_timeout: std::time::Duration::from_secs(5),
-                    shutdown_release_deadline: std::time::Duration::from_secs(10),
-                },
-                usage: UsageWriterConfig {
-                    queue_capacity: 4_096,
-                    max_batch: 256,
-                    flush_interval: std::time::Duration::from_millis(25),
-                    retry_backoff: std::time::Duration::from_millis(50),
-                    shutdown_drain_deadline: std::time::Duration::from_secs(5),
-                    ingest_timeout: std::time::Duration::from_secs(5),
-                },
+            runtime_config(
+                principals.clone(),
+                ControlPlaneTiming::EMBEDDED,
+                (target_grant, low_water),
                 sharding,
-                idle_account_linger: std::time::Duration::from_secs(1),
-                manager_restart_backoff: std::time::Duration::from_millis(200),
-                shutdown_deadline: std::time::Duration::from_secs(15),
-            },
+            ),
         )
         .expect("example runtime configuration is valid");
         let mut republishers = tokio::task::JoinSet::new();
@@ -667,7 +626,10 @@ async fn build_app_with(
         capacity,
         admission,
     });
+    (router(state), AppRuntime { store, background })
+}
 
+fn router(state: Arc<AppState>) -> axum::Router {
     let price_route = match state.admission.clone() {
         Some(runtime) => match state.capacity.clone() {
             Some(gate) => metered_price(state.clone(), runtime, gate),
@@ -676,13 +638,218 @@ async fn build_app_with(
         None => post(baseline_price),
     };
 
-    let router = axum::Router::new()
+    axum::Router::new()
         .route("/livez", get(async || StatusCode::OK))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
+        .route("/v1/budget", get(budget))
         .route("/v1/price", price_route)
-        .with_state(state);
-    (router, AppRuntime { store, background })
+        .with_state(state)
+}
+
+/// How often this instance consults its control plane, and how long its grants
+/// last. A deployment trades control-plane load against how soon a change
+/// reaches the request path.
+#[derive(Clone, Copy, Debug)]
+pub struct ControlPlaneTiming {
+    /// Snapshot and credential refresh. Bounds how soon a publication, a
+    /// revocation or new spend reaches this instance without a push.
+    pub refresh_interval: std::time::Duration,
+    pub lease_ttl: SignedDuration,
+    /// How long committed usage may wait for a batch to fill.
+    pub usage_flush_interval: std::time::Duration,
+}
+
+impl ControlPlaneTiming {
+    /// The embedded example's own cadence: its store pushes every publication.
+    pub const EMBEDDED: Self = Self {
+        refresh_interval: std::time::Duration::from_secs(30),
+        lease_ttl: SignedDuration::from_secs(60),
+        usage_flush_interval: std::time::Duration::from_millis(25),
+    };
+    /// A remote control plane over HTTP pushes nothing, so refresh is the only
+    /// way a change arrives.
+    pub const REMOTE: Self = Self {
+        refresh_interval: std::time::Duration::from_secs(5),
+        ..Self::EMBEDDED
+    };
+}
+
+fn runtime_config(
+    principals: Vec<Principal>,
+    timing: ControlPlaneTiming,
+    (target_grant, low_water): (CostUnits, CostUnits),
+    sharding: LocalSharding,
+) -> tollgate_client::InstanceRuntimeConfig {
+    tollgate_client::InstanceRuntimeConfig {
+        snapshot_history_capacity:
+            tollgate_admission::ArcSwapSnapshotMap::DEFAULT_GENERATION_CAPACITY,
+        snapshots: SnapshotManagerConfig {
+            // Stateless: any instance may serve any customer, so this one
+            // tracks everything the store knows rather than a list fixed at
+            // boot (GL-48). Seeded so the embedded example still works against
+            // a source that cannot enumerate.
+            principals: TrackedPrincipals::All { seed: principals },
+            refresh_interval: timing.refresh_interval,
+            unknown_ttl: SignedDuration::from_secs(60),
+            revoked_ttl: SignedDuration::from_secs(3_600),
+            retry_backoff: std::time::Duration::from_millis(200),
+            max_concurrent_fetches: 16,
+            // Above the slowest fetch this deployment's source legitimately
+            // makes, not against its fast path: an abandoned fetch keeps the
+            // principal's previous resolution and retries with backoff, so a
+            // value under real source latency would refresh nothing while
+            // looking healthy. Five seconds is deliberate headroom — the bound
+            // exists to keep the sweep returning (GL-103), not to police
+            // latency.
+            fetch_timeout: std::time::Duration::from_secs(5),
+            enumeration_timeout: std::time::Duration::from_secs(30),
+        },
+        leases: tollgate_client::AccountLeaseConfig {
+            target_grant,
+            low_water,
+            lease_ttl: timing.lease_ttl,
+            expiry_safety_margin: SignedDuration::from_secs(2),
+            poll_interval: std::time::Duration::from_millis(20),
+            store_call_timeout: std::time::Duration::from_secs(5),
+            shutdown_release_deadline: std::time::Duration::from_secs(10),
+        },
+        usage: UsageWriterConfig {
+            queue_capacity: 4_096,
+            max_batch: 256,
+            flush_interval: timing.usage_flush_interval,
+            retry_backoff: std::time::Duration::from_millis(50),
+            shutdown_drain_deadline: std::time::Duration::from_secs(5),
+            ingest_timeout: std::time::Duration::from_secs(5),
+        },
+        sharding,
+        idle_account_linger: std::time::Duration::from_secs(1),
+        manager_restart_backoff: std::time::Duration::from_millis(200),
+        shutdown_deadline: std::time::Duration::from_secs(15),
+    }
+}
+
+/// Everything an instance needs to serve from a `tollgate-server`. Accounts,
+/// credentials, policy and funding are all administered there.
+pub struct RemoteConfig {
+    /// The control plane's base URL.
+    pub control_url: String,
+    /// This instance's `instance`-role bearer credential.
+    pub control_token: tollgate_client::BearerToken,
+    /// The server's credential-issuer secret, which verifies customer keys.
+    pub credential_secret: Vec<u8>,
+    pub timing: ControlPlaneTiming,
+    pub target_grant: CostUnits,
+    pub low_water: CostUnits,
+    pub sharding: LocalSharding,
+}
+
+/// The same service against a remote control plane. Never ready until the
+/// credential feed and every discovered account have arrived.
+///
+/// # Errors
+///
+/// A configuration the transport, credential manager or runtime refuses.
+pub async fn build_remote_app(
+    config: RemoteConfig,
+) -> Result<(axum::Router, AppRuntime<()>), String> {
+    let store = tollgate_client::HttpStore::with_config(
+        config.control_url,
+        tollgate_client::HttpStoreConfig {
+            bearer: Some(tollgate_client::StaticBearer::new(config.control_token)),
+            ..Default::default()
+        },
+    )
+    .map_err(|error| format!("control-plane transport: {error}"))?;
+    let clock: Arc<SystemClock> = Arc::new(SystemClock);
+    let (runtime, admission) = tollgate_client::InstanceRuntime::spawn(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        clock.clone(),
+        runtime_config(
+            Vec::new(),
+            config.timing,
+            (config.target_grant, config.low_water),
+            config.sharding,
+        ),
+    )
+    .map_err(|error| format!("instance runtime: {error}"))?;
+    let key_manager = match tollgate_client::KeyManager::spawn(
+        store,
+        &config.credential_secret,
+        clock,
+        tollgate_client::KeyManagerConfig {
+            refresh_interval: config.timing.refresh_interval,
+            ..Default::default()
+        },
+    ) {
+        Ok(manager) => manager,
+        Err(error) => {
+            // Nothing has been admitted, so there is nothing to drain; stop
+            // the runtime rather than leaving its tasks behind.
+            if let Err(shutdown) = runtime.shutdown().await {
+                tracing::warn!(error = %shutdown, "instance supervisor died during startup abort");
+            }
+            return Err(format!("credential manager: {error}"));
+        }
+    };
+    let state = Arc::new(AppState {
+        auth: key_manager.verifier(),
+        keys: Some(key_manager.monitor()),
+        baseline_counters: tollgate_admission::AdmissionCounters::default(),
+        input_rejections: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+        capacity: None,
+        admission: Some(admission),
+    });
+    let background = Background {
+        keys: key_manager,
+        runtime,
+        republishers: tokio::task::JoinSet::new(),
+    };
+    Ok((
+        router(state),
+        AppRuntime {
+            store: (),
+            background: Some(background),
+        },
+    ))
+}
+
+/// The account's newest budget observation, as this instance holds it
+/// (INVARIANTS.md GL-28). An estimate for the customer, never an admission
+/// decision.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Budget {
+    pub balance: u64,
+    pub period_end: Option<String>,
+}
+
+/// `GET /v1/budget`. Authorizes like any request and charges nothing; the
+/// context it opens is therefore counted under `contexts_abandoned`.
+async fn budget(State(state): State<Arc<AppState>>, headers: header::HeaderMap) -> Response {
+    let Some(runtime) = state.admission.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let principal = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .and_then(|key| state.auth.verify(key.as_bytes()));
+    let Some(verified) = principal else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match runtime.begin(verified.principal, PERMISSION_PRICE, Timestamp::now()) {
+        Ok(context) => match context.observed_budget() {
+            Some(view) => Json(Budget {
+                balance: view.balance.get(),
+                period_end: view.period_end.map(|at| at.to_string()),
+            })
+            .into_response(),
+            None => StatusCode::NO_CONTENT.into_response(),
+        },
+        Err(reason) => deny_buffered(reason).into_response(),
+    }
 }
 
 async fn readyz(State(state): State<Arc<AppState>>) -> StatusCode {

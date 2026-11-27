@@ -12,7 +12,7 @@ publish.workspace = true
 tollgate-axum = { path = "../../crates/tollgate-axum", version = "=0.32.2" }
 tollgate-core = { path = "../../crates/tollgate-core", version = "=0.32.2" }
 tollgate-admission = { path = "../../crates/tollgate-admission", version = "=0.32.2" }
-tollgate-client = { path = "../../crates/tollgate-client", version = "=0.32.2" }
+tollgate-client = { path = "../../crates/tollgate-client", version = "=0.32.2", features = ["http"] }
 tollgate-store = { path = "../../crates/tollgate-store", version = "=0.32.2" }
 tollgate-auth = { path = "../../crates/tollgate-auth", version = "=0.32.2" }
 axum = { workspace = true }
@@ -27,6 +27,8 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true, features = ["fast-rng"] }
 
 [dev-dependencies]
+# The remote-topology tests run a control plane in process.
+tollgate-server = { path = "../../crates/tollgate-server", default-features = false }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 http-body-util = { workspace = true }

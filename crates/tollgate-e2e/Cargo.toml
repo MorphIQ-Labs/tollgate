@@ -1,0 +1,25 @@
+[package]
+name = "tollgate-e2e"
+description = "Drives tollgate-server, PostgreSQL and application instances as separate processes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Wire types only: everything else is reached over public HTTP, so the harness
+# cannot shortcut a step a deployment would have to perform.
+[dependencies]
+tollgate-core = { path = "../tollgate-core", features = ["serde"] }
+tollgate-store = { path = "../tollgate-store", features = ["wire"] }
+jiff = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

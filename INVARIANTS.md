@@ -597,6 +597,9 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    `RefillRequests` handoff tests. Configuration ownership is witnessed by
    `mismatched_local_sharding_is_rejected_before_tasks_start`.
 
+    Deployed witness, through a server process stopped and restarted:
+    `instances_serve_through_a_server_restart_and_then_settle`.
+
 7. **Idempotent partial accounting.** Replaying a usage batch (same request
    IDs) never double-bills. Every successful mixed batch classifies each
    input exactly once as accepted, duplicate, or rejected; only accepted
@@ -821,6 +824,9 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    stop/exit properties over atomic observations. Rust tests witness the watch,
    task, HTTP and finite-counter implementation boundaries separately.
 
+    Deployed witness, with a killed application process:
+    `a_killed_instance_does_not_return_spendable_units`.
+
 10. **Ready means currently admissible.** An instance reports ready only while
     its snapshot resolutions meet the bar below, it can still fund work, and
     its snapshot and refill/accounting tasks are alive. Readiness falls again
@@ -1019,6 +1025,9 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `failed_commit_releases_concurrency_and_accounting_capacity`, plus the
     `Committed` discarded-result and `CancelHandle` cannot-commit compile-fail
     doctests.
+
+    Deployed witness, from HTTP responses to the settled ledger:
+    `traffic_across_instances_is_billed_to_the_ledger`.
 
 14. **Account creation is never destructive.** Recreating an existing
     account is a surfaced `AlreadyExists` in every backend — never an
@@ -1910,6 +1919,10 @@ exists to detect corrupt state and must not be able to launder it.
     `credential_diagnostics_never_disclose_issuer_or_customer_secrets`; plus the paging, freshness and
     transport witnesses in 34.
 
+    Deployed witness, through an operator revocation reaching every
+    application process:
+    `a_revoked_credential_is_refused_by_every_instance`.
+
 28. **A budget period is crossed exactly once, and only its allowance
     expires.** An account may carry a [`BudgetSchedule`]: an allowance
     replenished each period, with unspent units that do not carry over. The
@@ -2053,6 +2066,9 @@ exists to detect corrupt state and must not be able to launder it.
     `a_rollover_never_touches_a_top_up`,
     `a_top_up_funded_lease_expires_nothing`, and
     `unrecorded_expiry_always_breaks_conservation`.
+
+    Deployed witness, across application processes:
+    `budget_estimates_converge_across_instances_without_publication`.
 
 29. **The application's policy identity is carried, never interpreted.** A
     snapshot may name the product policy it was compiled from — a
