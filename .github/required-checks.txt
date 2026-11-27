@@ -1,0 +1,26 @@
+# The status checks `main` requires, one per line, as GitHub names them.
+#
+# `scripts/check_required_checks.sh` holds this list to the jobs in
+# workflows/ci.yml on every pull request. Branch protection is a repository
+# setting that nothing here can change: update it in the same change that
+# edits this list, and compare the two with
+# `scripts/audit_required_checks.sh` (GH-88).
+check / commit-convention
+check / repository-hygiene
+check / secret-scan
+check / fmt
+check / clippy
+check / audit
+check / licenses
+check / package
+check / msrv
+check / docs
+test / test
+test / allocation-assertions
+test / test-no-default-features
+test / test-postgres
+test / test-e2e
+test / bench-compile
+test / load-failure-reporting
+assurance / formal
+assurance / mutation

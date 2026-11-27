@@ -44,6 +44,8 @@ TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
 ./scripts/check_load_thresholds.sh
 ./scripts/check_allocations.sh
 ./scripts/check_ci_rules.sh
+./scripts/check_required_checks.sh
+./scripts/audit_required_checks.sh  # live branch protection; needs admin `gh`
 ./scripts/check_invariant_witnesses.sh
 ./scripts/check_backend_parity.sh
 cargo run --locked --profile production -p pricing-api --example load_gate_failure_probe
@@ -136,7 +138,7 @@ Trunk-based, one long-lived branch. The workflow above is prose until these sett
 | --- | --- | --- |
 | Default branch | `main` | There is no `develop` and no release train. A second long-lived branch would divert pull requests away from `main`; since GL-106 that no longer disables the blocking assurance gates, which run on every pull request, but it still splits release preparation. |
 | `main` protection | pull request required, **administrators included**; force push and deletion **off** | "Accepts no direct pushes" is a setting, not a convention. |
-| Required status checks | every CI job, branch up to date with `main` | GitHub reports a job skipped behind a failed stage as passing. The stage chain is safe only because every job of every stage is itself required, so the failure that caused the skip still blocks the merge. A new job is added here in the same change that adds it to CI. The one exception is a sharded gate's matrix: its shards are summarised by one required aggregate (`assurance / mutation`), which runs under `always()` and fails unless every shard succeeded, so the required list does not track the shard count; `./scripts/check_ci_rules.sh` enforces that shape. |
+| Required status checks | exactly `.github/required-checks.txt`: every CI job, branch up to date with `main` | GitHub reports a job skipped behind a failed stage as passing. The stage chain is safe only because every job of every stage is itself required, so the failure that caused the skip still blocks the merge. A new job is added to the file in the same change that adds it to CI, which `./scripts/check_required_checks.sh` enforces, and to the setting when that change merges, which `./scripts/audit_required_checks.sh` verifies. The one exception is a sharded gate's matrix: its shards are summarised by one required aggregate (`assurance / mutation`), which runs under `always()` and fails unless every shard succeeded, so the required list does not track the shard count; `./scripts/check_ci_rules.sh` enforces that shape. |
 | Merge method | squash only; commit title from the PR title, body from its description | The PR title becomes the single commit subject on `main`, which release notes are computed from. |
 | Signed commits | required on `main` | GitHub signs the squash commits it creates; a key signing locally must carry the committer's (noreply) address to verify. |
 | Linear history | required | Follows from squash-only merging. |
@@ -146,7 +148,7 @@ Trunk-based, one long-lived branch. The workflow above is prose until these sett
 | Pages | source: GitHub Actions (`pages.yml`) | The site is built by the same pinned mdBook and link check as `check / docs`, never from a branch. |
 | Auto-merge | allowed | Merge-when-green. Safe only because checks are required: without branch protection, auto-merge merges at once. |
 
-Check them with `gh api repos/MorphIQ-Labs/tollgate` and `gh api repos/MorphIQ-Labs/tollgate/branches/main/protection` rather than assuming.
+Check them with `gh api repos/MorphIQ-Labs/tollgate` and `gh api repos/MorphIQ-Labs/tollgate/branches/main/protection` rather than assuming, and run `./scripts/audit_required_checks.sh` after merging any change to `.github/required-checks.txt` and when reviewing a release pull request. CI cannot run the audit: the workflow token may not read branch protection.
 
 ## Definition of Done
 

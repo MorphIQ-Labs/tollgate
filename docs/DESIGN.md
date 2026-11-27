@@ -8400,3 +8400,26 @@ measurements, keep the wrapper simple; continuous sampling would catch a brief
 switch at the cost of a second process running beside the benchmarks. A source
 that cannot be determined is judged as before, so servers without a battery
 are unaffected.
+
+## Required checks are declared in the repository (GH-88, 2026-11-27)
+
+The settings table said every CI job was required, and `check / docs` was not.
+Seven test jobs need it, and GitHub reports a job skipped behind a failed
+dependency as passing, so a failing documentation build left a pull request
+mergeable with those jobs never run. Nothing compared the table with the
+workflow or with GitHub.
+
+`.github/required-checks.txt` is now the declaration. A pull request cannot add,
+rename or remove a CI job without changing it, checked offline from the
+workflow alone. Whether the setting matches the declaration is a separate audit
+run by an administrator, because reading branch protection needs a permission
+the workflow token does not have. A scheduled workflow with its own credential
+was not taken: a standing token able to read repository administration is a
+larger exposure than the drift it would report, which can only follow a change
+to the declaration or a manual edit of the setting. The audit fails when it
+cannot read the setting.
+
+The workflow is read line by line, accepting only the shapes this repository
+writes, rather than adding a YAML dependency. An unfamiliar shape is an error,
+because a job the reader missed would be one nothing requires.
+

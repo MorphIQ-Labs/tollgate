@@ -42,5 +42,13 @@ name = "mdbook-repo-links"
 path = "src/bin/mdbook_repo_links.rs"
 
 [[bin]]
+name = "check_required_checks"
+path = "src/bin/check_required_checks.rs"
+
+[[bin]]
+name = "audit_required_checks"
+path = "src/bin/audit_required_checks.rs"
+
+[[bin]]
 name = "check_lean_mutants"
 path = "src/bin/check_lean_mutants.rs"
