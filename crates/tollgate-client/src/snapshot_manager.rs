@@ -277,6 +277,7 @@ pub struct SnapshotCounters {
     discovery_failures: AtomicU64,
     refused_updates: AtomicU64,
     history_evictions: AtomicU64,
+    refused_observations: AtomicU64,
     publication_failures: AtomicU64,
     unresolved: AtomicU64,
 }
@@ -292,6 +293,7 @@ impl SnapshotCounters {
             discovery_failures: AtomicU64::new(0),
             refused_updates: AtomicU64::new(0),
             history_evictions: AtomicU64::new(0),
+            refused_observations: AtomicU64::new(0),
             publication_failures: AtomicU64::new(0),
             unresolved: AtomicU64::new(0),
         }
@@ -333,6 +335,14 @@ impl SnapshotCounters {
         self.discovery_failures.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A fetched budget observation older than the account's held one. Reads
+    /// of one account's principals can complete out of order, so an occasional
+    /// one is expected; a count that keeps rising while estimates stand still
+    /// means the source's ledger moved backwards.
+    fn record_refused_observation(&self) {
+        self.refused_observations.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn set_unresolved(&self, principals: u64) {
         self.unresolved.store(principals, Ordering::Relaxed);
     }
@@ -348,6 +358,7 @@ impl SnapshotCounters {
             discovery_failures: self.discovery_failures.load(Ordering::Relaxed),
             refused_updates: self.refused_updates.load(Ordering::Relaxed),
             history_evictions: self.history_evictions.load(Ordering::Relaxed),
+            refused_observations: self.refused_observations.load(Ordering::Relaxed),
             publication_failures: self.publication_failures.load(Ordering::Relaxed),
             unresolved: self.unresolved.load(Ordering::Relaxed),
         }
@@ -382,6 +393,11 @@ pub struct SnapshotStats {
     /// Histories reclaimed under capacity pressure. Each removal also removes
     /// visible state and requires a fresh authoritative read to recover.
     pub history_evictions: u64,
+    /// Fetched budget observations refused as older than the one held for the
+    /// account. Occasional counts are reordered reads; a steady rise with
+    /// unmoving estimates means the source's ledger moved backwards, and the
+    /// instance keeps its newer figure until restarted.
+    pub refused_observations: u64,
     /// Reservations or publications refused by the retention/fence boundary.
     /// Distinct from source failures and ordinary generation rejection.
     pub publication_failures: u64,
@@ -1348,6 +1364,21 @@ async fn refresh_chunk_cancellable(
             };
             match result {
                 Ok(SnapshotResolution::Present(snapshot)) => {
+                    // Delivered before generation acceptance: an unchanged
+                    // generation is the ordinary answer, and the ledger moves
+                    // without one. Only an ordered observation can be applied
+                    // outside a publication — see `BudgetView::supersedes`.
+                    if let Some(view) = snapshot.budget
+                        && view.consumed.is_some()
+                        && !slots.slot(snapshot.account_id).observe_budget(view)
+                    {
+                        counters.record_refused_observation();
+                        tracing::debug!(
+                            %principal,
+                            account = %snapshot.account_id,
+                            "budget observation older than the one held; keeping the newer one"
+                        );
+                    }
                     if !resolutions.accepts_positive(
                         principal,
                         snapshot.generation,

@@ -107,6 +107,14 @@ impl ShutdownDeadline {
         *current = Some(current.map_or(deadline, |old| old.min(deadline)));
     }
 
+    /// Start the budget now: the instant [`within`](Self::within) returns is
+    /// retained, so every later phase of this shutdown shares it.
+    pub(crate) fn begin(&self, budget: std::time::Duration) -> tokio::time::Instant {
+        let deadline = self.within(budget);
+        self.constrain(deadline);
+        deadline
+    }
+
     pub(crate) fn within(&self, budget: std::time::Duration) -> tokio::time::Instant {
         let local = tokio::time::Instant::now() + budget;
         self.0
@@ -148,5 +156,16 @@ mod deadline_tests {
         assert_eq!(deadline.within(second), now + second);
         tokio::time::advance(second * 2).await;
         assert_eq!(deadline.within(second * 10), now + second * 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_begun_budget_is_not_restarted_by_a_later_phase() {
+        let deadline = ShutdownDeadline::default();
+        let now = Instant::now();
+        let second = Duration::from_secs(1);
+        assert_eq!(deadline.begin(second * 3), now + second * 3);
+        tokio::time::advance(second).await;
+        assert_eq!(deadline.within(second * 3), now + second * 3);
+        assert_eq!(deadline.begin(second * 3), now + second * 3);
     }
 }

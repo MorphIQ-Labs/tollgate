@@ -200,9 +200,10 @@ impl AccountRecord {
             .and_then(|spent| spent.checked_add(self.expired))
             .expect("consumption cannot exceed the funding it came from");
         BudgetView {
-            balance_at_publish: funded
+            balance: funded
                 .checked_sub(consumed)
                 .expect("conservation keeps consumption within funding"),
+            consumed: Some(consumed),
             // The period the account is *in*, which is what it can spend
             // against. An account whose schedule was set but whose first
             // rollover has not run yet is still in its previous period, and
@@ -1718,9 +1719,21 @@ impl AdminStore for MemoryStore {
 #[async_trait]
 impl SnapshotSource for MemoryStore {
     async fn snapshot(&self, principal: Principal) -> Result<SnapshotResolution, StoreError> {
-        Ok(match self.lock().snapshots.get(&principal) {
+        let inner = self.lock();
+        Ok(match inner.snapshots.get(&principal) {
             Some(SnapshotRecord::Present(snapshot)) => {
-                SnapshotResolution::Present(snapshot.clone())
+                // The stored authorization, with the ledger as it is now: the
+                // view stamped at publication is stale after any spend, and
+                // spend publishes nothing (GL-77).
+                let view = inner
+                    .accounts
+                    .get(&snapshot.account_id)
+                    .map(AccountRecord::budget_view);
+                SnapshotResolution::Present(if snapshot.budget == view {
+                    snapshot.clone()
+                } else {
+                    snapshot.with_budget(view)
+                })
             }
             Some(SnapshotRecord::Revoked(generation)) => SnapshotResolution::Revoked {
                 generation: *generation,

@@ -962,6 +962,20 @@ enum Collected {
 }
 
 impl Lanes {
+    /// Refuse new reservations from this instant. Permits already handed out
+    /// keep their slots and can still deliver into the drain. A closed lane
+    /// reports disconnected only once it is empty and every one of its permits
+    /// has sent or dropped — never merely because it is momentarily empty —
+    /// which is the done signal the single channel's `recv` gave. Every permit
+    /// that resolves from here rings the doorbell, so the drain waits on it
+    /// rather than polling. Idempotent.
+    fn close(&mut self) {
+        self.queue.draining.store(true, Ordering::Release);
+        for rx in &mut self.rx {
+            rx.close();
+        }
+    }
+
     /// Move whatever the lanes hold into `batch`, up to `max_batch`, without
     /// waiting. A lane's doorbell flag is cleared *before* the lane is read, so
     /// a send that lands after the read rings again rather than waiting a tick.
@@ -1022,7 +1036,7 @@ async fn run(writer: Writer, mut lanes: Lanes, mut shutdown: watch::Receiver<boo
                     Collected::Full => {
                         // Retry until delivered or shutdown interrupts; either
                         // way the loop-top level check decides what happens next.
-                        flush_retrying(&writer, &mut batch, &mut shutdown).await;
+                        flush_retrying(&writer, &mut lanes, &mut batch, &mut shutdown).await;
                         if *shutdown.borrow() || shutdown.has_changed().is_err() {
                             break false;
                         }
@@ -1034,7 +1048,7 @@ async fn run(writer: Writer, mut lanes: Lanes, mut shutdown: watch::Receiver<boo
                 break true;
             }
             if due && !batch.is_empty() {
-                flush_retrying(&writer, &mut batch, &mut shutdown).await;
+                flush_retrying(&writer, &mut lanes, &mut batch, &mut shutdown).await;
             }
             // Every handle is gone: nothing can arrive, so stop as the channel's
             // close used to (the recorder's lanes ring as they drop).
@@ -1053,8 +1067,14 @@ async fn run(writer: Writer, mut lanes: Lanes, mut shutdown: watch::Receiver<boo
 
 /// Ingest `batch`, retrying with backoff until it is delivered (batch
 /// cleared) or shutdown is observed (batch left intact for the final flush).
+///
+/// A call already in flight when shutdown arrives is finished rather than
+/// dropped: the sink may have committed it, and discarding its answer would
+/// send the batch again and report charges this writer billed as duplicates.
+/// The wait spends the drain budget, which starts at that moment.
 async fn flush_retrying(
     writer: &Writer,
+    lanes: &mut Lanes,
     batch: &mut Vec<UsageEvent>,
     shutdown: &mut watch::Receiver<bool>,
 ) {
@@ -1078,11 +1098,23 @@ async fn flush_retrying(
         // the last time the sink answered, so the health reading and the
         // ledger agree about when this batch happened.
         let now = clock.now();
-        let ingest =
-            tokio::time::timeout(config.ingest_timeout, ingest_checked(&**sink, batch, now));
-        let outcome = tokio::select! {
-            outcome = ingest => outcome,
-            _ = shutdown.changed() => return,
+        let outcome = {
+            let ingest =
+                tokio::time::timeout(config.ingest_timeout, ingest_checked(&**sink, batch, now));
+            tokio::pin!(ingest);
+            tokio::select! {
+                outcome = &mut ingest => outcome,
+                _ = shutdown.changed() => {
+                    // New reservations are refused from the signal, not from
+                    // the end of this call.
+                    lanes.close();
+                    let deadline = writer.deadline.begin(config.shutdown_drain_deadline);
+                    match tokio::time::timeout_at(deadline, ingest).await {
+                        Ok(outcome) => outcome,
+                        Err(_) => return,
+                    }
+                }
+            }
         };
         match outcome {
             Ok(Ok(report)) => {
@@ -1144,9 +1176,13 @@ async fn flush_retrying(
                 if attempts > 1 {
                     tracing::debug!(attempts, timed_out, "usage sink still failing");
                 }
-                tokio::select! {
-                    _ = tokio::time::sleep(config.retry_backoff) => {}
-                    _ = shutdown.changed() => {}
+                // A signal observed during the call has been consumed, so a
+                // stopping writer must not sit out the backoff waiting for it.
+                if !(*shutdown.borrow() || shutdown.has_changed().is_err()) {
+                    tokio::select! {
+                        _ = tokio::time::sleep(config.retry_backoff) => {}
+                        _ = shutdown.changed() => {}
+                    }
                 }
                 // Level check covers every wake-up path: backoff elapsed,
                 // signal received, or sender dropped.
@@ -1180,17 +1216,7 @@ async fn final_flush(
 ) -> WriterStats {
     let config = &writer.config;
     let max_batch = config.max_batch;
-    // Refuse new reservations from this instant. Permits already handed out
-    // keep their slots and can still deliver into the drain below. A closed
-    // lane reports disconnected only once it is empty and every one of its
-    // permits has sent or dropped — never merely because it is momentarily
-    // empty — which is the done signal the single channel's `recv` gave.
-    // Every permit that resolves from here rings the doorbell, so the drain
-    // waits on it rather than polling.
-    lanes.queue.draining.store(true, Ordering::Release);
-    for rx in &mut lanes.rx {
-        rx.close();
-    }
+    lanes.close();
     let deadline = writer.deadline.within(config.shutdown_drain_deadline);
     let mut expired = false;
     loop {

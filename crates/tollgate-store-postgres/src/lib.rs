@@ -2590,6 +2590,18 @@ const BUDGET_VIEW_SQL: &str = "SELECT account_id, deposited, overage_recorded, u
             budget_rollover, period_start_us
      FROM tollgate_accounts WHERE account_id = $1";
 
+/// A principal's stored snapshot joined to its account's ledger row, the
+/// latter in [`BUDGET_VIEW_SQL`]'s column order and all `NULL` when the ledger
+/// does not hold the account.
+const SNAPSHOT_READ_SQL: &str =
+    "SELECT a.account_id, a.deposited, a.overage_recorded, a.usage_recorded,
+            a.settlement_loss, a.expired, a.budget_allowance, a.budget_period,
+            a.budget_rollover, a.period_start_us,
+            s.generation, s.snapshot, s.deleted
+     FROM tollgate_snapshots s
+     LEFT JOIN tollgate_accounts a ON a.account_id = s.account_id
+     WHERE s.principal = $1";
+
 /// Debit a grant and return the committed-to-be row [`budget_view`] decodes,
 /// in the same column order as [`BUDGET_VIEW_SQL`].
 const GRANT_DEBIT_SQL: &str = "UPDATE tollgate_accounts
@@ -2632,7 +2644,8 @@ fn budget_view(row: &sqlx::postgres::PgRow) -> Result<BudgetView, StoreError> {
         .and_then(|spent| spent.checked_add(expired))
         .ok_or_else(|| StoreError("account consumption total overflows".into()))?;
     Ok(BudgetView {
-        balance_at_publish: funded.checked_sub(consumed).ok_or_else(|| {
+        consumed: Some(consumed),
+        balance: funded.checked_sub(consumed).ok_or_else(|| {
             StoreError(format!(
                 "consumption {} exceeds funding {}",
                 consumed.get(),
@@ -2704,29 +2717,46 @@ fn generation_from(column: i64) -> Result<Generation, StoreError> {
 #[async_trait]
 impl SnapshotSource for PostgresStore {
     async fn snapshot(&self, principal: Principal) -> Result<SnapshotResolution, StoreError> {
-        let row = sqlx::query(
-            "SELECT generation, snapshot, deleted FROM tollgate_snapshots WHERE principal = $1",
-        )
-        .bind(id_bytes(principal.0))
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(storage)?;
-        match row {
-            // Both branches now resolve the generation from the same column.
-            // They did not before: the tombstone read it here while a live read
-            // decoded a second copy out of the JSON, so one row could answer
-            // two different generations depending on which branch you reached
-            // (GL-54).
-            Some(row) if row.get::<bool, _>(2) => Ok(SnapshotResolution::Revoked {
-                generation: generation_from(row.get::<i64, _>(0))?,
-            }),
-            Some(row) => Ok(SnapshotResolution::Present(decode_publishable(
-                principal,
-                row.get::<i64, _>(0),
-                row.get(1),
-            )?)),
-            None => Ok(SnapshotResolution::Unknown),
+        // One statement, so one round trip and one MVCC snapshot: the stored
+        // authorization together with the ledger as it is now (GL-77). The
+        // view stamped at publication is stale after any spend, and spend
+        // publishes nothing. Positions 0 through 9 are `BUDGET_VIEW_SQL`'s.
+        let row = sqlx::query(SNAPSHOT_READ_SQL)
+            .bind(id_bytes(principal.0))
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(storage)?;
+        let Some(row) = row else {
+            return Ok(SnapshotResolution::Unknown);
+        };
+        // Both branches resolve the generation from the same column (GL-54).
+        let generation = row.get::<i64, _>(10);
+        if row.get::<bool, _>(12) {
+            return Ok(SnapshotResolution::Revoked {
+                generation: generation_from(generation)?,
+            });
         }
+        let snapshot = decode_publishable(principal, generation, row.get(11))?;
+        let view = match row.get::<Option<Vec<u8>>, _>(0) {
+            None => None,
+            // An unreadable ledger row costs the observation, never the
+            // authorization: failing the read would let a reporting value
+            // decide admission once the held snapshot expired.
+            Some(_) => budget_view(&row)
+                .inspect_err(|error| {
+                    tracing::error!(
+                        %principal,
+                        %error,
+                        "ledger row unreadable; snapshot served without a budget view"
+                    );
+                })
+                .ok(),
+        };
+        Ok(SnapshotResolution::Present(if snapshot.budget == view {
+            snapshot
+        } else {
+            snapshot.with_budget(view)
+        }))
     }
 
     fn subscribe(&self) -> broadcast::Receiver<SnapshotPush> {

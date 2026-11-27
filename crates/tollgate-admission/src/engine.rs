@@ -6,9 +6,9 @@ use std::sync::Arc;
 use jiff::Timestamp;
 
 use tollgate_core::{
-    AccountSnapshot, CancelHandle, CommitError, CommitFunding, CostQuote, CostUnits, DenyReason,
-    Generation, Locality, OpIndex, PermissionBits, PolicyRevision, QuoteError, RequestId,
-    Reservation, SharedCharge, UsageEvent, UsageSlot, UsageSource,
+    AccountSnapshot, BudgetView, CancelHandle, CommitError, CommitFunding, CostQuote, CostUnits,
+    DenyReason, Generation, Locality, OpIndex, PermissionBits, PolicyRevision, QuoteError,
+    RequestId, Reservation, SharedCharge, UsageEvent, UsageSlot, UsageSource,
 };
 
 use crate::capacity::{CapacityEvidence, CapacityGate, CapacityPermit};
@@ -75,9 +75,9 @@ impl RequestContext {
             .expect("a request context holds its pinned state until admit consumes it")
     }
 
-    /// What the account can still spend this period, as this instance best
-    /// knows it — see [`AccountAdmissionState::estimate_remaining`] for what
-    /// the estimate is wrong by and why it is never an authorization input.
+    /// What the account could still spend, as of the newest ledger observation
+    /// — see [`AccountAdmissionState::estimate_remaining`] for what it lags by
+    /// and why it is never an authorization input.
     ///
     /// Reachable from all three response-producing stages, because a caller
     /// answering "how much is left" has to answer it on a denial as well: this
@@ -86,6 +86,13 @@ impl RequestContext {
     #[must_use]
     pub fn estimate_remaining(&self) -> Option<CostUnits> {
         self.state().estimate_remaining()
+    }
+
+    /// See [`AccountAdmissionState::observed_budget`]. Read live, not pinned
+    /// with the snapshot: a later call may return a newer observation.
+    #[must_use]
+    pub fn observed_budget(&self) -> Option<BudgetView> {
+        self.state().observed_budget()
     }
 
     /// Price the decoded workload and reserve funding for it: stage two of
@@ -289,10 +296,17 @@ impl<S: UsageSlot> Pending<S> {
     }
 
     /// See [`RequestContext::estimate_remaining`]. This request's own quote is
-    /// already counted: admission tallies the units it reserved.
+    /// not subtracted.
     #[must_use]
     pub fn estimate_remaining(&self) -> Option<CostUnits> {
         self.concurrency.state().estimate_remaining()
+    }
+
+    /// See [`AccountAdmissionState::observed_budget`]. Read live, not pinned
+    /// with the snapshot: a later call may return a newer observation.
+    #[must_use]
+    pub fn observed_budget(&self) -> Option<BudgetView> {
+        self.concurrency.state().observed_budget()
     }
 
     /// Ask `gate` for execution capacity for this request, using the
@@ -665,11 +679,19 @@ impl<S: UsageSlot, P: CapacityPermit> Committed<S, P> {
             .map_or(PolicyRevision::UNSTATED, |event| event.policy_revision)
     }
 
-    /// See [`RequestContext::estimate_remaining`]. This is the one a response
-    /// carries: the charge for this request is already in it.
+    /// See [`RequestContext::estimate_remaining`]. This request's charge is
+    /// not subtracted: its usage event is emitted when this guard drops, so no
+    /// ledger observation can include it yet.
     #[must_use]
     pub fn estimate_remaining(&self) -> Option<CostUnits> {
         self._concurrency.state().estimate_remaining()
+    }
+
+    /// See [`AccountAdmissionState::observed_budget`]. Read live, not pinned
+    /// with the snapshot: a later call may return a newer observation.
+    #[must_use]
+    pub fn observed_budget(&self) -> Option<BudgetView> {
+        self._concurrency.state().observed_budget()
     }
 
     /// Whether someone has asked for this request to stop since it started.
@@ -1429,8 +1451,9 @@ mod tests {
                         };
                     } else {
                         next.budget = Some(BudgetView {
-                            balance_at_publish: CostUnits(100),
+                            balance: CostUnits(100),
                             period_end: None,
+                            consumed: None,
                         });
                     }
                     engine
@@ -1620,8 +1643,9 @@ mod tests {
         let mut next = (*snapshot(AccountStatus::Active)).clone();
         next.generation = Generation(2);
         next.budget = Some(BudgetView {
-            balance_at_publish: CostUnits(1_000),
+            balance: CostUnits(1_000),
             period_end: None,
+            consumed: None,
         });
         engine
             .map()
@@ -1671,8 +1695,9 @@ mod tests {
         let mut next = (*snapshot(AccountStatus::Active)).clone();
         next.generation = Generation(2);
         next.budget = Some(BudgetView {
-            balance_at_publish: CostUnits(100),
+            balance: CostUnits(100),
             period_end: Some(t(100)),
+            consumed: None,
         });
         engine
             .map()
@@ -2296,7 +2321,7 @@ mod tests {
     //
     // A quote here is 50 fixed + 1 per item, so `request(n)` costs `50 + n`.
 
-    /// An engine whose snapshot carries `balance_at_publish`, funded by a
+    /// An engine whose snapshot carries `balance`, funded by a
     /// lease large enough that the estimate is never what refuses a request.
     fn budgeted_engine(balance: u64, generation: u64) -> AdmissionEngine<ArcSwapSnapshotMap> {
         let engine = AdmissionEngine::new(ArcSwapSnapshotMap::new());
@@ -2310,8 +2335,9 @@ mod tests {
         let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
         snapshot.generation = Generation(generation);
         snapshot.budget = Some(BudgetView {
-            balance_at_publish: CostUnits(balance),
+            balance: CostUnits(balance),
             period_end: None,
+            consumed: None,
         });
         engine
             .map()
@@ -2336,70 +2362,35 @@ mod tests {
         assert_eq!(estimate(&engine), None);
     }
 
-    /// The subtraction that makes the number worth publishing: the ledger's
-    /// figure ages, and the instance knows exactly how much of that ageing it
-    /// caused itself.
+    fn observed(balance: u64, consumed: u64) -> BudgetView {
+        BudgetView {
+            balance: CostUnits(balance),
+            period_end: None,
+            consumed: Some(CostUnits(consumed)),
+        }
+    }
+
+    fn slot_of(engine: &AdmissionEngine<ArcSwapSnapshotMap>) -> Arc<LeaseSlot> {
+        let MapEntry::Present(state) = engine.map().get(&Principal(1)).expect("installed") else {
+            panic!("a positive entry")
+        };
+        Arc::clone(&state.lease)
+    }
+
+    /// An instance cannot know which of its admissions the ledger's figure
+    /// already includes, so it subtracts none of them: not a pending one, not a
+    /// cancelled one, and not the committed one whose response is being built.
     #[test]
-    fn an_estimate_subtracts_what_this_instance_admitted_since_publication() {
+    fn an_estimate_is_the_ledger_observation_at_every_stage() {
         let engine = budgeted_engine(1_000, 1);
-        assert_eq!(estimate(&engine), Some(CostUnits(1_000)));
+        let held = slot_of(&engine).budget();
+        assert!(held.is_some(), "installation delivered the published view");
 
         let pending = engine.admit_one(request(10), t(0)).expect("admits");
-        assert_eq!(
-            pending.estimate_remaining(),
-            Some(CostUnits(940)),
-            "this request's own 60-unit quote is already counted"
-        );
+        assert_eq!(pending.estimate_remaining(), Some(CostUnits(1_000)));
+        assert_eq!(pending.observed_budget(), held);
         let _released = pending.cancel();
-
-        assert_eq!(
-            estimate(&engine),
-            Some(CostUnits(940)),
-            "a cancelled admission still reads as spent: the estimate errs low, \
-             which is the safe direction for a number a customer acts on"
-        );
-    }
-
-    /// A republish is a fresh statement of the ledger, so the instance's own
-    /// tally has to restart with it. Carrying the old baseline forward would
-    /// double-count every unit spent before the refresh.
-    #[test]
-    fn a_republish_rebases_the_estimate() {
-        let engine = budgeted_engine(1_000, 1);
-        engine.admit_one(request(10), t(0)).expect("admits");
-        assert_eq!(estimate(&engine), Some(CostUnits(940)));
-
-        install_budget(&engine, 800, 2);
-
-        assert_eq!(
-            estimate(&engine),
-            Some(CostUnits(800)),
-            "the new figure already accounts for what was spent before it"
-        );
-        engine.admit_one(request(10), t(0)).expect("admits");
-        assert_eq!(estimate(&engine), Some(CostUnits(740)));
-    }
-
-    /// Spend outruns the published figure whenever the fleet is busy between
-    /// refreshes. Zero is the floor; a wrapped estimate would report a
-    /// customer's exhausted quota as astronomically large.
-    #[test]
-    fn an_estimate_saturates_at_zero_rather_than_wrapping() {
-        let engine = budgeted_engine(100, 1);
-        engine.admit_one(request(10), t(0)).expect("admits");
-        engine.admit_one(request(10), t(0)).expect("admits");
-
-        assert_eq!(estimate(&engine), Some(CostUnits::ZERO));
-    }
-
-    /// The stage a response is actually built from. `Committed` is what a
-    /// served request holds while its kernel runs, so an embedder answering
-    /// "how much is left" on a successful response reads it here — and it must
-    /// give the same answer the earlier stages would, not a fresh `None`
-    /// because the guard forgot to carry the state.
-    #[test]
-    fn a_committed_request_reports_the_estimate_its_response_carries() {
-        let engine = budgeted_engine(1_000, 1);
+        assert_eq!(estimate(&engine), Some(CostUnits(1_000)));
 
         let committed = engine
             .admit_one(request(10), t(0))
@@ -2408,17 +2399,83 @@ mod tests {
             .expect("NoGate always permits")
             .commit(RequestId(1), t(0))
             .expect("a fresh reservation commits");
+        assert_eq!(committed.estimate_remaining(), Some(CostUnits(1_000)));
+        assert_eq!(committed.observed_budget(), held);
+    }
 
-        assert_eq!(
-            committed.estimate_remaining(),
-            Some(CostUnits(940)),
-            "the 60 units this request was charged are already subtracted"
+    /// Spend publishes nothing, so the figure has to move without a new
+    /// generation — including under a request that already holds its snapshot.
+    #[test]
+    fn a_newer_observation_moves_the_estimate_without_a_publication() {
+        let engine = budgeted_engine(1_000, 1);
+        assert!(slot_of(&engine).observe_budget(observed(1_000, 0)));
+        let context = engine
+            .begin(Principal(1), PermissionBits::bit(0), t(0))
+            .expect("begins");
+
+        let next = BudgetView {
+            period_end: Some(t(100)),
+            ..observed(940, 60)
+        };
+        assert!(slot_of(&engine).observe_budget(next));
+
+        assert_eq!(context.estimate_remaining(), Some(CostUnits(940)));
+        assert_eq!(context.observed_budget(), Some(next));
+        assert_eq!(context.generation(), Generation(1));
+    }
+
+    /// A delayed read, or a publication stamped before the latest read, must not
+    /// restore units the ledger has since reported spent.
+    #[test]
+    fn a_stale_observation_does_not_replace_a_newer_one() {
+        let engine = budgeted_engine(1_000, 1);
+        let slot = slot_of(&engine);
+        assert!(slot.observe_budget(observed(940, 60)));
+
+        assert!(!slot.observe_budget(observed(1_000, 0)));
+        assert!(
+            !slot.observe_budget(BudgetView {
+                consumed: None,
+                ..observed(1_000, 0)
+            }),
+            "an unordered view cannot displace an ordered one"
         );
+        assert!(slot.observe_budget(observed(940, 60)), "already held");
+        assert_eq!(estimate(&engine), Some(CostUnits(940)));
 
-        // And it keeps moving as the instance serves more, rather than being
-        // frozen at whatever the first response happened to see.
-        engine.admit_one(request(10), t(0)).expect("admits");
-        assert_eq!(committed.estimate_remaining(), Some(CostUnits(880)));
+        let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
+        snapshot.generation = Generation(2);
+        snapshot.budget = Some(observed(1_000, 0));
+        engine
+            .map()
+            .install(Principal(1), Arc::new(snapshot), slot)
+            .expect("a newer authorization installs");
+        assert_eq!(
+            estimate(&engine),
+            Some(CostUnits(940)),
+            "a newer generation carrying an older observation keeps the newer one"
+        );
+    }
+
+    /// Without ledger order there is nothing to compare, so the latest
+    /// publication wins, as it did before observations were ordered.
+    #[test]
+    fn an_unordered_budget_follows_the_latest_publication() {
+        let engine = budgeted_engine(1_000, 1);
+        let slot = slot_of(&engine);
+        let mut snapshot = AccountSnapshot::clone(&snapshot(AccountStatus::Active));
+        snapshot.generation = Generation(2);
+        snapshot.budget = Some(BudgetView {
+            balance: CostUnits(800),
+            period_end: None,
+            consumed: None,
+        });
+        engine
+            .map()
+            .install(Principal(1), Arc::new(snapshot), slot)
+            .expect("installs");
+
+        assert_eq!(estimate(&engine), Some(CostUnits(800)));
     }
 
     /// The estimate is a report, never an input. Admission denies from the

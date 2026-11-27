@@ -869,6 +869,13 @@ async fn full_stack(mode: common::TransportMode) {
     // an `AccountSnapshot` and reserializes, so a field it did not carry would
     // be stripped exactly here (GL-94).
     assert_eq!(fetched.policy_revision, REVISION);
+    let initial = fetched
+        .budget
+        .expect("the budget view crosses the transport");
+    assert_eq!(
+        (initial.balance, initial.consumed),
+        (CostUnits(DEPOSIT), Some(CostUnits::ZERO))
+    );
     assert!(matches!(
         http.snapshot(Principal(999)).await.unwrap(),
         SnapshotResolution::Unknown
@@ -963,6 +970,16 @@ async fn full_stack(mode: common::TransportMode) {
     // Orderly shutdown: flush billing, then release leases, then stop the
     // server.
     let report = runtime.shutdown().await.unwrap();
+    // The ledger read crosses the transport too: the same generation, with the
+    // spend since publication in it (GL-77).
+    let SnapshotResolution::Present(spent) = http.snapshot(principal).await.unwrap() else {
+        panic!("published snapshot must be present");
+    };
+    let spent_view = spent.budget.expect("the budget view crosses the transport");
+    let consumed = spent_view.consumed.expect("the ledger total crosses too");
+    assert_eq!(spent.generation, Generation(1));
+    assert!(consumed >= CostUnits(committed_units));
+    assert_eq!(spent_view.balance.get() + consumed.get(), DEPOSIT);
     let stats = report.usage.as_ref().unwrap();
     assert_eq!(stats.unattributed, 0);
     assert_eq!(stats.attribution_unreported_batches, 0);

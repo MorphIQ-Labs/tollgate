@@ -653,8 +653,13 @@ pub struct AccountSnapshot {
     /// publishing successfully instead of getting a 422 for a field it has
     /// never heard of.
     ///
-    /// There is no builder setter: the store stamps this at publication and is
-    /// its only writer. See [`PublishableSnapshot::with_budget`].
+    /// There is no builder setter: the store stamps this at publication and on
+    /// every read, and is its only writer. See
+    /// [`PublishableSnapshot::with_budget`].
+    ///
+    /// This is what arrived with *this* publication. An instance's current
+    /// observation of the account moves without one; admission stages report it
+    /// through `observed_budget`.
     ///
     /// Free, spatially: it lands in the tail padding `#[repr(align(128))]`
     /// already reserved, so `AccountSnapshot` remains 256 bytes and the
@@ -1340,8 +1345,9 @@ mod tests {
         assert_eq!(publishable.budget, None, "a builder cannot set one");
 
         let view = BudgetView {
-            balance_at_publish: CostUnits(500),
+            balance: CostUnits(500),
             period_end: None,
+            consumed: None,
         };
         let stamped = publishable.with_budget(Some(view));
         assert_eq!(stamped.budget, Some(view));

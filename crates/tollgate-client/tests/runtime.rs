@@ -1585,6 +1585,149 @@ async fn slow_but_healthy_sink_still_delivers_at_shutdown() {
     assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(25));
 }
 
+/// A batch already sent when shutdown arrives is acknowledged, not resent: the
+/// sink may have committed it, and a second delivery would report a charge this
+/// writer billed as a duplicate. New reservations stop at the signal, not when
+/// that call returns.
+#[tokio::test(start_paused = true)]
+async fn an_ingest_in_flight_at_shutdown_is_finished_not_resent() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap()
+        .grant;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (counted, inner) = (Arc::clone(&calls), store.clone());
+    // Commits before answering, as a remote sink does.
+    let sink = Arc::new(DelegatingStore::wrapping(store.clone()).on_ingest(
+        move |_, events, now| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            let inner = inner.clone();
+            async move {
+                let report = inner.ingest(&events, now).await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                report
+            }
+        },
+    ));
+    let mut config = writer_config(16);
+    config.flush_interval = std::time::Duration::from_millis(1);
+    let (recorder, writer) = UsageWriter::spawn(
+        sink as Arc<dyn UsageSink>,
+        Arc::new(ManualClock::new(t(0))),
+        config,
+    )
+    .unwrap();
+    recorder.try_reserve().unwrap().record(event(1, 25, &lease));
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "the call is in flight");
+
+    let began = tokio::time::Instant::now();
+    let (stats, ()) = tokio::join!(writer.shutdown(), async {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        assert!(recorder.try_reserve().is_err(), "refused at the signal");
+    });
+    let stats = stats.unwrap();
+
+    assert!(began.elapsed() < std::time::Duration::from_millis(50));
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!((stats.accepted, stats.duplicate, stats.lost), (1, 0, 0));
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(25));
+}
+
+/// A failure answered after the signal goes straight to the final flush: the
+/// signal has already been observed, so waiting out the retry backoff for it
+/// would hold shutdown open for nothing.
+#[tokio::test(start_paused = true)]
+async fn a_failure_answered_after_the_signal_skips_the_retry_backoff() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap()
+        .grant;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (counted, inner) = (Arc::clone(&calls), store.clone());
+    // The first call fails slowly; every later one is delivered.
+    let sink = Arc::new(DelegatingStore::wrapping(store.clone()).on_ingest(
+        move |_, events, now| {
+            let first = counted.fetch_add(1, Ordering::Relaxed) == 0;
+            let inner = inner.clone();
+            async move {
+                if first {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    return Err(IngestError::Unavailable(StoreError("outage".into())));
+                }
+                inner.ingest(&events, now).await
+            }
+        },
+    ));
+    let mut config = writer_config(16);
+    config.flush_interval = std::time::Duration::from_millis(1);
+    config.retry_backoff = std::time::Duration::from_secs(30);
+    let (recorder, writer) = UsageWriter::spawn(
+        sink as Arc<dyn UsageSink>,
+        Arc::new(ManualClock::new(t(0))),
+        config,
+    )
+    .unwrap();
+    recorder.try_reserve().unwrap().record(event(1, 25, &lease));
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "the call is in flight");
+
+    let began = tokio::time::Instant::now();
+    let stats = writer.shutdown().await.unwrap();
+
+    assert!(began.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!((stats.accepted, stats.lost), (1, 0));
+}
+
+/// Finishing the call in flight spends the drain budget rather than adding to
+/// it: a hung sink costs shutdown one budget, however long its call timeout is.
+#[tokio::test(start_paused = true)]
+async fn a_hung_ingest_in_flight_at_shutdown_spends_one_drain_budget() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap()
+        .grant;
+    let mut config = writer_config(16);
+    config.flush_interval = std::time::Duration::from_millis(1);
+    config.ingest_timeout = std::time::Duration::from_secs(120);
+    config.shutdown_drain_deadline = std::time::Duration::from_secs(2);
+    let (recorder, writer) = UsageWriter::spawn(
+        hanging_sink() as Arc<dyn UsageSink>,
+        Arc::new(ManualClock::new(t(0))),
+        config,
+    )
+    .unwrap();
+    recorder.try_reserve().unwrap().record(event(1, 25, &lease));
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    let began = tokio::time::Instant::now();
+    let stats = writer.shutdown().await.unwrap();
+
+    assert_eq!(began.elapsed(), config.shutdown_drain_deadline);
+    assert_eq!((stats.accepted, stats.lost), (0, 1));
+}
+
 /// An allocator that never answers an acquire. Distinct from refusing: the
 /// grant may well have been made, so the client cannot treat this as a
 /// domain answer.
