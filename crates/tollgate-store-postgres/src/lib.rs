@@ -515,35 +515,32 @@ impl PostgresStore {
                 .await
                 .map_err(storage)?;
 
-            let (republished, unreadable) =
+            let (pushes, unreadable) =
                 republish_patched_snapshots(&mut tx, account, "{status}", status.as_str()).await?;
-            Ok(((before, before_set_by, set_by), republished, unreadable))
+            Ok(((before, before_set_by, set_by), pushes, unreadable))
         }
         .await;
 
-        let ((before, before_set_by, set_by), republished, unreadable) =
+        let ((before, before_set_by, set_by), pushes, unreadable) =
             finish_transaction(tx, result).await?;
         // Publish only after commit, as with snapshot publication itself.
-        if pushes_exceed_capacity(republished.len()) {
+        if pushes_exceed_capacity(pushes.len()) {
             tracing::warn!(
                 %account,
-                principals = republished.len(),
+                principals = pushes.len(),
                 capacity = PUSH_CHANNEL_CAPACITY,
                 "status change emitted more pushes than the channel holds; subscribers will resync"
             );
         }
-        let count = republished.len();
-        for (principal, snapshot) in republished {
-            self.push_to_subscribers(SnapshotPush {
-                principal,
-                resolution: SnapshotResolution::Present(snapshot),
-            });
+        let republished = pushes.len();
+        for push in pushes {
+            self.push_to_subscribers(push);
         }
         Ok(AdminReceipt::new(
             StatusChange {
-                // Rows that changed durably: the ones pushed, plus any that could
-                // not be decoded to push. The caller is told both numbers.
-                republished: count + unreadable,
+                // Every row that changed durably is pushed, `unreadable` of
+                // them as unreadable. The caller is told both numbers.
+                republished,
                 unreadable,
             },
             AdminState::Status {
@@ -2776,15 +2773,14 @@ fn budget_view(row: &sqlx::postgres::PgRow) -> Result<BudgetView, StoreError> {
 /// write time is the point.
 ///
 /// Since GL-54 that is literally true of the generation as well: both callers
-/// hand this the row's `generation` column, so a live read and a republish
-/// resolve it identically. Before, the JSON carried a second copy that only the
-/// live path consulted.
+/// resolve it from the row's `generation` column, so a live read and a republish
+/// agree. Before, the JSON carried a second copy that only the live path
+/// consulted.
 fn decode_publishable(
     principal: Principal,
-    generation: i64,
+    generation: Generation,
     value: serde_json::Value,
 ) -> Result<PublishableSnapshot, StoreError> {
-    let generation = generation_from(generation)?;
     let snapshot: StoredSnapshot =
         serde_json::from_value(value).map_err(|e| StoreError(format!("snapshot decode: {e}")))?;
     // Carried across the rebuild rather than through the builder: the builder
@@ -2807,11 +2803,9 @@ fn decode_publishable(
 
 /// Read a stored generation column.
 ///
-/// Takes the raw `i64` and converts here rather than at each call site, so
-/// every caller shares one refusal. That matters for the republish
-/// specifically: it must not fail an account-wide status change over one
-/// unreadable row, and a caller-side conversion is one `?` away from doing
-/// exactly that.
+/// Takes the raw `i64` and converts here, so every caller shares one refusal.
+/// It stays an error rather than an unreadable answer: such an answer is
+/// ordered by this number, and a corrupt one gives no order.
 ///
 /// A negative value is corruption to surface, never to clamp (INVARIANTS GL-11).
 /// Migration 0007's CHECK is what keeps it from being written in the first
@@ -2839,12 +2833,25 @@ impl SnapshotSource for PostgresStore {
         };
         // Both branches resolve the generation from the same column (GL-54).
         let generation = row.get::<i64, _>(10);
+        let generation = generation_from(generation)?;
         if row.get::<bool, _>(12) {
-            return Ok(SnapshotResolution::Revoked {
-                generation: generation_from(generation)?,
-            });
+            return Ok(SnapshotResolution::Revoked { generation });
         }
-        let snapshot = decode_publishable(principal, generation, row.get(11))?;
+        let snapshot = match decode_publishable(principal, generation, row.get(11)) {
+            Ok(snapshot) => snapshot,
+            // The row is there and live, so this is an answer rather than a
+            // failure to answer: an error would leave instances serving
+            // whatever they held before the row stopped decoding (GH-102).
+            Err(error) => {
+                tracing::error!(
+                    %principal,
+                    generation = generation.0,
+                    %error,
+                    "stored snapshot does not decode; instances withdraw the principal"
+                );
+                return Ok(SnapshotResolution::Unreadable { generation });
+            }
+        };
         let view = match row.get::<Option<Vec<u8>>, _>(0) {
             None => None,
             // An unreadable ledger row costs the observation, never the
@@ -2903,7 +2910,8 @@ impl StoreHealth for PostgresStore {
 }
 
 /// Re-stamp every live snapshot of `account`, patching one JSON key, and
-/// report which principals to push and how many rows could not be decoded.
+/// report the push owed to each principal and how many rows could not be
+/// decoded.
 ///
 /// Shared by the two account-owned facts that republish — status (GL-51) and
 /// execution-capacity class (GL-99). They differ in their precondition and their
@@ -2936,7 +2944,7 @@ async fn republish_patched_snapshots(
     account: AccountId,
     json_path: &'static str,
     value: &str,
-) -> Result<(Vec<(Principal, PublishableSnapshot)>, usize), SetStatusError> {
+) -> Result<(Vec<SnapshotPush>, usize), SetStatusError> {
     let rows = sqlx::query(
         "UPDATE tollgate_snapshots
             SET generation = generation + 1,
@@ -2953,37 +2961,42 @@ async fn republish_patched_snapshots(
     .await
     .map_err(storage)?;
 
-    let mut republished = Vec::with_capacity(rows.len());
+    let mut pushes = Vec::with_capacity(rows.len());
     let mut unreadable = 0usize;
     for row in rows {
         let principal = Principal(id_from(row.get::<Vec<u8>, _>(0).as_slice()));
-        match decode_publishable(
+        // A negative generation cannot arise here: the CHECK of migration 0007
+        // refuses the update that would write one.
+        let generation = generation_from(row.get::<i64, _>(1))?;
+        let resolution =
+            match decode_publishable(principal, generation, row.get::<serde_json::Value, _>(2)) {
+                Ok(snapshot) => SnapshotResolution::Present(snapshot),
+                // Not fatal: this row was already unreadable before the change
+                // touched it, and refusing to suspend or reclassify an account
+                // because one of its credentials is corrupt is the worse outcome.
+                // Counted and logged, never silent (INVARIANTS.md GL-19), and
+                // pushed as unreadable so that instances stop serving what they
+                // held before the change (GH-102).
+                Err(error) => {
+                    unreadable += 1;
+                    tracing::warn!(
+                        %principal,
+                        generation = generation.0,
+                        %error,
+                        "restamped snapshot does not decode; instances withdraw the principal"
+                    );
+                    SnapshotResolution::Unreadable { generation }
+                }
+            };
+        pushes.push(SnapshotPush {
             principal,
-            row.get::<i64, _>(1),
-            row.get::<serde_json::Value, _>(2),
-        ) {
-            Ok(snapshot) => republished.push((principal, snapshot)),
-            // Skipped for push, not fatal: this row was already unreadable
-            // before the change touched it, and refusing to suspend or
-            // reclassify an account because one of its credentials is corrupt
-            // is the worse outcome. Reported, never silent (INVARIANTS.md
-            // GL-19). Counted as well as logged: the row changed durably but
-            // will not be pushed, and no pull can read it until it is
-            // published again.
-            Err(error) => {
-                unreadable += 1;
-                tracing::warn!(
-                    %principal,
-                    %error,
-                    "restamped snapshot could not be decoded for push"
-                );
-            }
-        }
+            resolution,
+        });
     }
     // Ordered, so both backends emit the same sequence and a mirrored test
     // need not assert on incidental ordering.
-    republished.sort_unstable_by_key(|(principal, _)| *principal);
-    Ok((republished, unreadable))
+    pushes.sort_unstable_by_key(|push| push.principal);
+    Ok((pushes, unreadable))
 }
 #[async_trait]
 impl AdminStore for PostgresStore {
@@ -3361,34 +3374,31 @@ impl AdminStore for PostgresStore {
                 .await
                 .map_err(storage)?;
 
-            let (republished, unreadable) =
+            let (pushes, unreadable) =
                 republish_patched_snapshots(&mut tx, account, "{capacity_class}", class.as_str()).await?;
-            Ok((before, republished, unreadable))
+            Ok((before, pushes, unreadable))
         }
         .await;
 
-        let (before, republished, unreadable) = finish_transaction(tx, result).await?;
-        if pushes_exceed_capacity(republished.len()) {
+        let (before, pushes, unreadable) = finish_transaction(tx, result).await?;
+        if pushes_exceed_capacity(pushes.len()) {
             tracing::warn!(
                 %account,
-                principals = republished.len(),
+                principals = pushes.len(),
                 capacity = PUSH_CHANNEL_CAPACITY,
                 "capacity class change emitted more pushes than the channel holds; \
                  subscribers will resync"
             );
         }
-        let count = republished.len();
-        for (principal, snapshot) in republished {
-            self.push_to_subscribers(SnapshotPush {
-                principal,
-                resolution: SnapshotResolution::Present(snapshot),
-            });
+        let republished = pushes.len();
+        for push in pushes {
+            self.push_to_subscribers(push);
         }
         Ok(AdminReceipt::new(
             StatusChange {
-                // Rows that changed durably, whether or not they could be decoded
-                // for a push — the same accounting `set_account_status` reports.
-                republished: count + unreadable,
+                // Rows that changed durably, readable or not — the same
+                // accounting `set_account_status` reports.
+                republished,
                 unreadable,
             },
             AdminState::CapacityClass {

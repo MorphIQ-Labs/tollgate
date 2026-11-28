@@ -4388,6 +4388,7 @@ async fn racing_publication_and_revocation_receipts_name_the_actual_predecessor(
             revoked: true,
         },
         SnapshotResolution::Unknown => AdminState::Absent,
+        SnapshotResolution::Unreadable { .. } => panic!("a row the store wrote must read"),
     };
     assert_eq!(previous, final_state);
 }

@@ -625,6 +625,8 @@ impl OpIndex for PriceOp {
 #[derive(Clone, Copy)]
 pub struct Policy {
     pub generation: u64,
+    /// The account status it carries, which must be the ledger's.
+    pub status: AccountStatus,
     /// How long from publication the snapshot authorizes anything.
     pub valid_for: SignedDuration,
     /// The part of a request's price that does not depend on its size.
@@ -636,6 +638,7 @@ impl Policy {
     /// What [`ControlPlane::onboard`] publishes.
     pub const INITIAL: Policy = Policy {
         generation: 1,
+        status: AccountStatus::Active,
         valid_for: SignedDuration::from_hours(1),
         request_price: 50,
         mode: EnforcementMode::Strict,
@@ -988,7 +991,7 @@ impl ControlPlane {
         let snapshot = AccountSnapshot::builder(
             customer.account,
             Generation(policy.generation),
-            AccountStatus::Active,
+            policy.status,
             Timestamp::now() + policy.valid_for,
             PermissionBits::bit(0),
             ResolvedLimits::new(1_024).with_weighted_rate(5_000_000, 10_000_000),
@@ -1066,6 +1069,52 @@ impl ControlPlane {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         }
+    }
+
+    /// Set the account's status, returning how many of the snapshots it
+    /// changed could not be decoded.
+    ///
+    /// # Panics
+    ///
+    /// When the response does not report the figure.
+    pub async fn set_status(&self, customer: &Customer, status: AccountStatus) -> u64 {
+        let response = self
+            .operator(
+                Method::POST,
+                &format!("/accounts/{:032x}/status", customer.account.0),
+                Some(serde_json::json!({ "status": status })),
+                StatusCode::OK,
+            )
+            .await;
+        response["unreadable"]
+            .as_u64()
+            .expect("a status change reports its unreadable rows")
+    }
+
+    /// Damage every stored snapshot of the customer's account behind the API,
+    /// which would refuse it, so that none decodes: a burst below the largest
+    /// quote.
+    ///
+    /// # Panics
+    ///
+    /// When the database cannot be written, or holds no snapshot to damage.
+    pub async fn damage_snapshots(&self, customer: &Customer) {
+        let mut database = PgConnection::connect(&self.database.url)
+            .await
+            .unwrap_or_else(|_| panic!("cannot connect to the scenario database"));
+        let damaged = sqlx::query(
+            "UPDATE tollgate_snapshots
+                SET snapshot = jsonb_set(snapshot, '{limits,rate_burst_units}', '1')
+              WHERE account_id = $1",
+        )
+        .bind(customer.account.0.to_be_bytes().to_vec())
+        .execute(&mut database)
+        .await
+        .unwrap_or_else(|_| panic!("cannot damage the stored snapshot"));
+        assert!(
+            damaged.rows_affected() > 0,
+            "there was a snapshot to damage"
+        );
     }
 
     /// Revoke the customer's credential.

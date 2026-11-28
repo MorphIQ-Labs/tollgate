@@ -25,7 +25,7 @@ use tollgate_store::{
     AccountConfig, AdminAuthority, AdminState, AdminStore, AllocateError, BudgetError,
     Conservation, CreateAccountError, DEFAULT_RECLAIM_BATCH_LIMIT, GrantPolicy, KeyDirectory,
     KeyError, KeyRecord, LeaseAllocator, PublishSnapshotError, Revocation, RolledAccount,
-    SetStatusError, SnapshotResolution, SnapshotSource, UsageSink,
+    SetStatusError, SnapshotPush, SnapshotResolution, SnapshotSource, UsageSink,
 };
 use tollgate_store_postgres::{PoolConfig, PostgresStore};
 
@@ -1932,8 +1932,13 @@ async fn snapshot_json_preserves_legacy_numbers_and_encodes_high_ids_exactly() {
     assert_eq!(fetched.key_id, Some(key));
 }
 
+/// A stored row that does not decode is an answer about that principal, at the
+/// row's generation, and not a storage error: both a document that fails
+/// publication validation and one naming a value this build does not know
+/// (INVARIANTS.md GL-22). `MemoryStore` holds validated snapshots and has no
+/// mirror.
 #[tokio::test]
-async fn legacy_invalid_snapshot_is_rejected_on_read() {
+async fn a_stored_row_that_does_not_decode_resolves_unreadable() {
     let _guard = DB_LOCK.lock().await;
     let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
         return;
@@ -1963,16 +1968,40 @@ async fn legacy_invalid_snapshot_is_rejected_on_read() {
          VALUES ($1, 1, $2, FALSE)",
     )
     .bind(principal.0.to_be_bytes().to_vec())
-    .bind(snapshot)
+    .bind(snapshot.clone())
     .execute(&pool)
     .await
     .unwrap();
+    assert_unreadable(&store, principal, Generation(1)).await;
 
-    let error = store.snapshot(principal).await.unwrap_err();
-    assert!(
-        error.0.contains("invalid stored snapshot") && error.0.contains("exceeding the burst"),
-        "unexpected error: {error}"
-    );
+    let mut unknown_status = snapshot;
+    unknown_status["limits"]["rate_burst_units"] = serde_json::json!(1_000);
+    unknown_status["status"] = serde_json::json!("Quarantined");
+    sqlx::query("UPDATE tollgate_snapshots SET generation = 2, snapshot = $2 WHERE principal = $1")
+        .bind(principal.0.to_be_bytes().to_vec())
+        .bind(unknown_status)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_unreadable(&store, principal, Generation(2)).await;
+
+    // A tombstone is never decoded: revoking the row is the other way out.
+    AdminStore::remove_snapshot(&*store, principal)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.snapshot(principal).await.unwrap(),
+        SnapshotResolution::Revoked {
+            generation: Generation(2)
+        }
+    ));
+}
+
+async fn assert_unreadable(store: &PostgresStore, principal: Principal, expected: Generation) {
+    match store.snapshot(principal).await.unwrap() {
+        SnapshotResolution::Unreadable { generation } => assert_eq!(generation, expected),
+        other => panic!("principal {principal} must be unreadable, got {other:?}"),
+    }
 }
 
 /// Issue GL-12: `conservation` is the reconciliation primitive, and its
@@ -3473,21 +3502,20 @@ async fn a_capacity_class_change_that_cannot_republish_moves_neither_record() {
     .await;
 }
 
-/// A class change reports the rows it changed but could not push, exactly as a
-/// status change does.
+/// A class change reports the rows it changed but could not decode, exactly as
+/// a status change does.
 ///
-/// The same reasoning as `a_status_change_reports_rows_it_changed_but_could_
-/// not_push`, and the same defect family: mutation testing showed
-/// `republished: count + unreadable` could become `count - unreadable` with
-/// every class scenario still green, because none of them plants a row that
-/// cannot decode. The account-wide mutation was mirrored from status; its
-/// partial-result witness was not.
+/// The same reasoning as `a_status_change_reports_and_withdraws_rows_it_cannot_
+/// decode`, and the same defect family: the account-wide mutation was mirrored
+/// from status, so its partial-result witness belongs to both. Mutation testing
+/// showed the class change's counts could be wrong with every class scenario
+/// green while none of them planted a row that cannot decode.
 ///
 /// Memory has no mirror, for the reason the status test gives: it holds
 /// validated snapshots rather than encoded ones, so `unreadable` is
 /// structurally zero there.
 #[tokio::test]
-async fn a_capacity_class_change_reports_rows_it_changed_but_could_not_push() {
+async fn a_capacity_class_change_reports_and_withdraws_rows_it_cannot_decode() {
     let _guard = DB_LOCK.lock().await;
     let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
         return;
@@ -3536,28 +3564,45 @@ async fn a_capacity_class_change_reports_rows_it_changed_but_could_not_push() {
     assert_eq!(
         (change.outcome.republished, change.outcome.unreadable),
         (2, 1),
-        "both rows changed durably; one of them could not be pushed"
+        "both rows changed durably; one of them could not be decoded"
     );
 
-    let mut pushed = Vec::new();
-    while let Ok(push) = updates.try_recv() {
-        pushed.push(push.principal);
-    }
-    assert_eq!(
-        pushed,
-        vec![readable],
-        "only the decodable principal is pushed"
-    );
+    assert_pushed_readable_and_unreadable(&mut updates, readable, undecodable);
 
     let SnapshotResolution::Present(snapshot) = store.snapshot(readable).await.unwrap() else {
         panic!("the readable snapshot must still be present");
     };
     assert_eq!(snapshot.capacity_class, CapacityClass::BestEffort);
     assert_eq!(snapshot.generation, Generation(4));
-    assert!(
-        store.snapshot(undecodable).await.is_err(),
-        "the corrupt row is still refused on read, as it was before the change"
-    );
+    assert_unreadable(&store, undecodable, Generation(4)).await;
+}
+
+/// Exactly two pushes, in principal order: the row that decodes as present and
+/// the one that does not as unreadable, each at its new generation.
+fn assert_pushed_readable_and_unreadable(
+    updates: &mut tokio::sync::broadcast::Receiver<SnapshotPush>,
+    readable: Principal,
+    undecodable: Principal,
+) {
+    let first = updates
+        .try_recv()
+        .expect("the readable principal is pushed");
+    assert_eq!(first.principal, readable);
+    assert!(matches!(
+        first.resolution,
+        SnapshotResolution::Present(snapshot) if snapshot.generation == Generation(4)
+    ));
+    let second = updates
+        .try_recv()
+        .expect("the undecodable principal is pushed too");
+    assert_eq!(second.principal, undecodable);
+    assert!(matches!(
+        second.resolution,
+        SnapshotResolution::Unreadable {
+            generation: Generation(4)
+        }
+    ));
+    assert!(updates.try_recv().is_err(), "and nothing else");
 }
 
 /// Mirrors `store_suite::reclassifying_an_unknown_or_closed_account_is_refused`.
@@ -3957,12 +4002,12 @@ async fn a_status_change_that_cannot_republish_moves_neither_record() {
 /// The republish deliberately does not fail whole over one corrupt credential:
 /// that row was already unreadable before the transition touched it, and
 /// refusing to suspend an account because of it is the worse outcome. But the
-/// row *did* change durably, got no push, and no pull can read it until it is
-/// published again — which is exactly the "partial data is surfaced, never
-/// silently absorbed" case, and why `StatusChange::unreadable` exists. What an
-/// instance holding the old snapshot does meanwhile is witnessed by
-/// `an_unreadable_principal_keeps_its_snapshot_until_expiry_or_repair` in the
-/// client's snapshot-manager suite.
+/// row *did* change durably and cannot be decoded until it is published again —
+/// which is exactly the "partial data is surfaced, never silently absorbed"
+/// case, and why `StatusChange::unreadable` exists. It is pushed and pulled as
+/// unreadable; what an instance does with that is witnessed by
+/// `an_unreadable_principal_is_withdrawn_from_every_instance_until_repaired` in
+/// the client's snapshot-manager suite.
 ///
 /// Mutation testing is what caught this being untested: `unreadable += 1` could
 /// be flipped to `-=` or `*=` and every other scenario stayed green, because
@@ -3972,7 +4017,7 @@ async fn a_status_change_that_cannot_republish_moves_neither_record() {
 /// so an undecodable record is unrepresentable there and `unreadable` is
 /// structurally zero.
 #[tokio::test]
-async fn a_status_change_reports_rows_it_changed_but_could_not_push() {
+async fn a_status_change_reports_and_withdraws_rows_it_cannot_decode() {
     let _guard = DB_LOCK.lock().await;
     let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
         return;
@@ -4021,30 +4066,18 @@ async fn a_status_change_reports_rows_it_changed_but_could_not_push() {
     assert_eq!(
         (change.outcome.republished, change.outcome.unreadable),
         (2, 1),
-        "both rows changed durably; one of them could not be pushed"
+        "both rows changed durably; one of them could not be decoded"
     );
 
-    let mut pushed = Vec::new();
-    while let Ok(push) = updates.try_recv() {
-        pushed.push(push.principal);
-    }
-    assert_eq!(
-        pushed,
-        vec![readable],
-        "only the decodable principal is pushed"
-    );
+    assert_pushed_readable_and_unreadable(&mut updates, readable, undecodable);
 
     // The undecodable row still changed: it is suspended in the ledger's sense,
-    // and still refused on read for the reason it was refused before, so no
-    // refresh delivers the new status either.
+    // and a pull says at which generation it cannot be read.
     assert_eq!(
         status_of(&store, readable).await,
         (AccountStatus::Suspended, Generation(4))
     );
-    assert!(
-        store.snapshot(undecodable).await.is_err(),
-        "the corrupt row is still refused on read, as it was before the change"
-    );
+    assert_unreadable(&store, undecodable, Generation(4)).await;
 
     // Publishing a valid snapshot above the restamped generation repairs it.
     publish(
@@ -6815,6 +6848,7 @@ async fn racing_publication_and_revocation_receipts_name_the_actual_predecessor(
             revoked: true,
         },
         SnapshotResolution::Unknown => AdminState::Absent,
+        SnapshotResolution::Unreadable { .. } => panic!("a row the store wrote must read"),
     };
     assert_eq!(previous, final_state);
 }

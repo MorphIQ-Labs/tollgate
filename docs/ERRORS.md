@@ -22,7 +22,7 @@ from the `Problem` type in
 | `status` | always | the HTTP status, repeated |
 | `code` | always | the stable machine code below; classify by this and `status` |
 | `title` | always | a human-readable summary. Never backend text: storage failures always read `backend unavailable` |
-| `generation` | `revoked-principal` only | the tombstone's generation |
+| `generation` | `revoked-principal`, and `unknown-principal` for a snapshot that does not decode | the tombstone's generation, or the undecodable snapshot's |
 | `balance_exhaustion` | `balance-exhausted`, when the allocator attests it | `{"period_end": …}`: when the period that could refund the account ends, or `null` without a schedule |
 | `balance_shortfall` | `insufficient-balance`, when the allocator attests it | `{"remaining": …, "period_end": …}`: funding still held in other leases |
 | `error_id` | every 5xx, and `usage-refused` | 32 lowercase hex digits naming the matching `tollgate::diagnostics` warning; see [backend failures and diagnostics](CONTROL_PLANE_SECURITY.md#backend-failures-and-diagnostics) |
@@ -71,7 +71,7 @@ name. See [`LeaseAllocator`](../crates/tollgate-store/src/traits.rs).
 
 | code | status | meaning | retry |
 | --- | --- | --- | --- |
-| `unknown-principal` | 404 | no snapshot was ever published for this principal | after one is published |
+| `unknown-principal` | 404 | no snapshot was ever published for this principal; or, with `generation`, the stored one [does not decode](SNAPSHOT_OPERATIONS.md#unreadable-snapshots) | after one is published, above `generation` when it is present |
 | `revoked-principal` | 410 | the principal's snapshot was withdrawn; `generation` is the tombstone's | only after a republish at a higher generation |
 | `enumeration-unsupported` | 501 | the backend cannot list principals. Not an empty catalogue | no — track a configured principal set |
 | `invalid-snapshot-limits` | 422 | the snapshot's limits cannot be enforced as published | no — fix the snapshot |

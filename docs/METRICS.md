@@ -182,6 +182,7 @@ covers the refusal fields and recovery procedure.
 | `history_evictions` | counter | histories | Histories reclaimed under snapshot capacity pressure. | Snapshot capacity is too small; each eviction needs a fresh authoritative read to recover. |
 | `refused_observations` | counter | observations | Fetched budget observations older than the one held for the account. | Occasional counts are reordered reads. A steady rise while estimates stand still means the source's ledger moved backwards; restart the instance once the source is authoritative. |
 | `publication_failures` | counter | publications | Reservations or publications refused by history retention or a superseded source read. | Distinct from source failures and generation refusals. |
+| `unreadable_snapshots` | counter | answers | Pulls and pushes saying a stored snapshot does not decode. It counts each retry, so it rises every `unknown_ttl` while the row stays bad. | Those principals are denied as `unknown_principal`. Normal is zero; see [unreadable snapshots](SNAPSHOT_OPERATIONS.md#unreadable-snapshots). |
 | `unresolved` | gauge | principals | Principals with no currently valid resolution at the last pass. | Non-zero with `denials.unknown_principal` rising means distribution, not credentials. It reports the last pass, not task liveness. |
 
 ## Deny-reason labels

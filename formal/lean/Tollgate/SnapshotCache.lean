@@ -89,6 +89,15 @@ an observation into a revocation: that promotion is GL-53. -/
 def installUnknown (state : State) : State :=
   { state with visible := .negative }
 
+/-- A stored snapshot that does not decode withdraws the visible entry. It names
+a live generation, so it is ordered as a positive nothing is holding, and leaves
+an observation, never a revocation. -/
+def installUnreadable (state : State) (incoming : Nat) : State :=
+  if acceptsPositive { state with visible := .absent } incoming then
+    { watermark := some (.positive incoming), visible := .negative }
+  else
+    state
+
 def evictVisible (state : State) : State :=
   { state with visible := .absent }
 
@@ -159,6 +168,60 @@ theorem revoked_watermark_is_max
     rw [Nat.max_eq_left (Nat.le_of_lt h)]
   · rename_i h
     rw [Nat.max_eq_right (Nat.le_of_not_gt h)]
+
+/-- An unreadable snapshot at or above the observed generation withdraws
+whatever was visible, including the same generation (INVARIANTS.md GL-22). -/
+theorem unreadable_withdraws (current incoming : Nat) (visible : Visible)
+    (h : current ≤ incoming) :
+    installUnreadable { watermark := some (.positive current), visible := visible } incoming =
+      { watermark := some (.positive incoming), visible := .negative } := by
+  have hlt : ¬ incoming < current := Nat.not_lt.mpr h
+  simp [installUnreadable, acceptsPositive, Watermark.generation, Watermark.isRevoked,
+    Visible.isPresent, hlt]
+
+/-- A delayed unreadable answer cannot withdraw a newer snapshot. -/
+theorem older_unreadable_is_refused (current incoming : Nat) (visible : Visible)
+    (h : incoming < current) :
+    installUnreadable { watermark := some (.positive current), visible := visible } incoming =
+      { watermark := some (.positive current), visible := visible } := by
+  simp [installUnreadable, acceptsPositive, Watermark.generation, h]
+
+/-- It never weakens a revocation: at or below the tombstone nothing changes. -/
+theorem unreadable_at_or_below_revocation_is_refused
+    (current incoming : Nat) (visible : Visible) (h : incoming ≤ current) :
+    installUnreadable { watermark := some (.revoked current), visible := visible } incoming =
+      { watermark := some (.revoked current), visible := visible } := by
+  rcases Nat.lt_or_ge incoming current with hlt | hge
+  · simp [installUnreadable, acceptsPositive, Watermark.generation, hlt]
+  · have : incoming = current := Nat.le_antisymm h hge
+    simp [installUnreadable, acceptsPositive, Watermark.generation, Watermark.isRevoked, this]
+
+/-- Generations never move backward across it: what was held before an
+unreadable newer row stays dead. -/
+theorem unreadable_then_older_positive_is_rejected
+    (current incoming replay : Nat) (visible : Visible)
+    (h : current ≤ incoming) (older : replay < incoming) :
+    installPositive
+        (installUnreadable
+          { watermark := some (.positive current), visible := visible } incoming)
+        replay =
+      { watermark := some (.positive incoming), visible := .negative } := by
+  rw [unreadable_withdraws current incoming visible h]
+  simp [installPositive, acceptsPositive, Watermark.generation, older]
+
+/-- Recovery: the stored generation, once it reads, and any above it. -/
+theorem unreadable_then_readable_positive_is_accepted
+    (current incoming repaired : Nat) (visible : Visible)
+    (h : current ≤ incoming) (not_older : incoming ≤ repaired) :
+    installPositive
+        (installUnreadable
+          { watermark := some (.positive current), visible := visible } incoming)
+        repaired =
+      { watermark := some (.positive repaired), visible := .present repaired } := by
+  rw [unreadable_withdraws current incoming visible h]
+  have hlt : ¬ repaired < incoming := Nat.not_lt.mpr not_older
+  simp [installPositive, acceptsPositive, Watermark.generation, Watermark.isRevoked,
+    Visible.isPresent, hlt]
 
 /-- INVARIANTS.md GL-15's headline over *any* prior watermark, not just a
 revocation: revoke, evict the visible entry, then replay a positive at or below

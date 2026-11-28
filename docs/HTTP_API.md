@@ -241,6 +241,13 @@ Errors: `404 unknown-principal` when no snapshot was ever published;
 `410 revoked-principal`, with the tombstone's `generation`, when it was
 withdrawn.
 
+A live snapshot that does not decode is answered `404 unknown-principal` **with
+its `generation`**. An instance withdraws the principal and refuses anything
+older than that generation; one that predates the extension reads an unknown
+principal, which also denies. It is not a `503`, which would leave instances
+serving the snapshot they hold. See
+[unreadable snapshots](SNAPSHOT_OPERATIONS.md#unreadable-snapshots).
+
 ## Credential feed
 
 ### `GET /v1/keys`
@@ -423,12 +430,12 @@ Request `SetStatusRequest`: `{"status": "Active"}` — `Active`, `Suspended` or
 `Closed`.
 
 `200` with `SetStatusResponse`: `republished` is the number of live snapshots
-rewritten; `unreadable` is the number of stored rows that changed but could not
-be decoded. No refresh delivers the change to those principals: an instance
-holding an earlier snapshot of one keeps admitting on it until its
-`valid_until`. To repair one, publish a valid snapshot above its new generation;
-the server's `restamped snapshot could not be decoded for push` warnings name
-them.
+rewritten; `unreadable` is the number of those rows that could not be decoded.
+Instances withdraw those principals at their next refresh and deny them,
+whatever the new status permits. To repair one, publish a valid snapshot above
+its new generation; the server's `restamped snapshot does not decode` warnings
+name them. See
+[unreadable snapshots](SNAPSHOT_OPERATIONS.md#unreadable-snapshots).
 
 ```json
 {"republished": 2, "unreadable": 0}

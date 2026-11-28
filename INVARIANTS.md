@@ -371,7 +371,8 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    increments); `zero_fences_are_refused_in_every_persisted_capability`
    (Postgres schema checks).
 
-5. **Fail closed, zero I/O.** Unknown principal, suspended/closed account,
+5. **Fail closed, zero I/O.** Unknown principal, a principal whose stored
+   snapshot does not decode (22), suspended/closed account,
    expired snapshot, missing permission, cost overflow, accounting
    backpressure: all deny locally, under every enforcement mode. A lease that
    cannot fund the quote — absent, expired, or exhausted — also denies locally
@@ -1074,6 +1075,23 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     then refused it back forever; that is GL-17's rule — keyed on what the source
     answered, never on what the instance remembers — applied to admission
     rather than to TTL selection.
+    A stored snapshot that does not decode (22) names a live generation. It
+    withdraws what the instance serves at or below that generation, raises the
+    watermark to it as an observation, refuses an older positive from then on,
+    and admits the same generation once it reads. An older such answer, or one
+    at or below a tombstone, is refused. Enforcement: `accept_unreadable`, which
+    `SnapshotManager` applies to pulls and pushes alike; it publishes the
+    principal to the map as unknown, leaving the map's own watermark alone, and
+    holds the higher floor for as long as it holds the resolution.
+    *Tests:* `an_unreadable_row_outranks_older_snapshots_and_not_itself`
+    (admission),
+    `a_pushed_unreadable_answer_orders_snapshots_without_being_dead` and
+    `an_older_pulled_unreadable_answer_withdraws_nothing` (client). *Proof:*
+    `Tollgate.SnapshotCache.unreadable_withdraws`,
+    `Tollgate.SnapshotCache.older_unreadable_is_refused`,
+    `Tollgate.SnapshotCache.unreadable_at_or_below_revocation_is_refused`,
+    `Tollgate.SnapshotCache.unreadable_then_older_positive_is_rejected` and
+    `Tollgate.SnapshotCache.unreadable_then_readable_positive_is_accepted`.
     *Tests:* both snapshot-map contract tests,
     `negative_eviction_preserves_generation_monotonicity`,
     `revoked_generation_rejects_replay_after_visible_entry_is_evicted`,
@@ -1126,8 +1144,8 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `snapshot_publication_matches_u128_worst_case_oracle`,
     `admin_refuses_snapshot_whose_batch_quote_exceeds_burst`,
     `admin_refuses_weighted_rate_outside_governors_u32_domain`,
-    `http_store_rejects_invalid_snapshot_from_legacy_server`,
-    and `legacy_invalid_snapshot_is_rejected_on_read`. *Proof:*
+    `a_served_snapshot_that_does_not_decode_resolves_unreadable`,
+    and `a_stored_row_that_does_not_decode_resolves_unreadable`. *Proof:*
     `formal/lean/Tollgate/SnapshotLimits.lean`. Values are never silently
     repaired: coercing a declared capacity would change its contract.
 
@@ -1183,8 +1201,9 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     tracked set, because a dropped push is most often a reinstatement, and
     filtering by local resolution would skip exactly what recovery is for.
     Which TTL applies is keyed on **what the source answered**, never on the
-    generation the instance remembers: an absent row takes `unknown_ttl`, a
-    published revocation tombstone takes `revoked_ttl`. Conflating them
+    generation the instance remembers: an absent row and one that does not
+    decode take `unknown_ttl`, a published revocation tombstone takes
+    `revoked_ttl`. Conflating them
     strands a live principal for the reinstatement TTL whenever a source is
     merely rebuilding or failing over, while readiness still reports healthy.
     Pruning visible negatives never weakens invariant GL-15, and neither does
@@ -1241,7 +1260,8 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `a_reinstated_principal_comes_back_on_the_revoked_ttl`,
     `lag_recovery_covers_the_negatives_a_sweep_skips`,
     `a_lagged_push_stream_refetches_every_tracked_principal` (the running
-    manager takes that path), and
+    manager takes that path),
+    `a_pushed_withdrawal_is_rechecked_after_the_unknown_ttl`, and
     `deadline_helpers_are_exact_in_the_supported_domain`.
 
 18. **Background store calls are wall-clock bounded, and so is every pass
@@ -1550,9 +1570,29 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     its `valid_until`, and the next successful pull applies the change. The
     operation reports what it changed: how many snapshots it republished, and
     how many of those could not be decoded, so a partial result is surfaced
-    rather than absorbed. No pull can read such a row either: its principal
-    stays on any held snapshot until `valid_until`, until an operator publishes
-    a valid snapshot above the new generation. `StatusPropagation.lean` proves the exact model: the ledger
+    rather than absorbed.
+
+    A stored snapshot that does not decode cannot carry the change, so it
+    withdraws its principal instead, within the same bound: a status, a class or
+    any other change never leaves an instance serving what preceded a row it
+    cannot read. The source answers such a row as unreadable at its generation,
+    never as a failure to answer: `PostgresStore` on a pull and in the pushes of
+    a status or class change, `tollgate-server` as `404 unknown-principal`
+    carrying that generation, and `HttpStore` for that answer and for a complete
+    successful body that states a generation and does not decode. The instance
+    denies the principal with zero charge under every enforcement mode, counts
+    and logs it, and stays ready; siblings and other accounts are unaffected. It
+    stays denied until a valid snapshot is published above that generation (or,
+    where the reader was the fault, until it reads that one), applied by push or
+    when `unknown_ttl` elapses. A transport failure, a partial response or a
+    body with no readable generation remains a failed pull. An instance that
+    predates the answer reads the server's as an unknown principal and so
+    withdraws; one that predates it reads an undecodable body as a failed pull,
+    and a control plane that predates it answers such a row with a storage error,
+    both leaving the held snapshot until `valid_until`. `MemoryStore` holds
+    validated snapshots, so the state is unrepresentable there. The restamp of a
+    negative generation column is refused by schema and a read of one remains a
+    storage error. `StatusPropagation.lean` proves the exact model: the ledger
     and every live snapshot always agree
     (`Tollgate.StatusPropagation.setStatus_agrees`,
     `Tollgate.StatusPropagation.publish_agrees`); a change republishes exactly
@@ -1588,10 +1628,21 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `account_status_endpoint_speaks_the_status_vocabulary` (server).
     Propagation to running instances, and its bound when a pull fails:
     `a_status_change_reaches_every_instance_through_refresh` and
-    `an_unreadable_principal_keeps_its_snapshot_until_expiry_or_repair`
-    (client), with
-    `a_status_change_reports_rows_it_changed_but_could_not_push` (PostgreSQL)
-    for the stored row.
+    `a_failed_pull_keeps_the_held_snapshot_until_it_expires` (client).
+    A row that does not decode:
+    `an_unreadable_principal_is_withdrawn_from_every_instance_until_repaired`
+    and `a_row_unreadable_from_the_start_does_not_hold_the_initial_load`
+    (client);
+    `a_stored_row_that_does_not_decode_resolves_unreadable`,
+    `a_status_change_reports_and_withdraws_rows_it_cannot_decode` and
+    `a_capacity_class_change_reports_and_withdraws_rows_it_cannot_decode`
+    (PostgreSQL);
+    `an_unreadable_snapshot_is_an_unknown_principal_carrying_its_generation`,
+    `an_unreadable_stored_snapshot_crosses_the_wire_with_its_generation` and
+    `a_served_snapshot_that_does_not_decode_resolves_unreadable` (server and
+    HTTP client); and
+    `a_suspension_reaches_every_instance_past_a_snapshot_that_does_not_decode`
+    (deployed).
 
 23. **A cached credential proves identity, never authorization, and never
     outlives its own validity.** A `SessionCredential` may reuse a `Principal`

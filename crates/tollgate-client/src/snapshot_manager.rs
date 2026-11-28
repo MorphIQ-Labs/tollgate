@@ -10,6 +10,10 @@
 //!   precedes admissibility (INVARIANTS.md GL-10). It returns to false when a
 //!   resolution expires or the manager exits. Source errors keep retrying;
 //!   readiness waits.
+//! - **Unreadable snapshots** — a source holding a snapshot that does not
+//!   decode says so at its generation, and the principal is withdrawn and
+//!   negative-cached like an unknown one, refusing anything older
+//!   (INVARIANTS.md GL-22). A source *error* instead keeps what is held.
 //! - **Pushes** — subscribed updates install immediately (the map's
 //!   generation monotonicity discards stale or reordered pushes). A lagged
 //!   subscription triggers a full refetch, so a burst of missed pushes can
@@ -35,7 +39,7 @@ use tracing::Instrument as _;
 
 use tollgate_admission::{
     PublicationError, PublishableSnapshotUpdate, RefreshBatch, Refreshed, SnapshotMap, Watermark,
-    accept_positive, accept_revoked, accept_unknown,
+    accept_positive, accept_revoked, accept_unknown, accept_unreadable,
 };
 use tollgate_core::{Generation, Locality, Principal};
 use tollgate_store::{Clock, SnapshotResolution, SnapshotSource, StoreError};
@@ -278,6 +282,7 @@ pub struct SnapshotCounters {
     refused_updates: AtomicU64,
     history_evictions: AtomicU64,
     refused_observations: AtomicU64,
+    unreadable_snapshots: AtomicU64,
     publication_failures: AtomicU64,
     unresolved: AtomicU64,
 }
@@ -294,6 +299,7 @@ impl SnapshotCounters {
             refused_updates: AtomicU64::new(0),
             history_evictions: AtomicU64::new(0),
             refused_observations: AtomicU64::new(0),
+            unreadable_snapshots: AtomicU64::new(0),
             publication_failures: AtomicU64::new(0),
             unresolved: AtomicU64::new(0),
         }
@@ -343,6 +349,23 @@ impl SnapshotCounters {
         self.refused_observations.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count and report one answer saying a stored snapshot does not decode,
+    /// whether or not its generation is then accepted.
+    fn record_unreadable(
+        &self,
+        principal: Principal,
+        generation: Generation,
+        origin: UpdateOrigin,
+    ) {
+        self.unreadable_snapshots.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            %principal,
+            generation = generation.0,
+            origin = origin.name(),
+            "stored snapshot does not decode; publish a valid one above this generation"
+        );
+    }
+
     fn set_unresolved(&self, principals: u64) {
         self.unresolved.store(principals, Ordering::Relaxed);
     }
@@ -359,6 +382,7 @@ impl SnapshotCounters {
             refused_updates: self.refused_updates.load(Ordering::Relaxed),
             history_evictions: self.history_evictions.load(Ordering::Relaxed),
             refused_observations: self.refused_observations.load(Ordering::Relaxed),
+            unreadable_snapshots: self.unreadable_snapshots.load(Ordering::Relaxed),
             publication_failures: self.publication_failures.load(Ordering::Relaxed),
             unresolved: self.unresolved.load(Ordering::Relaxed),
         }
@@ -401,6 +425,11 @@ pub struct SnapshotStats {
     /// Reservations or publications refused by the retention/fence boundary.
     /// Distinct from source failures and ordinary generation rejection.
     pub publication_failures: u64,
+    /// Answers, pulled or pushed, saying a stored snapshot does not decode. The
+    /// principal is withdrawn unless the answer is older than what is held, so a
+    /// rising count means those principals are denied until a valid snapshot is
+    /// published above the reported generation.
+    pub unreadable_snapshots: u64,
     /// Principals with no currently valid resolution — a gauge, not a total.
     /// Reports the last resolution pass, not task liveness. Fixed mode needs
     /// zero unresolved; All mode needs some resolved (or an empty catalogue).
@@ -899,6 +928,21 @@ impl Resolutions {
         decision
     }
 
+    fn unreadable(
+        &self,
+        principal: Principal,
+        generation: Generation,
+        origin: UpdateOrigin,
+        counters: &SnapshotCounters,
+    ) -> (Option<Watermark>, bool) {
+        counters.record_unreadable(principal, generation, origin);
+        let decision = accept_unreadable(self.watermark_of(principal), generation);
+        if !decision.1 {
+            self.record_refusal(principal, generation, "unreadable", origin, counters);
+        }
+        decision
+    }
+
     /// Both ingress paths obtain their decision and its evidence together.
     fn record_refusal(
         &self,
@@ -1184,7 +1228,8 @@ fn after_std(now: jiff::Timestamp, duration: std::time::Duration) -> jiff::Times
 /// principal until `revoked_ttl`, with readiness still reporting healthy
 /// because a negative counts as resolved.
 ///
-/// A tombstone is a statement the source published; an absence is not.
+/// A tombstone is a statement the source published; an absence is not, and
+/// neither is a row that does not decode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NegativeKind {
     /// The source published a revocation tombstone. Durable, and undone only
@@ -1193,6 +1238,9 @@ enum NegativeKind {
     /// The source has no row for this principal. May be a signup in flight or
     /// a source that has not finished coming up, so it takes `unknown_ttl`.
     Unknown,
+    /// The source has a row that does not decode. A repair or an upgrade may
+    /// come at any moment, so it takes `unknown_ttl`.
+    Unreadable,
 }
 
 /// When a negative resolution should next be rechecked.
@@ -1206,7 +1254,7 @@ fn negative_deadline(
 ) -> jiff::Timestamp {
     let ttl = match kind {
         NegativeKind::Revoked => config.revoked_ttl,
-        NegativeKind::Unknown => config.unknown_ttl,
+        NegativeKind::Unknown | NegativeKind::Unreadable => config.unknown_ttl,
     };
     now.checked_add(ttl).unwrap_or(jiff::Timestamp::MAX)
 }
@@ -1443,6 +1491,33 @@ async fn refresh_chunk_cancellable(
                     // stranded the principal at its own generation (GL-53).
                     let (watermark, _) = accept_unknown(resolutions.watermark_of(principal));
                     let until = negative_deadline(now, config, NegativeKind::Unknown);
+                    resolutions.insert(
+                        principal,
+                        Resolution::Negative {
+                            deadline: until,
+                            next_refetch: until,
+                            watermark,
+                        },
+                    );
+                    Some(PublishableSnapshotUpdate::Unknown { principal, until })
+                }
+                // Withdrawn like an absence, and unlike one it names a
+                // generation: whatever is older is refused from here on. The
+                // map is told the principal is unknown, which denies and
+                // asserts nothing about the generation being dead.
+                Ok(SnapshotResolution::Unreadable { generation }) => {
+                    let now = clock.now();
+                    let (watermark, accepted) = resolutions.unreadable(
+                        principal,
+                        generation,
+                        UpdateOrigin::Refresh,
+                        counters,
+                    );
+                    if !accepted {
+                        return None;
+                    }
+                    let until = negative_deadline(now, config, NegativeKind::Unreadable);
+                    completed.insert(principal);
                     resolutions.insert(
                         principal,
                         Resolution::Negative {
@@ -1701,7 +1776,8 @@ async fn run(
                                 );
                             }
                             resolution @ (SnapshotResolution::Revoked { .. }
-                            | SnapshotResolution::Unknown) => {
+                            | SnapshotResolution::Unknown
+                            | SnapshotResolution::Unreadable { .. }) => {
                                 let current = resolutions.watermark_of(push.principal);
                                 let (watermark, accepted, kind, update) = match resolution {
                                     SnapshotResolution::Revoked { generation } => {
@@ -1712,6 +1788,11 @@ async fn run(
                                     SnapshotResolution::Unknown => {
                                         let (watermark, accepted) = accept_unknown(current);
                                         (watermark, accepted, NegativeKind::Unknown, None)
+                                    }
+                                    SnapshotResolution::Unreadable { generation } => {
+                                        let (watermark, accepted) =
+                                            resolutions.unreadable(push.principal, generation, UpdateOrigin::Push, &counters);
+                                        (watermark, accepted, NegativeKind::Unreadable, None)
                                     }
                                     SnapshotResolution::Present(_) => unreachable!(),
                                 };

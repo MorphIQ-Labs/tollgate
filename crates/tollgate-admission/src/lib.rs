@@ -57,7 +57,9 @@ pub use counters::{AdmissionCounters, CommitRefusal, CountersSnapshot};
 pub use engine::{
     AdmissionEngine, Committed, Pending, ReadyToStart, RefusedContext, Released, RequestContext,
 };
-pub use generation_model::{Watermark, accept_positive, accept_revoked, accept_unknown};
+pub use generation_model::{
+    Watermark, accept_positive, accept_revoked, accept_unknown, accept_unreadable,
+};
 pub use history::{
     PublicationError, RefreshBatch, Refreshed, SnapshotHistoryStats, SnapshotRefresh,
 };

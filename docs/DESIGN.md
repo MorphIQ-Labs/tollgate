@@ -506,10 +506,9 @@ validator and publish corrected snapshots at a higher generation, then
 upgrade every server/admin writer and client before relying on the invariant.
 Mixed versions are safe only in the fail-closed sense: an older writer can
 still persist invalid data, while a new Postgres reader or HTTP client refuses
-it. An already cached older snapshot remains usable only through its existing
-`valid_until`; if no corrected generation arrives, continuous readiness falls
-and admission denies. Recovery is to correct the plan and publish a higher
-generation. No SQL migration or automatic data rewrite is performed.
+it and [withdraws its principal](#an-unreadable-snapshot-withdraws-its-principal-gh-102-2026-11-27).
+Recovery is to correct the plan and publish a higher generation. No SQL
+migration or automatic data rewrite is performed.
 
 Two deliberate consequences:
 
@@ -735,11 +734,10 @@ snapshot's `valid_until`, counting each failure, and the next successful pull
 applies the change.
 
 The status change answers with what it did — `republished`, and `unreadable`
-for rows that changed durably but could not be decoded. Neither a push nor a
-pull delivers the change for an unreadable row: an instance holding that
-principal's earlier snapshot keeps admitting on it until its `valid_until`
-(leases are refused for the account regardless), and publishing a valid snapshot
-above the new generation repairs it. `republished: 0`
+for the rows among them that could not be decoded. An unreadable row is pushed,
+and answered to pulls, as unreadable at its new generation, so instances
+withdraw that principal within the same bound as any other and deny it until a
+valid snapshot is published above that generation. `republished: 0`
 is the one worth reading: the account had no live snapshot to change, so it has
 no credentials, or they are all revoked, or the call was a repeat. Any of those
 is better learned at the call than from a later denial.
@@ -8617,12 +8615,10 @@ puts every scheduled pull beyond the test, and due work becomes due while the
 component runs.
 
 The same audit found one claim that was false rather than unwitnessed. A status
-or class change cannot reach a principal whose stored snapshot does not decode:
-the next refresh reads the same row. The bound is that snapshot's `valid_until`
-and the repair is publishing a valid snapshot above the new generation
-(INVARIANTS GL-22). Having the source answer such a row with a withdrawal would
-close the window at the price of denying on corruption that today leaves the
-instance serving; it is not decided here.
+or class change did not reach a principal whose stored snapshot does not decode:
+the next refresh read the same row. [An unreadable snapshot withdraws its
+principal](#an-unreadable-snapshot-withdraws-its-principal-gh-102-2026-11-27)
+records how it was closed.
 
 ## Sustained load, and a boundary without a clock seam (GH-80, 2026-11-27)
 
@@ -8708,3 +8704,65 @@ wiring to the extracted example. The script refuses a patch touching anything
 else, so the libraries exercised are the released ones. The suite needs extra
 builds and the tags, so it runs locally. The release list is in the script and
 in the test; each new release is added there.
+
+## An unreadable snapshot withdraws its principal (GH-102, 2026-11-27)
+
+A source reported a row it could not decode as a `StoreError`, the same answer
+as an outage, and an instance keeps what it holds through an outage. A
+suspension, closure or class change restamps such a row, so the one principal
+that could not be told kept being admitted until its `valid_until`. The
+contract broke at the source: it had an answer, "a live snapshot exists at this
+generation and I cannot say what it authorizes", and no way to give it.
+
+`SnapshotResolution::Unreadable { generation }` is that answer. The manager
+withdraws the principal and negative-caches it for `unknown_ttl`. The decision
+costs availability on corruption: a row that stops decoding for a reason
+unrelated to any change now denies its principal, where it previously served
+until expiry. That is the fail-closed constraint, applied to the one principal.
+
+**Not a revocation.** Answering with a tombstone would have needed no new
+variant, and would have been wrong twice. A revocation refuses its own
+generation, so an instance upgraded to understand the row could never accept it,
+and it waits `revoked_ttl`, an operator-reinstatement interval, for what may be
+repaired in a minute. It would also record corruption as an operator's decision.
+
+**Not an absence either.** An absence carries no generation, so a delayed older
+snapshot, the pre-suspension one, would be accepted straight back. The
+unreadable generation raises the instance's watermark as a positive that nothing
+holds (`accept_unreadable`, `SnapshotCache.installUnreadable`): older is
+refused, the same generation is accepted once it reads, and a tombstone is never
+weakened. The admission map is told the principal is unknown, which denies and
+leaves its own watermark alone; the manager is its only publisher and holds the
+higher floor. A new map update variant would have changed the public map trait
+to restate that floor. The floor lives as long as the manager's resolution, so a
+publication the map refuses discards it, as it does any other generation, and
+the next source read restores it.
+
+**Where it is decided.** The source decides, because only it knows the row
+exists. `PostgresStore` answers it for a pull and pushes it for a restamped row.
+`MemoryStore` holds validated snapshots and cannot produce it. The HTTP client is
+a second reader: a complete successful body that states a generation and does not
+decode is the same fact seen one hop later, which is what a newer server
+publishing an unknown value looks like. A body with no readable generation, a
+partial response and every transport failure stay errors.
+
+**The wire.** The server answers `404 unknown-principal` with a `generation`.
+A new code would have been clearer and useless to the instances already
+running: an unrecognized code is an error to them, which keeps them serving.
+Reading an unknown principal, they withdraw. Upgrading the server alone closes
+the window fleet-wide. A new instance against an older server still receives
+`503` and keeps the old bound, and an older instance cannot be made to withdraw
+on a body it fails to decode. No schema or stored data changes.
+
+**Readiness** counts the withdrawn principal as resolved, as it does any
+negative. Counting it unresolved would let one corrupt row withdraw every
+instance of a fixed-set deployment from service. It also ends a worse case: the
+initial load retries failed principals until all resolve, before refresh,
+discovery or push handling starts, so a single row that errored on every read
+held a starting instance there indefinitely. `unreadable_snapshots` and the
+logs are the signal.
+
+Compatibility: `SnapshotResolution` gains a variant, which breaks exhaustive
+matches in embedder code and custom sources must decide whether to produce it.
+`SnapshotStats` gains `unreadable_snapshots`. No request-path, threshold or
+migration changes.

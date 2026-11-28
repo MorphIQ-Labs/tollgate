@@ -150,42 +150,108 @@ fn runtime_config(principal: Principal) -> tollgate_client::InstanceRuntimeConfi
     }
 }
 
+/// A complete body that states a generation and is no snapshot this build can
+/// enforce is an answer: unreadable at that generation. Without a generation to
+/// order it, it is a failure to answer (INVARIANTS.md GL-22).
 #[tokio::test]
-async fn http_store_rejects_invalid_snapshot_from_legacy_server() {
-    use axum::Json;
+async fn a_served_snapshot_that_does_not_decode_resolves_unreadable() {
     use axum::routing::get;
 
     let mut invalid = (*snapshot()).clone();
     invalid.limits = ResolvedLimits::new(64).with_weighted_rate(u64::from(u32::MAX), 113);
-    let invalid = Arc::new(invalid);
-    let app = axum::Router::new().route(
-        &format!("{API_PREFIX}/snapshots/{{principal}}"),
-        get(move || {
-            let invalid = Arc::clone(&invalid);
-            async move { Json(invalid) }
-        }),
+    let invalid = serde_json::to_value(invalid).unwrap();
+    // What a newer server publishing a value this build does not know sends.
+    let mut unknown_status = serde_json::to_value(&*snapshot()).unwrap();
+    unknown_status["status"] = serde_json::json!("Quarantined");
+    let generation = snapshot().generation;
+
+    let mut unstamped = unknown_status.clone();
+    unstamped.as_object_mut().unwrap().remove("generation");
+    let cases = [
+        (invalid.to_string(), Some(generation)),
+        (unknown_status.to_string(), Some(generation)),
+        (unstamped.to_string(), None),
+        (r#"{"generation":"7"}"#.to_owned(), None),
+        ("<html>gateway</html>".to_owned(), None),
+        (r#"{"generation":7"#.to_owned(), None),
+    ];
+    for (body, expected) in cases {
+        let served = body.clone();
+        let app = axum::Router::new().route(
+            &format!("{API_PREFIX}/snapshots/{{principal}}"),
+            get(move || {
+                let served = served.clone();
+                async move { served }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let answer = common::http(format!("http://{address}"))
+            .snapshot(PRINCIPAL)
+            .await;
+        match (expected, answer) {
+            (Some(expected), Ok(SnapshotResolution::Unreadable { generation })) => {
+                assert_eq!(generation, expected, "{body}");
+            }
+            (None, Err(error)) => assert!(
+                error.0.contains("snapshot decode"),
+                "unexpected error for {body}: {error}"
+            ),
+            (_, answer) => panic!("unexpected answer for {body}: {answer:?}"),
+        }
+        server.abort();
+    }
+}
+
+/// A row the control plane's store cannot read crosses the wire as itself, and
+/// an ordinary absence stays one.
+#[tokio::test]
+async fn an_unreadable_stored_snapshot_crosses_the_wire_with_its_generation() {
+    let store = Arc::new(
+        DelegatingStore::wrapping(MemoryStore::new(GrantPolicy::default()).unwrap()).on_snapshot(
+            |_, principal| async move {
+                Ok(if principal == PRINCIPAL {
+                    SnapshotResolution::Unreadable {
+                        generation: Generation(7),
+                    }
+                } else {
+                    SnapshotResolution::Unknown
+                })
+            },
+        ),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = stop_rx.await;
-            })
-            .await
-            .unwrap();
-    });
-
+    let server = tokio::spawn(serve(
+        listener,
+        ServerState {
+            security: common::security(),
+            issuer: None,
+            store,
+            clock: Arc::new(SystemClock),
+        },
+        std::time::Duration::from_secs(60),
+        std::future::pending(),
+    ));
     let http = common::http(format!("http://{address}"));
-    let error = http.snapshot(PRINCIPAL).await.unwrap_err();
-    assert!(
-        error.0.contains("invalid snapshot from server") && error.0.contains("exceeding the burst"),
-        "unexpected error: {error}"
-    );
 
-    let _ = stop_tx.send(());
-    server.await.unwrap();
+    assert!(matches!(
+        http.snapshot(PRINCIPAL).await.unwrap(),
+        SnapshotResolution::Unreadable {
+            generation: Generation(7)
+        }
+    ));
+    assert!(matches!(
+        http.snapshot(tollgate_core::Principal(PRINCIPAL.0 + 1))
+            .await
+            .unwrap(),
+        SnapshotResolution::Unknown
+    ));
+    server.abort();
 }
 
 #[tokio::test]

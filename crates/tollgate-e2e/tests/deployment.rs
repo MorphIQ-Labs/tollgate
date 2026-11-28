@@ -17,9 +17,9 @@ use std::cell::Cell;
 use std::time::Duration;
 
 use reqwest::StatusCode;
-use tollgate_core::{CostUnits, EnforcementMode};
+use tollgate_core::{AccountStatus, CostUnits, EnforcementMode};
 use tollgate_e2e::{
-    App, AppOptions, ControlPlane, Customer, DEADLINE, Settings, Transport, eventually,
+    App, AppOptions, ControlPlane, Customer, DEADLINE, Policy, Settings, Transport, eventually,
 };
 
 const BALANCE: u64 = 1_000_000;
@@ -186,6 +186,95 @@ async fn a_revoked_credential_is_refused_by_every_instance() {
         app.terminate().await;
     }
     for (customer, charged) in [(&revoked, charged.get()), (&bystander, neighbour)] {
+        let closed = plane.ledger(customer.account).await;
+        assert_eq!(closed.settled_usage.get(), charged);
+        assert_eq!(closed.outstanding_lease_grants.get(), 0);
+        assert_eq!(closed.balance.get(), BALANCE - charged);
+    }
+}
+
+/// A suspension reaches every instance even when the stored snapshot it
+/// restamps does not decode: each withdraws the credential and reports why,
+/// another account is untouched, and publishing a valid snapshot above the new
+/// generation restores the account's service (INVARIANTS.md GL-22).
+#[tokio::test]
+async fn a_suspension_reaches_every_instance_past_a_snapshot_that_does_not_decode() {
+    let Some(settings) = Settings::from_env() else {
+        return;
+    };
+    let plane = ControlPlane::start(settings).await;
+    let damaged = plane.onboard(1, BALANCE).await;
+    let bystander = plane.onboard(2, BALANCE).await;
+    let apps = [
+        plane.start_app("app-a", AppOptions::default()).await,
+        plane.start_app("app-b", AppOptions::default()).await,
+    ];
+    let charged = Cell::new(0);
+    for app in &apps {
+        charged.set(charged.get() + spend(app, &damaged, 5).await);
+    }
+
+    plane.damage_snapshots(&damaged).await;
+    assert_eq!(
+        plane.set_status(&damaged, AccountStatus::Suspended).await,
+        1,
+        "the change reports the row it could not read"
+    );
+    for app in &apps {
+        eventually("the withdrawal to reach the instance", DEADLINE, || async {
+            match app.price(&damaged.secret).await {
+                Ok(units) => {
+                    charged.set(charged.get() + units);
+                    Err(format!("still served, charging {units}"))
+                }
+                Err(refused) if refused.status == StatusCode::UNAUTHORIZED => Ok(()),
+                Err(refused) => Err(format!("{refused:?}")),
+            }
+        })
+        .await;
+        assert!(app.counter("/snapshots/unreadable_snapshots").await > 0);
+        assert!(
+            app.ready().await,
+            "one damaged row leaves the instance ready"
+        );
+    }
+    let mut neighbour = 0;
+    for app in &apps {
+        for _ in 0..10 {
+            app.price(&damaged.secret)
+                .await
+                .expect_err("a withdrawn credential is not served");
+        }
+        neighbour += spend(app, &bystander, 3).await;
+    }
+
+    // Generation 2 is the suspension's; the repair goes above it.
+    let repair = Policy {
+        generation: 3,
+        status: AccountStatus::Suspended,
+        ..Policy::INITIAL
+    };
+    plane.publish(&damaged, repair).await;
+    assert_eq!(plane.set_status(&damaged, AccountStatus::Active).await, 0);
+    // The reference application rechecks a withdrawn principal after its
+    // 60-second `unknown_ttl`.
+    for app in &apps {
+        eventually(
+            "the repair to restore service",
+            Duration::from_secs(60) + DEADLINE,
+            || async {
+                app.price(&damaged.secret)
+                    .await
+                    .map(|units| charged.set(charged.get() + units))
+                    .map_err(|refused| format!("{refused:?}"))
+            },
+        )
+        .await;
+    }
+    for app in apps {
+        app.terminate().await;
+    }
+    for (customer, charged) in [(&damaged, charged.get()), (&bystander, neighbour)] {
         let closed = plane.ledger(customer.account).await;
         assert_eq!(closed.settled_usage.get(), charged);
         assert_eq!(closed.outstanding_lease_grants.get(), 0);

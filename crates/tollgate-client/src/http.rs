@@ -19,8 +19,8 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
-    AccountId, AccountSnapshot, CostUnits, FencingToken, LeaseId, Principal, PublishableSnapshot,
-    UsageEvent,
+    AccountId, AccountSnapshot, CostUnits, FencingToken, Generation, LeaseId, Principal,
+    PublishableSnapshot, UsageEvent,
 };
 use tollgate_store::wire::{
     API_PREFIX, AcquireRequest, ConsolidateRequest, IngestRequestRef, LeaseTtl, PrincipalsResponse,
@@ -356,7 +356,12 @@ impl SnapshotSource for HttpStore {
                 ))
             })?;
             if problem.code == "unknown-principal" {
-                return Ok(SnapshotResolution::Unknown);
+                // A generation says the row is there and cannot be decoded,
+                // which orders it against what this instance holds.
+                return Ok(match problem.generation {
+                    Some(generation) => SnapshotResolution::Unreadable { generation },
+                    None => SnapshotResolution::Unknown,
+                });
             }
             return Err(StoreError(format!(
                 "snapshot endpoint returned 404 with code {} instead of unknown-principal",
@@ -382,13 +387,11 @@ impl SnapshotSource for HttpStore {
         if !response.status().is_success() {
             return Err(StoreError(problem_detail(response).await));
         }
-        let snapshot: AccountSnapshot = require_complete(response)?
-            .json()
+        let body = require_complete(response)?
+            .bytes()
             .await
             .map_err(|e| StoreError(format!("http: {}", e.without_url())))?;
-        let snapshot = PublishableSnapshot::try_new(Arc::new(snapshot))
-            .map_err(|error| StoreError(format!("invalid snapshot from server: {error}")))?;
-        Ok(SnapshotResolution::Present(snapshot))
+        decode_snapshot(principal, &body)
     }
 
     fn subscribe(&self) -> broadcast::Receiver<SnapshotPush> {
@@ -468,6 +471,39 @@ impl UsageSink for HttpStore {
         report.validate(events.len())?;
         Ok(report)
     }
+}
+
+/// Resolve a complete, successful snapshot body.
+///
+/// A body that states a generation and yet is no snapshot this instance can
+/// enforce is the control plane's answer, not a failure to get one: typically a
+/// newer server publishing a value this build does not know. Reporting it as an
+/// error would keep the older snapshot serving, whatever the newer one says, so
+/// it resolves as unreadable (INVARIANTS.md GL-22). A body without a readable
+/// generation answers nothing and is an error.
+fn decode_snapshot(principal: Principal, body: &[u8]) -> Result<SnapshotResolution, StoreError> {
+    #[derive(serde::Deserialize)]
+    struct Stamped {
+        generation: Generation,
+    }
+
+    let failure = match serde_json::from_slice::<AccountSnapshot>(body) {
+        Ok(snapshot) => match PublishableSnapshot::try_new(Arc::new(snapshot)) {
+            Ok(snapshot) => return Ok(SnapshotResolution::Present(snapshot)),
+            Err(error) => format!("invalid snapshot from server: {error}"),
+        },
+        Err(error) => format!("snapshot decode: {error}"),
+    };
+    let Ok(Stamped { generation }) = serde_json::from_slice(body) else {
+        return Err(StoreError(failure));
+    };
+    tracing::error!(
+        %principal,
+        generation = generation.0,
+        error = %failure,
+        "served snapshot does not decode; the principal is withdrawn"
+    );
+    Ok(SnapshotResolution::Unreadable { generation })
 }
 
 // Successful partial responses must never become a whole snapshot or catalogue.

@@ -668,6 +668,7 @@ async fn fetch_snapshot<S: Backend>(
         SnapshotResolution::Present(snapshot) => Ok(Json(snapshot.into_inner())),
         SnapshotResolution::Revoked { generation } => Err(ApiError::revoked(generation)),
         SnapshotResolution::Unknown => Err(ApiError::not_found("unknown-principal", "no snapshot")),
+        SnapshotResolution::Unreadable { generation } => Err(ApiError::unreadable(generation)),
     }
 }
 

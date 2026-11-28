@@ -29,6 +29,7 @@ snapshot counters under `snapshots` in `/metrics`:
 | `history_evictions` | Histories reclaimed under capacity pressure; visible entries also removed |
 | `refused_observations` | Fetched budget observations older than the one held |
 | `publication_failures` | Reservation or publication refused by a retention/fence check |
+| `unreadable_snapshots` | Pulls and pushes saying a stored snapshot does not decode |
 | `unresolved` | Principals unresolved at the last resolution pass |
 
 An ordinary refresh of an already installed positive at the same generation is
@@ -44,6 +45,51 @@ Use these fields to identify a delayed publisher or lagging source replica.
 Recover the source's authoritative generation; do not clear tombstones or lower
 watermarks to make a replay pass. The aggregate counter supports alerting even
 when event collection is disabled, and carries no per-principal metric labels.
+
+## Unreadable snapshots
+
+A stored snapshot can fail to decode: a row damaged or hand-edited, one written
+before a limit it now violates, or a value published by a newer binary than the
+one reading it. Nothing can say what such a row authorizes, so every instance
+that learns of it withdraws the principal. Requests deny as `unknown_principal`
+with zero charge, under `Elastic` too, whatever the held snapshot allowed.
+Sibling principals and other accounts are unaffected. A source that fails to
+answer is different: the held snapshot keeps serving until its `valid_until`.
+
+| Where | Signal |
+| --- | --- |
+| PostgreSQL store, on a pull | error `stored snapshot does not decode; instances withdraw the principal`, with `principal`, `generation` and the decode error |
+| PostgreSQL store, on a status or class change | warning `restamped snapshot does not decode; instances withdraw the principal`, and `unreadable` in the response |
+| HTTP instance, when the served body is what does not decode | error `served snapshot does not decode; the principal is withdrawn` |
+| Instance | warning `stored snapshot does not decode; publish a valid one above this generation`; counter `unreadable_snapshots` |
+| Control plane HTTP | `404 unknown-principal` carrying `generation` |
+
+Alert on any rise of `unreadable_snapshots`. Readiness does not report it: the
+withdrawn principal counts as resolved, like an unknown one, so one bad row
+cannot make a healthy instance unready. A catalogue that is unreadable as a
+whole therefore leaves a ready instance denying everyone.
+
+To repair it, publish a valid snapshot for the principal at a generation above
+the reported one, through the operator publication route or by letting the
+control plane allocate the generation for a key. Publication overwrites the
+stored row without reading it. The status and capacity class must match the
+account ledger. Instances over a direct store receive the push at once; over
+HTTP they pull it when the withdrawal's `unknown_ttl` elapses, since the refresh
+sweep skips withdrawn principals. Revoking the principal is the other exit. Do not lower the generation:
+instances refuse anything older than the one reported. If the cause is version
+skew, upgrading the reader recovers it at the same generation.
+
+Rolling upgrades:
+
+- Upgrade the control plane first. An older one answers an undecodable row with
+  a storage error, so instances keep the snapshot they hold until `valid_until`.
+- An older instance reads the new control plane's answer as an unknown
+  principal. It withdraws and recovers the same way, without the counter or the
+  generation floor.
+- Upgrade every instance before publishing a value an older build cannot
+  decode. A new instance withdraws such a principal; an older HTTP instance
+  treats the body as a failed fetch and keeps serving the previous snapshot
+  until `valid_until`.
 
 ## Budget observations
 

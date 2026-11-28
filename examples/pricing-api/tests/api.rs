@@ -861,6 +861,7 @@ async fn metrics_report_refill_and_snapshot_health() {
     assert_eq!(snapshots["history_evictions"], 0);
     assert_eq!(snapshots["refused_observations"], 0);
     assert_eq!(snapshots["publication_failures"], 0);
+    assert_eq!(snapshots["unreadable_snapshots"], 0);
     assert_eq!(
         snapshots["unresolved"], 0,
         "readiness is true, so nothing may be unresolved — the gauge and the \

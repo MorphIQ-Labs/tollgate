@@ -1897,3 +1897,37 @@ async fn deposit_overflow_is_a_permanent_client_error() {
         assert_eq!(store.conservation(AccountId(1)).unwrap(), before);
     }
 }
+
+/// The answer for a snapshot that does not decode is the shape an instance
+/// predating it already withdraws on, `404 unknown-principal`, plus the
+/// generation a current one orders it by (INVARIANTS.md GL-22). A `503` would
+/// leave both serving what they hold.
+#[tokio::test]
+async fn an_unreadable_snapshot_is_an_unknown_principal_carrying_its_generation() {
+    use tollgate_store::SnapshotResolution;
+    let store =
+        delegating::DelegatingStore::wrapping(MemoryStore::new(GrantPolicy::default()).unwrap())
+            .on_snapshot(|_, _| async {
+                Ok(SnapshotResolution::Unreadable {
+                    generation: tollgate_core::Generation(7),
+                })
+            });
+    let app = router(ServerState {
+        security: common::security(),
+        issuer: None,
+        store: Arc::new(store),
+        clock: Arc::new(ManualClock::new(t(0))),
+    });
+
+    let (status, problem) = call(
+        &app,
+        "GET",
+        &api(&format!("/snapshots/{}", Principal(42))),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(problem["code"], "unknown-principal");
+    assert_eq!(problem["generation"], 7);
+    assert_eq!(problem["title"], "stored snapshot does not decode");
+}

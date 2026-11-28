@@ -114,6 +114,21 @@ pub fn accept_revoked(
     }
 }
 
+/// Decide whether a stored snapshot that does not decode may withdraw the
+/// visible state.
+///
+/// It names a live generation, so it is ordered as a positive nothing is
+/// holding: refused when strictly older, or at a revocation's own generation,
+/// and accepted at the generation already installed, which is no longer to be
+/// served. The watermark it leaves refuses anything older and admits the same
+/// generation once it reads.
+pub fn accept_unreadable(
+    current: Option<Watermark>,
+    incoming: Generation,
+) -> (Option<Watermark>, bool) {
+    accept_positive(current, incoming, false)
+}
+
 /// Decide whether an absent row may replace the visible state.
 ///
 /// Always accepted — an absence denies locally — and it **never touches the
@@ -172,6 +187,26 @@ mod tests {
         assert_eq!(after, current);
     }
 
+    /// The transition that carries a status change past a row that does not
+    /// decode: what was held at an older generation is dead from here on, and
+    /// the stored generation itself is not (INVARIANTS.md GL-22).
+    #[test]
+    fn an_unreadable_row_outranks_older_snapshots_and_not_itself() {
+        let held = Some(Watermark::Positive(Generation(5)));
+        let (after, accepted) = accept_unreadable(held, Generation(6));
+        assert!(accepted);
+        assert_eq!(after, Some(Watermark::Positive(Generation(6))));
+        assert!(!accept_positive(after, Generation(5), false).1);
+        assert!(accept_positive(after, Generation(6), false).1);
+
+        assert_eq!(accept_unreadable(held, Generation(5)), (held, true));
+        assert_eq!(accept_unreadable(held, Generation(4)), (held, false));
+
+        let revoked = Some(Watermark::Revoked(Generation(5)));
+        assert_eq!(accept_unreadable(revoked, Generation(5)), (revoked, false));
+        assert!(accept_unreadable(revoked, Generation(6)).1);
+    }
+
     proptest! {
         #[test]
         fn accepted_transitions_never_lower_the_watermark(
@@ -188,9 +223,11 @@ mod tests {
             let (positive, _) = accept_positive(current, Generation(incoming), visible);
             let (revoked, _) = accept_revoked(current, Generation(incoming));
             let (unknown, _) = accept_unknown(current);
+            let (unreadable, _) = accept_unreadable(current, Generation(incoming));
             let floor = current.map(Watermark::generation);
             prop_assert!(positive.map(Watermark::generation) >= floor);
             prop_assert!(revoked.map(Watermark::generation) >= floor);
+            prop_assert!(unreadable.map(Watermark::generation) >= floor);
             prop_assert_eq!(unknown, current);
         }
 

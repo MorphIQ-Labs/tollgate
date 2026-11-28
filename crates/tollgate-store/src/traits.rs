@@ -701,6 +701,24 @@ pub enum SnapshotResolution {
     },
     /// The source has never observed this principal.
     Unknown,
+    /// The source holds a live snapshot for this principal at this generation
+    /// and cannot decode or validate it, so what it authorizes is unknown.
+    ///
+    /// An instance withdraws the principal: the change that wrote the stored
+    /// snapshot may have been a suspension, so nothing held at or below this
+    /// generation can be assumed current (INVARIANTS.md 22). It is not a
+    /// revocation. The generation is live, so a strictly older snapshot is
+    /// refused while the same generation is accepted once it reads, as is any
+    /// newer one.
+    ///
+    /// Distinct from a [`StoreError`], which says the source did not answer and
+    /// leaves the held snapshot serving. A source answering this reports why,
+    /// since nothing downstream can. A source that holds validated snapshots,
+    /// as `MemoryStore` does, never answers it.
+    Unreadable {
+        /// The generation of the stored snapshot that cannot be read.
+        generation: Generation,
+    },
 }
 
 /// Slots in a backend's snapshot push channel.
@@ -836,17 +854,16 @@ pub struct StatusChange {
     /// Excludes tombstones, which are never republished, and snapshots already
     /// carrying the target status, which are not rewritten.
     pub republished: usize,
-    /// Rows that changed durably but could not be decoded well enough to push.
+    /// Rows that changed durably but could not be decoded.
     ///
     /// Always zero in `MemoryStore`, which holds validated snapshots rather
     /// than encoded ones. In a stored backend a row can be undecodable — it
     /// already was before the transition touched it — and the transition
-    /// deliberately does not fail whole over one corrupt credential. But it is
-    /// not silently absorbed either: those principals got no push and no pull
-    /// can read them, so the change does not reach them by itself. An instance
-    /// still holding an earlier snapshot of one keeps admitting on it until
-    /// that snapshot's `valid_until`, counting each failed refresh. Publishing
-    /// a valid snapshot above the new generation repairs the row.
+    /// deliberately does not fail whole over one corrupt credential. It is not
+    /// silently absorbed either: those principals are pushed, and answered to
+    /// pulls, as [`SnapshotResolution::Unreadable`], which withdraws them from
+    /// instances. They stay denied, whatever the new value permits, until a
+    /// valid snapshot is published above the new generation.
     pub unreadable: usize,
 }
 

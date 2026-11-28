@@ -21,8 +21,8 @@ use tollgate_client::{
 };
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, CapacityClass, CostTable, CostUnits, DenyReason,
-    DiscardedUsage, FencingToken, Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding,
-    OpIndex, PermissionBits, Principal, PublishableSnapshot, ResolvedLimits,
+    DiscardedUsage, EnforcementMode, FencingToken, Generation, LeaseGrant, LeaseId, LocalLease,
+    LocalSharding, OpIndex, PermissionBits, Principal, PublishableSnapshot, ResolvedLimits,
 };
 #[path = "../../tollgate-store/tests/support/delegating.rs"]
 mod delegating;
@@ -422,25 +422,24 @@ async fn a_status_change_reaches_every_instance_through_refresh() {
     }
 }
 
-/// The bound on a status change one principal's pull cannot read — a stored row
-/// that changed but does not decode (`StatusChange::unreadable`). The instance
+/// The bound on a status change while one principal's pull fails: the instance
 /// keeps admitting it on the snapshot it holds, reported as a refresh failure,
-/// until that snapshot's `valid_until`; its readable sibling converges at the
-/// next refresh, and so does it once the row reads again (INVARIANTS.md GL-22).
+/// until that snapshot's `valid_until`; its sibling converges at the next
+/// refresh, and so does it once the source answers (INVARIANTS.md GL-22).
 #[tokio::test(start_paused = true)]
-async fn an_unreadable_principal_keeps_its_snapshot_until_expiry_or_repair() {
+async fn a_failed_pull_keeps_the_held_snapshot_until_it_expires() {
     let store = two_account_store();
-    let unreadable = Arc::new(AtomicBool::new(false));
+    let failing = Arc::new(AtomicBool::new(false));
     let source = {
-        let unreadable = Arc::clone(&unreadable);
+        let failing = Arc::clone(&failing);
         Arc::new(
             DelegatingStore::wrapping(Arc::clone(&store))
                 .on_subscribe(|_| no_pushes())
                 .on_snapshot(move |inner, principal| {
-                    let fails = principal == PRINCIPAL && unreadable.load(Ordering::Acquire);
+                    let fails = principal == PRINCIPAL && failing.load(Ordering::Acquire);
                     async move {
                         if fails {
-                            return Err(StoreError("invalid stored snapshot".into()));
+                            return Err(StoreError("source unreachable".into()));
                         }
                         SnapshotSource::snapshot(&*inner, principal).await
                     }
@@ -463,7 +462,7 @@ async fn an_unreadable_principal_keeps_its_snapshot_until_expiry_or_repair() {
             .map(drop)
     };
 
-    unreadable.store(true, Ordering::Release);
+    failing.store(true, Ordering::Release);
     AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
         .await
         .unwrap();
@@ -479,11 +478,271 @@ async fn an_unreadable_principal_keeps_its_snapshot_until_expiry_or_repair() {
         Err(DenyReason::SnapshotExpired),
         "and never past its validity"
     );
-    assert!(fixture.manager.counters().snapshot().refresh_failures > 0);
+    let stats = fixture.manager.counters().snapshot();
+    assert!(stats.refresh_failures > 0);
+    assert_eq!(stats.unreadable_snapshots, 0);
 
-    unreadable.store(false, Ordering::Release);
+    failing.store(false, Ordering::Release);
     settle().await;
     assert_eq!(admit_at(PRINCIPAL, t(1)), Err(DenyReason::AccountSuspended));
+    fixture.manager.shutdown().await;
+}
+
+/// A source over `store` that, while `unreadable` is set, answers [`PRINCIPAL`]
+/// as a stored backend answers a row it cannot decode: unreadable, at the
+/// generation the row carries. It sends no pushes.
+fn damaged_source(
+    store: &Arc<MemoryStore>,
+    unreadable: &Arc<AtomicBool>,
+) -> Arc<DelegatingStore<MemoryStore>> {
+    let unreadable = Arc::clone(unreadable);
+    Arc::new(
+        DelegatingStore::wrapping(Arc::clone(store))
+            .on_subscribe(|_| no_pushes())
+            .on_snapshot(move |inner, principal| {
+                let damaged = principal == PRINCIPAL && unreadable.load(Ordering::Acquire);
+                async move {
+                    let stored = SnapshotSource::snapshot(&*inner, principal).await?;
+                    Ok(match stored {
+                        SnapshotResolution::Present(snapshot) if damaged => {
+                            SnapshotResolution::Unreadable {
+                                generation: snapshot.generation,
+                            }
+                        }
+                        other => other,
+                    })
+                }
+            }),
+    )
+}
+
+/// A status change that restamps a row no instance can read still reaches every
+/// instance: each withdraws that principal at its next refresh, an elastic one
+/// included, while its sibling converges and another account is untouched. A
+/// valid publication above the row's generation restores service when the
+/// withdrawal's `unknown_ttl` elapses (INVARIANTS.md GL-22).
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_principal_is_withdrawn_from_every_instance_until_repaired() {
+    let store = two_account_store();
+    // Elastic, the one mode that admits past a funding refusal: a withdrawal is
+    // not one.
+    let mut elastic = AccountSnapshot::clone(&snapshot(2, PermissionBits::bit(0)));
+    elastic.enforcement_mode = EnforcementMode::Elastic {
+        overage_cap: CostUnits(1_000_000),
+    };
+    store
+        .publish_snapshot(PRINCIPAL, publishable(Arc::new(elastic)))
+        .expect("snapshot fixture matches its account and credential");
+    let unreadable = Arc::new(AtomicBool::new(false));
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let instances = [(), ()].map(|()| {
+        let fixture = spawn_clocked(
+            damaged_source(&store, &unreadable),
+            &clock,
+            SnapshotManagerConfig {
+                principals: TrackedPrincipals::Fixed(vec![
+                    PRINCIPAL,
+                    LATER_PRINCIPAL,
+                    OTHER_PRINCIPAL,
+                ]),
+                ..discovering_config(20)
+            },
+        );
+        stock_slot(&fixture);
+        stock(&fixture, OTHER_ACCOUNT, LeaseId(2));
+        fixture
+    });
+    settle().await;
+    for instance in &instances {
+        assert_eq!(admit(instance), Ok(()));
+    }
+
+    unreadable.store(true, Ordering::Release);
+    AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
+        .await
+        .unwrap();
+    settle().await;
+    for instance in &instances {
+        assert_eq!(admit(instance), Err(DenyReason::UnknownPrincipal));
+        assert_eq!(
+            admit_as(instance, LATER_PRINCIPAL),
+            Err(DenyReason::AccountSuspended)
+        );
+        assert_eq!(admit_as(instance, OTHER_PRINCIPAL), Ok(()));
+        assert!(
+            *instance.manager.ready().borrow(),
+            "one unreadable row withdraws its principal, not the instance"
+        );
+        let stats = instance.manager.counters().snapshot();
+        assert!(stats.unreadable_snapshots > 0);
+        assert_eq!((stats.refresh_failures, stats.refused_updates), (0, 0));
+    }
+
+    // Repair: the suspension replaced the row at generation 3, so 4 clears it.
+    let mut repaired = AccountSnapshot::clone(&snapshot(4, PermissionBits::bit(0)));
+    repaired.status = AccountStatus::Suspended;
+    store
+        .publish_snapshot(PRINCIPAL, publishable(Arc::new(repaired)))
+        .expect("the repair carries the ledger's status");
+    unreadable.store(false, Ordering::Release);
+    settle().await;
+    for instance in &instances {
+        assert_eq!(
+            admit(instance),
+            Err(DenyReason::UnknownPrincipal),
+            "the sweep skips a withdrawn principal until its TTL"
+        );
+    }
+    clock.set(t(30));
+    settle().await;
+    for instance in &instances {
+        assert_eq!(admit(instance), Err(DenyReason::AccountSuspended));
+    }
+    AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Active)
+        .await
+        .unwrap();
+    settle().await;
+    for instance in instances {
+        assert_eq!(admit(&instance), Ok(()));
+        instance.manager.shutdown().await;
+    }
+}
+
+fn present(generation: u64) -> SnapshotResolution {
+    SnapshotResolution::Present(publishable(snapshot(generation, PermissionBits::bit(0))))
+}
+
+fn unreadable(generation: u64) -> SnapshotResolution {
+    SnapshotResolution::Unreadable {
+        generation: Generation(generation),
+    }
+}
+
+/// A pushed unreadable answer withdraws at once and is ordered by its
+/// generation: older snapshots stay refused, the same generation is accepted
+/// once it reads, an older answer withdraws nothing, and a tombstone is never
+/// weakened by one (INVARIANTS.md GL-15, GL-22).
+#[tokio::test(start_paused = true)]
+async fn a_pushed_unreadable_answer_orders_snapshots_without_being_dead() {
+    let (source, pulls) = DrivenPushSource::new(present(5));
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let fixture = spawn_clocked(pulls, &clock, push_only_config());
+    stock_slot(&fixture);
+    settle().await;
+    assert_eq!(admit(&fixture), Ok(()));
+    let refused = || fixture.manager.counters().snapshot().refused_updates;
+    let push = async |resolution| {
+        source.send(PRINCIPAL, resolution);
+        settle().await;
+    };
+
+    push(unreadable(4)).await;
+    assert_eq!(admit(&fixture), Ok(()), "an older answer withdraws nothing");
+    assert_eq!(refused(), 1);
+
+    push(unreadable(6)).await;
+    assert_eq!(admit(&fixture), Err(DenyReason::UnknownPrincipal));
+    push(present(5)).await;
+    assert_eq!(admit(&fixture), Err(DenyReason::UnknownPrincipal));
+    assert_eq!(refused(), 2, "the pre-change snapshot stays dead");
+
+    // The same generation, once this reader can decode it.
+    push(present(6)).await;
+    assert_eq!(admit(&fixture), Ok(()));
+    push(unreadable(6)).await;
+    assert_eq!(
+        admit(&fixture),
+        Err(DenyReason::UnknownPrincipal),
+        "the generation being served withdraws too"
+    );
+
+    push(SnapshotResolution::Revoked {
+        generation: Generation(7),
+    })
+    .await;
+    push(unreadable(7)).await;
+    assert_eq!(refused(), 3);
+    push(present(7)).await;
+    assert_eq!(
+        refused(),
+        4,
+        "the tombstone still refuses its own generation"
+    );
+    assert_eq!(admit(&fixture), Err(DenyReason::UnknownPrincipal));
+    assert_eq!(
+        fixture.manager.counters().snapshot().unreadable_snapshots,
+        4
+    );
+    fixture.manager.shutdown().await;
+}
+
+/// A pushed withdrawal is rechecked on `unknown_ttl`, not the tombstone's.
+#[tokio::test(start_paused = true)]
+async fn a_pushed_withdrawal_is_rechecked_after_the_unknown_ttl() {
+    let (source, pulls) = DrivenPushSource::new(present(1));
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let fixture = spawn_clocked(pulls, &clock, push_only_config());
+    stock_slot(&fixture);
+    settle().await;
+    source.set_pull(present(2));
+    source.send(PRINCIPAL, unreadable(2));
+    settle().await;
+    clock.set(t(29));
+    // Any push wakes the loop; this one changes nothing.
+    source.send(PRINCIPAL, unreadable(1));
+    settle().await;
+    assert_eq!(admit(&fixture), Err(DenyReason::UnknownPrincipal));
+    clock.set(t(30));
+    source.send(PRINCIPAL, unreadable(1));
+    settle().await;
+    assert_eq!(admit(&fixture), Ok(()));
+    fixture.manager.shutdown().await;
+}
+
+/// A pulled unreadable answer older than the snapshot held, as a lagging
+/// replica gives, withdraws nothing.
+#[tokio::test(start_paused = true)]
+async fn an_older_pulled_unreadable_answer_withdraws_nothing() {
+    let (source, pulls) = DrivenPushSource::new(present(5));
+    let fixture = spawn_with(pulls, discovering_config(20));
+    stock_slot(&fixture);
+    settle().await;
+    source.set_pull(unreadable(4));
+    settle().await;
+    assert_eq!(admit(&fixture), Ok(()));
+    let stats = fixture.manager.counters().snapshot();
+    assert!(stats.unreadable_snapshots > 0);
+    assert!(stats.refused_updates > 0);
+    fixture.manager.shutdown().await;
+}
+
+/// One row unreadable from the start does not hold the instance in its initial
+/// load: readiness arrives and the other principals keep converging.
+#[tokio::test(start_paused = true)]
+async fn a_row_unreadable_from_the_start_does_not_hold_the_initial_load() {
+    let store = two_account_store();
+    let damaged = Arc::new(AtomicBool::new(true));
+    let fixture = spawn_with(
+        damaged_source(&store, &damaged),
+        SnapshotManagerConfig {
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL, LATER_PRINCIPAL]),
+            ..discovering_config(20)
+        },
+    );
+    stock_slot(&fixture);
+    settle().await;
+    assert!(*fixture.manager.ready().borrow());
+    assert_eq!(admit(&fixture), Err(DenyReason::UnknownPrincipal));
+    assert_eq!(admit_as(&fixture, LATER_PRINCIPAL), Ok(()));
+
+    AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
+        .await
+        .unwrap();
+    settle().await;
+    assert_eq!(
+        admit_as(&fixture, LATER_PRINCIPAL),
+        Err(DenyReason::AccountSuspended)
+    );
     fixture.manager.shutdown().await;
 }
 
@@ -1657,17 +1916,19 @@ async fn an_abandoned_fetch_is_throttled_like_a_refusal() {
 }
 
 fn spawn_with(source: Arc<dyn SnapshotSource>, config: SnapshotManagerConfig) -> Fixture {
+    spawn_clocked(source, &Arc::new(ManualClock::new(t(0))), config)
+}
+
+fn spawn_clocked(
+    source: Arc<dyn SnapshotSource>,
+    clock: &Arc<ManualClock>,
+    config: SnapshotManagerConfig,
+) -> Fixture {
     let map = Arc::new(ArcSwapSnapshotMap::new());
     let engine = AdmissionEngine::new(Arc::clone(&map));
     let slots = SlotRegistry::new();
-    let manager = SnapshotManager::spawn(
-        source,
-        map,
-        Arc::clone(&slots),
-        Arc::new(ManualClock::new(t(0))),
-        config,
-    )
-    .unwrap();
+    let manager =
+        SnapshotManager::spawn(source, map, Arc::clone(&slots), clock.clone(), config).unwrap();
     Fixture {
         engine,
         slots,

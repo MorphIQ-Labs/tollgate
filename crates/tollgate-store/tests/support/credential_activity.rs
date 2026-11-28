@@ -349,6 +349,7 @@ fn generation_of(resolution: tollgate_store::SnapshotResolution) -> Option<(u64,
         SnapshotResolution::Present(snapshot) => Some((snapshot.generation.0, false)),
         SnapshotResolution::Revoked { generation } => Some((generation.0, true)),
         SnapshotResolution::Unknown => None,
+        SnapshotResolution::Unreadable { .. } => panic!("a row the store wrote must read"),
     }
 }
 

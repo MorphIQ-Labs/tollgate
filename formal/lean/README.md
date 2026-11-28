@@ -24,6 +24,10 @@ This Lean package contains exact models for critical contracts:
   principal after eviction. It also proves the converse the distinction exists
   for: a principal whose row went absent is admitted again at the generation it
   already had, while a duplicate publish of a visible snapshot stays a no-op.
+  For a stored snapshot that does not decode it proves that the answer
+  withdraws what was visible at or below its generation, is refused when older
+  or at a revocation's generation, leaves an older replay dead, and admits that
+  generation or a newer one once it reads.
 - `ConcurrencyGauge` models principal-then-account acquisition, rollback when
   the account is full, exact ceiling preservation, and single release. Rust's
   ownership transition from `Pending` through `ReadyToStart` into `Committed`

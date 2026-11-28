@@ -1049,6 +1049,8 @@ pub struct Snapshots {
     pub refused_observations: u64,
     /// Publications refused by history retention or a superseded source read.
     pub publication_failures: u64,
+    /// Answers saying a stored snapshot does not decode.
+    pub unreadable_snapshots: u64,
     /// Principals unresolved at the last pass. Readiness also applies the
     /// configured Fixed/All rule and requires the background task to be alive.
     pub unresolved: u64,
@@ -1189,6 +1191,7 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Json<Metrics> {
                 history_evictions: stats.history_evictions,
                 refused_observations: stats.refused_observations,
                 publication_failures: stats.publication_failures,
+                unreadable_snapshots: stats.unreadable_snapshots,
                 unresolved: stats.unresolved,
             }
         }),

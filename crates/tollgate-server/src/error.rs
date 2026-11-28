@@ -36,7 +36,9 @@ pub struct ApiError {
     /// A short public description. Not a contract; classify by `status` and
     /// `code`.
     pub title: String,
-    /// The tombstone's generation on a `revoked-principal` refusal.
+    /// The stored generation: the tombstone's on a `revoked-principal`
+    /// refusal, and the undecodable snapshot's on an `unknown-principal` one
+    /// that carries it.
     pub generation: Option<Generation>,
     /// The allocator's evidence on a `balance-exhausted` refusal.
     pub balance_exhaustion: Option<tollgate_core::BalanceExhaustion>,
@@ -170,6 +172,18 @@ impl ApiError {
             generation: Some(generation),
             balance_exhaustion: None,
             balance_shortfall: None,
+        }
+    }
+
+    /// `404 unknown-principal` with a `generation`: a live snapshot is stored
+    /// and does not decode. A client that reads the generation withdraws the
+    /// principal as unreadable; one that predates it sees an unknown principal,
+    /// which also withdraws. A 5xx would leave both serving what they hold
+    /// (INVARIANTS.md 22).
+    pub fn unreadable(generation: Generation) -> Self {
+        ApiError {
+            generation: Some(generation),
+            ..Self::not_found("unknown-principal", "stored snapshot does not decode")
         }
     }
 

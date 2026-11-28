@@ -359,7 +359,9 @@ pub struct Problem {
     pub code: String,
     /// Human-readable summary. Never carries backend error text (INVARIANTS.md 37).
     pub title: String,
-    /// Optional extension used by versioned tombstone responses.
+    /// The stored generation of a versioned snapshot answer: a tombstone's on
+    /// `revoked-principal`, and on `unknown-principal` that of a live snapshot
+    /// which does not decode. An `unknown-principal` without it is an absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<Generation>,
     /// Authoritative exhaustion, present only on a confirmed allocator refusal.
