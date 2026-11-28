@@ -44,7 +44,7 @@ use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{AssertSqlSafe, PgPool, Postgres, Row, Transaction};
 use tokio::sync::broadcast;
 
 use tollgate_core::{
@@ -1101,7 +1101,8 @@ const ROLLOVER_QUEUE_BUDGET: Duration = Duration::from_secs(3);
 /// ends with it, nothing is left on the pooled connection, and there is no
 /// client-side `BEGIN` for a cancelled call to abandon. Such a message cannot
 /// bind parameters, so the values are written in; each is a number, hex, or one
-/// of [`Period`]'s fixed names.
+/// of [`Period`]'s fixed names. The parameter types admit nothing else, which is
+/// what justifies the [`AssertSqlSafe`] at the one call.
 ///
 /// Autocommitted, it holds no other row lock while it waits and cannot be part
 /// of a deadlock. The boundary test is re-applied to the row it eventually
@@ -3290,7 +3291,11 @@ impl AdminStore for PostgresStore {
                 let statement = queued_crossing_sql(*period, boundary_us, id_from(&account), wait);
                 // Every result is read, so success is reported only after the
                 // implicit transaction has committed.
-                match sqlx::raw_sql(&statement).fetch_all(&self.pool).await {
+                // Safe to send as text: see `queued_crossing_sql`.
+                match sqlx::raw_sql(AssertSqlSafe(statement))
+                    .fetch_all(&self.pool)
+                    .await
+                {
                     // No row: another pass crossed it while this one waited.
                     Ok(rows) => {
                         for row in &rows {

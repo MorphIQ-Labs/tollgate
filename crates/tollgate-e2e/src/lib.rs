@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use jiff::{SignedDuration, Timestamp};
 use reqwest::{Method, StatusCode};
-use sqlx::{Connection, PgConnection};
+use sqlx::{AssertSqlSafe, Connection, PgConnection};
 use tollgate_core::{
     AccountId, AccountSnapshot, AccountStatus, BudgetSchedule, CapacityClass, CostTable, CostUnits,
     EnforcementMode, Generation, KeyId, OpIndex, Period, PermissionBits, ResolvedLimits,
@@ -223,17 +223,19 @@ async fn age_period(
         .await?;
     // No lease can be granted now, so these are all that will settle against
     // the new period.
-    sqlx::query(&format!(
+    // A column expression cannot be a bind parameter. The only text written
+    // into these two statements is the constant above.
+    sqlx::query(AssertSqlSafe(format!(
         "UPDATE tollgate_leases SET period_start_us = {PREVIOUS_MONTH} \
          WHERE account_id = $1 AND state = 0 AND period_start_us > 0"
-    ))
+    )))
     .bind(account)
     .execute(&mut *transaction)
     .await?;
-    let aged = sqlx::query(&format!(
+    let aged = sqlx::query(AssertSqlSafe(format!(
         "UPDATE tollgate_accounts SET period_start_us = {PREVIOUS_MONTH} \
          WHERE account_id = $1 AND period_start_us = $2"
-    ))
+    )))
     .bind(account)
     .bind(current)
     .execute(&mut *transaction)
@@ -275,7 +277,9 @@ impl Database {
         let mut admin = PgConnection::connect(admin_url)
             .await
             .unwrap_or_else(|_| panic!("cannot connect to TOLLGATE_PG_URL"));
-        sqlx::raw_sql(&format!("CREATE DATABASE {name}"))
+        // A database name cannot be a bind parameter; this one is a fixed
+        // prefix and numbers.
+        sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE {name}")))
             .execute(&mut admin)
             .await
             .unwrap_or_else(|_| panic!("cannot create a scenario database"));
@@ -332,7 +336,11 @@ impl Drop for Database {
                 .ok()?;
             runtime.block_on(async {
                 let mut admin = PgConnection::connect(&admin_url).await.ok()?;
-                sqlx::raw_sql(&statement).execute(&mut admin).await.ok()
+                // Built above from the harness's own database name.
+                sqlx::raw_sql(AssertSqlSafe(statement))
+                    .execute(&mut admin)
+                    .await
+                    .ok()
             })
         })
         .join();

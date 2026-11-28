@@ -1325,6 +1325,21 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     covers those waits only: the sweep's other store calls, reclaim's account
     lock among them, carry no timeout of their own.
 
+    Dropping a `PostgresStore` call, at a caller's timeout or because a server
+    handler's client left, leaves no pooled connection inside a transaction: a
+    later write that reports success on it is committed, and its next
+    transaction starts as the outermost one. What the dropped call did is
+    unknown to its caller; a commit PostgreSQL received stands. The store begins
+    a transaction only through the driver's guard, and the driver owns the
+    cancelled `BEGIN`: the workspace requires sqlx 0.9.1 or later, because
+    earlier releases return that connection with its transaction open (GH-101).
+    A queued rollover crossing instead travels in one message, whose implicit
+    transaction PostgreSQL ends itself (28). Witnesses (PostgreSQL):
+    `a_call_cancelled_during_begin_leaves_no_open_transaction`,
+    `a_call_cancelled_inside_its_transaction_is_rolled_back`,
+    `a_call_cancelled_during_commit_commits_and_leaves_no_open_transaction`, and
+    `a_cancelled_queued_crossing_leaves_no_open_transaction`.
+
     `PeriodRoller` bounds each administrative rollover call and the entire
     multi-batch pass, including yields between batches. Each pass freezes one
     business-time cutoff; the next pass starts after a configured pause, so a

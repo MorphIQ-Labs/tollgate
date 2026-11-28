@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/tollgate-core.svg)](https://crates.io/crates/tollgate-core)
 [![docs.rs](https://img.shields.io/docsrs/tollgate-core)](https://docs.rs/tollgate-core)
 [![CI](https://github.com/MorphIQ-Labs/tollgate/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MorphIQ-Labs/tollgate/actions/workflows/ci.yml)
-[![MSRV 1.89](https://img.shields.io/badge/MSRV-1.89-blue.svg)](#status)
+[![MSRV 1.94](https://img.shields.io/badge/MSRV-1.94-blue.svg)](#status)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 **Quota admission and usage accounting for latency-critical services, with no
@@ -286,7 +286,7 @@ and the API reference is on [docs.rs](https://docs.rs/tollgate-core).
 
 Tollgate is pre-1.0. A breaking change moves the minor version, so a caret
 requirement (`"0.30"`) never crosses one; the [changelog](CHANGELOG.md) marks
-every break. The minimum supported Rust version is 1.89, and CI checks it on
+every break. The minimum supported Rust version is 1.94, and CI checks it on
 every pull request.
 
 ## Contributing
