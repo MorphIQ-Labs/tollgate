@@ -1434,6 +1434,44 @@ mod tests {
     use std::collections::BTreeSet;
     use tollgate_store::{SnapshotResolution, SnapshotSource};
 
+    /// A refused balance read speaks the service's problem vocabulary, the
+    /// same as a refused price, not the adapter's.
+    #[tokio::test]
+    async fn a_refused_budget_read_uses_the_services_problem_codes() {
+        for (reason, status, code) in [
+            (
+                DenyReason::UnknownPrincipal,
+                StatusCode::UNAUTHORIZED,
+                "unknown-principal",
+            ),
+            (
+                DenyReason::AccountSuspended,
+                StatusCode::FORBIDDEN,
+                "forbidden",
+            ),
+            (
+                DenyReason::MissingPermission,
+                StatusCode::FORBIDDEN,
+                "forbidden",
+            ),
+            (
+                DenyReason::SnapshotExpired,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "policy-stale",
+            ),
+        ] {
+            let response = budget_rejection(&Rejection::Denied(reason)).into_response();
+            assert_eq!(response.status(), status, "{reason:?}");
+            let body = axum::body::to_bytes(response.into_body(), 4_096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["code"], code, "{reason:?}");
+            // The reason in words, as a refused price carries it.
+            assert_eq!(body["title"], reason.to_string(), "{reason:?}");
+        }
+    }
+
     #[test]
     fn fixture_readiness_requires_each_named_account_to_be_funded() {
         let report = |account, fundable| tollgate_client::AccountReport {
