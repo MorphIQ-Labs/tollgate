@@ -918,6 +918,45 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `a_failed_initial_load_is_retried_until_the_source_answers`, and
     `readiness_counts_overage_headroom_for_an_elastic_account`.
 
+    **Convergence is per principal.** A principal the source does not answer
+    for delays no other principal's refresh, push, discovery or revocation,
+    during the first load or after it, and never changes what readiness
+    requires. The initial load is one pass over the tracked set; periodic
+    refresh, discovery and push handling start when it ends, whatever it left
+    unanswered. An unanswered read, one that failed, timed out, panicked or
+    could not be published, leaves the refresh sweep and is retried beside the
+    manager's loop: after `retry_backoff` for a principal with nothing, after
+    `refresh_interval` for one holding a snapshot, which keeps it until its
+    `valid_until`. Negative rechecks run the same way. A push for such a
+    principal brings its retry forward, lag recovery brings every retry
+    forward, and a read that anything newer has overtaken is discarded.
+
+    Two delays remain, each bounded. A sweep publishes when its slowest read
+    ends, so the pass in which a principal first stops answering holds the
+    other changes in its batch for up to `fetch_timeout`. Retries and rechecks
+    run in batches of at most `max_concurrent_fetches`, one batch at a time and
+    longest overdue first, so a principal that is itself waiting for a retry
+    can wait `fetch_timeout` for each batch ahead of it. A principal the source
+    answers for never waits behind them. Enforcement: `Resolutions` owns both
+    schedules and removes a principal from the sweep while a retry is owed;
+    recording any resolution invalidates a read in flight beside the loop.
+    *Tests:* `one_unanswered_principal_does_not_hold_back_the_others`,
+    `pushes_are_applied_while_a_principal_is_unanswered`,
+    `discovery_proceeds_while_a_principal_is_unanswered`,
+    `a_held_principal_that_stops_answering_leaves_the_sweep`,
+    `a_hanging_recheck_does_not_hold_back_the_others`,
+    `retries_are_paced_by_whether_a_snapshot_is_held`,
+    `a_push_brings_an_unanswered_principals_retry_forward`,
+    `lag_recovery_retries_an_unanswered_principal_at_once`,
+    `a_push_overtakes_a_retry_of_a_held_principal`,
+    `a_push_overtakes_a_retry_of_an_unresolved_principal`,
+    `an_unanswered_read_is_scheduled_by_what_the_principal_holds`,
+    `a_batch_beside_the_loop_takes_the_longest_overdue_first`,
+    `an_overtaken_read_no_longer_counts`,
+    `lag_recovery_expedites_retries_and_discards_reads_in_flight`,
+    `untracked_and_negative_principals_owe_no_retry`, and
+    `a_delay_beyond_the_timers_range_is_never_immediately_due`.
+
 11. **Checked arithmetic only.** Cost and lease arithmetic never wraps; any
     overflow is an explicit error that denies (fail closed), never a wrap to a
     small charge. Stored ledger values follow the same rule in both
@@ -1567,8 +1606,9 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     grant and GL-9 already bounds them — so the bound on "requests stop" is one
     `SnapshotManager` refresh interval, not zero, for an instance whose pull
     succeeds. While a pull fails the instance keeps the snapshot it holds until
-    its `valid_until`, and the next successful pull applies the change. The
-    operation reports what it changed: how many snapshots it republished, and
+    its `valid_until`, and the next successful pull applies the change; GL-10
+    bounds when that pull is made and keeps it from delaying any other
+    principal's. The operation reports what it changed: how many snapshots it republished, and
     how many of those could not be decoded, so a partial result is surfaced
     rather than absorbed.
 

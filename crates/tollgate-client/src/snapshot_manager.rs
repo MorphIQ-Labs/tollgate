@@ -4,12 +4,18 @@
 //! The manager keeps an admission map stocked for a tracked set of
 //! principals from a [`SnapshotSource`]:
 //!
-//! - **Initial load** — every tracked principal is resolved (installed, or
-//!   negative-cached when the source confirms it unknown) before the
-//!   [`ready`](SnapshotManager::ready) watch becomes true, so readiness never
-//!   precedes admissibility (INVARIANTS.md GL-10). It returns to false when a
-//!   resolution expires or the manager exits. Source errors keep retrying;
-//!   readiness waits.
+//! - **Initial load** — one pass over every tracked principal. The
+//!   [`ready`](SnapshotManager::ready) watch becomes true once the resolutions
+//!   (installed, or negative-cached when the source confirms it unknown) meet
+//!   the configured rule, so readiness never precedes admissibility
+//!   (INVARIANTS.md GL-10). It returns to false when a resolution expires or
+//!   the manager exits. The pass does not wait for failures: refresh,
+//!   discovery and push handling start once it ends.
+//! - **Retries** — a principal whose fetch the source does not answer is
+//!   retried on its own schedule, beside the loop rather than inside it, and
+//!   the full refresh leaves it to that schedule until it is answered. One
+//!   failing or hanging principal therefore does not hold up the others
+//!   (INVARIANTS.md GL-10).
 //! - **Unreadable snapshots** — a source holding a snapshot that does not
 //!   decode says so at its generation, and the principal is withdrawn and
 //!   negative-cached like an unknown one, refusing anything older
@@ -18,7 +24,7 @@
 //!   generation monotonicity discards stale or reordered pushes). A lagged
 //!   subscription triggers a full refetch, so a burst of missed pushes can
 //!   only delay freshness, never lose it.
-//! - **Periodic refresh** — re-fetches every tracked principal, which is
+//! - **Periodic refresh** — re-fetches every answering principal, which is
 //!   also how *revocation* propagates: a principal the source no longer
 //!   knows is removed from the map and negative-cached. The revocation
 //!   window is therefore bounded by the refresh interval (plus snapshot
@@ -35,11 +41,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use jiff::SignedDuration;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tracing::Instrument as _;
 
 use tollgate_admission::{
-    PublicationError, PublishableSnapshotUpdate, RefreshBatch, Refreshed, SnapshotMap, Watermark,
-    accept_positive, accept_revoked, accept_unknown, accept_unreadable,
+    PublicationError, PublishableSnapshotUpdate, RefreshBatch, Refreshed, SnapshotMap,
+    SnapshotRefresh, Watermark, accept_positive, accept_revoked, accept_unknown, accept_unreadable,
 };
 use tollgate_core::{Generation, Locality, Principal};
 use tollgate_store::{Clock, SnapshotResolution, SnapshotSource, StoreError};
@@ -100,7 +107,9 @@ pub struct SnapshotManagerConfig {
     pub principals: TrackedPrincipals,
     /// Full refetch cadence — also the revocation propagation bound.
     ///
-    /// Each refresh re-fetches every tracked principal (and, with `All`,
+    /// Each refresh re-fetches every tracked principal that is not on a
+    /// schedule of its own: a negative, or one whose last fetch went
+    /// unanswered (and, with `All`,
     /// re-enumerates the catalogue), which is how a withdrawn principal is
     /// removed. Too long lets a revoked principal keep admitting for up to
     /// this long, bounded also by its snapshot's `valid_until`; too short
@@ -140,13 +149,16 @@ pub struct SnapshotManagerConfig {
     ///
     /// Must be positive.
     pub revoked_ttl: SignedDuration,
-    /// Backoff between initial-load retries while the source is down.
-    ///
-    /// Also the delay before a failed or timed-out fetch is retried. Too
-    /// short hammers a source that is already failing; too long delays
-    /// readiness after the source recovers. Must be positive.
+    /// Delay before a failed or timed-out fetch is retried, for a principal
+    /// with no snapshot: one never resolved, or a negative due for its
+    /// recheck. A principal that holds a snapshot is retried after
+    /// `refresh_interval` instead. Too short hammers a source that is already
+    /// failing; too long delays readiness after the source recovers. Must be
+    /// positive.
     pub retry_backoff: std::time::Duration,
-    /// Maximum snapshot fetches in flight during a full refresh.
+    /// Maximum snapshot fetches in flight during a full refresh, and
+    /// separately among retries and negative rechecks, which run beside it.
+    /// One instance can therefore have twice this many in flight.
     ///
     /// Too low makes a refresh of a large tracked set take many round trips,
     /// stretching it toward or past `refresh_interval`; too high bursts
@@ -711,6 +723,21 @@ struct Resolutions {
     /// deliberately *not* drained by time, because a past refetch time is the
     /// signal to retry now, not something to forget.
     refetch: BTreeSet<(jiff::Timestamp, Principal)>,
+    /// Principals whose last read went unanswered, and when each is tried
+    /// again. Never a negative one, which `refetch` already schedules. Timed
+    /// by the task's own timer: this paces calls and decides nothing about
+    /// validity.
+    retries: HashMap<Principal, Instant>,
+    /// `retries`, earliest first.
+    retry_queue: BTreeSet<(Instant, Principal)>,
+    /// Principals with a read running beside the loop whose answer still
+    /// counts. Recording a resolution removes the principal: whatever recorded
+    /// it is at least as new as a read already in flight.
+    reading: HashSet<Principal>,
+    /// How long a principal with no snapshot waits after an unanswered read.
+    retry_backoff: std::time::Duration,
+    /// How long a principal holding a snapshot waits after an unanswered read.
+    refresh_interval: std::time::Duration,
 }
 
 impl Resolutions {
@@ -723,7 +750,129 @@ impl Resolutions {
             present: BTreeSet::new(),
             negative: BTreeSet::new(),
             refetch: BTreeSet::new(),
+            retries: HashMap::new(),
+            retry_queue: BTreeSet::new(),
+            reading: HashSet::new(),
+            retry_backoff: std::time::Duration::ZERO,
+            refresh_interval: std::time::Duration::ZERO,
         }
+    }
+
+    /// Adopt the pacing of unanswered reads.
+    fn paced(
+        mut self,
+        retry_backoff: std::time::Duration,
+        refresh_interval: std::time::Duration,
+    ) -> Self {
+        self.retry_backoff = retry_backoff;
+        self.refresh_interval = refresh_interval;
+        self
+    }
+
+    /// Try `principal` again at `at`, replacing any earlier schedule.
+    fn schedule_retry(&mut self, principal: Principal, at: Instant) {
+        if let Some(previous) = self.retries.insert(principal, at) {
+            self.retry_queue.remove(&(previous, principal));
+        }
+        self.retry_queue.insert((at, principal));
+    }
+
+    /// The source answered for `principal`, so no retry is owed.
+    fn answered(&mut self, principal: Principal) {
+        if let Some(previous) = self.retries.remove(&principal) {
+            self.retry_queue.remove(&(previous, principal));
+        }
+    }
+
+    /// A read the source did not answer, or whose publication was refused.
+    ///
+    /// A negative keeps the schedule it already has. A held snapshot is tried
+    /// at the cadence it was refreshed at; a principal with nothing is tried
+    /// after the backoff, since every request for it is being denied.
+    fn fetch_failed(&mut self, principal: Principal) {
+        if !self.is_tracked(principal) {
+            return;
+        }
+        let delay = match self.by_principal.get(&principal) {
+            Some(Resolution::Negative { .. }) => return,
+            Some(Resolution::Present { .. }) => self.refresh_interval,
+            None => self.retry_backoff,
+        };
+        let now = Instant::now();
+        // A delay past the timer's range is looked at again later, never at once.
+        let at = now.checked_add(delay).unwrap_or_else(|| now + IDLE_WAKEUP);
+        self.schedule_retry(principal, at);
+    }
+
+    /// Whether `principal`'s reads are on their own schedule or in flight
+    /// beside the loop, so the loop must not wait on one.
+    fn is_beside(&self, principal: Principal) -> bool {
+        self.retries.contains_key(&principal) || self.reading.contains(&principal)
+    }
+
+    /// Something newer than any outstanding read is known: drop that read's
+    /// answer, and bring a scheduled retry forward to now.
+    fn expedite(&mut self, principal: Principal) {
+        self.reading.remove(&principal);
+        if self.retries.contains_key(&principal) {
+            self.schedule_retry(principal, Instant::now());
+        }
+    }
+
+    /// Mark reads as running beside the loop.
+    fn begin_reads(&mut self, principals: &[Principal]) {
+        self.reading.extend(principals.iter().copied());
+    }
+
+    /// Whether a finished read still counts. Each counts at most once.
+    fn claim_read(&mut self, principal: Principal) -> bool {
+        self.reading.remove(&principal)
+    }
+
+    /// What to refetch inline after pushes were dropped: every tracked
+    /// principal, negatives included, except those owed a retry, which are
+    /// brought forward to now instead. Reads already in flight may predate a
+    /// dropped push, so their answers are discarded.
+    fn recover_from_lag(&mut self) -> Vec<Principal> {
+        self.reading.clear();
+        let now = Instant::now();
+        let waiting: Vec<Principal> = self
+            .retry_queue
+            .iter()
+            .map(|&(_, principal)| principal)
+            .collect();
+        for principal in waiting {
+            self.schedule_retry(principal, now);
+        }
+        let mut principals = self.all_tracked();
+        principals.retain(|principal| !self.retries.contains_key(principal));
+        principals
+    }
+
+    /// Negative rechecks and retries that are due, longest overdue first, at
+    /// most `limit` of them.
+    fn due_beside(&self, now: jiff::Timestamp, limit: usize) -> Vec<Principal> {
+        let instant = Instant::now();
+        let mut due: Vec<(std::time::Duration, Principal)> = self
+            .due_for_refetch(now, limit)
+            .into_iter()
+            .filter_map(|principal| match self.by_principal.get(&principal) {
+                Some(Resolution::Negative { next_refetch, .. }) => {
+                    Some((until(now, *next_refetch), principal))
+                }
+                _ => None,
+            })
+            .chain(
+                self.retry_queue
+                    .iter()
+                    .take_while(|(at, _)| *at <= instant)
+                    .take(limit)
+                    .map(|&(at, principal)| (instant.duration_since(at), principal)),
+            )
+            .collect();
+        due.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        due.truncate(limit);
+        due.into_iter().map(|(_, principal)| principal).collect()
     }
 
     fn publishing(
@@ -756,6 +905,7 @@ impl Resolutions {
             tracing::warn!(%error, "snapshot publication refused; affected principals remain unresolved and retry");
             for principal in principals {
                 self.discard(principal);
+                self.fetch_failed(principal);
             }
             false
         } else {
@@ -859,6 +1009,8 @@ impl Resolutions {
             if let Some(previous) = self.by_principal.remove(&principal) {
                 self.forget(principal, previous);
             }
+            self.answered(principal);
+            self.reading.remove(&principal);
         }
         if let Some(publication) = &self.publication {
             publication.slots.retain(&discovered);
@@ -968,6 +1120,10 @@ impl Resolutions {
     /// The single write path: index bookkeeping cannot be skipped because
     /// there is nowhere else to write.
     fn insert(&mut self, principal: Principal, resolution: Resolution) {
+        self.reading.remove(&principal);
+        if matches!(resolution, Resolution::Negative { .. }) {
+            self.answered(principal);
+        }
         if let Some(previous) = self.by_principal.insert(principal, resolution) {
             self.forget(principal, previous);
         }
@@ -988,7 +1144,7 @@ impl Resolutions {
 
     /// Push a negative principal's next attempt out, after a failed refetch.
     ///
-    /// The one in-place edit the manager makes. It moves `next_refetch` only,
+    /// The one in-place edit the manager makes to a resolution. It moves `next_refetch` only,
     /// never `deadline`, so it changes when the retry fires and never whether
     /// the instance is ready.
     fn back_off(&mut self, principal: Principal, retry_at: jiff::Timestamp) {
@@ -1062,8 +1218,9 @@ impl Resolutions {
         earliest.map_or(IDLE_WAKEUP, |deadline| until(deadline, now))
     }
 
-    /// How long until the control plane next has work: a live positive
-    /// lapsing, or a negative becoming due for another attempt.
+    /// How long until the control plane next has work, when nothing is running
+    /// beside the loop: a live positive lapsing, or a negative or a retry
+    /// becoming due.
     fn next_control_wakeup(&mut self, now: jiff::Timestamp) -> std::time::Duration {
         self.expire_through(now);
         let earliest = match (self.present.first(), self.refetch.first()) {
@@ -1071,7 +1228,10 @@ impl Resolutions {
             (Some((only, _)), None) | (None, Some((only, _))) => Some(*only),
             (None, None) => None,
         };
-        earliest.map_or(IDLE_WAKEUP, |deadline| until(deadline, now))
+        let wakeup = earliest.map_or(IDLE_WAKEUP, |deadline| until(deadline, now));
+        self.retry_queue.first().map_or(wakeup, |&(at, _)| {
+            wakeup.min(at.saturating_duration_since(Instant::now()))
+        })
     }
 
     /// Principals the full refresh should cover: everything tracked whose
@@ -1081,8 +1241,11 @@ impl Resolutions {
     /// own — [`Self::due_for_refetch`], on the TTL their kind carries. Sweeping
     /// them as well fetched every tombstone twice per cycle for nothing (GL-52).
     ///
-    /// Principals with *no* resolution stay in: that is the initial load, and
-    /// every principal discovery has just added.
+    /// Principals owed a retry are excluded for the same reason, and so that
+    /// one cannot hold every sweep at `fetch_timeout` (GH-106).
+    ///
+    /// Principals with *no* resolution and no retry stay in: that is the
+    /// initial load, and every principal discovery has just added.
     ///
     /// Ordered, so a sweep visits principals the same way twice running.
     fn due_for_sweep(&self) -> Vec<Principal> {
@@ -1097,7 +1260,7 @@ impl Resolutions {
                 !matches!(
                     self.by_principal.get(principal),
                     Some(Resolution::Negative { .. })
-                )
+                ) && !self.is_beside(**principal)
             })
             .copied()
             .collect();
@@ -1259,6 +1422,87 @@ fn negative_deadline(
     now.checked_add(ttl).unwrap_or(jiff::Timestamp::MAX)
 }
 
+/// The source's answer, or the bound it did not answer within. The inner
+/// result is the source's; the outer one says whether it arrived at all.
+type Fetched = Result<Result<SnapshotResolution, StoreError>, tokio::time::error::Elapsed>;
+
+/// One set of source reads under a concurrency bound. Dropping it aborts
+/// whatever is in flight.
+///
+/// Abandoning a fetch at `fetch_timeout` — rather than the task holding a
+/// future that never resolves — is what lets the set finish (GL-103).
+struct Fetches {
+    source: Arc<dyn SnapshotSource>,
+    bound: std::time::Duration,
+    pending: std::vec::IntoIter<SnapshotRefresh>,
+    tasks: JoinSet<Refreshed<Fetched>>,
+    results: Vec<Refreshed<Fetched>>,
+}
+
+impl Fetches {
+    fn start(
+        source: &Arc<dyn SnapshotSource>,
+        config: &SnapshotManagerConfig,
+        reads: Vec<SnapshotRefresh>,
+    ) -> Self {
+        let mut fetches = Fetches {
+            source: Arc::clone(source),
+            bound: config.fetch_timeout,
+            results: Vec::with_capacity(reads.len()),
+            pending: reads.into_iter(),
+            tasks: JoinSet::new(),
+        };
+        for _ in 0..config.max_concurrent_fetches {
+            fetches.spawn_next();
+        }
+        fetches
+    }
+
+    fn spawn_next(&mut self) {
+        let Some(read) = self.pending.next() else {
+            return;
+        };
+        let source = Arc::clone(&self.source);
+        let bound = self.bound;
+        let principal = read.principal();
+        self.tasks.spawn(async move {
+            read.fetch(|| tokio::time::timeout(bound, source.snapshot(principal)))
+                .await
+        });
+    }
+
+    /// Wait until every read has finished. Cancel-safe: nothing is awaited
+    /// between taking a result and keeping it.
+    async fn complete(&mut self) {
+        while let Some(joined) = self.tasks.join_next().await {
+            match joined {
+                Ok(result) => self.results.push(result),
+                // A fetch task that panicked leaves its principal simply
+                // absent from the results, indistinguishable from one that
+                // failed cleanly — so the panic itself must be said out loud.
+                Err(error) => tracing::error!(%error, "snapshot fetch task died"),
+            }
+            self.spawn_next();
+        }
+    }
+}
+
+/// Whose reads are being applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// A refresh the loop waits for: no resolution changed while it ran.
+    Inline,
+    /// Retries and negative rechecks running beside the loop. A read the loop
+    /// has since overtaken is dropped.
+    Beside,
+}
+
+/// The reads running beside the loop, and who they are for.
+struct Beside {
+    principals: Vec<Principal>,
+    fetches: Fetches,
+}
+
 /// Refresh a set of principals with bounded concurrency, then apply every
 /// positive and negative result in one logical map write. A shutdown signal
 /// aborts outstanding source futures immediately.
@@ -1276,25 +1520,52 @@ async fn refresh_all_cancellable(
     shutdown: &mut watch::Receiver<bool>,
     ready: &watch::Sender<bool>,
     counters: &SnapshotCounters,
-) -> Option<Vec<Principal>> {
-    let mut pending = Vec::new();
+) -> Option<()> {
     for principals in principals.chunks(resolutions.capacity()) {
-        pending.extend(
-            refresh_chunk_cancellable(
-                source,
-                slots,
-                clock,
-                config,
-                principals,
-                resolutions,
-                shutdown,
-                ready,
-                counters,
-            )
-            .await?,
-        );
+        refresh_chunk_cancellable(
+            source,
+            slots,
+            clock,
+            config,
+            principals,
+            resolutions,
+            shutdown,
+            ready,
+            counters,
+        )
+        .await?;
     }
-    Some(pending)
+    Some(())
+}
+
+/// Reserve the reads for one batch. A refused reservation is a failed read for
+/// every principal in it, and yields nothing to fetch.
+fn reserve_reads(
+    clock: &Arc<dyn Clock>,
+    config: &SnapshotManagerConfig,
+    principals: &[Principal],
+    resolutions: &mut Resolutions,
+    ready: &watch::Sender<bool>,
+    counters: &SnapshotCounters,
+) -> Option<Vec<SnapshotRefresh>> {
+    let reads = match resolutions.prepare_refreshes(principals, counters) {
+        Ok(batch) => batch.reads,
+        Err(error) => {
+            counters
+                .publication_failures
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(%error, "snapshot refresh reservation failed; principals retry with backoff");
+            let retry_at = after_std(clock.now(), config.retry_backoff);
+            for &principal in principals {
+                resolutions.fetch_failed(principal);
+                resolutions.back_off(principal, retry_at);
+            }
+            return None;
+        }
+    };
+    // Eviction changes readiness before source I/O, even if the source hangs.
+    update_ready(ready, resolutions, clock, counters, &config.principals);
+    Some(reads)
 }
 
 // One refresh pass's inputs, threaded rather than bundled: the enclosing task
@@ -1314,69 +1585,20 @@ async fn refresh_chunk_cancellable(
     shutdown: &mut watch::Receiver<bool>,
     ready: &watch::Sender<bool>,
     counters: &SnapshotCounters,
-) -> Option<Vec<Principal>> {
-    let mut pending = match resolutions.prepare_refreshes(principals, counters) {
-        Ok(batch) => batch.reads.into_iter(),
-        Err(error) => {
-            counters
-                .publication_failures
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(%error, "snapshot refresh reservation failed; principals retry with backoff");
-            return Some(principals.to_vec());
-        }
+) -> Option<()> {
+    let Some(reads) = reserve_reads(clock, config, principals, resolutions, ready, counters) else {
+        return Some(());
     };
-    // Eviction changes readiness before source I/O, even if the source hangs.
-    update_ready(ready, resolutions, clock, counters, &config.principals);
-    // The inner result is the source's answer; the outer one says whether it
-    // arrived at all. Abandoning the fetch — rather than the task holding a
-    // future that never resolves — is what lets `tasks` empty and the sweep
-    // return (GL-103).
-    type Fetched = Result<Result<SnapshotResolution, StoreError>, tokio::time::error::Elapsed>;
-    let mut tasks = JoinSet::<Refreshed<Fetched>>::new();
-    for _ in 0..config.max_concurrent_fetches {
-        let Some(read) = pending.next() else {
-            break;
-        };
-        let source = Arc::clone(source);
-        let bound = config.fetch_timeout;
-        let principal = read.principal();
-        tasks.spawn(async move {
-            read.fetch(|| tokio::time::timeout(bound, source.snapshot(principal)))
-                .await
-        });
-    }
-
-    let mut results = Vec::with_capacity(principals.len());
-    while !tasks.is_empty() {
+    let mut fetches = Fetches::start(source, config, reads);
+    loop {
         // A source future may hang indefinitely. Keep readiness tied to the
         // actual resolution deadlines even while this sweep is in flight.
         let readiness_check = tokio::time::sleep(resolutions.next_readiness_check(clock.now()));
         tokio::pin!(readiness_check);
         tokio::select! {
-            joined = tasks.join_next() => {
-                match joined {
-                    Some(Ok(result)) => results.push(result),
-                    // A fetch task that panicked leaves its principal simply
-                    // absent from the results, indistinguishable from one
-                    // that failed cleanly — so the panic itself must be said
-                    // out loud.
-                    Some(Err(error)) => {
-                        tracing::error!(%error, "snapshot fetch task died");
-                    }
-                    None => {}
-                }
-                if let Some(read) = pending.next() {
-                    let source = Arc::clone(source);
-                    let bound = config.fetch_timeout;
-                    let principal = read.principal();
-                    tasks.spawn(async move {
-                        read.fetch(|| tokio::time::timeout(bound, source.snapshot(principal))).await
-                    });
-                }
-            }
+            () = fetches.complete() => break,
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    tasks.abort_all();
                     return None;
                 }
             }
@@ -1385,8 +1607,44 @@ async fn refresh_chunk_cancellable(
             }
         }
     }
+    apply_fetches(
+        slots,
+        clock,
+        config,
+        principals,
+        fetches.results,
+        Pass::Inline,
+        resolutions,
+        counters,
+    );
+    Some(())
+}
 
+/// Turn finished reads into resolutions and one logical map write, and
+/// schedule whatever the source did not answer.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one batch's inputs, owned by the enclosing task"
+)]
+fn apply_fetches(
+    slots: &Arc<SlotRegistry>,
+    clock: &Arc<dyn Clock>,
+    config: &SnapshotManagerConfig,
+    principals: &[Principal],
+    results: Vec<Refreshed<Fetched>>,
+    pass: Pass,
+    resolutions: &mut Resolutions,
+    counters: &SnapshotCounters,
+) {
+    // The principals whose read from this batch still counts.
+    let live: Vec<Principal> = principals
+        .iter()
+        .copied()
+        .filter(|&principal| pass == Pass::Inline || resolutions.claim_read(principal))
+        .collect();
+    let current: HashSet<Principal> = live.iter().copied().collect();
     let mut updates = Vec::with_capacity(results.len());
+    let mut answered = HashSet::with_capacity(results.len());
     let mut completed = HashSet::with_capacity(results.len());
     for read in results {
         let principal = read.principal();
@@ -1395,6 +1653,9 @@ async fn refresh_chunk_cancellable(
             // an attempt rate that has gone to zero is itself the signal that the
             // refresh loop has stopped.
             counters.record_attempt();
+            if !current.contains(&principal) {
+                return None;
+            }
             // Unwrap the bound before the source's own answer, so every arm below
             // reads exactly as it did when a fetch could only succeed or fail.
             // Left out of `completed` like a refusal, which is what re-arms
@@ -1410,6 +1671,10 @@ async fn refresh_chunk_cancellable(
                 );
                 return None;
             };
+            if result.is_ok() {
+                answered.insert(principal);
+                resolutions.answered(principal);
+            }
             match result {
                 Ok(SnapshotResolution::Present(snapshot)) => {
                     // Delivered before generation acceptance: an unchanged
@@ -1546,6 +1811,13 @@ async fn refresh_chunk_cancellable(
             updates.push(update);
         }
     }
+    // A timeout, a source error and a dead task all leave the principal
+    // unanswered, and each is retried on its own schedule.
+    for &principal in &live {
+        if !answered.contains(&principal) {
+            resolutions.fetch_failed(principal);
+        }
+    }
     if !updates.is_empty() {
         let published = updates.iter().map(Refreshed::principal).collect::<Vec<_>>();
         if !resolutions.publish(Publications::Refreshed(updates), clock.now(), counters) {
@@ -1554,13 +1826,16 @@ async fn refresh_chunk_cancellable(
             }
         }
     }
-    Some(
-        principals
-            .iter()
-            .copied()
-            .filter(|principal| !completed.contains(principal))
-            .collect(),
-    )
+    if pass == Pass::Beside {
+        // A negative whose recheck did not settle it waits out the backoff,
+        // which moves its next attempt and never its validity deadline.
+        let retry_at = after_std(clock.now(), config.retry_backoff);
+        for principal in live {
+            if !completed.contains(&principal) {
+                resolutions.back_off(principal, retry_at);
+            }
+        }
+    }
 }
 
 /// Re-enumerate the tracked set.
@@ -1654,11 +1929,12 @@ async fn run(
         config.principals.initial().iter().copied(),
         Arc::clone(&map),
         Arc::clone(&slots),
-    );
+    )
+    .paced(config.retry_backoff, config.refresh_interval);
 
     // Discover before the initial load, so a stateless instance starts from
     // the real set rather than its (usually empty) seed. Enumeration failure
-    // is not fatal: the retry loop below covers it, and the seed keeps the
+    // is not fatal: every refresh enumerates again, and the seed keeps the
     // instance serving whatever it was told about meanwhile.
     if config.principals.discovers()
         && discover(&source, &mut resolutions, &counters, &config, &mut shutdown)
@@ -1668,51 +1944,26 @@ async fn run(
         return;
     }
 
-    // Initial load: retry until every tracked principal is resolved, then
-    // report ready. The map denies (fail closed) for anything unresolved in
-    // the meantime.
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "a work queue drained to empty, not an output: every tracked principal is fetched, and the pass reports the same result whichever order they were fetched in"
-    )]
-    let mut pending: Vec<Principal> = resolutions.tracked.iter().copied().collect();
-    while !pending.is_empty() {
-        if *shutdown.borrow() {
-            return;
-        }
-        let Some(failed) = refresh_all_cancellable(
-            &source,
-            &slots,
-            &clock,
-            &config,
-            &pending,
-            &mut resolutions,
-            &mut shutdown,
-            ready,
-            &counters,
-        )
-        .await
-        else {
-            return;
-        };
-        pending = failed;
-        update_ready(
-            ready,
-            &mut resolutions,
-            &clock,
-            &counters,
-            &config.principals,
-        );
-        if !pending.is_empty() {
-            tokio::select! {
-                _ = tokio::time::sleep(config.retry_backoff) => {}
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return;
-                    }
-                }
-            }
-        }
+    // Initial load: one pass over everything tracked. The map denies (fail
+    // closed) for whatever it leaves unresolved, which is retried beside the
+    // loop below. Waiting here for every principal would hold refresh and push
+    // handling back from all of them on account of one (GH-106).
+    let initial = resolutions.all_tracked();
+    if refresh_all_cancellable(
+        &source,
+        &slots,
+        &clock,
+        &config,
+        &initial,
+        &mut resolutions,
+        &mut shutdown,
+        ready,
+        &counters,
+    )
+    .await
+    .is_none()
+    {
+        return;
     }
     update_ready(
         ready,
@@ -1726,11 +1977,20 @@ async fn run(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.reset(); // the initial load already counts as a refresh
     let mut updates_closed = false;
+    // Retries and negative rechecks, one batch at a time, polled by the loop
+    // so that a slow one holds up nothing else.
+    let mut beside: Option<Beside> = None;
     loop {
         if *shutdown.borrow() {
             return;
         }
-        let control_wakeup = tokio::time::sleep(resolutions.next_control_wakeup(clock.now()));
+        // While a batch is running nothing more can start, so only a lapsing
+        // resolution is worth waking for.
+        let control_wakeup = tokio::time::sleep(if beside.is_some() {
+            resolutions.next_readiness_check(clock.now())
+        } else {
+            resolutions.next_control_wakeup(clock.now())
+        });
         tokio::pin!(control_wakeup);
         tokio::select! {
             push = updates.recv(), if !updates_closed => match push {
@@ -1744,6 +2004,13 @@ async fn run(
                     }
                     if resolutions.is_tracked(push.principal) {
                         if resolutions.needs_refresh(push.principal) {
+                            // One already on its own schedule is brought
+                            // forward there: reading it here would let it hold
+                            // the loop.
+                            if resolutions.is_beside(push.principal) {
+                                resolutions.expedite(push.principal);
+                                continue;
+                            }
                             if refresh_all_cancellable(&source, &slots, &clock, &config, &[push.principal],
                                 &mut resolutions, &mut shutdown, ready, &counters).await.is_none() { return; }
                             update_ready(ready, &mut resolutions, &clock, &counters, &config.principals);
@@ -1827,12 +2094,13 @@ async fn run(
                     }
                 }
                 // Lagged: missed pushes — refetch everything rather than
-                // guess what was dropped. `all_tracked`, not `due_for_sweep`:
+                // guess what was dropped. Not `due_for_sweep`:
                 // a dropped reinstatement leaves a stale Negative behind, and
                 // that is the one thing a filtered sweep would never revisit.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    let dropped = resolutions.recover_from_lag();
                     if refresh_all_cancellable(
-                        &source, &slots, &clock, &config, &resolutions.all_tracked(),
+                        &source, &slots, &clock, &config, &dropped,
                         &mut resolutions, &mut shutdown,
                         ready,
                         &counters,
@@ -1869,22 +2137,37 @@ async fn run(
                 }
                 update_ready(ready, &mut resolutions, &clock, &counters, &config.principals);
             }
+            () = async {
+                match beside.as_mut() {
+                    Some(batch) => batch.fetches.complete().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(batch) = beside.take() {
+                    apply_fetches(
+                        &slots, &clock, &config, &batch.principals, batch.fetches.results,
+                        Pass::Beside, &mut resolutions, &counters,
+                    );
+                    update_ready(ready, &mut resolutions, &clock, &counters, &config.principals);
+                }
+            }
             _ = &mut control_wakeup => {
                 let now = clock.now();
                 update_ready(ready, &mut resolutions, &clock, &counters, &config.principals);
-                let due = resolutions.due_for_refetch(now, config.max_concurrent_fetches);
-                if !due.is_empty() {
-                    let Some(failed) = refresh_all_cancellable(
-                        &source, &slots, &clock, &config, &due,
-                        &mut resolutions, &mut shutdown, ready, &counters,
-                    ).await else {
-                        return;
-                    };
-                    let retry_at = after_std(clock.now(), config.retry_backoff);
-                    for principal in failed {
-                        resolutions.back_off(principal, retry_at);
+                if beside.is_none() {
+                    let limit = config.max_concurrent_fetches.min(resolutions.capacity());
+                    let due = resolutions.due_beside(now, limit);
+                    if !due.is_empty()
+                        && let Some(reads) = reserve_reads(
+                            &clock, &config, &due, &mut resolutions, ready, &counters,
+                        )
+                    {
+                        resolutions.begin_reads(&due);
+                        beside = Some(Beside {
+                            fetches: Fetches::start(&source, &config, reads),
+                            principals: due,
+                        });
                     }
-                    update_ready(ready, &mut resolutions, &clock, &counters, &config.principals);
                 }
             }
             changed = shutdown.changed() => {
@@ -2544,6 +2827,158 @@ mod tests {
             vec![Principal(0), Principal(1)],
             "lag recovery refetches everything, tombstones included"
         );
+    }
+
+    fn positive(deadline: i64) -> Resolution {
+        Resolution::Present {
+            deadline: t(deadline),
+            generation: Generation(1),
+        }
+    }
+
+    fn negative(deadline: i64) -> Resolution {
+        Resolution::Negative {
+            deadline: t(deadline),
+            next_refetch: t(deadline),
+            watermark: None,
+        }
+    }
+
+    fn paced(principals: u128) -> Resolutions {
+        Resolutions::new((0..principals).map(Principal)).paced(secs(5), secs(60))
+    }
+
+    /// An unanswered read leaves the sweep for a schedule of its own: soon for
+    /// a principal with nothing, at the refresh cadence for one holding a
+    /// snapshot, and not at all for a negative, which `refetch` schedules.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_read_is_scheduled_by_what_the_principal_holds() {
+        let mut resolutions = paced(3);
+        resolutions.insert(Principal(1), positive(1_000));
+        resolutions.insert(Principal(2), negative(1_000));
+        for principal in (0..4).map(Principal) {
+            resolutions.fetch_failed(principal);
+        }
+
+        let now = Instant::now();
+        assert_eq!(
+            resolutions.retries,
+            HashMap::from([
+                (Principal(0), now + secs(5)),
+                (Principal(1), now + secs(60))
+            ]),
+            "neither the negative nor the untracked principal is scheduled"
+        );
+        assert!(resolutions.due_for_sweep().is_empty());
+        assert_eq!(resolutions.next_control_wakeup(t(0)), secs(5));
+        assert!(resolutions.due_beside(t(0), 8).is_empty());
+
+        tokio::time::advance(secs(5)).await;
+        assert_eq!(resolutions.next_control_wakeup(t(0)), secs(0));
+        assert_eq!(resolutions.due_beside(t(0), 8), vec![Principal(0)]);
+
+        resolutions.answered(Principal(0));
+        assert_eq!(resolutions.due_for_sweep(), vec![Principal(0)]);
+        assert_eq!(resolutions.next_control_wakeup(t(0)), secs(55));
+        assert_eq!(resolutions.retry_queue.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_delay_beyond_the_timers_range_is_never_immediately_due() {
+        let mut resolutions = Resolutions::new([Principal(0)])
+            .paced(std::time::Duration::MAX, std::time::Duration::MAX);
+        resolutions.fetch_failed(Principal(0));
+        assert!(resolutions.due_beside(t(0), 8).is_empty());
+        assert_eq!(resolutions.next_control_wakeup(t(0)), IDLE_WAKEUP);
+    }
+
+    /// A batch holds the longest overdue of both schedules, up to its bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_beside_the_loop_takes_the_longest_overdue_first() {
+        let mut resolutions = paced(4);
+        resolutions.fetch_failed(Principal(3));
+        tokio::time::advance(secs(25)).await;
+        resolutions.fetch_failed(Principal(2));
+        tokio::time::advance(secs(5)).await;
+        // Retries 25 and 0 seconds overdue; negatives 10 and 30.
+        resolutions.insert(Principal(0), negative(90));
+        resolutions.insert(Principal(1), negative(70));
+
+        assert_eq!(
+            resolutions.due_beside(t(100), 8),
+            vec![Principal(1), Principal(3), Principal(0), Principal(2)]
+        );
+        assert_eq!(
+            resolutions.due_beside(t(100), 2),
+            vec![Principal(1), Principal(3)]
+        );
+    }
+
+    /// A read beside the loop counts once, and not at all once something at
+    /// least as new has been recorded or announced.
+    #[tokio::test(start_paused = true)]
+    async fn an_overtaken_read_no_longer_counts() {
+        let mut resolutions = paced(4);
+        resolutions.fetch_failed(Principal(3));
+        resolutions.begin_reads(&[Principal(0), Principal(1), Principal(2), Principal(3)]);
+        assert!(resolutions.due_for_sweep().is_empty());
+
+        assert!(resolutions.claim_read(Principal(0)));
+        assert!(!resolutions.claim_read(Principal(0)), "once");
+
+        resolutions.insert(Principal(1), positive(1_000));
+        assert!(!resolutions.claim_read(Principal(1)));
+
+        resolutions.expedite(Principal(2));
+        assert!(!resolutions.claim_read(Principal(2)));
+        assert!(
+            !resolutions.retries.contains_key(&Principal(2)),
+            "nothing was owed, so nothing is scheduled"
+        );
+        resolutions.expedite(Principal(3));
+        assert!(!resolutions.claim_read(Principal(3)));
+        assert_eq!(resolutions.due_beside(t(0), 8), vec![Principal(3)]);
+    }
+
+    /// Lag recovery refetches inline what the loop may wait for, brings every
+    /// retry forward, and distrusts reads already in flight.
+    #[tokio::test(start_paused = true)]
+    async fn lag_recovery_expedites_retries_and_discards_reads_in_flight() {
+        let mut resolutions = paced(3);
+        resolutions.insert(Principal(0), negative(1_000));
+        resolutions.fetch_failed(Principal(2));
+        resolutions.begin_reads(&[Principal(0)]);
+
+        assert_eq!(
+            resolutions.recover_from_lag(),
+            vec![Principal(0), Principal(1)]
+        );
+        assert!(!resolutions.claim_read(Principal(0)));
+        assert_eq!(resolutions.due_beside(t(0), 8), vec![Principal(2)]);
+    }
+
+    /// A principal that leaves the catalogue, or becomes negative, owes no
+    /// retry.
+    #[tokio::test(start_paused = true)]
+    async fn untracked_and_negative_principals_owe_no_retry() {
+        let mut resolutions = paced(3);
+        for principal in (0..3).map(Principal) {
+            resolutions.fetch_failed(principal);
+        }
+        resolutions.begin_reads(&[Principal(0)]);
+        resolutions.insert(Principal(1), negative(1_000));
+        resolutions.retain(HashSet::from([Principal(1), Principal(2)]));
+
+        assert!(!resolutions.claim_read(Principal(0)));
+        assert_eq!(
+            resolutions
+                .retry_queue
+                .iter()
+                .map(|&(_, principal)| principal)
+                .collect::<Vec<_>>(),
+            vec![Principal(2)]
+        );
+        assert_eq!(resolutions.retries.len(), 1);
     }
 
     /// The generation watermark outlives the resolution that carried it, or a

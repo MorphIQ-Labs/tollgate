@@ -8756,13 +8756,59 @@ on a body it fails to decode. No schema or stored data changes.
 
 **Readiness** counts the withdrawn principal as resolved, as it does any
 negative. Counting it unresolved would let one corrupt row withdraw every
-instance of a fixed-set deployment from service. It also ends a worse case: the
-initial load retries failed principals until all resolve, before refresh,
-discovery or push handling starts, so a single row that errored on every read
-held a starting instance there indefinitely. `unreadable_snapshots` and the
-logs are the signal.
+instance of a fixed-set deployment from service. It also removed one cause of a
+worse case, an initial load held open by a row that errored on every read; [an
+unanswered principal delays no
+other](#an-unanswered-principal-delays-no-other-gh-106-2026-11-27) removed the
+case itself. `unreadable_snapshots` and the logs are the signal.
 
 Compatibility: `SnapshotResolution` gains a variant, which breaks exhaustive
 matches in embedder code and custom sources must decide whether to produce it.
 `SnapshotStats` gains `unreadable_snapshots`. No request-path, threshold or
 migration changes.
+
+## An unanswered principal delays no other (GH-106, 2026-11-27)
+
+The snapshot manager ran its initial load as a loop of its own: fetch whatever
+was still unresolved, wait `retry_backoff`, repeat until nothing was left. The
+select loop that refreshes, discovers and applies pushes started afterwards. One
+principal with a persistent error therefore left every other principal frozen
+at its first snapshot, expiring and missing suspensions. The same coupling
+existed in a smaller form after startup: a principal that hung held every sweep,
+and every targeted recheck, at `fetch_timeout`, and the loop processed no push
+while it waited.
+
+The loop is gone. The initial load is one pass, and an unanswered read is
+scheduled where negative rechecks already were: on its own, outside the sweep.
+Both now run as a batch the select loop polls rather than awaits.
+
+Alternatives considered:
+
+- **Retry inside the loop.** The smallest change, and enough for a source that
+  fails quickly. A source that hangs would still hold pushes and the refresh
+  tick for `fetch_timeout` on every retry.
+- **Make the sweep asynchronous too.** Nothing would ever wait, but a sweep
+  publishes its batch in one map write, which is what keeps an `ArcSwap` map
+  from being copied once per principal, and would need a second batching rule
+  for completion order. The remaining cost is one delayed sweep when a principal
+  first stops answering, which is bounded and stated in GL-10.
+- **One fetch pool shared by the sweep and the retries.** Hanging retries would
+  occupy the pool the healthy sweep needs. Each gets its own
+  `max_concurrent_fetches`, doubling the worst case in flight.
+
+Running reads beside the loop creates an ordering the manager did not have: a
+push can be applied while an older read is outstanding. Recording any resolution
+invalidates that read, in the one write path every resolution goes through, so
+no caller can forget it. A push for a principal with nothing resolved is still
+only a hint (GL-15), so it discards the outstanding read and reads again.
+
+Retries are timed by the task's timer rather than the injected clock. The clock
+decides validity; a retry delay only paces calls, as the old loop's sleep did. A
+principal holding a snapshot is retried at `refresh_interval`, the load it put
+on the source before.
+
+Compatibility: no public API, wire, schema or configuration change. Readiness
+rules are unchanged. `retry_backoff` now also paces any principal with nothing
+resolved after startup, which previously waited for the next sweep, and
+`max_concurrent_fetches` bounds retries separately from the sweep. No
+request-path or threshold change.

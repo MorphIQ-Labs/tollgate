@@ -175,7 +175,7 @@ covers the refusal fields and recovery procedure.
 | Field | Kind | Unit | Counts | A non-zero or rising value means |
 |---|---|---|---|---|
 | `refresh_attempts` | counter | fetches | Fetches attempted, one per principal per pass. | A flat rate means no fetches; check task health before inferring an outage. |
-| `refresh_failures` | counter | fetches | Fetches the source could not answer. | Known principals are going stale; `unresolved` shows it once their resolution lapses. |
+| `refresh_failures` | counter | fetches | Fetches the source could not answer. | The named principals are going stale and are being retried on their own; `unresolved` shows it once their resolution lapses. |
 | `refresh_timeouts` | counter | fetches | Fetches abandoned at `fetch_timeout`. | Source latency, not a catalogue problem. |
 | `discovery_failures` | counter | enumerations | Principal enumerations the source could not answer. | The tracked set is frozen: new principals never appear, while everything known keeps working. |
 | `refused_updates` | counter | updates | Pushes or fetched updates refused by generation ordering, excluding an unchanged positive at the installed generation. | A stale or revoked update was offered. |

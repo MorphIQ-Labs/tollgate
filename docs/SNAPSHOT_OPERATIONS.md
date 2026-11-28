@@ -46,6 +46,32 @@ Recover the source's authoritative generation; do not clear tombstones or lower
 watermarks to make a replay pass. The aggregate counter supports alerting even
 when event collection is disabled, and carries no per-principal metric labels.
 
+## Unanswered principals
+
+A fetch can fail or time out for one principal while the rest are answered. That
+principal delays nobody else: the refresh, discovery and pushes carry on, from
+startup onwards. A Fixed instance stays unready until it resolves, because
+readiness still requires every configured principal.
+
+| Principal's state | Retried after | Meanwhile |
+| --- | --- | --- |
+| Nothing resolved | `retry_backoff` | Denied as `unknown_principal` |
+| Holds a snapshot | `refresh_interval` | Served from it until `valid_until` |
+| Negative due for recheck | `retry_backoff` | Stays denied |
+
+`refresh_failures` or `refresh_timeouts` rises with each attempt and a warning
+names the principal. A change reaches the other principals within one
+`refresh_interval`, with two exceptions. The sweep in which a principal first
+stops answering publishes up to `fetch_timeout` later. A principal that is
+itself waiting for a retry shares batches of at most `max_concurrent_fetches`
+with the other waiting ones, one batch at a time, so while many time out it can
+wait `fetch_timeout` for each batch ahead of it. Retries and rechecks have their
+own `max_concurrent_fetches` bound beside the sweep's, so one instance can have
+twice that many fetches in flight; size the source for it.
+
+Upgrading changes no configuration or wire format. Instances may be upgraded in
+any order.
+
 ## Unreadable snapshots
 
 A stored snapshot can fail to decode: a row damaged or hand-edited, one written

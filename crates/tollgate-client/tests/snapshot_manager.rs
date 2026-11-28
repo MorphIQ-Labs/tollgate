@@ -9,7 +9,7 @@
 )]
 
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use jiff::{SignedDuration, Timestamp};
@@ -2834,4 +2834,484 @@ async fn a_push_for_an_unresolved_principal_is_discovery_not_authority() {
         Err(DenyReason::UnknownPrincipal),
         "the authoritative read decides a newly discovered principal, not the push that named it"
     );
+}
+
+const ANSWERS: u8 = 0;
+const FAILS: u8 = 1;
+const HANGS: u8 = 2;
+
+/// What the source does when asked for [`PRINCIPAL`], and how often it was.
+#[derive(Default)]
+struct Fault {
+    mode: AtomicU8,
+    calls: AtomicUsize,
+}
+
+impl Fault {
+    fn new(mode: u8) -> Arc<Self> {
+        let fault = Arc::new(Self::default());
+        fault.set(mode);
+        fault
+    }
+
+    fn set(&self, mode: u8) {
+        self.mode.store(mode, Ordering::Release);
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Acquire)
+    }
+}
+
+/// `store`, except that [`PRINCIPAL`] is answered as `fault` says. Every other
+/// principal, and the push stream, are the store's own.
+fn faulty(store: &Arc<MemoryStore>, fault: &Arc<Fault>) -> DelegatingStore<MemoryStore> {
+    let fault = Arc::clone(fault);
+    DelegatingStore::wrapping(Arc::clone(store)).on_snapshot(move |inner, principal| {
+        let mode = if principal == PRINCIPAL {
+            fault.calls.fetch_add(1, Ordering::AcqRel);
+            fault.mode.load(Ordering::Acquire)
+        } else {
+            ANSWERS
+        };
+        async move {
+            match mode {
+                FAILS => Err(StoreError("one principal is unavailable".into())),
+                HANGS => std::future::pending().await,
+                _ => SnapshotSource::snapshot(&*inner, principal).await,
+            }
+        }
+    })
+}
+
+fn three_principals() -> TrackedPrincipals {
+    TrackedPrincipals::Fixed(vec![PRINCIPAL, LATER_PRINCIPAL, OTHER_PRINCIPAL])
+}
+
+/// Longer than the five-second `fetch_timeout` these fixtures configure.
+async fn past_a_fetch_timeout() {
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+}
+
+/// One principal the source cannot answer for, from the first pass on, holds
+/// nothing back from the others: every instance still delivers them a
+/// suspension, a reactivation and a revocation by refresh alone, within one
+/// interval, and the failing principal arrives once the source answers
+/// (INVARIANTS.md GL-10).
+#[tokio::test(start_paused = true)]
+async fn one_unanswered_principal_does_not_hold_back_the_others() {
+    for mode in [FAILS, HANGS] {
+        let store = two_account_store();
+        let fault = Fault::new(mode);
+        let clock = Arc::new(ManualClock::new(t(0)));
+        let instances = [(), ()].map(|()| {
+            let fixture = spawn_clocked(
+                Arc::new(faulty(&store, &fault).on_subscribe(|_| no_pushes())),
+                &clock,
+                SnapshotManagerConfig {
+                    principals: three_principals(),
+                    ..discovering_config(20)
+                },
+            );
+            stock_slot(&fixture);
+            stock(&fixture, OTHER_ACCOUNT, LeaseId(2));
+            fixture
+        });
+        past_a_fetch_timeout().await;
+        for instance in &instances {
+            assert!(!*instance.manager.ready().borrow(), "fixed: one is missing");
+            assert_eq!(instance.manager.counters().snapshot().unresolved, 1);
+            assert_eq!(admit(instance), Err(DenyReason::UnknownPrincipal));
+            assert_eq!(admit_as(instance, LATER_PRINCIPAL), Ok(()));
+            assert_eq!(admit_as(instance, OTHER_PRINCIPAL), Ok(()));
+        }
+
+        for (status, expected) in [
+            (AccountStatus::Suspended, Err(DenyReason::AccountSuspended)),
+            (AccountStatus::Active, Ok(())),
+            (AccountStatus::Suspended, Err(DenyReason::AccountSuspended)),
+        ] {
+            AdminStore::set_account_status(&*store, ACCOUNT, status)
+                .await
+                .unwrap();
+            settle().await;
+            for instance in &instances {
+                assert_eq!(
+                    admit_as(instance, LATER_PRINCIPAL),
+                    expected,
+                    "mode {mode}, {status:?}"
+                );
+                assert_eq!(admit_as(instance, OTHER_PRINCIPAL), Ok(()));
+            }
+        }
+        store.remove_snapshot(OTHER_PRINCIPAL);
+        settle().await;
+        for instance in &instances {
+            assert_eq!(
+                admit_as(instance, OTHER_PRINCIPAL),
+                Err(DenyReason::UnknownPrincipal)
+            );
+            let stats = instance.manager.counters().snapshot();
+            if mode == HANGS {
+                assert!(stats.refresh_timeouts > 0);
+            } else {
+                assert!(stats.refresh_failures > 0);
+            }
+        }
+
+        fault.set(ANSWERS);
+        past_a_fetch_timeout().await;
+        for instance in instances {
+            assert_eq!(admit(&instance), Err(DenyReason::AccountSuspended));
+            assert!(*instance.manager.ready().borrow());
+            instance.manager.shutdown().await;
+        }
+    }
+}
+
+/// The same holds for the push stream: with every scheduled pull beyond the
+/// test, a publication and a revocation arrive while one principal is still
+/// unanswered.
+#[tokio::test(start_paused = true)]
+async fn pushes_are_applied_while_a_principal_is_unanswered() {
+    for mode in [FAILS, HANGS] {
+        let store = two_account_store();
+        let fixture = spawn_with(
+            Arc::new(faulty(&store, &Fault::new(mode))),
+            SnapshotManagerConfig {
+                principals: three_principals(),
+                ..push_only_config()
+            },
+        );
+        stock_slot(&fixture);
+        stock(&fixture, OTHER_ACCOUNT, LeaseId(2));
+        past_a_fetch_timeout().await;
+        assert_eq!(admit_as(&fixture, LATER_PRINCIPAL), Ok(()));
+
+        store
+            .publish_snapshot(
+                LATER_PRINCIPAL,
+                publishable(snapshot(2, PermissionBits::NONE)),
+            )
+            .expect("snapshot fixture matches its account and credential");
+        store.remove_snapshot(OTHER_PRINCIPAL);
+        settle().await;
+        assert_eq!(
+            admit_as(&fixture, LATER_PRINCIPAL),
+            Err(DenyReason::MissingPermission),
+            "mode {mode}"
+        );
+        assert_eq!(
+            admit_as(&fixture, OTHER_PRINCIPAL),
+            Err(DenyReason::UnknownPrincipal)
+        );
+        fixture.manager.shutdown().await;
+    }
+}
+
+/// Discovery starts as soon as the first pass ends, whatever it left
+/// unanswered.
+#[tokio::test(start_paused = true)]
+async fn discovery_proceeds_while_a_principal_is_unanswered() {
+    let store = base_store();
+    store
+        .publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))))
+        .expect("snapshot fixture matches its account and credential");
+    let fixture = spawn_with(
+        Arc::new(faulty(&store, &Fault::new(HANGS)).on_subscribe(|_| no_pushes())),
+        discovering_config(20),
+    );
+    stock_slot(&fixture);
+    past_a_fetch_timeout().await;
+    store
+        .publish_snapshot(
+            LATER_PRINCIPAL,
+            publishable(snapshot(1, PermissionBits::bit(0))),
+        )
+        .expect("snapshot fixture matches its account and credential");
+    settle().await;
+    assert_eq!(admit_as(&fixture, LATER_PRINCIPAL), Ok(()));
+    assert!(*fixture.manager.ready().borrow(), "all: someone is served");
+    fixture.manager.shutdown().await;
+}
+
+/// A principal that stops answering after it was served holds up one sweep, by
+/// at most `fetch_timeout`. After that it is retried beside the refresh, keeps
+/// what it holds, and converges once the source answers.
+#[tokio::test(start_paused = true)]
+async fn a_held_principal_that_stops_answering_leaves_the_sweep() {
+    let store = two_account_store();
+    let fault = Fault::new(ANSWERS);
+    let fixture = spawn_with(
+        Arc::new(faulty(&store, &fault).on_subscribe(|_| no_pushes())),
+        SnapshotManagerConfig {
+            principals: three_principals(),
+            ..discovering_config(20)
+        },
+    );
+    stock_slot(&fixture);
+    settle().await;
+
+    fault.set(HANGS);
+    past_a_fetch_timeout().await;
+    for (status, expected) in [
+        (AccountStatus::Suspended, Err(DenyReason::AccountSuspended)),
+        (AccountStatus::Active, Ok(())),
+        (AccountStatus::Suspended, Err(DenyReason::AccountSuspended)),
+    ] {
+        AdminStore::set_account_status(&*store, ACCOUNT, status)
+            .await
+            .unwrap();
+        settle().await;
+        assert_eq!(admit_as(&fixture, LATER_PRINCIPAL), expected, "{status:?}");
+        assert_eq!(admit(&fixture), Ok(()), "still the held snapshot");
+    }
+
+    fault.set(ANSWERS);
+    past_a_fetch_timeout().await;
+    assert_eq!(admit(&fixture), Err(DenyReason::AccountSuspended));
+    // And the sweep covers it again.
+    AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Active)
+        .await
+        .unwrap();
+    settle().await;
+    assert_eq!(admit(&fixture), Ok(()));
+    fixture.manager.shutdown().await;
+}
+
+/// A held principal is retried at the cadence it was refreshed at; one with
+/// nothing is retried after the backoff.
+#[tokio::test(start_paused = true)]
+async fn retries_are_paced_by_whether_a_snapshot_is_held() {
+    for (initial, expected) in [(ANSWERS, 4..=7), (FAILS, 90..=101)] {
+        let store = two_account_store();
+        let fault = Fault::new(initial);
+        let fixture = spawn_with(
+            Arc::new(faulty(&store, &fault).on_subscribe(|_| no_pushes())),
+            SnapshotManagerConfig {
+                retry_backoff: std::time::Duration::from_millis(100),
+                ..discovering_config(1_700)
+            },
+        );
+        settle().await;
+        fault.set(FAILS);
+        let before = fault.calls();
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        let calls = fault.calls() - before;
+        assert!(expected.contains(&calls), "{initial}: {calls} calls");
+        fixture.manager.shutdown().await;
+    }
+}
+
+/// A push naming a principal that is waiting out its backoff brings its retry
+/// forward.
+#[tokio::test(start_paused = true)]
+async fn a_push_brings_an_unanswered_principals_retry_forward() {
+    let store = two_account_store();
+    let fault = Fault::new(FAILS);
+    let fixture = spawn_with(
+        Arc::new(faulty(&store, &fault)),
+        SnapshotManagerConfig {
+            retry_backoff: std::time::Duration::from_secs(600),
+            ..push_only_config()
+        },
+    );
+    stock_slot(&fixture);
+    settle().await;
+    fault.set(ANSWERS);
+    settle().await;
+    assert_eq!(fault.calls(), 1, "nothing is due yet");
+
+    store
+        .publish_snapshot(PRINCIPAL, publishable(snapshot(2, PermissionBits::bit(0))))
+        .expect("snapshot fixture matches its account and credential");
+    settle().await;
+    assert_eq!(admit(&fixture), Ok(()));
+    assert_eq!(fault.calls(), 2);
+    fixture.manager.shutdown().await;
+}
+
+/// A lagged push stream may have dropped the push that would have brought a
+/// retry forward, so lag recovery retries at once.
+#[tokio::test(start_paused = true)]
+async fn lag_recovery_retries_an_unanswered_principal_at_once() {
+    let store = two_account_store();
+    let fault = Fault::new(FAILS);
+    let (pushes, _) = tokio::sync::broadcast::channel(8);
+    let subscribers = pushes.clone();
+    let fixture = spawn_with(
+        Arc::new(faulty(&store, &fault).on_subscribe(move |_| subscribers.subscribe())),
+        SnapshotManagerConfig {
+            retry_backoff: std::time::Duration::from_secs(600),
+            ..push_only_config()
+        },
+    );
+    stock_slot(&fixture);
+    settle().await;
+    fault.set(ANSWERS);
+    // Sent without yielding, so the eight-slot channel overflows.
+    for _ in 0..9 {
+        pushes
+            .send(SnapshotPush {
+                principal: LATER_PRINCIPAL,
+                resolution: SnapshotResolution::Unknown,
+            })
+            .expect("the manager is subscribed");
+    }
+    settle().await;
+    assert_eq!(admit(&fixture), Ok(()));
+    fixture.manager.shutdown().await;
+}
+
+/// One scripted pull.
+#[derive(Clone)]
+enum Step {
+    Answer(SnapshotResolution),
+    Fail,
+    /// Answer once the test releases it.
+    Gated(SnapshotResolution),
+}
+
+/// A source whose pulls follow a script and then never answer, so no later read
+/// can paper over an applied stale answer. Pushes are the test's.
+struct Scripted {
+    source: Arc<DelegatingStore<RejectingStore>>,
+    pushes: tokio::sync::broadcast::Sender<SnapshotPush>,
+    release: Arc<tokio::sync::Notify>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl Scripted {
+    fn new(script: impl IntoIterator<Item = Step>) -> Self {
+        let script: Arc<Vec<Step>> = Arc::new(script.into_iter().collect());
+        let (pushes, _) = tokio::sync::broadcast::channel(8);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = {
+            let (subscribers, release, calls) =
+                (pushes.clone(), Arc::clone(&release), Arc::clone(&calls));
+            rejecting("a scripted fixture answers snapshots and nothing else")
+                .on_subscribe(move |_| subscribers.subscribe())
+                .on_principals(|_| async { Ok(None) })
+                .on_snapshot(move |_, _| {
+                    let step = script.get(calls.fetch_add(1, Ordering::AcqRel)).cloned();
+                    let release = Arc::clone(&release);
+                    async move {
+                        match step {
+                            Some(Step::Answer(resolution)) => Ok(resolution),
+                            Some(Step::Fail) => Err(StoreError("scripted failure".into())),
+                            Some(Step::Gated(resolution)) => {
+                                release.notified().await;
+                                Ok(resolution)
+                            }
+                            None => std::future::pending().await,
+                        }
+                    }
+                })
+        };
+        Scripted {
+            source: Arc::new(source),
+            pushes,
+            release,
+            calls,
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Acquire)
+    }
+
+    fn push(&self, resolution: SnapshotResolution) {
+        self.pushes
+            .send(SnapshotPush {
+                principal: PRINCIPAL,
+                resolution,
+            })
+            .expect("the manager is subscribed");
+    }
+}
+
+/// A push applied while a retry is in flight is newer than that read, so the
+/// read's answer is discarded: here, an absence that would otherwise withdraw
+/// what the push delivered.
+#[tokio::test(start_paused = true)]
+async fn a_push_overtakes_a_retry_of_a_held_principal() {
+    let scripted = Scripted::new([
+        Step::Answer(present(1)),
+        Step::Fail,
+        Step::Gated(SnapshotResolution::Unknown),
+    ]);
+    let fixture = spawn_with(
+        scripted.source.clone(),
+        SnapshotManagerConfig {
+            fetch_timeout: std::time::Duration::from_secs(3_600),
+            ..push_only_config()
+        },
+    );
+    stock_slot(&fixture);
+    // The first sweep fails, and the retry an interval later is held open.
+    tokio::time::sleep(std::time::Duration::from_secs(1_201)).await;
+    assert_eq!(scripted.calls(), 3, "the retry is in flight");
+
+    scripted.push(present(2));
+    settle().await;
+    scripted.release.notify_one();
+    settle().await;
+    assert_eq!(admit(&fixture), Ok(()));
+    fixture.manager.shutdown().await;
+}
+
+/// A push naming a principal whose first read is being retried discards that
+/// read: what it answers may predate the push, so the principal is read again.
+#[tokio::test(start_paused = true)]
+async fn a_push_overtakes_a_retry_of_an_unresolved_principal() {
+    let scripted = Scripted::new([Step::Fail, Step::Gated(present(1))]);
+    let fixture = spawn_with(scripted.source.clone(), push_only_config());
+    stock_slot(&fixture);
+    settle().await;
+    assert_eq!(scripted.calls(), 2, "the retry is in flight");
+
+    scripted.push(present(2));
+    settle().await;
+    scripted.release.notify_one();
+    settle().await;
+    assert_eq!(admit(&fixture), Err(DenyReason::UnknownPrincipal));
+    assert_eq!(scripted.calls(), 3, "read again at once");
+    fixture.manager.shutdown().await;
+}
+
+/// A tombstone's recheck that never answers runs beside the loop too.
+#[tokio::test(start_paused = true)]
+async fn a_hanging_recheck_does_not_hold_back_the_others() {
+    let store = two_account_store();
+    store.remove_snapshot(PRINCIPAL);
+    let fault = Fault::new(ANSWERS);
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let fixture = spawn_clocked(
+        Arc::new(faulty(&store, &fault).on_subscribe(|_| no_pushes())),
+        &clock,
+        SnapshotManagerConfig {
+            principals: three_principals(),
+            ..discovering_config(20)
+        },
+    );
+    stock_slot(&fixture);
+    settle().await;
+    fault.set(HANGS);
+    clock.set(t(3_600));
+    settle().await;
+    assert_eq!(fault.calls(), 2, "the recheck is in flight");
+
+    AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
+        .await
+        .unwrap();
+    settle().await;
+    assert_eq!(
+        admit_as(&fixture, LATER_PRINCIPAL),
+        Err(DenyReason::AccountSuspended)
+    );
+    // Shutdown does not wait for the read in flight.
+    let started = tokio::time::Instant::now();
+    fixture.manager.shutdown().await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }
