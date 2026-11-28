@@ -1942,6 +1942,54 @@ async fn shutdown_reports_released_leases() {
     assert_eq!(store.balance(ACCOUNT), CostUnits(10_000), "units came back");
 }
 
+/// A release the allocator fails, or never answers, is asked again by the
+/// running manager until it lands: the units return without a shutdown.
+#[tokio::test(start_paused = true)]
+async fn a_failed_release_is_retried_while_the_manager_runs() {
+    for hang in [false, true] {
+        let store = store(10_000);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&attempts);
+        let allocator = Arc::new(DelegatingStore::wrapping(store.clone()).on_release(
+            move |inner, lease, fence, unspent, now| {
+                let attempt = counted.fetch_add(1, Ordering::AcqRel);
+                async move {
+                    match attempt {
+                        0 | 1 if hang => std::future::pending().await,
+                        0 | 1 => Err(StoreError("release outage".into()).into()),
+                        _ => inner.release(lease, fence, unspent, now).await,
+                    }
+                }
+            },
+        ));
+        let slot = LeaseSlot::for_account(ACCOUNT);
+        let manager = LeaseManager::spawn(
+            allocator,
+            Arc::clone(&slot),
+            Arc::new(ManualClock::new(t(0))),
+            LeaseManagerConfig {
+                store_call_timeout: std::time::Duration::from_millis(10),
+                ..manager_config()
+            },
+        )
+        .unwrap();
+        settle().await;
+        let first = slot.load().expect("a lease is installed");
+        first.try_debit(CostUnits(800), t(0)).unwrap();
+        drop(first);
+        settle().await;
+
+        assert!(attempts.load(Ordering::Acquire) >= 3, "hang: {hang}");
+        assert_eq!(manager.counters().snapshot().released, 1);
+        assert_eq!(
+            store.balance(ACCOUNT),
+            CostUnits(8_200),
+            "the superseded lease's 200 unspent units are back (hang: {hang})"
+        );
+        manager.shutdown().await;
+    }
+}
+
 /// A hung release cannot stall shutdown, and what it could not return is
 /// reported rather than assumed settled (INVARIANTS.md GL-18).
 #[tokio::test(start_paused = true)]
@@ -2263,6 +2311,11 @@ async fn a_refused_batch_is_counted_lost_rather_than_retried_forever() {
         recorder.health().unaccounted,
         0,
         "a reported loss is a completed accounting outcome"
+    );
+    assert_eq!(
+        recorder.health().stats.lost,
+        1,
+        "the loss is visible while the writer runs, not only at shutdown"
     );
 
     // The queue keeps working: a later event is not stuck behind the refusal.

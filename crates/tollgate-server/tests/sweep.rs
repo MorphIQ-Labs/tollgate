@@ -793,6 +793,48 @@ async fn the_server_reclaims_expired_leases_on_its_interval() {
     );
 }
 
+/// Each tick reads the clock again: a lease and a budget boundary that come due
+/// while the server is running are settled and crossed by a later tick, with no
+/// restart.
+#[tokio::test]
+async fn work_that_falls_due_while_the_server_runs_is_done_by_a_later_tick() {
+    let inner = store_with_expired_lease();
+    AdminStore::set_budget_schedule(
+        &*inner,
+        ACCOUNT,
+        Some(tollgate_core::BudgetSchedule::monthly(CostUnits(500))),
+    )
+    .await
+    .unwrap();
+    inner
+        .acquire(ACCOUNT, CostUnits(400), SignedDuration::from_secs(60), t(0))
+        .await
+        .unwrap();
+
+    let state = Arc::new(SweepState::default());
+    let store = flaky(Arc::clone(&inner), &state);
+    let clock = Arc::new(tollgate_store::ManualClock::new(t(0)));
+    let (server, stop_tx) =
+        spawn_server(store, clock.clone(), std::time::Duration::from_millis(10)).await;
+    wait_for_cycles(&state, 3).await;
+    let before = inner.conservation(ACCOUNT).unwrap();
+    assert_eq!(before.active_lease_grants, CostUnits(400), "not yet due");
+    assert_eq!(inner.balance(ACCOUNT), CostUnits(600), "no boundary yet");
+
+    // 2026-02-14: past both the lease's expiry and the account's boundary.
+    clock.set(t(1_771_027_200));
+    // Two more completed cycles: the one in progress may predate the change.
+    wait_for_cycles(&state, state.cycles.load(Ordering::Acquire) + 3).await;
+    let _ = stop_tx.send(());
+    server.await.unwrap().unwrap();
+
+    let after = inner.conservation(ACCOUNT).unwrap();
+    assert_eq!(after.settlement_loss, CostUnits(400));
+    assert_eq!(after.active_lease_grants, CostUnits::ZERO);
+    assert_eq!(inner.balance(ACCOUNT), CostUnits(1_100));
+    assert!(after.holds(), "{after:?}");
+}
+
 /// A swept lease whose usage accounted for every unit forfeits nothing: that
 /// is an ordinary settlement, reported at `info` rather than as a warning.
 /// Ticks that settle nothing stay silent at every level.

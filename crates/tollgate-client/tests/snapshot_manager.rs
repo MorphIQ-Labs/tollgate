@@ -29,8 +29,8 @@ mod delegating;
 use delegating::{DelegatingStore, RejectingStore, rejecting};
 
 use tollgate_store::{
-    AccountConfig, GrantPolicy, MemoryStore, SnapshotPush, SnapshotResolution, SnapshotSource,
-    StoreError,
+    AccountConfig, AdminStore, GrantPolicy, MemoryStore, SnapshotPush, SnapshotResolution,
+    SnapshotSource, StoreError,
 };
 
 #[path = "support/snapshot_source.rs"]
@@ -123,14 +123,18 @@ fn base_store() -> Arc<MemoryStore> {
 /// Fund the account's slot directly so admission outcomes isolate snapshot
 /// behavior.
 fn stock_slot(fixture: &Fixture) {
+    stock(fixture, ACCOUNT, LeaseId(1));
+}
+
+fn stock(fixture: &Fixture, account: AccountId, lease_id: LeaseId) {
     drop(
         fixture
             .slots
-            .slot(ACCOUNT)
+            .slot(account)
             .replace(Arc::new(LocalLease::new(
                 LeaseGrant {
-                    lease_id: LeaseId(1),
-                    account_id: ACCOUNT,
+                    lease_id,
+                    account_id: account,
                     fencing_token: FencingToken(1),
                     units: CostUnits(1_000_000),
                     expires_at: t(100_000),
@@ -246,7 +250,8 @@ async fn push_update_propagates_permission_change() {
     store
         .publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))))
         .expect("snapshot fixture matches its account and credential");
-    let fixture = fixture(store.clone());
+    // The refresh is ten minutes away, so only the push can carry the change.
+    let fixture = spawn_with(store.clone(), push_only_config());
     stock_slot(&fixture);
     settle().await;
     assert_eq!(admit(&fixture), Ok(()));
@@ -260,34 +265,271 @@ async fn push_update_propagates_permission_change() {
     fixture.manager.shutdown().await;
 }
 
+/// A fixed set whose scheduled pulls are all far beyond the test, so a change
+/// observed within it arrived by push.
+fn push_only_config() -> SnapshotManagerConfig {
+    SnapshotManagerConfig {
+        principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
+        ..discovering_config(600_000)
+    }
+}
+
+/// A `MemoryStore` whose push stream is closed, as it is over HTTP: whatever an
+/// instance learns after its initial load, its own pulls fetched.
+fn pull_only(store: &Arc<MemoryStore>) -> Arc<DelegatingStore<MemoryStore>> {
+    Arc::new(DelegatingStore::wrapping(Arc::clone(store)).on_subscribe(|_| no_pushes()))
+}
+
+/// One instance of a pull-only deployment, serving two principals of
+/// [`ACCOUNT`] and one of [`OTHER_ACCOUNT`] from `clock`.
+fn pulling_instance(store: &Arc<MemoryStore>, clock: &Arc<ManualClock>) -> Fixture {
+    let map = Arc::new(ArcSwapSnapshotMap::new());
+    let engine = AdmissionEngine::new(Arc::clone(&map));
+    let slots = SlotRegistry::new();
+    let manager = SnapshotManager::spawn(
+        pull_only(store),
+        map,
+        Arc::clone(&slots),
+        clock.clone(),
+        SnapshotManagerConfig {
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL, LATER_PRINCIPAL, OTHER_PRINCIPAL]),
+            ..discovering_config(20)
+        },
+    )
+    .unwrap();
+    let fixture = Fixture {
+        engine,
+        slots,
+        manager,
+    };
+    stock_slot(&fixture);
+    stock(&fixture, OTHER_ACCOUNT, LeaseId(2));
+    fixture
+}
+
+const OTHER_ACCOUNT: AccountId = AccountId(2);
+const OTHER_PRINCIPAL: Principal = Principal(9);
+
+/// [`base_store`] plus a second account, each principal published at
+/// generation 1.
+fn two_account_store() -> Arc<MemoryStore> {
+    let store = base_store();
+    store.create_account(AccountConfig {
+        account_id: OTHER_ACCOUNT,
+        initial_balance: CostUnits(1_000_000),
+        status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
+    });
+    for principal in [PRINCIPAL, LATER_PRINCIPAL] {
+        store
+            .publish_snapshot(principal, publishable(snapshot(1, PermissionBits::bit(0))))
+            .expect("snapshot fixture matches its account and credential");
+    }
+    let mut other = AccountSnapshot::clone(&snapshot(1, PermissionBits::bit(0)));
+    other.account_id = OTHER_ACCOUNT;
+    store
+        .publish_snapshot(OTHER_PRINCIPAL, publishable(Arc::new(other)))
+        .expect("snapshot fixture matches its account and credential");
+    store
+}
+
+/// Revocation reaches every running instance through its own periodic refresh:
+/// the source sends no pushes. The account's other principal and another
+/// account are untouched. Coming back takes a newer generation, which the
+/// instance fetches when the tombstone's own TTL elapses and not before.
 #[tokio::test(start_paused = true)]
 async fn revocation_reaches_instances_via_refresh() {
-    let store = base_store();
-    store
-        .publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))))
-        .expect("snapshot fixture matches its account and credential");
-    let fixture = fixture(store.clone());
-    stock_slot(&fixture);
+    let store = two_account_store();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let instances = [
+        pulling_instance(&store, &clock),
+        pulling_instance(&store, &clock),
+    ];
     settle().await;
-    assert_eq!(admit(&fixture), Ok(()));
+    for instance in &instances {
+        assert_eq!(admit(instance), Ok(()));
+    }
 
-    // Key revoked at the source: within a refresh interval the instance
-    // denies and negative-caches.
     store.remove_snapshot(PRINCIPAL);
     settle().await;
-    assert_eq!(admit(&fixture), Err(DenyReason::UnknownPrincipal));
+    for instance in &instances {
+        assert_eq!(admit(instance), Err(DenyReason::UnknownPrincipal));
+        assert_eq!(admit_as(instance, LATER_PRINCIPAL), Ok(()));
+        assert_eq!(admit_as(instance, OTHER_PRINCIPAL), Ok(()));
+    }
 
-    // Generation 1 is older than the retained tombstone and cannot
-    // resurrect the key. A genuinely newer generation can.
+    // Generation 1 is older than the retained tombstone and cannot resurrect
+    // the key, even once the tombstone is rechecked.
     store
         .publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))))
         .expect("snapshot fixture matches its account and credential");
+    clock.set(t(3_600));
     settle().await;
-    assert_eq!(admit(&fixture), Err(DenyReason::UnknownPrincipal));
+    for instance in &instances {
+        assert_eq!(admit(instance), Err(DenyReason::UnknownPrincipal));
+    }
+
+    // A genuinely newer generation can, at the next recheck.
     store
         .publish_snapshot(PRINCIPAL, publishable(snapshot(2, PermissionBits::bit(0))))
         .expect("snapshot fixture matches its account and credential");
     settle().await;
+    for instance in &instances {
+        assert_eq!(
+            admit(instance),
+            Err(DenyReason::UnknownPrincipal),
+            "the refresh skips tombstones, so reinstatement waits for revoked_ttl"
+        );
+    }
+    clock.set(t(7_200));
+    settle().await;
+    for instance in instances {
+        assert_eq!(admit(&instance), Ok(()));
+        instance.manager.shutdown().await;
+    }
+}
+
+/// An account status change reaches every running instance through refresh
+/// alone, for every principal of the account and no other account's
+/// (INVARIANTS.md GL-22).
+#[tokio::test(start_paused = true)]
+async fn a_status_change_reaches_every_instance_through_refresh() {
+    let store = two_account_store();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let instances = [
+        pulling_instance(&store, &clock),
+        pulling_instance(&store, &clock),
+    ];
+    settle().await;
+
+    for (status, expected) in [
+        (AccountStatus::Suspended, Err(DenyReason::AccountSuspended)),
+        (AccountStatus::Active, Ok(())),
+    ] {
+        AdminStore::set_account_status(&*store, ACCOUNT, status)
+            .await
+            .unwrap();
+        settle().await;
+        for instance in &instances {
+            for principal in [PRINCIPAL, LATER_PRINCIPAL] {
+                assert_eq!(admit_as(instance, principal), expected, "{status:?}");
+            }
+            assert_eq!(admit_as(instance, OTHER_PRINCIPAL), Ok(()));
+        }
+    }
+    for instance in instances {
+        instance.manager.shutdown().await;
+    }
+}
+
+/// The bound on a status change one principal's pull cannot read — a stored row
+/// that changed but does not decode (`StatusChange::unreadable`). The instance
+/// keeps admitting it on the snapshot it holds, reported as a refresh failure,
+/// until that snapshot's `valid_until`; its readable sibling converges at the
+/// next refresh, and so does it once the row reads again (INVARIANTS.md GL-22).
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_principal_keeps_its_snapshot_until_expiry_or_repair() {
+    let store = two_account_store();
+    let unreadable = Arc::new(AtomicBool::new(false));
+    let source = {
+        let unreadable = Arc::clone(&unreadable);
+        Arc::new(
+            DelegatingStore::wrapping(Arc::clone(&store))
+                .on_subscribe(|_| no_pushes())
+                .on_snapshot(move |inner, principal| {
+                    let fails = principal == PRINCIPAL && unreadable.load(Ordering::Acquire);
+                    async move {
+                        if fails {
+                            return Err(StoreError("invalid stored snapshot".into()));
+                        }
+                        SnapshotSource::snapshot(&*inner, principal).await
+                    }
+                }),
+        )
+    };
+    let fixture = spawn_with(
+        source,
+        SnapshotManagerConfig {
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL, LATER_PRINCIPAL]),
+            ..discovering_config(20)
+        },
+    );
+    stock_slot(&fixture);
+    settle().await;
+    let admit_at = |principal, now| {
+        fixture
+            .engine
+            .begin(principal, PermissionBits::bit(0), now)
+            .map(drop)
+    };
+
+    unreadable.store(true, Ordering::Release);
+    AdminStore::set_account_status(&*store, ACCOUNT, AccountStatus::Suspended)
+        .await
+        .unwrap();
+    settle().await;
+
+    assert_eq!(
+        admit_at(LATER_PRINCIPAL, t(1)),
+        Err(DenyReason::AccountSuspended)
+    );
+    assert_eq!(admit_at(PRINCIPAL, t(99_999)), Ok(()), "still the old one");
+    assert_eq!(
+        admit_at(PRINCIPAL, t(100_000)),
+        Err(DenyReason::SnapshotExpired),
+        "and never past its validity"
+    );
+    assert!(fixture.manager.counters().snapshot().refresh_failures > 0);
+
+    unreadable.store(false, Ordering::Release);
+    settle().await;
+    assert_eq!(admit_at(PRINCIPAL, t(1)), Err(DenyReason::AccountSuspended));
+    fixture.manager.shutdown().await;
+}
+
+/// A source that is down at startup is retried on `retry_backoff`, not left to
+/// the refresh interval, and the instance becomes ready once it answers.
+#[tokio::test(start_paused = true)]
+async fn a_failed_initial_load_is_retried_until_the_source_answers() {
+    let (source, pulls) = MutableNoPushSource::new();
+    source.set(MutableMode::Failing);
+    let fixture = spawn_with(pulls.clone(), push_only_config());
+    stock_slot(&fixture);
+    settle().await;
+    assert!(!*fixture.manager.ready().borrow());
+    assert!(source.calls.load(Ordering::Acquire) > 2, "still retrying");
+
+    source.set(MutableMode::Present(snapshot(1, PermissionBits::bit(0))));
+    settle().await;
+    assert!(*fixture.manager.ready().borrow());
+    assert_eq!(admit(&fixture), Ok(()));
+    fixture.manager.shutdown().await;
+}
+
+/// A lagged push stream has lost messages for good, so the manager refetches
+/// every tracked principal, tombstones included. Nothing else could repair this
+/// here: the refresh and the tombstone's recheck are both far off.
+#[tokio::test(start_paused = true)]
+async fn a_lagged_push_stream_refetches_every_tracked_principal() {
+    let (source, pulls) = DrivenPushSource::new(SnapshotResolution::Revoked {
+        generation: Generation(9),
+    });
+    let fixture = spawn_with(pulls.clone(), push_only_config());
+    stock_slot(&fixture);
+    settle().await;
+    assert_eq!(admit(&fixture), Err(DenyReason::UnknownPrincipal));
+
+    let reinstated = SnapshotResolution::Present(publishable(snapshot(10, PermissionBits::bit(0))));
+    source.set_pull(reinstated.clone());
+    // Sent without yielding, so the manager cannot drain: the eight-slot
+    // channel overflows and drops the oldest, which names the principal. The
+    // rest name a principal this instance does not serve.
+    source.send(PRINCIPAL, reinstated);
+    for _ in 0..8 {
+        source.send(LATER_PRINCIPAL, SnapshotResolution::Unknown);
+    }
+    settle().await;
+
     assert_eq!(admit(&fixture), Ok(()));
     fixture.manager.shutdown().await;
 }
@@ -297,12 +539,13 @@ async fn unknown_principal_resolves_once_published() {
     // Nothing published yet: initial load negative-caches, readiness still
     // arrives (the principal is *resolved* — as unknown).
     let store = base_store();
-    let fixture = fixture(store.clone());
+    let fixture = spawn_with(store.clone(), push_only_config());
     stock_slot(&fixture);
     settle().await;
     assert_eq!(admit(&fixture), Err(DenyReason::UnknownPrincipal));
 
-    // Publication later is picked up by push/refresh.
+    // The push carries a later publication. Without one the recheck is the
+    // negative TTL's: `negative_ttl_retry_is_backed_off_and_recovers_without_push`.
     store
         .publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))))
         .expect("snapshot fixture matches its account and credential");
@@ -839,7 +1082,8 @@ async fn a_principal_published_after_start_is_discovered_and_served() {
     store
         .publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))))
         .expect("snapshot fixture matches its account and credential");
-    let fixture = discovering_fixture(store.clone());
+    // No pushes: only the periodic enumeration can reveal the new principal.
+    let fixture = spawn_with(pull_only(&store), discovering_config(20));
     stock_slot(&fixture);
     settle().await;
     assert_eq!(admit_as(&fixture, PRINCIPAL), Ok(()));
