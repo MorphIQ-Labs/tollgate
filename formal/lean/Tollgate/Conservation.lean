@@ -21,8 +21,11 @@ whole point of `topupBalance` is that no transition here ever moves it to
 Scope. Natural-number units and atomic transitions. The Rust is `u64` with
 checked arithmetic in both directions, and an overflow there answers `false`
 rather than wrapping, so the exact model and the implementation agree wherever
-the implementation does not refuse outright; overflow behaviour itself is an
-implementation obligation covered by tests, not by this file. Interleaving,
+the implementation does not refuse outright. `boundedWrite` models the one refusal
+this file states, the funding writers' bound on the funding total (#110), and
+`every_resting_place_fits` why that bound is enough; that the Rust and SQL
+apply it is an implementation obligation covered by tests, as is every other
+overflow behaviour. Interleaving,
 locking, and SQL are likewise out of scope: what is proved here is that the
 equation closes under each transition, not that the code performs them
 atomically.
@@ -411,6 +414,63 @@ total. -/
 theorem a_debit_up_to_the_cap_is_accepted (spent cap units : Nat) (fits : spent + units ≤ cap) :
     debit spent cap units = some (spent + units) := by
   simp [debit, fits]
+
+/-- A funding writer's guard (#110): the ledger a deposit, a rollover or an
+overage ingest would produce is written only when its funding total fits the
+store's unit domain. Bounding each column alone is not this guard: both terms
+can fit while their sum does not. -/
+def boundedWrite (ceiling : Nat) (next : Ledger) : Option Ledger :=
+  if next.funded ≤ ceiling then some next else none
+
+theorem an_admitted_write_stays_within_the_ceiling
+    (ceiling : Nat) (next written : Ledger) (accepted : boundedWrite ceiling next = some written) :
+    written = next ∧ written.funded ≤ ceiling := by
+  unfold boundedWrite at accepted
+  split at accepted
+  · rename_i within
+    injection accepted with same
+    subst same
+    exact ⟨rfl, within⟩
+  · exact absurd accepted (by simp)
+
+/-- The ceiling itself is reachable: nothing that fits is refused. -/
+theorem a_write_up_to_the_ceiling_is_admitted
+    (ceiling : Nat) (next : Ledger) (fits : next.funded ≤ ceiling) :
+    boundedWrite ceiling next = some next := by
+  simp [boundedWrite, fits]
+
+theorem a_write_past_the_ceiling_is_refused
+    (ceiling : Nat) (next : Ledger) (over : ceiling < next.funded) :
+    boundedWrite ceiling next = none := by
+  unfold boundedWrite
+  split
+  · omega
+  · rfl
+
+/-- Only the funding writers can move the total, so a ledger bounded when they
+wrote it stays bounded under every other transition. -/
+theorem other_transitions_leave_funding_unchanged
+    (l : Ledger) (a b used toAllowance toTopup lost units : Nat) (samePeriod : Bool) :
+    (acquire l a b).funded = l.funded ∧
+      (settle l used toAllowance toTopup lost samePeriod).funded = l.funded ∧
+      (straggle l units).funded = l.funded :=
+  ⟨rfl, rfl, rfl⟩
+
+/-- Why bounding the funding total is enough: on a ledger that holds, the
+spendable balance, the outstanding grants and the whole consumed total each fit
+the same ceiling, so no sum a reader takes over them can overflow. -/
+theorem every_resting_place_fits
+    (l : Ledger) (ceiling : Nat) (h : l.holds) (bounded : l.funded ≤ ceiling) :
+    l.balance + l.activeGrants ≤ ceiling ∧ l.settledUsage + l.loss + l.expired ≤ ceiling := by
+  simp only [Ledger.holds, Ledger.held] at h
+  omega
+
+/-- PostgreSQL needs no check of the total: its two funding columns are
+nonnegative `BIGINT`s, whose sum always fits `u64`. -/
+theorem two_bigint_columns_fit_the_unit_domain
+    (deposited overage : Nat) (d : deposited ≤ 2 ^ 63 - 1) (o : overage ≤ 2 ^ 63 - 1) :
+    deposited + overage ≤ 2 ^ 64 - 1 := by
+  omega
 
 /-- A refused quote the restored balance funds grows the grant to exactly it. -/
 theorem a_funded_need_is_granted (available sized needed : Nat)

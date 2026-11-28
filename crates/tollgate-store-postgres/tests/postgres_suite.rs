@@ -8430,3 +8430,97 @@ async fn repeating_operator_suspension_establishes_a_hold() {
     assert_eq!(view.status, AccountStatus::Suspended);
     assert_eq!(view.status_set_by, AdminAuthority::Operator);
 }
+
+/// A principal of `ACCOUNT` whose snapshot reads carry the ledger's budget.
+async fn publish_budget_reader(store: &PostgresStore) -> Principal {
+    let principal = Principal(0x110);
+    AdminStore::publish_snapshot(
+        store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            1,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+    principal
+}
+
+async fn read_budget(store: &PostgresStore, principal: Principal) -> tollgate_core::BudgetView {
+    let SnapshotResolution::Present(snapshot) = store.snapshot(principal).await.unwrap() else {
+        panic!("the snapshot must be present");
+    };
+    snapshot.budget.expect("the ledger holds the account")
+}
+
+/// #110, mirrored. Each funding column ends at `i64::MAX`, so the highest total
+/// this backend can store is `u64::MAX - 1`: it must read as a budget on every
+/// path that derives one, and every writer must refuse what its column cannot
+/// take.
+#[tokio::test]
+async fn funding_at_the_unit_ceiling_stays_readable_and_refuses_more() {
+    let _guard = DB_LOCK.lock().await;
+    let ceiling = u64::try_from(i64::MAX).unwrap();
+    let Some(store) = store_with_balance(full_grant_policy(), ceiling - 100).await else {
+        return;
+    };
+    let principal = publish_budget_reader(&store).await;
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(40)))
+        .await
+        .unwrap();
+    assert!(roll(&store, JAN + 1).await.is_some());
+    store
+        .ingest(&[overage_usage(ACCOUNT, 1, ceiling, 1)], t(JAN + 2))
+        .await
+        .unwrap();
+    AdminStore::deposit(&*store, ACCOUNT, CostUnits(60))
+        .await
+        .unwrap();
+
+    let full = store.conservation(ACCOUNT).await.unwrap().unwrap();
+    assert_eq!(full.deposited, CostUnits(ceiling));
+    assert_eq!(full.overage_recorded, CostUnits(ceiling));
+    assert!(full.holds(), "{full:?}");
+
+    assert_eq!(
+        AdminStore::deposit(&*store, ACCOUNT, CostUnits(1))
+            .await
+            .unwrap_err(),
+        AllocateError::BalanceOverflow
+    );
+    let refused = store
+        .ingest(&[overage_usage(ACCOUNT, 2, 1, 2)], t(JAN + 3))
+        .await;
+    assert!(
+        matches!(refused, Err(tollgate_store::IngestError::Refused(_))),
+        "{refused:?}"
+    );
+    assert!(
+        AdminStore::roll_due_periods(&*store, t(FEB), NonZeroUsize::new(64).unwrap())
+            .await
+            .is_err()
+    );
+    assert_eq!(store.conservation(ACCOUNT).await.unwrap().unwrap(), full);
+
+    let view = read_budget(&store, principal).await;
+    assert_eq!(view.balance, CostUnits(ceiling));
+    assert_eq!(view.consumed, Some(CostUnits(ceiling)));
+    // The reads taken inside a publication and a grant derive the same view.
+    AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            2,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+    store
+        .acquire(ACCOUNT, CostUnits(10), TTL, t(JAN + 4))
+        .await
+        .unwrap();
+}

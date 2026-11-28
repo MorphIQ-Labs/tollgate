@@ -88,7 +88,7 @@ name. See [`LeaseAllocator`](../crates/tollgate-store/src/traits.rs).
 | `account-not-provisioned` | 403 | a `provisioner` addressed an account an operator created | no — an operator administers it |
 | `operator-hold` | 403 | a `provisioner` tried to activate an account whose current status an operator set | no — only an operator lifts the hold |
 | `zero-deposit` | 400 | a deposit of zero units | no — deposit a positive amount |
-| `balance-overflow` | 422 | a deposit exceeds the backend's unit domain or would overflow the top-up balance or lifetime deposited total; nothing changes | never |
+| `balance-overflow` | 422 | a deposit exceeds the backend's unit domain or would overflow the top-up balance, the lifetime deposited total or the funding total (`deposited + overage_recorded`); nothing changes | never |
 | `unknown-credential` | 404 | no such credential for this account, including another account's key | no |
 | `credential-exists` | 409 | this `key_id` is already recorded | no — the first issuance succeeded; its secret is not disclosed again |
 | `active-key-limit` | 409 | the account already holds `max_active_keys` live credentials | after revoking one |

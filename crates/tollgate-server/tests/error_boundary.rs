@@ -117,7 +117,7 @@ async fn router_correlates_backend_failures_without_logging_request_or_error_pay
         &*store,
         AccountConfig {
             account_id: account,
-            initial_balance: CostUnits(u64::MAX),
+            initial_balance: CostUnits::ZERO,
             status: AccountStatus::Active,
             capacity_class: CapacityClass::BestEffort,
         },

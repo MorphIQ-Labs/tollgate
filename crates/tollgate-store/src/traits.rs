@@ -58,8 +58,10 @@ pub enum AllocateError {
     /// (`unspent + recorded usage > granted`) — a client accounting bug,
     /// surfaced rather than absorbed.
     InvalidRelease,
-    /// A deposit exceeds the backend's unit domain or would overflow its
-    /// top-up balance or lifetime deposited total. Nothing changes; do not retry.
+    /// A deposit exceeds the backend's unit domain, or would overflow the
+    /// account's top-up balance, lifetime deposited total or funding total
+    /// ([`Conservation::deposited`] plus [`Conservation::overage_recorded`]).
+    /// Nothing changes; do not retry.
     BalanceOverflow,
     /// A backend failure unrelated to domain rules; see [`StoreError`].
     Storage(StoreError),
@@ -189,6 +191,10 @@ pub struct AccountConfig {
 /// and credit extended ([`overage_recorded`](Self::overage_recorded)); the
 /// three resting places are unspent balance, capacity currently out on lease,
 /// and units already consumed or written off.
+///
+/// A store keeps the left side within [`CostUnits`]: every writer of a funding
+/// term refuses a total that does not fit, so on a ledger that holds, every
+/// term and every sum of resting places fits too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Conservation {
     /// Every unit ever deposited: the opening balance, top-ups, and periodic
@@ -1173,8 +1179,9 @@ pub trait AdminStore: Send + Sync {
     /// boundaries, raising its balance and its `deposited` total together.
     ///
     /// A missing account is [`AllocateError::UnknownAccount`]. An overflow of
-    /// either counter, or units outside the backend's numeric domain, is
-    /// [`AllocateError::BalanceOverflow`] and moves neither. Account
+    /// either counter or of the funding total, or units outside the backend's
+    /// numeric domain, is [`AllocateError::BalanceOverflow`] and moves
+    /// neither. Account
     /// status is not checked. The receipt carries
     /// [`AdminState::Funding`](crate::AdminState::Funding) before and after.
     async fn deposit(
@@ -1326,6 +1333,11 @@ pub trait AdminStore: Send + Sync {
     /// be crossed. That wait is bounded, so one held account cannot park the
     /// caller; what it could not cross is reported as
     /// [`RolloverBatch::deferred`].
+    ///
+    /// An allowance that would take an account's deposited counter or funding
+    /// total outside the backend's unit domain fails the call, and every call
+    /// that selects that account, before any account selected with it has
+    /// moved. Retrying cannot help; lowering or removing its schedule does.
     async fn roll_due_periods(
         &self,
         now: Timestamp,

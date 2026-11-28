@@ -11,13 +11,16 @@
 use std::sync::Arc;
 
 use proptest::prelude::*;
+use std::num::NonZeroUsize;
+
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CapacityClass, CostTable, CostUnits, Generation,
-    PermissionBits, Principal, PublishableSnapshot, ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, BudgetSchedule, CapacityClass, CostTable, CostUnits,
+    Generation, Period, PermissionBits, PolicyRevision, Principal, PublishableSnapshot, RequestId,
+    ResolvedLimits, UsageEvent, UsageSource,
 };
 use tollgate_store::{
     AccountConfig, AdminStore, GrantPolicy, MemoryStore, SetStatusError, SnapshotResolution,
-    SnapshotSource,
+    SnapshotSource, UsageSink,
 };
 
 fn snapshot(account: AccountId, status: AccountStatus) -> PublishableSnapshot {
@@ -132,6 +135,151 @@ proptest! {
                     );
                     last_generation[slot] = (*principal, current.generation);
                 }
+            }
+            Ok(())
+        })?;
+    }
+}
+
+/// An amount near the points where the funding total runs out, and small ones
+/// that make progress.
+fn funding_amount() -> impl Strategy<Value = u64> {
+    prop_oneof![
+        0u64..8,
+        (u64::MAX / 2 - 4)..(u64::MAX / 2 + 4),
+        (u64::MAX - 8)..=u64::MAX,
+    ]
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Funds {
+    Deposit(u64),
+    Overage(u64),
+    /// Schedule this allowance and cross the next month's boundary.
+    Allowance(u64),
+}
+
+fn any_funds() -> impl Strategy<Value = Funds> {
+    prop_oneof![
+        funding_amount().prop_map(Funds::Deposit),
+        funding_amount().prop_map(Funds::Overage),
+        funding_amount().prop_map(Funds::Allowance),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// #110: over any sequence of the funding writers, one is accepted exactly
+    /// when the funding total still fits `u64` afterwards (computed here in
+    /// `u128`), a refused one moves nothing, and the budget read succeeds and
+    /// reports the funding less what was consumed.
+    #[test]
+    fn no_funding_writer_takes_the_total_past_the_unit_domain(
+        opening in funding_amount(),
+        writes in prop::collection::vec(any_funds(), 1..16),
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime");
+        runtime.block_on(async {
+            let account = AccountId(1);
+            let principal = Principal(1);
+            let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+            AdminStore::create_account(
+                &*store,
+                AccountConfig {
+                    account_id: account,
+                    initial_balance: CostUnits(opening),
+                    status: AccountStatus::Active,
+                    capacity_class: CapacityClass::Assured,
+                },
+            )
+            .await
+            .unwrap();
+            AdminStore::publish_snapshot(&*store, principal, snapshot(account, AccountStatus::Active))
+                .await
+                .unwrap();
+
+            // Money in, credit extended, and the allowance currently unspent.
+            let (mut deposited, mut overage, mut allowance) = (u128::from(opening), 0u128, 0u128);
+            let mut expired = 0u128;
+            let mut month: jiff::Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
+            for (request, write) in writes.into_iter().enumerate() {
+                let fits = |units: u64| {
+                    deposited + overage + u128::from(units) <= u128::from(u64::MAX)
+                };
+                match write {
+                    Funds::Deposit(units) => {
+                        let accepted = fits(units);
+                        let result = AdminStore::deposit(&*store, account, CostUnits(units)).await;
+                        prop_assert_eq!(result.is_ok(), accepted, "{:?}", write);
+                        if accepted {
+                            deposited += u128::from(units);
+                        }
+                    }
+                    Funds::Overage(units) => {
+                        let accepted = fits(units);
+                        let event = UsageEvent::new(
+                            RequestId(request as u128),
+                            account,
+                            UsageSource::Overage,
+                            CostUnits(units),
+                            month,
+                            PolicyRevision::UNSTATED,
+                            None,
+                        );
+                        let result = store.ingest(&[event], month).await;
+                        prop_assert_eq!(result.is_ok(), accepted, "{:?}", write);
+                        if accepted {
+                            overage += u128::from(units);
+                        }
+                    }
+                    Funds::Allowance(units) => {
+                        let accepted = fits(units);
+                        AdminStore::set_budget_schedule(
+                            &*store,
+                            account,
+                            Some(BudgetSchedule::monthly(CostUnits(units))),
+                        )
+                        .await
+                        .unwrap();
+                        let pass = AdminStore::roll_due_periods(
+                            &*store,
+                            month,
+                            NonZeroUsize::new(8).unwrap(),
+                        )
+                        .await;
+                        prop_assert_eq!(
+                            pass.map(|batch| batch.len()).ok(),
+                            accepted.then_some(1),
+                            "{:?}",
+                            write
+                        );
+                        if accepted {
+                            deposited += u128::from(units);
+                            expired += allowance;
+                            allowance = u128::from(units);
+                        }
+                        month = Period::UtcCalendarMonth.end_after(month);
+                    }
+                }
+
+                let ledger = store.conservation(account).unwrap();
+                prop_assert!(ledger.holds(), "{:?}", ledger);
+                prop_assert_eq!(u128::from(ledger.deposited.get()), deposited);
+                prop_assert_eq!(u128::from(ledger.overage_recorded.get()), overage);
+                let SnapshotResolution::Present(read) =
+                    store.snapshot(principal).await.unwrap()
+                else {
+                    panic!("the snapshot stays published");
+                };
+                let view = read.budget.expect("the ledger holds the account");
+                prop_assert_eq!(
+                    u128::from(view.balance.get()),
+                    deposited - expired,
+                    "everything funded, less overage consumed and allowance expired"
+                );
             }
             Ok(())
         })?;

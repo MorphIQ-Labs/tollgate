@@ -2496,18 +2496,18 @@ async fn an_overage_replay_is_idempotent() {
 #[tokio::test]
 async fn overage_accounting_overflow_is_surfaced() {
     let store = store_with_balance(full_grant_policy(), 1_000).await;
-    // Fill the funding term to the top of its domain, which an accepted event
+    // Fill the funding total to the top of its domain, which an accepted event
     // is allowed to do.
     assert_eq!(
         store
-            .ingest(&[overage_usage(ACCOUNT, 1, u64::MAX, 1)], t(1))
+            .ingest(&[overage_usage(ACCOUNT, 1, u64::MAX - 1_000, 1)], t(1))
             .await
             .unwrap()
             .accepted,
         1
     );
     let before = store.conservation(ACCOUNT).unwrap();
-    assert_eq!(before.overage_recorded, CostUnits(u64::MAX));
+    assert_eq!(before.overage_recorded, CostUnits(u64::MAX - 1_000));
 
     let error = store
         .ingest(&[overage_usage(ACCOUNT, 2, 1, 2)], t(2))
@@ -5499,4 +5499,135 @@ async fn repeating_operator_suspension_establishes_a_hold() {
         .unwrap();
     assert_eq!(view.status, AccountStatus::Suspended);
     assert_eq!(view.status_set_by, AdminAuthority::Operator);
+}
+
+/// A principal of `ACCOUNT` whose snapshot reads carry the ledger's budget.
+async fn publish_budget_reader(store: &MemoryStore) -> Principal {
+    let principal = Principal(0x110);
+    AdminStore::publish_snapshot(
+        store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            1,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+    principal
+}
+
+async fn read_budget(store: &MemoryStore, principal: Principal) -> BudgetView {
+    let SnapshotResolution::Present(snapshot) = store.snapshot(principal).await.unwrap() else {
+        panic!("the snapshot must be present");
+    };
+    snapshot.budget.expect("the ledger holds the account")
+}
+
+/// #110: each funding counter had room of its own, so deposits, allowances and
+/// overage could together take the funding total past `u64`, and the next
+/// budget read panicked. Every writer reaches the exact ceiling and none
+/// passes it.
+///
+/// Mirrored by name in the Postgres suite, whose columns cannot reach this
+/// total.
+#[tokio::test]
+async fn funding_at_the_unit_ceiling_stays_readable_and_refuses_more() {
+    let store = store_with_balance(full_grant_policy(), u64::MAX - 100).await;
+    let principal = publish_budget_reader(&store).await;
+    AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(40)))
+        .await
+        .unwrap();
+    assert!(roll(&store, JAN + 1).await.is_some());
+    store
+        .ingest(&[overage_usage(ACCOUNT, 1, 50, 1)], t(JAN + 2))
+        .await
+        .unwrap();
+    AdminStore::deposit(&*store, ACCOUNT, CostUnits(10))
+        .await
+        .unwrap();
+
+    let full = store.conservation(ACCOUNT).unwrap();
+    assert_eq!(full.deposited, CostUnits(u64::MAX - 50));
+    assert_eq!(full.overage_recorded, CostUnits(50));
+    assert!(full.holds(), "{full:?}");
+
+    // One more unit from each writer. Both counters still have room, so only
+    // the total refuses.
+    assert_eq!(
+        AdminStore::deposit(&*store, ACCOUNT, CostUnits(1))
+            .await
+            .unwrap_err(),
+        AllocateError::BalanceOverflow
+    );
+    let refused = store
+        .ingest(&[overage_usage(ACCOUNT, 2, 1, 2)], t(JAN + 3))
+        .await;
+    assert!(
+        matches!(refused, Err(tollgate_store::IngestError::Refused(_))),
+        "{refused:?}"
+    );
+    assert!(
+        store
+            .roll_due_periods(t(FEB), NonZeroUsize::new(64).unwrap())
+            .await
+            .is_err()
+    );
+    assert_eq!(store.conservation(ACCOUNT).unwrap(), full);
+
+    let view = read_budget(&store, principal).await;
+    assert_eq!(view.balance, CostUnits(u64::MAX - 50));
+    assert_eq!(view.consumed, Some(CostUnits(50)));
+    // The reads taken inside a publication and a grant derive the same view.
+    AdminStore::publish_snapshot(
+        &*store,
+        principal,
+        publishable(Arc::new(account_snapshot(
+            ACCOUNT,
+            2,
+            AccountStatus::Active,
+        ))),
+    )
+    .await
+    .unwrap();
+    store
+        .acquire(ACCOUNT, CostUnits(10), TTL, t(JAN + 4))
+        .await
+        .unwrap();
+}
+
+/// One batch's overage events share the funding total: the second sees the
+/// first, and the refusal leaves neither applied.
+#[tokio::test]
+async fn overage_in_one_batch_is_bounded_together() {
+    let store = store_with_balance(full_grant_policy(), u64::MAX - 10).await;
+    let before = store.conservation(ACCOUNT).unwrap();
+    let refused = store
+        .ingest(
+            &[
+                overage_usage(ACCOUNT, 1, 6, 1),
+                overage_usage(ACCOUNT, 2, 5, 1),
+            ],
+            t(1),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(tollgate_store::IngestError::Refused(_))),
+        "{refused:?}"
+    );
+    assert_eq!(store.conservation(ACCOUNT).unwrap(), before);
+
+    let exact = store
+        .ingest(
+            &[
+                overage_usage(ACCOUNT, 1, 6, 1),
+                overage_usage(ACCOUNT, 2, 4, 1),
+            ],
+            t(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact.accepted, 2);
+    assert!(store.conservation(ACCOUNT).unwrap().holds());
 }

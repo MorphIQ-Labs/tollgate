@@ -8860,3 +8860,27 @@ The catalogue is the limit of the claim. Nothing derives the list of mechanisms
 from the code: a new `select!` arm with no entry passes the gate. Counting arms
 or spawns would assert source text and would miss a mechanism that is neither,
 so adding the entry stays a review obligation.
+
+## The funding total is bounded by its writers (GH-110)
+
+Each funding counter was checked on its own, but `deposited + overage_recorded`
+was not, while `MemoryStore` derived every budget view from that sum under an
+`expect`. A deposit near `u64::MAX` followed by one unit of overage was
+accepted, and the next snapshot publication or read panicked. The conservation
+read answered "violated" for a ledger every operation had accepted. The
+existing witnesses each filled one counter, which is the case the per-counter
+checks cover.
+
+The bound is `deposited + overage_recorded <= u64::MAX`, the domain of
+`CostUnits`. It is the only bound needed: units are nonnegative and the
+conservation equation places the whole total in the resting places, so every
+sum a reader takes over them fits. `MemoryStore` keeps the two terms in a type
+whose mutators return `None` past the bound, so a writer cannot skip the check.
+PostgreSQL's columns are nonnegative `BIGINT`s, whose sum cannot reach the
+bound, so it needs no new check. A tighter total of `i64::MAX` there would have
+refused ledgers that already work, for no read that needs it.
+
+A rollover that meets the bound fails its call whole, as one that overflows a
+column does (GH-91). There is no wire, schema or request-path change. A ledger
+already past the bound could exist only inside a running `MemoryStore`, which
+persists nothing.

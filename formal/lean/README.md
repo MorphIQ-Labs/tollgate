@@ -92,6 +92,10 @@ This Lean package contains exact models for critical contracts:
   proves that billing overage without funding it, or discarding an allowance
   without recording its expiry, breaks the equation by exactly the omitted
   units. An accepted overage debit never carries the counter past its cap.
+  A funding write is admitted exactly when the funding total fits the unit
+  domain, no other modeled transition moves that total, and on a ledger that
+  holds, a bounded total bounds the balance, grants and consumed sums; two
+  nonnegative `BIGINT` funding columns always satisfy the `u64` bound.
 - `OveragePublication` models the observer-visible split between pending and
   committed overage and the publication marker around the reservation phase
   CAS. It proves an in-flight commit is never reported as refundable, stable

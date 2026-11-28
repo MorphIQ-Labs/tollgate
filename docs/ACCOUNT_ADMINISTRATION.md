@@ -73,6 +73,14 @@ The response reports both states, so a repeat is visibly a no-op:
 { "previous": null, "current": { "allowance": 500, … } }
 ```
 
+An account's lifetime funding (`deposited + overage_recorded`) is bounded: at
+most `u64::MAX`, and on PostgreSQL each of the two counters is also at most
+`i64::MAX`. A schedule whose next allowance would pass that bound is accepted,
+but the rollover pass that reaches it fails, and so does every later one: no
+account selected with it crosses its boundary. The server reports
+`budget rollover failed`; set a smaller allowance on that account, or clear its
+schedule.
+
 `"budget": null` clears the schedule. That is **not** the same as an allowance
 of zero: `null` means the balance does not expire, zero means the account is
 funded nothing each period. The `budget` field must be present:

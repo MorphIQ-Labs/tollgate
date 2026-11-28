@@ -121,10 +121,77 @@ pub(crate) struct Drawn {
     pub(crate) from_topup: CostUnits,
 }
 
+mod funding {
+    use tollgate_core::CostUnits;
+
+    /// The two funding terms of an account, whose sum always fits [`CostUnits`]
+    /// (INVARIANTS.md "Ledger roles").
+    ///
+    /// The fields are private to this module, so every writer of a funding
+    /// term obtains the new value from a method here, and each refuses a total
+    /// that does not fit. Bounding each counter alone is not enough: both can
+    /// fit while their sum does not (#110).
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct Funding {
+        deposited: CostUnits,
+        /// Unfunded units billed under elastic enforcement: the second funding
+        /// term of the conservation equation. Monotonic, like `deposited` and
+        /// `usage_recorded`; only a deposit settles it, and settling it does
+        /// not reduce it.
+        overage_recorded: CostUnits,
+    }
+
+    impl Funding {
+        pub(super) fn opening(deposited: CostUnits) -> Self {
+            Funding {
+                deposited,
+                overage_recorded: CostUnits::ZERO,
+            }
+        }
+
+        /// These terms after `units` more money in, or `None` if the counter
+        /// or the total would not fit.
+        pub(super) fn deposit(self, units: CostUnits) -> Option<Self> {
+            Self::bounded(self.deposited.checked_add(units)?, self.overage_recorded)
+        }
+
+        /// These terms after `units` more overage, or `None` if the counter
+        /// or the total would not fit.
+        pub(super) fn overage(self, units: CostUnits) -> Option<Self> {
+            Self::bounded(self.deposited, self.overage_recorded.checked_add(units)?)
+        }
+
+        fn bounded(deposited: CostUnits, overage_recorded: CostUnits) -> Option<Self> {
+            deposited.checked_add(overage_recorded)?;
+            Some(Funding {
+                deposited,
+                overage_recorded,
+            })
+        }
+
+        pub(super) fn deposited(self) -> CostUnits {
+            self.deposited
+        }
+
+        pub(super) fn overage_recorded(self) -> CostUnits {
+            self.overage_recorded
+        }
+
+        /// Everything the account was ever funded with.
+        pub(super) fn total(self) -> CostUnits {
+            self.deposited
+                .checked_add(self.overage_recorded)
+                .expect("every constructor bounds the funding total")
+        }
+    }
+}
+
+use funding::Funding;
+
 #[derive(Debug)]
 struct AccountRecord {
     balance: Balance,
-    deposited: CostUnits,
+    funding: Funding,
     /// The account's periodic allowance, if it has one. `None` keeps the
     /// manual-deposit behaviour the ledger has always had, and a rollover pass
     /// skips the account entirely — which is why this is an `Option` rather
@@ -156,11 +223,6 @@ struct AccountRecord {
     next_fence: u64,
     /// Usage accepted into the billing ledger.
     usage_recorded: CostUnits,
-    /// Unfunded units billed under elastic enforcement: the second funding
-    /// term of the conservation equation. Monotonic, like `deposited` and
-    /// `usage_recorded`; only a deposit settles it, and settling it does not
-    /// reduce it.
-    overage_recorded: CostUnits,
     /// Billing lost at settlement: usage that had not arrived when a lease
     /// was released/reclaimed. Bounded by construction; reconciliation
     /// watches it.
@@ -190,10 +252,7 @@ impl AccountRecord {
     /// have caused. The PostgreSQL backend reads a database it does not
     /// exclusively own and reports the same condition as an error.
     fn budget_view(&self) -> BudgetView {
-        let funded = self
-            .deposited
-            .checked_add(self.overage_recorded)
-            .expect("an account cannot be funded past what it was funded with");
+        let funded = self.funding.total();
         let consumed = self
             .usage_recorded
             .checked_add(self.settlement_loss)
@@ -492,7 +551,7 @@ impl MemoryStore {
                     allowance: CostUnits::ZERO,
                     topup: config.initial_balance,
                 },
-                deposited: config.initial_balance,
+                funding: Funding::opening(config.initial_balance),
                 schedule: None,
                 period_start: Timestamp::UNIX_EPOCH,
                 expired: CostUnits::ZERO,
@@ -502,7 +561,6 @@ impl MemoryStore {
                 status_set_by: origin,
                 next_fence: 1,
                 usage_recorded: CostUnits::ZERO,
-                overage_recorded: CostUnits::ZERO,
                 settlement_loss: CostUnits::ZERO,
             },
         );
@@ -626,14 +684,14 @@ impl MemoryStore {
             .accounts
             .get_mut(&account)
             .ok_or(AllocateError::UnknownAccount)?;
-        // Both sums are computed before either lands, the rule `acquire`
-        // states and `set_account_status` splits into plan/apply. Assigning
-        // as they were computed left the ledger permanently short when the
-        // second overflowed: conservation keeps `balance <= deposited`, so
-        // `deposited` reaches the ceiling first, and a refused top-up on a
-        // fully-spent account still credited `balance` (GL-57). `PostgresStore`
-        // moves both columns in one statement, where an overflow aborts it
-        // and nothing moves.
+        // Every sum is computed before any lands, the rule `acquire` states
+        // and `set_account_status` splits into plan/apply. Assigning as they
+        // were computed left the ledger permanently short when a later one
+        // overflowed: the top-up balance never exceeds the funding total, so
+        // the funding side reaches the ceiling first, and a refused top-up on
+        // a fully-spent account still credited `balance` (GL-57).
+        // `PostgresStore` moves both columns in one statement, where an
+        // overflow aborts it and nothing moves.
         // A manual deposit is a top-up: it survives a period boundary, which
         // is the documented default (GL-97). An allowance only ever arrives
         // through `roll_period`.
@@ -642,20 +700,23 @@ impl MemoryStore {
             .topup
             .checked_add(units)
             .ok_or(AllocateError::BalanceOverflow)?;
-        let deposited = record
-            .deposited
-            .checked_add(units)
+        let funding = record
+            .funding
+            .deposit(units)
             .ok_or(AllocateError::BalanceOverflow)?;
         let before = AdminState::Funding {
             topup: record.balance.topup,
-            deposited: record.deposited,
+            deposited: record.funding.deposited(),
         };
         record.balance.topup = topup;
-        record.deposited = deposited;
+        record.funding = funding;
         Ok(AdminReceipt::new(
             (),
             before,
-            AdminState::Funding { topup, deposited },
+            AdminState::Funding {
+                topup,
+                deposited: funding.deposited(),
+            },
         ))
     }
 
@@ -747,8 +808,8 @@ impl MemoryStore {
                 .expect("used sum overflow");
         }
         Some(Conservation {
-            deposited: record.deposited,
-            overage_recorded: record.overage_recorded,
+            deposited: record.funding.deposited(),
+            overage_recorded: record.funding.overage_recorded(),
             balance: record.balance.total(),
             active_lease_grants: active_grants,
             settled_usage: record
@@ -1534,15 +1595,15 @@ impl AdminStore for MemoryStore {
             // unrolled for two months is entitled to what it has now, not to a
             // backlog.
             let expired = record.balance.allowance;
-            let deposited = record
-                .deposited
-                .checked_add(allowance)
-                .ok_or_else(|| StoreError(format!("deposit overflow for account {account_id}")))?;
+            let funding = record
+                .funding
+                .deposit(allowance)
+                .ok_or_else(|| StoreError(format!("funding overflow for account {account_id}")))?;
             let total_expired = record
                 .expired
                 .checked_add(expired)
                 .ok_or_else(|| StoreError(format!("expiry overflow for account {account_id}")))?;
-            planned.push((account_id, boundary, deposited, total_expired));
+            planned.push((account_id, boundary, funding, total_expired));
             rolled.push(RolledAccount {
                 account_id,
                 deposited: allowance,
@@ -1551,14 +1612,14 @@ impl AdminStore for MemoryStore {
         }
         let batch = RolloverBatch::try_new(rolled, limit)?;
 
-        for (rolled, (account_id, boundary, deposited, total_expired)) in
+        for (rolled, (account_id, boundary, funding, total_expired)) in
             batch.rolled().iter().zip(planned)
         {
             let record = inner
                 .accounts
                 .get_mut(&account_id)
                 .expect("planned from this map under the same lock");
-            record.deposited = deposited;
+            record.funding = funding;
             record.expired = total_expired;
             record.balance.allowance = rolled.deposited;
             record.period_start = boundary;
@@ -1704,8 +1765,8 @@ impl AdminStore for MemoryStore {
             schedule: record.schedule,
             period_start: record.period_start,
             conservation: Conservation {
-                deposited: record.deposited,
-                overage_recorded: record.overage_recorded,
+                deposited: record.funding.deposited(),
+                overage_recorded: record.funding.overage_recorded(),
                 balance: record.balance.total(),
                 active_lease_grants: active_grants,
                 settled_usage: record
@@ -1807,7 +1868,7 @@ impl UsageSink for MemoryStore {
         let mut accepted: Vec<UsageEvent> = Vec::new();
         let mut lease_used: HashMap<LeaseId, CostUnits> = HashMap::new();
         let mut usage_recorded: HashMap<AccountId, CostUnits> = HashMap::new();
-        let mut overage_recorded: HashMap<AccountId, CostUnits> = HashMap::new();
+        let mut funding: HashMap<AccountId, Funding> = HashMap::new();
         let mut settlement_loss: HashMap<AccountId, CostUnits> = HashMap::new();
         let mut planned: HashSet<tollgate_core::RequestId> = HashSet::new();
 
@@ -1841,31 +1902,34 @@ impl UsageSink for MemoryStore {
                 let recorded = *usage_recorded
                     .get(&event.account_id)
                     .unwrap_or(&record.usage_recorded);
-                let overage = *overage_recorded
-                    .get(&event.account_id)
-                    .unwrap_or(&record.overage_recorded);
+                let funded = *funding.get(&event.account_id).unwrap_or(&record.funding);
                 // Both terms must move or neither does, or the equation is
-                // left open (INVARIANTS.md GL-11). A total that cannot be
-                // represented is corruption of a monotonic column rather than
-                // a problem with this event, so it is surfaced as a store
-                // error and the whole batch fails — and because nothing has
-                // been applied yet, the batch fails whole.
-                let (Some(next_recorded), Some(next_overage)) = (
+                // left open (INVARIANTS.md GL-11). A counter or funding total
+                // that cannot be represented is a limit of the account's
+                // monotonic columns rather than a problem with this event, so
+                // it is surfaced as a store error and the whole batch fails —
+                // and because nothing has been applied yet, the batch fails
+                // whole.
+                let (Some(next_recorded), Some(next_funded)) = (
                     recorded.checked_add(event.units),
-                    overage.checked_add(event.units),
+                    funded.overage(event.units),
                 ) else {
                     // Refused, not unavailable: a monotonic column that cannot
                     // absorb these units will not absorb them on the next
                     // attempt either, so retrying this batch forever would
                     // wedge the writer behind an arithmetic fact (GL-61).
                     return Err(IngestError::Refused(StoreError(format!(
-                        "overage accounting overflow for account {:#034x}: recorded usage {} \
-                         and overage {} cannot absorb {}",
-                        event.account_id.0, recorded, overage, event.units
+                        "overage accounting overflow for account {:#034x}: recorded usage {}, \
+                         deposited {} and overage {} cannot absorb {}",
+                        event.account_id.0,
+                        recorded,
+                        funded.deposited(),
+                        funded.overage_recorded(),
+                        event.units
                     ))));
                 };
                 usage_recorded.insert(event.account_id, next_recorded);
-                overage_recorded.insert(event.account_id, next_overage);
+                funding.insert(event.account_id, next_funded);
                 planned.insert(event.request_id);
                 accepted.push(*event);
                 report.accepted += 1;
@@ -1974,12 +2038,12 @@ impl UsageSink for MemoryStore {
                 .expect("planned against an account that exists")
                 .usage_recorded = value;
         }
-        for (account_id, value) in overage_recorded {
+        for (account_id, value) in funding {
             inner
                 .accounts
                 .get_mut(&account_id)
                 .expect("planned against an account that exists")
-                .overage_recorded = value;
+                .funding = value;
         }
         for (account_id, value) in settlement_loss {
             inner

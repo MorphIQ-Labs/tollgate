@@ -408,7 +408,8 @@ boundaries.
 Request `DepositRequest`: `{"units": 1000}`. `204` with no body.
 
 Errors: `400 zero-deposit`, `404 unknown-account`. A deposit that would
-overflow the account's balance or deposited total is refused as
+overflow the account's balance, deposited total or funding total
+(`deposited + overage_recorded`, at most `u64::MAX`) is refused as
 `422 balance-overflow` and changes nothing. An amount outside the backend's
 unit domain is refused the same way (`u64` for memory, nonnegative `BIGINT`
 through `i64::MAX` for PostgreSQL). Never retry the unchanged request.

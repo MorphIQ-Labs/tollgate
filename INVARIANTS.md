@@ -623,11 +623,12 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    the whole batch with `IngestError::Refused`; a retry cannot recover capacity.
    Stored corruption and operational failures remain retryable store errors.
 
-   Deposits outside the backend's unit domain or overflowing either funding
-   counter return `AllocateError::BalanceOverflow`, mapped to HTTP
-   `422 balance-overflow`; the unchanged request must never be retried.
-   Both counters remain unchanged. Memory checks both sums before applying
-   either; PostgreSQL's single UPDATE rolls back on numeric overflow.
+   Deposits outside the backend's unit domain, or overflowing either deposit
+   counter or the funding total (*Ledger roles*), return
+   `AllocateError::BalanceOverflow`, mapped to HTTP `422 balance-overflow`;
+   the unchanged request must never be retried. Both counters remain
+   unchanged. Memory checks every sum before applying any; PostgreSQL's single
+   UPDATE rolls back on numeric overflow.
    Witnesses: `deposits_accept_the_unit_ceiling_and_refuse_overflow` and
    `a_refused_deposit_moves_neither_column` (both backends),
    `a_deposit_outside_bigint_is_a_permanent_refusal` (PostgreSQL), and
@@ -1904,6 +1905,28 @@ exists to detect corrupt state and must not be able to launder it.
 `rollover_preserves_conservation` and
 `unrecorded_expiry_always_breaks_conservation`.
 
+**The funding total fits the unit type.** For every account,
+`deposited + overage_recorded <= u64::MAX`, the range of `CostUnits`. Units are
+nonnegative integers, so on a ledger that holds, every bucket and every sum of
+buckets then fits too, and no budget read can overflow. Bounding each counter
+alone does not give this. Account creation starts within the bound, and the
+three writers that raise a funding term refuse a result outside it, or outside
+the backend's per-counter domain, moving nothing: a deposit with
+`BalanceOverflow` (7), an overage ingest by refusing its batch (7), and a
+rollover by failing the call (28). No other transition raises either term. In
+`MemoryStore` the two terms are private to a type whose only mutators check the
+total. `PostgresStore` stores each as a nonnegative `BIGINT`, so their sum is
+at most `u64::MAX - 1` and only the column bounds can refuse.
+*Proof:* `Tollgate.Conservation.a_write_up_to_the_ceiling_is_admitted`,
+`a_write_past_the_ceiling_is_refused`,
+`an_admitted_write_stays_within_the_ceiling`,
+`other_transitions_leave_funding_unchanged`, `every_resting_place_fits` and
+`two_bigint_columns_fit_the_unit_domain`.
+*Tests:* `no_funding_writer_takes_the_total_past_the_unit_domain`,
+`overage_in_one_batch_is_bounded_together`, and
+`funding_at_the_unit_ceiling_stays_readable_and_refuses_more` (both store
+suites, each at its backend's highest storable total).
+
 27. **A credential is durable before it is disclosed, and its digest table is
     a projection.** Credential lifecycle is control-plane state like every
     other: the durable record lives behind [`KeyDirectory`] and the verifier
@@ -2152,9 +2175,10 @@ exists to detect corrupt state and must not be able to launder it.
     `a_failure_after_commit_reports_the_observation_execution_received`.
 
     **Accounts crossed together move together or not at all.** An account whose
-    totals cannot absorb its allowance fails the call before any account
-    selected with it has moved: `MemoryStore` computes every total before it
-    writes one, and PostgreSQL crosses its page in one statement. *Tests:*
+    totals, including its funding total (*Ledger roles*), cannot absorb its
+    allowance fails the call before any account selected with it has moved:
+    `MemoryStore` computes every total before it writes one, and PostgreSQL
+    crosses its page in one statement. *Tests:*
     `a_rollover_that_cannot_complete_moves_no_account` (both store suites).
 
     This is rung 2 of the enforcement ladder: the store owns the crossing, the
