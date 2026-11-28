@@ -440,6 +440,22 @@ mod tests {
         assert_eq!(registry.retained_slots(), 2);
     }
 
+    /// The contention report walks these, so an account missing here is one an
+    /// operator cannot see.
+    #[test]
+    fn every_retained_slot_is_listed_with_its_account() {
+        let registry = SlotRegistry::with_sharding(LocalSharding::SINGLE);
+        assert!(registry.slots().is_empty());
+        let retained = [AccountId(2), AccountId(1)].map(|id| (id, registry.slot(id)));
+        let mut listed = registry.slots();
+        listed.sort_by_key(|(account, _)| account.0);
+        assert_eq!(listed.len(), retained.len());
+        for ((account, slot), (expected, original)) in listed.iter().zip(retained.iter().rev()) {
+            assert_eq!(account, expected);
+            assert!(Arc::ptr_eq(slot, original));
+        }
+    }
+
     #[tokio::test]
     async fn membership_wakes_once_per_publication_and_expires_at_its_exact_deadline() {
         use tollgate_admission::{ArcSwapSnapshotMap, SnapshotMap};
