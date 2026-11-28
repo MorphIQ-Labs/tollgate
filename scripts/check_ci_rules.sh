@@ -18,13 +18,13 @@ CONFIG="$ROOT/.github/workflows/ci.yml"
 WORKFLOWS="$ROOT/.github/workflows"
 
 # Blocking gates. Each must run on every pull request, whatever it targets.
-BLOCKING_GATES="formal mutation-shard"
+BLOCKING_GATES="formal mutation-shard witness-mutant-shard"
 
 # Required checks that summarise a sharded gate, as `<job>:<gate>`. Each runs
 # under `always()` and fails unless the gate's result is `success`, because
 # GitHub reports a job skipped behind a failed dependency as passing: an
 # aggregate without `always()` would go green exactly when a shard failed.
-AGGREGATES="mutation:mutation-shard"
+AGGREGATES="mutation:mutation-shard witness-mutants:witness-mutant-shard"
 
 # Timed measurements run locally. Compilation and allocation assertions still
 # belong in CI; a remote performance job must not silently restore the policy
@@ -141,6 +141,6 @@ if grep -E 'TOLLGATE_PERF_HOST' "$WORKFLOWS"/*.yml > /dev/null 2>&1; then
 fi
 
 if [ "$status" -eq 0 ]; then
-  echo "ci rules: OK (formal/mutation block every pull request; timed performance is local)"
+  echo "ci rules: OK (formal/mutation/witness mutants block every pull request; timed performance is local)"
 fi
 exit "$status"

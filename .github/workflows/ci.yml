@@ -1,6 +1,6 @@
 # Tollgate CI — Rust correctness, dependency advisories and licenses, backend
-# parity, performance compilation, mutation assurance, machine-checked proofs,
-# a secret scan, and the documentation site's build and link check.
+# parity, performance compilation, mutation and witness-mutant assurance,
+# machine-checked proofs, a secret scan, and the documentation site's build and link check.
 #
 # The toolchain comes from rust-toolchain.toml; rustup installs exactly that
 # pin, so CI and local builds cannot drift. Timed Criterion and loopback load
@@ -114,6 +114,9 @@ jobs:
       # The staged admission seam's contract must name every published seam
       # method before it ships (GL-126).
       - run: ./scripts/check_seam_contract.sh
+      # Every witness-mutant pattern still names exactly one site. This builds
+      # and runs no mutant; `assurance / witness-mutants` does that.
+      - run: ./scripts/check_witness_mutants.sh --verify
 
   secret-scan:
     name: check / secret-scan
@@ -423,6 +426,66 @@ jobs:
           shared-key: tools
           save-if: false
       - run: ./scripts/check_formal_mutants.sh
+
+  # Blocking assurance gate: each background mechanism (a sweep, a reload, a
+  # retry, an enumeration, a push, a bound on a hung call) is disabled by one
+  # source edit, and the tests named for it must fail. cargo-mutants does not
+  # delete a `select!` arm or substitute an argument, so the mutation gate
+  # below says nothing about these. Sharded for wall-clock time; each shard has
+  # its own Postgres service for the backend witnesses.
+  witness-mutant-shard:
+    name: assurance / witness-mutants shard ${{ matrix.shard }}/4
+    needs: [test, allocation-assertions, test-no-default-features, test-postgres, test-e2e, bench-compile, load-failure-reporting]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tollgate
+          POSTGRES_PASSWORD: tollgate
+          POSTGRES_DB: tollgate
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tollgate" --health-interval 2s
+          --health-timeout 5s --health-retries 30
+    env:
+      TOLLGATE_PG_URL: postgres://tollgate:tollgate@localhost:5432/tollgate
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: workspace
+          save-if: false
+      - run: ./scripts/check_witness_mutants.sh --shard "$SHARD/4"
+        env:
+          SHARD: ${{ matrix.shard }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: witness-mutant-report-${{ matrix.shard }}
+          path: reports/witness-mutants
+
+  # The required check, as `assurance / mutation` is for its shards.
+  witness-mutants:
+    name: assurance / witness-mutants
+    needs: [witness-mutant-shard]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: every shard passed
+        run: |
+          if [ "$RESULT" != "success" ]; then
+            echo "witness-mutant shards finished as '$RESULT'; see each shard's witness-mutant-report artifact" >&2
+            exit 1
+          fi
+        env:
+          RESULT: ${{ needs.witness-mutant-shard.result }}
 
   # Blocking assurance gate: diff-scoped mutation testing, including the
   # Postgres backend, split into shards so a large diff finishes inside the
