@@ -8,6 +8,27 @@ and the GitHub release from that section.
 
 ## [Unreleased]
 
+## [0.34.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.33.0...v0.34.0) - 2026-11-28
+
+### Added
+
+- *(axum)* #81 read the budget estimate without abandoning an admission context (#97)
+
+### Fixed
+
+- *(postgres)* [**breaking**] #101 keep a cancelled begin from stranding later writes, on sqlx 0.9 (#99)
+- *(store)* #91 cross a memory rollover batch whole or not at all, and kill the sweep survivors (#116)
+- *(postgres)* #80 cross a budget boundary on an account that is in use (#108)
+
+### Other
+
+- #103 gate that each background mechanism has a witness that fails without it (#128)
+- *(admission)* #123 wait for a new lost race before asserting one was counted (#124)
+- #83 witness convergence claims with production components alone (#104)
+- *(client)* #93 keep the recording benchmark inside its queue (#95)
+- #91 sweep the whole workspace for mutation survivors and coverage (#94)
+- #80 end-to-end scenarios for elastic overage, outages, partitions and TLS (#92)
+
 ## [0.33.0](https://github.com/MorphIQ-Labs/tollgate/compare/v0.32.2...v0.33.0) - 2026-11-27
 
 ### Fixed
