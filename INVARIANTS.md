@@ -1299,6 +1299,12 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `a_begun_budget_is_not_restarted_by_a_later_phase`, and
     `invalid_pool_config_is_rejected_before_connecting`.
 
+    `PostgresStore::roll_due_periods` bounds its own waiting for held account
+    rows with a transaction-local statement timeout, for callers that set no
+    deadline of their own, as the server's maintenance sweep does not (28). This
+    covers those waits only: the sweep's other store calls, reclaim's account
+    lock among them, carry no timeout of their own.
+
     `PeriodRoller` bounds each administrative rollover call and the entire
     multi-batch pass, including yields between batches. Each pass freezes one
     business-time cutoff; the next pass starts after a configured pause, so a
@@ -2013,10 +2019,34 @@ exists to detect corrupt state and must not be able to launder it.
     its row held almost continuously. `PostgresStore` takes the free rows of a
     page in one `SKIP LOCKED` statement and then crosses each account still
     behind in a statement of its own that queues for the row, holding no other
-    row lock while it waits. A row held indefinitely therefore holds the pass,
-    after every free account in the page has crossed. *Tests:*
-    `a_rollover_pass_queues_for_an_account_that_other_work_holds` and
-    `a_rollover_pass_crosses_the_free_accounts_before_waiting_for_a_held_one`.
+    row lock while it waits.
+
+    That wait is bounded (18): two seconds for one account and three for all of
+    a call's queued crossings, so a held row delays no other account's crossing
+    beyond that call. An account not crossed in time is unchanged, stays due and
+    is counted in `RolloverBatch::deferred`; the server and `PeriodRoller` warn
+    with the count, and `PeriodRoller` does not advance
+    `last_successful_cutoff` past a pass that left one. *Progress:* free
+    accounts in the page cross on every call. Each call starts its queue one
+    account further along than the last, so while the set of up to `batch_limit`
+    oldest accounts still due is unchanged, a replica queues first, for the full
+    two seconds, for each of them within that many calls. An account is
+    therefore crossed provided its row can be locked within that wait when its
+    turn comes. A row that never can be is not crossed, and is reported on every
+    pass; so is one behind more than `batch_limit` older accounts that are all
+    held. *Tests:*
+    `a_rollover_pass_queues_for_an_account_that_other_work_holds`,
+    `a_rollover_pass_crosses_the_free_accounts_before_waiting_for_a_held_one`,
+    `a_pass_gives_up_on_a_held_account_and_reports_it`,
+    `a_pass_bounds_its_waiting_across_held_accounts`,
+    `rotation_reaches_an_account_behind_ones_that_stay_held`,
+    `queued_crossings_stop_at_the_batch_limit`,
+    `a_configured_lock_timeout_defers_the_account_too`,
+    `a_failed_queued_crossing_is_an_error`,
+    `the_rollover_timeout_does_not_stay_on_the_connection`,
+    `a_cancelled_queued_crossing_leaves_no_open_transaction`,
+    `a_pass_with_a_deferred_account_does_not_claim_its_cutoff` and
+    `a_tick_reports_the_accounts_it_had_to_defer`.
 
     **Direct-store scheduling has an owner.** `PeriodRoller` runs an immediate
     startup pass and periodic bounded drains through `AdminStore`. It owns no

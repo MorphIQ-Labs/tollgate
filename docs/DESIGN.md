@@ -8623,6 +8623,7 @@ and the repair is publishing a valid snapshot above the new generation
 (INVARIANTS GL-22). Having the source answer such a row with a withdrawal would
 close the window at the price of denying on corruption that today leaves the
 instance serving; it is not decided here.
+
 ## Sustained load, and a boundary without a clock seam (GH-80, 2026-11-27)
 
 The only budget period is a UTC calendar month, and every process reads the
@@ -8669,12 +8670,29 @@ and the boundary test is repeated on the row it gets. Replacing `SKIP LOCKED`
 outright was not taken: the page locks several accounts in boundary order while
 ingest and reclaim lock them in account order, so waiting inside it could
 deadlock. Backing off a refused refill would lower contention without
-guaranteeing a crossing. The cost is one indexed query per period on a tick
-whose page is partial, and that a row held indefinitely now stalls the pass, as
-it already stalls any ingest or reclaim touching that account.
+guaranteeing a crossing.
+
+The queueing is bounded, since the server's sweep sets no deadline and a session
+holding a row for good would otherwise park reclaim behind it. The bound is a
+`statement_timeout` set in the same query message as the crossing.
+`lock_timeout` restarts each time a waiter follows an updated row to its next
+version, so it does not bound the statement. A client-side `BEGIN` would carry
+the setting too, but cancelling one can return the connection to the pool inside
+a transaction (GH-101), and a client deadline would abandon a statement that may
+still commit. One message is one implicit transaction: the setting ends with it.
+It cannot bind parameters, so the statement's numbers and fixed names are
+written into it. An account left behind is counted on the batch and warned
+about, and each call starts its queue one account further on, so that rows held
+for good cannot keep the budget from one that comes free. The cost is one more
+indexed query per period on a tick whose page is partial, and up to three
+seconds added to a call that finds a held account. `PeriodRollerStats` gained no
+counter, which would break callers that build it; the batch's count and the
+warning carry the signal.
 
 The other `SKIP LOCKED` selection, expiry reclaim, locks expired lease rows,
-which only late usage from their holder contends, and waits for account rows.
+which only late usage from their holder contends. It then waits for their
+account rows with no timeout, as it did before: a held account with an expired
+lease can still park a sweep there.
 
 ## Earlier releases are built from their tags (GH-80, 2026-11-27)
 

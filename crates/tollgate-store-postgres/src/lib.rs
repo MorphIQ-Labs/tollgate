@@ -37,6 +37,8 @@ pub mod test_support;
 use instant::StoredInstant;
 use std::num::{NonZeroI64, NonZeroUsize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
@@ -995,15 +997,21 @@ const RECLAIM_DUE_LEASES_SQL: &str = "SELECT lease_id, account_id, granted, used
      LIMIT $3 FOR UPDATE SKIP LOCKED";
 
 /// Cross the boundary for the due accounts that `$selection` picks and locks.
+/// `$period` and `$boundary` are how the statement spells its two values:
+/// bound parameters, or format placeholders for a statement that cannot bind.
 macro_rules! cross_periods {
-    ($selection:literal) => {
+    ($period:literal, $boundary:literal, $selection:literal) => {
         concat!(
             "WITH due AS (
          SELECT account_id, allowance_balance AS prior, budget_allowance AS allowance,
                 period_start_us AS crossed_from
          FROM tollgate_accounts
          WHERE budget_allowance IS NOT NULL
-           AND budget_period = $1 AND period_start_us < $2
+           AND budget_period = ",
+            $period,
+            " AND period_start_us < ",
+            $boundary,
+            "
          ",
             $selection,
             "
@@ -1013,7 +1021,9 @@ macro_rules! cross_periods {
          expired = account.expired + due.prior,
          balance = account.balance - due.prior + due.allowance,
          allowance_balance = due.allowance,
-         period_start_us = $2
+         period_start_us = ",
+            $boundary,
+            "
      FROM due
      WHERE account.account_id = due.account_id
      RETURNING due.account_id, due.allowance, due.prior, due.crossed_from"
@@ -1061,8 +1071,11 @@ fn rolled_account(row: &sqlx::postgres::PgRow) -> Result<(i64, RolledAccount), S
 /// `the_rollover_sweep_reaches_its_index_instead_of_sorting_the_due_set`
 /// forbids (GL-65) — so the page is ordered in Rust instead, where it is bounded
 /// by the batch limit rather than by how many accounts are due.
-const DUE_PERIODS_SQL: &str =
-    cross_periods!("ORDER BY period_start_us LIMIT $3 FOR UPDATE SKIP LOCKED");
+const DUE_PERIODS_SQL: &str = cross_periods!(
+    "$1",
+    "$2",
+    "ORDER BY period_start_us LIMIT $3 FOR UPDATE SKIP LOCKED"
+);
 
 /// Accounts still behind their boundary, oldest first: what the page above left
 /// because something held the row.
@@ -1071,11 +1084,62 @@ const OVERDUE_ACCOUNTS_SQL: &str = "SELECT account_id FROM tollgate_accounts
        AND budget_period = $1 AND period_start_us < $2
      ORDER BY period_start_us LIMIT $3";
 
-/// One such account's crossing, waiting for its row. Autocommitted, so it holds
-/// no other row lock while it waits and cannot be part of a deadlock; the
-/// boundary test is re-applied to the row it eventually locks, so a pass that
-/// lost the race changes nothing.
-const OVERDUE_PERIOD_SQL: &str = cross_periods!("AND account_id = $3 FOR UPDATE");
+/// The longest one queued crossing may take, waiting included.
+const ROLLOVER_ROW_WAIT: Duration = Duration::from_secs(2);
+
+/// The longest one `roll_due_periods` call spends on queued crossings, however
+/// many accounts are held. Below [`PeriodRollerConfig`]'s default call timeout,
+/// and more than one row's wait so that a held account does not take it all.
+///
+/// [`PeriodRollerConfig`]: https://docs.rs/tollgate-client/latest/tollgate_client/struct.PeriodRollerConfig.html
+const ROLLOVER_QUEUE_BUDGET: Duration = Duration::from_secs(3);
+
+/// One held account's crossing, queued behind whatever holds its row for at most
+/// `timeout_ms`.
+///
+/// The bound is the database's own `statement_timeout`, which covers every wait
+/// the statement makes; `lock_timeout` restarts each time a waiter follows an
+/// updated row to its next version. Both statements travel in one query
+/// message, so PostgreSQL runs them in one implicit transaction: `SET LOCAL`
+/// ends with it, nothing is left on the pooled connection, and there is no
+/// client-side `BEGIN` for a cancelled call to abandon. Such a message cannot
+/// bind parameters, so the values are written in; each is a number, hex, or one
+/// of [`Period`]'s fixed names.
+///
+/// Autocommitted, it holds no other row lock while it waits and cannot be part
+/// of a deadlock. The boundary test is re-applied to the row it eventually
+/// locks, so a pass that lost the race changes nothing.
+fn queued_crossing_sql(
+    period: Period,
+    boundary_us: i64,
+    account: u128,
+    timeout_ms: u128,
+) -> String {
+    format!(
+        concat!(
+            "SET LOCAL statement_timeout = {timeout_ms}; ",
+            cross_periods!(
+                "'{period}'",
+                "{boundary_us}",
+                "AND account_id = decode('{account:032x}', 'hex') FOR UPDATE"
+            )
+        ),
+        timeout_ms = timeout_ms,
+        period = period.as_str(),
+        boundary_us = boundary_us,
+        account = account,
+    )
+}
+
+/// Whether the database gave up on a statement for time: `query_canceled`
+/// (which `statement_timeout` raises) or `lock_not_available` (a shorter
+/// `lock_timeout` the operator configured). Either way nothing was changed.
+fn gave_up_waiting(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .is_some_and(|code| code == "57014" || code == "55P03")
+}
 
 fn id_bytes(id: u128) -> Vec<u8> {
     id.to_be_bytes().to_vec()
@@ -1208,6 +1272,8 @@ pub struct PostgresStore {
     pool: PgPool,
     policy: GrantPolicy,
     push: broadcast::Sender<SnapshotPush>,
+    /// Which held account the next rollover pass queues for first.
+    rollover_turn: AtomicUsize,
 }
 
 /// Connection-pool bounds. Callers that hold background tasks open against
@@ -1284,7 +1350,12 @@ impl PostgresStore {
             .await
             .map_err(|e| StoreError(format!("migrate: {e}")))?;
         let (push, _) = broadcast::channel(PUSH_CHANNEL_CAPACITY);
-        Ok(Arc::new(PostgresStore { pool, policy, push }))
+        Ok(Arc::new(PostgresStore {
+            pool,
+            policy,
+            push,
+            rollover_turn: AtomicUsize::new(0),
+        }))
     }
 
     /// Broadcast a control-plane change to in-process subscribers. No
@@ -3126,6 +3197,8 @@ impl AdminStore for PostgresStore {
         let limit_i = i64::try_from(limit.get())
             .map_err(|_| StoreError(format!("rollover batch limit exceeds i64 range: {limit}")))?;
         let mut rolled = Vec::new();
+        let mut deferred = 0_usize;
+        let queue_deadline = Instant::now() + ROLLOVER_QUEUE_BUDGET;
         // One statement per period kind, because the boundary is a property of
         // the period: a weekly schedule and a monthly one are due at different
         // instants, and a single comparison could only be right for one of
@@ -3171,24 +3244,49 @@ impl AdminStore for PostgresStore {
             // asking for an exhausted account's next lease keep its row held
             // almost continuously. Skipping it again on every tick would
             // withhold the allowance from exactly the account waiting for it,
-            // so what is left is crossed one row at a time, queueing for each.
-            let overdue = sqlx::query_scalar::<_, Vec<u8>>(OVERDUE_ACCOUNTS_SQL)
+            // so what is left is crossed one row at a time, queueing for each
+            // within this call's budget.
+            let mut overdue = sqlx::query_scalar::<_, Vec<u8>>(OVERDUE_ACCOUNTS_SQL)
                 .bind(period.as_str())
                 .bind(boundary_us)
-                .bind(remaining - page)
+                .bind(limit_i)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(storage)?;
+            if overdue.is_empty() {
+                continue;
+            }
+            // Each pass starts one further along, so that a row held for good
+            // cannot always be the one the budget is spent on.
+            let turn = self.rollover_turn.fetch_add(1, Ordering::Relaxed) % overdue.len();
+            overdue.rotate_left(turn);
+            let mut room = remaining - page;
             for account in overdue {
-                let row = sqlx::query(OVERDUE_PERIOD_SQL)
-                    .bind(period.as_str())
-                    .bind(boundary_us)
-                    .bind(account)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(storage)?;
-                if let Some(row) = row {
-                    rolled.push(rolled_account(&row)?);
+                if room == 0 {
+                    break;
+                }
+                // Whole milliseconds, and never zero, which PostgreSQL reads
+                // as no timeout at all.
+                let wait = ROLLOVER_ROW_WAIT
+                    .min(queue_deadline.saturating_duration_since(Instant::now()))
+                    .as_millis();
+                if wait == 0 {
+                    deferred += 1;
+                    continue;
+                }
+                let statement = queued_crossing_sql(*period, boundary_us, id_from(&account), wait);
+                // Every result is read, so success is reported only after the
+                // implicit transaction has committed.
+                match sqlx::raw_sql(&statement).fetch_all(&self.pool).await {
+                    // No row: another pass crossed it while this one waited.
+                    Ok(rows) => {
+                        for row in &rows {
+                            rolled.push(rolled_account(row)?);
+                            room -= 1;
+                        }
+                    }
+                    Err(error) if gave_up_waiting(&error) => deferred += 1,
+                    Err(error) => return Err(storage(error)),
                 }
             }
         }
@@ -3200,10 +3298,11 @@ impl AdminStore for PostgresStore {
         // planner. Bounded by `limit`, not by how many accounts are due.
         rolled
             .sort_unstable_by_key(|(crossed_from, account)| (*crossed_from, account.account_id.0));
-        RolloverBatch::try_new(
+        Ok(RolloverBatch::try_new(
             rolled.into_iter().map(|(_, account)| account).collect(),
             limit,
-        )
+        )?
+        .deferring(deferred))
     }
 
     async fn set_account_status(
@@ -3632,6 +3731,7 @@ mod tests {
             pool,
             policy: GrantPolicy::default(),
             push,
+            rollover_turn: AtomicUsize::new(0),
         };
 
         assert!(store.ping().await.is_err());
