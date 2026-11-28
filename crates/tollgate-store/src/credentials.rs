@@ -542,6 +542,22 @@ mod tests {
         assert!(page(&[], &[1], Some(1), None).is_err());
         assert!(page(&[], &[2], Some(1), None).is_ok());
         assert!(page(&[1], &[1], None, None).is_err());
+        let wider = |withheld: u128| {
+            KeyPage::try_with_unreadable(
+                0,
+                now,
+                None,
+                NonZeroUsize::new(3).unwrap(),
+                (1..=3).map(key).collect(),
+                None,
+                UnreadableCredentials {
+                    key_ids: (4..4 + withheld).map(KeyId).collect(),
+                    unnamed: 0,
+                },
+            )
+        };
+        assert!(wider(3).is_ok());
+        assert!(wider(4).is_err());
     }
 
     #[test]

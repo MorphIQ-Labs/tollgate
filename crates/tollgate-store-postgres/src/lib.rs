@@ -768,9 +768,11 @@ impl tollgate_store::KeySource for PostgresStore {
         } else {
             0
         };
-        if unnamed > 0 {
+        let unnamed = u64::try_from(unnamed)
+            .map_err(|_| StoreError("credential row count is negative".into()))?;
+        if let Some(rows) = std::num::NonZeroU64::new(unnamed) {
             tracing::error!(
-                rows = unnamed,
+                rows = rows.get(),
                 "stored credentials have identifiers that are not 16 bytes; they are withheld from the feed"
             );
         }
@@ -815,8 +817,6 @@ impl tollgate_store::KeySource for PostgresStore {
             }
         }
         tx.commit().await.map_err(storage)?;
-        let unnamed = u64::try_from(unnamed)
-            .map_err(|_| StoreError("credential row count is negative".into()))?;
         page.finish(revision, now, unnamed)
     }
 }

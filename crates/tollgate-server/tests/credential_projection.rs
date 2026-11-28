@@ -91,6 +91,8 @@ async fn only_instances_receive_active_keys_at_the_server_clock_without_caching(
         assert_eq!(keys[1]["not_after"], json!(t(101)));
         assert!(keys[0].get("account_id").is_none() && keys[0]["key_id"] == json!(KeyId(1)));
         assert!(keys[0].get("secret").is_none());
+        // With nothing withheld the page keeps its original shape.
+        assert!(body.get("unreadable").is_none() && body.get("unnamed_unreadable").is_none());
     }
     let query = app
         .clone()
