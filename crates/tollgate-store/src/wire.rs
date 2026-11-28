@@ -321,9 +321,10 @@ pub struct SetCapacityClassRequest {
 pub struct SetStatusResponse {
     /// Live snapshots republished with the new value; see [`StatusChange::republished`](crate::StatusChange::republished).
     pub republished: usize,
-    /// Rows that changed durably but could not be decoded well enough to push,
-    /// so those principals converge only at their next refresh. Always zero on
-    /// an in-memory backend.
+    /// Rows that changed durably but could not be decoded, so the change does
+    /// not reach those principals until a valid snapshot is published for them;
+    /// see [`StatusChange::unreadable`](crate::StatusChange::unreadable). Always
+    /// zero on an in-memory backend.
     pub unreadable: usize,
 }
 

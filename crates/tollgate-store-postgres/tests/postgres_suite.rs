@@ -3546,7 +3546,7 @@ async fn a_capacity_class_change_reports_rows_it_changed_but_could_not_push() {
     assert_eq!(
         pushed,
         vec![readable],
-        "only the decodable principal is pushed; the other waits for a refresh"
+        "only the decodable principal is pushed"
     );
 
     let SnapshotResolution::Present(snapshot) = store.snapshot(readable).await.unwrap() else {
@@ -3957,9 +3957,12 @@ async fn a_status_change_that_cannot_republish_moves_neither_record() {
 /// The republish deliberately does not fail whole over one corrupt credential:
 /// that row was already unreadable before the transition touched it, and
 /// refusing to suspend an account because of it is the worse outcome. But the
-/// row *did* change durably and got no push, so its principal converges only at
-/// the next refresh — which is exactly the "partial data is surfaced, never
-/// silently absorbed" case, and why `StatusChange::unreadable` exists.
+/// row *did* change durably, got no push, and no pull can read it until it is
+/// published again — which is exactly the "partial data is surfaced, never
+/// silently absorbed" case, and why `StatusChange::unreadable` exists. What an
+/// instance holding the old snapshot does meanwhile is witnessed by
+/// `an_unreadable_principal_keeps_its_snapshot_until_expiry_or_repair` in the
+/// client's snapshot-manager suite.
 ///
 /// Mutation testing is what caught this being untested: `unreadable += 1` could
 /// be flipped to `-=` or `*=` and every other scenario stayed green, because
@@ -4028,11 +4031,12 @@ async fn a_status_change_reports_rows_it_changed_but_could_not_push() {
     assert_eq!(
         pushed,
         vec![readable],
-        "only the decodable principal is pushed; the other waits for a refresh"
+        "only the decodable principal is pushed"
     );
 
     // The undecodable row still changed: it is suspended in the ledger's sense,
-    // and still refused on read for the reason it was refused before.
+    // and still refused on read for the reason it was refused before, so no
+    // refresh delivers the new status either.
     assert_eq!(
         status_of(&store, readable).await,
         (AccountStatus::Suspended, Generation(4))
@@ -4040,6 +4044,21 @@ async fn a_status_change_reports_rows_it_changed_but_could_not_push() {
     assert!(
         store.snapshot(undecodable).await.is_err(),
         "the corrupt row is still refused on read, as it was before the change"
+    );
+
+    // Publishing a valid snapshot above the restamped generation repairs it.
+    publish(
+        &store,
+        undecodable,
+        account_snapshot(ACCOUNT, 5, AccountStatus::Suspended),
+    )
+    .await;
+    let SnapshotResolution::Present(repaired) = store.snapshot(undecodable).await.unwrap() else {
+        panic!("the repaired snapshot must be readable");
+    };
+    assert_eq!(
+        (repaired.status, repaired.generation),
+        (AccountStatus::Suspended, Generation(5))
     );
 }
 

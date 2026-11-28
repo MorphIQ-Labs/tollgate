@@ -183,10 +183,13 @@ another account answers `404 unknown-credential` and revokes nothing. You
 cannot retire another customer's credential by guessing or mistyping an id.
 
 **Revoking a key is two calls.** Revocation retires the credential but leaves
-its bound snapshot in place. That is safe for authorization, because a revoked
-credential leaves the key projection and fails authentication. It is still a stale
-positive grant, so follow every revocation with
-`DELETE /v1/admin/accounts/{account}/keys/{key}/snapshot`.
+its bound snapshot in place. A new verification fails once an instance's next key
+refresh succeeds, but a session that had already verified the credential keeps
+being admitted until that proof's deadline (at most `max_age` after the fetch it
+came from), because the snapshot is still a positive grant. Follow every
+revocation with `DELETE /v1/admin/accounts/{account}/keys/{key}/snapshot`: it
+withdraws the grant, so warm sessions are refused at the next snapshot refresh
+too.
 
 Revocation is terminal and generation-ordered. It is **not** instant across a
 fleet: serving instances hold a projection and converge at their next refresh.

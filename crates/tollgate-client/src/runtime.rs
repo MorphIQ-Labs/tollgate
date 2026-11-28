@@ -311,8 +311,8 @@ pub struct RuntimeReport {
     /// dying.
     pub manager_restarts: u64,
     /// Summed across accounts: see [`AccountReport::unrecovered_grants`].
-    /// Nonzero is crash exposure — granted units that return only at TTL
-    /// reclaim (INVARIANTS.md 9).
+    /// Nonzero is crash exposure — granted units no release will return, which
+    /// TTL reclaim forfeits (INVARIANTS.md 9).
     pub unrecovered_grants: u64,
     /// Summed across accounts: see [`AccountReport::uncertain_acquires`].
     pub uncertain_acquires: u64,
@@ -1088,7 +1088,7 @@ impl Supervisor {
                 .expect("managed account")
                 .restart_after_death = true;
             tracing::error!(%account, unrecovered_grants = unresolved, uncertain_acquires = o.uncertain,
-                "lease manager died; unrecovered grants return only at TTL reclaim");
+                "lease manager died; TTL reclaim forfeits what is left of its unrecovered grants");
         }
         o.settled = o.settled.and_then(|old| old.checked_add(last));
         o.health = None;

@@ -168,8 +168,9 @@ accounting breaks it by exactly the omitted units.
    released while its usage events still sit in the writer's queue. A release
    credits only the claimed `unspent`; the gap `granted − used − unspent` is
    *provisional* loss, and a late event that fits inside it converts to
-   billed usage. Expired-lease reclaim credits the whole remainder, so its
-   stragglers never fit and stay rejected — no double-count either way.
+   billed usage. Expired-lease reclaim credits nothing and records the whole
+   remainder as the same provisional loss (GL-136), so its stragglers convert
+   it too — no double-count either way.
 3. **arc-swap beats moka for the snapshot map, ~5×** (13.9 ns vs 69.5 ns hit
    on the development laptop), confirming the thread's caution about moka's TinyLFU
    bookkeeping. Both stay behind `SnapshotMap`; the perf gate carries both,
@@ -686,11 +687,13 @@ sources. The [snapshot operations guide](SNAPSHOT_OPERATIONS.md) defines the
 counters, structured refusal fields and recovery procedure.
 
 **`refill.abandoned` above zero.** Leases a shutdown budget could not return
-to the allocator. Their units are stranded until TTL reclaim (INVARIANTS GL-9) —
-bounded, not lost, but capacity is unavailable meanwhile. Like
-`accounting.lost` this can only move at shutdown, so it is a post-mortem
-number: a rising count across restarts means `shutdown_release_deadline` is
-too tight for the allocator's real latency.
+to the allocator. TTL reclaim forfeits their unspent units as settlement loss
+(INVARIANTS GL-9) — bounded by what the instance held, but gone from the
+account's spendable balance unless late usage bills against it. A rising count
+across restarts means `shutdown_release_deadline` is too tight for the
+allocator's real latency. A rise on a running instance is different: the
+allocator refused a release as inconsistent with the grant, and readiness
+drops.
 
 **`/readyz` false while every task is alive.** Not a crash: either the lease
 is unusable (expired, or exhausted) or the snapshot set is stale. This is
@@ -726,8 +729,17 @@ scope, a different blast radius, and a different answer to "can I undo it".
 | Close an account | same, `{"status":"Closed"}` | the account | as above, denied `account_closed` | as above | **no — terminal** |
 | Revoke one credential | `DELETE /v1/admin/snapshots/{principal}` | one principal | that credential denies `unknown_principal`; its siblings keep serving | same bound; carries the GL-15 generation watermark | republish at a higher generation |
 
+The refresh bound holds when the instance's pull succeeds. While it fails — a
+source outage, a partition — the instance keeps the snapshot it holds until that
+snapshot's `valid_until`, counting each failure, and the next successful pull
+applies the change.
+
 The status change answers with what it did — `republished`, and `unreadable`
-for rows that changed durably but could not be decoded to push. `republished: 0`
+for rows that changed durably but could not be decoded. Neither a push nor a
+pull delivers the change for an unreadable row: an instance holding that
+principal's earlier snapshot keeps admitting on it until its `valid_until`
+(leases are refused for the account regardless), and publishing a valid snapshot
+above the new generation repairs it. `republished: 0`
 is the one worth reading: the account had no live snapshot to change, so it has
 no credentials, or they are all revoked, or the call was a repeat. Any of those
 is better learned at the call than from a later denial.
@@ -902,7 +914,8 @@ and fences outstanding reads; reopening requires a new authoritative source
 read. Source tombstones remain durable. Negative validity expiry
 schedules a targeted pull with retry backoff; it does not wait for a longer
 full-refresh interval and works over HTTP's explicitly closed push stream. A
-crashed instance strands quota at most until lease TTL. Immediate
+crashed instance forfeits at most what its leases held, settled after each
+lease's TTL and reclaim grace. Immediate
 global revocation and durable-before-response accounting would require
 synchronous coordination per request — a separate strict-accounting mode
 could accept that cost, and nothing in the trait surface precludes it, but it
@@ -1051,8 +1064,8 @@ standalone `Arc<AtomicU64>` did not have.
 `lost` is the number that matters for billing integrity, and it stays zero for
 a healthy-but-cut-off process's entire life: the steady-state path retries a
 failing sink forever, so nothing is declared lost until the final flush gives
-up. Told to "watch `lost`", an operator would be watching a counter that can
-only move at shutdown. The runtime signals are the age of the last successful
+up. Told to "watch `lost`", an operator would be watching a counter that,
+through an outage, can only move at shutdown. The runtime signals are the age of the last successful
 ingest, a queue depth approaching its capacity, and `rejected` — events the
 sink has already refused, which is bounded billing loss reconciliation is meant
 to catch. This is the substance GL-39 has to convey.
@@ -2503,12 +2516,11 @@ and settles one usage event.
 **Why the billing statement reads the phase.** `Reservation::usage_event`
 selects `UsageSource` from the terminal phase, not from the funding receipt,
 and that is load-bearing. A fallback happens *because* the lease's window
-lapsed, so the allocator reclaims that lease shortly afterwards — and
-`MemoryStore::ingest` rejects a `Leased` event naming a reclaimed lease,
-because the reclaim already credited its full remainder and the units would
-otherwise double-count. Billing a fallback against its receipt would therefore
-drop the charge for work that ran, silently, on the exact path elastic mode
-exists to serve. `Reservation::is_overage` was renamed `admitted_as_overage`
+lapsed, so that lease is settled shortly afterwards, and the receipt's units
+have already gone back to it. A leased bill would claim units the settlement
+accounts for: rejected against a release's credit, silently dropping the charge
+for work that ran on the exact path elastic mode exists to serve, or booked
+against a reclaim's forfeit the fallback did not cause. `Reservation::is_overage` was renamed `admitted_as_overage`
 to stop the two questions sharing one name: it answers what *admission* found,
 which is what the `admitted_overage` counter qualifier needs, while the billing
 statement is the event's own source.
@@ -8587,3 +8599,27 @@ denial and the queue's own `shed` count are unchanged. Embedders that reserve
 beside the context keep working and keep the double count until they adopt the
 method.
 
+## Convergence witnesses are proven by removing the mechanism (GH-83, 2026-11-27)
+
+Each background mechanism behind a convergence, refresh, recovery or expiry
+claim was disabled in turn and the suites run against it. Several stayed green
+or left the named witness green. Three shapes recurred. A second path delivered
+the same change: `MemoryStore` pushes what a "refresh" test published, and the
+refresh carries what a "push" test published. The test performed the step: it
+restarted the key manager, or loaded and installed a security generation by
+hand. And every item of work was already due at startup, so a server that read
+its clock once passed. A helper's unit test also stood in for the loop that
+calls it, which left lag recovery unwitnessed. Mutation testing did not object,
+because it neither deletes a `select!` arm nor moves a clock read.
+
+A refresh witness therefore uses a source with no push stream, a push witness
+puts every scheduled pull beyond the test, and due work becomes due while the
+component runs.
+
+The same audit found one claim that was false rather than unwitnessed. A status
+or class change cannot reach a principal whose stored snapshot does not decode:
+the next refresh reads the same row. The bound is that snapshot's `valid_until`
+and the repair is publishing a valid snapshot above the new generation
+(INVARIANTS GL-22). Having the source answer such a row with a withdrawal would
+close the window at the price of denying on corruption that today leaves the
+instance serving; it is not decided here.

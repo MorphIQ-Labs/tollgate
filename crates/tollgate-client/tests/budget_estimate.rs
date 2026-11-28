@@ -352,6 +352,44 @@ async fn moka_principals_of_one_account_converge() {
     principals_of_one_account_converge(MokaSnapshotMap::new(16)).await;
 }
 
+/// An observation fetched for one account is delivered to that account alone:
+/// each estimate follows its own ledger through refresh.
+#[tokio::test(start_paused = true)]
+async fn refresh_delivers_each_account_its_own_observation() {
+    let store = setup().await;
+    let (other, other_principal) = (AccountId(2), Principal(8));
+    AdminStore::create_account(
+        &*store,
+        AccountConfig {
+            account_id: other,
+            initial_balance: CostUnits(2 * INITIAL),
+            status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
+        },
+    )
+    .await
+    .unwrap();
+    AdminStore::publish_snapshot(&*store, other_principal, snapshot(other))
+        .await
+        .unwrap();
+    let principals = vec![PRINCIPAL, other_principal];
+    let a =
+        Instance::start_with(store.clone(), ArcSwapSnapshotMap::new(), principals.clone()).await;
+    let b = Instance::start_with(store.clone(), MokaSnapshotMap::new(16), principals).await;
+    a.spend_and_ingest(&store).await;
+    refresh_while_idle(&a, &b).await;
+    let observed = [
+        (a.estimate(), estimate(&a.engine, other_principal)),
+        (
+            estimate(&b.engine, PRINCIPAL),
+            estimate(&b.engine, other_principal),
+        ),
+    ];
+    a.manager.shutdown().await;
+    b.manager.shutdown().await;
+    assert_eq!(observed, [(INITIAL - CHARGE, 2 * INITIAL); 2]);
+}
+
 /// What the scripted source answers next. It sends no pushes.
 #[derive(Debug, Clone, Copy)]
 enum Answer {

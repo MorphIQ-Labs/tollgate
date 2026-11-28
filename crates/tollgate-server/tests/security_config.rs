@@ -75,6 +75,62 @@ async fn security_reload_stages_validates_and_only_then_replaces() {
     );
 }
 
+/// The owned reloader applies changed files by itself, keeps the last valid
+/// generation while the files are broken, and applies the next valid one. The
+/// test only edits files and lets time pass.
+#[tokio::test(start_paused = true)]
+async fn the_reloader_applies_file_changes_and_recovers_from_a_broken_manifest() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("security.json");
+    let token_path = directory.path().join("instance.token");
+    std::fs::write(&token_path, common::INSTANCE).unwrap();
+    let manifest = json!({ "bearers": [{"identity": "instance", "role": "instance", "token_file": "instance.token"}] }).to_string();
+    std::fs::write(&path, &manifest).unwrap();
+    let mut loader = SecurityLoader::new(&path);
+    let loaded = loader.load(SystemClock.now()).await.unwrap().unwrap();
+    let security = loader.start(loaded).unwrap();
+    let app = router(ServerState {
+        store: MemoryStore::new(GrantPolicy::default()).unwrap(),
+        clock: Arc::new(SystemClock),
+        security: Arc::clone(&security),
+        issuer: None,
+    });
+    let _reloader =
+        tollgate_server::config::SecurityReloader::spawn(loader, security, Arc::new(SystemClock));
+    let status = async |token: &str| {
+        let request = Request::builder()
+            .uri("/v1/snapshots")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(request).await.unwrap().status()
+    };
+    let accepted = async |token: &str| {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while status(token).await != StatusCode::OK {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        })
+        .await
+        .expect("the reloader must apply the changed files");
+    };
+
+    const REPLACEMENT: &str = "replacement-instance-credential-fixture";
+    std::fs::write(&token_path, REPLACEMENT).unwrap();
+    accepted(REPLACEMENT).await;
+    assert_eq!(status(common::INSTANCE).await, StatusCode::UNAUTHORIZED);
+
+    std::fs::write(&path, "{broken manifest").unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    assert_eq!(status(REPLACEMENT).await, StatusCode::OK);
+
+    const REPAIRED: &str = "repaired-instance-credential-fixture";
+    std::fs::write(&token_path, REPAIRED).unwrap();
+    std::fs::write(&path, &manifest).unwrap();
+    accepted(REPAIRED).await;
+    assert_eq!(status(REPLACEMENT).await, StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn a_failed_install_is_retried_and_cannot_remove_tls() {
     let directory = tempfile::tempdir().unwrap();

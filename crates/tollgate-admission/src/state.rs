@@ -2499,7 +2499,7 @@ mod tests {
 
     /// `replace` hands back the superseded grant so the refill plane can
     /// release it; `take` removes and returns in one step. Losing either
-    /// return value strands units until TTL reclaim.
+    /// return value strands units, which TTL reclaim then forfeits.
     #[test]
     fn superseding_a_lease_hands_back_the_old_one() {
         for shards in [1, 8] {
