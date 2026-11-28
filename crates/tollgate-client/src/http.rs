@@ -585,16 +585,210 @@ impl tollgate_store::KeySource for HttpStore {
             tollgate_store::wire::MAX_KEYS_BODY_BYTES,
         )
         .await?;
-        let body: tollgate_store::wire::KeysResponse = serde_json::from_slice(&bytes)
-            .map_err(|_| StoreError("invalid credential page body".into()))?;
-        tollgate_store::KeyPage::try_new(
-            body.revision,
-            body.as_of,
-            after,
-            limit,
-            body.keys,
-            body.next_after,
+        credential_page(&bytes, after, limit)
+    }
+}
+
+/// [`KeysResponse`](tollgate_store::wire::KeysResponse), with each record kept
+/// apart so that one this build cannot decode does not lose the others.
+#[derive(serde::Deserialize)]
+struct KeysBody<'a> {
+    revision: u64,
+    as_of: Timestamp,
+    #[serde(borrow)]
+    keys: Vec<&'a serde_json::value::RawValue>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    next_after: Option<tollgate_core::KeyId>,
+    #[serde(default)]
+    unreadable: Vec<tollgate_core::KeyId>,
+    #[serde(default)]
+    unnamed_unreadable: u64,
+}
+
+/// The identity of a record that does not otherwise decode.
+#[derive(serde::Deserialize)]
+struct KeyIdentity {
+    key_id: tollgate_core::KeyId,
+}
+
+/// Decode one complete credential page. A record that states a key id and
+/// either does not decode or does not identify its principal is withheld, as a
+/// direct store withholds such a row. A body or a record without that much
+/// remains a failed read.
+fn credential_page(
+    bytes: &[u8],
+    after: Option<tollgate_core::KeyId>,
+    limit: NonZeroUsize,
+) -> Result<tollgate_store::KeyPage, StoreError> {
+    let invalid = |_| StoreError("invalid credential page body".into());
+    let body: KeysBody<'_> = serde_json::from_slice(bytes).map_err(invalid)?;
+    let mut keys = Vec::with_capacity(body.keys.len());
+    let mut unreadable = body.unreadable;
+    // The order of what arrived is checked before anything is set aside, so
+    // withholding cannot repair a malformed page.
+    let mut previous = after;
+    for raw in body.keys {
+        let decoded = serde_json::from_str::<tollgate_store::CredentialRecord>(raw.get())
+            .ok()
+            .filter(|record| record.validate().is_ok());
+        let key_id = match &decoded {
+            Some(record) => record.key_id,
+            None => {
+                serde_json::from_str::<KeyIdentity>(raw.get())
+                    .map_err(invalid)?
+                    .key_id
+            }
+        };
+        if previous.is_some_and(|previous| key_id <= previous) {
+            return Err(StoreError(
+                "credential page is unordered or repeated".into(),
+            ));
+        }
+        previous = Some(key_id);
+        match decoded {
+            Some(record) => keys.push(record),
+            None => {
+                // The decode error is not logged: it can quote the record.
+                tracing::error!(
+                    %key_id,
+                    "served credential does not decode; it is withheld from the projection"
+                );
+                unreadable.push(key_id);
+            }
+        }
+    }
+    unreadable.sort_unstable();
+    tollgate_store::KeyPage::try_with_unreadable(
+        body.revision,
+        body.as_of,
+        after,
+        limit,
+        keys,
+        body.next_after,
+        tollgate_store::UnreadableCredentials {
+            key_ids: unreadable,
+            unnamed: body.unnamed_unreadable,
+        },
+    )
+}
+
+#[cfg(test)]
+mod credential_page_tests {
+    use super::*;
+    use serde_json::{Value, json};
+    use tollgate_core::KeyId;
+
+    fn key_id(id: u128) -> Value {
+        json!(KeyId(id))
+    }
+
+    fn record(id: u128) -> Value {
+        let mut digest = [0; 32];
+        digest[..16].copy_from_slice(&id.to_be_bytes());
+        serde_json::to_value(tollgate_store::CredentialRecord {
+            key_id: KeyId(id),
+            principal: tollgate_core::Principal(id),
+            digest,
+            not_after: None,
+        })
+        .unwrap()
+    }
+
+    fn with(mut record: Value, field: &str, value: Value) -> Value {
+        record[field] = value;
+        record
+    }
+
+    fn page(body: Value) -> Result<tollgate_store::KeyPage, StoreError> {
+        credential_page(
+            &serde_json::to_vec(&body).unwrap(),
+            None,
+            NonZeroUsize::new(2).unwrap(),
         )
+    }
+
+    fn body(keys: Vec<Value>, next_after: Value) -> Value {
+        json!({"revision": 1, "as_of": "2026-01-01T00:00:00Z", "keys": keys, "next_after": next_after})
+    }
+
+    fn ids(page: &tollgate_store::KeyPage) -> (Vec<u128>, Vec<u128>) {
+        (
+            page.records().iter().map(|key| key.key_id.0).collect(),
+            page.unreadable().key_ids.iter().map(|id| id.0).collect(),
+        )
+    }
+
+    /// A server that predates withheld ids sends neither field.
+    #[test]
+    fn a_body_without_the_withheld_fields_reads() {
+        let read = page(body(vec![record(1), record(2)], key_id(2))).unwrap();
+        assert_eq!(ids(&read), (vec![1, 2], vec![]));
+        assert_eq!(read.unreadable().unnamed, 0);
+        assert_eq!(read.next_after(), Some(KeyId(2)));
+    }
+
+    #[test]
+    fn withheld_ids_and_counts_cross_the_wire() {
+        let mut served = body(vec![record(2)], Value::Null);
+        served["unreadable"] = json!([key_id(1)]);
+        served["unnamed_unreadable"] = json!(3);
+        let read = page(served).unwrap();
+        assert_eq!(ids(&read), (vec![2], vec![1]));
+        assert_eq!(read.unreadable().unnamed, 3);
+    }
+
+    /// A record this build cannot decode, or whose identity does not hold, is
+    /// withheld as a direct store withholds the row, wherever it falls in a
+    /// full page, and merged in order with the ids the server withheld.
+    #[test]
+    fn a_served_record_that_does_not_decode_is_withheld() {
+        for damaged in [
+            with(record(2), "digest", json!("from-a-newer-scheme")),
+            with(record(2), "principal", json!(key_id(9))),
+            with(record(2), "not_after", json!(true)),
+            json!({"key_id": key_id(2)}),
+        ] {
+            let mut served = body(vec![record(1), damaged.clone()], key_id(2));
+            served["unreadable"] = json!([key_id(0)]);
+            let read = credential_page(
+                &serde_json::to_vec(&served).unwrap(),
+                None,
+                NonZeroUsize::new(2).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(ids(&read), (vec![1], vec![0, 2]), "{damaged}");
+            assert_eq!(read.next_after(), Some(KeyId(2)));
+        }
+        let first = with(record(1), "digest", json!(""));
+        let read = page(body(vec![first, record(2)], key_id(2))).unwrap();
+        assert_eq!(ids(&read), (vec![2], vec![1]));
+    }
+
+    /// What cannot be named cannot be withheld, and withholding never repairs
+    /// a page that was malformed as served.
+    #[test]
+    fn an_unusable_credential_body_stays_a_failed_read() {
+        let undecodable = |id| with(record(id), "digest", json!("x"));
+        for served in [
+            body(vec![record(1), json!({"digest": "x"})], Value::Null),
+            body(vec![record(1), json!({"key_id": 7})], Value::Null),
+            body(vec![record(2), undecodable(1)], Value::Null),
+            body(vec![record(1), undecodable(1)], Value::Null),
+            body(vec![record(1), record(2), undecodable(3)], key_id(2)),
+            json!({"revision": 1, "as_of": "2026-01-01T00:00:00Z", "keys": []}),
+            json!({"revision": 1, "keys": [], "next_after": null}),
+        ] {
+            assert!(page(served.clone()).is_err(), "{served}");
+        }
+        assert!(
+            credential_page(
+                &serde_json::to_vec(&body(vec![undecodable(1)], Value::Null)).unwrap(),
+                Some(KeyId(1)),
+                NonZeroUsize::new(2).unwrap(),
+            )
+            .is_err(),
+            "a withheld record must still advance the cursor"
+        );
     }
 }
 

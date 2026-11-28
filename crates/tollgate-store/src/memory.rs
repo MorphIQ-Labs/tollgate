@@ -2283,29 +2283,18 @@ impl crate::KeySource for MemoryStore {
         crate::validate_key_page_limit(limit)?;
         let inner = self.lock();
         let lower = after.map_or(Unbounded, Excluded);
-        let mut records: Vec<crate::CredentialRecord> = inner
+        let mut page = crate::KeyPageBuilder::new(after, limit);
+        for record in inner
             .unrevoked_keys
             .range((lower, Unbounded))
             .map(|id| &inner.keys[id].record)
             .filter(|record| record.not_after.is_none_or(|end| now < end))
-            .take(limit.get() + 1)
-            .cloned()
-            .map(Into::into)
-            .collect();
-        let next_after = if records.len() > limit.get() {
-            records.pop();
-            records.last().map(|key| key.key_id)
-        } else {
-            None
-        };
-        crate::KeyPage::try_new(
-            inner.credential_revision,
-            now,
-            after,
-            limit,
-            records,
-            next_after,
-        )
+        {
+            if !page.offer(record.key_id, Ok(record.clone().into())) {
+                break;
+            }
+        }
+        page.finish(inner.credential_revision, now, 0)
     }
 }
 

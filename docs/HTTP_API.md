@@ -265,6 +265,12 @@ verifiers. Query: `after`, an exclusive key-ID cursor, and `limit`, 1–4096
  "next_after": null}
 ```
 
+Two further fields appear only when there is damage to report. `unreadable` lists
+the ids of active credentials in the page's range that the server cannot decode,
+in increasing order and at most `limit` of them. `unnamed_unreadable`, on the
+first page, counts those whose id does not decode either. Neither kind is in
+`keys`.
+
 Errors: `400 invalid-query`, `422 invalid-limit`,
 `503 credential-source-unavailable` in place of `storage`. The
 [credential projection](CREDENTIAL_PROJECTION.md) page states the paging and

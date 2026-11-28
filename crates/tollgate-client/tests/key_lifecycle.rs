@@ -322,6 +322,69 @@ async fn issuance_refuses_a_duplicate_key_or_an_unknown_account() {
     );
 }
 
+/// A recorded credential whose stored identity cannot be trusted, here a
+/// principal that is not its digest's, is withdrawn and counted by the running
+/// manager while the rest of the projection keeps advancing: a revocation and
+/// an issuance reach it at the next refresh. Repairing it, by retiring it and
+/// issuing another, clears the report (INVARIANTS.md 34).
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_credential_does_not_hold_back_the_others() {
+    let store = store().await;
+    let registry = HmacRegistry::new(SECRET);
+    let record = |key: &tollgate_auth::MintedKey| KeyRecord {
+        key_id: key.key_id,
+        account_id: ACCOUNT,
+        principal: key.principal,
+        digest: key.digest,
+        not_after: None,
+    };
+    let revoked_later = registry.mint(KeyId(1)).unwrap();
+    let damaged = registry.mint(KeyId(2)).unwrap();
+    let kept = registry.mint(KeyId(3)).unwrap();
+    for key in [&revoked_later, &damaged, &kept] {
+        store.insert_key(record(key)).await.unwrap();
+    }
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let manager = project(&store, &clock).await;
+    assert_eq!(manager.monitor().report(t(0)).projected_keys, 3);
+
+    // The damaged record, as a faulty issuer would write it.
+    let broken = registry.mint(KeyId(4)).unwrap();
+    store
+        .insert_key(KeyRecord {
+            principal: tollgate_core::Principal(broken.principal.0 ^ 1),
+            ..record(&broken)
+        })
+        .await
+        .unwrap();
+    store.revoke_key(KeyId(1), t(1)).await.unwrap();
+    let issued = registry.mint(KeyId(5)).unwrap();
+    store.insert_key(record(&issued)).await.unwrap();
+    clock.set(t(5));
+    refreshed(&manager, 2).await;
+
+    let verifies = |key: &tollgate_auth::MintedKey| manager.verifier().verify(&key.secret);
+    assert_eq!(verifies(&revoked_later), None);
+    assert_eq!(verifies(&broken), None);
+    for key in [&damaged, &kept, &issued] {
+        assert!(verifies(key).is_some());
+    }
+    let report = manager.monitor().report(t(5));
+    assert!(report.ready);
+    assert_eq!(report.projected_keys, 3);
+    assert_eq!(report.stats.failures, 0);
+    assert_eq!(report.stats.unreadable_credentials, 1);
+
+    store.revoke_key(KeyId(4), t(5)).await.unwrap();
+    refreshed(&manager, 3).await;
+    assert_eq!(
+        manager.monitor().report(t(5)).stats.unreadable_credentials,
+        1,
+        "no later pass withholds it"
+    );
+    manager.shutdown().await;
+}
+
 /// Every mint is independent: the same registry, the same secret, different
 /// credentials. A generator that repeated itself would hand two customers the
 /// same key and neither would ever know.

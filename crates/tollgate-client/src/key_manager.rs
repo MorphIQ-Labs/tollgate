@@ -16,7 +16,7 @@ use arc_swap::ArcSwapOption;
 use jiff::{SignedDuration, Timestamp};
 use tokio::sync::watch;
 use tollgate_auth::{CredentialVerifier, HmacRegistry, Verified};
-use tollgate_store::{Clock, CredentialSet, KeySource, StoreError};
+use tollgate_store::{Clock, CredentialSet, KeySource, StoreError, UnreadableCredentials};
 use zeroize::Zeroizing;
 
 /// Credential-projection refresh timing and paging budgets.
@@ -212,6 +212,10 @@ pub struct KeyManagerStats {
     /// Passes abandoned because they used up `max_pages` page calls. Nonzero
     /// means the catalogue has outgrown the page budget.
     pub page_budget_exceeded: u64,
+    /// Credentials a page withheld because they cannot be decoded, counted on
+    /// every page read, so a standing one raises it each pass. Those
+    /// credentials do not authenticate until their rows are repaired.
+    pub unreadable_credentials: u64,
     /// A counter reached `u64::MAX` and stopped counting; values are lower
     /// bounds.
     pub counter_overflow: bool,
@@ -492,6 +496,31 @@ fn projection(
     })
 }
 
+/// How many withheld key ids one warning names.
+const UNREADABLE_IDS_LOGGED: usize = 16;
+
+/// Count and report the credentials a page withheld. Key ids are not secrets.
+fn report_unreadable(unreadable: &UnreadableCredentials, stats: &mut KeyManagerStats) {
+    let named = unreadable.key_ids.len() as u64;
+    let withheld = named.saturating_add(unreadable.unnamed);
+    if withheld == 0 {
+        return;
+    }
+    if let Some(total) = stats.unreadable_credentials.checked_add(withheld) {
+        stats.unreadable_credentials = total;
+    } else {
+        stats.unreadable_credentials = u64::MAX;
+        stats.counter_overflow = true;
+    }
+    let shown = unreadable.key_ids.len().min(UNREADABLE_IDS_LOGGED);
+    tracing::warn!(
+        withheld,
+        key_ids = ?&unreadable.key_ids[..shown],
+        unnamed = unreadable.unnamed,
+        "credentials cannot be decoded and do not authenticate; repair or revoke them"
+    );
+}
+
 async fn refresh(
     source: &dyn KeySource,
     secret: &[u8],
@@ -548,6 +577,7 @@ async fn refresh(
         page.validate_request(after, config.page_limit)
             .map_err(|_| "page-request-mismatch")?;
         KeyManagerStats::increment(&mut stats.pages, &mut stats.counter_overflow);
+        report_unreadable(page.unreadable(), stats);
         if revision.is_some_and(|previous| previous != page.revision()) {
             // An insertion behind the cursor or revocation of an earlier page
             // invalidates the whole candidate. Restarts consume the same budget.
@@ -661,6 +691,25 @@ mod tests {
     use proptest::prelude::*;
     use tollgate_core::KeyId;
     use tollgate_store::CredentialRecord;
+
+    #[test]
+    fn every_withheld_credential_is_counted_and_overflow_is_visible() {
+        let mut stats = KeyManagerStats::default();
+        report_unreadable(&UnreadableCredentials::default(), &mut stats);
+        assert_eq!(stats, KeyManagerStats::default());
+        let withheld = UnreadableCredentials {
+            key_ids: vec![KeyId(1), KeyId(2)],
+            unnamed: 3,
+        };
+        report_unreadable(&withheld, &mut stats);
+        report_unreadable(&withheld, &mut stats);
+        assert_eq!(stats.unreadable_credentials, 10);
+        assert!(!stats.counter_overflow);
+        stats.unreadable_credentials = u64::MAX - 1;
+        report_unreadable(&withheld, &mut stats);
+        assert_eq!(stats.unreadable_credentials, u64::MAX);
+        assert!(stats.counter_overflow);
+    }
 
     proptest! {
         #[test]

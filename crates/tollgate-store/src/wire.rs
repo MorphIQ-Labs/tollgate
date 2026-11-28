@@ -100,13 +100,34 @@ pub struct KeysResponse {
     /// an omitted field is refused rather than read as terminal.
     #[serde(deserialize_with = "crate::credentials::required_option")]
     pub next_after: Option<tollgate_core::KeyId>,
+    /// Active credentials in this page's range that the source withholds
+    /// because it cannot decode them, in strictly increasing key-id order.
+    /// Omitted when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<tollgate_core::KeyId>,
+    /// Withheld credentials whose key id does not decode either, counted on the
+    /// first page. Omitted when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unnamed_unreadable: u64,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's predicate signature"
+)]
+fn is_zero(count: &u64) -> bool {
+    *count == 0
 }
 
 /// Fixed-width identifiers/digest plus the widest timestamp and JSON framing.
 /// `wire_limits` measures a maximal record and page against these bounds.
 pub const MAX_KEY_RECORD_BYTES: usize = 216;
-/// The maximal envelope is 134 bytes; the first record needs no comma.
-pub const MAX_KEYS_BODY_BYTES: usize = crate::MAX_KEY_PAGE_LIMIT * (MAX_KEY_RECORD_BYTES + 1) + 133;
+/// The envelope of a page that withholds nothing is 134 bytes and its first
+/// record needs no comma. A page can also name a page limit's worth of withheld
+/// ids, 34 bytes and a comma each, beside their field names and the widest
+/// count.
+pub const MAX_KEYS_BODY_BYTES: usize =
+    crate::MAX_KEY_PAGE_LIMIT * (MAX_KEY_RECORD_BYTES + 1 + 35) + 133 + 57;
 
 /// The TTL fields shared by both lease-creating requests.
 ///

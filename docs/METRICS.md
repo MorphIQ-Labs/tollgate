@@ -289,6 +289,7 @@ reads its `ready` bit in `/readyz`. Configuration and outage behavior are in
 | `stats.pages` | counter | pages | Pages received and validated. |
 | `stats.revision_conflicts` | counter | restarts | Passes restarted because the source revision changed between pages. Rising means the catalogue changes faster than a pass completes. |
 | `stats.page_budget_exceeded` | counter | passes | Passes that hit `max_pages`. Rising means the catalogue has outgrown the page budget. |
+| `stats.unreadable_credentials` | counter | credentials | Credentials withheld because they cannot be decoded, counted on every page read. Any rise means those customers cannot authenticate: [repair or retire them](CREDENTIAL_PROJECTION.md#unreadable-credentials). Readiness does not move. |
 | `stats.counter_overflow` | flag | — | A stats counter could not be incremented. |
 
 ## Budget rollover

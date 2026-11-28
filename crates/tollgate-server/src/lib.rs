@@ -749,6 +749,8 @@ async fn active_keys<S: Backend>(
         revision: page.revision(),
         as_of: page.as_of(),
         next_after: page.next_after(),
+        unreadable: page.unreadable().key_ids.clone(),
+        unnamed_unreadable: page.unreadable().unnamed,
         keys: page.into_records(),
     };
     Ok((

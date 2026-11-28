@@ -209,6 +209,8 @@ fn maximal_key_pages_fit_the_derived_envelope_and_digests_are_canonical() {
         as_of: expiry,
         keys: vec![record; MAX_KEY_PAGE_LIMIT],
         next_after: Some(KeyId(u128::MAX)),
+        unreadable: vec![KeyId(u128::MAX); MAX_KEY_PAGE_LIMIT],
+        unnamed_unreadable: u64::MAX,
     };
     let encoded = serde_json::to_vec(&page).unwrap();
     assert_eq!(encoded.len(), MAX_KEYS_BODY_BYTES);

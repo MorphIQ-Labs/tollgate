@@ -2298,6 +2298,97 @@ fn account_bytes() -> Vec<u8> {
     ACCOUNT.0.to_be_bytes().to_vec()
 }
 
+/// A damaged credential row, however it came to be, is withheld from the feed
+/// and the rest of the feed keeps advancing: a revocation behind it is read at
+/// once. A row whose id cannot be decoded is counted, on the first page only
+/// and only while it is active (INVARIANTS.md 34). `MemoryStore` holds typed
+/// records, so of these only a principal that is not its digest's can reach it.
+#[tokio::test]
+async fn a_damaged_credential_row_is_withheld_and_the_feed_advances() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    use tollgate_store::KeySource;
+    for id in 1..=3_u128 {
+        let mut digest = [0x07; 32];
+        digest[..16].copy_from_slice(&id.to_be_bytes());
+        store
+            .insert_key(KeyRecord {
+                key_id: KeyId(id),
+                account_id: ACCOUNT,
+                principal: Principal(id),
+                digest,
+                not_after: None,
+            })
+            .await
+            .unwrap();
+    }
+    let limit = NonZeroUsize::new(2).unwrap();
+    let healthy = store.active_keys_page(t(100), None, limit).await.unwrap();
+
+    let pool = corruption_pool().await;
+    sqlx::query("UPDATE tollgate_credential_keys SET digest = $1 WHERE key_id = $2")
+        .bind(vec![0xee_u8; 32])
+        .bind(2_u128.to_be_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Two rows whose ids are not sixteen bytes, one of them already expired.
+    for (id, principal, expiry) in [(vec![0_u8], 0xa0_u8, None), (vec![9_u8; 17], 0xa1, Some(0))] {
+        sqlx::query(
+            "INSERT INTO tollgate_credential_keys
+             (key_id, account_id, principal, digest, not_after_floor_us,
+              not_after_submicro_ns, not_after_is_lower_bound, revoked_at_us)
+             VALUES ($1, $2, $3, $4, $5, $6, FALSE, NULL)",
+        )
+        .bind(id)
+        .bind(account_bytes())
+        .bind(vec![principal; 16])
+        .bind(vec![principal; 32])
+        .bind(expiry.map(|micros: i32| i64::from(micros)))
+        .bind(expiry.map(|_| 0_i16))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    store.revoke_key(KeyId(1), t(100)).await.unwrap();
+
+    let first = store.active_keys_page(t(100), None, limit).await.unwrap();
+    assert!(first.revision() > healthy.revision());
+    assert_eq!(
+        first.records().iter().map(|k| k.key_id).collect::<Vec<_>>(),
+        vec![KeyId(3)]
+    );
+    assert_eq!(first.unreadable().key_ids, vec![KeyId(2)]);
+    assert_eq!(first.unreadable().unnamed, 1);
+    assert_eq!(first.next_after(), None);
+    let later = store
+        .active_keys_page(t(100), Some(KeyId(2)), limit)
+        .await
+        .unwrap();
+    assert_eq!(later.unreadable().unnamed, 0);
+
+    // Repairing the row restores it.
+    let mut digest = [0x07; 32];
+    digest[..16].copy_from_slice(&2_u128.to_be_bytes());
+    sqlx::query("UPDATE tollgate_credential_keys SET digest = $1 WHERE key_id = $2")
+        .bind(digest.to_vec())
+        .bind(2_u128.to_be_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM tollgate_credential_keys WHERE octet_length(key_id) <> 16")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let repaired = store.active_keys_page(t(100), None, limit).await.unwrap();
+    assert!(repaired.revision() > first.revision());
+    assert_eq!(repaired.records().len(), 2);
+    assert_eq!(repaired.unreadable(), &Default::default());
+    pool.close().await;
+}
+
 /// Suspend every CHECK constraint on `table` whose definition mentions
 /// `column`, except `keep`, and report what was dropped so it can be restored.
 ///
@@ -6854,7 +6945,7 @@ async fn racing_publication_and_revocation_receipts_name_the_actual_predecessor(
 }
 
 #[tokio::test]
-async fn credential_projection_preserves_lifecycle_truth_and_refuses_corrupt_identity() {
+async fn credential_projection_preserves_lifecycle_truth_and_withholds_corrupt_identity() {
     let _guard = DB_LOCK.lock().await;
     let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
         return;
@@ -6896,8 +6987,7 @@ async fn credential_projection_preserves_lifecycle_truth_and_refuses_corrupt_ide
             .records()
             .is_empty()
     );
-    // Corrupt identity evidence is reported, not silently dropped from a
-    // partially successful projection.
+    // Corrupt identity evidence is withheld and named, and never verifies.
     store
         .insert_key(KeyRecord {
             key_id: KeyId(4),
@@ -6908,12 +6998,12 @@ async fn credential_projection_preserves_lifecycle_truth_and_refuses_corrupt_ide
         })
         .await
         .unwrap();
-    assert!(
-        store
-            .active_keys_page(t(100), None, tollgate_store::DEFAULT_KEY_PAGE_LIMIT)
-            .await
-            .is_err()
-    );
+    let withheld = store
+        .active_keys_page(t(100), None, tollgate_store::DEFAULT_KEY_PAGE_LIMIT)
+        .await
+        .unwrap();
+    assert!(withheld.records().is_empty());
+    assert_eq!(withheld.unreadable().key_ids, vec![KeyId(4)]);
 }
 
 #[tokio::test]
@@ -7329,6 +7419,19 @@ async fn an_unrepresentable_replacement_expiry_leaves_the_original_grant_untouch
 }
 #[path = "../../tollgate-store/tests/support/credential_expiry.rs"]
 mod credential_expiry;
+
+#[path = "../../tollgate-store/tests/support/credential_unreadable.rs"]
+mod credential_unreadable;
+
+#[tokio::test]
+async fn unreadable_credentials_are_withheld_from_every_page() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 100).await else {
+        return;
+    };
+    credential_unreadable::unreadable_credentials_are_withheld(&*store, &*store, ACCOUNT, t(100))
+        .await;
+}
 
 #[tokio::test]
 async fn credential_expiry_is_exact_in_directory_and_every_page() {

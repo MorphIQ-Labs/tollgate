@@ -35,8 +35,8 @@ pub mod wire;
 pub use audit::{AdminAuthority, AdminReceipt, AdminState};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use credentials::{
-    CredentialRecord, CredentialSet, DEFAULT_KEY_PAGE_LIMIT, KeyPage, KeySource,
-    MAX_KEY_PAGE_LIMIT, MAX_KEY_REVISION, validate_key_page_limit,
+    CredentialRecord, CredentialSet, DEFAULT_KEY_PAGE_LIMIT, KeyPage, KeyPageBuilder, KeySource,
+    MAX_KEY_PAGE_LIMIT, MAX_KEY_REVISION, UnreadableCredentials, validate_key_page_limit,
 };
 pub use memory::{MemoryStore, StoredRecords};
 pub use traits::{

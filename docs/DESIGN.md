@@ -8835,3 +8835,54 @@ rules are unchanged. `retry_backoff` now also paces any principal with nothing
 resolved after startup, which previously waited for the next sweep, and
 `max_concurrent_fetches` bounds retries separately from the sweep. No
 request-path or threshold change.
+
+## One unreadable credential does not stall the feed (GH-107, 2026-11-27)
+
+A page of the credential feed was all or nothing. One active row that failed to
+decode, or whose digest did not name its principal, failed the page, the page
+failed the drain, and an instance kept its previous table until `max_age`. Every
+revocation and issuance in the catalogue waited on that one row, and then
+authentication stopped for everyone. The reproduction needs no corrupted
+database: both stores accept, through `KeyDirectory::insert_key`, a record whose
+principal is not its digest's.
+
+The contract broke where it did for an unreadable snapshot: the source knew that
+a credential existed and could not say what it was, and had no way to answer
+that. The page now carries the withheld ids. Withholding is fail-closed for the
+one credential, since replacement never merges (GL-27), and it needs no marker:
+a credential absent from the table does not verify.
+
+**Failing the page was deliberate**, so that corrupt identity evidence could not
+masquerade as a smaller complete projection. The report replaces that guarantee:
+the omission is in the same revisioned read, logged at the source, and counted by
+the manager.
+
+**Pages are filled past withheld rows.** A direct store keeps reading until the
+page holds `limit` records or `limit` withheld ids. Counting withheld rows
+against the record limit would have been simpler and would have broken instances
+already running: they accept a continuation only from a page of `limit` records.
+Filled this way, upgrading the control plane alone restores their revocations in
+every case short of `limit` consecutive damaged rows. The bound on withheld ids
+keeps one call's work and the response body finite when a whole catalogue is
+damaged. `KeyPageBuilder` is public so that both direct stores, and an
+embedder's, share the rule.
+
+**Rows without a usable id** are counted rather than listed, once per drain,
+because they cannot be a cursor. The schema has never constrained the key id's
+length; adding the constraint would refuse the upgrade of the very databases that
+need this.
+
+**The HTTP reader** applies the same rule to a record it cannot decode and can
+name, which is what a newer server's unknown encoding would look like.
+
+Not changed: `CredentialSet` still refuses a set holding a mismatched or
+duplicate identity, so nothing a source withholds, or fails to withhold, can be
+installed. Duplicate principals need the unique constraint removed and still fail
+the drain. Neither store refuses a mismatched record at insertion; doing so is a
+new refusal on the public lifecycle API and is its own change.
+
+Compatibility: `KeysResponse` gains two fields omitted when empty,
+`KeyManagerStats` gains `unreadable_credentials`, and `KeyPage` gains a
+constructor and accessor. The two struct fields break exhaustive construction in
+embedder code. The response body bound grows. No migration and no request-path
+or threshold change. Each PostgreSQL drain adds one count over the active rows.

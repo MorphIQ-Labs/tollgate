@@ -4394,7 +4394,7 @@ async fn racing_publication_and_revocation_receipts_name_the_actual_predecessor(
 }
 
 #[tokio::test]
-async fn credential_projection_preserves_lifecycle_truth_and_refuses_corrupt_identity() {
+async fn credential_projection_preserves_lifecycle_truth_and_withholds_corrupt_identity() {
     let store = store_with_balance(full_grant_policy(), 100).await;
     use tollgate_store::KeySource;
     for (id, expiry) in [(1u128, None), (2, Some(t(100))), (3, None)] {
@@ -4433,8 +4433,7 @@ async fn credential_projection_preserves_lifecycle_truth_and_refuses_corrupt_ide
             .records()
             .is_empty()
     );
-    // Corrupt identity evidence is reported, not silently dropped from a
-    // partially successful projection.
+    // Corrupt identity evidence is withheld and named, and never verifies.
     store
         .insert_key(KeyRecord {
             key_id: KeyId(4),
@@ -4445,12 +4444,12 @@ async fn credential_projection_preserves_lifecycle_truth_and_refuses_corrupt_ide
         })
         .await
         .unwrap();
-    assert!(
-        store
-            .active_keys_page(t(100), None, tollgate_store::DEFAULT_KEY_PAGE_LIMIT)
-            .await
-            .is_err()
-    );
+    let withheld = store
+        .active_keys_page(t(100), None, tollgate_store::DEFAULT_KEY_PAGE_LIMIT)
+        .await
+        .unwrap();
+    assert!(withheld.records().is_empty());
+    assert_eq!(withheld.unreadable().key_ids, vec![KeyId(4)]);
 }
 
 #[tokio::test]
@@ -4760,6 +4759,16 @@ async fn an_unrepresentable_replacement_expiry_leaves_the_original_grant_untouch
 }
 #[path = "support/credential_expiry.rs"]
 mod credential_expiry;
+
+#[path = "support/credential_unreadable.rs"]
+mod credential_unreadable;
+
+#[tokio::test]
+async fn unreadable_credentials_are_withheld_from_every_page() {
+    let store = store_with_balance(full_grant_policy(), 100).await;
+    credential_unreadable::unreadable_credentials_are_withheld(&*store, &*store, ACCOUNT, t(100))
+        .await;
+}
 
 #[tokio::test]
 async fn credential_expiry_is_exact_in_directory_and_every_page() {

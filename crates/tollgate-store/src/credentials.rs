@@ -71,6 +71,25 @@ impl From<KeyRecord> for CredentialRecord {
     }
 }
 
+impl CredentialRecord {
+    /// Check that `principal` is the leading 128 bits of `digest`, which is
+    /// what makes the record identity evidence at all.
+    ///
+    /// # Errors
+    ///
+    /// A [`StoreError`] when it is not.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        let mut prefix = [0; 16];
+        prefix.copy_from_slice(&self.digest[..16]);
+        if self.principal.0 != u128::from_be_bytes(prefix) {
+            return Err(StoreError(
+                "credential digest does not identify its principal".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Validated identity evidence. Completeness across pages additionally requires
 /// the source revision and terminal cursor, checked by the owning drain.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,13 +106,7 @@ impl CredentialSet {
         let mut principals = HashSet::with_capacity(records.len());
         let mut ids = HashSet::with_capacity(records.len());
         for record in &records {
-            let mut prefix = [0; 16];
-            prefix.copy_from_slice(&record.digest[..16]);
-            if record.principal.0 != u128::from_be_bytes(prefix) {
-                return Err(StoreError(
-                    "credential digest does not identify its principal".into(),
-                ));
-            }
+            record.validate()?;
             if !principals.insert(record.principal) || !ids.insert(record.key_id) {
                 return Err(StoreError(
                     "credential projection contains duplicate identities".into(),
@@ -113,23 +126,41 @@ impl CredentialSet {
     }
 }
 
-/// One bounded page, validated against the request that produced it. Records
-/// and revision describe the same committed source read. `next_after` exists
-/// only when lookahead found another active record; an exactly full final page
-/// is terminal. Revisions advance on every mutation that can change the feed.
+/// Active credentials a source holds but cannot project: a row that does not
+/// decode, or one whose digest does not identify its principal (INVARIANTS.md
+/// 34). They are withheld from the page's records, so a projection built from
+/// it does not verify them, and named so that the damage is reported.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnreadableCredentials {
+    /// The withheld credentials in the range this page covers, in strictly
+    /// increasing key-id order.
+    pub key_ids: Vec<KeyId>,
+    /// Withheld credentials whose key id does not decode either, so they
+    /// cannot be named. A source counts them once per drain, on its first
+    /// page.
+    pub unnamed: u64,
+}
+
+/// One bounded page, validated against the request that produced it. Records,
+/// withheld credentials and revision describe the same committed source read.
+/// `next_after` exists only when lookahead found another active credential; an
+/// exactly full final page is terminal. Revisions advance on every mutation
+/// that can change the feed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyPage {
     revision: u64,
     as_of: Timestamp,
     keys: CredentialSet,
+    unreadable: UnreadableCredentials,
     next_after: Option<KeyId>,
     after: Option<KeyId>,
     limit: NonZeroUsize,
 }
 
 impl KeyPage {
-    /// Validate one page against the request (`after`, `limit`) that produced it.
-    /// `as_of` is the instant the source selected active records at.
+    /// Validate one page, with nothing withheld, against the request (`after`,
+    /// `limit`) that produced it. `as_of` is the instant the source selected
+    /// active records at.
     ///
     /// # Errors
     ///
@@ -146,8 +177,43 @@ impl KeyPage {
         keys: Vec<CredentialRecord>,
         next_after: Option<KeyId>,
     ) -> Result<Self, StoreError> {
+        Self::try_with_unreadable(
+            revision,
+            as_of,
+            after,
+            limit,
+            keys,
+            next_after,
+            UnreadableCredentials::default(),
+        )
+    }
+
+    /// [`try_new`](Self::try_new) for a page that also withholds credentials.
+    ///
+    /// A page holds at most `limit` records and at most `2 * limit` entries
+    /// counting named withheld credentials: a source withholds at most
+    /// `limit`, and a reader of its answer may withhold records it cannot
+    /// decode itself.
+    ///
+    /// # Errors
+    ///
+    /// A [`StoreError`] for everything [`try_new`](Self::try_new) refuses, and
+    /// when the withheld key ids do not strictly increase from `after`, repeat
+    /// a record's, or exceed the entry bound; or when `next_after` is present
+    /// on a page of fewer than `limit` entries or does not name its last one.
+    pub fn try_with_unreadable(
+        revision: u64,
+        as_of: Timestamp,
+        after: Option<KeyId>,
+        limit: NonZeroUsize,
+        keys: Vec<CredentialRecord>,
+        next_after: Option<KeyId>,
+        unreadable: UnreadableCredentials,
+    ) -> Result<Self, StoreError> {
         validate_key_page_limit(limit)?;
-        if revision > MAX_KEY_REVISION || keys.len() > limit.get() {
+        // Cannot overflow: `limit` was just bounded.
+        let entries = keys.len().saturating_add(unreadable.key_ids.len());
+        if revision > MAX_KEY_REVISION || keys.len() > limit.get() || entries > 2 * limit.get() {
             return Err(StoreError(
                 "credential page exceeds its revision or record domain".into(),
             ));
@@ -163,8 +229,19 @@ impl KeyPage {
             }
             previous = Some(key.key_id);
         }
+        let mut withheld = after;
+        for &id in &unreadable.key_ids {
+            if withheld.is_some_and(|previous| id <= previous)
+                || keys.binary_search_by_key(&id, |key| key.key_id).is_ok()
+            {
+                return Err(StoreError(
+                    "credential page withholds unordered or repeated identities".into(),
+                ));
+            }
+            withheld = Some(id);
+        }
         if let Some(next) = next_after
-            && (keys.len() != limit.get() || Some(next) != previous)
+            && (entries < limit.get() || Some(next) != previous.max(withheld))
         {
             return Err(StoreError(
                 "credential page continuation does not advance its full page".into(),
@@ -174,6 +251,7 @@ impl KeyPage {
             revision,
             as_of,
             keys: CredentialSet::try_new(keys)?,
+            unreadable,
             next_after,
             after,
             limit,
@@ -210,6 +288,10 @@ impl KeyPage {
     pub fn records(&self) -> &[CredentialRecord] {
         self.keys.records()
     }
+    /// The active credentials in this page's range that the source withholds.
+    pub fn unreadable(&self) -> &UnreadableCredentials {
+        &self.unreadable
+    }
     /// The cursor for the next page, which is this page's last key id, or `None`
     /// when the page is terminal.
     pub fn next_after(&self) -> Option<KeyId> {
@@ -218,6 +300,86 @@ impl KeyPage {
     /// Consume the page, returning its records.
     pub fn into_records(self) -> Vec<CredentialRecord> {
         self.keys.into_records()
+    }
+}
+
+/// How both direct stores fill a page, so that they withhold, bound and
+/// continue it identically. Offer active credentials in increasing key-id order
+/// until one is refused.
+#[derive(Debug)]
+pub struct KeyPageBuilder {
+    after: Option<KeyId>,
+    limit: NonZeroUsize,
+    records: Vec<CredentialRecord>,
+    unreadable: Vec<KeyId>,
+    last: Option<KeyId>,
+    more: bool,
+}
+
+impl KeyPageBuilder {
+    /// An empty page answering the request (`after`, `limit`).
+    pub fn new(after: Option<KeyId>, limit: NonZeroUsize) -> Self {
+        Self {
+            after,
+            limit,
+            records: Vec::new(),
+            unreadable: Vec::new(),
+            last: None,
+            more: false,
+        }
+    }
+
+    /// Offer the next active credential: its record, or why its row did not
+    /// decode. Returns `false` when the page has no room for it, which
+    /// makes the page continue after the last one taken.
+    pub fn offer(&mut self, key_id: KeyId, record: Result<CredentialRecord, StoreError>) -> bool {
+        if self.records.len() == self.limit.get() {
+            self.more = true;
+            return false;
+        }
+        match record.and_then(|record| record.validate().map(|()| record)) {
+            Ok(record) => self.records.push(record),
+            Err(error) => {
+                if self.unreadable.len() == self.limit.get() {
+                    self.more = true;
+                    return false;
+                }
+                tracing::error!(
+                    %key_id,
+                    %error,
+                    "stored credential cannot be projected; it is withheld from the feed"
+                );
+                self.unreadable.push(key_id);
+            }
+        }
+        self.last = Some(key_id);
+        true
+    }
+
+    /// The finished page, read at `revision` and `as_of`. `unnamed` counts
+    /// withheld rows with no decodable key id.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`KeyPage::try_with_unreadable`] refuses.
+    pub fn finish(
+        self,
+        revision: u64,
+        as_of: Timestamp,
+        unnamed: u64,
+    ) -> Result<KeyPage, StoreError> {
+        KeyPage::try_with_unreadable(
+            revision,
+            as_of,
+            self.after,
+            self.limit,
+            self.records,
+            self.last.filter(|_| self.more),
+            UnreadableCredentials {
+                key_ids: self.unreadable,
+                unnamed,
+            },
+        )
     }
 }
 
@@ -231,6 +393,11 @@ pub trait KeySource: Send + Sync {
     /// use `now`; HTTP servers choose their own clock and return it as `as_of`.
     /// Reads must be coherent with the returned revision, including for an
     /// empty result. Never return a partial successful page after a failure.
+    ///
+    /// A credential the source holds but cannot decode is not a failure of the
+    /// read: withhold it and name it in the page's
+    /// [`unreadable`](KeyPage::unreadable), so that revocations and issuance
+    /// behind it still reach readers.
     async fn active_keys_page(
         &self,
         now: Timestamp,
@@ -334,6 +501,49 @@ mod tests {
             validate_key_page_limit(NonZeroUsize::new(MAX_KEY_PAGE_LIMIT + 1).unwrap()).is_err()
         );
     }
+    #[test]
+    fn page_bounds_and_orders_what_it_withholds() {
+        let now = Timestamp::UNIX_EPOCH;
+        let limit = NonZeroUsize::new(2).unwrap();
+        let page =
+            |records: &[u128], withheld: &[u128], after: Option<u128>, next: Option<u128>| {
+                KeyPage::try_with_unreadable(
+                    0,
+                    now,
+                    after.map(KeyId),
+                    limit,
+                    records.iter().copied().map(key).collect(),
+                    next.map(KeyId),
+                    UnreadableCredentials {
+                        key_ids: withheld.iter().copied().map(KeyId).collect(),
+                        unnamed: 7,
+                    },
+                )
+            };
+        let full = page(&[1, 3], &[2, 4], None, Some(4)).unwrap();
+        assert_eq!(full.unreadable().key_ids, vec![KeyId(2), KeyId(4)]);
+        assert_eq!(full.unreadable().unnamed, 7);
+        // A continuation names the last entry, of either kind.
+        assert!(page(&[1, 4], &[2], None, Some(4)).is_ok());
+        assert!(page(&[1, 4], &[2], None, Some(2)).is_err());
+        assert!(page(&[1], &[2], None, Some(2)).is_ok());
+        assert!(page(&[1], &[2], None, Some(1)).is_err());
+        assert!(page(&[], &[1, 2], None, Some(2)).is_ok());
+        // A page with room left over has nothing to continue to.
+        assert!(page(&[], &[1], None, Some(1)).is_err());
+        assert!(page(&[], &[], None, Some(1)).is_err());
+        // Bounds: two records, four entries.
+        assert!(page(&[1], &[2, 3, 4], None, None).is_ok());
+        assert!(page(&[1], &[2, 3, 4, 5], None, None).is_err());
+        assert!(page(&[1, 2, 3], &[], None, None).is_err());
+        // Order, the cursor, and one identity per entry.
+        assert!(page(&[], &[2, 1], None, None).is_err());
+        assert!(page(&[], &[1, 1], None, None).is_err());
+        assert!(page(&[], &[1], Some(1), None).is_err());
+        assert!(page(&[], &[2], Some(1), None).is_ok());
+        assert!(page(&[1], &[1], None, None).is_err());
+    }
+
     #[test]
     fn record_diagnostics_redact_the_digest() {
         let record = key(0xabc);

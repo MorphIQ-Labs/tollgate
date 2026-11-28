@@ -751,43 +751,73 @@ impl tollgate_store::KeySource for PostgresStore {
                 .map_err(storage)?;
         let revision = u64::try_from(revision)
             .map_err(|_| StoreError("credential revision is negative".into()))?;
-        // Separate SQL shapes preserve an indexable range in prepared plans.
-        let sql = if after.is_some() {
-            "SELECT key_id, account_id, principal, digest, not_after_floor_us, not_after_submicro_ns, not_after_is_lower_bound
-             FROM tollgate_credential_keys WHERE revoked_at_us IS NULL
-             AND (not_after_floor_us IS NULL OR not_after_submicro_ns IS NULL
-                  OR (not_after_floor_us, not_after_submicro_ns) > ($1, $2)) AND key_id > $3
-             ORDER BY key_id LIMIT $4"
-        } else {
-            "SELECT key_id, account_id, principal, digest, not_after_floor_us, not_after_submicro_ns, not_after_is_lower_bound
-             FROM tollgate_credential_keys WHERE revoked_at_us IS NULL
-             AND (not_after_floor_us IS NULL OR not_after_submicro_ns IS NULL
-                  OR (not_after_floor_us, not_after_submicro_ns) > ($1, $2)) AND key_id >= $3
-             ORDER BY key_id LIMIT $4"
-        };
-        let rows = sqlx::query(sql)
+        // Rows whose id is not sixteen bytes cannot be named or used as a
+        // cursor, so they are counted instead, once per drain.
+        let unnamed: i64 = if after.is_none() {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM tollgate_credential_keys WHERE revoked_at_us IS NULL
+                 AND (not_after_floor_us IS NULL OR not_after_submicro_ns IS NULL
+                      OR (not_after_floor_us, not_after_submicro_ns) > ($1, $2))
+                 AND octet_length(key_id) <> 16",
+            )
             .bind(cutoff.micros)
             .bind(cutoff.submicro_nanos)
-            .bind(id_bytes(after.unwrap_or(KeyId(0)).0))
-            .bind((limit.get() + 1) as i64)
-            .fetch_all(&mut *tx)
+            .fetch_one(&mut *tx)
             .await
-            .map_err(storage)?;
-        tx.commit().await.map_err(storage)?;
-        // Decode lookahead too: corrupt data cannot masquerade as a normal
-        // continuation and silently defer a failure to another request.
-        let mut records = rows
-            .into_iter()
-            .map(credential_from_row)
-            .map(|row| row.map(tollgate_store::CredentialRecord::from))
-            .collect::<Result<Vec<_>, _>>()?;
-        let next_after = if records.len() > limit.get() {
-            records.pop();
-            records.last().map(|record| record.key_id)
+            .map_err(storage)?
         } else {
-            None
+            0
         };
-        tollgate_store::KeyPage::try_new(revision, now, after, limit, records, next_after)
+        if unnamed > 0 {
+            tracing::error!(
+                rows = unnamed,
+                "stored credentials have identifiers that are not 16 bytes; they are withheld from the feed"
+            );
+        }
+        let mut page = tollgate_store::KeyPageBuilder::new(after, limit);
+        let mut cursor = after;
+        // Lookahead of one past the limit. Only a page withholding rows reads a
+        // second time, and the builder refuses a row after at most twice that.
+        'read: loop {
+            // Separate SQL shapes preserve an indexable range in prepared plans.
+            let sql = if cursor.is_some() {
+                "SELECT key_id, account_id, principal, digest, not_after_floor_us, not_after_submicro_ns, not_after_is_lower_bound
+                 FROM tollgate_credential_keys WHERE revoked_at_us IS NULL
+                 AND (not_after_floor_us IS NULL OR not_after_submicro_ns IS NULL
+                      OR (not_after_floor_us, not_after_submicro_ns) > ($1, $2)) AND key_id > $3
+                 AND octet_length(key_id) = 16 ORDER BY key_id LIMIT $4"
+            } else {
+                "SELECT key_id, account_id, principal, digest, not_after_floor_us, not_after_submicro_ns, not_after_is_lower_bound
+                 FROM tollgate_credential_keys WHERE revoked_at_us IS NULL
+                 AND (not_after_floor_us IS NULL OR not_after_submicro_ns IS NULL
+                      OR (not_after_floor_us, not_after_submicro_ns) > ($1, $2)) AND key_id >= $3
+                 AND octet_length(key_id) = 16 ORDER BY key_id LIMIT $4"
+            };
+            let rows = sqlx::query(sql)
+                .bind(cutoff.micros)
+                .bind(cutoff.submicro_nanos)
+                .bind(id_bytes(cursor.unwrap_or(KeyId(0)).0))
+                .bind((limit.get() + 1) as i64)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(storage)?;
+            let exhausted = rows.len() <= limit.get();
+            for row in rows {
+                let key_id = KeyId(id_from(row.get::<Vec<u8>, _>(0).as_slice()));
+                let record = credential_from_row(row).map(tollgate_store::CredentialRecord::from);
+                cursor = Some(key_id);
+                if !page.offer(key_id, record) {
+                    break 'read;
+                }
+            }
+            if exhausted {
+                break;
+            }
+        }
+        tx.commit().await.map_err(storage)?;
+        let unnamed = u64::try_from(unnamed)
+            .map_err(|_| StoreError("credential row count is negative".into()))?;
+        page.finish(revision, now, unnamed)
     }
 }
 

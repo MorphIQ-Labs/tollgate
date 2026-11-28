@@ -23,7 +23,7 @@ reqwest = { workspace = true, optional = true }
 arc-swap = { workspace = true }
 zeroize = { workspace = true }
 serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true, features = ["raw_value"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 

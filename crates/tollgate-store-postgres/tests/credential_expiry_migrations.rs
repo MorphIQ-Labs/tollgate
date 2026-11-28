@@ -313,7 +313,8 @@ async fn credential_expiry_constraints_and_readers_refuse_incomplete_evidence() 
         );
     }
     // Corrupt storage is outside the schema contract, but readers must still
-    // report a missing counterpart rather than omit it or invent infinity.
+    // report a missing counterpart rather than omit it or invent infinity: the
+    // operator listing fails, and the feed names the credential it withholds.
     sqlx::query("ALTER TABLE tollgate_credential_keys DROP CONSTRAINT tollgate_credential_keys_expiry_domain")
         .execute(&mut connection).await.unwrap();
     let store = PostgresStore::connect(&url, GrantPolicy::default())
@@ -333,14 +334,12 @@ async fn credential_expiry_constraints_and_readers_refuse_incomplete_evidence() 
         .await
         .unwrap();
         assert!(store.active_keys(Timestamp::UNIX_EPOCH).await.is_err());
-        for after in [None, Some(KeyId(0))] {
-            assert!(
-                store
-                    .active_keys_page(Timestamp::UNIX_EPOCH, after, NonZeroUsize::new(1).unwrap())
-                    .await
-                    .is_err()
-            );
-        }
+        let page = store
+            .active_keys_page(Timestamp::UNIX_EPOCH, None, NonZeroUsize::new(1).unwrap())
+            .await
+            .unwrap();
+        assert!(page.records().is_empty());
+        assert_eq!(page.unreadable().key_ids.len(), 1);
     }
     drop(store);
     cleanup(connection, &schema).await;

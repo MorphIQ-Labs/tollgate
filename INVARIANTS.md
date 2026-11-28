@@ -2070,7 +2070,8 @@ exists to detect corrupt state and must not be able to launder it.
     New credential expiry is preserved at nanosecond precision through every
     backend read and projection. PostgreSQL's `StoredInstant` representation
     and schema constraints own the exact pair; a missing component is a storage
-    error, never an indefinite credential. Migration 0018 marks legacy finite
+    error on an operator read and a withheld credential on the feed (34), never
+    an indefinite credential. Migration 0018 marks legacy finite
     rows with the earliest compatible expiry and fences old readers/issuers.
     It cannot extend source authority. Existing cached proofs must be cleared
     during the coordinated upgrade described in `docs/CREDENTIAL_PROJECTION.md`.
@@ -2632,7 +2633,8 @@ exists to detect corrupt state and must not be able to launder it.
 
 34. **A credential projection cannot renew stale identity evidence.** A single
     owned publisher replaces the complete validated active-key table. Duplicate
-    principals or a digest naming a different principal reject the entire set;
+    principals or a digest naming a different principal reject the entire set, so
+    no such record is ever installed;
     failed, incomplete or expired reads preserve the previous table and its
     original deadline. A successful empty set withdraws all entries. Every
     installed credential carries an exclusive evidence deadline equal to the
@@ -2689,8 +2691,50 @@ exists to detect corrupt state and must not be able to launder it.
     `only_instances_receive_active_keys_at_the_server_clock_without_caching`,
     `http_projection_refuses_partial_ambiguous_or_unsuccessful_responses`,
     the mirrored backend
-    `credential_projection_preserves_lifecycle_truth_and_refuses_corrupt_identity`,
+    `credential_projection_preserves_lifecycle_truth_and_withholds_corrupt_identity`,
     and the three full-stack HTTP/TLS/mTLS conservation tests named in 32.
+
+    **One credential that cannot be projected is withheld, not waited for.** An
+    active row that does not decode, or whose digest does not identify its
+    principal, delays no other credential's issuance, revocation or expiry. The
+    source leaves it out of the page's records and names it beside them, or
+    counts it when its key id does not decode either, in the same revisioned
+    read. The table built from that drain does not hold it, so it stops
+    authenticating at that publication, and a proof a session already cached
+    ends at its original deadline like that of a removed key. It returns once
+    its row reads. Both direct stores fill pages through `KeyPageBuilder`, which
+    owns the identity check, the bound of `limit` withheld ids per page and the
+    continuation; `HttpStore` applies the same rule to a served record that
+    states a key id and does not decode. A body or record with no readable key
+    id is a failed read. The source logs each withheld row, the manager logs
+    the ids and counts them in `unreadable_credentials`, and readiness is
+    unaffected: a catalogue withheld whole installs an empty table and reports
+    ready. `KeyDirectory::active_keys` and the account listing remain operator
+    reads that fail on a row they cannot decode. A source that omits the report
+    cannot be told apart from one with nothing to withhold.
+
+    An older control plane fails the whole page, so the previous table serves
+    until its deadline. An older instance ignores the report: it installs the
+    rest whenever every page that continues carries `limit` records, which is
+    every page from a direct store unless `limit` rows in a row are withheld or
+    the HTTP reader itself withholds one, and otherwise fails the pass and keeps
+    its previous table until the deadline.
+    *Tests:* `an_unreadable_credential_does_not_hold_back_the_others` (running
+    manager); `unreadable_credentials_are_withheld_from_every_page` (both
+    stores); `a_damaged_credential_row_is_withheld_and_the_feed_advances` and
+    `credential_expiry_constraints_and_readers_refuse_incomplete_evidence`
+    (PostgreSQL);
+    `memory_unreadable_credentials_cross_http_without_stalling_the_projection`
+    and
+    `postgres_unreadable_credentials_cross_http_without_stalling_the_projection`
+    (server, HTTP client and manager);
+    `a_body_without_the_withheld_fields_reads`,
+    `withheld_ids_and_counts_cross_the_wire`,
+    `a_served_record_that_does_not_decode_is_withheld`,
+    `an_unusable_credential_body_stays_a_failed_read`,
+    `page_bounds_and_orders_what_it_withholds` and
+    `every_withheld_credential_is_counted_and_overflow_is_visible`. The Lean
+    projection model assumes verified records and does not model withholding.
 
 35. **Credential activity derives from canonical accepted commitments.** A
     pinned snapshot supplies its optional key ID when commitment constructs

@@ -182,6 +182,14 @@ async fn http_projection_refuses_partial_ambiguous_or_unsuccessful_responses() {
     missing_cursor.as_object_mut().unwrap().remove("next_after");
     let mut nonadvancing = envelope(json!([record.clone()]));
     nonadvancing["next_after"] = json!(KeyId(0));
+    // A named record that does not decode, or does not identify its principal,
+    // is withheld: it never verifies, and never reads as one without expiry.
+    for damaged in [missing_expiry, wrong_digest] {
+        set(StatusCode::OK, envelope(json!([damaged])).to_string());
+        let page = http.active_keys_page(t(100), None, limit).await.unwrap();
+        assert!(page.records().is_empty());
+        assert_eq!(page.unreadable().key_ids, vec![KeyId(1)]);
+    }
     let mut maximal = envelope(json!([])).to_string();
     maximal.push_str(&" ".repeat(tollgate_store::wire::MAX_KEYS_BODY_BYTES - maximal.len()));
     set(StatusCode::OK, maximal);
@@ -190,8 +198,6 @@ async fn http_projection_refuses_partial_ambiguous_or_unsuccessful_responses() {
         "{\"keys\":[".to_owned(),
         "{}".to_owned(),
         envelope(json!([record.clone(), record.clone()])).to_string(),
-        envelope(json!([missing_expiry])).to_string(),
-        envelope(json!([wrong_digest])).to_string(),
         missing_cursor.to_string(),
         nonadvancing.to_string(),
         " ".repeat(tollgate_store::wire::MAX_KEYS_BODY_BYTES + 1),

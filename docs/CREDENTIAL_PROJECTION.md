@@ -33,6 +33,11 @@ record. An exactly full final page is terminal. Success carries
 The derived body limit admits every maximal legitimate page, including widest
 IDs and timestamps. Do not log the digest catalogue.
 
+A credential the server cannot decode is not in `keys`. The page names it in
+`unreadable`, or counts it in `unnamed_unreadable`; see
+[unreadable credentials](#unreadable-credentials). Both fields are omitted when
+empty. A page continues after its last entry of either kind.
+
 Records and revision come from one committed backend read. Mutations advance
 the revision; a manager that observes different revisions discards its
 candidate and restarts from the beginning. Expiry can narrow later pages
@@ -136,6 +141,50 @@ existing exact timing model. Shared backend scenarios, migration/rollback tests
 and real memory/PostgreSQL HTTP-to-session tests are separate finite arithmetic,
 driver, transaction and rollout witnesses; these do not prove cryptography or
 fleet-wide operator execution.
+
+## Unreadable credentials
+
+A stored credential can be unusable: a row damaged or hand-edited, a digest that
+no longer identifies its principal, an incomplete expiry, or a record written by
+a faulty embedder issuer. One such row delays nothing else. It is withheld from
+the feed, so the next pass of every instance stops verifying it while
+revocations, issuance and expiry of other credentials arrive as usual. A session
+that already proved it keeps that proof until its original deadline.
+
+| Where | Signal |
+| --- | --- |
+| Direct store, on a page read | error `stored credential cannot be projected; it is withheld from the feed`, with `key_id` and the reason |
+| PostgreSQL store, identifiers that are not 16 bytes | error naming the number of rows |
+| HTTP instance, when the served record is what does not decode | error `served credential does not decode; it is withheld from the projection`, with `key_id` |
+| Instance | warning `credentials cannot be decoded and do not authenticate; repair or revoke them`, naming up to 16 ids; counter `unreadable_credentials` |
+| Control plane HTTP | `unreadable` and `unnamed_unreadable` on `GET /v1/keys` |
+
+Alert on any rise of `unreadable_credentials`. Readiness does not report it, so
+a catalogue withheld whole leaves a ready instance authenticating nobody. A row
+that has expired or been revoked is not part of the feed and is not reported.
+
+To remove one, retire it with the ordinary revocation route, which reads only the
+owning account, and issue a replacement. To keep it, restore the row from
+authoritative evidence; the revision advances with the write and the next pass
+installs it. Never invent a digest, principal or expiry. A row whose id is not
+16 bytes cannot be named through the API and has to be corrected or removed with
+SQL:
+
+```sql
+SELECT encode(key_id, 'hex'), revoked_at_us IS NOT NULL AS revoked
+FROM tollgate_credential_keys WHERE octet_length(key_id) <> 16;
+```
+
+The operator reads, `KeyDirectory::active_keys` and the account's credential
+listing, still fail on a row they cannot decode. Duplicate principals, which
+need the table's unique constraint removed, still fail the whole drain.
+
+Rolling upgrades: upgrade the control plane first. An older one fails the whole
+page on such a row, so instances keep their previous table until `max_age`. An
+older instance ignores the two fields and installs the rest. It cannot count
+what was withheld, and it fails the pass, as before, if a page that continues
+carries fewer than `limit` records: `limit` withheld rows in a row, or a served
+record only that instance cannot read. There is no database migration.
 
 ## Instance lifecycle
 
