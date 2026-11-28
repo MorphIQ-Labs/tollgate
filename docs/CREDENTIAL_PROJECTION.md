@@ -183,8 +183,9 @@ Rolling upgrades: upgrade the control plane first. An older one fails the whole
 page on such a row, so instances keep their previous table until `max_age`. An
 older instance ignores the two fields and installs the rest. It cannot count
 what was withheld, and it fails the pass, as before, if a page that continues
-carries fewer than `limit` records: `limit` withheld rows in a row, or a served
-record only that instance cannot read. There is no database migration.
+carries fewer than `limit` records. That takes more than `limit` withheld rows
+before the page reaches `limit` readable ones, or a served record that only that
+instance cannot read. There is no database migration.
 
 ## Instance lifecycle
 

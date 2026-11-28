@@ -2716,8 +2716,9 @@ exists to detect corrupt state and must not be able to launder it.
     An older control plane fails the whole page, so the previous table serves
     until its deadline. An older instance ignores the report: it installs the
     rest whenever every page that continues carries `limit` records, which is
-    every page from a direct store unless `limit` rows in a row are withheld or
-    the HTTP reader itself withholds one, and otherwise fails the pass and keeps
+    every page from a direct store unless more than `limit` rows are withheld
+    before it reaches `limit` readable ones, and no page where only the HTTP
+    reader withholds; otherwise it fails the pass and keeps
     its previous table until the deadline.
     *Tests:* `an_unreadable_credential_does_not_hold_back_the_others` (running
     manager); `unreadable_credentials_are_withheld_from_every_page` (both

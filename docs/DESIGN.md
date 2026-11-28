@@ -8862,7 +8862,8 @@ page holds `limit` records or `limit` withheld ids. Counting withheld rows
 against the record limit would have been simpler and would have broken instances
 already running: they accept a continuation only from a page of `limit` records.
 Filled this way, upgrading the control plane alone restores their revocations in
-every case short of `limit` consecutive damaged rows. The bound on withheld ids
+every case where a page reaches `limit` readable rows before it meets more
+than `limit` damaged ones. The bound on withheld ids
 keeps one call's work and the response body finite when a whole catalogue is
 damaged. `KeyPageBuilder` is public so that both direct stores, and an
 embedder's, share the rule.
