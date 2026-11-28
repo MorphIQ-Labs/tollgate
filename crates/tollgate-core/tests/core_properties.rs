@@ -94,6 +94,24 @@ proptest! {
         prop_assert_eq!(revision.as_bytes(), &bytes);
     }
 
+    /// A union grants exactly what either side grants, including a permission
+    /// both sides hold.
+    #[test]
+    fn a_permission_union_grants_what_either_side_grants(
+        left in any::<u64>(),
+        right in any::<u64>(),
+        bit in 0u32..64,
+    ) {
+        let (left, right) = (PermissionBits(left), PermissionBits(right));
+        let union = left.union(right);
+        let one = PermissionBits::bit(bit);
+        prop_assert_eq!(
+            union.contains_all(one),
+            left.contains_all(one) || right.contains_all(one)
+        );
+        prop_assert!(union.contains_all(left) && union.contains_all(right));
+    }
+
     /// Quotes match exact u128 arithmetic or refuse with Overflow — never a
     /// wrapped value (INVARIANTS.md GL-11).
     #[test]

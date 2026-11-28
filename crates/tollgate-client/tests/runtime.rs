@@ -380,6 +380,36 @@ fn invalid_lease_manager_durations_are_rejected() {
     assert!(config.validate().is_err());
 }
 
+/// INVARIANTS.md GL-16: a grant nobody can spend is refused, never repaired.
+/// The safety margin must leave some of the lease usable (GL-9), and each
+/// refusal names the rule it broke.
+#[test]
+fn an_unusable_lease_grant_is_rejected_by_name() {
+    type Break = fn(&mut LeaseManagerConfig);
+    let cases: [(Break, &str); 3] = [
+        (
+            |c| c.target_grant = CostUnits::ZERO,
+            "target_grant must be positive",
+        ),
+        (
+            |c| c.expiry_safety_margin = c.lease_ttl,
+            "expiry_safety_margin must be shorter than lease_ttl",
+        ),
+        (
+            |c| c.expiry_safety_margin = c.lease_ttl + SignedDuration::from_nanos(1),
+            "expiry_safety_margin must be shorter than lease_ttl",
+        ),
+    ];
+    for (break_it, rule) in cases {
+        let mut config = manager_config();
+        break_it(&mut config);
+        assert_eq!(config.validate().unwrap_err().to_string(), rule);
+    }
+    let mut config = manager_config();
+    config.expiry_safety_margin = config.lease_ttl - SignedDuration::from_nanos(1);
+    assert_eq!(config.validate(), Ok(()));
+}
+
 #[test]
 fn fractional_and_wide_lease_ttls_remain_valid_configuration() {
     for ttl in [

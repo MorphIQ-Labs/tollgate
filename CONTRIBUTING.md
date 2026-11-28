@@ -48,9 +48,8 @@ TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
   ./scripts/check_mutations.sh --diff main
 ./scripts/check_mutations.sh --package tollgate-core
 
-# What pull requests do not measure: the whole workspace, and line coverage.
-# `.github/workflows/sweep.yml` runs both weekly, on demand, and on a push to
-# any `sweep/**` branch; survivors and uncovered contract paths are filed.
+# What pull requests do not measure: the whole workspace, and line coverage
+# (see "The weekly sweep" below).
 TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
   ./scripts/check_mutations.sh             # every mutant; many hours on one machine
 TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
@@ -62,6 +61,14 @@ The workspace's minimum supported Rust version is 1.89, and every pull request c
 Run timed performance checks locally and include their reports in performance-sensitive pull requests and release validation. Remote CI compiles benchmarks and enforces deterministic allocation counts; it does not execute Criterion or load measurements. Absolute thresholds and recorded baselines require their calibrated host, and even ratios need comparable measurement conditions. See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for commands, provenance and review requirements. `AGENTS.md` has the full command inventory.
 
 A backend behavior change must update both the memory and PostgreSQL implementations and their mirrored scenario tests.
+
+### The weekly sweep
+
+`.github/workflows/sweep.yml` runs the full mutation sweep and the coverage report every Saturday, on demand, and on a push to any `sweep/**` branch. Its reports are workflow artifacts. It blocks no merge, so a result stands until someone acts on it: read each run, and file what it finds in an issue that names the tested revision.
+
+- A **missed** mutant is killed by a test of the contract the code owes, or removed with the dead code it sits in. One that no input can distinguish from the original is excluded in [`.cargo/mutants.toml`](.cargo/mutants.toml), narrowly, with the argument or invariant that proves it. A survivor that exposes a defect gets a reproducing test and a fix.
+- A **timeout** is not a pass. Read the mutant's log: a test that cannot terminate gets a bound, and a run that was merely still passing is a missed mutant.
+- An **uncovered line** that enforces an invariant gets a test, or is filed with its location.
 
 ## Proposing a change
 
