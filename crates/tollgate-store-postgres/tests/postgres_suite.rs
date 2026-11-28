@@ -2301,10 +2301,12 @@ async fn suspend_checks(
         .filter(|(name, _)| Some(name.as_str()) != keep)
         .collect();
     for (name, _) in &dropped {
-        sqlx::raw_sql(&format!("ALTER TABLE {table} DROP CONSTRAINT {name}"))
-            .execute(pool)
-            .await
-            .unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE {table} DROP CONSTRAINT {name}"
+        )))
+        .execute(pool)
+        .await
+        .unwrap();
     }
     dropped
 }
@@ -2313,9 +2315,9 @@ async fn suspend_checks(
 /// survives while every future write stays checked.
 async fn restore_checks(pool: &sqlx::PgPool, table: &str, dropped: Vec<(String, String)>) {
     for (name, definition) in dropped {
-        sqlx::raw_sql(&format!(
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE {table} ADD CONSTRAINT {name} {definition} NOT VALID"
-        ))
+        )))
         .execute(pool)
         .await
         .unwrap();
@@ -2333,9 +2335,9 @@ async fn plant_value(
     value: i64,
 ) {
     let dropped = suspend_checks(pool, table, column, None).await;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {table} SET {column} = $1 WHERE {id_column} = $2"
-    ))
+    )))
     .bind(value)
     .bind(id)
     .execute(pool)
@@ -2790,9 +2792,9 @@ async fn checked_ledger_columns_reject_negative_writes() {
         };
         let nonneg = format!("{table}_{column}_{suffix}");
         let dropped = suspend_checks(&pool, table, column, Some(&nonneg)).await;
-        let result = sqlx::query(&format!(
+        let result = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {table} SET {column} = -1 WHERE {id_column} = $1"
-        ))
+        )))
         .bind(id)
         .execute(&pool)
         .await;
@@ -2848,9 +2850,9 @@ async fn zero_fences_are_refused_in_every_persisted_capability() {
             event.request_id.0.to_be_bytes().to_vec(),
         ),
     ] {
-        let error = sqlx::query(&format!(
+        let error = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {table} SET {column} = 0 WHERE {id_column} = $1"
-        ))
+        )))
         .bind(id)
         .execute(&pool)
         .await
@@ -2904,9 +2906,9 @@ async fn the_allowance_split_cannot_exceed_what_it_is_part_of() {
             "tollgate_leases_from_allowance_within_grant",
         ),
     ] {
-        let err = sqlx::query(&format!(
+        let err = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {table} SET {column} = $1 WHERE {id_column} = $2"
-        ))
+        )))
         .bind(value)
         .bind(id)
         .execute(&pool)
@@ -6663,9 +6665,9 @@ async fn an_unrecognized_stored_schedule_name_is_refused() {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE tollgate_accounts SET {column} = $1 WHERE account_id = $2"
-        ))
+        )))
         .bind(planted)
         .bind(account_bytes())
         .execute(&pool)

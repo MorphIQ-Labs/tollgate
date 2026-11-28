@@ -5,7 +5,7 @@
 //! Normal consumers do not enable this feature; in-repository integration
 //! tests opt in through dev-dependencies.
 
-use sqlx::Row;
+use sqlx::{AssertSqlSafe, Row};
 use tollgate_core::AccountId;
 use tollgate_store::StoreError;
 
@@ -34,7 +34,7 @@ pub async fn explain_active_lease_sum(
         .execute(&store.pool)
         .await
         .map_err(storage)?;
-    let rows = sqlx::query(&format!("EXPLAIN {ACTIVE_LEASE_SUM_SQL}"))
+    let rows = sqlx::query(explain(ACTIVE_LEASE_SUM_SQL))
         .bind(id_bytes(account.0))
         .fetch_all(&store.pool)
         .await
@@ -68,7 +68,7 @@ pub async fn explain_reclaim_due_leases(
         .execute(&store.pool)
         .await
         .map_err(storage)?;
-    let rows = sqlx::query(&format!("EXPLAIN {RECLAIM_DUE_LEASES_SQL}"))
+    let rows = sqlx::query(explain(RECLAIM_DUE_LEASES_SQL))
         .bind(cutoff.micros)
         .bind(cutoff.submicro_nanos)
         .bind(limit)
@@ -92,7 +92,7 @@ pub async fn explain_due_periods(
         .execute(&store.pool)
         .await
         .map_err(storage)?;
-    let rows = sqlx::query(&format!("EXPLAIN {DUE_PERIODS_SQL}"))
+    let rows = sqlx::query(explain(DUE_PERIODS_SQL))
         .bind(period)
         .bind(boundary_us)
         .bind(limit)
@@ -100,6 +100,12 @@ pub async fn explain_due_periods(
         .await
         .map_err(storage)?;
     Ok(plan_text(&rows))
+}
+
+/// `EXPLAIN` over one of this crate's own statements. Taking `&'static str`
+/// keeps run-time text out of the one dynamic statement here.
+fn explain(statement: &'static str) -> AssertSqlSafe<String> {
+    AssertSqlSafe(format!("EXPLAIN {statement}"))
 }
 
 fn plan_text(rows: &[sqlx::postgres::PgRow]) -> String {

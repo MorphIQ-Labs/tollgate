@@ -39,7 +39,7 @@ uuid = { workspace = true }
 tollgate-store-postgres = { path = ".", default-features = false, features = ["test-support"] }
 criterion = { workspace = true }
 proptest = { workspace = true }
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["io-util", "test-util"] }
 
 # Control-plane database latency, reported but not gated: the absolute result
 # depends on the PostgreSQL host and connection path. This benchmark exists to

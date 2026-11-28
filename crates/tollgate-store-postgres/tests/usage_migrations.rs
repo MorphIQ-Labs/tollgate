@@ -34,9 +34,9 @@ async fn legacy_fixture() -> Option<(PgConnection, String)> {
         .await
         .expect("connect to test database");
     let schema = format!("tollgate_usage_upgrade_{}", uuid::Uuid::new_v4().simple());
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE SCHEMA {schema}; SET search_path TO {schema}"
-    ))
+    )))
     .execute(&mut connection)
     .await
     .unwrap();
@@ -51,9 +51,9 @@ async fn legacy_fixture() -> Option<(PgConnection, String)> {
 }
 
 async fn cleanup(mut connection: PgConnection, schema: &str) {
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "SET search_path TO public; DROP SCHEMA {schema} CASCADE"
-    ))
+    )))
     .execute(&mut connection)
     .await
     .unwrap();
@@ -125,9 +125,9 @@ async fn invalid_history_blocks_validation_but_leaves_write_guards_and_can_be_re
         let Some((mut connection, schema)) = legacy_fixture().await else {
             return;
         };
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {table} SET {column} = $1 WHERE {predicate}"
-        ))
+        )))
         .bind(invalid)
         .execute(&mut connection)
         .await
@@ -155,11 +155,12 @@ async fn invalid_history_blocks_validation_but_leaves_write_guards_and_can_be_re
             applied, 15,
             "validation failure preserves the installed guards"
         );
-        let old_value: i64 =
-            sqlx::query_scalar(&format!("SELECT {column} FROM {table} WHERE {predicate}"))
-                .fetch_one(&mut connection)
-                .await
-                .unwrap();
+        let old_value: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT {column} FROM {table} WHERE {predicate}"
+        )))
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
         assert_eq!(
             old_value, invalid,
             "migration must not rewrite corrupt history"
@@ -175,9 +176,9 @@ async fn invalid_history_blocks_validation_but_leaves_write_guards_and_can_be_re
         );
         // Fixture-only repair to the known original value. Operators must use
         // authoritative evidence; blindly normalizing history is not recovery.
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {table} SET {column} = $1 WHERE {predicate}"
-        ))
+        )))
         .bind(repaired)
         .execute(&mut connection)
         .await

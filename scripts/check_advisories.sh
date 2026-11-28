@@ -3,15 +3,11 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 VERSION_FILE="$ROOT/.cargo/audit-version"
-# Each exception is an advisory and the package it is filed against, and is
-# tolerated only while no workspace target compiles that package: Cargo.lock
-# records the optional MySQL and SQLite graphs of sqlx's published crates
-# although only PostgreSQL is enabled.
-#
-# RUSTSEC-2023-0071: rsa 0.9.10, through sqlx's MySQL graph; no fixed release.
-# RUSTSEC-2026-0459: libsqlite3-sys 0.30.1, through sqlx's SQLite graph; the
-# fixed releases need sqlx 0.9, whose minimum Rust is above this workspace's.
-EXCEPTIONS="RUSTSEC-2023-0071:rsa RUSTSEC-2026-0459:libsqlite3-sys"
+# Each exception is an advisory and the package it is filed against, written
+# "RUSTSEC-YYYY-NNNN:package" and separated by spaces, with the reason above the
+# list. One is tolerated only while no workspace target compiles that package
+# and the audit still fails without it. There are none.
+EXCEPTIONS=""
 
 required=$(cat "$VERSION_FILE")
 installed=$(cargo-audit --version 2>/dev/null || true)
@@ -27,6 +23,10 @@ cd "$ROOT"
 for exception in $EXCEPTIONS; do
   advisory=${exception%%:*}
   package=${exception#*:}
+  if ! grep -qx "name = \"$package\"" Cargo.lock; then
+    echo "advisory gate: $package is not in Cargo.lock; remove the exception for $advisory" >&2
+    exit 1
+  fi
   reachable=$(cargo tree --quiet --locked --workspace --all-features --target all \
     --edges normal,build,dev --prefix none -i "$package")
   if [ -n "$reachable" ]; then
@@ -76,4 +76,8 @@ for exception in $EXCEPTIONS; do
   esac
 done
 
-echo "advisory gate: OK (every exception is isolated to an unreachable lockfile package: $EXCEPTIONS)"
+if [ -z "$EXCEPTIONS" ]; then
+  echo "advisory gate: OK (no exceptions)"
+else
+  echo "advisory gate: OK (every exception is isolated to an unreachable lockfile package: $EXCEPTIONS)"
+fi
