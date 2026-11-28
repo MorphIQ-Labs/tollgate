@@ -3170,6 +3170,8 @@ enum Step {
     Fail,
     /// Answer once the test releases it.
     Gated(SnapshotResolution),
+    /// Fail once the test releases it.
+    GatedFail,
 }
 
 /// A source whose pulls follow a script and then never answer, so no later read
@@ -3203,6 +3205,10 @@ impl Scripted {
                             Some(Step::Gated(resolution)) => {
                                 release.notified().await;
                                 Ok(resolution)
+                            }
+                            Some(Step::GatedFail) => {
+                                release.notified().await;
+                                Err(StoreError("scripted failure".into()))
                             }
                             None => std::future::pending().await,
                         }
@@ -3261,22 +3267,196 @@ async fn a_push_overtakes_a_retry_of_a_held_principal() {
     fixture.manager.shutdown().await;
 }
 
-/// A push naming a principal whose first read is being retried discards that
-/// read: what it answers may predate the push, so the principal is read again.
+fn narrowed(generation: u64) -> SnapshotResolution {
+    SnapshotResolution::Present(publishable(snapshot(generation, PermissionBits::NONE)))
+}
+
+fn revoked(generation: u64) -> SnapshotResolution {
+    SnapshotResolution::Revoked {
+        generation: Generation(generation),
+    }
+}
+
+/// Pushes for a principal whose first read is being retried are applied on top
+/// of that read's answer, so what they superseded is never served: whatever
+/// arrived during the read, the outcome is that of the answer followed by every
+/// push (INVARIANTS.md GL-10, GL-15).
 #[tokio::test(start_paused = true)]
-async fn a_push_overtakes_a_retry_of_an_unresolved_principal() {
-    let scripted = Scripted::new([Step::Fail, Step::Gated(present(1))]);
-    let fixture = spawn_with(scripted.source.clone(), push_only_config());
+async fn pushes_during_an_unresolved_read_apply_on_top_of_its_answer() {
+    let denied = Err(DenyReason::UnknownPrincipal);
+    let narrow = Err(DenyReason::MissingPermission);
+    for (answer, pushes, expected, replay) in [
+        (present(1), vec![narrowed(2)], narrow, Some(1)),
+        (narrowed(2), vec![present(1)], narrow, None),
+        (present(1), vec![revoked(2)], denied, Some(2)),
+        (present(1), vec![SnapshotResolution::Unknown], denied, None),
+        (present(1), vec![unreadable(2)], denied, Some(1)),
+        (present(1), vec![revoked(2), present(2)], denied, Some(2)),
+        (
+            present(1),
+            vec![SnapshotResolution::Unknown, narrowed(2)],
+            narrow,
+            None,
+        ),
+        (
+            present(1),
+            vec![narrowed(2), SnapshotResolution::Unknown],
+            denied,
+            Some(1),
+        ),
+        (
+            SnapshotResolution::Unknown,
+            vec![revoked(9)],
+            denied,
+            Some(9),
+        ),
+        (revoked(9), vec![present(8)], denied, Some(9)),
+    ] {
+        let scripted = Scripted::new([Step::Fail, Step::Gated(answer.clone())]);
+        let fixture = spawn_with(scripted.source.clone(), push_only_config());
+        stock_slot(&fixture);
+        settle().await;
+        assert_eq!(scripted.calls(), 2, "the retry is in flight");
+
+        for push in &pushes {
+            scripted.push(push.clone());
+        }
+        settle().await;
+        scripted.release.notify_one();
+        settle().await;
+        let case = format!("{answer:?} then {pushes:?}");
+        assert_eq!(admit(&fixture), expected, "{case}");
+        assert_eq!(scripted.calls(), 2, "{case}: the answer was used");
+        // The ordering the pushes established is retained.
+        if let Some(generation) = replay {
+            scripted.push(present(generation));
+            settle().await;
+            assert_eq!(admit(&fixture), expected, "{case}: replay");
+        }
+        fixture.manager.shutdown().await;
+    }
+}
+
+/// A push is not authority for a principal the answer does not hold: a newer
+/// snapshot pushed during a read that found none only has it read again, at
+/// once.
+#[tokio::test(start_paused = true)]
+async fn a_newer_push_over_a_negative_answer_is_read_again_not_installed() {
+    for answer in [SnapshotResolution::Unknown, revoked(9), unreadable(9)] {
+        let scripted = Scripted::new([Step::Fail, Step::Gated(answer.clone())]);
+        let fixture = spawn_with(scripted.source.clone(), push_only_config());
+        stock_slot(&fixture);
+        settle().await;
+        scripted.push(present(10));
+        settle().await;
+        scripted.release.notify_one();
+        settle().await;
+        assert_eq!(
+            admit(&fixture),
+            Err(DenyReason::UnknownPrincipal),
+            "{answer:?}"
+        );
+        assert_eq!(scripted.calls(), 3, "{answer:?}: read again at once");
+        fixture.manager.shutdown().await;
+    }
+}
+
+/// A push that arrived during a read the source then failed brings the next
+/// attempt forward.
+#[tokio::test(start_paused = true)]
+async fn a_push_during_a_failed_read_retries_at_once() {
+    let scripted = Scripted::new([Step::Fail, Step::GatedFail, Step::Answer(present(2))]);
+    let fixture = spawn_with(
+        scripted.source.clone(),
+        SnapshotManagerConfig {
+            retry_backoff: std::time::Duration::from_secs(600),
+            ..push_only_config()
+        },
+    );
     stock_slot(&fixture);
     settle().await;
-    assert_eq!(scripted.calls(), 2, "the retry is in flight");
-
+    scripted.push(present(2));
+    settle().await;
+    assert_eq!(scripted.calls(), 2, "the push brought the retry forward");
     scripted.push(present(2));
     settle().await;
     scripted.release.notify_one();
     settle().await;
-    assert_eq!(admit(&fixture), Err(DenyReason::UnknownPrincipal));
-    assert_eq!(scripted.calls(), 3, "read again at once");
+    assert_eq!(scripted.calls(), 3);
+    assert_eq!(admit(&fixture), Ok(()));
+    fixture.manager.shutdown().await;
+}
+
+/// A principal whose pushes arrive faster than the source answers still
+/// resolves, while they keep arriving, and then follows them (INVARIANTS.md
+/// GL-10). The source answers with what it held when asked, so every answer is
+/// already behind the publications made while it was in flight.
+#[tokio::test(start_paused = true)]
+async fn a_principal_resolves_while_pushes_keep_arriving() {
+    let store = two_account_store();
+    let first = Arc::new(AtomicBool::new(true));
+    let source = Arc::new(DelegatingStore::wrapping(Arc::clone(&store)).on_snapshot(
+        move |inner, principal| {
+            let fails = first.swap(false, Ordering::AcqRel);
+            async move {
+                if fails {
+                    return Err(StoreError("not yet".into()));
+                }
+                let stored = SnapshotSource::snapshot(&*inner, principal).await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                stored
+            }
+        },
+    ));
+    let fixture = spawn_with(source, push_only_config());
+    stock_slot(&fixture);
+
+    let publish = async |generation, permissions| {
+        store
+            .publish_snapshot(PRINCIPAL, publishable(snapshot(generation, permissions)))
+            .expect("snapshot fixture matches its account and credential");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    for generation in 2..50 {
+        publish(generation, PermissionBits::bit(0)).await;
+    }
+    assert_eq!(admit(&fixture), Ok(()), "resolved during the stream");
+    publish(50, PermissionBits::NONE).await;
+    assert_eq!(admit(&fixture), Err(DenyReason::MissingPermission));
+    fixture.manager.shutdown().await;
+}
+
+/// Due retries start between pushes, without waiting for a timer a stream of
+/// them could hold off. No time passes here while they arrive.
+#[tokio::test(start_paused = true)]
+async fn a_due_retry_starts_while_pushes_leave_no_idle_moment() {
+    let store = two_account_store();
+    let fault = Fault::new(FAILS);
+    let fixture = spawn_with(
+        Arc::new(faulty(&store, &fault)),
+        SnapshotManagerConfig {
+            retry_backoff: std::time::Duration::from_secs(600),
+            ..push_only_config()
+        },
+    );
+    stock_slot(&fixture);
+    settle().await;
+    fault.set(ANSWERS);
+    // Off the timer's millisecond boundary, so that even a zero-length wait
+    // lies ahead of a clock that does not move.
+    tokio::time::advance(std::time::Duration::from_micros(500)).await;
+    let started = tokio::time::Instant::now();
+    for generation in 2..200 {
+        store
+            .publish_snapshot(
+                PRINCIPAL,
+                publishable(snapshot(generation, PermissionBits::bit(0))),
+            )
+            .expect("snapshot fixture matches its account and credential");
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    assert_eq!(admit(&fixture), Ok(()));
     fixture.manager.shutdown().await;
 }
 

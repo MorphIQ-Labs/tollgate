@@ -8799,8 +8799,31 @@ Alternatives considered:
 Running reads beside the loop creates an ordering the manager did not have: a
 push can be applied while an older read is outstanding. Recording any resolution
 invalidates that read, in the one write path every resolution goes through, so
-no caller can forget it. A push for a principal with nothing resolved is still
-only a hint (GL-15), so it discards the outstanding read and reads again.
+no caller can forget it.
+
+A push for a principal with nothing resolved is still only a hint (GL-15), so it
+cannot be applied while that principal's read is outstanding. Discarding the
+read and reading again was the first answer, and it starves: pushes arriving
+faster than the source answers discard every read, and the principal is never
+resolved. The push is held instead and applied on top of the answer, which is
+the order the loop produced when it waited for each read, with the two
+publications made one so that the superseded answer is never visible. Rejected:
+
+- **Accepting only an answer at least as new as every push.** Safe, and starves
+  the same way under a publisher that outpaces the source.
+- **Queueing every push.** Unbounded for as long as a read takes, or bounded by
+  discarding the read on overflow, which starves again. The newest versioned
+  push and the last absence determine the outcome of any sequence, so nothing
+  else is kept.
+
+A held snapshot is applied only over an answer that is itself a snapshot. Over
+an absence or a tombstone it would give a push the authority to open what the
+source did not, so the principal is read again. A lagged stream still discards
+the reads in flight: what was dropped cannot be held.
+
+Work due beside the loop is started at the top of the loop. Starting it when the
+wakeup timer fired let a stream of events recreate the timer ahead of its next
+tick indefinitely.
 
 Retries are timed by the task's timer rather than the injected clock. The clock
 decides validity; a retry delay only paces calls, as the old loop's sleep did. A

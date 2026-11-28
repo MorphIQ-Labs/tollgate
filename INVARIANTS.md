@@ -927,9 +927,24 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     could not be published, leaves the refresh sweep and is retried beside the
     manager's loop: after `retry_backoff` for a principal with nothing, after
     `refresh_interval` for one holding a snapshot, which keeps it until its
-    `valid_until`. Negative rechecks run the same way. A push for such a
-    principal brings its retry forward, lag recovery brings every retry
-    forward, and a read that anything newer has overtaken is discarded.
+    `valid_until`. Negative rechecks run the same way. Due work starts between
+    events, so a stream of pushes cannot postpone it. A push for a principal
+    that is waiting brings its retry forward, and lag recovery brings every
+    retry forward.
+
+    **Pushes cannot keep a principal unresolved.** A push applied to a
+    principal that holds a resolution discards a read of it still in flight.
+    A push that cannot yet be applied, for a principal with nothing resolved,
+    is held for the read in flight and applied on top of its answer, with one
+    publication for both: nothing a held push superseded is ever visible, and
+    the read is not discarded however often pushes arrive. At most the newest
+    versioned push and the last absence are held, which has the effect of
+    holding all of them. A held positive advances only an answer that is itself
+    a snapshot (15); over any other answer the principal stays denied and is
+    read again at once. A read that fails with pushes held is retried at once.
+    A lagged stream discards every read in flight, with what it held, because a
+    dropped push may be newer than the answer: such a principal resolves by a
+    read during which the stream did not lag.
 
     Two delays remain, each bounded. A sweep publishes when its slowest read
     ends, so the pass in which a principal first stops answering holds the
@@ -939,7 +954,8 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     can wait `fetch_timeout` for each batch ahead of it. A principal the source
     answers for never waits behind them. Enforcement: `Resolutions` owns both
     schedules and removes a principal from the sweep while a retry is owed;
-    recording any resolution invalidates a read in flight beside the loop.
+    recording any resolution invalidates a read in flight beside the loop, and
+    `Overtaking` owns what is held for one.
     *Tests:* `one_unanswered_principal_does_not_hold_back_the_others`,
     `pushes_are_applied_while_a_principal_is_unanswered`,
     `discovery_proceeds_while_a_principal_is_unanswered`,
@@ -949,7 +965,14 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `a_push_brings_an_unanswered_principals_retry_forward`,
     `lag_recovery_retries_an_unanswered_principal_at_once`,
     `a_push_overtakes_a_retry_of_a_held_principal`,
-    `a_push_overtakes_a_retry_of_an_unresolved_principal`,
+    `a_principal_resolves_while_pushes_keep_arriving`,
+    `pushes_during_an_unresolved_read_apply_on_top_of_its_answer`,
+    `a_newer_push_over_a_negative_answer_is_read_again_not_installed`,
+    `a_push_during_a_failed_read_retries_at_once`,
+    `a_due_retry_starts_while_pushes_leave_no_idle_moment`,
+    `held_pushes_have_the_effect_of_every_push`,
+    `a_dropped_held_push_is_still_reported`,
+    `a_push_is_held_for_a_read_in_flight_and_otherwise_hurries_a_retry`,
     `an_unanswered_read_is_scheduled_by_what_the_principal_holds`,
     `a_batch_beside_the_loop_takes_the_longest_overdue_first`,
     `an_overtaken_read_no_longer_counts`,

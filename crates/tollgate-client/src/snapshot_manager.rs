@@ -14,8 +14,9 @@
 //! - **Retries** — a principal whose fetch the source does not answer is
 //!   retried on its own schedule, beside the loop rather than inside it, and
 //!   the full refresh leaves it to that schedule until it is answered. One
-//!   failing or hanging principal therefore does not hold up the others
-//!   (INVARIANTS.md GL-10).
+//!   failing or hanging principal therefore does not hold up the others, and
+//!   pushes arriving during its retry are applied on top of the answer rather
+//!   than restarting it (INVARIANTS.md GL-10).
 //! - **Unreadable snapshots** — a source holding a snapshot that does not
 //!   decode says so at its generation, and the principal is withdrawn and
 //!   negative-cached like an unknown one, refusing anything older
@@ -731,9 +732,10 @@ struct Resolutions {
     /// `retries`, earliest first.
     retry_queue: BTreeSet<(Instant, Principal)>,
     /// Principals with a read running beside the loop whose answer still
-    /// counts. Recording a resolution removes the principal: whatever recorded
-    /// it is at least as new as a read already in flight.
-    reading: HashSet<Principal>,
+    /// counts, and the pushes to apply on top of that answer. Recording a
+    /// resolution removes the principal: whatever recorded it is at least as
+    /// new as a read already in flight.
+    reading: HashMap<Principal, Overtaking>,
     /// How long a principal with no snapshot waits after an unanswered read.
     retry_backoff: std::time::Duration,
     /// How long a principal holding a snapshot waits after an unanswered read.
@@ -752,7 +754,7 @@ impl Resolutions {
             refetch: BTreeSet::new(),
             retries: HashMap::new(),
             retry_queue: BTreeSet::new(),
-            reading: HashSet::new(),
+            reading: HashMap::new(),
             retry_backoff: std::time::Duration::ZERO,
             refresh_interval: std::time::Duration::ZERO,
         }
@@ -807,13 +809,42 @@ impl Resolutions {
     /// Whether `principal`'s reads are on their own schedule or in flight
     /// beside the loop, so the loop must not wait on one.
     fn is_beside(&self, principal: Principal) -> bool {
-        self.retries.contains_key(&principal) || self.reading.contains(&principal)
+        self.retries.contains_key(&principal) || self.reading.contains_key(&principal)
     }
 
-    /// Something newer than any outstanding read is known: drop that read's
-    /// answer, and bring a scheduled retry forward to now.
-    fn expedite(&mut self, principal: Principal) {
-        self.reading.remove(&principal);
+    /// A push for a principal the loop must not read inline, and cannot yet
+    /// be advanced by it: hold it for the read in flight, or bring a
+    /// scheduled retry forward to now.
+    ///
+    /// Holding it, rather than discarding the read, is what lets such a
+    /// principal resolve while pushes keep arriving faster than the source
+    /// answers.
+    fn overtake(
+        &mut self,
+        principal: Principal,
+        push: SnapshotResolution,
+        counters: &SnapshotCounters,
+    ) {
+        let Some(mut held) = self.reading.remove(&principal) else {
+            self.hurry(principal);
+            return;
+        };
+        if let Some((dropped, refused)) = held.hold(push)
+            && let Some((generation, kind)) = versioned(&dropped)
+        {
+            // What compaction drops is still reported as it would have been.
+            if matches!(dropped, SnapshotResolution::Unreadable { .. }) {
+                counters.record_unreadable(principal, generation, UpdateOrigin::Push);
+            }
+            if refused {
+                self.record_refusal(principal, generation, kind, UpdateOrigin::Push, counters);
+            }
+        }
+        self.reading.insert(principal, held);
+    }
+
+    /// Bring a scheduled retry forward to now.
+    fn hurry(&mut self, principal: Principal) {
         if self.retries.contains_key(&principal) {
             self.schedule_retry(principal, Instant::now());
         }
@@ -821,11 +852,16 @@ impl Resolutions {
 
     /// Mark reads as running beside the loop.
     fn begin_reads(&mut self, principals: &[Principal]) {
-        self.reading.extend(principals.iter().copied());
+        self.reading.extend(
+            principals
+                .iter()
+                .map(|&principal| (principal, Overtaking::default())),
+        );
     }
 
-    /// Whether a finished read still counts. Each counts at most once.
-    fn claim_read(&mut self, principal: Principal) -> bool {
+    /// The pushes to apply on top of a finished read, or `None` when the read
+    /// no longer counts. Each counts at most once.
+    fn claim_read(&mut self, principal: Principal) -> Option<Overtaking> {
         self.reading.remove(&principal)
     }
 
@@ -1487,13 +1523,208 @@ impl Fetches {
     }
 }
 
+/// The generation a resolution names, and what kind of statement it is. An
+/// absence names none.
+fn versioned(resolution: &SnapshotResolution) -> Option<(Generation, &'static str)> {
+    match resolution {
+        SnapshotResolution::Present(snapshot) => Some((snapshot.generation, "positive")),
+        SnapshotResolution::Revoked { generation } => Some((*generation, "revoked")),
+        SnapshotResolution::Unreadable { generation } => Some((*generation, "unreadable")),
+        SnapshotResolution::Unknown => None,
+    }
+}
+
+/// Pushes that arrived while a read was in flight, reduced to what can still
+/// affect its answer: the newest versioned one and the last absence, in arrival
+/// order. Applying these has the effect of applying every push held.
+#[derive(Debug, Default)]
+struct Overtaking(Vec<SnapshotResolution>);
+
+impl Overtaking {
+    /// Hold one more push. Returns whichever push no longer matters, if any,
+    /// and whether generation ordering refused it rather than replaced it.
+    fn hold(&mut self, push: SnapshotResolution) -> Option<(SnapshotResolution, bool)> {
+        let Some((generation, _)) = versioned(&push) else {
+            self.0.retain(|held| versioned(held).is_some());
+            self.0.push(push);
+            return None;
+        };
+        let newest = self.0.iter().enumerate().find_map(|(index, held)| {
+            versioned(held).map(|(held_generation, _)| (index, held_generation))
+        });
+        let Some((index, held_generation)) = newest else {
+            self.0.push(push);
+            return None;
+        };
+        let revoked = |resolution: &SnapshotResolution| {
+            matches!(resolution, SnapshotResolution::Revoked { .. })
+        };
+        if generation < held_generation
+            || (generation == held_generation && revoked(&self.0[index]) && !revoked(&push))
+        {
+            return Some((push, true));
+        }
+        let replaced = self.0.remove(index);
+        self.0.push(push);
+        Some((replaced, false))
+    }
+}
+
+/// Order one pushed or held resolution against what the principal holds, record
+/// it if it is accepted, and return what to publish.
+fn apply_push(
+    resolutions: &mut Resolutions,
+    slots: &Arc<SlotRegistry>,
+    now: jiff::Timestamp,
+    config: &SnapshotManagerConfig,
+    principal: Principal,
+    resolution: SnapshotResolution,
+    counters: &SnapshotCounters,
+) -> Option<PublishableSnapshotUpdate> {
+    let ((watermark, accepted), kind, revoked) = match resolution {
+        SnapshotResolution::Present(snapshot) => {
+            if !resolutions.accepts_positive(
+                principal,
+                snapshot.generation,
+                UpdateOrigin::Push,
+                counters,
+            ) {
+                return None;
+            }
+            let slot = slots.slot(snapshot.account_id);
+            resolutions.insert(
+                principal,
+                Resolution::Present {
+                    deadline: snapshot.valid_until,
+                    generation: snapshot.generation,
+                },
+            );
+            return Some(PublishableSnapshotUpdate::Present {
+                principal,
+                snapshot,
+                lease: slot,
+            });
+        }
+        SnapshotResolution::Revoked { generation } => (
+            resolutions.revocation(principal, generation, UpdateOrigin::Push, counters),
+            NegativeKind::Revoked,
+            Some(generation),
+        ),
+        SnapshotResolution::Unknown => (
+            accept_unknown(resolutions.watermark_of(principal)),
+            NegativeKind::Unknown,
+            None,
+        ),
+        SnapshotResolution::Unreadable { generation } => (
+            resolutions.unreadable(principal, generation, UpdateOrigin::Push, counters),
+            NegativeKind::Unreadable,
+            None,
+        ),
+    };
+    if !accepted {
+        return None;
+    }
+    let until = negative_deadline(now, config, kind);
+    resolutions.insert(
+        principal,
+        Resolution::Negative {
+            deadline: until,
+            next_refetch: until,
+            watermark,
+        },
+    );
+    Some(match revoked {
+        Some(generation) => PublishableSnapshotUpdate::Revoked {
+            principal,
+            until,
+            generation,
+        },
+        None => PublishableSnapshotUpdate::Unknown { principal, until },
+    })
+}
+
+/// Apply what arrived during a read on top of its answer, and return the one
+/// update to publish for both, so nothing a push has superseded is ever
+/// visible.
+///
+/// A held positive advances only an answer that is itself a snapshot: a push is
+/// authority only for a principal already held (GL-15). Over any other answer a
+/// newer positive instead has the principal read again at once.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one read's answer and the state it applies to"
+)]
+fn apply_overtaking(
+    held: Overtaking,
+    answered_present: bool,
+    mut update: PublishableSnapshotUpdate,
+    resolutions: &mut Resolutions,
+    slots: &Arc<SlotRegistry>,
+    clock: &Arc<dyn Clock>,
+    config: &SnapshotManagerConfig,
+    principal: Principal,
+    counters: &SnapshotCounters,
+) -> PublishableSnapshotUpdate {
+    for push in held.0 {
+        match &push {
+            SnapshotResolution::Present(snapshot) if !answered_present => {
+                if resolutions.accepts_positive(
+                    principal,
+                    snapshot.generation,
+                    UpdateOrigin::Push,
+                    counters,
+                ) {
+                    resolutions.back_off(principal, clock.now());
+                }
+            }
+            _ => {
+                if let Some(newer) = apply_push(
+                    resolutions,
+                    slots,
+                    clock.now(),
+                    config,
+                    principal,
+                    push,
+                    counters,
+                ) {
+                    update = newer;
+                }
+            }
+        }
+    }
+    update
+}
+
+/// Start the next batch of retries and negative rechecks that are due, if any.
+fn start_beside(
+    source: &Arc<dyn SnapshotSource>,
+    clock: &Arc<dyn Clock>,
+    config: &SnapshotManagerConfig,
+    resolutions: &mut Resolutions,
+    ready: &watch::Sender<bool>,
+    counters: &SnapshotCounters,
+) -> Option<Beside> {
+    let limit = config.max_concurrent_fetches.min(resolutions.capacity());
+    let due = resolutions.due_beside(clock.now(), limit);
+    if due.is_empty() {
+        return None;
+    }
+    let reads = reserve_reads(clock, config, &due, resolutions, ready, counters)?;
+    resolutions.begin_reads(&due);
+    Some(Beside {
+        fetches: Fetches::start(source, config, reads),
+        principals: due,
+    })
+}
+
 /// Whose reads are being applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pass {
     /// A refresh the loop waits for: no resolution changed while it ran.
     Inline,
-    /// Retries and negative rechecks running beside the loop. A read the loop
-    /// has since overtaken is dropped.
+    /// Retries and negative rechecks running beside the loop. A read is dropped
+    /// if a resolution was recorded while it ran; pushes that could not be
+    /// applied meanwhile are applied on top of it.
     Beside,
 }
 
@@ -1636,13 +1867,23 @@ fn apply_fetches(
     resolutions: &mut Resolutions,
     counters: &SnapshotCounters,
 ) {
-    // The principals whose read from this batch still counts.
+    // The principals whose read from this batch still counts, with whatever
+    // was pushed for them while it ran.
+    let mut overtaken: HashMap<Principal, Overtaking> = principals
+        .iter()
+        .filter_map(|&principal| {
+            let held = match pass {
+                Pass::Inline => Some(Overtaking::default()),
+                Pass::Beside => resolutions.claim_read(principal),
+            };
+            held.map(|held| (principal, held))
+        })
+        .collect();
     let live: Vec<Principal> = principals
         .iter()
         .copied()
-        .filter(|&principal| pass == Pass::Inline || resolutions.claim_read(principal))
+        .filter(|principal| overtaken.contains_key(principal))
         .collect();
-    let current: HashSet<Principal> = live.iter().copied().collect();
     let mut updates = Vec::with_capacity(results.len());
     let mut answered = HashSet::with_capacity(results.len());
     let mut completed = HashSet::with_capacity(results.len());
@@ -1653,7 +1894,7 @@ fn apply_fetches(
             // an attempt rate that has gone to zero is itself the signal that the
             // refresh loop has stopped.
             counters.record_attempt();
-            if !current.contains(&principal) {
+            if !overtaken.contains_key(&principal) {
                 return None;
             }
             // Unwrap the bound before the source's own answer, so every arm below
@@ -1675,7 +1916,8 @@ fn apply_fetches(
                 answered.insert(principal);
                 resolutions.answered(principal);
             }
-            match result {
+            let present = matches!(result, Ok(SnapshotResolution::Present(_)));
+            let update = match result {
                 Ok(SnapshotResolution::Present(snapshot)) => {
                     // Delivered before generation acceptance: an unchanged
                     // generation is the ordinary answer, and the ledger moves
@@ -1805,7 +2047,19 @@ fn apply_fetches(
                     );
                     None
                 }
-            }
+            }?;
+            let held = overtaken.remove(&principal)?;
+            Some(apply_overtaking(
+                held,
+                present,
+                update,
+                resolutions,
+                slots,
+                clock,
+                config,
+                principal,
+                counters,
+            ))
         });
         if let Some(update) = update {
             updates.push(update);
@@ -1816,6 +2070,13 @@ fn apply_fetches(
     for &principal in &live {
         if !answered.contains(&principal) {
             resolutions.fetch_failed(principal);
+            // A push arrived during the read that failed: try again at once.
+            if overtaken
+                .get(&principal)
+                .is_some_and(|held| !held.0.is_empty())
+            {
+                resolutions.hurry(principal);
+            }
         }
     }
     if !updates.is_empty() {
@@ -1984,6 +2245,11 @@ async fn run(
         if *shutdown.borrow() {
             return;
         }
+        // Started here rather than when the timer fires, which a stream of
+        // pushes arriving faster than it could hold off indefinitely.
+        if beside.is_none() {
+            beside = start_beside(&source, &clock, &config, &mut resolutions, ready, &counters);
+        }
         // While a batch is running nothing more can start, so only a lapsing
         // resolution is worth waking for.
         let control_wakeup = tokio::time::sleep(if beside.is_some() {
@@ -2004,11 +2270,10 @@ async fn run(
                     }
                     if resolutions.is_tracked(push.principal) {
                         if resolutions.needs_refresh(push.principal) {
-                            // One already on its own schedule is brought
-                            // forward there: reading it here would let it hold
-                            // the loop.
+                            // One already on its own schedule is left to it:
+                            // reading it here would let it hold the loop.
                             if resolutions.is_beside(push.principal) {
-                                resolutions.expedite(push.principal);
+                                resolutions.overtake(push.principal, push.resolution, &counters);
                                 continue;
                             }
                             if refresh_all_cancellable(&source, &slots, &clock, &config, &[push.principal],
@@ -2017,79 +2282,14 @@ async fn run(
                             continue;
                         }
 
-                        match push.resolution {
-                            SnapshotResolution::Present(snapshot) => {
-                                if !resolutions
-                                    .accepts_positive(push.principal, snapshot.generation, UpdateOrigin::Push, &counters)
-                                {
-                                    continue;
-                                }
-                                let slot = slots.slot(snapshot.account_id);
-                                resolutions.insert(
-                                    push.principal,
-                                    Resolution::Present {
-                                        deadline: snapshot.valid_until,
-                                        generation: snapshot.generation,
-                                    },
-                                );
-                                resolutions.publish(
-                                    Publications::Push(vec![PublishableSnapshotUpdate::Present {
-                                        principal: push.principal,
-                                        snapshot,
-                                        lease: slot,
-                                    }]),
-                                    clock.now(),
-                                    &counters,
-                                );
-                            }
-                            resolution @ (SnapshotResolution::Revoked { .. }
-                            | SnapshotResolution::Unknown
-                            | SnapshotResolution::Unreadable { .. }) => {
-                                let current = resolutions.watermark_of(push.principal);
-                                let (watermark, accepted, kind, update) = match resolution {
-                                    SnapshotResolution::Revoked { generation } => {
-                                        let (watermark, accepted) =
-                                            resolutions.revocation(push.principal, generation, UpdateOrigin::Push, &counters);
-                                        (watermark, accepted, NegativeKind::Revoked, Some(generation))
-                                    }
-                                    SnapshotResolution::Unknown => {
-                                        let (watermark, accepted) = accept_unknown(current);
-                                        (watermark, accepted, NegativeKind::Unknown, None)
-                                    }
-                                    SnapshotResolution::Unreadable { generation } => {
-                                        let (watermark, accepted) =
-                                            resolutions.unreadable(push.principal, generation, UpdateOrigin::Push, &counters);
-                                        (watermark, accepted, NegativeKind::Unreadable, None)
-                                    }
-                                    SnapshotResolution::Present(_) => unreachable!(),
-                                };
-                                if !accepted {
-                                    continue;
-                                }
-                                let now = clock.now();
-                                let until = negative_deadline(now, &config, kind);
-                                resolutions.insert(
-                                    push.principal,
-                                    Resolution::Negative {
-                                        deadline: until,
-                                        next_refetch: until,
-                                        watermark,
-                                    },
-                                );
-                                let update = match update {
-                                    Some(generation) => PublishableSnapshotUpdate::Revoked {
-                                        principal: push.principal,
-                                        until,
-                                        generation,
-                                    },
-                                    None => PublishableSnapshotUpdate::Unknown {
-                                        principal: push.principal,
-                                        until,
-                                    },
-                                };
-                                resolutions.publish(Publications::Push(vec![update]), now, &counters);
-                            }
-                        }
+                        let now = clock.now();
+                        let Some(update) = apply_push(
+                            &mut resolutions, &slots, now, &config, push.principal,
+                            push.resolution, &counters,
+                        ) else {
+                            continue;
+                        };
+                        resolutions.publish(Publications::Push(vec![update]), now, &counters);
                         update_ready(ready, &mut resolutions, &clock, &counters, &config.principals);
                     }
                 }
@@ -2152,23 +2352,9 @@ async fn run(
                 }
             }
             _ = &mut control_wakeup => {
-                let now = clock.now();
+                // A lapsed resolution changes readiness; work that came due
+                // starts at the top of the loop.
                 update_ready(ready, &mut resolutions, &clock, &counters, &config.principals);
-                if beside.is_none() {
-                    let limit = config.max_concurrent_fetches.min(resolutions.capacity());
-                    let due = resolutions.due_beside(now, limit);
-                    if !due.is_empty()
-                        && let Some(reads) = reserve_reads(
-                            &clock, &config, &due, &mut resolutions, ready, &counters,
-                        )
-                    {
-                        resolutions.begin_reads(&due);
-                        beside = Some(Beside {
-                            fetches: Fetches::start(&source, &config, reads),
-                            principals: due,
-                        });
-                    }
-                }
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -2923,21 +3109,30 @@ mod tests {
         resolutions.begin_reads(&[Principal(0), Principal(1), Principal(2), Principal(3)]);
         assert!(resolutions.due_for_sweep().is_empty());
 
-        assert!(resolutions.claim_read(Principal(0)));
-        assert!(!resolutions.claim_read(Principal(0)), "once");
+        assert!(resolutions.claim_read(Principal(0)).is_some());
+        assert!(resolutions.claim_read(Principal(0)).is_none(), "once");
 
         resolutions.insert(Principal(1), positive(1_000));
-        assert!(!resolutions.claim_read(Principal(1)));
+        assert!(resolutions.claim_read(Principal(1)).is_none());
+    }
 
-        resolutions.expedite(Principal(2));
-        assert!(!resolutions.claim_read(Principal(2)));
-        assert!(
-            !resolutions.retries.contains_key(&Principal(2)),
-            "nothing was owed, so nothing is scheduled"
-        );
-        resolutions.expedite(Principal(3));
-        assert!(!resolutions.claim_read(Principal(3)));
-        assert_eq!(resolutions.due_beside(t(0), 8), vec![Principal(3)]);
+    /// A push for a principal being read is held for that read; for one only
+    /// waiting, it brings the retry forward; otherwise it leaves no trace.
+    #[tokio::test(start_paused = true)]
+    async fn a_push_is_held_for_a_read_in_flight_and_otherwise_hurries_a_retry() {
+        let counters = SnapshotCounters::new();
+        let mut resolutions = paced(3);
+        resolutions.fetch_failed(Principal(0));
+        resolutions.fetch_failed(Principal(1));
+        resolutions.begin_reads(&[Principal(0)]);
+
+        for principal in (0..3).map(Principal) {
+            resolutions.overtake(principal, SnapshotResolution::Unknown, &counters);
+        }
+        assert_eq!(resolutions.due_beside(t(0), 8), vec![Principal(1)]);
+        assert!(!resolutions.retries.contains_key(&Principal(2)));
+        let held = resolutions.claim_read(Principal(0)).expect("still counts");
+        assert!(matches!(held.0.as_slice(), [SnapshotResolution::Unknown]));
     }
 
     /// Lag recovery refetches inline what the loop may wait for, brings every
@@ -2953,7 +3148,7 @@ mod tests {
             resolutions.recover_from_lag(),
             vec![Principal(0), Principal(1)]
         );
-        assert!(!resolutions.claim_read(Principal(0)));
+        assert!(resolutions.claim_read(Principal(0)).is_none());
         assert_eq!(resolutions.due_beside(t(0), 8), vec![Principal(2)]);
     }
 
@@ -2969,7 +3164,7 @@ mod tests {
         resolutions.insert(Principal(1), negative(1_000));
         resolutions.retain(HashSet::from([Principal(1), Principal(2)]));
 
-        assert!(!resolutions.claim_read(Principal(0)));
+        assert!(resolutions.claim_read(Principal(0)).is_none());
         assert_eq!(
             resolutions
                 .retry_queue
@@ -2979,6 +3174,127 @@ mod tests {
             vec![Principal(2)]
         );
         assert_eq!(resolutions.retries.len(), 1);
+    }
+
+    fn published(generation: u64) -> SnapshotResolution {
+        use tollgate_core::{
+            AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, PermissionBits,
+            PublishableSnapshot, ResolvedLimits,
+        };
+        SnapshotResolution::Present(
+            PublishableSnapshot::try_new(Arc::new(
+                AccountSnapshot::builder(
+                    AccountId(1),
+                    Generation(generation),
+                    AccountStatus::Active,
+                    t(3_600),
+                    PermissionBits::bit(0),
+                    ResolvedLimits::new(16),
+                    Arc::new(CostTable::builder(CostUnits(1), CostUnits(1)).build()),
+                )
+                .build(),
+            ))
+            .expect("test snapshot limits are valid"),
+        )
+    }
+
+    fn any_resolution() -> impl Strategy<Value = SnapshotResolution> {
+        (0u8..4, 0u64..4).prop_map(|(kind, generation)| match kind {
+            0 => published(generation),
+            1 => SnapshotResolution::Revoked {
+                generation: Generation(generation),
+            },
+            2 => SnapshotResolution::Unreadable {
+                generation: Generation(generation),
+            },
+            _ => SnapshotResolution::Unknown,
+        })
+    }
+
+    /// What a principal holds after applying `pushes` to `first`.
+    fn replay(
+        first: &SnapshotResolution,
+        pushes: &[SnapshotResolution],
+    ) -> (bool, Option<Watermark>) {
+        let config = SnapshotManagerConfig {
+            principals: TrackedPrincipals::Fixed(vec![Principal(0)]),
+            refresh_interval: secs(1),
+            unknown_ttl: SignedDuration::from_secs(30),
+            revoked_ttl: SignedDuration::from_secs(60),
+            retry_backoff: secs(1),
+            max_concurrent_fetches: 1,
+            fetch_timeout: secs(1),
+            enumeration_timeout: secs(1),
+        };
+        let slots = SlotRegistry::new();
+        let counters = SnapshotCounters::new();
+        let mut resolutions = Resolutions::new([Principal(0)]);
+        for resolution in std::iter::once(first).chain(pushes) {
+            apply_push(
+                &mut resolutions,
+                &slots,
+                t(0),
+                &config,
+                Principal(0),
+                resolution.clone(),
+                &counters,
+            );
+        }
+        let held = resolutions.by_principal.get(&Principal(0));
+        (
+            matches!(held, Some(Resolution::Present { .. })),
+            resolutions.watermark_of(Principal(0)),
+        )
+    }
+
+    proptest! {
+        /// Holding pushes in the reduced form loses nothing: applied to any
+        /// answer, it leaves what applying every one of them would.
+        #[test]
+        fn held_pushes_have_the_effect_of_every_push(
+            first in any_resolution(),
+            pushes in proptest::collection::vec(any_resolution(), 0..12),
+        ) {
+            let mut held = Overtaking::default();
+            for push in &pushes {
+                held.hold(push.clone());
+                prop_assert!(held.0.len() <= 2, "bounded whatever arrives");
+            }
+            prop_assert_eq!(replay(&first, &held.0), replay(&first, &pushes));
+        }
+    }
+
+    /// What compaction drops is reported as it would have been had it been
+    /// applied: an ordered-out push as a refusal, an unreadable one counted.
+    #[test]
+    fn a_dropped_held_push_is_still_reported() {
+        let counters = SnapshotCounters::new();
+        let mut resolutions = paced(1);
+        resolutions.begin_reads(&[Principal(0)]);
+        let revoked = |generation| SnapshotResolution::Revoked {
+            generation: Generation(generation),
+        };
+        let unreadable = |generation| SnapshotResolution::Unreadable {
+            generation: Generation(generation),
+        };
+        let counts = |counters: &SnapshotCounters| {
+            let stats = counters.snapshot();
+            (stats.refused_updates, stats.unreadable_snapshots)
+        };
+        let mut push = |resolution| resolutions.overtake(Principal(0), resolution, &counters);
+
+        push(published(5));
+        push(published(5));
+        assert_eq!(counts(&counters), (0, 0), "a duplicate is no refusal");
+        push(published(4));
+        assert_eq!(counts(&counters), (1, 0));
+        push(unreadable(3));
+        assert_eq!(counts(&counters), (2, 1));
+        push(unreadable(6));
+        push(revoked(7));
+        assert_eq!(counts(&counters), (2, 2), "replaced, so not refused");
+        push(published(7));
+        assert_eq!(counts(&counters), (3, 2));
     }
 
     /// The generation watermark outlives the resolution that carried it, or a

@@ -69,6 +69,11 @@ wait `fetch_timeout` for each batch ahead of it. Retries and rechecks have their
 own `max_concurrent_fetches` bound beside the sweep's, so one instance can have
 twice that many fetches in flight; size the source for it.
 
+Pushes for a principal still being retried do not restart its fetch: they are
+applied on top of its answer, so frequent publication does not keep it denied. A
+push stream that lags during the fetch does discard it, and the principal waits
+for a fetch the stream keeps up with.
+
 Upgrading changes no configuration or wire format. Instances may be upgraded in
 any order.
 
