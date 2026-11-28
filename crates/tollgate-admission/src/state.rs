@@ -2241,10 +2241,13 @@ mod tests {
         ))
     }
 
-    /// Drive eight writers through `lease` until at least one debit lost a
-    /// race. Bounded so a single-core host cannot hang the suite.
+    /// Drive eight writers through `lease` until another debit loses a race:
+    /// one more than the lease had counted on entry, so a lease already
+    /// contended cannot satisfy this without losing again. Bounded so a
+    /// single-core host cannot hang the suite.
     fn contend(lease: &LocalLease) {
         let now = Timestamp::from_second(0).unwrap();
+        let before = lease.contended_debits();
         for _ in 0..50 {
             std::thread::scope(|scope| {
                 for _ in 0..8 {
@@ -2255,7 +2258,7 @@ mod tests {
                     });
                 }
             });
-            if lease.contended_debits() > 0 {
+            if lease.contended_debits() > before {
                 return;
             }
         }
