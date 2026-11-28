@@ -12,6 +12,30 @@ use tollgate_server::{ServerState, router};
 use tollgate_store::{Clock, GrantPolicy, MemoryStore, SystemClock};
 use tower::ServiceExt;
 
+/// An identity is an audit actor: a name is 1 to 128 identifier characters.
+#[test]
+fn an_identity_name_is_a_bounded_identifier() {
+    let named = |name: &str| ControlIdentity::new(name, Role::Instance);
+    for name in [
+        "a".to_owned(),
+        "a".repeat(127),
+        "a".repeat(128),
+        "ops@a.b_c:d/e-9".to_owned(),
+    ] {
+        assert_eq!(named(&name).unwrap().name(), name);
+    }
+    for name in [
+        String::new(),
+        "a".repeat(129),
+        "a".repeat(4_096),
+        "two words".to_owned(),
+        "line\nbreak".to_owned(),
+        "caf\u{e9}".to_owned(),
+    ] {
+        assert!(named(&name).is_err(), "{name:?}");
+    }
+}
+
 #[tokio::test]
 async fn security_reload_stages_validates_and_only_then_replaces() {
     let directory = tempfile::tempdir().unwrap();

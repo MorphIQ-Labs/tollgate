@@ -110,6 +110,57 @@ async fn lease_lifecycle_over_http() {
     assert_eq!(store.balance(AccountId(1)), CostUnits(1_000));
 }
 
+/// The explicit sweep reports every grant it settled and what each forfeited:
+/// an operator reads the answer to learn which units were taken back
+/// (INVARIANTS.md GL-9).
+#[tokio::test]
+async fn reclaim_over_http_reports_each_settled_lease() {
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let store = MemoryStore::new(GrantPolicy::default()).unwrap();
+    let router = router(ServerState {
+        security: common::security(),
+        issuer: None,
+        store: Arc::clone(&store),
+        clock: Arc::clone(&clock) as _,
+    });
+    store.create_account(AccountConfig {
+        account_id: AccountId(1),
+        initial_balance: CostUnits(1_000),
+        status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
+    });
+    let (status, grant) = call(
+        &router,
+        "POST",
+        &api("/leases/acquire"),
+        Some(json!({"account_id": id(1), "requested": 400, "ttl_seconds": 60})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, reclaimed) = call(&router, "POST", &api("/leases/reclaim"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reclaimed, json!([]), "a live grant is not reclaimed");
+
+    clock.set(
+        t(60)
+            .checked_add(GrantPolicy::default().reclaim_grace)
+            .unwrap()
+            .checked_add(SignedDuration::from_secs(1))
+            .unwrap(),
+    );
+    let (status, reclaimed) = call(&router, "POST", &api("/leases/reclaim"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        reclaimed,
+        json!([{
+            "lease_id": grant["lease_id"],
+            "account_id": id(1),
+            "forfeited": grant["units"],
+        }])
+    );
+}
+
 #[tokio::test]
 async fn problem_codes_are_stable() {
     let (store, router) = state();
@@ -177,6 +228,101 @@ async fn problem_codes_are_stable() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(problem["code"], "unknown-principal");
+}
+
+/// The published status and `code` for refusals an operator or a lease holder
+/// acts on (`docs/ERRORS.md`).
+#[tokio::test]
+async fn refused_writes_carry_their_published_problem_codes() {
+    let (store, router) = state();
+    store.create_account(AccountConfig {
+        account_id: AccountId(1),
+        initial_balance: CostUnits(100),
+        status: AccountStatus::Active,
+        capacity_class: CapacityClass::Assured,
+    });
+    let (status, grant) = call(
+        &router,
+        "POST",
+        &api("/leases/acquire"),
+        Some(json!({"account_id": id(1), "requested": 10, "ttl_seconds": 60})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let snapshot = |status: &str, class: &str| {
+        json!({"snapshot": {
+            "account_id": id(1),
+            "key_id": null,
+            "generation": 1,
+            "status": status,
+            "capacity_class": class,
+            "valid_until": "2100-01-01T00:00:00Z",
+            "permissions": 1,
+            "limits": {
+                "max_items_per_request": 1,
+                "rate_units_per_second": 10,
+                "rate_burst_units": 10
+            },
+            "cost_table": {"fixed_request": 1, "minimum_charge": 1, "weights": [1]}
+        }})
+    };
+    let snapshot_path = api(&format!("/admin/snapshots/{}", Principal(7)));
+    for (method, path, body, status, code) in [
+        (
+            "POST",
+            api("/leases/release"),
+            json!({"lease_id": id(999), "fencing_token": 1, "unspent": 0}),
+            StatusCode::NOT_FOUND,
+            "unknown-lease",
+        ),
+        (
+            "POST",
+            api("/leases/release"),
+            json!({
+                "lease_id": grant["lease_id"],
+                "fencing_token": grant["fencing_token"],
+                "unspent": 11
+            }),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid-release",
+        ),
+        (
+            "POST",
+            api(&format!("/admin/accounts/{}/deposit", AccountId(1))),
+            json!({"units": 0}),
+            StatusCode::BAD_REQUEST,
+            "zero-deposit",
+        ),
+        (
+            "PUT",
+            api(&format!("/admin/accounts/{}/budget", AccountId(9))),
+            json!({"budget": null}),
+            StatusCode::NOT_FOUND,
+            "unknown-account",
+        ),
+        (
+            "PUT",
+            snapshot_path.clone(),
+            snapshot("Suspended", "Assured"),
+            StatusCode::CONFLICT,
+            "snapshot-status-mismatch",
+        ),
+        (
+            "PUT",
+            snapshot_path.clone(),
+            snapshot("Active", "BestEffort"),
+            StatusCode::CONFLICT,
+            "snapshot-capacity-class-mismatch",
+        ),
+    ] {
+        let (answered, problem) = call(&router, method, &path, Some(body)).await;
+        assert_eq!(
+            (answered, &problem["code"]),
+            (status, &json!(code)),
+            "{problem}"
+        );
+    }
+    assert_eq!(store.balance(AccountId(1)), CostUnits(90));
 }
 
 #[tokio::test]

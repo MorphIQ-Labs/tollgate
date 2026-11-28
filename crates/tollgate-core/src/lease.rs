@@ -1381,6 +1381,40 @@ mod tests {
         );
     }
 
+    /// The fragmented walk loses races too, and records them. A quote above
+    /// the whole grant never attempts a single-shard exchange, so everything
+    /// counted here was lost while taking pieces.
+    #[test]
+    fn contended_fragmented_debits_are_recorded_without_disturbing_the_balance() {
+        const THREADS: u64 = 8;
+        const DEBITS: u64 = 20_000;
+        const GRANT: u64 = 100;
+        let l = lease(GRANT, 1_000, 0);
+        for _ in 0..50 {
+            std::thread::scope(|scope| {
+                for _ in 0..THREADS {
+                    scope.spawn(|| {
+                        for _ in 0..DEBITS {
+                            assert!(l.try_debit(CostUnits(GRANT + 1), t(0)).is_err());
+                        }
+                    });
+                }
+            });
+            if l.contended_debits() > 0 {
+                break;
+            }
+        }
+        assert!(
+            l.contended_debits() > 0,
+            "eight writers on one line never lost a race"
+        );
+        assert_eq!(
+            l.remaining(),
+            CostUnits(GRANT),
+            "every refusal was rolled back"
+        );
+    }
+
     /// The hand-out is exact and idempotent. A slot that takes the lease out,
     /// reinstalls it, and takes it out again must not report the same
     /// contention twice.

@@ -6,7 +6,13 @@ test_tool = "nextest"
 additional_cargo_test_args = ["--profile", "mutants"]
 test_workspace = true
 timeout_multiplier = 4.0
-minimum_test_timeout = 60
+# The floor is what usually binds: the unmutated baseline runs only the
+# packages that hold mutants, while `test_workspace` runs every test against
+# each mutant, so the derived multiple can be far below one real run. A mutant
+# that survives takes that whole run, about 52 s with PostgreSQL on a hosted
+# runner, and must report MISSED rather than TIMEOUT. A test that never
+# terminates is stopped by nextest's `mutants` profile, not by this bound.
+minimum_test_timeout = 180
 
 # The end-to-end harness is test code: it drives separate processes and its
 # scenarios run only where those binaries and PostgreSQL are provided

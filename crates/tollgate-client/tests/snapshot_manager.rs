@@ -201,6 +201,47 @@ async fn snapshot_readiness_is_false_after_shutdown_or_owner_drop() {
     }
 }
 
+/// Dropping the handle aborts the task: a change the source pushed but the
+/// task has not applied yet is never published after the owner is gone. A task
+/// merely told to stop would still choose between that push and the stop
+/// signal, so the claim is repeated until losing every choice is implausible.
+#[tokio::test(start_paused = true)]
+async fn dropping_the_manager_publishes_nothing_afterwards() {
+    for trial in 0..64 {
+        let (source, pulls) = DrivenPushSource::new(SnapshotResolution::Present(publishable(
+            snapshot(1, PermissionBits::bit(0)),
+        )));
+        let map = Arc::new(ArcSwapSnapshotMap::new());
+        let manager = SnapshotManager::spawn(
+            pulls,
+            map.clone(),
+            SlotRegistry::new(),
+            Arc::new(ManualClock::new(t(0))),
+            push_only_config(),
+        )
+        .unwrap();
+        let mut ready = manager.ready();
+        while !*ready.borrow_and_update() {
+            ready.changed().await.unwrap();
+        }
+        // Ready is published inside the initial load; let the task park in its
+        // loop before there is anything for it to choose between.
+        tokio::task::yield_now().await;
+        source.send(
+            PRINCIPAL,
+            SnapshotResolution::Revoked {
+                generation: Generation(7),
+            },
+        );
+        drop(manager);
+        while ready.changed().await.is_ok() {}
+        assert!(
+            matches!(map.get(&PRINCIPAL), Some(MapEntry::Present(_))),
+            "trial {trial}: published after its owner was dropped"
+        );
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_snapshot_task_panic_withdraws_the_retained_readiness_value() {
     struct PanicClock(AtomicBool);
@@ -1001,6 +1042,42 @@ fn invalid_snapshot_manager_intervals_are_rejected() {
     assert!(config.validate().is_err());
 }
 
+/// INVARIANTS.md GL-16: a TTL or backoff that would make a negative answer
+/// lapse at once, or retry without pause, is refused by name, as is a starting
+/// set that names a principal twice.
+#[test]
+fn each_unusable_snapshot_setting_is_rejected_by_name() {
+    type Break = fn(&mut SnapshotManagerConfig);
+    let cases: [(Break, &str); 5] = [
+        (
+            |c| c.unknown_ttl = SignedDuration::ZERO,
+            "unknown_ttl must be positive",
+        ),
+        (
+            |c| c.revoked_ttl = SignedDuration::ZERO,
+            "revoked_ttl must be positive",
+        ),
+        (
+            |c| c.revoked_ttl = SignedDuration::from_nanos(-1),
+            "revoked_ttl must be positive",
+        ),
+        (
+            |c| c.retry_backoff = std::time::Duration::ZERO,
+            "retry_backoff must be positive",
+        ),
+        (
+            |c| c.principals = TrackedPrincipals::Fixed(vec![PRINCIPAL, PRINCIPAL]),
+            "principals must not contain duplicates",
+        ),
+    ];
+    assert_eq!(push_only_config().validate(), Ok(()));
+    for (break_it, rule) in cases {
+        let mut config = push_only_config();
+        break_it(&mut config);
+        assert_eq!(config.validate().unwrap_err().to_string(), rule);
+    }
+}
+
 #[tokio::test]
 async fn mismatched_local_sharding_is_rejected_before_tasks_start() {
     let sharding = LocalSharding::new(NonZeroUsize::new(8).unwrap());
@@ -1289,18 +1366,22 @@ async fn one_unanswerable_principal_unreadies_only_a_fixed_instance() {
     );
 }
 
-/// A source with no catalogue at all — it does not override `principals`, so
-/// it takes the trait's default.
-/// Answers snapshots and cannot enumerate.
-fn no_catalogue_source(snapshot: Arc<AccountSnapshot>) -> Arc<DelegatingStore<RejectingStore>> {
-    Arc::new(
-        bare_source("a no-catalogue fixture answers snapshots and nothing else").on_snapshot(
-            move |_, _principal| {
-                let snapshot = Arc::clone(&snapshot);
-                async move { Ok(SnapshotResolution::Present(publishable(snapshot))) }
-            },
-        ),
-    )
+/// A source with no catalogue at all: it answers snapshots and takes the
+/// trait's default `principals`. Not a `DelegatingStore`, which states every
+/// answer itself and so would never reach that default.
+struct NoCatalogue(Arc<AccountSnapshot>);
+
+#[async_trait::async_trait]
+impl SnapshotSource for NoCatalogue {
+    async fn snapshot(&self, _principal: Principal) -> Result<SnapshotResolution, StoreError> {
+        Ok(SnapshotResolution::Present(publishable(Arc::clone(
+            &self.0,
+        ))))
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
+        no_pushes()
+    }
 }
 
 /// A source that enumerates but always fails to.
@@ -1698,7 +1779,7 @@ fn discovering_config(refresh_ms: u64) -> SnapshotManagerConfig {
 #[tokio::test(start_paused = true)]
 async fn a_source_that_cannot_enumerate_keeps_the_configured_set() {
     let fixture = spawn_with(
-        no_catalogue_source(snapshot(1, PermissionBits::bit(0))),
+        Arc::new(NoCatalogue(snapshot(1, PermissionBits::bit(0)))),
         discovering_config(20),
     );
     stock_slot(&fixture);

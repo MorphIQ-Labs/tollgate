@@ -1663,6 +1663,69 @@ mod lane_tests {
         assert_eq!(writer.shutdown().await.unwrap().accepted, 3);
     }
 
+    /// Lanes exist so request threads stay off one another's cache lines: a
+    /// queue with room for it gets a lane per hardware thread, and the
+    /// smallest queue that affords two floors gets two (GL-137).
+    #[test]
+    fn an_ample_queue_has_a_lane_for_every_hardware_thread() {
+        let parallelism = LocalSharding::available_parallelism().get();
+        let ample = parallelism.next_power_of_two() * MIN_LANE_CAPACITY;
+        for capacity in [ample, ample * 4] {
+            assert!(lane_count(capacity) >= parallelism, "{capacity}");
+        }
+        assert_eq!(lane_count(MIN_LANE_CAPACITY * 2), parallelism.min(2));
+    }
+
+    /// Below its ring point a lane wakes nobody, so the writer does not even
+    /// read it before the tick; reaching the ring point — half a lane, when
+    /// that is less than a batch — wakes it (GL-137).
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_rings_the_writer_at_half_its_capacity_and_not_before() {
+        let sink = Arc::new(Recording::default());
+        // Four lanes of 64 slots, so the ring point is 32; one thread records
+        // into one lane.
+        let (recorder, writer) = spawn(&sink, 256, 256, 4);
+        for id in 0..31 {
+            recorder.try_reserve().unwrap().record(event(id));
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                u128::try_from(recorder.health().queue_depth).unwrap(),
+                id + 1,
+                "event {id} woke the writer"
+            );
+        }
+        recorder.try_reserve().unwrap().record(event(31));
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(recorder.health().queue_depth, 0, "the ring point drains");
+        assert_eq!(writer.shutdown().await.unwrap().accepted, 32);
+    }
+
+    /// A permit dropped unrecorded — a denial or a cancellation — also
+    /// resolves it, so the drain finishes then and not at its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn an_abandoned_permit_completes_the_drain() {
+        let sink = Arc::new(Recording::default());
+        let (recorder, writer) = spawn(&sink, 256, 64, 4);
+        let held: Vec<_> = (0..3).map(|_| recorder.try_reserve().unwrap()).collect();
+        let began = tokio::time::Instant::now();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(held);
+        });
+        let stats = writer.shutdown().await.unwrap();
+        release.await.unwrap();
+        assert_eq!(stats.unresolved, 0);
+        assert_eq!(
+            began.elapsed(),
+            Duration::from_millis(50),
+            "woken, not timed out"
+        );
+    }
+
     /// Dropping every recorder handle stops the writer without a tick: the
     /// lanes ring as their last handles go.
     #[tokio::test(start_paused = true)]
