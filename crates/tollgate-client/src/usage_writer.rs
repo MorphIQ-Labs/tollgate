@@ -626,8 +626,8 @@ impl tollgate_core::UsageSlot for UsagePermit {
 }
 
 /// Terminal accounting of a writer's lifetime, returned by
-/// [`UsageWriter::shutdown`]. `lost` counts events a final flush could not
-/// deliver; `unresolved` counts permits still outstanding when the drain
+/// [`UsageWriter::shutdown`]. `lost` counts events that will never reach the
+/// ledger; `unresolved` counts permits still outstanding when the drain
 /// deadline expired — both reported, never silent.
 ///
 /// Deliberately not [`Default`]: a zeroed report must never be conjurable

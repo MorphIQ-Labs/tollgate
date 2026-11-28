@@ -551,7 +551,8 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    `shutdown_accounts_for_unanswered_grants_over_tls`, and
    `shutdown_accounts_for_unanswered_grants_over_mtls`. They reconcile billing
    and active grants at shutdown, preserve the reclaim grace period, and verify
-   the exact unspent balance returns when the reported unanswered grant expires.
+   that when the reported unanswered grant expires exactly its units are
+   forfeited as settlement loss and none return to the balance (9).
    Uncertainty counts possible grants, not units or confirmed transactions.
 
    Publishing a lease to N locality views is N swaps, so mutators are serialized: a
@@ -595,6 +596,7 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    `an_over_claimed_fold_withdraws_readiness_and_keeps_serving`,
    `a_consolidation_defers_while_a_reservation_is_in_flight`,
    `shutdown_releases_unspent_units`,
+   `a_failed_release_is_retried_while_the_manager_runs`,
    `sharded_slot_keeps_release_parked_while_any_local_view_is_held`,
    `racing_mutators_never_leave_a_slot_holding_two_answers`, and the
    `RefillRequests` handoff tests. Configuration ownership is witnessed by
@@ -760,7 +762,8 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    `the_expiry_sweep_stops_at_its_batch_instead_of_sorting_the_backlog` and
    `a_bounded_rollover_page_crosses_the_oldest_boundaries_first` (PostgreSQL
    plan and page order), plus
-   `one_scheduled_sweep_drains_every_saturated_batch` and
+   `one_scheduled_sweep_drains_every_saturated_batch`,
+   `work_that_falls_due_while_the_server_runs_is_done_by_a_later_tick` and
    `the_server_reclaims_expired_leases_on_its_interval` (server suite, which
    also witnesses the forfeit warning), and
    `a_sweep_with_nothing_to_forfeit_reports_at_info_and_idle_ticks_stay_silent`
@@ -908,7 +911,8 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `readiness_falls_when_background_planes_stop`,
     `one_unanswerable_principal_unreadies_only_a_fixed_instance`,
     `snapshot_counters_track_failures_and_the_unresolved_gauge`,
-    `readiness_closes_the_lease_window_exactly_when_debits_do`, and
+    `readiness_closes_the_lease_window_exactly_when_debits_do`,
+    `a_failed_initial_load_is_retried_until_the_source_answers`, and
     `readiness_counts_overage_headroom_for_an_elastic_account`.
 
 11. **Checked arithmetic only.** Cost and lease arithmetic never wraps; any
@@ -1181,7 +1185,10 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     Pruning visible negatives never weakens invariant GL-15, and neither does
     skipping them in the sweep: a live principal is always swept, so
     withdrawing one still propagates within `refresh_interval`; what the
-    longer TTL bounds is the Negative → Present direction only.
+    longer TTL bounds is the Negative → Present direction only. The interval
+    bound assumes the pull succeeds: while it fails, the held snapshot keeps
+    serving until its `valid_until`, each failure is counted (19), and the next
+    successful pull applies the withdrawal.
     Both maps also bound retained generation histories and their eviction
     index, including pending reconstructions. The client removes reclaimed
     resolution/deadline entries before source I/O, batches reads within that
@@ -1227,7 +1234,9 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `revocation_still_propagates_within_the_refresh_interval`,
     `a_live_principal_that_goes_absent_recovers_on_the_unknown_ttl`,
     `a_reinstated_principal_comes_back_on_the_revoked_ttl`,
-    `lag_recovery_covers_the_negatives_a_sweep_skips`, and
+    `lag_recovery_covers_the_negatives_a_sweep_skips`,
+    `a_lagged_push_stream_refetches_every_tracked_principal` (the running
+    manager takes that path), and
     `deadline_helpers_are_exact_in_the_supported_domain`.
 
 18. **Background store calls are wall-clock bounded, and so is every pass
@@ -1525,10 +1534,14 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     status and leaves it never, and the refusal changes nothing. Suspension
     does **not** reclaim outstanding leases — their units were debited at
     grant and GL-9 already bounds them — so the bound on "requests stop" is one
-    `SnapshotManager` refresh interval, not zero. The operation reports what it
-    changed: how many snapshots it republished, and how many changed durably
-    but could not be decoded to push, so a partial result is surfaced rather
-    than absorbed. `StatusPropagation.lean` proves the exact model: the ledger
+    `SnapshotManager` refresh interval, not zero, for an instance whose pull
+    succeeds. While a pull fails the instance keeps the snapshot it holds until
+    its `valid_until`, and the next successful pull applies the change. The
+    operation reports what it changed: how many snapshots it republished, and
+    how many of those could not be decoded, so a partial result is surfaced
+    rather than absorbed. No pull can read such a row either: its principal
+    stays on any held snapshot until `valid_until`, until an operator publishes
+    a valid snapshot above the new generation. `StatusPropagation.lean` proves the exact model: the ledger
     and every live snapshot always agree
     (`Tollgate.StatusPropagation.setStatus_agrees`,
     `Tollgate.StatusPropagation.publish_agrees`); a change republishes exactly
@@ -1562,6 +1575,12 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `account_status_text_matches_its_serde_spelling` and
     `restamping_preserves_everything_validation_depends_on` (core);
     `account_status_endpoint_speaks_the_status_vocabulary` (server).
+    Propagation to running instances, and its bound when a pull fails:
+    `a_status_change_reaches_every_instance_through_refresh` and
+    `an_unreadable_principal_keeps_its_snapshot_until_expiry_or_repair`
+    (client), with
+    `a_status_change_reports_rows_it_changed_but_could_not_push` (PostgreSQL)
+    for the stored row.
 
 23. **A cached credential proves identity, never authorization, and never
     outlives its own validity.** A `SessionCredential` may reuse a `Principal`
@@ -2105,6 +2124,7 @@ exists to detect corrupt state and must not be able to launder it.
     `cancelled_admission_does_not_leave_a_permanent_budget_deduction`,
     `a_late_instance_observes_usage_settled_before_it_started`,
     `arc_swap_budget_does_not_subtract_another_accounts_admissions`,
+    `refresh_delivers_each_account_its_own_observation`,
     `moka_budget_does_not_subtract_another_accounts_admissions`,
     `arc_swap_principals_of_one_account_converge`,
     `moka_principals_of_one_account_converge`,
@@ -2348,6 +2368,7 @@ exists to detect corrupt state and must not be able to launder it.
     `signing_keys_never_outlive_the_issuer_cache_policy_or_one_hour`,
     `failed_key_refresh_never_extends_verified_identity_validity`,
     `security_reload_stages_validates_and_only_then_replaces`,
+    `the_reloader_applies_file_changes_and_recovers_from_a_broken_manifest`,
     `a_failed_install_is_retried_and_cannot_remove_tls`,
     `file_boundaries_are_part_of_the_rotation_fingerprint`,
     `bearer_rotation_changes_existing_connections_and_preserves_usage_for_retry`,

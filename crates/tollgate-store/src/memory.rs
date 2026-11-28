@@ -1862,11 +1862,11 @@ impl UsageSink for MemoryStore {
             // Capability check: the (lease, token, account) triple must name
             // a known lease. Then the conservation check: the event must fit in
             // `granted - used - credited`. For an active lease `credited` is
-            // zero (plain capacity check). For a released lease the gap is
+            // zero (plain capacity check). For a settled lease the gap is
             // exactly the provisional settlement loss, so a straggler that
-            // was committed before release converts loss into billed usage.
-            // For an expired lease the reclaim credited the full remainder —
-            // nothing fits, so stragglers stay rejected (they'd double-count).
+            // was committed before settlement converts loss into billed usage.
+            // Expiry reclaim credits nothing (GL-136), so its whole forfeit
+            // remains available to stragglers in the same way.
             let Some(lease) = inner.leases.get(lease_id) else {
                 report.rejected += 1;
                 continue;

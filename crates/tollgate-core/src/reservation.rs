@@ -476,12 +476,12 @@ impl Reservation {
     /// The billing statement reads the *phase*, not the receipt, and that is
     /// load-bearing rather than stylistic. A commit-time fallback happens
     /// precisely because the lease's window lapsed, so by the time the event
-    /// flushes the allocator may already have reclaimed that lease — and the
-    /// sink rejects a `Leased` event naming a reclaimed lease, because the
-    /// reclaim credited its full remainder and the units would double-count.
-    /// Billing the fallback against its receipt would therefore silently drop
-    /// the charge for work that ran, on the exact path elastic mode exists to
-    /// serve. The terminal phase is the funding statement.
+    /// flushes the allocator may already have settled that lease. The receipt's
+    /// units went back to the lease, so a `Leased` event would claim units its
+    /// settlement already accounted for: rejected against a release's credit,
+    /// silently dropping the charge for work that ran, or billed against a
+    /// reclaim's forfeit the fallback did not cause (INVARIANTS.md GL-12). The
+    /// terminal phase is the funding statement.
     ///
     /// `policy_revision` is the consuming application's identity for the
     /// policy that priced this request (GL-94), taken from the pinned snapshot.
@@ -912,10 +912,10 @@ mod tests {
     /// between admission and execution start settles against overage instead
     /// of refusing, and the resulting bill names *no lease capability*.
     ///
-    /// The missing capability is the point, not a detail. The sink rejects a
-    /// leased event whose lease has been reclaimed — and this lease lapsed, so
-    /// reclaim is exactly what happens next. Billing against the receipt would
-    /// silently drop the charge for work that ran.
+    /// The missing capability is the point, not a detail. The receipt's units
+    /// went back to the lapsed lease, whose settlement accounts for them, so a
+    /// bill naming it would be refused against a release's credit or booked
+    /// against a forfeit this request did not cause.
     #[test]
     fn an_elastic_lapse_at_execution_start_bills_as_overage_with_no_lease_capability() {
         let l = lease(100);

@@ -99,10 +99,10 @@ pub struct LeaseManagerConfig {
     /// The allocator clamps it to its policy's `max_ttl`.
     ///
     /// Too short rotates leases on expiry rather than on spending and gives
-    /// less room over `expiry_safety_margin`; too long delays the return of
-    /// units a crashed holder never released, which come back only after
-    /// `expires_at + reclaim_grace` (INVARIANTS.md 9). Must be positive and
-    /// longer than `expiry_safety_margin`.
+    /// less room over `expiry_safety_margin`; too long delays the settlement
+    /// of what a crashed holder never released, which reclaim forfeits only
+    /// after `expires_at + reclaim_grace` (INVARIANTS.md 9). Must be positive
+    /// and longer than `expiry_safety_margin`.
     pub lease_ttl: SignedDuration,
     /// Local safety margin: installed leases stop accepting debits and
     /// commits at `expires_at - margin`. Size it to cover worst-case
@@ -203,8 +203,8 @@ impl AccountLeaseConfig {
 pub struct LeaseManagerReport {
     /// Leases the allocator accepted, or already considered settled.
     pub released: u64,
-    /// Leases still held when the shutdown budget ran out. Their units come
-    /// back at TTL reclaim, not at shutdown — reported, never silent.
+    /// Leases still held when the shutdown budget ran out. TTL reclaim forfeits
+    /// their unspent units (INVARIANTS.md GL-9) — reported, never silent.
     pub abandoned: u64,
     /// The task died (panic or abort) instead of reporting: the counts above
     /// are what is known, not what happened. Never `true` for a task that
@@ -474,9 +474,10 @@ pub struct LeaseStats {
     pub acquire_refused: [u64; AllocateError::COUNT],
     /// Leases the allocator no longer holds open for this instance.
     pub released: u64,
-    /// Leases the shutdown budget could not return; their units come back at
-    /// TTL reclaim (INVARIANTS.md GL-9). Like the writer's `lost`, this can only
-    /// move at shutdown — it is a confirmation, not an early warning.
+    /// Leases this instance gave up returning: the shutdown budget could not
+    /// return them, or the allocator refused a release as inconsistent with the
+    /// grant (an integrity fault, which also withdraws readiness). TTL reclaim
+    /// forfeits their unspent units (INVARIANTS.md GL-9).
     pub abandoned: u64,
     /// Rotations that folded a refused lease's unspent units into their
     /// replacement, counted apart from `acquired` because each one records

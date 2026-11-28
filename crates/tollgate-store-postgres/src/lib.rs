@@ -2860,8 +2860,8 @@ async fn republish_patched_snapshots(
             // reclassify an account because one of its credentials is corrupt
             // is the worse outcome. Reported, never silent (INVARIANTS.md
             // GL-19). Counted as well as logged: the row changed durably but
-            // will not be pushed, so those principals converge only at their
-            // next refresh.
+            // will not be pushed, and no pull can read it until it is
+            // published again.
             Err(error) => {
                 unreadable += 1;
                 tracing::warn!(

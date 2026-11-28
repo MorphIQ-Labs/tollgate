@@ -125,7 +125,7 @@ From `WriterHealth`, the usage writer's live health.
 | `accepted` | counter | events | Events the sink recorded. | Normal billing flow. |
 | `duplicate` | counter | events | Events whose request id the sink had already recorded. | Idempotent replay after a lost acknowledgement, not loss. |
 | `rejected` | counter | events | Events the sink refused: unknown lease, lease-capability mismatch, or no remaining lease capacity. | Bounded billing loss that has already happened. Normal is zero. Readiness drops while it is non-zero. |
-| `lost` | counter | events | Events a final flush could not deliver. | Committed charges that never reached the ledger. It moves only at shutdown, because the running writer retries forever; it is a confirmation, not a warning. |
+| `lost` | counter | events | Events the sink refused outright as a batch, plus events a final flush could not deliver. | Committed charges that never reached the ledger. A running writer retries an unavailable sink forever, so while running it moves only when the sink refuses a batch it would refuse again; investigate that at once. |
 | `unaccounted` | gauge | events | Charges queued with no billing outcome yet. | Work in flight to the sink. Growing with `ingest_age_seconds` means the sink is not answering. |
 | `shed` | counter | requests | Requests refused for want of queue capacity. `pricing-api` also counts each refused reservation under `denials.accounting_backpressure`. | The sink is behind and admission is protecting the queue. Charged zero. |
 | `queue_depth` | gauge | slots | Slots held by queued events and outstanding permits. | Backpressure before it sheds. |
@@ -156,7 +156,7 @@ runtime's aggregate overflowed, in which case `counter_overflow` is `true`.
 | `refused` | counter | calls | Sum of `refusals`. | Refill refusals of any kind. |
 | `refusals.<label>` | counter | calls | Acquire refusals per `AllocateError`: `unknown_account`, `account_inactive`, `insufficient_balance`, `invalid_ttl`, `unknown_lease`, `fenced`, `lease_not_active`, `invalid_release`, `storage`, `balance_exhausted`, `balance_insufficient`, `balance_overflow` (deposit-only; unexpected during acquire). | Which refill problem an instance has. `insufficient_balance` (and the attested `balance_*` pair) is an account that is genuinely out of funds; `storage` is a control plane this instance cannot reach. The HTTP forms of these are in [Errors](ERRORS.md). |
 | `released` | counter | leases | Leases the allocator no longer holds open for this instance. | Normal rotation. |
-| `abandoned` | counter | leases | Leases a shutdown could not return within its budget. | Units stranded until TTL reclaim. Moves only at shutdown; rising across restarts means the shutdown release deadline is too tight. |
+| `abandoned` | counter | leases | Leases this instance gave up returning: a shutdown could not return them within its budget, or the allocator refused a release as inconsistent with the grant. | Left to TTL reclaim. Rising across restarts means the shutdown release deadline is too tight; a rise while running is an accounting-integrity fault, which also withdraws readiness. |
 
 The library's `LeaseStats` carries three more fields the example does not
 publish:
@@ -235,7 +235,7 @@ fields an embedder can export.
 | `retiring_accounts` | gauge | accounts | Accounts whose manager is retiring. |
 | `restarting_accounts` | gauge | accounts | Accounts in `Backoff`: a lease manager died and is waiting to be restarted. |
 | `manager_restarts` | counter | restarts | Lease-manager restarts across all accounts. |
-| `unrecovered_grants` | counter | grants | Known grants lost with a dead task, excluding its recoverable current slot. Units that come back only at TTL reclaim. |
+| `unrecovered_grants` | counter | grants | Known grants lost with a dead task, excluding its recoverable current slot. No release will return their units; TTL reclaim forfeits what is left. |
 | `uncertain_acquires` | counter | calls | Acquires whose grant outcome is unknown, including interrupted calls. Not confirmed grants or units. |
 | `counter_overflow` | flag | — | An aggregate saturated. |
 | `refill` | — | — | `LeaseStats` summed over accounts; see [`refill`](#refill). |

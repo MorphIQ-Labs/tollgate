@@ -840,11 +840,13 @@ pub struct StatusChange {
     ///
     /// Always zero in `MemoryStore`, which holds validated snapshots rather
     /// than encoded ones. In a stored backend a row can be undecodable — it
-    /// already was before the transition touched it, and the request path
-    /// already refuses it — and the transition deliberately does not fail
-    /// whole over one corrupt credential. But it is not silently absorbed
-    /// either: those principals did not get a push, so they will not converge
-    /// until their next refresh.
+    /// already was before the transition touched it — and the transition
+    /// deliberately does not fail whole over one corrupt credential. But it is
+    /// not silently absorbed either: those principals got no push and no pull
+    /// can read them, so the change does not reach them by itself. An instance
+    /// still holding an earlier snapshot of one keeps admitting on it until
+    /// that snapshot's `valid_until`, counting each failed refresh. Publishing
+    /// a valid snapshot above the new generation repairs the row.
     pub unreadable: usize,
 }
 

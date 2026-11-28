@@ -424,7 +424,11 @@ Request `SetStatusRequest`: `{"status": "Active"}` — `Active`, `Suspended` or
 
 `200` with `SetStatusResponse`: `republished` is the number of live snapshots
 rewritten; `unreadable` is the number of stored rows that changed but could not
-be decoded to push, which converge at their next refresh.
+be decoded. No refresh delivers the change to those principals: an instance
+holding an earlier snapshot of one keeps admitting on it until its
+`valid_until`. To repair one, publish a valid snapshot above its new generation;
+the server's `restamped snapshot could not be decoded for push` warnings name
+them.
 
 ```json
 {"republished": 2, "unreadable": 0}

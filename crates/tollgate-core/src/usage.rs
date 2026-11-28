@@ -124,7 +124,7 @@ pub enum UsageSource {
     ///
     /// **It carries no lease id on purpose, and must never be given one.**
     /// Attributing unfunded spend to a real lease drives that lease's `used`
-    /// past its `granted`, which makes reclaim's `granted - used` credit
+    /// past its `granted`, which makes reclaim's `granted - used` remainder
     /// negative — a panic in the memory backend and a permanently failing
     /// transaction in Postgres, so the account's expired leases would never be
     /// reclaimed again. Overage stands outside lease accounting entirely and
