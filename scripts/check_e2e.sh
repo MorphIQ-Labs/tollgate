@@ -4,6 +4,9 @@
 #
 # TOLLGATE_PG_URL must name a PostgreSQL database whose role may create
 # databases. Each scenario creates its own and drops it afterwards.
+#
+# The TLS scenarios run against throwaway containers that
+# ./scripts/with_tls_postgres.sh starts, so docker and openssl are needed.
 set -eu
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -22,4 +25,4 @@ target=$(cargo metadata --locked --no-deps --format-version 1 |
 TOLLGATE_REQUIRE_E2E=1 \
   TOLLGATE_E2E_SERVER_BIN="$target/debug/tollgate-server" \
   TOLLGATE_E2E_APP_BIN="$target/debug/pricing-api" \
-  cargo test --locked -p tollgate-e2e "$@"
+  ./scripts/with_tls_postgres.sh cargo test --locked -p tollgate-e2e "$@"

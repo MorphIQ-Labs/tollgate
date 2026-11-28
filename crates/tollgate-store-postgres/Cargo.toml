@@ -29,6 +29,7 @@ serde_json = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
@@ -40,6 +41,7 @@ tollgate-store-postgres = { path = ".", default-features = false, features = ["t
 criterion = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "test-util"] }
+tracing-subscriber = { workspace = true }
 
 # Control-plane database latency, reported but not gated: the absolute result
 # depends on the PostgreSQL host and connection path. This benchmark exists to

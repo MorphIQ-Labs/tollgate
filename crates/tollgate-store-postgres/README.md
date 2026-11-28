@@ -34,11 +34,18 @@ reconciliation query checks it on a live database.
 [sqlx](https://docs.rs/sqlx/0.9/sqlx/postgres/struct.PgConnectOptions.html)
 reads together with the `PG*` environment variables and the password file.
 
-- The crate enables no TLS backend for sqlx. Unless another dependency of the
-  same build enables one, connections are plaintext: `sslmode=prefer`, the
-  default, falls back to plaintext, and `require`, `verify-ca` and
-  `verify-full` are refused. Keep the database on a trusted network or put a
-  TLS-terminating proxy beside the application.
+- TLS is rustls with ring. `sslmode=verify-full` with `sslrootcert` requires
+  TLS and authenticates the server. The default, `prefer`, does neither: it
+  encrypts when the server offers TLS, to any certificate, and otherwise
+  connects in plaintext. `require` encrypts without verifying.
+- `sslrootcert` adds to the bundled Mozilla roots, so `verify-ca` also accepts a
+  publicly issued certificate for any name.
+- A non-loopback database under any mode but `verify-full` is connected to as
+  configured and reported with a `tracing` warning.
+- [Control-plane security](https://github.com/MorphIQ-Labs/tollgate/blob/main/docs/CONTROL_PLANE_SECURITY.md#postgresql-connections)
+  lists each mode, the differences from libpq, and certificate rotation.
+- If another dependency of the same build enables sqlx's native-TLS feature,
+  sqlx uses that in place of rustls.
 - `hostaddr` and `PGHOSTADDR` give the address to connect to without replacing
   the host name. `PGHOSTADDR` applies even when the URL names a host.
 - A password or user name that SASLprep prohibits, such as one containing a

@@ -36,6 +36,10 @@ TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
 ./scripts/check_e2e_soak.sh                # sustained load across period boundaries (10 minutes)
 ./scripts/check_e2e_upgrade.sh             # earlier releases against this one (needs their tags)
 
+# TLS to PostgreSQL, against throwaway containers (needs docker and openssl).
+# check_e2e.sh starts the same containers for its TLS scenarios.
+./scripts/with_tls_postgres.sh cargo test -p tollgate-store-postgres --test tls
+
 ./scripts/check_required_checks.sh         # every CI job is listed as a required check
 ./scripts/check_advisories.sh              # RustSec, yanked and informational advisories
 ./scripts/check_formal.sh                  # the Lean proofs

@@ -8,7 +8,9 @@
 //! listeners require TLS; every protected route requires an identity.
 //! `TOLLGATE_STORE` — `memory` (default; ephemeral, dev/demo only) or, when
 //! built with the default `postgres` feature, `postgres` (durable; requires
-//! `TOLLGATE_PG_URL`, runs migrations on startup). The memory backend never
+//! `TOLLGATE_PG_URL`, runs migrations on startup; TLS follows the URL's
+//! `sslmode`, and `verify-full` is what a non-loopback database needs). The
+//! memory backend never
 //! forgets a usage event — it is the idempotency index — so its footprint
 //! grows with lifetime request count and it is not a soak- or load-test
 //! target. Each reclaim sweep logs what it is holding at `debug`.
@@ -198,7 +200,7 @@ async fn run_server() -> std::io::Result<()> {
                         backend = "postgres",
                         operation = "connect",
                         code = "storage",
-                        "cannot initialize postgres; verify connectivity, TOLLGATE_PG_URL credentials and schema migrations"
+                        "cannot initialize postgres; verify connectivity, TOLLGATE_PG_URL credentials and TLS settings, and schema migrations"
                     );
                     std::process::exit(2);
                 });

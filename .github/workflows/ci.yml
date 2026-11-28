@@ -331,6 +331,9 @@ jobs:
           shared-key: workspace
           save-if: false
       - run: cargo test --locked -p tollgate-store-postgres
+      # TLS against throwaway containers with a certificate authority made for
+      # the run; the script requires the environment, so nothing can skip.
+      - run: ./scripts/with_tls_postgres.sh cargo test --locked -p tollgate-store-postgres --test tls
       - run: cargo test --locked -p tollgate-server --all-features --test lease_ttl
       - run: cargo test --locked -p tollgate-server --all-features --test credential_expiry
 

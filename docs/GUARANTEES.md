@@ -6,7 +6,7 @@ and the ledger always balances. This page explains how each kind of claim is
 checked, maps the whole contract to its proofs, and states what is *not*
 established.
 
-The contract itself is [the invariants](../INVARIANTS.md): 41 numbered
+The contract itself is [the invariants](../INVARIANTS.md): 42 numbered
 statements, each naming how it is enforced and the tests that witness it.
 Violating one is a defect even if every test passes.
 
@@ -47,7 +47,7 @@ allocation counts.
 
 ## The invariant map
 
-Each invariant, and the Lean modules whose theorems it cites. 27 of the 41
+Each invariant, and the Lean modules whose theorems it cites. 27 of the 42
 rest partly on a machine-checked proof. The others are enforced by types, by
 their owning component, or by tested convention, as each one states. A dash
 means no proof is claimed, not that the invariant is unchecked.
@@ -100,6 +100,7 @@ theorem or invariant count stated on this page or in the README goes stale.
 | 39 | Load execution failures remain reportable under the deployment panic policy. | — |
 | 40 | Instance-local sharding separates request-serving threads only while affinities outnumber neither the shards nor their holders. | — |
 | 41 | A provisioner can neither fund, close, grant `Assured`, exceed its budget ceiling, extend credit, reach an operator's account, nor undo an operator's status, exhaust snapshot generations through caller-selected jumps, or publish unapproved policy. | [ControlPlane](../formal/lean/Tollgate/ControlPlane.lean) |
+| 42 | A connection to PostgreSQL is as protected as its settings require, and an exposed one is never silent. | — |
 <!-- invariant-map:end -->
 
 ## What the proofs cover, and what they don't

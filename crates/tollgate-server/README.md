@@ -33,6 +33,10 @@ The `tollgate-server` binary reads:
 - `TOLLGATE_STORE`: `memory` (the default; ephemeral, for development) or
   `postgres`.
 - `TOLLGATE_PG_URL`: the PostgreSQL connection URL, for the `postgres` store.
+  Add `sslmode=verify-full`, and `sslrootcert` for a private authority, when the
+  database is not on loopback;
+  [PostgreSQL connections](https://github.com/MorphIQ-Labs/tollgate/blob/main/docs/CONTROL_PLANE_SECURITY.md#postgresql-connections)
+  describes each mode.
 - `TOLLGATE_RECLAIM_INTERVAL_SECS`: the expiry sweep interval, default 5.
 
 [`docs/CONTROL_PLANE_SECURITY.md`](https://github.com/MorphIQ-Labs/tollgate/blob/main/docs/CONTROL_PLANE_SECURITY.md)

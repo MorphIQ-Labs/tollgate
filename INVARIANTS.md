@@ -2937,3 +2937,58 @@ exists to detect corrupt state and must not be able to launder it.
     `operators_can_publish_policies_outside_provisioner_templates`,
     `manifest_policy_allowlists_fail_closed_for_bearers_and_certificates`, and
     `a_google_provisioner_subject_requires_its_ceiling`.
+
+42. **A connection to PostgreSQL is as protected as its settings require, and an
+    exposed one is never silent.** `sslmode` and `sslrootcert`, in the URL or
+    in `PGSSLMODE` and `PGSSLROOTCERT`, keep libpq's names. Tollgate enables
+    only the driver's rustls backend. `require`, `verify-ca` and
+    `verify-full` never fall back to plaintext. `verify-ca` and `verify-full`
+    refuse a certificate that no trusted authority signed, and `verify-full`
+    refuses one that does not name the host. The trusted authorities are the
+    bundled public roots plus any `sslrootcert`, which adds to them. `require`
+    and `prefer` authenticate nothing, whatever root certificate is given, and
+    `disable` and `allow` use no TLS.
+
+    The store refuses no setting the driver accepts, so a configuration that
+    connected in plaintext before TLS was available still connects; `prefer`,
+    the default, uses TLS where the server offers it. Each connect to a
+    database that is not on loopback or a Unix-domain socket, under any mode
+    but `verify-full`, logs one warning naming the mode and what it leaves
+    open, before a connection is opened. A host name other than `localhost`
+    counts as remote without being resolved. A first connection that fails in
+    TLS is refused and logged as a TLS failure with its cause.
+
+    The store logs no connection URL, user name or password, and no value of a
+    connection parameter or password-file line the driver cannot read: with a
+    `tracing` dispatcher installed, it replaces the driver's parsing warnings
+    with ones that carry the message, the password file's path and, for a known
+    libpq parameter, its name. An embedder that receives driver events only
+    through the `log` crate receives the driver's own.
+
+    Enforcement is component-owned: the driver and rustls perform the handshake
+    and verification, and `PostgresStore::connect_with`, the way to open a store
+    from a URL, assesses the settings and owns what is logged about them.
+    *Tests:* against a TLS server with a throwaway authority and a server
+    without TLS (`./scripts/with_tls_postgres.sh`):
+    `verify_full_connects_over_tls_to_the_authenticated_server`,
+    `an_authority_that_did_not_sign_the_certificate_is_refused`,
+    `only_verify_full_checks_the_server_name`,
+    `require_and_prefer_encrypt_without_authenticating`,
+    `disable_and_allow_stay_plaintext_beside_a_tls_server`, and
+    `a_server_without_tls_is_refused_by_every_mode_that_requires_it`; end to
+    end, `a_deployment_over_a_tls_database_bills_and_settles` and
+    `a_server_does_not_start_over_a_database_it_cannot_authenticate`. Without a
+    database: `only_an_authenticated_server_name_leaves_nothing_exposed`,
+    `sockets_loopback_addresses_and_localhost_are_the_only_local_paths`,
+    `a_hostaddr_from_the_url_overrides_the_environment`,
+    `a_root_certificate_the_mode_ignores_is_reported`,
+    `an_unrecognized_mode_variable_matters_only_while_it_is_in_effect`,
+    `an_exposed_database_is_reported_with_what_its_mode_leaves_open`,
+    `requiring_an_authenticated_server_or_staying_on_loopback_is_not_reported`,
+    `the_environment_the_driver_reads_is_reported_too`,
+    `a_failed_tls_negotiation_is_logged_with_its_cause`,
+    `an_unreachable_database_is_not_called_a_tls_failure`,
+    `only_a_tls_failure_has_a_tls_cause`,
+    `an_inline_certificate_is_never_quoted`,
+    `an_unread_parameter_is_reported_without_its_value`, and
+    `a_malformed_password_file_line_is_reported_without_the_line`.

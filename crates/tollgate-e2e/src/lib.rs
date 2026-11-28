@@ -65,6 +65,26 @@ pub enum Transport {
     MutualTls,
 }
 
+/// The database a deployment runs over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DatabaseTransport {
+    /// Whatever `TOLLGATE_PG_URL` asks for: loopback, in this harness.
+    AsConfigured,
+    /// A TLS database, with `sslmode=verify-full` against its private CA.
+    VerifiedTls,
+}
+
+/// A database address the server must not start over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UntrustedDatabase {
+    /// `verify-full` with a CA that did not sign the certificate.
+    WrongAuthority,
+    /// `verify-full` for a host name the certificate does not carry.
+    WrongName,
+    /// `require` of a database that has no TLS.
+    NoTls,
+}
+
 /// One release's two binaries.
 #[derive(Clone)]
 pub struct Build {
@@ -99,17 +119,23 @@ impl Build {
     }
 }
 
-/// Where the processes and the database come from.
+/// Where the processes and the databases come from.
 #[derive(Clone)]
 pub struct Settings {
     pg_url: String,
+    pg_tls_url: String,
+    pg_tls_ca: String,
+    pg_tls_wrong_ca: String,
+    pg_plaintext_url: String,
     current: Build,
 }
 
 impl Settings {
-    /// `TOLLGATE_PG_URL`, `TOLLGATE_E2E_SERVER_BIN` and
-    /// `TOLLGATE_E2E_APP_BIN`. `None`, so a scenario can skip, when any is
-    /// unset.
+    /// `TOLLGATE_PG_URL`, `TOLLGATE_E2E_SERVER_BIN`,
+    /// `TOLLGATE_E2E_APP_BIN` and the `TOLLGATE_PG_TLS_*` and
+    /// `TOLLGATE_PG_PLAINTEXT_URL` databases that
+    /// `./scripts/with_tls_postgres.sh` provides. `None`, so a scenario can
+    /// skip, when any is unset.
     ///
     /// # Panics
     ///
@@ -121,6 +147,10 @@ impl Settings {
         let settings = (|| {
             Some(Settings {
                 pg_url: read("TOLLGATE_PG_URL")?,
+                pg_tls_url: read("TOLLGATE_PG_TLS_URL")?,
+                pg_tls_ca: read("TOLLGATE_PG_TLS_CA")?,
+                pg_tls_wrong_ca: read("TOLLGATE_PG_TLS_WRONG_CA")?,
+                pg_plaintext_url: read("TOLLGATE_PG_PLAINTEXT_URL")?,
                 current: Build {
                     server: read("TOLLGATE_E2E_SERVER_BIN")?.into(),
                     app: read("TOLLGATE_E2E_APP_BIN")?.into(),
@@ -166,6 +196,62 @@ impl Settings {
             app: binary("pricing-api"),
         }
     }
+}
+
+/// Start a `tollgate-server` over a database it cannot trust, require it to
+/// give up without listening, and return what it logged.
+///
+/// # Panics
+///
+/// If the server starts, outlives [`DEADLINE`] or logs the database password.
+pub async fn refused_start(settings: &Settings, database: UntrustedDatabase) -> String {
+    let url = match database {
+        UntrustedDatabase::WrongAuthority => format!(
+            "{}?sslmode=verify-full&sslrootcert={}",
+            settings.pg_tls_url, settings.pg_tls_wrong_ca
+        ),
+        UntrustedDatabase::WrongName => format!(
+            "{}?sslmode=verify-full&sslrootcert={}&host=another-server.invalid&hostaddr=127.0.0.1",
+            settings.pg_tls_url, settings.pg_tls_ca
+        ),
+        UntrustedDatabase::NoTls => format!("{}?sslmode=require", settings.pg_plaintext_url),
+    };
+    let password = authority_and_password(&url).1.to_owned();
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let manifest = directory.path().join("security.json");
+    std::fs::write(&manifest, "{}").expect("a fixture file");
+    let mut child = Command::new(&settings.current.server)
+        .env_clear()
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "info")
+        .env("TOLLGATE_STORE", "postgres")
+        .env("TOLLGATE_PG_URL", url)
+        .env("TOLLGATE_BIND", "127.0.0.1:0")
+        .env("TOLLGATE_SECURITY_CONFIG", &manifest)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("tollgate-server starts");
+    // A refusal logs a few lines, which a pipe holds until the process exits.
+    let deadline = Instant::now() + DEADLINE;
+    while child.try_wait().expect("the child can be polled").is_none() {
+        if Instant::now() >= deadline {
+            child.kill().expect("the child can be killed");
+            child.wait().expect("the child can be reaped");
+            panic!("tollgate-server did not give up on {database:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let output = child.wait_with_output().expect("the child's output");
+    let mut log = String::from_utf8_lossy(&output.stdout).into_owned();
+    log.push_str(&String::from_utf8_lossy(&output.stderr));
+    assert!(
+        !log.contains(&password),
+        "a refusal logged the database password"
+    );
+    assert_eq!(output.status.code(), Some(2), "{database:?}: {log}");
+    assert!(!log.contains(" listening"), "{database:?}: {log}");
+    log
 }
 
 /// Poll until `check` yields a value.
@@ -301,6 +387,20 @@ impl Database {
     fn url_via(&self, address: &str) -> String {
         self.url.replacen(self.address(), address, 1)
     }
+}
+
+/// The `host:port` and the password of a
+/// `scheme://user:password@host:port/database` URL.
+fn authority_and_password(url: &str) -> (&str, &str) {
+    let credentials = url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('@'))
+        .map_or("", |(credentials, _)| credentials);
+    let password = credentials
+        .split_once(':')
+        .map_or("", |(_, password)| password);
+    assert!(!password.is_empty(), "the database URL carries a password");
+    (authority(url), password)
 }
 
 /// The `host:port` of a `scheme://user:password@host:port/database` URL.
@@ -679,17 +779,44 @@ impl ControlPlane {
 
     /// As [`Self::start`], with the control plane served over `transport`.
     pub async fn start_with(settings: Settings, transport: Transport) -> Self {
-        let build = settings.current.clone();
-        Self::start_build(settings, build, transport).await
+        Self::start_over(settings, transport, DatabaseTransport::AsConfigured).await
     }
 
     /// As [`Self::start`], running `build`'s server.
     pub async fn start_on(settings: Settings, build: &Build) -> Self {
-        Self::start_build(settings, build.clone(), Transport::Plaintext).await
+        Self::start_build(
+            settings,
+            build.clone(),
+            Transport::Plaintext,
+            DatabaseTransport::AsConfigured,
+        )
+        .await
     }
 
-    async fn start_build(settings: Settings, server_build: Build, transport: Transport) -> Self {
-        let database = Database::create(&settings.pg_url).await;
+    /// As [`Self::start_with`], over the database reached by `database`.
+    pub async fn start_over(
+        settings: Settings,
+        transport: Transport,
+        database: DatabaseTransport,
+    ) -> Self {
+        let build = settings.current.clone();
+        Self::start_build(settings, build, transport, database).await
+    }
+
+    async fn start_build(
+        settings: Settings,
+        server_build: Build,
+        transport: Transport,
+        database: DatabaseTransport,
+    ) -> Self {
+        let admin_url = match database {
+            DatabaseTransport::AsConfigured => settings.pg_url.clone(),
+            DatabaseTransport::VerifiedTls => format!(
+                "{}?sslmode=verify-full&sslrootcert={}",
+                settings.pg_tls_url, settings.pg_tls_ca
+            ),
+        };
+        let database = Database::create(&admin_url).await;
         let directory = tempfile::tempdir().expect("a temporary directory");
         let write = |name: &str, contents: &str| {
             std::fs::write(directory.path().join(name), contents).expect("a fixture file");
@@ -789,6 +916,28 @@ impl ControlPlane {
     pub fn kill_server(&mut self) {
         let mut server = self.server.take().expect("the server is running");
         server.kill();
+    }
+
+    /// How many connections PostgreSQL holds to this deployment's database,
+    /// and how many of them it reports as encrypted.
+    ///
+    /// # Panics
+    ///
+    /// When the database cannot be asked.
+    pub async fn database_sessions(&self) -> (i64, i64) {
+        // Errors are not printed: driver text can carry the URL's credentials.
+        let mut admin = PgConnection::connect(&self.database.admin_url)
+            .await
+            .unwrap_or_else(|_| panic!("cannot connect to the database server"));
+        sqlx::query_as(
+            "SELECT count(*), count(*) FILTER (WHERE ssl.ssl)
+             FROM pg_stat_activity AS activity JOIN pg_stat_ssl AS ssl USING (pid)
+             WHERE activity.datname = $1",
+        )
+        .bind(&self.database.name)
+        .fetch_one(&mut admin)
+        .await
+        .unwrap_or_else(|_| panic!("cannot read the database's sessions"))
     }
 
     /// The server's connection to its database, to break and restore.

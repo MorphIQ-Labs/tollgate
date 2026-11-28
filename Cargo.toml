@@ -92,7 +92,12 @@ moka = { version = "0.12", features = ["sync"] }
 governor = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
 axum = "0.8"
-sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "uuid", "json"] }
+# TLS to PostgreSQL is rustls with ring, verifying against the Mozilla roots in
+# webpki-roots plus any `sslrootcert` (GH-100). No native TLS/OpenSSL.
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "uuid", "json", "tls-rustls-ring-webpki"] }
+# Reads the connection URL with the parser sqlx itself uses; already in the
+# graph through sqlx.
+url = "2"
 getrandom = "0.3"
 hmac = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

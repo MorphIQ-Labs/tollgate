@@ -236,6 +236,80 @@ The caller's shutdown future remains owned by `serve`. Cancellation or task
 failure also releases its internal signal waiter and tells existing connections
 to shut down.
 
+## PostgreSQL connections
+
+`tollgate-server` reaches PostgreSQL through `TOLLGATE_PG_URL`, and an embedded
+instance through the URL it gives `PostgresStore`. TLS is rustls (versions 1.2
+and 1.3), configured by the usual libpq parameters. To require TLS and
+authenticate the server, which is what a database off loopback needs:
+
+```text
+postgres://USER@db.internal:5432/tollgate?sslmode=verify-full&sslrootcert=/etc/tollgate/db-ca.pem
+```
+
+`sslmode` and `sslrootcert` in the URL override `PGSSLMODE` and
+`PGSSLROOTCERT`.
+
+| `sslmode` | Encrypted | Server authenticated | Server without TLS |
+|---|---|---|---|
+| `disable`, `allow` | Never | No | Connects |
+| `prefer` (default) | When offered | No | Connects in plaintext |
+| `require` | Always | No | Refused |
+| `verify-ca` | Always | A trusted authority signed the certificate, for any name | Refused |
+| `verify-full` | Always | A trusted authority signed it and it names the host | Refused |
+
+Where the driver differs from libpq:
+
+- The trusted authorities are the Mozilla roots built into the binary **plus**
+  the file `sslrootcert` names. The system trust store is not read, and there is
+  no way to trust only the private authority. `sslrootcert=system` is not
+  supported: omit the parameter to rely on the built-in roots.
+- Because public authorities stay trusted, `verify-ca` accepts a certificate
+  any of them issued for any name. Use `verify-full`.
+- `require` does not verify, even with `sslrootcert` set.
+- `allow` never tries TLS. `prefer` does not retry in plaintext when a server
+  offers TLS and the handshake then fails.
+- The server certificate needs a subject alternative name for the host or IP
+  address in the URL; the common name is not consulted. A certificate authority's
+  own certificate cannot serve as the server certificate. `hostaddr` changes
+  where the connection goes without changing the name verified.
+- Certificate revocation lists (`sslcrl`) are not consulted.
+- A Unix-domain socket carries no TLS: leave `sslmode` unset or `disable`.
+- `sslcert` and `sslkey` present a client certificate. The key must be
+  unencrypted PEM; `sslpassword` is not read.
+
+### Warnings and failures
+
+The store never refuses a setting because it is weak. Each connect to a database
+that is not on loopback (`localhost` or a loopback address) or a Unix-domain
+socket, under any mode but `verify-full`, logs one `WARN` with `host`,
+`sslmode`, `sslrootcert_ignored` and `security`:
+
+| `security` | Mode |
+|---|---|
+| `plaintext` | `disable`, `allow` |
+| `plaintext_permitted` | `prefer` |
+| `server_unauthenticated` | `require` |
+| `server_name_unverified` | `verify-ca` |
+
+Host names are not resolved, so a name for a local or private address warns too.
+A TLS-terminating proxy on loopback does not warn, and what it does beyond
+loopback is its own configuration. Alert on the warning where policy requires
+TLS; `sslmode=verify-full` is what enforces it. An unrecognized `PGSSLMODE`
+falls back to `prefer` and is reported.
+
+A first connection that fails in TLS logs `ERROR` with `failure="tls"`,
+`sslmode` and a `cause`, such as `server does not support TLS` or
+`invalid peer certificate: UnknownIssuer`, and startup fails. Later reconnects
+fail as storage errors under the ordinary readiness and retry behaviour.
+
+### Rotating the database's certificate authority
+
+The `sslrootcert` file is read once for each store. To change authorities,
+write a bundle holding the old and the new, restart every process that connects,
+change the server's certificate, then remove the old authority and restart
+again. A new server certificate from the same authority needs no restart.
+
 ## Maintenance readiness and recovery
 
 `serve` starts maintenance immediately. `/readyz` stays 503 until both the reclaim
@@ -356,7 +430,8 @@ valid refresh succeeds. Internet access to Google's signing-key endpoint and
 accurate server time are deployment prerequisites for this mode.
 
 The supported topology has clients connecting over TLS to a directly encrypted
-server endpoint, with PostgreSQL behind the server. The server must therefore
+server endpoint, with PostgreSQL behind the server (see
+[PostgreSQL connections](#postgresql-connections)). The server must therefore
 run where it can expose its own TLS listener. A platform front end that
 terminates TLS and forwards plaintext is not an exemption from the non-loopback
 plaintext rule; this feature does not provide a forwarded-identity or

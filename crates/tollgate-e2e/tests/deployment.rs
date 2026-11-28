@@ -19,7 +19,8 @@ use std::time::Duration;
 use reqwest::StatusCode;
 use tollgate_core::{CostUnits, EnforcementMode};
 use tollgate_e2e::{
-    App, AppOptions, ControlPlane, Customer, DEADLINE, Settings, Transport, eventually,
+    App, AppOptions, ControlPlane, Customer, DEADLINE, DatabaseTransport, Settings, Transport,
+    UntrustedDatabase, eventually, refused_start,
 };
 
 const BALANCE: u64 = 1_000_000;
@@ -504,4 +505,49 @@ async fn mutual_tls_serves_a_mapped_instance_and_nothing_else() {
         .expect_err("an unmapped certificate serves no customer");
     stranger.terminate().await;
     drain_and_reconcile(&plane, vec![app], &customer, charged).await;
+}
+
+/// With `sslmode=verify-full`, the server's every connection to PostgreSQL is
+/// encrypted, and the deployment bills and settles over them
+/// (INVARIANTS.md 42).
+#[tokio::test]
+async fn a_deployment_over_a_tls_database_bills_and_settles() {
+    let Some(settings) = Settings::from_env() else {
+        return;
+    };
+    let plane = ControlPlane::start_over(
+        settings,
+        Transport::Plaintext,
+        DatabaseTransport::VerifiedTls,
+    )
+    .await;
+    let customer = plane.onboard(1, BALANCE).await;
+    let app = plane
+        .start_app("app-tls-database", AppOptions::default())
+        .await;
+    let charged = spend(&app, &customer, 15).await;
+    estimates_converge(&[&app], &customer, charged).await;
+    drain_and_reconcile(&plane, vec![app], &customer, charged).await;
+    let (sessions, encrypted) = plane.database_sessions().await;
+    assert!(sessions > 0, "the server holds connections");
+    assert_eq!(sessions, encrypted, "every connection is encrypted");
+}
+
+/// A server that cannot authenticate its database as configured does not serve,
+/// and says that TLS is why.
+#[tokio::test]
+async fn a_server_does_not_start_over_a_database_it_cannot_authenticate() {
+    let Some(settings) = Settings::from_env() else {
+        return;
+    };
+    for (database, cause) in [
+        (UntrustedDatabase::WrongAuthority, "UnknownIssuer"),
+        (UntrustedDatabase::WrongName, "not valid for"),
+        (UntrustedDatabase::NoTls, "server does not support TLS"),
+    ] {
+        let log = refused_start(&settings, database).await;
+        for expected in ["failure=\"tls\"", cause] {
+            assert!(log.contains(expected), "{database:?}: {expected}: {log}");
+        }
+    }
 }

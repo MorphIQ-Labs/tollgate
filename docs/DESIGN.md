@@ -8826,3 +8826,84 @@ statement.
 
 Every one of those outcomes is the ordinary uncertainty of a lost reply. An
 administrative operation's audit event already reports an unknown commit (33).
+
+## TLS to PostgreSQL (GH-100, 2026-11-27)
+
+The store was built with no TLS backend: the default `sslmode` connected in
+plaintext without saying so, and `require` was refused. Account, credential and
+ledger traffic depended entirely on the network. sqlx's
+`tls-rustls-ring-webpki` feature closes that with the URL parameters operators
+already know, and invariant 42 states the result.
+
+**Choices.** rustls with ring is what the control plane and `reqwest` already
+use, so no process has two TLS stacks to patch, and no OpenSSL or platform TLS
+enters. The bundled `webpki-roots` were chosen over native roots: they are
+already in the graph through `reqwest`, while reading the system store would add
+`rustls-native-certs` and its platform dependencies. The feature adds no package
+to this workspace's `Cargo.lock`; `rustls` and `webpki-roots` gain an edge from
+`sqlx-core`, and `url`, also already present, is taken directly to read the
+query parameters the driver does not expose (`hostaddr`, `sslrootcert`). Their
+licenses were already admitted. A consumer of `tollgate-store-postgres` that had
+no rustls in its graph now compiles rustls, `ring`, `rustls-webpki` and the
+roots. Nothing on the request path depends on sqlx. TLS costs
+a handshake for each new pooled connection and record encryption on each
+statement, in the control plane only. Neither is measured. The feature is not
+optional: a cargo feature that removes TLS would recreate the silent plaintext
+build.
+
+**Warn rather than refuse.** The server refuses to listen in plaintext off
+loopback, and the same rule for its database was considered. It differs in two
+ways. The listener's configuration is Tollgate's own and carried the rule from
+the day it could be exposed. The database URL is libpq's vocabulary, its
+default is `prefer`, and every deployment with a database on a private network,
+which is the arrangement the earlier documentation recommended, connects off
+loopback without asking for TLS. Refusing would stop those deployments on
+upgrade and give `prefer` and `disable` a meaning they have nowhere else. So the
+settings keep their meaning, the exposure is logged with a field to alert on,
+and `sslmode=verify-full` is the explicit way to require protection. No second
+Tollgate switch was added: it could only disagree with the URL.
+
+The warning is decided from the settings, not from what a connection negotiated.
+Under `prefer`, one encrypted connection says nothing about the next, and a
+party on the path can answer that TLS is unavailable; what is true for the life
+of the pool is what the settings permit.
+
+**What does change for an existing configuration.** `prefer` now upgrades where
+the server offers TLS, which is what the value has always asked for. A
+deployment whose server offers TLS that rustls cannot complete (before TLS 1.2,
+or only suites it lacks) fails to connect where it used to use plaintext, because
+this driver does not fall back after a failed handshake. A server whose
+`pg_hba.conf` treats `hostssl` differently now applies those rules. `sslcert`,
+`sslkey` and their variables, formerly inert, are now loaded, so a half or
+unreadable pair stops startup. The remedy in each case is a correct setting or
+an explicit `sslmode=disable`. The schema, SQL and wire contracts are unchanged,
+and old and new builds may share a database during a rollout or rollback.
+
+**The driver's verification differs from libpq's**, and the difference matters in
+one direction: `sslrootcert` adds to the public roots. A private authority is
+trusted as intended, but `verify-ca`, which ignores the name, then also accepts
+any publicly issued certificate. The store cannot supply its own verifier to
+sqlx, so that mode warns like the weaker ones and the documentation points to
+`verify-full`.
+
+**What the driver logs.** While parsing, sqlx 0.9 warns with the value of any
+parameter it does not read, which includes libpq's `sslpassword` and a password
+split by an unescaped `&`, and with a whole malformed password-file line. The
+store parses inside a scoped `tracing` subscriber that keeps the message and an
+allow-list of fields, then logs those. Rewriting the URL was rejected: it would
+duplicate the driver's parameter list and drop a parameter a later release
+learns, and it cannot reach the password file. The scoped subscriber is skipped
+while no dispatcher has been installed, because installing one would permanently
+stop `tracing`'s forwarding to the `log` crate for the whole process. It reads
+`tracing::dispatcher::has_been_set`, which is public and hidden from that crate's
+documentation.
+
+**Evidence.** `scripts/with_tls_postgres.sh` creates a certificate authority, an
+unrelated one and a server certificate for each run, starts one PostgreSQL with
+them and one without TLS, and removes both and the keys afterwards. The store
+suite observes encryption through `pg_stat_ssl` on its own connections; the
+end-to-end suite does the same for every connection of a running server and
+shows the three refusals from the binary. Both run in the existing
+`test / test-postgres` and `test / test-e2e` jobs. The tests of what is assessed
+and logged need no database, so the diff-scoped mutation gate reaches that code.
+Client certificates are passed to the driver and are not witnessed here.

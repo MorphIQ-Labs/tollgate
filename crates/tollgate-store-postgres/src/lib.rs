@@ -29,6 +29,7 @@
 
 #![deny(missing_docs)]
 
+mod connection;
 pub(crate) mod instant;
 
 #[cfg(feature = "test-support")]
@@ -1326,6 +1327,12 @@ impl PostgresStore {
     /// Connect and run pending migrations (versioned under ./migrations,
     /// tracked by sqlx's _sqlx_migrations table — review finding GL-11).
     ///
+    /// TLS follows the URL's `sslmode` and `sslrootcert`, or `PGSSLMODE` and
+    /// `PGSSLROOTCERT`, over rustls. The default, `prefer`, neither requires
+    /// TLS nor authenticates the server. A non-loopback database whose mode is
+    /// not `verify-full` is connected to as configured, and reported with a
+    /// warning (INVARIANTS.md 42).
+    ///
     /// Note the limits of what a pool bound can promise: `acquire_timeout`
     /// covers waiting for a connection, including establishing one, but a
     /// query already in flight on a healthy connection is bounded only by a
@@ -1340,12 +1347,13 @@ impl PostgresStore {
             .validate()
             .map_err(|e| StoreError(format!("invalid grant policy: {e}")))?;
         pool_config.validate()?;
+        let options = connection::options(url)?;
         let pool = PgPoolOptions::new()
             .max_connections(pool_config.max_connections)
             .acquire_timeout(pool_config.acquire_timeout)
-            .connect(url)
+            .connect_with(options.clone())
             .await
-            .map_err(storage)?;
+            .map_err(|error| connection::connect_error(error, &options))?;
         sqlx::migrate!("./migrations")
             .run(&pool)
             .await

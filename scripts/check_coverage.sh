@@ -28,6 +28,7 @@ environment=$(cargo llvm-cov show-env --sh)
 eval "$environment"
 cargo llvm-cov clean --workspace
 TOLLGATE_REQUIRE_PG=1 cargo test --locked --workspace --all-features -- --test-threads=1
+./scripts/with_tls_postgres.sh cargo test --locked -p tollgate-store-postgres --test tls
 ./scripts/check_e2e.sh
 
 mkdir -p reports/coverage
