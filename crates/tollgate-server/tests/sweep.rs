@@ -1310,6 +1310,78 @@ async fn a_tick_reports_the_accounts_it_had_to_defer() {
     );
 }
 
+/// A sweep that leaves expired leases behind held accounts names each account
+/// once, across every batch it drained.
+#[tokio::test]
+async fn a_tick_names_the_accounts_whose_expired_leases_it_left() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&calls);
+    let store =
+        Arc::new(
+            DelegatingStore::wrapping(store_with_expired_lease()).on_reclaim_expired_batch(
+                move |_, _, limit| {
+                    // The first tick drains a saturated batch and then a partial
+                    // one, each deferring; later ticks find nothing.
+                    let call = counted.fetch_add(1, Ordering::AcqRel);
+                    async move {
+                        let full = (0..limit.get())
+                            .map(|lease| tollgate_store::ReclaimedLease {
+                                lease_id: tollgate_core::LeaseId(lease as u128 + 100),
+                                account_id: ACCOUNT,
+                                forfeited: CostUnits::ZERO,
+                            })
+                            .collect();
+                        let (reclaimed, deferred) = match call {
+                            0 => (full, vec![AccountId(71)]),
+                            1 => (Vec::new(), vec![AccountId(71), AccountId(72)]),
+                            _ => (Vec::new(), Vec::new()),
+                        };
+                        Ok(tollgate_store::ReclaimBatch::try_new(reclaimed, limit)?
+                            .deferring(deferred))
+                    }
+                },
+            ),
+        );
+    let (captor, guard) = capture();
+    let (server, stop) = spawn_server(
+        store,
+        Arc::new(SystemClock),
+        std::time::Duration::from_millis(10),
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while calls.load(Ordering::Acquire) < 4 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the sweep keeps running");
+    let _ = stop.send(());
+    server.await.unwrap().unwrap();
+    drop(guard);
+
+    let events = captor.0.lock().unwrap();
+    let deferrals: Vec<_> = events
+        .iter()
+        .filter(|event| event.fields.iter().any(|(key, _)| key == "held_accounts"))
+        .collect();
+    assert_eq!(deferrals.len(), 1, "only the tick that deferred says so");
+    assert_eq!(deferrals[0].level, Level::WARN);
+    let field = |name: &str| {
+        deferrals[0]
+            .fields
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .expect(name)
+    };
+    assert_eq!(field("held_accounts"), "2");
+    let named = field("account_ids");
+    for id in [71, 72] {
+        assert!(named.contains(&format!("{:?}", AccountId(id))), "{named}");
+    }
+}
+
 /// An account with no schedule is not "rolled with zero accounts" — the pass
 /// must stay silent, or every quiet tick would emit an event and the signal
 /// above would be worthless.

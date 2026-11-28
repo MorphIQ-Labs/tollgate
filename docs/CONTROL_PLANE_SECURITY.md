@@ -276,7 +276,11 @@ with backend records rather than inferring rollback from shutdown.
 This health policy observes completed outcomes and task liveness. It adds no
 timeout or cancellation deadline to a backend call that remains pending, and it
 does not certify that `SKIP LOCKED` left no leases with another replica. A
-rollover pass waits for an account row that other work holds for at most two
+reclaim pass waits for an account row that other work holds for at most two
+seconds, three across all such accounts in a call, then warns with
+`operation=reclaim`, `held_accounts` and `account_ids` and leaves their expired
+leases active for a later tick; the pass still counts as completed, so readiness
+stays up. A rollover pass waits for an account row that other work holds for at most two
 seconds, three across all such accounts in a call, then warns with
 `operation=budget-rollover` and `deferred_accounts` and leaves them, still on
 last period's allowance, to a later tick. A count that persists means a session

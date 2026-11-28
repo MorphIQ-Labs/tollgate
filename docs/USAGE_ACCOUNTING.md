@@ -25,6 +25,22 @@ PostgreSQL's oversized-event outcome changes from a failed batch to an individua
 rejection. Its accounting-overflow outcome becomes a permanent refusal.
 MemoryStore's leased-usage overflow becomes a refusal instead of a panic.
 
+## A row another session holds
+
+PostgreSQL ingest locks the batch's lease and account rows. When another session
+holds one, ingest waits at most two seconds for it, or less under a shorter
+configured `lock_timeout` or `statement_timeout`, then rolls the whole batch back
+and returns `IngestError::Unavailable`. A warning with `operation=ingest` and
+`held` names the batch's accounts whose rows are held at that moment; over HTTP
+the caller receives the ordinary unavailable response, so read the server's log.
+Nothing is recorded, and the replay is exact.
+
+The usage writer retries that batch with its usual backoff, so the events that
+share it, and those queued behind it in that instance, wait until the row is
+free. Batches that do not touch the row are unaffected. A refusal that persists
+means a session is keeping the row: find it in `pg_stat_activity` with
+`pg_blocking_pids`, and end it if it is not doing legitimate work.
+
 ## Migration and rollout
 
 0015 installs checks for nonnegative `tollgate_usage_events.units` and positive

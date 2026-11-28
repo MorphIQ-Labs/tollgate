@@ -755,7 +755,10 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
    *oldest due* leases and stops at the first one that is not due, identically
    in both backends — and on PostgreSQL the batch's read work is bounded by the
    batch rather than by the backlog, because the sweep orders by the expiry
-   index's own columns so the `LIMIT` stops the walk (GL-65). *Tests:*
+   index's own columns so the `LIMIT` stops the walk (GL-65). On PostgreSQL both
+   statements range over the leases whose own row and account row are free: the
+   page passes over the others, reading them on the way, and settles them from a
+   queue or a later call (18). *Tests:*
    `reclaim_forfeits_an_unreleased_remainder_as_provisional_loss`,
    `straggler_usage_after_reclaim_is_billed_against_the_forfeit`,
    `a_reclaimed_lease_forfeits_its_funding_instead_of_restoring_it`,
@@ -1299,11 +1302,64 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `a_begun_budget_is_not_restarted_by_a_later_phase`, and
     `invalid_pool_config_is_rejected_before_connecting`.
 
-    `PostgresStore::roll_due_periods` bounds its own waiting for held account
-    rows with a transaction-local statement timeout, for callers that set no
-    deadline of their own, as the server's maintenance sweep does not (28). This
-    covers those waits only: the sweep's other store calls, reclaim's account
-    lock among them, carry no timeout of their own.
+    `PostgresStore` bounds its own waiting for rows other sessions hold in
+    rollover, reclaim and ingest, for callers that set no deadline of their own,
+    as the server's maintenance sweep and handlers do not. Each bound is a
+    transaction-local timeout; a shorter one the operator configured still
+    applies, and nothing stays on the pooled connection. These bounds cover
+    waiting for rows only: not a table lock, a statement a healthy connection
+    never finishes, or the store's other writes, which wait as long as the
+    session's settings allow.
+
+    Rollover waits as described in 28. Reclaim takes the due leases whose lease
+    and account rows are both free without waiting, so a held account neither
+    fills the page nor delays another account's settlement. It then queues for
+    each account with leases still due, holding no other lock while it waits:
+    two seconds for one account and three for all of a call's queued accounts.
+    An account not locked in time is unchanged, stays due and is named in
+    `ReclaimBatch::deferred_accounts`; the server warns with those accounts
+    (19). *Progress:* each call starts its queue one account further along, so
+    while the set of accounts among the `limit` oldest leases still due is
+    unchanged, a replica queues first, for the full two seconds, for each of
+    them within that many calls. An account is therefore reclaimed provided its
+    row can be locked within that wait when its turn comes. A row that never can
+    be is reported on every call that reaches it. A call may commit several
+    transactions, each settling its leases completely; an error from a later one
+    states what the call had already settled. A lease row held alone, with its
+    account free, is skipped without a wait or a report. Witnesses (PostgreSQL):
+    `a_reclaim_defers_a_held_account_and_settles_the_others`,
+    `a_reclaim_queues_for_an_account_that_other_work_holds`,
+    `a_reclaim_names_a_held_account_whose_leases_are_locked_too`,
+    `a_reclaim_bounds_its_waiting_across_held_accounts`,
+    `reclaim_rotation_reaches_an_account_behind_ones_that_stay_held`,
+    `queued_reclaims_stop_at_the_batch_limit`,
+    `a_configured_lock_timeout_defers_the_reclaim_too`,
+    `a_failed_queued_reclaim_reports_what_the_call_had_settled`,
+    `a_queued_reclaim_whose_account_lock_fails_otherwise_is_an_error`,
+    `a_queued_wait_is_capped_and_ends_with_the_budget`,
+    `a_partial_reclaim_failure_carries_what_was_settled`,
+    `a_reclaim_batch_names_the_accounts_it_deferred` and
+    `a_tick_names_the_accounts_whose_expired_leases_it_left`.
+
+    Ingest is all or nothing, so a held row refuses its whole batch as
+    `IngestError::Unavailable`: nothing is recorded, the replay is exact (7),
+    and the refusal and a warning name the batch's accounts held at that moment.
+    No single wait of an ingest transaction exceeds two seconds, whether for a
+    lease row, an account row, a credential row an activity insert references or
+    an uncommitted event with the same request id, and each of its two
+    row-locking selections has two seconds for all of its waiting together. The
+    refusal releases every lock the batch held, so other work on its other
+    accounts proceeds. Events that share a batch with a held account are not
+    recorded until that row is free: the usage writer retries the same batch.
+    Witnesses (PostgreSQL):
+    `ingest_gives_up_on_a_held_account_and_records_nothing`,
+    `ingest_gives_up_on_a_held_lease_row`,
+    `ingest_gives_up_on_rows_its_inserts_wait_for`,
+    `ingest_queues_for_an_account_that_other_work_holds`,
+    `an_ingest_that_loses_its_session_is_not_reported_as_a_held_row`,
+    `a_tightened_timeout_never_loosens_a_configured_one` and
+    `bounded_waits_end_before_the_work_that_follows_them`. `MemoryStore` has no
+    row another session can hold and defers nothing.
 
     Dropping a `PostgresStore` call, at a caller's timeout or because a server
     handler's client left, leaves no pooled connection inside a transaction: a

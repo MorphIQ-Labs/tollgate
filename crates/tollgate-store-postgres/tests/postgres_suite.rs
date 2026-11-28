@@ -27,6 +27,7 @@ use tollgate_store::{
     KeyError, KeyRecord, LeaseAllocator, PublishSnapshotError, Revocation, RolledAccount,
     SetStatusError, SnapshotResolution, SnapshotSource, UsageSink,
 };
+use tollgate_store_postgres::test_support::wait_patiently;
 use tollgate_store_postgres::{PoolConfig, PostgresStore};
 
 static DB_LOCK: Mutex<()> = Mutex::const_new(());
@@ -4943,9 +4944,10 @@ async fn racing_passes_cross_a_boundary_exactly_once() {
 #[tokio::test]
 async fn a_rollover_pass_queues_for_an_account_that_other_work_holds() {
     let _guard = DB_LOCK.lock().await;
-    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+    let Some(mut store) = store_with_balance(full_grant_policy(), 0).await else {
         return;
     };
+    wait_patiently(&mut store);
     AdminStore::set_budget_schedule(&*store, ACCOUNT, Some(monthly(500)))
         .await
         .unwrap();
@@ -4982,9 +4984,10 @@ async fn a_rollover_pass_queues_for_an_account_that_other_work_holds() {
 #[tokio::test]
 async fn a_rollover_pass_crosses_the_free_accounts_before_waiting_for_a_held_one() {
     let _guard = DB_LOCK.lock().await;
-    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+    let Some(mut store) = store_with_balance(full_grant_policy(), 0).await else {
         return;
     };
+    wait_patiently(&mut store);
     for id in 2..=3u128 {
         AdminStore::create_account(
             &*store,
@@ -5186,7 +5189,9 @@ async fn rotation_reaches_an_account_behind_ones_that_stay_held() {
     };
 
     let mut crossed = Vec::new();
-    for _ in 0..3 {
+    // Three passes queue for it first once; more allow for a host too busy to
+    // release the row inside that wait, after which the page takes it.
+    for _ in 0..12 {
         let batch = bounded_pass(&store, 64).await;
         crossed.extend(batch.rolled().iter().map(|account| account.account_id.0));
         if !crossed.is_empty() {
@@ -5203,9 +5208,10 @@ async fn rotation_reaches_an_account_behind_ones_that_stay_held() {
 #[tokio::test]
 async fn queued_crossings_stop_at_the_batch_limit() {
     let _guard = DB_LOCK.lock().await;
-    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+    let Some(mut store) = store_with_balance(full_grant_policy(), 0).await else {
         return;
     };
+    wait_patiently(&mut store);
     let pool = corruption_pool().await;
     due_accounts(&store, &pool, 3).await;
     let (blocker, blocker_pid) = hold(&pool, &[1, 2]).await;
@@ -5255,9 +5261,10 @@ async fn a_configured_lock_timeout_defers_the_account_too() {
 #[tokio::test]
 async fn a_failed_queued_crossing_is_an_error() {
     let _guard = DB_LOCK.lock().await;
-    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+    let Some(mut store) = store_with_balance(full_grant_policy(), 0).await else {
         return;
     };
+    wait_patiently(&mut store);
     let pool = corruption_pool().await;
     due_accounts(&store, &pool, 1).await;
     // One more allowance overflows the column.
@@ -5283,7 +5290,7 @@ async fn a_failed_queued_crossing_is_an_error() {
 }
 
 /// The queued statement's timeout ends with its own transaction: the one pooled
-/// connection afterwards waits as long as it is made to.
+/// connection afterwards has the statement timeout it started with.
 #[tokio::test]
 async fn the_rollover_timeout_does_not_stay_on_the_connection() {
     let _guard = DB_LOCK.lock().await;
@@ -5292,19 +5299,13 @@ async fn the_rollover_timeout_does_not_stay_on_the_connection() {
     };
     let pool = corruption_pool().await;
     due_accounts(&fixture, &pool, 1).await;
-    let url = std::env::var("TOLLGATE_PG_URL").unwrap();
-    let store = PostgresStore::connect_with(
-        &url,
-        full_grant_policy(),
-        PoolConfig {
-            max_connections: 1,
-            ..PoolConfig::default()
-        },
-    )
-    .await
-    .unwrap();
-    // Once for a crossing that gave up, once for one that committed.
+    // Once for a crossing that gave up, once for one that committed, which
+    // waits patiently so that releasing the row does not race its bound.
     for commits in [false, true] {
+        let mut store = store_with_options("-c%20statement_timeout%3D1h", 1).await;
+        if commits {
+            wait_patiently(&mut store);
+        }
         let (blocker, blocker_pid) = hold(&pool, &[1]).await;
         let pass = {
             let store = Arc::clone(&store);
@@ -5322,27 +5323,11 @@ async fn the_rollover_timeout_does_not_stay_on_the_connection() {
             blocker.commit().await.unwrap();
         }
 
-        let (blocker, blocker_pid) = hold(&pool, &[1]).await;
-        let deposit = {
-            let store = Arc::clone(&store);
-            tokio::spawn(async move { AdminStore::deposit(&*store, ACCOUNT, CostUnits(1)).await })
-        };
-        wait_for_blocked_operations(&pool, blocker_pid, 1).await;
-        // Longer than any rollover timeout.
-        tokio::time::sleep(std::time::Duration::from_millis(3_500)).await;
-        blocker.commit().await.unwrap();
-        deposit
+        let left: String = sqlx::query_scalar("SELECT current_setting('statement_timeout')")
+            .fetch_one(&tollgate_store_postgres::test_support::pool(&store))
             .await
-            .unwrap()
-            .expect("no statement timeout was left behind");
-        if !commits {
-            // Put the boundary back for the committing round.
-            sqlx::query("UPDATE tollgate_accounts SET period_start_us = 1 WHERE account_id = $1")
-                .bind(account_bytes())
-                .execute(&pool)
-                .await
-                .unwrap();
-        }
+            .unwrap();
+        assert_eq!(left, "1h", "no statement timeout was left behind");
     }
 }
 
@@ -5357,7 +5342,7 @@ async fn a_cancelled_queued_crossing_leaves_no_open_transaction() {
     let pool = corruption_pool().await;
     due_accounts(&fixture, &pool, 1).await;
     let url = std::env::var("TOLLGATE_PG_URL").unwrap();
-    let store = PostgresStore::connect_with(
+    let mut store = PostgresStore::connect_with(
         &url,
         full_grant_policy(),
         PoolConfig {
@@ -5367,6 +5352,7 @@ async fn a_cancelled_queued_crossing_leaves_no_open_transaction() {
     )
     .await
     .unwrap();
+    wait_patiently(&mut store);
     let (blocker, blocker_pid) = hold(&pool, &[1]).await;
     let pass = {
         let store = Arc::clone(&store);
@@ -7616,6 +7602,697 @@ async fn wait_for_blocked_operations(pool: &sqlx::PgPool, blocker_pid: i32, expe
     })
     .await
     .expect("issuers reach the account lock queue");
+}
+
+// --- Held rows (GH-109, INVARIANTS.md GL-18) -----------------------------------
+//
+// Interleavings are placed with row locks and observed through
+// `pg_blocking_pids`. The deadlines below only turn a parked call into a
+// failure. PostgreSQL only: `MemoryStore` has no row another session can hold.
+
+/// Accounts 1 to `count`, each with a balance of 100 and one lease of 10,
+/// the lowest id's lease expiring first.
+async fn leased_accounts(
+    count: u128,
+) -> Option<(Arc<PostgresStore>, Vec<tollgate_core::LeaseGrant>)> {
+    let store = empty_store(full_grant_policy()).await?;
+    let mut leases = Vec::new();
+    for id in 1..=count {
+        AdminStore::create_account(
+            &*store,
+            AccountConfig {
+                account_id: AccountId(id),
+                initial_balance: CostUnits(100),
+                status: AccountStatus::Active,
+                capacity_class: CapacityClass::Assured,
+            },
+        )
+        .await
+        .unwrap();
+        let at = t(i64::try_from(id).unwrap());
+        leases.push(
+            store
+                .acquire(AccountId(id), CostUnits(10), TTL, at)
+                .await
+                .unwrap()
+                .grant,
+        );
+    }
+    Some((store, leases))
+}
+
+/// Long after every lease above expired.
+const LATER: i64 = 1_000;
+
+/// Longer than any correct call waits, so that a parked one fails.
+const PARKED: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn bounded_reclaim(store: &PostgresStore, limit: usize) -> tollgate_store::ReclaimBatch {
+    tokio::time::timeout(
+        PARKED,
+        store.reclaim_expired_batch(t(LATER), NonZeroUsize::new(limit).unwrap()),
+    )
+    .await
+    .expect("a held row must not park reclaim")
+    .expect("a held row is not a failure")
+}
+
+fn settled(batch: &tollgate_store::ReclaimBatch) -> Vec<u128> {
+    batch
+        .reclaimed()
+        .iter()
+        .map(|lease| lease.account_id.0)
+        .collect()
+}
+
+async fn assert_all_conserved(store: &PostgresStore, accounts: u128) {
+    for id in 1..=accounts {
+        let ledger = store.conservation(AccountId(id)).await.unwrap().unwrap();
+        assert!(ledger.holds(), "account {id}: {ledger:?}");
+    }
+}
+
+/// Whether another session could lock the row now.
+async fn is_free(pool: &sqlx::PgPool, table: &str, column: &str, id: u128) -> bool {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM {table} WHERE {column} = $1 FOR UPDATE NOWAIT"
+    )))
+    .bind(id.to_be_bytes().to_vec())
+    .fetch_one(pool)
+    .await
+    .is_ok()
+}
+
+/// Hold one row of `table` until the transaction ends.
+async fn hold_row(
+    pool: &sqlx::PgPool,
+    table: &str,
+    column: &str,
+    id: u128,
+) -> (sqlx::Transaction<'static, sqlx::Postgres>, i32) {
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM {table} WHERE {column} = $1 FOR UPDATE"
+    )))
+    .bind(id.to_be_bytes().to_vec())
+    .fetch_one(&mut *blocker)
+    .await
+    .unwrap();
+    let pid = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    (blocker, pid)
+}
+
+/// The held account's lease is the oldest due, so it is what a page of one
+/// would take if holding its account did not remove it from the page.
+#[tokio::test]
+async fn a_reclaim_defers_a_held_account_and_settles_the_others() {
+    let _guard = DB_LOCK.lock().await;
+    let Some((store, leases)) = leased_accounts(2).await else {
+        return;
+    };
+    let pool = corruption_pool().await;
+    let (blocker, _) = hold(&pool, &[1]).await;
+
+    let page = bounded_reclaim(&store, 1).await;
+    assert_eq!(settled(&page), vec![2]);
+    assert!(page.is_saturated());
+
+    let batch = bounded_reclaim(&store, 64).await;
+    assert!(batch.is_empty());
+    assert!(!batch.is_saturated());
+    assert_eq!(batch.deferred_accounts(), [AccountId(1)]);
+    assert_all_conserved(&store, 2).await;
+
+    blocker.commit().await.unwrap();
+    let batch = bounded_reclaim(&store, 64).await;
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch.reclaimed()[0].lease_id, leases[0].lease_id);
+    assert_eq!(batch.reclaimed()[0].forfeited, CostUnits(10));
+    assert!(batch.deferred_accounts().is_empty());
+    assert_all_conserved(&store, 2).await;
+}
+
+#[tokio::test]
+async fn a_reclaim_queues_for_an_account_that_other_work_holds() {
+    let _guard = DB_LOCK.lock().await;
+    let Some((mut store, leases)) = leased_accounts(1).await else {
+        return;
+    };
+    wait_patiently(&mut store);
+    let pool = corruption_pool().await;
+    let (blocker, blocker_pid) = hold(&pool, &[1]).await;
+    let sweep = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move { bounded_reclaim(&store, 64).await })
+    };
+    wait_for_blocked_operations(&pool, blocker_pid, 1).await;
+    // Nothing is held during the wait, the waited-for account's lease included.
+    assert!(is_free(&pool, "tollgate_leases", "lease_id", leases[0].lease_id.0).await);
+    blocker.commit().await.unwrap();
+
+    let batch = sweep.await.unwrap();
+    assert_eq!(settled(&batch), vec![1]);
+    assert!(batch.deferred_accounts().is_empty());
+    assert_all_conserved(&store, 1).await;
+}
+
+/// A release already waiting on a held account holds its lease row, so the
+/// sweep can select neither. It still names the account.
+#[tokio::test]
+async fn a_reclaim_names_a_held_account_whose_leases_are_locked_too() {
+    let _guard = DB_LOCK.lock().await;
+    let Some((store, leases)) = leased_accounts(1).await else {
+        return;
+    };
+    let pool = corruption_pool().await;
+    let (account, _) = hold(&pool, &[1]).await;
+    let (lease, _) = hold_row(&pool, "tollgate_leases", "lease_id", leases[0].lease_id.0).await;
+
+    let batch = bounded_reclaim(&store, 64).await;
+
+    assert!(batch.is_empty());
+    assert_eq!(batch.deferred_accounts(), [AccountId(1)]);
+    lease.commit().await.unwrap();
+    account.commit().await.unwrap();
+}
+
+/// Forty held rows at two seconds each would take well past the deadline: the
+/// call's waiting is bounded as a whole, and every account it left is named.
+#[tokio::test]
+async fn a_reclaim_bounds_its_waiting_across_held_accounts() {
+    const ACCOUNTS: u128 = 40;
+    let _guard = DB_LOCK.lock().await;
+    let Some((store, _)) = leased_accounts(ACCOUNTS).await else {
+        return;
+    };
+    let pool = corruption_pool().await;
+    let all: Vec<u128> = (1..=ACCOUNTS).collect();
+    let (blocker, _) = hold(&pool, &all).await;
+
+    let batch = bounded_reclaim(&store, 64).await;
+
+    assert!(batch.is_empty());
+    let mut deferred: Vec<u128> = batch.deferred_accounts().iter().map(|id| id.0).collect();
+    deferred.sort_unstable();
+    assert_eq!(deferred, all);
+    blocker.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn reclaim_rotation_reaches_an_account_behind_ones_that_stay_held() {
+    let _guard = DB_LOCK.lock().await;
+    let Some((store, _)) = leased_accounts(3).await else {
+        return;
+    };
+    let pool = corruption_pool().await;
+    // Two would spend a whole call between them, every time, if taken in order.
+    let (held, _) = hold(&pool, &[1, 2]).await;
+    let (busy, busy_pid) = hold(&pool, &[3]).await;
+    let released = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            // Free as soon as a call is found waiting for it.
+            wait_for_blocked_operations(&pool, busy_pid, 1).await;
+            busy.commit().await.unwrap();
+        })
+    };
+
+    let mut reached = Vec::new();
+    // Three calls queue for it first once; more allow for a host too busy to
+    // release the row inside that wait, after which the page takes it.
+    for _ in 0..12 {
+        reached.extend(settled(&bounded_reclaim(&store, 64).await));
+        if !reached.is_empty() {
+            break;
+        }
+    }
+
+    assert_eq!(reached, vec![3]);
+    released.await.unwrap();
+    held.commit().await.unwrap();
+}
+
+/// What the queue settles counts against the batch like the page.
+#[tokio::test]
+async fn queued_reclaims_stop_at_the_batch_limit() {
+    let _guard = DB_LOCK.lock().await;
+    let Some((mut store, _)) = leased_accounts(3).await else {
+        return;
+    };
+    wait_patiently(&mut store);
+    store
+        .acquire(AccountId(1), CostUnits(10), TTL, t(1))
+        .await
+        .unwrap();
+    let pool = corruption_pool().await;
+    let (blocker, blocker_pid) = hold(&pool, &[1, 2]).await;
+    let sweep = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move { bounded_reclaim(&store, 2).await })
+    };
+    // Account 3 takes one place in the page, leaving one for the two held.
+    wait_for_blocked_operations(&pool, blocker_pid, 1).await;
+    blocker.commit().await.unwrap();
+
+    let batch = sweep.await.unwrap();
+    assert!(batch.is_saturated());
+    assert_eq!(batch.len(), 2);
+    assert!(batch.deferred_accounts().is_empty());
+    assert_all_conserved(&store, 3).await;
+}
+
+#[tokio::test]
+async fn a_configured_lock_timeout_defers_the_reclaim_too() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(_fixture) = leased_accounts(1).await else {
+        return;
+    };
+    let pool = corruption_pool().await;
+    let store = store_with_options("-c%20lock_timeout%3D100", 4).await;
+    let (blocker, _) = hold(&pool, &[1]).await;
+
+    let batch = bounded_reclaim(&store, 64).await;
+
+    assert!(batch.is_empty());
+    assert_eq!(batch.deferred_accounts(), [AccountId(1)]);
+    blocker.commit().await.unwrap();
+}
+
+/// A failure after part of a call committed says what that part settled, and
+/// the queued settlement that fails changes nothing.
+#[tokio::test]
+async fn a_failed_queued_reclaim_reports_what_the_call_had_settled() {
+    let _guard = DB_LOCK.lock().await;
+    let Some((mut store, _)) = leased_accounts(2).await else {
+        return;
+    };
+    wait_patiently(&mut store);
+    let pool = corruption_pool().await;
+    // One more unit of loss overflows the column.
+    set_account_column(&pool, "settlement_loss", i64::MAX).await;
+    let (blocker, blocker_pid) = hold(&pool, &[1]).await;
+    let sweep = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            store
+                .reclaim_expired_batch(t(LATER), DEFAULT_RECLAIM_BATCH_LIMIT)
+                .await
+        })
+    };
+    wait_for_blocked_operations(&pool, blocker_pid, 1).await;
+    blocker.commit().await.unwrap();
+
+    let error = sweep
+        .await
+        .unwrap()
+        .expect_err("an overflow is not a held row");
+    assert!(
+        error
+            .0
+            .contains("after settling 1 leases forfeiting 10 units"),
+        "{error}"
+    );
+    let active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tollgate_leases WHERE account_id = $1 AND state = 0",
+    )
+    .bind(account_bytes())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(active, 1);
+}
+
+/// A queued account lock that fails for any other reason, on a session that
+/// stays usable, is a failed call and not an account quietly left for later.
+/// Under repeatable read, the row changing during the wait is such a failure.
+#[tokio::test]
+async fn a_queued_reclaim_whose_account_lock_fails_otherwise_is_an_error() {
+    let _guard = DB_LOCK.lock().await;
+    let Some((_fixture, _)) = leased_accounts(1).await else {
+        return;
+    };
+    let pool = corruption_pool().await;
+    let mut store = store_with_options(
+        "-c%20default_transaction_isolation%3Drepeatable%5C%20read",
+        4,
+    )
+    .await;
+    wait_patiently(&mut store);
+    let (mut blocker, blocker_pid) = hold(&pool, &[1]).await;
+    sqlx::query("UPDATE tollgate_accounts SET next_fence = next_fence WHERE account_id = $1")
+        .bind(account_bytes())
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let sweep = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            store
+                .reclaim_expired_batch(t(LATER), DEFAULT_RECLAIM_BATCH_LIMIT)
+                .await
+        })
+    };
+    wait_for_blocked_operations(&pool, blocker_pid, 1).await;
+    blocker.commit().await.unwrap();
+
+    let error = sweep
+        .await
+        .unwrap()
+        .expect_err("a serialization failure is not a held row");
+    assert!(error.0.contains("could not serialize"), "{error}");
+}
+
+/// End the session found waiting behind `blocker_pid`.
+async fn terminate_waiter(pool: &sqlx::PgPool, blocker_pid: i32) {
+    wait_for_blocked_operations(pool, blocker_pid, 1).await;
+    sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+         WHERE $1 = ANY(pg_blocking_pids(pid))",
+    )
+    .bind(blocker_pid)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+fn overage(account: u128, request: u128) -> UsageEvent {
+    UsageEvent::new(
+        RequestId(request),
+        AccountId(account),
+        UsageSource::Overage,
+        CostUnits(1),
+        t(1),
+        PolicyRevision::UNSTATED,
+        None,
+    )
+}
+
+/// The refusal of a batch that waited too long, which must return.
+async fn gave_up(store: &PostgresStore, events: &[UsageEvent]) -> String {
+    let outcome = tokio::time::timeout(PARKED, UsageSink::ingest(store, events, t(2)))
+        .await
+        .expect("a held row must not park ingest");
+    let Err(tollgate_store::IngestError::Unavailable(error)) = outcome else {
+        panic!("a held row is retryable: {outcome:?}");
+    };
+    assert!(error.0.contains("ingest gave up waiting"), "{error}");
+    error.0
+}
+
+async fn recorded_events(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM tollgate_usage_events")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// One held account refuses the whole batch, names that account, and leaves
+/// the other account's rows free for its own work. The replay is exact.
+#[tokio::test]
+async fn ingest_gives_up_on_a_held_account_and_records_nothing() {
+    let _guard = DB_LOCK.lock().await;
+    let Some((store, leases)) = leased_accounts(2).await else {
+        return;
+    };
+    let pool = corruption_pool().await;
+    let events = [usage(&leases[0], 1, 3, 1), usage(&leases[1], 2, 4, 2)];
+    let (blocker, _) = hold(&pool, &[1]).await;
+
+    let error = gave_up(&store, &events).await;
+
+    assert!(
+        error.contains(&format!("(held accounts: {})", AccountId(1))),
+        "{error}"
+    );
+    assert_eq!(recorded_events(&pool).await, 0);
+    assert!(is_free(&pool, "tollgate_accounts", "account_id", 2).await);
+    assert!(is_free(&pool, "tollgate_leases", "lease_id", leases[1].lease_id.0).await);
+    // The other account's own batch is accepted while the first stays held.
+    let alone = UsageSink::ingest(&*store, &events[1..], t(2))
+        .await
+        .unwrap();
+    assert_eq!(alone.accepted, 1);
+
+    blocker.commit().await.unwrap();
+    let replay = UsageSink::ingest(&*store, &events, t(3)).await.unwrap();
+    assert_eq!((replay.accepted, replay.duplicate), (1, 1));
+    assert_all_conserved(&store, 2).await;
+}
+
+#[tokio::test]
+async fn ingest_gives_up_on_a_held_lease_row() {
+    let _guard = DB_LOCK.lock().await;
+    let Some((store, leases)) = leased_accounts(1).await else {
+        return;
+    };
+    let pool = corruption_pool().await;
+    let events = [usage(&leases[0], 1, 3, 1)];
+    let (blocker, _) = hold_row(&pool, "tollgate_leases", "lease_id", leases[0].lease_id.0).await;
+
+    let error = gave_up(&store, &events).await;
+
+    assert!(
+        error.contains("none of its account rows is held"),
+        "{error}"
+    );
+    assert_eq!(recorded_events(&pool).await, 0);
+    blocker.commit().await.unwrap();
+    let replay = UsageSink::ingest(&*store, &events, t(3)).await.unwrap();
+    assert_eq!(replay.accepted, 1);
+}
+
+/// The waits ingest does not make by selecting rows: an activity insert behind
+/// its credential row, and an event insert behind an uncommitted one with the
+/// same request id.
+#[tokio::test]
+async fn ingest_gives_up_on_rows_its_inserts_wait_for() {
+    let _guard = DB_LOCK.lock().await;
+    let Some((store, _)) = leased_accounts(1).await else {
+        return;
+    };
+    let pool = corruption_pool().await;
+    store.insert_key(key(7, 11, 0xa1, None)).await.unwrap();
+    let mut attributed = overage(1, 1);
+    attributed.key_id = Some(KeyId(7));
+    let (credential, _) = hold_row(&pool, "tollgate_credential_keys", "key_id", 7).await;
+    gave_up(&store, &[attributed]).await;
+    assert_eq!(recorded_events(&pool).await, 0);
+    credential.commit().await.unwrap();
+
+    let mut rival = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO tollgate_usage_events (request_id, account_id, units, occurred_at_us)
+         VALUES ($1, $2, 1, 0)",
+    )
+    .bind(2u128.to_be_bytes().to_vec())
+    .bind(account_bytes())
+    .execute(&mut *rival)
+    .await
+    .unwrap();
+    gave_up(&store, &[overage(1, 2)]).await;
+    rival.rollback().await.unwrap();
+
+    let replay = UsageSink::ingest(&*store, &[attributed, overage(1, 2)], t(3))
+        .await
+        .unwrap();
+    assert_eq!(replay.accepted, 2);
+    assert_all_conserved(&store, 1).await;
+}
+
+#[tokio::test]
+async fn ingest_queues_for_an_account_that_other_work_holds() {
+    let _guard = DB_LOCK.lock().await;
+    let Some((mut store, leases)) = leased_accounts(1).await else {
+        return;
+    };
+    wait_patiently(&mut store);
+    let pool = corruption_pool().await;
+    let (blocker, blocker_pid) = hold(&pool, &[1]).await;
+    let ingest = {
+        let store = Arc::clone(&store);
+        let event = usage(&leases[0], 1, 3, 1);
+        tokio::spawn(async move { UsageSink::ingest(&*store, &[event], t(2)).await })
+    };
+    wait_for_blocked_operations(&pool, blocker_pid, 1).await;
+    blocker.commit().await.unwrap();
+
+    assert_eq!(ingest.await.unwrap().unwrap().accepted, 1);
+    assert_all_conserved(&store, 1).await;
+}
+
+#[tokio::test]
+async fn an_ingest_that_loses_its_session_is_not_reported_as_a_held_row() {
+    let _guard = DB_LOCK.lock().await;
+    let Some((mut store, leases)) = leased_accounts(1).await else {
+        return;
+    };
+    wait_patiently(&mut store);
+    let pool = corruption_pool().await;
+    let (blocker, blocker_pid) = hold(&pool, &[1]).await;
+    let ingest = {
+        let store = Arc::clone(&store);
+        let event = usage(&leases[0], 1, 3, 1);
+        tokio::spawn(async move { UsageSink::ingest(&*store, &[event], t(2)).await })
+    };
+    terminate_waiter(&pool, blocker_pid).await;
+
+    let error = ingest.await.unwrap().expect_err("the session ended");
+    assert!(error.is_retryable());
+    assert!(!error.to_string().contains("gave up waiting"), "{error}");
+    blocker.commit().await.unwrap();
+}
+
+/// A store whose sessions start with `options`, over at most `connections`.
+async fn store_with_options(options: &str, connections: u32) -> Arc<PostgresStore> {
+    let url = std::env::var("TOLLGATE_PG_URL").expect("caller already gated on TOLLGATE_PG_URL");
+    let separator = if url.contains('?') { '&' } else { '?' };
+    PostgresStore::connect_with(
+        &format!("{url}{separator}options={options}"),
+        full_grant_policy(),
+        PoolConfig {
+            max_connections: connections,
+            ..PoolConfig::default()
+        },
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_tightened_timeout_never_loosens_a_configured_one() {
+    let _guard = DB_LOCK.lock().await;
+    if empty_store(full_grant_policy()).await.is_none() {
+        return;
+    }
+    let pool = corruption_pool().await;
+    for (configured, expected) in [
+        ("0", "2s"),
+        ("100ms", "100ms"),
+        ("2s", "2s"),
+        ("1min", "2s"),
+        ("1d", "2s"),
+    ] {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+            .bind(configured)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(tollgate_store_postgres::test_support::TIGHTEN_TIMEOUT)
+            .bind("lock_timeout")
+            .bind(2_000_i64)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let effective: String = sqlx::query_scalar("SELECT current_setting('lock_timeout')")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(effective, expected, "configured {configured}");
+        tx.rollback().await.unwrap();
+    }
+}
+
+/// The timeouts in force for each lease update since the last call.
+async fn recorded_timeouts(pool: &sqlx::PgPool) -> Vec<(String, String)> {
+    sqlx::query_as("DELETE FROM tollgate_test_timeouts RETURNING statement, waiting")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// The bounds cover waiting only: the writes that follow run under the
+/// session's own statement timeout, ingest keeps a configured lock timeout
+/// shorter than its own, and nothing stays on the pooled connection.
+#[tokio::test]
+async fn bounded_waits_end_before_the_work_that_follows_them() {
+    let _guard = DB_LOCK.lock().await;
+    let Some((_, leases)) = leased_accounts(2).await else {
+        return;
+    };
+    let pool = corruption_pool().await;
+    sqlx::raw_sql(
+        "DROP TABLE IF EXISTS tollgate_test_timeouts;
+         CREATE TABLE tollgate_test_timeouts (statement TEXT, waiting TEXT);
+         CREATE OR REPLACE FUNCTION tollgate_test_record_timeouts() RETURNS trigger
+         LANGUAGE plpgsql AS $$ BEGIN
+             INSERT INTO tollgate_test_timeouts VALUES
+                 (current_setting('statement_timeout'), current_setting('lock_timeout'));
+             RETURN NULL;
+         END $$;
+         DROP TRIGGER IF EXISTS tollgate_test_record_timeouts ON tollgate_leases;
+         CREATE TRIGGER tollgate_test_record_timeouts AFTER UPDATE ON tollgate_leases
+             FOR EACH STATEMENT EXECUTE FUNCTION tollgate_test_record_timeouts()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut ingests = Vec::new();
+    let mut queued = Vec::new();
+    let mut left = Vec::new();
+    for (request, configured) in [(1u128, "1h"), (2, "100ms")] {
+        let store = store_with_options(
+            &format!("-c%20statement_timeout%3D1h%20-c%20lock_timeout%3D{configured}"),
+            1,
+        )
+        .await;
+        UsageSink::ingest(&*store, &[usage(&leases[0], request, 1, 1)], t(2))
+            .await
+            .unwrap();
+        ingests.push(recorded_timeouts(&pool).await);
+        if configured == "1h" {
+            // Account 2's lease, settled through the queue.
+            let mut patient =
+                store_with_options("-c%20statement_timeout%3D1h%20-c%20lock_timeout%3D1h", 1).await;
+            wait_patiently(&mut patient);
+            // A lengthened wait is what bounds that store's ingest too.
+            UsageSink::ingest(&*patient, &[usage(&leases[0], 3, 1, 1)], t(2))
+                .await
+                .unwrap();
+            ingests.push(recorded_timeouts(&pool).await);
+            let (blocker, blocker_pid) = hold(&pool, &[2]).await;
+            let (other, _) =
+                hold_row(&pool, "tollgate_leases", "lease_id", leases[0].lease_id.0).await;
+            let sweep = {
+                let store = Arc::clone(&patient);
+                tokio::spawn(async move { bounded_reclaim(&store, 64).await })
+            };
+            wait_for_blocked_operations(&pool, blocker_pid, 1).await;
+            blocker.commit().await.unwrap();
+            assert_eq!(settled(&sweep.await.unwrap()), vec![2]);
+            other.commit().await.unwrap();
+            queued = recorded_timeouts(&pool).await;
+        }
+        let setting: (String, String) = sqlx::query_as(
+            "SELECT current_setting('statement_timeout'), current_setting('lock_timeout')",
+        )
+        .fetch_one(&tollgate_store_postgres::test_support::pool(&store))
+        .await
+        .unwrap();
+        left.push(setting);
+    }
+    sqlx::raw_sql(
+        "DROP FUNCTION tollgate_test_record_timeouts() CASCADE; DROP TABLE tollgate_test_timeouts",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let setting = |statement: &str, waiting: &str| (statement.to_owned(), waiting.to_owned());
+    assert_eq!(
+        ingests,
+        [
+            vec![setting("1h", "2s")],
+            vec![setting("1h", "1min")],
+            vec![setting("1h", "100ms")],
+        ]
+    );
+    assert_eq!(queued, [setting("1h", "1h")]);
+    assert_eq!(left, [setting("1h", "1h"), setting("1h", "100ms")]);
 }
 
 #[path = "../../tollgate-store/tests/support/account_view.rs"]

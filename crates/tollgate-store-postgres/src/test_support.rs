@@ -131,6 +131,26 @@ pub async fn truncate_all(store: &PostgresStore) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Make every wait for a held row last far longer than a test takes to act on
+/// it, so that releasing the row mid-wait does not race the bound. Call it on a
+/// store that nothing else holds yet.
+///
+/// # Panics
+///
+/// If the handle has been cloned.
+pub fn wait_patiently(store: &mut std::sync::Arc<PostgresStore>) {
+    let store = std::sync::Arc::get_mut(store).expect("a store not yet shared");
+    store.waits = crate::HeldRowWaits {
+        row: std::time::Duration::from_secs(60),
+        queue: std::time::Duration::from_secs(90),
+    };
+}
+
+/// The statement that bounds a background pass's waits: it sets the timeout
+/// named by `$1` to `$2` milliseconds for the transaction, unless a shorter one
+/// is already in force. Exposed so a test drives the store's own statement.
+pub const TIGHTEN_TIMEOUT: &str = crate::TIGHTEN_TIMEOUT_SQL;
+
 /// The statements [`KeyDirectory::insert_key_within`] serialises with, exposed
 /// so a test can demonstrate the race the lock prevents by driving the same
 /// SQL rather than a copy of it (GL-121).

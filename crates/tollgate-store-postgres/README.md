@@ -19,6 +19,9 @@ repository checks keep the two suites driving one contract.
   wrapped, and schema constraints keep every unit column non-negative.
 - **Usage ingest** is set-wise; **expiry reclaim** runs in bounded,
   set-wise `SKIP LOCKED` batches, oldest due first, in index order.
+- **Held rows** do not park background work: reclaim settles the other accounts,
+  waits a few seconds per call for held ones and names those it left, and ingest
+  rolls back a batch that waits more than two seconds for a row, as retryable.
 - **Budget rollover** crosses the free accounts of a bounded page set-wise,
   then queues for each held one within a few seconds per call, so an account in
   constant use is still crossed and one held for good is reported, not waited

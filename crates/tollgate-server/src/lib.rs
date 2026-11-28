@@ -332,6 +332,8 @@ async fn maintenance_sweep<S: Backend>(
         leases: u128,
         units: u128,
         batches: u64,
+        /// Accounts whose expired leases a batch left because they were held.
+        held: std::collections::BTreeSet<tollgate_core::AccountId>,
     }
 
     impl Progress {
@@ -357,11 +359,8 @@ async fn maintenance_sweep<S: Backend>(
                 .batches
                 .checked_add(1)
                 .ok_or_else(|| StoreError("reclaim cycle batch count overflow".into()))?;
-            *self = Progress {
-                leases,
-                units,
-                batches,
-            };
+            self.held.extend(batch.deferred_accounts());
+            (self.leases, self.units, self.batches) = (leases, units, batches);
             Ok(())
         }
     }
@@ -399,6 +398,18 @@ async fn maintenance_sweep<S: Backend>(
                 Err(error) => break Err(error),
             }
         };
+
+        // Whatever else the pass did, expired leases it could not reach stay
+        // active, and only this says why (INVARIANTS.md 19).
+        if !progress.held.is_empty() {
+            tracing::warn!(
+                operation = "reclaim",
+                held_accounts = progress.held.len(),
+                account_ids = ?progress.held,
+                "reclaim left expired leases of accounts other work holds; \
+                 the next tick tries them again"
+            );
+        }
 
         let Ok(report) = health.record(maintenance::Operation::Reclaim, outcome.is_ok()) else {
             tracing::error!(

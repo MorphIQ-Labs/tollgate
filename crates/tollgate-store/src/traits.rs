@@ -432,6 +432,7 @@ pub const DEFAULT_RECLAIM_BATCH_LIMIT: NonZeroUsize =
 pub struct ReclaimBatch {
     reclaimed: Vec<ReclaimedLease>,
     saturated: bool,
+    deferred_accounts: Vec<AccountId>,
 }
 
 impl ReclaimBatch {
@@ -450,7 +451,24 @@ impl ReclaimBatch {
         Ok(ReclaimBatch {
             saturated: reclaimed.len() == limit.get(),
             reclaimed,
+            deferred_accounts: Vec::new(),
         })
+    }
+
+    /// Record that the call left expired leases of `accounts` unsettled because
+    /// other work held those accounts for longer than it would wait.
+    #[must_use]
+    pub fn deferring(mut self, accounts: Vec<AccountId>) -> Self {
+        self.deferred_accounts = accounts;
+        self
+    }
+
+    /// Accounts this call could not lock in time. Their expired leases stay
+    /// active until a later call reaches them. An empty slice does not say that
+    /// every expired lease has been settled.
+    #[must_use]
+    pub fn deferred_accounts(&self) -> &[AccountId] {
+        &self.deferred_accounts
     }
 
     /// The leases this batch settled.
@@ -614,10 +632,14 @@ pub trait LeaseAllocator: Send + Sync {
     /// flushed (INVARIANTS.md GL-9, GL-136). Usage for the lease that arrives
     /// later fits in that loss and converts it into billed usage.
     ///
-    /// One call is one bounded atomic
-    /// transaction; [`ReclaimBatch::is_saturated`] is verified evidence that
-    /// the caller should immediately run another batch. It must be safe to
-    /// run concurrently with everything else.
+    /// One call does a bounded amount of work, in one or more atomic
+    /// transactions that each settle a lease completely or not at all;
+    /// [`ReclaimBatch::is_saturated`] is verified evidence that the caller
+    /// should immediately run another batch. A backend that other work can keep
+    /// from an account bounds its wait, settles the other accounts' leases, and
+    /// names the ones it left in [`ReclaimBatch::deferred_accounts`]. An error
+    /// may follow transactions of the same call that committed. It must be safe
+    /// to run concurrently with everything else.
     async fn reclaim_expired_batch(
         &self,
         now: Timestamp,
@@ -625,6 +647,9 @@ pub trait LeaseAllocator: Send + Sync {
     ) -> Result<ReclaimBatch, StoreError>;
 
     /// Settle every currently expired lease through bounded transactions.
+    /// Leases a batch deferred are not settled, and this return value does not
+    /// say so; call [`reclaim_expired_batch`](Self::reclaim_expired_batch) to
+    /// learn which accounts were left.
     ///
     /// This preserves the original full-drain caller API. If a later batch
     /// fails, earlier batches are already committed, so the returned error
@@ -2260,6 +2285,15 @@ mod tests {
             RolloverBatch::try_new(vec![rolled(1), rolled(2)], NonZeroUsize::new(1).unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_reclaim_batch_names_the_accounts_it_deferred() {
+        let batch = ReclaimBatch::try_new(Vec::new(), NonZeroUsize::new(2).unwrap()).unwrap();
+        assert!(batch.deferred_accounts().is_empty());
+        let deferred = batch.deferring(vec![AccountId(7), AccountId(3)]);
+        assert_eq!(deferred.deferred_accounts(), [AccountId(7), AccountId(3)]);
+        assert!(!deferred.is_saturated());
     }
 
     #[test]

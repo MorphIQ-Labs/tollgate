@@ -5,7 +5,8 @@
 //! `tollgate-store/tests/store_suite.rs` by name) is the proof. Concurrency
 //! control is row-level: `SELECT ... FOR UPDATE` on the account funds
 //! acquire; on the lease it serializes release/ingest/reclaim against each
-//! other. Fencing tokens come from the account row's `next_fence` counter,
+//! other. Rollover, reclaim and ingest bound how long they wait for a row
+//! another session holds (INVARIANTS.md GL-18). Fencing tokens come from the account row's `next_fence` counter,
 //! so allocation is strictly monotonic per account across any number of
 //! servers sharing the database. Each token remains a capability for its own
 //! lease record; the sequence is not an account-wide validity epoch.
@@ -44,7 +45,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgArguments, PgPoolOptions, PgRow};
+use sqlx::query::Query;
 use sqlx::{AssertSqlSafe, PgPool, Postgres, Row, Transaction};
 use tokio::sync::broadcast;
 
@@ -962,19 +964,6 @@ const ACTIVE_LEASE_SUM_SQL: &str =
     "SELECT COALESCE(SUM(granted), 0)::BIGINT, COALESCE(SUM(used), 0)::BIGINT
      FROM tollgate_leases WHERE account_id = $1 AND state = 0";
 
-/// The expiry sweep's selection, named for the same reason as the sum above:
-/// `reclaim_expired_batch` runs it and `explain_reclaim_due_leases` asks the
-/// planner what it does with it. A test that copied the text would keep
-/// reporting an index-ordered walk after the real `ORDER BY` had drifted away
-/// from `tollgate_leases_expiry` — which is exactly the drift GL-65 found.
-///
-/// The `ORDER BY` is the index's own column order, and that is the whole
-/// point. It was `(account_id, lease_id)`, which no index answers, so the
-/// `LIMIT` could not stop an index walk: every batch read and sorted the
-/// entire remaining backlog to return 256 rows, making a drain quadratic in
-/// the backlog it exists to clear (GL-65). Ordering by the expiry pair makes
-/// the `LIMIT` a range stop, and settles oldest-due-first like the reference
-/// backend does.
 /// Takes the account row before an issuance counts against its bound.
 ///
 /// Hoisted so the test that demonstrates the race can drive the *same*
@@ -991,11 +980,66 @@ pub(crate) const LIVE_KEY_COUNT_SQL: &str = "SELECT count(*) FROM tollgate_crede
        AND (not_after_floor_us IS NULL OR not_after_submicro_ns IS NULL
             OR (not_after_floor_us, not_after_submicro_ns) > ($2, $3))";
 
-const RECLAIM_DUE_LEASES_SQL: &str = "SELECT lease_id, account_id, granted, used
-     FROM tollgate_leases
+/// The expiry sweep's selection, named for the same reason as the sum above:
+/// `reclaim_expired_batch` runs it and `explain_reclaim_due_leases` asks the
+/// planner what it does with it. A test that copied the text would keep
+/// reporting an index-ordered walk after the real `ORDER BY` had drifted away
+/// from `tollgate_leases_expiry` — which is exactly the drift GL-65 found.
+///
+/// The `ORDER BY` is the index's own column order, and that is the whole
+/// point. It was `(account_id, lease_id)`, which no index answers, so the
+/// `LIMIT` could not stop an index walk: every batch read and sorted the
+/// entire remaining backlog to return 256 rows, making a drain quadratic in
+/// the backlog it exists to clear (GL-65). Ordering by the expiry pair makes
+/// the `LIMIT` a range stop, and settles oldest-due-first like the reference
+/// backend does.
+///
+/// The join takes each lease's account row in the same statement, so that a
+/// lease behind a held account is passed over before the `LIMIT` counts it.
+const RECLAIM_DUE_LEASES_SQL: &str =
+    "SELECT lease.lease_id, lease.account_id, lease.granted, lease.used
+     FROM tollgate_leases AS lease
+     JOIN tollgate_accounts AS account USING (account_id)
+     WHERE lease.state = 0
+       AND (lease.expires_at_floor_us, lease.expires_at_submicro_ns) <= ($1, $2)
+     ORDER BY lease.expires_at_floor_us, lease.expires_at_submicro_ns
+     LIMIT $3 FOR UPDATE SKIP LOCKED";
+
+/// The accounts of leases still due, oldest first: what the page above left
+/// because something held a row.
+const OVERDUE_LEASE_ACCOUNTS_SQL: &str = "SELECT account_id FROM tollgate_leases
      WHERE state = 0 AND (expires_at_floor_us, expires_at_submicro_ns) <= ($1, $2)
      ORDER BY expires_at_floor_us, expires_at_submicro_ns
+     LIMIT $3";
+
+/// One account's due leases, selected once its row is already locked. Skipping
+/// locked leases means this never waits while the account row is held.
+const ACCOUNT_DUE_LEASES_SQL: &str = "SELECT lease_id, account_id, granted, used
+     FROM tollgate_leases
+     WHERE state = 0 AND (expires_at_floor_us, expires_at_submicro_ns) <= ($1, $2)
+       AND account_id = $4
+     ORDER BY expires_at_floor_us, expires_at_submicro_ns
      LIMIT $3 FOR UPDATE SKIP LOCKED";
+
+/// Which of the given accounts another session holds. Free rows are locked only
+/// for the length of this statement.
+const HELD_ACCOUNTS_SQL: &str = "WITH free AS MATERIALIZED (
+     SELECT account_id FROM tollgate_accounts
+     WHERE account_id = ANY($1) FOR UPDATE SKIP LOCKED
+ )
+ SELECT account_id FROM tollgate_accounts
+ WHERE account_id = ANY($1) AND account_id NOT IN (SELECT account_id FROM free)
+ ORDER BY account_id";
+
+/// Set a timeout for the rest of the transaction to `$2` milliseconds, or keep
+/// the one already in force when that is shorter. `$1` names the setting; zero,
+/// which PostgreSQL reads as disabled, counts as longer than any bound.
+const TIGHTEN_TIMEOUT_SQL: &str = "SELECT set_config($1, LEAST(
+     NULLIF(EXTRACT(EPOCH FROM current_setting($1)::interval) * 1000, 0),
+     $2)::bigint::text, true)";
+
+/// Put the statement timeout back to what the session started with.
+const RESTORE_STATEMENT_TIMEOUT_SQL: &str = "SET LOCAL statement_timeout TO DEFAULT";
 
 /// Cross the boundary for the due accounts that `$selection` picks and locks.
 /// `$period` and `$boundary` are how the statement spells its two values:
@@ -1085,15 +1129,79 @@ const OVERDUE_ACCOUNTS_SQL: &str = "SELECT account_id FROM tollgate_accounts
        AND budget_period = $1 AND period_start_us < $2
      ORDER BY period_start_us LIMIT $3";
 
-/// The longest one queued crossing may take, waiting included.
-const ROLLOVER_ROW_WAIT: Duration = Duration::from_secs(2);
+/// The longest a background pass waits for a row another session holds: one
+/// queued rollover crossing, waiting included; one queued reclaim's account
+/// lock; and each wait ingest makes (INVARIANTS.md GL-18).
+const HELD_ROW_WAIT: Duration = Duration::from_secs(2);
 
-/// The longest one `roll_due_periods` call spends on queued crossings, however
-/// many accounts are held. Below [`PeriodRollerConfig`]'s default call timeout,
-/// and more than one row's wait so that a held account does not take it all.
+/// The longest one `roll_due_periods` or `reclaim_expired_batch` call spends
+/// queueing for held accounts, however many are held. Below
+/// [`PeriodRollerConfig`]'s default call timeout, and more than one row's wait
+/// so that a held account does not take it all.
 ///
 /// [`PeriodRollerConfig`]: https://docs.rs/tollgate-client/latest/tollgate_client/struct.PeriodRollerConfig.html
-const ROLLOVER_QUEUE_BUDGET: Duration = Duration::from_secs(3);
+const QUEUE_BUDGET: Duration = Duration::from_secs(3);
+
+/// How long a store's background passes wait for held rows. Every store has
+/// [`HeldRowWaits::STANDARD`]; only `test_support` sets another, so that a test
+/// which releases a row mid-wait does not race the bound.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HeldRowWaits {
+    /// [`HELD_ROW_WAIT`].
+    pub(crate) row: Duration,
+    /// [`QUEUE_BUDGET`].
+    pub(crate) queue: Duration,
+}
+
+impl HeldRowWaits {
+    const STANDARD: Self = HeldRowWaits {
+        row: HELD_ROW_WAIT,
+        queue: QUEUE_BUDGET,
+    };
+
+    /// How long the next queued row may be waited for: whole milliseconds, and
+    /// `None` once the call's budget is spent, because PostgreSQL reads zero as
+    /// no timeout at all.
+    fn queued(self, deadline: Instant) -> Option<u128> {
+        let wait = self
+            .row
+            .min(deadline.saturating_duration_since(Instant::now()))
+            .as_millis();
+        (wait > 0).then_some(wait)
+    }
+}
+
+/// Bound `setting` for the rest of the transaction by [`TIGHTEN_TIMEOUT_SQL`]'s
+/// rule.
+async fn tighten_timeout(
+    tx: &mut Transaction<'_, Postgres>,
+    setting: &'static str,
+    millis: u128,
+) -> Result<(), sqlx::Error> {
+    let millis = i64::try_from(millis).unwrap_or(i64::MAX);
+    sqlx::query(TIGHTEN_TIMEOUT_SQL)
+        .bind(setting)
+        .bind(millis)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Run a row-locking selection under a statement timeout of at most `wait`,
+/// which bounds all of its waiting together: `lock_timeout`
+/// restarts each time a waiter follows an updated row to its next version.
+async fn lock_rows_bounded(
+    tx: &mut Transaction<'_, Postgres>,
+    selection: Query<'_, Postgres, PgArguments>,
+    wait: Duration,
+) -> Result<Vec<PgRow>, sqlx::Error> {
+    tighten_timeout(tx, "statement_timeout", wait.as_millis()).await?;
+    let rows = selection.fetch_all(&mut **tx).await?;
+    sqlx::query(RESTORE_STATEMENT_TIMEOUT_SQL)
+        .execute(&mut **tx)
+        .await?;
+    Ok(rows)
+}
 
 /// One held account's crossing, queued behind whatever holds its row for at most
 /// `timeout_ms`.
@@ -1141,6 +1249,15 @@ fn gave_up_waiting(error: &sqlx::Error) -> bool {
         .as_database_error()
         .and_then(sqlx::error::DatabaseError::code)
         .is_some_and(|code| code == "57014" || code == "55P03")
+}
+
+/// [`storage`], remembering in `gave_up` whether the error is a wait the
+/// database ended.
+fn noting_waits(gave_up: &mut bool) -> impl FnOnce(sqlx::Error) -> StoreError {
+    |error| {
+        *gave_up |= gave_up_waiting(&error);
+        storage(error)
+    }
 }
 
 fn id_bytes(id: u128) -> Vec<u8> {
@@ -1276,6 +1393,9 @@ pub struct PostgresStore {
     push: broadcast::Sender<SnapshotPush>,
     /// Which held account the next rollover pass queues for first.
     rollover_turn: AtomicUsize,
+    /// Which held account the next reclaim call queues for first.
+    reclaim_turn: AtomicUsize,
+    waits: HeldRowWaits,
 }
 
 /// Connection-pool bounds. Callers that hold background tasks open against
@@ -1360,6 +1480,8 @@ impl PostgresStore {
             policy,
             push,
             rollover_turn: AtomicUsize::new(0),
+            reclaim_turn: AtomicUsize::new(0),
+            waits: HeldRowWaits::STANDARD,
         }))
     }
 
@@ -1922,13 +2044,16 @@ impl LeaseAllocator for PostgresStore {
             return ReclaimBatch::try_new(Vec::new(), limit);
         };
         let cutoff = StoredInstant::from(cutoff);
+        let queue_deadline = Instant::now() + self.waits.queue;
+        // Reclaim only once the grace window past expiry has fully lapsed:
+        // expires_at + grace <= now  iff  expires_at <= now - grace.
+        // Both tuple components preserve the exact timestamp ordering.
+        // The page takes only leases whose own row and account row are both
+        // free, so it never waits and a held account does not fill it. SKIP
+        // LOCKED also lets concurrent sweepers cooperate, and the limit keeps
+        // both the locks and the transaction's row work bounded.
         let mut tx = self.pool.begin().await.map_err(storage)?;
         let result = async {
-            // Reclaim only once the grace window past expiry has fully lapsed:
-            // expires_at + grace <= now  iff  expires_at <= now - grace.
-            // Both tuple components preserve the exact timestamp ordering.
-            // SKIP LOCKED lets concurrent sweepers cooperate; the limit keeps
-            // both the lease locks and the transaction's row work bounded.
             let rows = sqlx::query(RECLAIM_DUE_LEASES_SQL)
                 .bind(cutoff.micros)
                 .bind(cutoff.submicro_nanos)
@@ -1936,115 +2061,263 @@ impl LeaseAllocator for PostgresStore {
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(storage)?;
-
-            // A holder that never released cannot prove any unit unspent, so
-            // nothing is credited: each remainder becomes provisional
-            // settlement loss, which later usage for the lease converts into
-            // billed usage (GL-136). `credited` stays zero so that usage fits.
-            let mut reclaimed = Vec::with_capacity(rows.len());
-            let mut lease_ids = Vec::with_capacity(rows.len());
-            let mut forfeits: std::collections::BTreeMap<Vec<u8>, i64> =
-                std::collections::BTreeMap::new();
-            for row in rows {
-                let lease_bytes: Vec<u8> = row.get(0);
-                let account_bytes: Vec<u8> = row.get(1);
-                let granted = row.get::<i64, _>(2);
-                let used = row.get::<i64, _>(3);
-                // Validate the whole batch before either set-wise UPDATE: a
-                // negative remainder is corruption, and recording it would
-                // shrink the account's loss rather than account for a lease.
-                let forfeited = granted.checked_sub(used).ok_or_else(|| {
-                    StoreError(format!(
-                        "reclaim remainder overflow: granted {granted}, used {used}"
-                    ))
-                })?;
-                let forfeited_units = to_units(forfeited, "reclaim remainder")?;
-                let total = forfeits.entry(account_bytes.clone()).or_default();
-                *total = total
-                    .checked_add(forfeited)
-                    .ok_or_else(|| StoreError("reclaim loss sum overflow".into()))?;
-                lease_ids.push(lease_bytes.clone());
-                reclaimed.push(ReclaimedLease {
-                    lease_id: LeaseId(id_from(&lease_bytes)),
-                    account_id: AccountId(id_from(&account_bytes)),
-                    forfeited: forfeited_units,
-                });
-            }
-
-            let batch = ReclaimBatch::try_new(reclaimed, limit)?;
-            if batch.is_empty() {
-                return Ok(batch);
-            }
-
-            let (account_ids, account_forfeits): (Vec<_>, Vec<_>) = forfeits.into_iter().unzip();
-            let expected_lease_rows = u64::try_from(lease_ids.len())
-                .map_err(|_| StoreError("reclaim lease row count exceeds u64 range".into()))?;
-            let expected_account_rows = u64::try_from(account_ids.len())
-                .map_err(|_| StoreError("reclaim account row count exceeds u64 range".into()))?;
-
-            // A set-wise UPDATE does not promise row-lock order. Lock every
-            // affected account explicitly in byte-sorted order first (the
-            // BTreeMap above), matching release and ingest's lease-then-account
-            // order and preventing concurrent multi-account sweeps from
-            // forming a deadlock cycle.
-            let locked_accounts = sqlx::query(
-                "SELECT account_id FROM tollgate_accounts
-                 WHERE account_id = ANY($1) ORDER BY account_id FOR UPDATE",
-            )
-            .bind(&account_ids)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(storage)?;
-            if locked_accounts.len() != account_ids.len() {
-                return Err(StoreError(format!(
-                    "reclaim locked {} of {} referenced account rows",
-                    locked_accounts.len(),
-                    account_ids.len()
-                )));
-            }
-
-            let updated_leases = sqlx::query(
-                "UPDATE tollgate_leases
-                 SET state = $2, credited = 0
-                 WHERE lease_id = ANY($1) AND state = $3",
-            )
-            .bind(&lease_ids)
-            .bind(STATE_EXPIRED)
-            .bind(STATE_ACTIVE)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
-            if updated_leases.rows_affected() != expected_lease_rows {
-                return Err(StoreError(format!(
-                    "reclaim updated {} of {} locked lease rows",
-                    updated_leases.rows_affected(),
-                    lease_ids.len()
-                )));
-            }
-
-            let updated_accounts = sqlx::query(
-                "UPDATE tollgate_accounts AS account
-                 SET settlement_loss = account.settlement_loss + delta.forfeited
-                 FROM UNNEST($1::bytea[], $2::bigint[]) AS delta(account_id, forfeited)
-                 WHERE account.account_id = delta.account_id",
-            )
-            .bind(&account_ids)
-            .bind(&account_forfeits)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
-            if updated_accounts.rows_affected() != expected_account_rows {
-                return Err(StoreError(format!(
-                    "reclaim updated {} of {} locked account rows",
-                    updated_accounts.rows_affected(),
-                    account_ids.len()
-                )));
-            }
-
-            Ok(batch)
+            settle_expired(&mut tx, rows).await
         }
         .await;
-        finish_transaction(tx, result).await
+        let mut reclaimed = finish_transaction(tx, result).await?;
+        let mut held = Vec::new();
+        if let Err(error) = self
+            .reclaim_queued(cutoff, limit, queue_deadline, &mut reclaimed, &mut held)
+            .await
+        {
+            // Earlier transactions of this call stand, and their report is
+            // replaced by this error, so the error carries the totals.
+            return Err(partial_reclaim(error, &reclaimed));
+        }
+        Ok(ReclaimBatch::try_new(reclaimed, limit)?.deferring(held))
+    }
+}
+
+/// A later transaction's failure, saying what the call had already settled.
+fn partial_reclaim(error: StoreError, settled: &[ReclaimedLease]) -> StoreError {
+    if settled.is_empty() {
+        return error;
+    }
+    let forfeited: u128 = settled
+        .iter()
+        .map(|lease| u128::from(lease.forfeited.get()))
+        .sum();
+    StoreError(format!(
+        "reclaim failed after settling {} leases forfeiting {forfeited} units: {}",
+        settled.len(),
+        error.0
+    ))
+}
+
+/// Settle the expired leases `rows` selected, in the transaction that holds
+/// each of those lease rows and their account rows.
+///
+/// A holder that never released cannot prove any unit unspent, so nothing is
+/// credited: each remainder becomes provisional settlement loss, which later
+/// usage for the lease converts into billed usage (GL-136). `credited` stays
+/// zero so that usage fits.
+async fn settle_expired(
+    tx: &mut Transaction<'_, Postgres>,
+    rows: Vec<PgRow>,
+) -> Result<Vec<ReclaimedLease>, StoreError> {
+    let mut reclaimed = Vec::with_capacity(rows.len());
+    let mut lease_ids = Vec::with_capacity(rows.len());
+    let mut forfeits: std::collections::BTreeMap<Vec<u8>, i64> = std::collections::BTreeMap::new();
+    for row in rows {
+        let lease_bytes: Vec<u8> = row.get(0);
+        let account_bytes: Vec<u8> = row.get(1);
+        let granted = row.get::<i64, _>(2);
+        let used = row.get::<i64, _>(3);
+        // Validate the whole batch before either set-wise UPDATE: a negative
+        // remainder is corruption, and recording it would shrink the
+        // account's loss rather than account for a lease.
+        let forfeited = granted.checked_sub(used).ok_or_else(|| {
+            StoreError(format!(
+                "reclaim remainder overflow: granted {granted}, used {used}"
+            ))
+        })?;
+        let forfeited_units = to_units(forfeited, "reclaim remainder")?;
+        let total = forfeits.entry(account_bytes.clone()).or_default();
+        *total = total
+            .checked_add(forfeited)
+            .ok_or_else(|| StoreError("reclaim loss sum overflow".into()))?;
+        lease_ids.push(lease_bytes.clone());
+        reclaimed.push(ReclaimedLease {
+            lease_id: LeaseId(id_from(&lease_bytes)),
+            account_id: AccountId(id_from(&account_bytes)),
+            forfeited: forfeited_units,
+        });
+    }
+
+    if reclaimed.is_empty() {
+        return Ok(reclaimed);
+    }
+
+    let (account_ids, account_forfeits): (Vec<_>, Vec<_>) = forfeits.into_iter().unzip();
+    let expected_lease_rows = u64::try_from(lease_ids.len())
+        .map_err(|_| StoreError("reclaim lease row count exceeds u64 range".into()))?;
+    let expected_account_rows = u64::try_from(account_ids.len())
+        .map_err(|_| StoreError("reclaim account row count exceeds u64 range".into()))?;
+
+    let updated_leases = sqlx::query(
+        "UPDATE tollgate_leases
+         SET state = $2, credited = 0
+         WHERE lease_id = ANY($1) AND state = $3",
+    )
+    .bind(&lease_ids)
+    .bind(STATE_EXPIRED)
+    .bind(STATE_ACTIVE)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage)?;
+    if updated_leases.rows_affected() != expected_lease_rows {
+        return Err(StoreError(format!(
+            "reclaim updated {} of {} locked lease rows",
+            updated_leases.rows_affected(),
+            lease_ids.len()
+        )));
+    }
+
+    let updated_accounts = sqlx::query(
+        "UPDATE tollgate_accounts AS account
+         SET settlement_loss = account.settlement_loss + delta.forfeited
+         FROM UNNEST($1::bytea[], $2::bigint[]) AS delta(account_id, forfeited)
+         WHERE account.account_id = delta.account_id",
+    )
+    .bind(&account_ids)
+    .bind(&account_forfeits)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage)?;
+    if updated_accounts.rows_affected() != expected_account_rows {
+        return Err(StoreError(format!(
+            "reclaim updated {} of {} locked account rows",
+            updated_accounts.rows_affected(),
+            account_ids.len()
+        )));
+    }
+
+    Ok(reclaimed)
+}
+
+impl PostgresStore {
+    /// Queue for the accounts whose due leases a partial page left, one
+    /// transaction per account, adding what settles to `reclaimed` and the
+    /// accounts that could not be locked in time to `held`.
+    async fn reclaim_queued(
+        &self,
+        cutoff: StoredInstant,
+        limit: NonZeroUsize,
+        queue_deadline: Instant,
+        reclaimed: &mut Vec<ReclaimedLease>,
+        held: &mut Vec<AccountId>,
+    ) -> Result<(), StoreError> {
+        // A full batch has no room for the queue; its caller runs another.
+        if reclaimed.len() == limit.get() {
+            return Ok(());
+        }
+        let limit_i = i64::try_from(limit.get())
+            .map_err(|_| StoreError(format!("reclaim batch limit exceeds i64 range: {limit}")))?;
+        let rows = sqlx::query_scalar::<_, Vec<u8>>(OVERDUE_LEASE_ACCOUNTS_SQL)
+            .bind(cutoff.micros)
+            .bind(cutoff.submicro_nanos)
+            .bind(limit_i)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)?;
+        // Each account once, oldest due lease first.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut overdue: Vec<Vec<u8>> = rows;
+        overdue.retain(|account| seen.insert(account.clone()));
+        if overdue.is_empty() {
+            return Ok(());
+        }
+        // Each call starts one further along, so that a row held for good
+        // cannot always be the one the budget is spent on.
+        let turn = self.reclaim_turn.fetch_add(1, Ordering::Relaxed) % overdue.len();
+        overdue.rotate_left(turn);
+        for account in overdue {
+            let room = limit.get() - reclaimed.len();
+            if room == 0 {
+                break;
+            }
+            let account_id = AccountId(id_from(&account));
+            let Some(wait) = self.waits.queued(queue_deadline) else {
+                held.push(account_id);
+                continue;
+            };
+            match self.reclaim_account(cutoff, &account, room, wait).await? {
+                Some(settled) => reclaimed.extend(settled),
+                None => held.push(account_id),
+            }
+        }
+        Ok(())
+    }
+
+    /// Wait up to `wait_ms` for one account's row, then settle up to `room` of
+    /// its due leases. `None` when the row stayed held, with nothing changed.
+    ///
+    /// The account row is the only one waited for, and nothing is held during
+    /// the wait: the leases are selected afterwards, skipping any that are
+    /// locked. So this takes the two in the opposite order from release and
+    /// ingest and still cannot be part of a deadlock.
+    async fn reclaim_account(
+        &self,
+        cutoff: StoredInstant,
+        account: &[u8],
+        room: usize,
+        wait_ms: u128,
+    ) -> Result<Option<Vec<ReclaimedLease>>, StoreError> {
+        let room = i64::try_from(room)
+            .map_err(|_| StoreError("reclaim batch room exceeds i64 range".into()))?;
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let locked = async {
+            tighten_timeout(&mut tx, "statement_timeout", wait_ms).await?;
+            sqlx::query(ACCOUNT_LOCK_SQL)
+                .bind(account)
+                .fetch_one(&mut *tx)
+                .await?;
+            sqlx::query(RESTORE_STATEMENT_TIMEOUT_SQL)
+                .execute(&mut *tx)
+                .await
+        }
+        .await;
+        match locked {
+            Ok(_) => {}
+            Err(error) if gave_up_waiting(&error) => {
+                tx.rollback().await.map_err(storage)?;
+                return Ok(None);
+            }
+            Err(error) => return finish_transaction(tx, Err(storage(error))).await,
+        }
+        let result = async {
+            let rows = sqlx::query(ACCOUNT_DUE_LEASES_SQL)
+                .bind(cutoff.micros)
+                .bind(cutoff.submicro_nanos)
+                .bind(room)
+                .bind(account)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(storage)?;
+            settle_expired(&mut tx, rows).await
+        }
+        .await;
+        finish_transaction(tx, result).await.map(Some)
+    }
+
+    /// What ingest reports when a wait ran out: which of the batch's accounts
+    /// are held at this moment. The probe skips locked rows, so it never waits,
+    /// and its failure only costs the names.
+    async fn gave_up_ingest(&self, error: IngestError, accounts: &[Vec<u8>]) -> IngestError {
+        let held = sqlx::query_scalar::<_, Vec<u8>>(HELD_ACCOUNTS_SQL)
+            .bind(accounts)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.iter()
+                    .map(|account| AccountId(id_from(account)).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+        let held = match held {
+            Ok(held) if held.is_empty() => "none of its account rows is held now".to_owned(),
+            Ok(held) => format!("held accounts: {held}"),
+            Err(probe) => format!("held accounts unknown: {probe}"),
+        };
+        tracing::warn!(
+            operation = "ingest",
+            %held,
+            "ingest gave up waiting for a row another session holds; nothing was recorded"
+        );
+        IngestError::Unavailable(StoreError(format!(
+            "ingest gave up waiting for a row another session holds, and recorded nothing \
+             ({held}): {error}"
+        )))
     }
 }
 
@@ -2101,15 +2374,24 @@ impl UsageSink for PostgresStore {
             .collect::<Result<_, StoreError>>()?;
 
         let mut tx = self.pool.begin().await.map_err(storage)?;
+        // Set when the database ends one of this transaction's waits.
+        let mut gave_up = false;
         let result: Result<_, IngestError> = async {
+            // No wait in this transaction outlasts `HELD_ROW_WAIT`: for a
+            // lease or account row, a conflicting insert, or the credential
+            // row an activity insert references. While it waits it holds
+            // locks other accounts' work needs, and a pooled connection.
+            tighten_timeout(&mut tx, "lock_timeout", self.waits.row.as_millis())
+                .await
+                .map_err(storage)?;
+
             // Lock every referenced lease in one global account/lease order.
-            // A cycle needs two waiters, and this is the path that waits:
-            // release touches a single lease, and reclaim takes its leases
-            // with SKIP LOCKED, so it abandons a contended row instead of
-            // queueing behind it. Concurrent ingests are therefore what this
-            // order is for -- reclaim selects in expiry order (GL-65) and is
-            // still safe, because the lease-then-account phase order below is
-            // what keeps the two from crossing.
+            // A cycle needs two waiters that each hold a row: release touches
+            // a single lease, and reclaim never waits for a row while holding
+            // one -- its page skips locked rows (GL-65) and its queue takes
+            // an account while holding nothing, then skips locked leases.
+            // Concurrent ingests are therefore what this order is for, with
+            // the lease-then-account phase order below shared with release.
             let lease_ids: Vec<Vec<u8>> = prepared
                 .iter()
                 .filter_map(|event| event.lease_id.clone())
@@ -2125,16 +2407,16 @@ impl UsageSink for PostgresStore {
                 credited: i64,
                 settled: bool,
             }
-            let rows = sqlx::query(
+            let selection = sqlx::query(
                 "SELECT lease_id, account_id, fencing_token, granted, used, credited, state
                  FROM tollgate_leases
                  WHERE lease_id = ANY($1)
                  ORDER BY account_id, lease_id FOR UPDATE",
             )
-            .bind(&lease_ids)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(storage)?;
+            .bind(&lease_ids);
+            let rows = lock_rows_bounded(&mut tx, selection, self.waits.row)
+                .await
+                .map_err(noting_waits(&mut gave_up))?;
             let mut leases: std::collections::BTreeMap<Vec<u8>, LeaseRow> =
                 std::collections::BTreeMap::new();
             for row in rows {
@@ -2415,7 +2697,7 @@ impl UsageSink for PostgresStore {
             .bind(&keys)
             .execute(&mut *tx)
             .await
-            .map_err(storage)?;
+            .map_err(noting_waits(&mut gave_up))?;
             let expected_event_rows = u64::try_from(accepted.len())
                 .map_err(|_| StoreError("accepted event count exceeds u64 range".into()))?;
             if inserted.rows_affected() != expected_event_rows {
@@ -2475,16 +2757,16 @@ impl UsageSink for PostgresStore {
             // account_ids sorted, preserving ingest's lease-then-account
             // order and preventing concurrent multi-account batches from
             // forming a deadlock cycle.
-            let locked_accounts = sqlx::query(
+            let selection = sqlx::query(
                 "SELECT account_id, usage_recorded, settlement_loss, overage_recorded
                  FROM tollgate_accounts
                  WHERE account_id = ANY($1)
                  ORDER BY account_id FOR UPDATE",
             )
-            .bind(&account_ids)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(storage)?;
+            .bind(&account_ids);
+            let locked_accounts = lock_rows_bounded(&mut tx, selection, self.waits.row)
+                .await
+                .map_err(noting_waits(&mut gave_up))?;
             if locked_accounts.len() != account_ids.len() {
                 return Err(IngestError::Unavailable(StoreError(format!(
                     "ingest locked {} of {} referenced account rows",
@@ -2592,7 +2874,8 @@ impl UsageSink for PostgresStore {
                     WHERE activity.last_committed_at_us < EXCLUDED.last_committed_at_us
                     RETURNING key_id
                  ) SELECT COUNT(*) FROM matched"
-            ).bind(&keys).bind(&acct).bind(&at).fetch_one(&mut *tx).await.map_err(storage)?;
+            ).bind(&keys).bind(&acct).bind(&at).fetch_one(&mut *tx).await
+                .map_err(noting_waits(&mut gave_up))?;
             report.unattributed = Some(expected_event_rows.checked_sub(
                 u64::try_from(attributed).map_err(|_| StoreError("negative attribution count".into()))?
             ).ok_or_else(|| StoreError("attribution count exceeds accepted events".into()))?);
@@ -2603,7 +2886,18 @@ impl UsageSink for PostgresStore {
         // Monotonic accounting overflow is a permanent batch refusal. Database
         // and stored-corruption errors remain retryable, and rollback must
         // complete before either outcome becomes observable.
-        finish_transaction(tx, result).await
+        match finish_transaction(tx, result).await {
+            Err(error) if gave_up => {
+                let accounts: Vec<Vec<u8>> = prepared
+                    .iter()
+                    .map(|event| event.account_id.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                Err(self.gave_up_ingest(error, &accounts).await)
+            }
+            outcome => outcome,
+        }
     }
 }
 
@@ -3203,7 +3497,7 @@ impl AdminStore for PostgresStore {
             .map_err(|_| StoreError(format!("rollover batch limit exceeds i64 range: {limit}")))?;
         let mut rolled = Vec::new();
         let mut deferred = 0_usize;
-        let queue_deadline = Instant::now() + ROLLOVER_QUEUE_BUDGET;
+        let queue_deadline = Instant::now() + self.waits.queue;
         // One statement per period kind, because the boundary is a property of
         // the period: a weekly schedule and a monthly one are due at different
         // instants, and a single comparison could only be right for one of
@@ -3270,15 +3564,10 @@ impl AdminStore for PostgresStore {
                 if room == 0 {
                     break;
                 }
-                // Whole milliseconds, and never zero, which PostgreSQL reads
-                // as no timeout at all.
-                let wait = ROLLOVER_ROW_WAIT
-                    .min(queue_deadline.saturating_duration_since(Instant::now()))
-                    .as_millis();
-                if wait == 0 {
+                let Some(wait) = self.waits.queued(queue_deadline) else {
                     deferred += 1;
                     continue;
-                }
+                };
                 let statement = queued_crossing_sql(*period, boundary_us, id_from(&account), wait);
                 // Every result is read, so success is reported only after the
                 // implicit transaction has committed.
@@ -3728,6 +4017,32 @@ mod tests {
     }
 
     /// A readiness probe is evidence that PostgreSQL answered, not merely that
+    #[test]
+    fn a_queued_wait_is_capped_and_ends_with_the_budget() {
+        let waits = HeldRowWaits::STANDARD;
+        assert_eq!(waits.queued(Instant::now()), None);
+        assert_eq!(
+            waits.queued(Instant::now() + Duration::from_secs(3_600)),
+            Some(2_000)
+        );
+        assert_eq!(waits.queue, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_partial_reclaim_failure_carries_what_was_settled() {
+        let failed = || StoreError("postgres: lost".into());
+        assert_eq!(partial_reclaim(failed(), &[]), failed());
+        let lease = |forfeited| ReclaimedLease {
+            lease_id: LeaseId(1),
+            account_id: AccountId(1),
+            forfeited: CostUnits(forfeited),
+        };
+        assert_eq!(
+            partial_reclaim(failed(), &[lease(3), lease(4)]).0,
+            "reclaim failed after settling 2 leases forfeiting 7 units: postgres: lost"
+        );
+    }
+
     /// a store object exists (INVARIANTS.md GL-19).
     #[tokio::test]
     async fn ping_surfaces_a_closed_pool() {
@@ -3741,6 +4056,8 @@ mod tests {
             policy: GrantPolicy::default(),
             push,
             rollover_turn: AtomicUsize::new(0),
+            reclaim_turn: AtomicUsize::new(0),
+            waits: HeldRowWaits::STANDARD,
         };
 
         assert!(store.ping().await.is_err());

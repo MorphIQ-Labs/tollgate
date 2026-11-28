@@ -968,6 +968,41 @@ pub const CATALOG: &[Mutant] = &[
             store_postgres(Target::Test("postgres_suite"), "a_capacity_class_change_pushes_every_republished_principal"),
         ],
     },
+    // ---- Held rows: PostgreSQL ----
+    Mutant {
+        id: "postgres-reclaim-queue",
+        disables: "queueing for an expired lease's held account",
+        file: STORE_POSTGRES_LIB,
+        find: "        if reclaimed.len() == limit.get() {
+            return Ok(());",
+        replace: "        if true {
+            return Ok(());",
+        witnesses: &[
+            store_postgres(Target::Test("postgres_suite"), "a_reclaim_queues_for_an_account_that_other_work_holds"),
+            store_postgres(Target::Test("postgres_suite"), "a_reclaim_defers_a_held_account_and_settles_the_others"),
+        ],
+    },
+    Mutant {
+        id: "postgres-held-queue-budget",
+        disables: "bounding one call's queueing across held accounts",
+        file: STORE_POSTGRES_LIB,
+        find: "const QUEUE_BUDGET: Duration = Duration::from_secs(3);",
+        replace: "const QUEUE_BUDGET: Duration = Duration::from_secs(86_400);",
+        witnesses: &[
+            store_postgres(Target::Test("postgres_suite"), "a_reclaim_bounds_its_waiting_across_held_accounts"),
+        ],
+    },
+    Mutant {
+        id: "postgres-held-row-bound",
+        disables: "ending ingest's wait for a held row",
+        file: STORE_POSTGRES_LIB,
+        find: "const HELD_ROW_WAIT: Duration = Duration::from_secs(2);",
+        replace: "const HELD_ROW_WAIT: Duration = Duration::from_secs(86_400);",
+        witnesses: &[
+            store_postgres(Target::Test("postgres_suite"), "ingest_gives_up_on_a_held_account_and_records_nothing"),
+            store_postgres(Target::Test("postgres_suite"), "ingest_gives_up_on_rows_its_inserts_wait_for"),
+        ],
+    },
     // ---- Example service ----
     Mutant {
         id: "example-republish",

@@ -8813,8 +8813,8 @@ statement.
 - Dropped while acquiring, the connection is closed or never added to the pool.
 - Dropped inside a transaction, the rollback is queued and sent when the
   connection returns. Behind a statement waiting on a lock, it runs after that
-  statement, and the connection stays out of the pool until then: apart from a
-  queued rollover crossing, the store sets no `statement_timeout`.
+  statement, and the connection stays out of the pool until then. The store
+  bounds that wait in rollover, reclaim and ingest only (GH-109).
 - A queued crossing has no client-side transaction to abandon. Dropped while it
   waits, it still commits if it gets its row in time. If its timeout ends it
   first, the connection reads that error on return and is closed.
@@ -8913,3 +8913,72 @@ and a newer instance together.
 **Siblings searched.** The crate takes no other advisory lock, and 0005 is the
 only `no-transaction` migration. The migration suites' own serialization stays:
 they drive sqlx's migrator directly, with its waiting acquisition.
+
+## A held row parked reclaim and ingest (GH-109, 2026-11-28)
+
+Reclaim selected expired leases with `SKIP LOCKED` and then waited for their
+account rows with no timeout. Ingest waited the same way for lease rows, account
+rows and the rows its inserts conflict with or reference. One session keeping an
+account row parked the server's maintenance task, rollover behind it, and every
+ingest that touched the account, each holding a pooled connection and the lease
+locks of the other accounts in its transaction.
+
+**Why nothing caught it.** The rule that background work is wall-clock bounded
+(18) was witnessed against the client tasks, which wrap every call in a
+deadline. The server calls the store with none. The first witness that held an
+account row was written for rollover (GH-80), bounded that pass alone, and
+recorded the other waits as unchanged instead of treating them as the same
+defect.
+
+**Reclaim** follows the rollover's shape. The page locks lease and account rows
+in one `SKIP LOCKED` selection, so a held account is passed over before the
+`LIMIT` counts it; skipping after the limit would let a held account's old
+leases fill every page. A partial page is followed by one transaction per
+account with leases still due, which waits for the account row under the same
+two-second and three-second bounds as a rollover crossing, with the same
+rotation. That transaction takes the account first and then its leases with
+`SKIP LOCKED`, so nothing is held while it waits and the reversed order cannot
+close a cycle. A client-side transaction is safe to abandon since sqlx 0.9.1
+(GH-101). `SKIP LOCKED` alone was not taken: an exhausted account's row is held
+almost continuously (GH-80). The plan stays an ordered walk of the expiry index
+with an account lookup per row, which the GL-65 witness still checks.
+
+A call can now commit more than one transaction, which
+`LeaseAllocator::reclaim_expired_batch` states. `ReclaimBatch` gained
+`deferred_accounts`, naming the accounts rather than counting them, because the
+account is what an operator has to find.
+
+**Ingest** keeps its contract: a batch is applied whole or not at all, so it
+refuses the batch instead of waiting. `lock_timeout` covers every wait in the
+transaction, including those inside inserts; the two row-locking selections also
+run under `statement_timeout`, which bounds all of a selection's waiting where
+`lock_timeout` restarts per row version. The writes keep the session's own
+statement timeout, so a large batch on a slow database is not cut off by a bound
+meant for waiting. The accounts are named by a probe after the rollback.
+
+**Witnessing a bound without racing it.** A test that releases a held row while
+a call waits for it would fail on a host too busy to act within two seconds. It
+lengthens that store's waits through `test_support`, which no production build
+enables; the tests of the bounds themselves keep the shipped values and only
+require the call to return and the report to be right.
+
+**Not taken: recording part of a batch.** Letting the free accounts' events
+commit while the held account's wait needs an acknowledgement that says which
+events were deferred: `IngestReport` partitions a batch into accepted,
+duplicate and rejected, and the writer releases its whole batch on that answer.
+Committing the others and then returning an error would make the replay report
+billed events as duplicates, which the writer counts and an operator reads.
+Per-event deferral changes the sink contract, the wire response and the writer's
+queue, and needs its own design.
+
+**Compatibility.** No schema or wire change. `ReclaimBatch` adds methods. An
+ingest that previously waited longer than two seconds for a row now returns a
+retryable error, including behind a legitimate transaction that long; a shorter
+configured timeout behaves as before.
+
+**Siblings searched.** Every row lock the crate takes: rollover was already
+bounded (GH-80). Acquire, release, consolidate, deposit, account, budget, status,
+class, credential and snapshot writes still wait without a bound of their own.
+Each serves one caller's request and its failure changes that caller's contract,
+so bounding them is a policy for the whole store rather than for background
+work; until then `lock_timeout` in the connection URL bounds them.
