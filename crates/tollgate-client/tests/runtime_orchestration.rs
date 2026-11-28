@@ -16,6 +16,9 @@ use tollgate_core::{
 };
 #[path = "../../tollgate-store/tests/support/delegating.rs"]
 mod delegating;
+#[path = "../../tollgate-store/tests/support/pull_only.rs"]
+mod pull_only;
+use pull_only::{PullOnly, pull_only};
 #[path = "../../tollgate-core/tests/support/isolated.rs"]
 mod isolated;
 use delegating::{DelegatingStore, RejectingStore, rejecting};
@@ -624,31 +627,25 @@ async fn a_refresh_outage_preserves_a_fresh_accounts_manager() {
     assert_eq!(runtime.shutdown().await.unwrap().usage.unwrap().accepted, 1);
 }
 
-/// A source with a controllable catalogue and, deliberately, no pushes: the
-/// dead receiver is what isolates the enumeration path this test measures, so
-/// `subscribe` is overridden rather than delegated.
+/// A source with a controllable catalogue and, deliberately, no pushes, which
+/// is what isolates the enumeration path this test measures.
 fn catalogue_source(
     store: &Arc<MemoryStore>,
     visible: &Arc<AtomicBool>,
-) -> Arc<DelegatingStore<MemoryStore>> {
+) -> Arc<PullOnly<DelegatingStore<MemoryStore>>> {
     let visible = Arc::clone(visible);
-    Arc::new(
-        DelegatingStore::wrapping(Arc::clone(store))
-            .on_subscribe(|_| {
-                let (_, rx) = tokio::sync::broadcast::channel(1);
-                rx
-            })
-            .on_principals(move |_| {
-                let visible = Arc::clone(&visible);
-                async move {
-                    Ok(Some(if visible.load(Ordering::Acquire) {
-                        vec![Principal(11)]
-                    } else {
-                        vec![]
-                    }))
-                }
-            }),
-    )
+    pull_only(Arc::new(
+        DelegatingStore::wrapping(Arc::clone(store)).on_principals(move |_| {
+            let visible = Arc::clone(&visible);
+            async move {
+                Ok(Some(if visible.load(Ordering::Acquire) {
+                    vec![Principal(11)]
+                } else {
+                    vec![]
+                }))
+            }
+        }),
+    ))
 }
 
 #[tokio::test(start_paused = true)]
@@ -803,6 +800,67 @@ async fn an_accounting_integrity_fault_stops_the_instance_without_restart() {
     assert_eq!(handle.report().manager_restarts, 0);
     assert!(runtime.shutdown().await.unwrap().background_failed);
     assert!(!handle.readiness(t(100)).background_healthy);
+}
+
+/// A snapshot task that dies takes the instance out of service: the supervisor
+/// notices and stops the whole runtime, closing admission's usage queue, rather
+/// than leaving it to spend leases on snapshots nothing refreshes.
+#[tokio::test(start_paused = true)]
+async fn a_dead_snapshot_task_stops_the_runtime() {
+    let store = store();
+    account(&store, 1, 1_000);
+    publish(&store, 11, 1, 1, EnforcementMode::Strict);
+    let die = Arc::new(AtomicBool::new(false));
+    let source = {
+        let die = Arc::clone(&die);
+        Arc::new(
+            DelegatingStore::wrapping(Arc::clone(&store)).on_principals(move |inner| {
+                assert!(!die.load(Ordering::Acquire), "injected snapshot task death");
+                async move { tollgate_store::SnapshotSource::principals(&*inner).await }
+            }),
+        )
+    };
+    let (runtime, handle) = InstanceRuntime::spawn(
+        source,
+        store.clone(),
+        store.clone(),
+        Arc::new(ManualClock::new(t(100))),
+        config(),
+    )
+    .unwrap();
+    wait(|| handle.readiness(t(100)).is_ready()).await;
+    die.store(true, Ordering::Release);
+    wait(|| handle.recorder().is_closed()).await;
+    assert!(!handle.readiness(t(100)).background_healthy);
+    assert!(runtime.shutdown().await.unwrap().background_failed);
+}
+
+/// A usage writer that dies stops the runtime too, which hands the unspent
+/// units back without waiting for anyone to call shutdown.
+#[tokio::test(start_paused = true)]
+async fn a_dead_usage_writer_stops_the_runtime_and_releases_its_leases() {
+    let store = store();
+    account(&store, 1, 1_000);
+    publish(&store, 11, 1, 1, EnforcementMode::Strict);
+    let sink = Arc::new(
+        DelegatingStore::wrapping(Arc::clone(&store)).on_ingest(|_, _, _| async {
+            panic!("injected usage writer death");
+        }),
+    );
+    let (runtime, handle) = InstanceRuntime::spawn(
+        store.clone(),
+        store.clone(),
+        sink,
+        Arc::new(ManualClock::new(t(100))),
+        config(),
+    )
+    .unwrap();
+    wait(|| handle.readiness(t(100)).is_ready()).await;
+    assert_eq!(store.balance(AccountId(1)), CostUnits(500));
+    charge(&handle, 11, 1, 7);
+    wait(|| store.balance(AccountId(1)) == CostUnits(993)).await;
+    assert!(!handle.readiness(t(100)).background_healthy);
+    assert!(runtime.shutdown().await.unwrap().background_failed);
 }
 
 #[tokio::test(start_paused = true)]

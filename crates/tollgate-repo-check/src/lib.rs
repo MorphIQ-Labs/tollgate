@@ -10,6 +10,7 @@ pub mod lean_mutants;
 pub mod parity;
 pub mod required_checks;
 pub mod seam;
+pub mod witness_mutants;
 
 use proc_macro2::{TokenStream, TokenTree};
 use std::{

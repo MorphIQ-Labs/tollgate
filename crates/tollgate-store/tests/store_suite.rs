@@ -1469,7 +1469,9 @@ async fn snapshot_publish_fetch_and_push() {
         panic!("published snapshot must be present");
     };
     assert_eq!(fetched.generation, Generation(3));
-    let pushed = updates.recv().await.unwrap();
+    // A push is sent before the call that caused it returns, so a missing one
+    // fails here rather than waiting for it.
+    let pushed = updates.try_recv().expect("a publication is pushed");
     assert_eq!(pushed.principal, principal);
     let SnapshotResolution::Present(pushed) = pushed.resolution else {
         panic!("publish push must be present");
@@ -1498,7 +1500,7 @@ async fn snapshot_publish_fetch_and_push() {
     AdminStore::remove_snapshot(&*store, principal)
         .await
         .unwrap();
-    let removed = updates.recv().await.unwrap();
+    let removed = updates.try_recv().expect("a removal is pushed");
     assert!(matches!(
         removed.resolution,
         SnapshotResolution::Revoked {
@@ -2253,6 +2255,50 @@ async fn a_status_change_pushes_every_republished_principal() {
             panic!("a status change republishes; it never revokes");
         };
         assert_eq!(snapshot.status, AccountStatus::Suspended);
+        pushed.push(push.principal);
+    }
+    assert_eq!(
+        pushed,
+        vec![first, second],
+        "one push per live principal, ordered, and none for the tombstone"
+    );
+}
+
+/// A class change pushes as a status change does, so an in-process instance
+/// applies the new class without waiting for its refresh (INVARIANTS.md GL-22).
+#[tokio::test]
+async fn a_capacity_class_change_pushes_every_republished_principal() {
+    let store = store_with_balance(GrantPolicy::default(), 1_000).await;
+    let first = Principal(10);
+    let second = Principal(11);
+    let revoked = Principal(12);
+    for principal in [first, second, revoked] {
+        AdminStore::publish_snapshot(
+            &*store,
+            principal,
+            publishable(Arc::new(account_snapshot(
+                ACCOUNT,
+                3,
+                AccountStatus::Active,
+            ))),
+        )
+        .await
+        .unwrap();
+    }
+    AdminStore::remove_snapshot(&*store, revoked).await.unwrap();
+
+    let mut updates = store.subscribe();
+    let change = AdminStore::set_capacity_class(&*store, ACCOUNT, CapacityClass::BestEffort)
+        .await
+        .unwrap();
+    assert_eq!(change.outcome.republished, 2);
+
+    let mut pushed = Vec::new();
+    while let Ok(push) = updates.try_recv() {
+        let SnapshotResolution::Present(snapshot) = push.resolution else {
+            panic!("a class change republishes; it never revokes");
+        };
+        assert_eq!(snapshot.capacity_class, CapacityClass::BestEffort);
         pushed.push(push.principal);
     }
     assert_eq!(

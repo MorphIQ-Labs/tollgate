@@ -8773,3 +8773,30 @@ Compatibility: `SnapshotResolution` gains a variant, which breaks exhaustive
 matches in embedder code and custom sources must decide whether to produce it.
 `SnapshotStats` gains `unreadable_snapshots`. No request-path, threshold or
 migration changes.
+
+## The witness-mutant gate (GH-103, 2026-11-28)
+
+The GH-83 method became a gate. A catalogue names, for each background
+mechanism, one source edit that disables it and the tests that must then fail.
+The catalogue is Rust data in `tollgate-repo-check`, so an entry is typed and a
+multi-line pattern needs no parser of its own. The runner copies the repository
+under `target/` and edits the copy, so an interrupted run leaves nothing behind
+in the working tree.
+
+A mutant counts only as a witness that ran and failed. A compile error, a crash,
+a hang past the bound and a filter that matched no test are all failures of the
+gate: each would otherwise read as a test biting. The baseline requires every
+witness to pass unmodified for the same reason, and the PostgreSQL witnesses
+require a database because their suite passes by skipping without one.
+
+Building the catalogue found mechanisms nothing witnessed: abandoning a hung
+ingest while the writer runs, the writer's retry backoff, waking to withdraw
+readiness between two refreshes, the runtime stopping when its snapshot task or
+usage writer dies, and the memory store's push of a capacity class change. Some
+push tests also waited without bound for a push that is sent before the call
+returns, so a missing one hung them instead of failing.
+
+The catalogue is the limit of the claim. Nothing derives the list of mechanisms
+from the code: a new `select!` arm with no entry passes the gate. Counting arms
+or spawns would assert source text and would miss a mechanism that is neither,
+so adding the entry stays a review obligation.

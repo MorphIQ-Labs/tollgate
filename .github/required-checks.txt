@@ -23,4 +23,5 @@ test / test-e2e
 test / bench-compile
 test / load-failure-reporting
 assurance / formal
+assurance / witness-mutants
 assurance / mutation

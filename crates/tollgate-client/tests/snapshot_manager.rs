@@ -36,6 +36,9 @@ use tollgate_store::{
 #[path = "support/snapshot_source.rs"]
 mod snapshot_source;
 use snapshot_source::DrivenPushSource;
+#[path = "../../tollgate-store/tests/support/pull_only.rs"]
+mod pull_only;
+use pull_only::{PullOnly, pull_only};
 
 const ACCOUNT: AccountId = AccountId(1);
 const PRINCIPAL: Principal = Principal(7);
@@ -315,12 +318,6 @@ fn push_only_config() -> SnapshotManagerConfig {
     }
 }
 
-/// A `MemoryStore` whose push stream is closed, as it is over HTTP: whatever an
-/// instance learns after its initial load, its own pulls fetched.
-fn pull_only(store: &Arc<MemoryStore>) -> Arc<DelegatingStore<MemoryStore>> {
-    Arc::new(DelegatingStore::wrapping(Arc::clone(store)).on_subscribe(|_| no_pushes()))
-}
-
 /// One instance of a pull-only deployment, serving two principals of
 /// [`ACCOUNT`] and one of [`OTHER_ACCOUNT`] from `clock`.
 fn pulling_instance(store: &Arc<MemoryStore>, clock: &Arc<ManualClock>) -> Fixture {
@@ -328,7 +325,7 @@ fn pulling_instance(store: &Arc<MemoryStore>, clock: &Arc<ManualClock>) -> Fixtu
     let engine = AdmissionEngine::new(Arc::clone(&map));
     let slots = SlotRegistry::new();
     let manager = SnapshotManager::spawn(
-        pull_only(store),
+        pull_only(Arc::clone(store)),
         map,
         Arc::clone(&slots),
         clock.clone(),
@@ -473,19 +470,17 @@ async fn a_failed_pull_keeps_the_held_snapshot_until_it_expires() {
     let failing = Arc::new(AtomicBool::new(false));
     let source = {
         let failing = Arc::clone(&failing);
-        Arc::new(
-            DelegatingStore::wrapping(Arc::clone(&store))
-                .on_subscribe(|_| no_pushes())
-                .on_snapshot(move |inner, principal| {
-                    let fails = principal == PRINCIPAL && failing.load(Ordering::Acquire);
-                    async move {
-                        if fails {
-                            return Err(StoreError("source unreachable".into()));
-                        }
-                        SnapshotSource::snapshot(&*inner, principal).await
+        pull_only(Arc::new(
+            DelegatingStore::wrapping(Arc::clone(&store)).on_snapshot(move |inner, principal| {
+                let fails = principal == PRINCIPAL && failing.load(Ordering::Acquire);
+                async move {
+                    if fails {
+                        return Err(StoreError("source unreachable".into()));
                     }
-                }),
-        )
+                    SnapshotSource::snapshot(&*inner, principal).await
+                }
+            }),
+        ))
     };
     let fixture = spawn_with(
         source,
@@ -535,26 +530,24 @@ async fn a_failed_pull_keeps_the_held_snapshot_until_it_expires() {
 fn damaged_source(
     store: &Arc<MemoryStore>,
     unreadable: &Arc<AtomicBool>,
-) -> Arc<DelegatingStore<MemoryStore>> {
+) -> Arc<PullOnly<DelegatingStore<MemoryStore>>> {
     let unreadable = Arc::clone(unreadable);
-    Arc::new(
-        DelegatingStore::wrapping(Arc::clone(store))
-            .on_subscribe(|_| no_pushes())
-            .on_snapshot(move |inner, principal| {
-                let damaged = principal == PRINCIPAL && unreadable.load(Ordering::Acquire);
-                async move {
-                    let stored = SnapshotSource::snapshot(&*inner, principal).await?;
-                    Ok(match stored {
-                        SnapshotResolution::Present(snapshot) if damaged => {
-                            SnapshotResolution::Unreadable {
-                                generation: snapshot.generation,
-                            }
+    pull_only(Arc::new(
+        DelegatingStore::wrapping(Arc::clone(store)).on_snapshot(move |inner, principal| {
+            let damaged = principal == PRINCIPAL && unreadable.load(Ordering::Acquire);
+            async move {
+                let stored = SnapshotSource::snapshot(&*inner, principal).await?;
+                Ok(match stored {
+                    SnapshotResolution::Present(snapshot) if damaged => {
+                        SnapshotResolution::Unreadable {
+                            generation: snapshot.generation,
                         }
-                        other => other,
-                    })
-                }
-            }),
-    )
+                    }
+                    other => other,
+                })
+            }
+        }),
+    ))
 }
 
 /// A status change that restamps a row no instance can read still reaches every
@@ -862,25 +855,18 @@ enum MutableMode {
     Failing,
 }
 
-/// A receiver that never yields a push: the sender is dropped immediately.
-///
-/// Nine fixtures in this file wrote this out; it is one function now.
-fn no_pushes() -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-    let (sender, receiver) = tokio::sync::broadcast::channel(1);
-    drop(sender);
-    receiver
-}
+/// A scripted source with its push stream closed: [`PullOnly`] owns that, so
+/// no hook on the double can open it.
+type PulledSource = PullOnly<DelegatingStore<RejectingStore>>;
 
-/// The shape most fixtures here have: no pushes and no catalogue.
+/// The shape most fixtures here have: no catalogue. Wrap it in [`pull_only`].
 ///
-/// Both answers are *stated*. `principals` has a default body -- the `Ok(None)`
+/// The answer is *stated*. `principals` has a default body -- the `Ok(None)`
 /// sentinel -- and these doubles used to get it by omission, which is the same
 /// silence that made wrappers elsewhere lie about a catalogue they did have
 /// (GL-83). Saying it is the difference between the two.
 fn bare_source(reason: &'static str) -> DelegatingStore<RejectingStore> {
-    rejecting(reason)
-        .on_subscribe(|_| no_pushes())
-        .on_principals(|_| async { Ok(None) })
+    rejecting(reason).on_principals(|_| async { Ok(None) })
 }
 
 /// A source whose answer the test rewrites between passes.
@@ -891,7 +877,7 @@ struct MutableNoPushSource {
 
 impl MutableNoPushSource {
     /// The handle and the source to hand [`SnapshotManager::spawn`].
-    fn new() -> (Arc<Self>, Arc<DelegatingStore<RejectingStore>>) {
+    fn new() -> (Arc<Self>, Arc<PulledSource>) {
         let source = Arc::new(Self {
             mode: Mutex::new(MutableMode::Unknown),
             calls: AtomicUsize::new(0),
@@ -899,7 +885,7 @@ impl MutableNoPushSource {
         let pulls = Arc::clone(&source);
         (
             source,
-            Arc::new(
+            pull_only(Arc::new(
                 bare_source("a mutable fixture answers snapshots and nothing else").on_snapshot(
                     move |_, _principal| {
                         let source = Arc::clone(&pulls);
@@ -920,7 +906,7 @@ impl MutableNoPushSource {
                         }
                     },
                 ),
-            ),
+            )),
         )
     }
 
@@ -1024,6 +1010,36 @@ impl ToggleSource {
             ),
         )
     }
+}
+
+/// Readiness falls when a resolution lapses, not at the next scheduled pull:
+/// the manager wakes at the deadline itself. The refresh interval here is far
+/// beyond the test, so no tick can explain the transition (INVARIANTS.md GL-10).
+#[tokio::test(start_paused = true)]
+async fn readiness_falls_at_expiry_between_refreshes() {
+    let store = two_account_store();
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let map = Arc::new(ArcSwapSnapshotMap::new());
+    let manager = SnapshotManager::spawn(
+        pull_only(store),
+        map,
+        SlotRegistry::new(),
+        clock.clone(),
+        SnapshotManagerConfig {
+            principals: TrackedPrincipals::Fixed(vec![PRINCIPAL]),
+            ..discovering_config(1_000_000_000)
+        },
+    )
+    .unwrap();
+    let ready = manager.ready();
+    settle().await;
+    assert!(*ready.borrow());
+
+    // The fixture's snapshots are valid until second 100,000.
+    clock.set(t(100_000));
+    tokio::time::sleep(std::time::Duration::from_secs(100_001)).await;
+    assert!(!*ready.borrow());
+    manager.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -1419,7 +1435,7 @@ async fn a_principal_published_after_start_is_discovered_and_served() {
         .publish_snapshot(PRINCIPAL, publishable(snapshot(1, PermissionBits::bit(0))))
         .expect("snapshot fixture matches its account and credential");
     // No pushes: only the periodic enumeration can reveal the new principal.
-    let fixture = spawn_with(pull_only(&store), discovering_config(20));
+    let fixture = spawn_with(pull_only(Arc::clone(&store)), discovering_config(20));
     stock_slot(&fixture);
     settle().await;
     assert_eq!(admit_as(&fixture, PRINCIPAL), Ok(()));
@@ -1546,8 +1562,8 @@ async fn a_revoked_principal_stays_tracked_and_cannot_be_resurrected() {
 /// injects.
 /// Answers for one principal and permanently refuses the other, while
 /// enumerating both.
-fn one_unanswerable_source(good: Arc<AccountSnapshot>) -> Arc<DelegatingStore<RejectingStore>> {
-    Arc::new(
+fn one_unanswerable_source(good: Arc<AccountSnapshot>) -> Arc<PulledSource> {
+    pull_only(Arc::new(
         rejecting("an unanswerable fixture answers snapshots and enumeration")
             .on_snapshot(move |_, principal| {
                 let good = Arc::clone(&good);
@@ -1559,9 +1575,8 @@ fn one_unanswerable_source(good: Arc<AccountSnapshot>) -> Arc<DelegatingStore<Re
                     }
                 }
             })
-            .on_subscribe(|_| no_pushes())
             .on_principals(|_| async { Ok(Some(vec![PRINCIPAL, LATER_PRINCIPAL])) }),
-    )
+    ))
 }
 
 /// Readiness under `All` means "I can serve someone", not "I can serve
@@ -1639,7 +1654,8 @@ impl SnapshotSource for NoCatalogue {
     }
 
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SnapshotPush> {
-        no_pushes()
+        // Closed: the sender is dropped here.
+        tokio::sync::broadcast::channel(1).1
     }
 }
 
@@ -1647,15 +1663,14 @@ impl SnapshotSource for NoCatalogue {
 fn failing_catalogue_source(
     snapshot: Arc<AccountSnapshot>,
     failures: &Arc<AtomicUsize>,
-) -> Arc<DelegatingStore<RejectingStore>> {
+) -> Arc<PulledSource> {
     let failures = Arc::clone(failures);
-    Arc::new(
+    pull_only(Arc::new(
         rejecting("a failing-catalogue fixture answers snapshots and enumeration")
             .on_snapshot(move |_, _principal| {
                 let snapshot = Arc::clone(&snapshot);
                 async move { Ok(SnapshotResolution::Present(publishable(snapshot))) }
             })
-            .on_subscribe(|_| no_pushes())
             .on_principals(move |_| {
                 let failures = Arc::clone(&failures);
                 async move {
@@ -1663,22 +1678,19 @@ fn failing_catalogue_source(
                     Err(StoreError("injected catalogue outage".into()))
                 }
             }),
-    )
+    ))
 }
 
 /// A source that answers snapshots but never answers enumeration.
-fn hanging_catalogue_source(
-    snapshot: Arc<AccountSnapshot>,
-) -> Arc<DelegatingStore<RejectingStore>> {
-    Arc::new(
+fn hanging_catalogue_source(snapshot: Arc<AccountSnapshot>) -> Arc<PulledSource> {
+    pull_only(Arc::new(
         rejecting("a hanging-catalogue fixture answers snapshots and enumeration")
             .on_snapshot(move |_, _principal| {
                 let snapshot = Arc::clone(&snapshot);
                 async move { Ok(SnapshotResolution::Present(publishable(snapshot))) }
             })
-            .on_subscribe(|_| no_pushes())
             .on_principals(|_| async { std::future::pending().await }),
-    )
+    ))
 }
 
 /// A source whose enumeration hangs until released, and which answers
@@ -1687,15 +1699,14 @@ fn hangs_on_enumeration_source(
     snapshot: Arc<AccountSnapshot>,
     release: &Arc<tokio::sync::Notify>,
     enumerations: &Arc<AtomicUsize>,
-) -> Arc<DelegatingStore<RejectingStore>> {
+) -> Arc<PulledSource> {
     let (release, enumerations) = (Arc::clone(release), Arc::clone(enumerations));
-    Arc::new(
+    pull_only(Arc::new(
         rejecting("an enumeration-hang fixture answers snapshots and enumeration")
             .on_snapshot(move |_, _principal| {
                 let snapshot = Arc::clone(&snapshot);
                 async move { Ok(SnapshotResolution::Present(publishable(snapshot))) }
             })
-            .on_subscribe(|_| no_pushes())
             .on_principals(move |_| {
                 let (release, enumerations) = (Arc::clone(&release), Arc::clone(&enumerations));
                 async move {
@@ -1704,7 +1715,7 @@ fn hangs_on_enumeration_source(
                     Ok(Some(vec![PRINCIPAL]))
                 }
             }),
-    )
+    ))
 }
 
 /// Issue GL-59: an enumeration that never answers is abandoned at
@@ -1822,9 +1833,9 @@ fn hangs_on_one_source(
     hung: Principal,
     release: &Arc<tokio::sync::Notify>,
     answered: &Arc<AtomicUsize>,
-) -> Arc<DelegatingStore<RejectingStore>> {
+) -> Arc<PulledSource> {
     let (release, answered) = (Arc::clone(release), Arc::clone(answered));
-    Arc::new(
+    pull_only(Arc::new(
         bare_source("a one-hang fixture answers snapshots and nothing else").on_snapshot(
             move |_, principal| {
                 let (snapshot, release, answered) = (
@@ -1841,7 +1852,7 @@ fn hangs_on_one_source(
                 }
             },
         ),
-    )
+    ))
 }
 
 /// Issue GL-103: a fetch that never resolves is abandoned at `fetch_timeout`,
@@ -1918,9 +1929,9 @@ async fn a_hung_fetch_is_abandoned_so_the_sweep_keeps_running() {
 /// Answers `Unknown` once — putting the principal into a negative resolution
 /// with a live refetch deadline — and hangs on every fetch after that.
 /// Answers `Unknown` once, then never answers again.
-fn unknown_then_hangs_source(calls: &Arc<AtomicUsize>) -> Arc<DelegatingStore<RejectingStore>> {
+fn unknown_then_hangs_source(calls: &Arc<AtomicUsize>) -> Arc<PulledSource> {
     let calls = Arc::clone(calls);
-    Arc::new(
+    pull_only(Arc::new(
         bare_source("an unknown-then-hangs fixture answers snapshots and nothing else")
             .on_snapshot(move |_, _principal| {
                 let calls = Arc::clone(&calls);
@@ -1931,7 +1942,7 @@ fn unknown_then_hangs_source(calls: &Arc<AtomicUsize>) -> Arc<DelegatingStore<Re
                     std::future::pending().await
                 }
             }),
-    )
+    ))
 }
 
 /// Issue GL-103 meets issue GL-53: an abandoned fetch must land in the failed set
@@ -2123,14 +2134,13 @@ async fn a_push_discovers_the_principal_it_names() {
 #[tokio::test(start_paused = true)]
 async fn a_discovering_instance_with_nothing_resolvable_is_unready() {
     let fixture = spawn_with(
-        Arc::new(
+        pull_only(Arc::new(
             rejecting("an all-fail fixture answers snapshots and enumeration")
                 .on_snapshot(|_, _principal| async {
                     Err(StoreError("injected total source outage".into()))
                 })
-                .on_subscribe(|_| no_pushes())
                 .on_principals(|_| async { Ok(Some(vec![PRINCIPAL, LATER_PRINCIPAL])) }),
-        ),
+        )),
         discovering_config(20),
     );
     stock_slot(&fixture);
@@ -2156,7 +2166,7 @@ struct CountingSource {
 
 impl CountingSource {
     /// The handle and the source to hand [`SnapshotManager::spawn`].
-    fn new() -> (Arc<Self>, Arc<DelegatingStore<RejectingStore>>) {
+    fn new() -> (Arc<Self>, Arc<PulledSource>) {
         let source = Arc::new(CountingSource {
             revoked: AtomicBool::new(false),
             live_calls: AtomicUsize::new(0),
@@ -2166,7 +2176,7 @@ impl CountingSource {
         let pulls = Arc::clone(&source);
         (
             source,
-            Arc::new(
+            pull_only(Arc::new(
                 rejecting("a counting fixture answers snapshots and enumeration")
                     .on_snapshot(move |_, principal| {
                         let (source, snapshot) = (Arc::clone(&pulls), Arc::clone(&snapshot));
@@ -2188,9 +2198,8 @@ impl CountingSource {
                             }
                         }
                     })
-                    .on_subscribe(|_| no_pushes())
                     .on_principals(|_| async { Ok(Some(vec![PRINCIPAL, LATER_PRINCIPAL])) }),
-            ),
+            )),
         )
     }
 }

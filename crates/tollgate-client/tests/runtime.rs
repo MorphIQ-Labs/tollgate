@@ -958,6 +958,103 @@ async fn writer_retries_through_outage_without_losing_events() {
     assert_eq!(stats.lost, 0);
 }
 
+/// INVARIANTS.md GL-18: a sink call that never answers is abandoned at
+/// `ingest_timeout` while the writer runs, and the same batch is delivered once
+/// the sink answers again. The final flush bounds its calls separately, so the
+/// delivery is asserted before shutdown.
+#[tokio::test(start_paused = true)]
+async fn a_hung_ingest_is_abandoned_and_delivered_while_the_writer_runs() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap()
+        .grant;
+    let hung = Arc::new(AtomicU32::new(1));
+    let sink = {
+        let hung = Arc::clone(&hung);
+        Arc::new(DelegatingStore::wrapping(Arc::clone(&store)).on_ingest(
+            move |inner, events, now| {
+                let hung = Arc::clone(&hung);
+                async move {
+                    if hung
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                        .is_ok()
+                    {
+                        return std::future::pending().await;
+                    }
+                    inner.ingest(&events, now).await
+                }
+            },
+        ))
+    };
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let config = UsageWriterConfig {
+        ingest_timeout: std::time::Duration::from_millis(100),
+        ..writer_config(64)
+    };
+    let (recorder, writer) = UsageWriter::spawn(sink, clock, config).unwrap();
+
+    recorder.try_reserve().unwrap().record(event(1, 25, &lease));
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    assert_eq!(hung.load(Ordering::Acquire), 0, "the first call hung");
+    assert_eq!(store.usage_recorded(ACCOUNT), CostUnits(25));
+
+    let stats = writer.shutdown().await.unwrap();
+    assert_eq!((stats.accepted, stats.lost), (1, 0));
+}
+
+/// A failing sink is called once per `retry_backoff`, not as fast as it can
+/// refuse: an outage must not become a load of its own on the sink.
+#[tokio::test(start_paused = true)]
+async fn a_failing_sink_is_retried_once_per_backoff() {
+    let store = store(10_000);
+    let lease = store
+        .acquire(
+            ACCOUNT,
+            CostUnits(1_000),
+            SignedDuration::from_secs(60),
+            t(0),
+        )
+        .await
+        .unwrap()
+        .grant;
+    let attempts = Arc::new(AtomicU32::new(0));
+    let sink = {
+        let attempts = Arc::clone(&attempts);
+        Arc::new(
+            rejecting("an outage fixture answers ingest and nothing else").on_ingest(
+                move |_, _events, _now| {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        attempts.fetch_add(1, Ordering::AcqRel);
+                        Err(StoreError("injected outage".into()).into())
+                    }
+                },
+            ),
+        )
+    };
+    let clock = Arc::new(ManualClock::new(t(0)));
+    let config = UsageWriterConfig {
+        retry_backoff: std::time::Duration::from_secs(1),
+        shutdown_drain_deadline: std::time::Duration::from_millis(100),
+        ..writer_config(64)
+    };
+    let (recorder, writer) = UsageWriter::spawn(sink, clock, config).unwrap();
+
+    recorder.try_reserve().unwrap().record(event(1, 25, &lease));
+    // The first call on the first flush tick, then one at each whole second.
+    tokio::time::sleep(std::time::Duration::from_millis(3_500)).await;
+    assert_eq!(attempts.load(Ordering::Acquire), 4);
+
+    assert_eq!(writer.shutdown().await.unwrap().lost, 1);
+}
+
 /// Review finding GL-3 regression: a panic between commit and response must
 /// still bill — the queue permit is the usage slot bound at admission, and
 /// `Committed`'s drop emits into it during unwind.
