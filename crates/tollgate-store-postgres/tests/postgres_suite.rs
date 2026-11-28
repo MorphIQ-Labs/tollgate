@@ -1483,7 +1483,7 @@ async fn publish_pushes_to_subscribers_only_when_the_row_changes() {
         .publish_snapshot(principal, snapshot(5))
         .await
         .unwrap();
-    let pushed = updates.recv().await.expect("a new generation is pushed");
+    let pushed = updates.try_recv().expect("a new generation is pushed");
     assert_eq!(pushed.principal, principal);
 
     // Superseded: the row is unchanged, so there is nothing to tell anyone.
@@ -1492,7 +1492,7 @@ async fn publish_pushes_to_subscribers_only_when_the_row_changes() {
         .await
         .unwrap();
     store.remove_snapshot(principal).await.unwrap();
-    let pushed = updates.recv().await.expect("the revocation is pushed");
+    let pushed = updates.try_recv().expect("the revocation is pushed");
     assert!(
         matches!(pushed.resolution, SnapshotResolution::Revoked { .. }),
         "the stale publish must not have produced a push of its own"
@@ -3701,6 +3701,47 @@ async fn a_status_change_pushes_every_republished_principal() {
             panic!("a status change republishes; it never revokes");
         };
         assert_eq!(snapshot.status, AccountStatus::Suspended);
+        pushed.push(push.principal);
+    }
+    assert_eq!(
+        pushed,
+        vec![first, second],
+        "one push per live principal, ordered, and none for the tombstone"
+    );
+}
+
+/// Mirrors `store_suite::a_capacity_class_change_pushes_every_republished_principal`.
+#[tokio::test]
+async fn a_capacity_class_change_pushes_every_republished_principal() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(GrantPolicy::default(), 1_000).await else {
+        return;
+    };
+    let first = Principal(10);
+    let second = Principal(11);
+    let revoked = Principal(12);
+    for principal in [first, second, revoked] {
+        publish(
+            &store,
+            principal,
+            account_snapshot(ACCOUNT, 3, AccountStatus::Active),
+        )
+        .await;
+    }
+    AdminStore::remove_snapshot(&*store, revoked).await.unwrap();
+
+    let mut updates = store.subscribe();
+    let change = AdminStore::set_capacity_class(&*store, ACCOUNT, CapacityClass::BestEffort)
+        .await
+        .unwrap();
+    assert_eq!(change.outcome.republished, 2);
+
+    let mut pushed = Vec::new();
+    while let Ok(push) = updates.try_recv() {
+        let SnapshotResolution::Present(snapshot) = push.resolution else {
+            panic!("a class change republishes; it never revokes");
+        };
+        assert_eq!(snapshot.capacity_class, CapacityClass::BestEffort);
         pushed.push(push.principal);
     }
     assert_eq!(

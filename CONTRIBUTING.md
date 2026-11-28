@@ -43,6 +43,10 @@ TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
 ./scripts/check_perf_thresholds.sh         # hot-path microbenchmark gate
 ./scripts/check_load_thresholds.sh         # local ratios and controlled-host absolutes
 
+# Witness mutants: each background mechanism has a test that fails without it.
+TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
+  ./scripts/check_witness_mutants.sh       # `--only <id>` for one, `--verify` for drift alone
+
 # Mutation testing: what a branch changed, or one crate's whole surface.
 TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
   ./scripts/check_mutations.sh --diff main
@@ -69,6 +73,12 @@ A backend behavior change must update both the memory and PostgreSQL implementat
 - A **missed** mutant is killed by a test of the contract the code owes, or removed with the dead code it sits in. One that no input can distinguish from the original is excluded in [`.cargo/mutants.toml`](.cargo/mutants.toml), narrowly, with the argument or invariant that proves it. A survivor that exposes a defect gets a reproducing test and a fix.
 - A **timeout** is not a pass. Read the mutant's log: a test that cannot terminate gets a bound, and a run that was merely still passing is a missed mutant.
 - An **uncovered line** that enforces an invariant gets a test, or is filed with its location.
+
+## Background mechanisms and their witnesses
+
+A change that adds a background mechanism (a periodic pass, a reload, a retry, an enumeration, a push, a bound on a hung call) adds an entry to [`witness_mutants/catalog.rs`](crates/tollgate-repo-check/src/witness_mutants/catalog.rs): one source edit that disables it, and the tests that must then fail. A change that moves an edited site updates the pattern, which must occur exactly once; `repository-hygiene` reports drift without building anything.
+
+A witness fails by its own assertion within the gate's bound, so it waits with a timeout and never indefinitely. A test that claims a change arrives by a pull wraps its source in [`pull_only`](crates/tollgate-store/tests/support/pull_only.rs), so a push cannot satisfy it.
 
 ## Proposing a change
 

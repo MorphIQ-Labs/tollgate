@@ -24,6 +24,9 @@ use tollgate_core::{
     Generation, LocalLease, OpIndex, PermissionBits, Principal, PublishableSnapshot, RequestId,
     ResolvedLimits, UsageEvent, UsageSlot,
 };
+#[path = "../../tollgate-store/tests/support/pull_only.rs"]
+mod pull_only;
+use pull_only::pull_only;
 use tollgate_store::{
     AccountConfig, AdminStore, GrantPolicy, LeaseAllocator, MemoryStore, SnapshotPush,
     SnapshotResolution, SnapshotSource, StoreError, UsageSink,
@@ -390,7 +393,8 @@ async fn refresh_delivers_each_account_its_own_observation() {
     assert_eq!(observed, [(INITIAL - CHARGE, 2 * INITIAL); 2]);
 }
 
-/// What the scripted source answers next. It sends no pushes.
+/// What the scripted source answers next. Served through [`pull_only`], so
+/// nothing it holds can be pushed.
 #[derive(Debug, Clone, Copy)]
 enum Answer {
     Observation { balance: u64, consumed: u64 },
@@ -399,7 +403,6 @@ enum Answer {
 
 struct Scripted {
     answer: Mutex<Answer>,
-    push: broadcast::Sender<SnapshotPush>,
 }
 
 impl Scripted {
@@ -425,7 +428,7 @@ impl SnapshotSource for Scripted {
     }
 
     fn subscribe(&self) -> broadcast::Receiver<SnapshotPush> {
-        self.push.subscribe()
+        unreachable!("`pull_only` closes the push stream without asking the source")
     }
 }
 
@@ -443,10 +446,13 @@ async fn failed_and_stale_refreshes_keep_the_newest_observation() {
             balance: 900,
             consumed: 100,
         }),
-        push: broadcast::channel(1).0,
     });
-    let instance =
-        Instance::start_with(source.clone(), ArcSwapSnapshotMap::new(), vec![PRINCIPAL]).await;
+    let instance = Instance::start_with(
+        pull_only(source.clone()),
+        ArcSwapSnapshotMap::new(),
+        vec![PRINCIPAL],
+    )
+    .await;
     let counters = instance.manager.counters();
     assert_eq!(instance.estimate(), 900);
 
