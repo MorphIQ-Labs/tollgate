@@ -75,7 +75,7 @@ pub const CATALOG: &[Mutant] = &[
             client(Target::Test("snapshot_manager"), "revocation_reaches_instances_via_refresh"),
             client(Target::Test("snapshot_manager"), "revocation_still_propagates_within_the_refresh_interval"),
             client(Target::Test("snapshot_manager"), "a_status_change_reaches_every_instance_through_refresh"),
-            client(Target::Test("snapshot_manager"), "an_unreadable_principal_keeps_its_snapshot_until_expiry_or_repair"),
+            client(Target::Test("snapshot_manager"), "a_failed_pull_keeps_the_held_snapshot_until_it_expires"),
             client(Target::Test("snapshot_manager"), "same_generation_refresh_repairs_a_visible_cache_eviction"),
             client(Target::Test("budget_estimate"), "settled_spend_converges_after_refresh_without_policy_republication"),
             client(Target::Test("budget_estimate"), "refresh_delivers_each_account_its_own_observation"),
