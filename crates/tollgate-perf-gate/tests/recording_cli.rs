@@ -674,6 +674,95 @@ fn divergent_copies_and_invalid_sample_values_preserve_the_destination() {
     }
 }
 
+/// A recording says which rows the history widened and which runs it set
+/// aside, naming only those rows, so the change is read rather than
+/// discovered (GL-141).
+#[test]
+fn a_recording_reports_widened_rows_and_excursions_and_no_others() {
+    const EARLIER: &str = "abcdef0123456789abcdef0123456789abcdef01";
+    let fixture = Fixture::new();
+    // Row `a` per run; row `b` never moves. The last run records.
+    let runs = [
+        (EARLIER, 100.0),
+        (EARLIER, 100.0),
+        (EARLIER, 130.0),
+        (EARLIER, 250.0),
+        (REVISION, 100.0),
+        (REVISION, 100.0),
+        (REVISION, 100.0),
+    ];
+    let mut stdout = String::new();
+    for (run, (revision, mean)) in (1..).zip(runs) {
+        fixture.measure(run, mean);
+        // Each run is judged on its own: this series is about the history
+        // kept for allowances, not the previous-run trust comparison.
+        let _ = std::fs::remove_file(fixture.root.join("perf_gate_history.json"));
+        let mut args = vec!["--run-history", "history"];
+        if run == 7 {
+            args.extend(["--record", "baseline.json"]);
+        }
+        let output = fixture.run(&args, &[("TOLLGATE_GATE_REVISION", Some(revision))]);
+        // No comparison baseline was given, so no run is performance evidence.
+        assert_exit(&output, 4);
+        stdout = String::from_utf8(output.stdout).unwrap();
+    }
+    let reported: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.contains(" allowance ") || line.contains(" excursion"))
+        .collect();
+    assert_eq!(
+        reported,
+        [
+            "perf-gate: a allowance 0.15 -> 0.20 from 6 runs over 2 revisions",
+            "perf-gate: a set aside 1 excursion(s) above x1.5: x2.17",
+        ],
+        "{stdout}"
+    );
+    assert_eq!(
+        fixture.read("baseline.json")["benchmarks"][0]["max_regression"],
+        0.2
+    );
+}
+
+#[test]
+fn rows_with_weak_allowances_are_named_and_a_tight_baseline_names_none() {
+    for (allowance, weak) in [(0.15, false), (0.55, true)] {
+        let fixture = Fixture::new();
+        let mut baseline = fixture.read("baseline.json");
+        baseline["benchmarks"][0]["max_regression"] = json!(allowance);
+        fixture.write("baseline.json", &baseline);
+        let output = fixture.run(&["--baseline", "baseline.json"], &[]);
+        assert_exit(&output, 0);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.contains("1 rows carry allowances above 0.30, weak per-row gates: a (0.55)"),
+            weak,
+            "{stdout}"
+        );
+        assert_eq!(stdout.contains("weak per-row gates"), weak, "{stdout}");
+    }
+}
+
+/// A target may equal its threshold; only one above it is a manifest no run
+/// could satisfy.
+#[test]
+fn a_target_above_its_threshold_is_an_invalid_manifest_row() {
+    for (target, valid) in [(999.0, true), (1000.0, true), (1001.0, false)] {
+        let fixture = Fixture::new();
+        let mut manifest = fixture.read("manifest.json");
+        manifest["benchmarks"][0]["target_ns"] = json!(target);
+        fixture.write("manifest.json", &manifest);
+        let output = fixture.run(&["--baseline", "baseline.json"], &[]);
+        assert_exit(&output, i32::from(!valid));
+        let row = fixture.read("report.json")["rows"][0].clone();
+        assert_eq!(row["status"] != "invalid-manifest", valid, "{row}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).contains("INVALID a"),
+            !valid
+        );
+    }
+}
+
 #[test]
 fn invalid_criterion_means_fail_gating_without_depositing_a_sample() {
     for mean in [0.0, -1.0] {

@@ -4693,6 +4693,66 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// "More than" [`EXCURSION_RATIO`]: a run exactly that far above its
+    /// revision's median is still believed, and widens the row.
+    #[test]
+    fn a_run_exactly_at_the_excursion_ratio_is_believed() {
+        let derived = derive(&[
+            (1, 100.0),
+            (1, 100.0),
+            (1, 100.0 * EXCURSION_RATIO),
+            (2, 100.0),
+            (2, 100.0),
+            (2, 100.0),
+        ])
+        .unwrap();
+        assert!(derived.excursions.is_empty());
+        assert_eq!(derived.runs, 6);
+        assert_eq!(derived.allowance, 0.55);
+    }
+
+    /// A well-formed history file holding values no run can have measured
+    /// informs nothing.
+    #[test]
+    fn run_history_skips_an_invalid_run() {
+        let dir =
+            std::env::temp_dir().join(format!("perf-gate-invalid-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_sample(&dir, &history_run(1, &revision(1), 100.0)).unwrap();
+        for (name, run) in [
+            ("run-2.json", history_run(2, &revision(1), -100.0)),
+            ("run-3.json", history_run(3, &revision(1), 0.0)),
+        ] {
+            std::fs::write(dir.join(name), serde_json::to_vec(&run).unwrap()).unwrap();
+        }
+        let loaded: Vec<String> = load_history(&dir).into_iter().map(|s| s.run_id).collect();
+        assert_eq!(loaded, ["1"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Estimates are this run's when they are no older than its marker: a
+    /// filesystem with coarse timestamps can stamp both alike.
+    #[test]
+    fn estimates_are_stale_only_when_older_than_the_run_marker() {
+        let path =
+            std::env::temp_dir().join(format!("perf-gate-estimates-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"mean":{"point_estimate":100.0}}"#).unwrap();
+        let written = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
+        let second = std::time::Duration::from_secs(1);
+        for marker in [written - second, written] {
+            assert_eq!(read_estimates(&path, marker).unwrap().mean_ns, 100.0);
+        }
+        let stale = read_estimates(&path, written + second).map(|m| m.mean_ns);
+        assert!(stale.unwrap_err().contains("stale estimates"));
+        std::fs::remove_file(&path).unwrap();
+    }
+
     #[test]
     fn run_history_is_an_option_taken_once() {
         let base = ["m.json", "c", "r.json", "f"];

@@ -353,6 +353,20 @@ mod tests {
         );
     }
 
+    /// Empty means every credential is refused, which readiness reporting
+    /// relies on: it must follow the projection both ways.
+    #[test]
+    fn emptiness_follows_the_projected_credentials() {
+        let registry = HmacRegistry::new(b"fixture-emptiness-secret-91");
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+        registry.install_credentials([b"key-one".as_slice()]);
+        assert!(!registry.is_empty());
+        assert_eq!(registry.len(), 1);
+        registry.install_credentials(std::iter::empty::<&[u8]>());
+        assert!(registry.is_empty());
+    }
+
     fn registry() -> HmacRegistry {
         let registry = HmacRegistry::new(b"server-secret");
         registry.install_credentials([b"key-one".as_slice()]);

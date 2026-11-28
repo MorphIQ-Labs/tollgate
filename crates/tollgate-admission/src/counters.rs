@@ -940,6 +940,34 @@ mod tests {
         assert_eq!(snapshot.denied(), 1);
     }
 
+    #[test]
+    fn the_focused_unit_total_is_the_snapshots() {
+        let counters = AdmissionCounters::new();
+        assert_eq!(counters.units_admitted(), 0);
+        counters.record_admit(CostUnits(51));
+        counters.record_admit(CostUnits(64));
+        counters.record_deny(&DenyReason::UnknownPrincipal);
+
+        assert_eq!(counters.units_admitted(), 115);
+        assert_eq!(counters.snapshot().units_admitted, 115);
+    }
+
+    /// A contended fixture reads this to place two threads on one tally line,
+    /// so it must describe the layout actually in use.
+    #[test]
+    fn the_reported_sharding_is_at_least_as_fine_as_the_leases() {
+        for shards in [1, 4, 64] {
+            let leases = LocalSharding::new(std::num::NonZeroUsize::new(shards).unwrap());
+            let layout = AdmissionCounters::with_sharding(leases).local_sharding();
+            assert!(layout.get() >= leases.get(), "{layout:?} for {leases:?}");
+            assert!(layout.get().is_power_of_two());
+            assert_eq!(
+                layout.get(),
+                AdmissionCounters::with_sharding(leases).shards.len()
+            );
+        }
+    }
+
     /// The overage qualifier is a *subset* of `admitted`, so one call has to
     /// move both pairs. Recording it as a sibling instead would make
     /// `admitted` stop being the total, and every dashboard that reads it

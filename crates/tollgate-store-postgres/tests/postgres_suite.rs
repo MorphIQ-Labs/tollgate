@@ -5622,6 +5622,57 @@ async fn clearing_a_schedule_leaves_the_balance_alone() {
     assert_conserved(&store).await;
 }
 
+/// A batch crosses every account it selected or none of them: one whose totals
+/// cannot absorb its allowance fails the call before an earlier account has
+/// moved, so no crossing happens that the caller was never told about.
+#[tokio::test]
+async fn a_rollover_that_cannot_complete_moves_no_account() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(store) = store_with_balance(full_grant_policy(), 0).await else {
+        return;
+    };
+    // The ledger columns are `BIGINT`, so this backend's ceiling is `i64`.
+    AdminStore::create_account(
+        &*store,
+        AccountConfig {
+            account_id: AccountId(2),
+            initial_balance: CostUnits(i64::MAX.unsigned_abs() - 5),
+            status: AccountStatus::Active,
+            capacity_class: CapacityClass::Assured,
+        },
+    )
+    .await
+    .unwrap();
+    for id in 1..=2u128 {
+        AdminStore::set_budget_schedule(&*store, AccountId(id), Some(monthly(100)))
+            .await
+            .unwrap();
+    }
+    let limit = NonZeroUsize::new(10).unwrap();
+
+    assert!(
+        AdminStore::roll_due_periods(&*store, t(FEB), limit)
+            .await
+            .is_err()
+    );
+
+    // With the offending schedule gone, the other account is still due.
+    AdminStore::set_budget_schedule(&*store, AccountId(2), None)
+        .await
+        .unwrap();
+    let batch = AdminStore::roll_due_periods(&*store, t(FEB), limit)
+        .await
+        .unwrap();
+    assert_eq!(
+        batch.rolled(),
+        [RolledAccount {
+            account_id: AccountId(1),
+            deposited: CostUnits(100),
+            expired: CostUnits::ZERO,
+        }]
+    );
+}
+
 #[tokio::test]
 async fn the_rollover_pass_is_bounded_and_saturation_says_there_is_more() {
     let _guard = DB_LOCK.lock().await;

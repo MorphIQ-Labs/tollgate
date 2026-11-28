@@ -3469,6 +3469,13 @@ bounded drain, and a failure that is reported rather than swallowed, and the
 sweep already provides all three. The two passes are independent, because a
 stuck rollover stranding quota would be strictly worse than a late allowance.
 
+A batch is planned before it is applied. `MemoryStore` computes every selected
+account's new totals, and only then writes any of them, as its ingest and
+reclaim do (GL-57): PostgreSQL's single statement moves every selected account or
+none, and a reference backend that stopped partway would cross some accounts and
+report none of them. The backend suites witness an unrepresentable total on one
+account leaving the others due.
+
 Idempotency is the store's, not the caller's. The pass runs on every replica,
 so two of them race the boundary; the crossing is done under a row lock guarded
 on the stored period — a mutex in `MemoryStore`, `FOR UPDATE` in
