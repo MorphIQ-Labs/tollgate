@@ -189,6 +189,42 @@ fn a_seam_type_that_moved_is_a_stale_list() {
     assert!(message.contains("stale"), "{message}");
 }
 
+/// A seam type may be an enum: its definition is found, and its methods are
+/// held to the contract like a struct's.
+#[test]
+fn an_enum_seam_type_is_checked_like_a_struct() {
+    let reservation = r"
+        pub enum CancelHandle { Open }
+        impl CancelHandle { pub fn cancel(&self) {} pub fn revoke(&self) {} }
+    ";
+    let root = repository(&contract(""), &engine_with(""), reservation);
+    let found = undeclared(root.path()).expect("an enum is a definition");
+    let reported: Vec<&str> = found.iter().map(|u| u.method.as_str()).collect();
+    assert_eq!(reported, ["revoke"], "{found:?}");
+}
+
+/// Some other enum in the file says nothing about the seam type that moved.
+#[test]
+fn an_unrelated_enum_does_not_stand_in_for_a_moved_seam_type() {
+    let root = repository(&contract(""), &engine_with(""), "pub enum Unrelated {}");
+    let message = undeclared(root.path()).expect_err("a vanished type must not pass");
+    assert!(message.contains("stale"), "{message}");
+}
+
+/// Only what lies inside a pair of backticks is code: the words between one
+/// inline span and the next are still prose.
+#[test]
+fn prose_between_two_inline_spans_does_not_declare() {
+    let root = repository(
+        &contract("Both `begin` and estimate_remaining sit beside `commit`."),
+        &engine_with("pub fn estimate_remaining(&self) {}"),
+        RESERVATION,
+    );
+    let found = undeclared(root.path()).expect("well formed");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].method, "estimate_remaining");
+}
+
 /// The section ends at the next heading: a method declared further down the
 /// document is not declared *here*.
 #[test]

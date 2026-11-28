@@ -1420,15 +1420,16 @@ fn norm_cdf(x: f64) -> f64 {
 }
 
 /// Abramowitz–Stegun 7.1.26; |error| < 1.5e-7 — fine for a demo kernel.
+/// Evaluated on `|x|` and given the sign of `x`, so it is exactly odd.
 fn erf(x: f64) -> f64 {
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let argument = x;
     let x = x.abs();
     let t = 1.0 / (1.0 + 0.327_591_1 * x);
     let poly = t
         * (0.254_829_592
             + t * (-0.284_496_736
                 + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
-    sign * (1.0 - poly * (-x * x).exp())
+    (1.0 - poly * (-x * x).exp()).copysign(argument)
 }
 
 #[cfg(test)]
@@ -1472,6 +1473,60 @@ mod tests {
             assert_eq!(body["code"], code, "{reason:?}");
             // The reason in words, as a refused price carries it.
             assert_eq!(body["title"], reason.to_string(), "{reason:?}");
+        }
+    }
+
+    /// The bound Abramowitz and Stegun state for formula 7.1.26.
+    const ERF_ERROR: f64 = 1.5e-7;
+
+    /// Reference values from an independent implementation (C `libm`'s `erf`).
+    #[test]
+    fn erf_stays_within_its_stated_error_and_is_odd() {
+        for (x, reference) in [
+            (0.0, 0.0),
+            (0.1, 0.112_462_916_018_284_9),
+            (0.5, 0.520_499_877_813_046_5),
+            (1.0, 0.842_700_792_949_714_8),
+            (2.0, 0.995_322_265_018_952_7),
+            (3.5, 0.999_999_256_901_627_6),
+            (6.0, 1.0),
+        ] {
+            for (x, reference) in [(x, reference), (-x, -reference)] {
+                let error = (erf(x) - reference).abs();
+                assert!(error < ERF_ERROR, "erf({x}) is off by {error:e}");
+            }
+            assert_eq!(erf(-x).to_bits(), (-erf(x)).to_bits(), "erf is odd at {x}");
+        }
+    }
+
+    /// Black-Scholes prices computed independently with `libm`'s `erf`. The
+    /// first-listed textbook case (Hull) is the last row.
+    #[test]
+    fn a_european_call_matches_independently_computed_prices() {
+        for (spot, strike, rate, vol, tte_years, reference) in [
+            (100.0, 105.0, 0.05, 0.2, 0.25, 2.477_901_874_073_254),
+            (100.0, 100.0, 0.0, 0.2, 1.0, 7.965_567_455_405_804),
+            (150.0, 100.0, 0.03, 0.35, 2.0, 61.203_925_648_851_126),
+            (60.0, 100.0, 0.01, 0.5, 0.5, 0.925_524_725_394_189_4),
+            (100.0, 95.0, -0.02, 0.1, 5.0, 6.843_270_285_471_085),
+            (42.0, 40.0, 0.1, 0.2, 0.5, 4.759_422_392_871_535),
+        ] {
+            let contract = Contract {
+                spot,
+                strike,
+                rate,
+                vol,
+                tte_years,
+            };
+            // Each CDF carries at most half the error of `erf`, weighted by
+            // the leg it multiplies.
+            let discounted = strike * f64::exp(-rate * tte_years);
+            let bound = 0.5 * ERF_ERROR * (spot + discounted);
+            let error = (black_scholes_call(&contract) - reference).abs();
+            assert!(
+                error <= bound,
+                "{contract:?} is off by {error:e} > {bound:e}"
+            );
         }
     }
 

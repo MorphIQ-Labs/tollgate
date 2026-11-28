@@ -2187,6 +2187,12 @@ exists to detect corrupt state and must not be able to launder it.
     `refusals_after_input_carry_the_observation`, and
     `a_failure_after_commit_reports_the_observation_execution_received`.
 
+    **Accounts crossed together move together or not at all.** An account whose
+    totals cannot absorb its allowance fails the call before any account
+    selected with it has moved: `MemoryStore` computes every total before it
+    writes one, and PostgreSQL crosses its page in one statement. *Tests:*
+    `a_rollover_that_cannot_complete_moves_no_account` (both store suites).
+
     This is rung 2 of the enforcement ladder: the store owns the crossing, the
     settlement decision, and the published view, and none is expressible by a
     caller. The `expired` term makes the outcome auditable rather than merely

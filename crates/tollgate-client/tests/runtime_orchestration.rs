@@ -484,6 +484,24 @@ async fn shutdown_with_an_unresolved_permit_still_obeys_the_total_deadline() {
     assert_eq!(store.balance(AccountId(1)), CostUnits(1_000));
 }
 
+/// A fixed set larger than the generation history could not keep every
+/// principal's revocation floor, so it is refused before anything starts.
+#[test]
+fn a_fixed_set_larger_than_the_snapshot_history_is_rejected() {
+    let mut cfg = config();
+    cfg.snapshot_history_capacity = std::num::NonZeroUsize::new(2).unwrap();
+    cfg.snapshots.principals = TrackedPrincipals::Fixed(vec![Principal(1), Principal(2)]);
+    assert!(cfg.validate().is_ok());
+    cfg.snapshots.principals =
+        TrackedPrincipals::Fixed(vec![Principal(1), Principal(2), Principal(3)]);
+    assert!(
+        cfg.validate()
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot_history_capacity")
+    );
+}
+
 #[test]
 fn a_shutdown_deadline_shorter_than_its_phases_is_rejected() {
     let mut cfg = config();

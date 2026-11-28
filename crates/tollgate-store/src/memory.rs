@@ -1476,7 +1476,6 @@ impl AdminStore for MemoryStore {
         limit: NonZeroUsize,
     ) -> Result<RolloverBatch, StoreError> {
         let mut inner = self.lock();
-        let mut rolled = Vec::new();
         // Choose *which* accounts this bounded batch rolls before rolling any,
         // oldest period first, exactly as `DUE_PERIODS_SQL` does with
         // `ORDER BY period_start_us LIMIT $3`.
@@ -1493,65 +1492,78 @@ impl AdminStore for MemoryStore {
         // equal `period_start_us` rows in an arbitrary order; being stricter
         // than the contract is safe, and being unpredictable is what this
         // avoids.
+        //
+        // The boundary test and the crossing happen under one lock, which is
+        // what makes two passes racing a boundary produce one roll. The
+        // reference backend gets that from the mutex; PostgreSQL gets it from
+        // a row lock over the same comparison.
         #[allow(
             clippy::disallowed_methods,
             reason = "sorted below before the limit is applied, so the batch's membership is a function of the stored state"
         )]
-        let mut due: Vec<(Timestamp, AccountId)> = inner
+        let mut due: Vec<(Timestamp, AccountId, Timestamp, CostUnits)> = inner
             .accounts
             .iter()
             .filter_map(|(account_id, record)| {
                 let schedule = record.schedule?;
-                (schedule.period.start_of(now) > record.period_start)
-                    .then_some((record.period_start, *account_id))
+                let boundary = schedule.period.start_of(now);
+                (boundary > record.period_start).then_some((
+                    record.period_start,
+                    *account_id,
+                    boundary,
+                    schedule.allowance,
+                ))
             })
             .collect();
-        due.sort_unstable();
+        due.sort_unstable_by_key(|&(period_start, account_id, ..)| (period_start, account_id));
         due.truncate(limit.get());
 
-        for (_, account_id) in due {
-            let account_id = &account_id;
+        // Planned, validated, then applied, as `ingest` and
+        // `reclaim_expired_batch` are: an account whose totals cannot absorb
+        // its allowance fails the batch before any account has moved.
+        // `PostgresStore` crosses the page in one statement, so it too moves
+        // every account or none.
+        let mut rolled = Vec::with_capacity(due.len());
+        let mut planned = Vec::with_capacity(due.len());
+        for (_, account_id, boundary, allowance) in due {
             let record = inner
                 .accounts
-                .get_mut(account_id)
+                .get(&account_id)
                 .expect("the due set was taken from this map under the same lock");
-            let Some(schedule) = record.schedule else {
-                continue;
-            };
-            // The boundary test and the crossing happen under one lock, which
-            // is what makes two passes racing a boundary produce one roll. The
-            // reference backend gets that from the mutex; PostgreSQL gets it
-            // from a row lock over the same comparison.
-            let boundary = schedule.period.start_of(now);
-            if boundary <= record.period_start {
-                continue;
-            }
             // One allowance, not one per missed boundary: an account left
             // unrolled for two months is entitled to what it has now, not to a
             // backlog.
             let expired = record.balance.allowance;
             let deposited = record
                 .deposited
-                .checked_add(schedule.allowance)
+                .checked_add(allowance)
                 .ok_or_else(|| StoreError(format!("deposit overflow for account {account_id}")))?;
             let total_expired = record
                 .expired
                 .checked_add(expired)
                 .ok_or_else(|| StoreError(format!("expiry overflow for account {account_id}")))?;
-            // Written only after every fallible step has succeeded: a rollover
-            // that overflowed halfway would leave the account funded but not
-            // credited, or credited twice at the next pass.
-            record.deposited = deposited;
-            record.expired = total_expired;
-            record.balance.allowance = schedule.allowance;
-            record.period_start = boundary;
+            planned.push((account_id, boundary, deposited, total_expired));
             rolled.push(RolledAccount {
-                account_id: *account_id,
-                deposited: schedule.allowance,
+                account_id,
+                deposited: allowance,
                 expired,
             });
         }
-        RolloverBatch::try_new(rolled, limit)
+        let batch = RolloverBatch::try_new(rolled, limit)?;
+
+        for (rolled, (account_id, boundary, deposited, total_expired)) in
+            batch.rolled().iter().zip(planned)
+        {
+            let record = inner
+                .accounts
+                .get_mut(&account_id)
+                .expect("planned from this map under the same lock");
+            record.deposited = deposited;
+            record.expired = total_expired;
+            record.balance.allowance = rolled.deposited;
+            record.period_start = boundary;
+        }
+        Ok(batch)
     }
 
     async fn set_account_status(

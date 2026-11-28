@@ -56,10 +56,23 @@ fn invalid_grant_policy_is_rejected() {
     };
     assert!(MemoryStore::new(policy).is_err());
 
+    // A divisor or floor of zero has no grant to compute, so neither a store
+    // nor a policy check accepts it.
     let invalid = GrantPolicy {
         shrink_divisor: 0,
         ..GrantPolicy::default()
     };
+    let floorless = GrantPolicy {
+        min_grant: CostUnits::ZERO,
+        ..GrantPolicy::default()
+    };
+    for (policy, rule) in [
+        (invalid, "shrink_divisor must be positive"),
+        (floorless, "min_grant must be positive"),
+    ] {
+        assert_eq!(policy.validate().unwrap_err().0, rule);
+        assert!(MemoryStore::new(policy).is_err());
+    }
     assert_eq!(invalid.grant(CostUnits(10), CostUnits(100)), None);
     assert_eq!(
         GrantPolicy::default().grant(CostUnits::ZERO, CostUnits(100)),
@@ -3452,6 +3465,53 @@ async fn the_rollover_pass_is_bounded_and_saturation_says_there_is_more() {
     assert_eq!(
         batches, 3,
         "two saturated batches of two, then the partial one that ends the drain"
+    );
+}
+
+/// A batch crosses every account it selected or none of them: one whose totals
+/// cannot absorb its allowance fails the call before an earlier account has
+/// moved, so no crossing happens that the caller was never told about.
+#[tokio::test]
+async fn a_rollover_that_cannot_complete_moves_no_account() {
+    let store = MemoryStore::new(full_grant_policy()).unwrap();
+    for (id, balance) in [(1u128, 0), (2, u64::MAX - 5)] {
+        AdminStore::create_account(
+            &*store,
+            AccountConfig {
+                account_id: AccountId(id),
+                initial_balance: CostUnits(balance),
+                status: AccountStatus::Active,
+                capacity_class: CapacityClass::Assured,
+            },
+        )
+        .await
+        .unwrap();
+        AdminStore::set_budget_schedule(&*store, AccountId(id), Some(monthly(100)))
+            .await
+            .unwrap();
+    }
+    let limit = NonZeroUsize::new(10).unwrap();
+
+    assert!(
+        AdminStore::roll_due_periods(&*store, t(FEB), limit)
+            .await
+            .is_err()
+    );
+
+    // With the offending schedule gone, the other account is still due.
+    AdminStore::set_budget_schedule(&*store, AccountId(2), None)
+        .await
+        .unwrap();
+    let batch = AdminStore::roll_due_periods(&*store, t(FEB), limit)
+        .await
+        .unwrap();
+    assert_eq!(
+        batch.rolled(),
+        [RolledAccount {
+            account_id: AccountId(1),
+            deposited: CostUnits(100),
+            expired: CostUnits::ZERO,
+        }]
     );
 }
 
