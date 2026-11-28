@@ -52,3 +52,7 @@ path = "src/bin/audit_required_checks.rs"
 [[bin]]
 name = "check_lean_mutants"
 path = "src/bin/check_lean_mutants.rs"
+
+[[bin]]
+name = "check_witness_mutants"
+path = "src/bin/check_witness_mutants.rs"

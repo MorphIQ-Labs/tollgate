@@ -127,6 +127,16 @@ finite-width overflow, SQL and the network. Those are separate Rust
 obligations, and the [formal models README](../formal/lean/README.md) lists them module
 by module.
 
+## Background mechanisms are witnessed
+
+A sweep, a reload, a retry or a push can be switched off while the test named
+for it stays green: another path delivers the same change, or the test performs
+the step itself. Mutation testing does not delete a `select!` arm, so it says
+nothing about this. `check_witness_mutants` disables one mechanism at a time
+with a checked-in source edit and requires every test named for it to run and
+fail. The [catalogue](../crates/tollgate-repo-check/src/witness_mutants/catalog.rs)
+lists the mechanisms it covers; one that is not listed has no such evidence.
+
 ## What is not claimed
 
 - **No end-to-end refinement proof.** There is no machine-checked link from
@@ -151,6 +161,7 @@ by module.
 cargo test --workspace --all-features         # tests, witnesses, parity, docs checks
 ./scripts/check_formal.sh                     # the Lean proofs
 ./scripts/check_formal_mutants.sh             # mutation testing of the Lean models
+./scripts/check_witness_mutants.sh            # background witnesses; needs TOLLGATE_PG_URL
 ./scripts/check_mutations.sh --diff main      # mutation testing on a branch
 ./scripts/check_perf_thresholds.sh            # timed gates, on your own host
 ```

@@ -22,6 +22,9 @@ use tollgate_store::{
 #[path = "support/delegating.rs"]
 mod delegating;
 use delegating::{DelegatingStore, rejecting};
+#[path = "support/pull_only.rs"]
+mod pull_only;
+use pull_only::pull_only;
 
 fn t(secs: i64) -> Timestamp {
     Timestamp::from_second(secs).unwrap()
@@ -168,6 +171,28 @@ async fn a_rejecting_double_rejects_the_defaulted_methods_too() {
             .await
             .is_ok()
     );
+}
+
+/// The wrapper refresh witnesses use: every pull and the catalogue are the
+/// store's own, and a publication never arrives by push.
+#[tokio::test]
+async fn a_pull_only_source_forwards_pulls_and_closes_the_push_stream() {
+    let inner = store();
+    let source = pull_only(Arc::clone(&inner));
+    let mut pushes = source.subscribe();
+    inner
+        .publish_snapshot(Principal(1), snapshot())
+        .expect("snapshot fixture matches its account");
+
+    assert!(matches!(
+        pushes.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+    ));
+    assert!(matches!(
+        source.snapshot(Principal(1)).await,
+        Ok(tollgate_store::SnapshotResolution::Present(_))
+    ));
+    assert_eq!(source.principals().await.unwrap(), Some(vec![Principal(1)]));
 }
 
 /// A hook is reached, and it can still consult the store it replaced.
