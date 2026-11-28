@@ -98,6 +98,8 @@ enum Action {
     Delay(Duration),
     Advance(Timestamp),
     Panic,
+    /// Roll, and report one more due account as held.
+    Defer,
 }
 /// The rollover script and everything the tests observe about it.
 ///
@@ -178,12 +180,16 @@ fn rolling(store: Arc<MemoryStore>, scripted: &Arc<Scripted>) -> Arc<DelegatingS
                     Action::Delay(duration) => tokio::time::sleep(duration).await,
                     Action::Advance(to) => scripted.clock.set(to),
                     Action::Panic => panic!("injected rollover task failure"),
-                    Action::Normal | Action::CommitThenHang | Action::CommitThenFail => {}
+                    Action::Normal
+                    | Action::Defer
+                    | Action::CommitThenHang
+                    | Action::CommitThenFail => {}
                 }
                 let batch = AdminStore::roll_due_periods(&*inner, now, limit).await?;
                 match action {
                     Action::CommitThenHang => std::future::pending().await,
                     Action::CommitThenFail => Err(StoreError("reply lost after commit".into())),
+                    Action::Defer => Ok(batch.deferring(1)),
                     _ => Ok(batch),
                 }
             }
@@ -213,6 +219,34 @@ async fn startup_drains_saturated_batches_without_waiting_for_a_tick() {
     assert_eq!(scripted.max_active.load(Ordering::SeqCst), 1);
     assert!(!roller.shutdown().await.deadline_expired);
     assert_eq!(monitor.report().health, PeriodRollerHealth::Stopped);
+}
+
+/// A deferred account is not current, so a pass that left one does not claim
+/// its cutoff, whichever of its batches reported it.
+#[tokio::test(start_paused = true)]
+async fn a_pass_with_a_deferred_account_does_not_claim_its_cutoff() {
+    // Three accounts in batches of two: a saturated batch, then a partial one.
+    for deferring in [
+        [Action::Defer, Action::Normal],
+        [Action::Normal, Action::Defer],
+    ] {
+        let store = store(3).await;
+        let clock = Arc::new(ManualClock::new(january()));
+        let (scripted, rolling) = Scripted::new(store, clock.clone(), deferring);
+        let roller = PeriodRoller::spawn(rolling, clock.clone(), config()).unwrap();
+        let mut monitor = roller.monitor();
+
+        let first = observe(&mut monitor, |report| report.stats.passes_completed == 1).await;
+        assert_eq!(first.health, PeriodRollerHealth::Healthy);
+        assert_eq!(first.stats.accounts_rolled, 3);
+        assert_eq!(first.last_successful_cutoff, None);
+
+        // The next pass is told of none.
+        let next = observe(&mut monitor, |report| report.stats.passes_completed == 2).await;
+        assert_eq!(next.last_successful_cutoff, Some(january()));
+        assert!(scripted.calls().len() >= 3);
+        roller.shutdown().await;
+    }
 }
 
 #[tokio::test(start_paused = true)]

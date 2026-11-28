@@ -883,6 +883,7 @@ pub const DEFAULT_ROLLOVER_BATCH_LIMIT: NonZeroUsize =
 pub struct RolloverBatch {
     rolled: Vec<RolledAccount>,
     saturated: bool,
+    deferred: usize,
 }
 
 impl RolloverBatch {
@@ -898,7 +899,24 @@ impl RolloverBatch {
         Ok(RolloverBatch {
             saturated: rolled.len() == limit.get(),
             rolled,
+            deferred: 0,
         })
+    }
+
+    /// Record that the call left `accounts` due accounts uncrossed because
+    /// other work held them for longer than it would wait.
+    #[must_use]
+    pub fn deferring(mut self, accounts: usize) -> Self {
+        self.deferred = accounts;
+        self
+    }
+
+    /// Due accounts this call could not cross in time. They keep last period's
+    /// allowance until a later call reaches them. Zero does not say that every
+    /// account is current.
+    #[must_use]
+    pub fn deferred(&self) -> usize {
+        self.deferred
     }
 
     /// The accounts this batch rolled.
@@ -1300,6 +1318,14 @@ pub trait AdminStore: Send + Sync {
     /// Bounded, and saturating means there is more: every scheduled account
     /// comes due at the same instant, so a caller must drain saturated batches
     /// until one comes back partial. Unscheduled accounts are never selected.
+    ///
+    /// Other work on a due account delays its crossing and does not cancel it:
+    /// a backend that sets such an account aside must come back for it, and
+    /// wait for it, within the call. An account in constant use, as an
+    /// exhausted one is while its instances ask for more, would otherwise never
+    /// be crossed. That wait is bounded, so one held account cannot park the
+    /// caller; what it could not cross is reported as
+    /// [`RolloverBatch::deferred`].
     async fn roll_due_periods(
         &self,
         now: Timestamp,
@@ -2202,6 +2228,8 @@ mod tests {
         assert!(empty.rolled().is_empty());
 
         let partial = RolloverBatch::try_new(vec![rolled(1)], limit).unwrap();
+        assert_eq!(partial.deferred(), 0);
+        assert_eq!(partial.clone().deferring(3).deferred(), 3);
         assert!(!partial.is_empty());
         assert_eq!(partial.len(), 1);
         assert!(

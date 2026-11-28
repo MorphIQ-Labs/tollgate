@@ -486,6 +486,7 @@ async fn roll_due_periods<S: Backend>(
 ) -> std::ops::ControlFlow<()> {
     let mut accounts: u64 = 0;
     let mut batches: u64 = 0;
+    let mut deferrals: u128 = 0;
     loop {
         match store
             .roll_due_periods(now, DEFAULT_ROLLOVER_BATCH_LIMIT)
@@ -509,6 +510,8 @@ async fn roll_due_periods<S: Backend>(
                     return std::ops::ControlFlow::Break(());
                 };
                 (accounts, batches) = (total.0, total.1);
+                // `usize` terms cannot fill a `u128`.
+                deferrals += batch.deferred() as u128;
                 if !batch.is_saturated() {
                     break;
                 }
@@ -557,6 +560,13 @@ async fn roll_due_periods<S: Backend>(
     }
     if accounts > 0 {
         tracing::info!(accounts, batches, "rolled budget periods");
+    }
+    if deferrals > 0 {
+        tracing::warn!(
+            operation = "budget-rollover",
+            deferred_accounts = %deferrals,
+            "accounts held by other work were not rolled; they keep last period's allowance until a later pass reaches them"
+        );
     }
     std::ops::ControlFlow::Continue(())
 }

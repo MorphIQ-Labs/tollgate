@@ -155,7 +155,8 @@ pub enum PeriodRollerHealth {
 pub struct PeriodRollerStats {
     /// Passes begun, each with one frozen cutoff.
     pub passes_started: u64,
-    /// Passes that drained every due account to a partial batch.
+    /// Passes that reached a partial batch, including any that left held
+    /// accounts to a later pass.
     pub passes_completed: u64,
     /// Passes that ended early: failed, timed out, or interrupted by
     /// shutdown or task exit. Their accounts are retried on the next pass.
@@ -208,9 +209,9 @@ pub struct PeriodRollerReport {
     pub health: PeriodRollerHealth,
     /// Confirmed progress since the task started.
     pub stats: PeriodRollerStats,
-    /// Cutoff of the last pass that completed: every account due at that
-    /// instant had been crossed, by this replica or another. `None` until a
-    /// pass completes. A stale value is maintenance falling behind.
+    /// Cutoff of the last pass that completed with no account deferred
+    /// ([`RolloverBatch::deferred`]). `None` until there is one. A stale value
+    /// is maintenance falling behind, or an account that stays held.
     pub last_successful_cutoff: Option<Timestamp>,
     /// Totals are incomplete after overflow, never silently wrapped.
     pub counter_overflow: bool,
@@ -421,7 +422,11 @@ impl Progress {
 }
 
 enum PassEnd {
-    Complete,
+    /// Reached a partial batch. `deferrals` counts the due accounts the store
+    /// reported it could not cross.
+    Complete {
+        deferrals: u128,
+    },
     Failed,
     Stop,
 }
@@ -441,6 +446,7 @@ async fn pass(
     }) {
         return PassEnd::Failed;
     }
+    let mut deferrals: u128 = 0;
     loop {
         if *stopping.borrow() {
             return PassEnd::Stop;
@@ -467,8 +473,10 @@ async fn pass(
                 if !progress.batch(&batch) {
                     return PassEnd::Failed;
                 }
+                // `usize` terms cannot fill a `u128`.
+                deferrals += batch.deferred() as u128;
                 if !batch.is_saturated() {
-                    return PassEnd::Complete;
+                    return PassEnd::Complete { deferrals };
                 }
                 progress.publish();
                 tokio::task::yield_now().await;
@@ -518,14 +526,19 @@ async fn run(
         .await
         {
             PassEnd::Stop => break,
-            PassEnd::Complete => {
+            PassEnd::Complete { deferrals } => {
                 progress.state.in_pass = false;
                 if progress.state.add(PeriodRollerStats {
                     passes_completed: 1,
                     ..PeriodRollerStats::default()
                 }) {
                     progress.state.report.health = PeriodRollerHealth::Healthy;
-                    progress.state.report.last_successful_cutoff = Some(cutoff);
+                    if deferrals == 0 {
+                        progress.state.report.last_successful_cutoff = Some(cutoff);
+                    } else {
+                        tracing::warn!(%cutoff, deferred_accounts = %deferrals,
+                            "accounts held by other work were not rolled; a later pass will try again");
+                    }
                 }
             }
             PassEnd::Failed => {

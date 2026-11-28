@@ -606,6 +606,8 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `instances_serve_through_a_server_restart_and_then_settle`,
     and through a severed or stalled network path:
     `a_partitioned_instance_serves_locally_and_settles_after_healing`.
+    Through continuous lease renewal under load (local):
+    `sustained_load_across_renewal_refresh_and_period_boundaries`.
 
 7. **Idempotent partial accounting.** Replaying a usage batch (same request
    IDs) never double-bills. Every successful mixed batch classifies each
@@ -1039,6 +1041,9 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `traffic_across_instances_is_billed_to_the_ledger`.
     Through a database outage, billed once:
     `a_database_outage_delays_billing_without_losing_or_repeating_it`.
+    Through upgrades from earlier releases (local):
+    `a_rolling_upgrade_from_0_33_0_loses_and_repeats_nothing` and
+    `a_rolling_upgrade_from_0_32_2_loses_and_repeats_nothing`.
 
 14. **Account creation is never destructive.** Recreating an existing
     account is a surfaced `AlreadyExists` in every backend — never an
@@ -1293,6 +1298,12 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `a_failure_answered_after_the_signal_skips_the_retry_backoff`,
     `a_begun_budget_is_not_restarted_by_a_later_phase`, and
     `invalid_pool_config_is_rejected_before_connecting`.
+
+    `PostgresStore::roll_due_periods` bounds its own waiting for held account
+    rows with a transaction-local statement timeout, for callers that set no
+    deadline of their own, as the server's maintenance sweep does not (28). This
+    covers those waits only: the sweep's other store calls, reclaim's account
+    lock among them, carry no timeout of their own.
 
     `PeriodRoller` bounds each administrative rollover call and the entire
     multi-batch pass, including yields between batches. Each pass freezes one
@@ -1993,23 +2004,57 @@ exists to detect corrupt state and must not be able to launder it.
 
     **Crossing is the store's job, not the caller's.** The scheduled pass runs
     on every control-plane replica, so two of them will race a boundary: the
-    backend crosses it under a row lock (a mutex in `MemoryStore`,
-    `FOR UPDATE SKIP LOCKED` in `PostgresStore`) guarded on the stored period,
-    and the loser finds the account already current. A caller that read the
-    period and then rolled would produce two deposits under exactly that race.
+    backend crosses it under a row lock (a mutex in `MemoryStore`, `FOR UPDATE`
+    in `PostgresStore`) guarded on the stored period, and the loser finds the
+    account already current. A caller that read the period and then rolled
+    would produce two deposits under exactly that race.
     One allowance is deposited however many boundaries have passed — an
     account left unrolled for two months is entitled to what its schedule
     gives it now, not to a backlog. The pass is bounded per transaction and
     its caller drains saturated batches, because every scheduled account comes
     due at the same instant.
 
+    **A held account is waited for, not passed over.** Every acquire locks its
+    account, so one whose instances keep asking for a lease it cannot fund has
+    its row held almost continuously. `PostgresStore` takes the free rows of a
+    page in one `SKIP LOCKED` statement and then crosses each account still
+    behind in a statement of its own that queues for the row, holding no other
+    row lock while it waits.
+
+    That wait is bounded (18): two seconds for one account and three for all of
+    a call's queued crossings, so a held row delays no other account's crossing
+    beyond that call. An account not crossed in time is unchanged, stays due and
+    is counted in `RolloverBatch::deferred`; the server and `PeriodRoller` warn
+    with the count, and `PeriodRoller` does not advance
+    `last_successful_cutoff` past a pass that left one. *Progress:* free
+    accounts in the page cross on every call. Each call starts its queue one
+    account further along than the last, so while the set of up to `batch_limit`
+    oldest accounts still due is unchanged, a replica queues first, for the full
+    two seconds, for each of them within that many calls. An account is
+    therefore crossed provided its row can be locked within that wait when its
+    turn comes. A row that never can be is not crossed, and is reported on every
+    pass; so is one behind more than `batch_limit` older accounts that are all
+    held. *Tests:*
+    `a_rollover_pass_queues_for_an_account_that_other_work_holds`,
+    `a_rollover_pass_crosses_the_free_accounts_before_waiting_for_a_held_one`,
+    `a_pass_gives_up_on_a_held_account_and_reports_it`,
+    `a_pass_bounds_its_waiting_across_held_accounts`,
+    `rotation_reaches_an_account_behind_ones_that_stay_held`,
+    `queued_crossings_stop_at_the_batch_limit`,
+    `a_configured_lock_timeout_defers_the_account_too`,
+    `a_failed_queued_crossing_is_an_error`,
+    `the_rollover_timeout_does_not_stay_on_the_connection`,
+    `a_cancelled_queued_crossing_leaves_no_open_transaction`,
+    `a_pass_with_a_deferred_account_does_not_claim_its_cutoff` and
+    `a_tick_reports_the_accounts_it_had_to_defer`.
+
     **Direct-store scheduling has an owner.** `PeriodRoller` runs an immediate
     startup pass and periodic bounded drains through `AdminStore`. It owns no
     account catalogue or calendar logic. A cloneable monitor retains confirmed
     progress and derives task death from channel closure, so a stale healthy
     publication cannot conceal a dead task. A partial batch means this pass
-    completed, not that every account is current: PostgreSQL can skip rows
-    held by another replica. Errors, timeouts, and interrupted calls may have
+    completed, not that every account is current: accounts come due, and
+    replicas cross them, while it runs. Errors, timeouts, and interrupted calls may have
     committed unknown work; confirmed totals exclude it and `uncertain_calls`
     preserves that distinction through recovery and shutdown. Counter overflow
     is explicit and stops further scheduling. Dropping the owner or cancelling
@@ -2140,7 +2185,16 @@ exists to detect corrupt state and must not be able to launder it.
     `unrecorded_expiry_always_breaks_conservation`.
 
     Deployed witness, across application processes:
-    `budget_estimates_converge_across_instances_without_publication`.
+    `budget_estimates_converge_across_instances_without_publication`. Under
+    sustained load across period boundaries, with each allowance deposited
+    once, unspent allowance expired, manual units kept and an exhausted account
+    served again (local; the stored period markers move, not any clock):
+    `sustained_load_across_renewal_refresh_and_period_boundaries`. Across
+    releases built from their tags (local):
+    `a_rolling_upgrade_from_0_33_0_loses_and_repeats_nothing`,
+    `a_rolling_upgrade_from_0_32_2_loses_and_repeats_nothing`,
+    `new_instances_serve_correctly_against_a_0_33_0_server` and
+    `new_instances_serve_correctly_against_a_0_32_2_server`.
 
 29. **The application's policy identity is carried, never interpreted.** A
     snapshot may name the product policy it was compiled from — a

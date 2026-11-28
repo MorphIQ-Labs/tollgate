@@ -32,6 +32,10 @@ TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
 TOLLGATE_PG_URL=postgres://tollgate:tollgate@127.0.0.1:5433/tollgate \
   ./scripts/check_e2e.sh                   # server and application processes, end to end
 
+# Local only, not run on pull requests; same TOLLGATE_PG_URL.
+./scripts/check_e2e_soak.sh                # sustained load across period boundaries (10 minutes)
+./scripts/check_e2e_upgrade.sh             # earlier releases against this one (needs their tags)
+
 ./scripts/check_required_checks.sh         # every CI job is listed as a required check
 ./scripts/check_advisories.sh              # RustSec, yanked and informational advisories
 ./scripts/check_formal.sh                  # the Lean proofs

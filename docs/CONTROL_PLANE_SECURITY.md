@@ -275,7 +275,13 @@ with backend records rather than inferring rollback from shutdown.
 
 This health policy observes completed outcomes and task liveness. It adds no
 timeout or cancellation deadline to a backend call that remains pending, and it
-does not certify that `SKIP LOCKED` left no rows with another replica. Backend
+does not certify that `SKIP LOCKED` left no leases with another replica. A
+rollover pass waits for an account row that other work holds for at most two
+seconds, three across all such accounts in a call, then warns with
+`operation=budget-rollover` and `deferred_accounts` and leaves them, still on
+last period's allowance, to a later tick. A count that persists means a session
+is holding those rows; find it in `pg_stat_activity` with `pg_blocking_pids`.
+Backend
 futures must yield to the executor for task supervision and cancellation to run.
 
 There are no Rust signature, database or wire-schema changes. Readiness is

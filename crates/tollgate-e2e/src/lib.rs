@@ -3,11 +3,15 @@
 //! server.
 //!
 //! Everything a scenario does goes through public HTTP, as an operator or a
-//! customer would. The one exception is creating and dropping each
-//! deployment's own database.
+//! customer would. There are two exceptions, both on the deployment's own
+//! database: creating and dropping it, and
+//! [`ControlPlane::end_budget_period`], which stands in for the passage of a
+//! calendar month.
 //!
 //! The binaries and database come from the environment, which
 //! `./scripts/check_e2e.sh` sets; see [`Settings::from_env`].
+//! `./scripts/check_e2e_upgrade.sh` also builds earlier releases; see
+//! [`Settings::previous`].
 
 #![allow(
     clippy::disallowed_methods,
@@ -16,9 +20,11 @@
 )]
 
 mod link;
+mod load;
 mod pki;
 
 pub use link::Link;
+pub use load::{LedgerWatch, Load, Tally, estimates_reach_ledger};
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
@@ -31,12 +37,12 @@ use jiff::{SignedDuration, Timestamp};
 use reqwest::{Method, StatusCode};
 use sqlx::{Connection, PgConnection};
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CapacityClass, CostTable, CostUnits,
-    EnforcementMode, Generation, KeyId, OpIndex, PermissionBits, ResolvedLimits,
+    AccountId, AccountSnapshot, AccountStatus, BudgetSchedule, CapacityClass, CostTable, CostUnits,
+    EnforcementMode, Generation, KeyId, OpIndex, Period, PermissionBits, ResolvedLimits,
 };
 use tollgate_store::wire::{
     AccountResponse, CreateAccountRequest, IssueKeyRequest, IssuedKeyResponse,
-    PublishSnapshotRequest,
+    PublishSnapshotRequest, SetBudgetRequest,
 };
 
 // Public test fixtures. These credentials are never deployment defaults.
@@ -59,12 +65,45 @@ pub enum Transport {
     MutualTls,
 }
 
+/// One release's two binaries.
+#[derive(Clone)]
+pub struct Build {
+    server: PathBuf,
+    app: PathBuf,
+}
+
+impl Build {
+    /// Require both binaries to report `version`, so a scenario about an
+    /// earlier release cannot run something else under its name.
+    ///
+    /// # Panics
+    ///
+    /// When either binary does not run or reports another version.
+    pub fn assert_version(&self, version: &str) {
+        for (binary, name) in [
+            (&self.server, "tollgate-server"),
+            (&self.app, "pricing-api"),
+        ] {
+            let output = Command::new(binary)
+                .arg("--version")
+                .env_clear()
+                .output()
+                .unwrap_or_else(|error| panic!("cannot run {name} {version}: {error}"));
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                format!("{name} {version}"),
+                "{} is not the release it is used as",
+                binary.display()
+            );
+        }
+    }
+}
+
 /// Where the processes and the database come from.
 #[derive(Clone)]
 pub struct Settings {
     pg_url: String,
-    server: PathBuf,
-    app: PathBuf,
+    current: Build,
 }
 
 impl Settings {
@@ -82,8 +121,10 @@ impl Settings {
         let settings = (|| {
             Some(Settings {
                 pg_url: read("TOLLGATE_PG_URL")?,
-                server: read("TOLLGATE_E2E_SERVER_BIN")?.into(),
-                app: read("TOLLGATE_E2E_APP_BIN")?.into(),
+                current: Build {
+                    server: read("TOLLGATE_E2E_SERVER_BIN")?.into(),
+                    app: read("TOLLGATE_E2E_APP_BIN")?.into(),
+                },
             })
         })();
         if settings.is_none() {
@@ -95,6 +136,35 @@ impl Settings {
             eprintln!("SKIPPED: run ./scripts/check_e2e.sh for the end-to-end scenarios");
         }
         settings
+    }
+
+    /// The binaries under test.
+    #[must_use]
+    pub fn current(&self) -> &Build {
+        &self.current
+    }
+
+    /// The binaries of the release tagged `tag`, from
+    /// `TOLLGATE_E2E_PREVIOUS_DIR`.
+    ///
+    /// # Panics
+    ///
+    /// When that is unset or holds no such binaries: a scenario about an
+    /// earlier release must not pass without one.
+    #[must_use]
+    pub fn previous(&self, tag: &str) -> Build {
+        let directory = std::env::var_os("TOLLGATE_E2E_PREVIOUS_DIR")
+            .map(PathBuf::from)
+            .expect("TOLLGATE_E2E_PREVIOUS_DIR is unset; run ./scripts/check_e2e_upgrade.sh");
+        let binary = |name: &str| {
+            let path = directory.join(tag).join(name);
+            assert!(path.is_file(), "no {name} built for {tag}");
+            path
+        };
+        Build {
+            server: binary("tollgate-server"),
+            app: binary("pricing-api"),
+        }
     }
 }
 
@@ -119,6 +189,61 @@ where
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// Move one account's period marker, and those of its active leases, back one
+/// month, in one transaction. An error means nothing changed.
+async fn age_period(
+    database: &mut PgConnection,
+    account: &[u8],
+    current: i64,
+) -> Result<(), sqlx::Error> {
+    const PREVIOUS_MONTH: &str = "(extract(epoch FROM \
+         ((to_timestamp(period_start_us / 1000000) AT TIME ZONE 'UTC') - interval '1 month') \
+         AT TIME ZONE 'UTC') * 1000000)::bigint";
+    let mut transaction = database.begin().await?;
+    // Row locks in the server's own order, active leases and then the account,
+    // queueing behind its transactions for as long as an exhausted account's
+    // takes to drain.
+    for lock in [
+        "SELECT 1 FROM tollgate_leases WHERE account_id = $1 AND state = 0 \
+         ORDER BY lease_id FOR UPDATE",
+        "SELECT 1 FROM tollgate_accounts WHERE account_id = $1 FOR UPDATE",
+    ] {
+        sqlx::query(lock)
+            .bind(account)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    // A lease granted between those two could now be held by a transaction
+    // waiting for the account. Giving up before the database's deadlock
+    // detector would run makes this transaction the one that yields.
+    sqlx::raw_sql("SET LOCAL lock_timeout = '500ms'")
+        .execute(&mut *transaction)
+        .await?;
+    // No lease can be granted now, so these are all that will settle against
+    // the new period.
+    sqlx::query(&format!(
+        "UPDATE tollgate_leases SET period_start_us = {PREVIOUS_MONTH} \
+         WHERE account_id = $1 AND state = 0 AND period_start_us > 0"
+    ))
+    .bind(account)
+    .execute(&mut *transaction)
+    .await?;
+    let aged = sqlx::query(&format!(
+        "UPDATE tollgate_accounts SET period_start_us = {PREVIOUS_MONTH} \
+         WHERE account_id = $1 AND period_start_us = $2"
+    ))
+    .bind(account)
+    .bind(current)
+    .execute(&mut *transaction)
+    .await?;
+    assert_eq!(
+        aged.rows_affected(),
+        1,
+        "an account must be in the current period before that period can end"
+    );
+    transaction.commit().await
 }
 
 /// A database that exists for one deployment and is dropped with it.
@@ -436,13 +561,12 @@ impl App {
         })
     }
 
-    /// The unfunded units this instance reports having extended, across every
-    /// account.
+    /// The counter at `pointer` (a JSON pointer) in the instance's metrics.
     ///
     /// # Panics
     ///
-    /// When the instance does not report the figure.
-    pub async fn overage_spent(&self) -> u64 {
+    /// When the instance does not report it.
+    pub async fn counter(&self, pointer: &str) -> u64 {
         let body: serde_json::Value = self
             .client
             .get(self.url("/metrics"))
@@ -452,9 +576,15 @@ impl App {
             .json()
             .await
             .expect("a metrics body");
-        body["total_overage_spent"]
-            .as_u64()
-            .expect("metrics report the overage spent")
+        body.pointer(pointer)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_else(|| panic!("metrics report no counter at {pointer}"))
+    }
+
+    /// The unfunded units this instance reports having extended, across every
+    /// account.
+    pub async fn overage_spent(&self) -> u64 {
+        self.counter("/total_overage_spent").await
     }
 
     /// Whether the readiness probe passes.
@@ -491,10 +621,39 @@ impl OpIndex for PriceOp {
     }
 }
 
+/// What a published snapshot says that a scenario varies.
+#[derive(Clone, Copy)]
+pub struct Policy {
+    pub generation: u64,
+    /// How long from publication the snapshot authorizes anything.
+    pub valid_for: SignedDuration,
+    /// The part of a request's price that does not depend on its size.
+    pub request_price: u64,
+    pub mode: EnforcementMode,
+}
+
+impl Policy {
+    /// What [`ControlPlane::onboard`] publishes.
+    pub const INITIAL: Policy = Policy {
+        generation: 1,
+        valid_for: SignedDuration::from_hours(1),
+        request_price: 50,
+        mode: EnforcementMode::Strict,
+    };
+
+    /// What one request, of one contract, costs under this policy.
+    #[must_use]
+    pub fn charge(&self) -> u64 {
+        self.request_price + 1
+    }
+}
+
 /// The control plane and its database. Application instances are held by the
 /// scenario; declare them after this so they stop first.
 pub struct ControlPlane {
     settings: Settings,
+    /// The release the server runs, or will run when next started.
+    server_build: Build,
     server: Option<Process>,
     transport: Transport,
     bind: String,
@@ -512,6 +671,16 @@ impl ControlPlane {
 
     /// As [`Self::start`], with the control plane served over `transport`.
     pub async fn start_with(settings: Settings, transport: Transport) -> Self {
+        let build = settings.current.clone();
+        Self::start_build(settings, build, transport).await
+    }
+
+    /// As [`Self::start`], running `build`'s server.
+    pub async fn start_on(settings: Settings, build: &Build) -> Self {
+        Self::start_build(settings, build.clone(), Transport::Plaintext).await
+    }
+
+    async fn start_build(settings: Settings, server_build: Build, transport: Transport) -> Self {
         let database = Database::create(&settings.pg_url).await;
         let directory = tempfile::tempdir().expect("a temporary directory");
         let write = |name: &str, contents: &str| {
@@ -563,6 +732,7 @@ impl ControlPlane {
         let database_link = Link::to(database.address().to_owned()).await;
         let mut plane = ControlPlane {
             settings,
+            server_build,
             server: None,
             transport,
             bind: "127.0.0.1:0".to_owned(),
@@ -578,7 +748,7 @@ impl ControlPlane {
     /// Start the server, on the same address as before after the first time.
     pub async fn start_server(&mut self) {
         assert!(self.server.is_none(), "the server is already running");
-        let mut command = Command::new(&self.settings.server);
+        let mut command = Command::new(&self.server_build.server);
         command
             .env_clear()
             .env("TOLLGATE_STORE", "postgres")
@@ -595,6 +765,16 @@ impl ControlPlane {
         let server = Process::start("tollgate-server", command).await;
         self.bind.clone_from(&server.address);
         self.server = Some(server);
+    }
+
+    /// Stop the server as an orchestrator would and start `build`'s in its
+    /// place, at the same address over the same database: the control-plane
+    /// step of an upgrade.
+    pub async fn replace_server(&mut self, build: &Build) {
+        let server = self.server.take().expect("the server is running");
+        server.terminate().await;
+        self.server_build = build.clone();
+        self.start_server().await;
     }
 
     /// Kill the server: an outage, not a drain.
@@ -617,17 +797,30 @@ impl ControlPlane {
 
     /// An application instance against this control plane, once ready.
     pub async fn start_app(&self, name: &str, options: AppOptions) -> App {
-        self.start_app_at(name, options, &self.bind).await
+        self.start_app_from(&self.settings.current, name, options)
+            .await
+    }
+
+    /// As [`Self::start_app`], running `build`'s instance.
+    pub async fn start_app_from(&self, build: &Build, name: &str, options: AppOptions) -> App {
+        self.start_app_at(build, name, options, &self.bind).await
     }
 
     /// As [`Self::start_app`], reaching the server only through `link`.
     pub async fn start_app_via(&self, name: &str, options: AppOptions, link: &Link) -> App {
-        self.start_app_at(name, options, &link.address()).await
+        self.start_app_at(&self.settings.current, name, options, &link.address())
+            .await
     }
 
-    async fn start_app_at(&self, name: &str, options: AppOptions, server: &str) -> App {
+    async fn start_app_at(
+        &self,
+        build: &Build,
+        name: &str,
+        options: AppOptions,
+        server: &str,
+    ) -> App {
         let app = self
-            .spawn_app(name, options, server, "instance.identity")
+            .spawn_app(build, name, options, server, "instance.identity")
             .await;
         eventually(&format!("{name} to become ready"), DEADLINE, || async {
             app.ready()
@@ -647,7 +840,8 @@ impl ControlPlane {
     /// Under any other transport, where no certificate identifies an instance.
     pub async fn start_unknown_app(&self, name: &str, options: AppOptions) -> App {
         assert_eq!(self.transport, Transport::MutualTls);
-        self.spawn_app(name, options, &self.bind, "stranger.identity")
+        let build = &self.settings.current;
+        self.spawn_app(build, name, options, &self.bind, "stranger.identity")
             .await
     }
 
@@ -661,12 +855,13 @@ impl ControlPlane {
 
     async fn spawn_app(
         &self,
+        build: &Build,
         name: &str,
         options: AppOptions,
         server: &str,
         identity: &str,
     ) -> App {
-        let mut command = Command::new(&self.settings.app);
+        let mut command = Command::new(&build.app);
         let path = |file: &str| self.directory.path().join(file);
         command
             .env_clear()
@@ -771,35 +966,105 @@ impl ControlPlane {
             .await,
         )
         .unwrap_or_else(|_| panic!("an issuance response"));
-        let snapshot = AccountSnapshot::builder(
+        let customer = Customer {
             account,
-            Generation(1),
+            key,
+            secret: issued.secret,
+        };
+        self.publish(
+            &customer,
+            Policy {
+                mode,
+                ..Policy::INITIAL
+            },
+        )
+        .await;
+        customer
+    }
+
+    /// Publish the policy the customer's credential authorizes against.
+    pub async fn publish(&self, customer: &Customer, policy: Policy) {
+        let price = CostUnits(policy.request_price);
+        let snapshot = AccountSnapshot::builder(
+            customer.account,
+            Generation(policy.generation),
             AccountStatus::Active,
-            Timestamp::now() + SignedDuration::from_hours(1),
+            Timestamp::now() + policy.valid_for,
             PermissionBits::bit(0),
             ResolvedLimits::new(1_024).with_weighted_rate(5_000_000, 10_000_000),
             Arc::new(
-                CostTable::builder(CostUnits(50), CostUnits(50))
+                CostTable::builder(price, price)
                     .weight(&PriceOp, CostUnits(1))
                     .build(),
             ),
         )
         .capacity_class(CapacityClass::Assured)
-        .enforcement_mode(mode)
+        .enforcement_mode(policy.mode)
         .build();
+        let request = PublishSnapshotRequest {
+            snapshot: Arc::new(snapshot),
+        };
         self.operator(
             Method::PUT,
-            &format!("{keys}/{:032x}/snapshot", key.0),
-            json(serde_json::to_value(PublishSnapshotRequest {
-                snapshot: Arc::new(snapshot),
-            })),
+            &format!(
+                "/accounts/{:032x}/keys/{:032x}/snapshot",
+                customer.account.0, customer.key.0
+            ),
+            Some(serde_json::to_value(request).expect("wire types serialize")),
             StatusCode::NO_CONTENT,
         )
         .await;
-        Customer {
-            account,
-            key,
-            secret: issued.secret,
+    }
+
+    /// Give the account a monthly allowance. The server's next maintenance
+    /// pass deposits the first one.
+    pub async fn set_allowance(&self, account: AccountId, allowance: u64) {
+        let request = SetBudgetRequest {
+            budget: Some(BudgetSchedule::monthly(CostUnits(allowance))),
+        };
+        self.operator(
+            Method::PUT,
+            &format!("/accounts/{:032x}/budget", account.0),
+            Some(serde_json::to_value(request).expect("wire types serialize")),
+            StatusCode::OK,
+        )
+        .await;
+    }
+
+    /// Make each account's current budget period the previous one, as the
+    /// passage of a calendar month would. Nothing is deposited, expired or
+    /// published here: the server's maintenance pass finds the accounts past
+    /// their boundary and crosses it.
+    ///
+    /// The only period is a UTC calendar month and every process reads the
+    /// host's clock, so the stored period markers move instead of the clock:
+    /// each account's, and that of every lease it funded, which settlement
+    /// compares with it. What this does not reproduce is an instance's own
+    /// clock passing a period end.
+    ///
+    /// # Panics
+    ///
+    /// When an account is not in the current period, or the database cannot be
+    /// reached.
+    pub async fn end_budget_period(&self, accounts: &[AccountId]) {
+        let current = Period::UtcCalendarMonth
+            .start_of(Timestamp::now())
+            .as_microsecond();
+        let mut database = PgConnection::connect(&self.database.url)
+            .await
+            .unwrap_or_else(|_| panic!("cannot connect to the scenario database"));
+        for account in accounts {
+            let id = account.0.to_be_bytes();
+            // Longer than most waits here: under load this queues behind an
+            // account in constant use.
+            let deadline = Instant::now() + DEADLINE * 4;
+            while let Err(busy) = age_period(&mut database, &id, current).await {
+                assert!(
+                    Instant::now() < deadline,
+                    "account {account} was never free to age: {busy}"
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
         }
     }
 
