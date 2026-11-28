@@ -23,7 +23,10 @@ repository checks keep the two suites driving one contract.
   then queues for each held one within a few seconds per call, so an account in
   constant use is still crossed and one held for good is reported, not waited
   on.
-- **Migrations** are embedded and run on connect.
+- **Migrations** are embedded and run on connect. Instances starting together
+  take turns, waiting without a snapshot so a concurrent index build cannot
+  deadlock against them; see
+  [`migrations/README.md`](https://github.com/MorphIQ-Labs/tollgate/blob/main/crates/tollgate-store-postgres/migrations/README.md).
 
 The conservation equation holds on this backend as on every other, and a
 reconciliation query checks it on a live database.

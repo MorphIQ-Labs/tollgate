@@ -92,6 +92,10 @@ moka = { version = "0.12", features = ["sync"] }
 governor = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
 axum = "0.8"
+# CRC-32 for the advisory key sqlx's PostgreSQL migrator locks, which the
+# PostgreSQL backend must compute to take the same lock without blocking
+# (GH-112). Already compiled by sqlx-postgres, so it adds no package.
+crc = "3"
 sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "uuid", "json"] }
 getrandom = "0.3"
 hmac = "0.12"

@@ -57,7 +57,7 @@ permission bits, never plan names, product currencies or SQL.
 
 Tollgate is built so that its claims are checked, not asserted:
 
-- **[41 numbered invariants](INVARIANTS.md)** form the testable contract.
+- **[42 numbered invariants](INVARIANTS.md)** form the testable contract.
   Each one names the tests that enforce it, and CI fails if a named witness
   stops existing.
 - **Fail closed:** unknown, stale, exhausted or backpressured states deny with

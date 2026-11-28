@@ -30,6 +30,7 @@
 #![deny(missing_docs)]
 
 pub(crate) mod instant;
+mod migration;
 
 #[cfg(feature = "test-support")]
 pub mod test_support;
@@ -1326,6 +1327,12 @@ impl PostgresStore {
     /// Connect and run pending migrations (versioned under ./migrations,
     /// tracked by sqlx's _sqlx_migrations table — review finding GL-11).
     ///
+    /// Instances starting together against one database take turns: one
+    /// migrates while the others wait without holding a snapshot, so an index
+    /// built concurrently never deadlocks against them (INVARIANTS.md 42).
+    /// The wait ends with the session's `lock_timeout` or `statement_timeout`
+    /// when one is set, and is otherwise unbounded.
+    ///
     /// Note the limits of what a pool bound can promise: `acquire_timeout`
     /// covers waiting for a connection, including establishing one, but a
     /// query already in flight on a healthy connection is bounded only by a
@@ -1346,10 +1353,7 @@ impl PostgresStore {
             .connect(url)
             .await
             .map_err(storage)?;
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .map_err(|e| StoreError(format!("migrate: {e}")))?;
+        migration::run(&pool).await?;
         let (push, _) = broadcast::channel(PUSH_CHANNEL_CAPACITY);
         Ok(Arc::new(PostgresStore {
             pool,

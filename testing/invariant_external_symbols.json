@@ -2,6 +2,10 @@
   "catch_unwind": "std::panic::catch_unwind, the standard-library panic boundary",
   "clippy::let_underscore_must_use": "Clippy lint for discarding a must-use result",
   "error_id_unavailable": "Static diagnostic event name, not a Rust declaration; diagnostic middleware reports failed entropy acquisition",
+  "lock_timeout": "PostgreSQL session setting bounding a statement's wait for a lock",
+  "pg_advisory_lock": "PostgreSQL function that waits for a session advisory lock inside the calling statement",
+  "pg_try_advisory_lock": "PostgreSQL function that takes a session advisory lock or returns false at once",
+  "statement_timeout": "PostgreSQL session setting bounding a statement's running time",
   "tollgate_accounts.status": "SQL account-status column; enforced by migrations and backend scenario tests",
   "try_lock": "parking_lot::Mutex::try_lock, the non-blocking acquisition moka's housekeeper uses to drain its read log inline",
   "unused_must_use": "Rust compiler lint for discarding a must-use value"

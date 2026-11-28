@@ -2943,3 +2943,33 @@ exists to detect corrupt state and must not be able to launder it.
     `operators_can_publish_policies_outside_provisioner_templates`,
     `manifest_policy_allowlists_fail_closed_for_bearers_and_certificates`, and
     `a_google_provisioner_subject_requires_its_ceiling`.
+
+42. **Instances starting together all migrate or wait; none is aborted for
+    waiting.** One session at a time applies migrations to a database. A startup
+    that finds the migration lock held waits for it holding no snapshot and no
+    lock, so a concurrent index build run by the holder cannot form a cycle
+    with it. The lock is the one sqlx's migrator takes for that database, so
+    the exclusion also covers instances that take it through sqlx. It is held
+    on a connection of its own, so a startup that succeeds, fails or is dropped
+    releases it when that session ends; a statement already sent runs to its end
+    first. The wait ends with the session's `lock_timeout` or
+    `statement_timeout`, whichever is shorter, and is otherwise unbounded, as a
+    statement blocked on the lock would be.
+
+    The claim covers startups of releases that wait this way. A release that
+    waits inside `pg_advisory_lock` can still deadlock with a concurrent index
+    build, in either direction. Every published release includes the one such
+    migration (0005), so the overlap needs a database below version 5, such as
+    a new one first opened by an older and a newer instance together.
+
+    Enforcement: component-owned in the PostgreSQL backend's `migration` module,
+    the only caller of the embedded migrator, which disables the migrator's own
+    waiting acquisition after taking the lock by `pg_try_advisory_lock`. That a
+    future `no-transaction` migration is safe follows from the same ownership.
+    *Tests:* `servers_starting_together_on_a_new_database_all_start`,
+    `a_startup_waiting_to_migrate_does_not_deadlock_a_concurrent_index_build`,
+    `startup_waits_for_a_session_holding_sqlx_s_migration_lock`,
+    `a_configured_timeout_ends_the_wait_for_the_migration_lock`,
+    `a_failed_startup_releases_the_migration_lock` and
+    `a_dropped_startup_releases_the_migration_lock` (PostgreSQL only; the memory
+    backend has no migrations).

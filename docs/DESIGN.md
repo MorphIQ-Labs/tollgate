@@ -8826,10 +8826,11 @@ statement.
   lost though the crossing stands.
 - A committed change whose caller was dropped is not pushed to in-process
   subscribers; their next pull observes it.
-- The store holds no session state outside a transaction: no advisory lock of
-  its own, `LISTEN`, or session `SET`; a crossing's `SET LOCAL` ends with its
-  implicit transaction. A migration dropped during connect goes
-  down with that connection's pool.
+- No pooled connection holds session state outside a transaction: no advisory
+  lock, `LISTEN`, or session `SET`; a crossing's `SET LOCAL` ends with its
+  implicit transaction. The migration lock is the one session-level lock, taken
+  on a connection detached from the pool (GH-112), so a dropped connect closes
+  that session.
 
 Every one of those outcomes is the ordinary uncertainty of a lost reply. An
 administrative operation's audit event already reports an unknown commit (33).
@@ -8860,3 +8861,55 @@ The catalogue is the limit of the claim. Nothing derives the list of mechanisms
 from the code: a new `select!` arm with no entry passes the gate. Counting arms
 or spawns would assert source text and would miss a mechanism that is neither,
 so adding the entry stays a review obligation.
+
+## Startups waiting to migrate held a snapshot (GH-112, 2026-11-27)
+
+Several instances connecting to a new database could see one fail with
+"deadlock detected". sqlx takes its migration lock with `pg_advisory_lock`,
+which waits inside a statement, and a waiting statement holds a snapshot.
+Migration 0005 builds an index `CONCURRENTLY`, which ends by waiting for every
+older snapshot in the database. The holder therefore waited for the waiter's
+snapshot while the waiter waited for the holder's lock. PostgreSQL aborts
+whichever runs the deadlock check, and when that is the index build it also
+leaves an invalid index that blocks the next startup.
+
+**Why nothing caught it.** The cycle was known to the tests: the migration
+suites serialized themselves around it, which removed the one condition that
+exposes it from every run. Nothing started two stores against one new database.
+The witnesses now do that, and one places the interleaving with a held table
+lock so that it does not depend on racing.
+
+**The choice.** The store takes the same advisory lock itself with
+`pg_try_advisory_lock`, pausing between attempts with the session idle, and
+turns the migrator's own locking off. The alternatives:
+
+- *Retrying on the deadlock error* does not cover the build being the victim:
+  its invalid index makes the retry fail until an operator drops it.
+- *A short `lock_timeout` around sqlx's acquisition* still waits with a
+  snapshot, and is safe only while the timeout stays below the server's
+  `deadlock_timeout`.
+- *Dropping `CONCURRENTLY`* means editing an applied migration, which startup
+  refuses, and would block lease writes during any later index build.
+- *A different lock* would not exclude an instance still using sqlx's.
+
+Using sqlx's lock means computing its key, a CRC-32 of the database name times
+a constant, which sqlx does not export. A witness holds the lock through sqlx
+and requires a startup to wait for it, so a changed derivation fails the suite
+instead of silently removing the exclusion. The `crc` crate was already compiled
+by `sqlx-postgres`. The migrator runs through `Migrator::run_direct`, the
+connection-level entry point sqlx hides from its documentation, because the
+generic `run` over a borrowed connection leaves the connect future unspawnable.
+
+The wait was bounded by `lock_timeout` and `statement_timeout` when the
+statement did the waiting, so it still is, and the startup error names the
+setting. Without either it remains unbounded.
+
+**Compatibility.** No schema, migration file or public API changes. Old and new
+instances exclude each other. An older instance waiting while any instance runs
+a concurrent index build can still deadlock. Only a database below version 5
+has one pending: for published releases, a new database first opened by an older
+and a newer instance together.
+
+**Siblings searched.** The crate takes no other advisory lock, and 0005 is the
+only `no-transaction` migration. The migration suites' own serialization stays:
+they drive sqlx's migrator directly, with its waiting acquisition.

@@ -3,6 +3,30 @@
 Forward-only, applied by `sqlx::migrate!("./migrations")` at
 `PostgresStore::connect`, tracked in `_sqlx_migrations`.
 
+## Starting several instances at once
+
+Instances may start together. One takes sqlx's per-database advisory lock and
+migrates; the others ask for it with `pg_try_advisory_lock` until it is free,
+holding no snapshot meanwhile, then find nothing left to apply. Waiting inside
+`pg_advisory_lock`, as sqlx's migrator does by itself, deadlocks against a
+`CREATE INDEX CONCURRENTLY` run by the holder (INVARIANTS.md 42), so do not run
+this catalogue through a migrator that takes the lock that way while another
+instance may be migrating, and expect the `sqlx` command line to be subject to
+the same deadlock when run beside a starting instance on a database that still
+needs a `no-transaction` migration.
+
+A startup waiting its turn logs `waiting for another session to finish
+migrating this database` with the advisory key, which finds the holder:
+
+```sql
+SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted
+  AND ((classid::bigint << 32) | objid::bigint) = <advisory_key>;
+```
+
+A session `lock_timeout` or `statement_timeout` ends the wait with a startup
+error naming the setting; with neither, the startup waits as long as the holder
+keeps the lock.
+
 ## An applied migration is immutable, comments included
 
 sqlx checksums each file. Change one byte of a migration some deployment has
