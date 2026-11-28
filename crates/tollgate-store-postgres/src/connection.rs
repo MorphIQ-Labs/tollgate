@@ -216,10 +216,6 @@ struct DriverWarning {
 }
 
 impl Visit for DriverWarning {
-    fn record_str(&mut self, field: &Field, value: &str) {
-        self.record_debug(field, &format_args!("{value}"));
-    }
-
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
         // An allow-list: a field this does not name is never copied.
         match field.name() {

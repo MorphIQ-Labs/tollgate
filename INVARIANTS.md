@@ -2990,5 +2990,6 @@ exists to detect corrupt state and must not be able to launder it.
     `an_unreachable_database_is_not_called_a_tls_failure`,
     `only_a_tls_failure_has_a_tls_cause`,
     `an_inline_certificate_is_never_quoted`,
-    `an_unread_parameter_is_reported_without_its_value`, and
-    `a_malformed_password_file_line_is_reported_without_the_line`.
+    `an_unread_parameter_is_reported_without_its_value`,
+    `a_malformed_password_file_line_is_reported_without_the_line`, and
+    `an_unopenable_password_file_is_reported_with_its_path`.

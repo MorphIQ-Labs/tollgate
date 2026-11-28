@@ -77,17 +77,26 @@ fn an_exposed_database_is_reported_with_what_its_mode_leaves_open() {
 
 #[test]
 fn requiring_an_authenticated_server_or_staying_on_loopback_is_not_reported() {
-    for url in [
+    let urls = [
         remote("sslmode=verify-full"),
         // Nothing listens on port 1.
         format!("postgres://tollgate:{SECRET}@127.0.0.1:1/tollgate"),
         format!("postgres://tollgate:{SECRET}@localhost:1/tollgate?sslmode=disable"),
         remote("hostaddr=127.0.0.1&port=1"),
-    ] {
-        let log = startup(&url, &[]);
-        assert!(!log.contains(EXPOSED), "{log}");
-        assert!(!log.contains(DRIVER), "{log}");
-    }
+        // With no password the driver looks for a password file, and says so
+        // only below the warning level.
+        "postgres://tollgate@127.0.0.1:1/tollgate".to_owned(),
+    ];
+    // Together: a refused connection is retried until the pool gives up.
+    std::thread::scope(|scope| {
+        for url in &urls {
+            scope.spawn(move || {
+                let log = startup(url, &[]);
+                assert!(!log.contains(EXPOSED), "{log}");
+                assert!(!log.contains(DRIVER), "{log}");
+            });
+        }
+    });
     let log = startup(&remote(""), &[("PGSSLMODE", "verify-full")]);
     assert!(!log.contains(EXPOSED), "{log}");
 }
@@ -157,6 +166,32 @@ fn a_malformed_password_file_line_is_reported_without_the_line() {
         .unwrap_or_else(|| panic!("the malformed line is reported: {log}"));
     assert!(
         warning.contains("Malformed line in pgpass file"),
+        "{warning}"
+    );
+}
+
+#[test]
+fn an_unopenable_password_file_is_reported_with_its_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("file");
+    std::fs::write(&file, "").unwrap();
+    // A path through a file cannot be opened, whoever asks.
+    let passfile = file.join("pgpass");
+    let passfile = passfile.to_str().unwrap();
+    let log = startup(
+        "postgres://tollgate@database.invalid:5432/tollgate?sslmode=verify-full",
+        &[("PGPASSFILE", passfile)],
+    );
+    let warning = log
+        .lines()
+        .find(|line| line.contains(DRIVER))
+        .unwrap_or_else(|| panic!("the unopenable file is reported: {log}"));
+    assert!(
+        warning.contains("Failed to open `.pgpass` file"),
+        "{warning}"
+    );
+    assert!(
+        warning.contains(&format!("path=\"{passfile}\"")),
         "{warning}"
     );
 }
