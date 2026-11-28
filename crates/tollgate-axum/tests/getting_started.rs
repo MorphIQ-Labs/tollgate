@@ -12,7 +12,7 @@ use tollgate_admission::{ExecutionCapacityGate, ExecutionCapacityMode};
 use tollgate_auth::{CredentialVerifier, HmacRegistry};
 use tollgate_axum::{
     AdapterConfig, BearerAuth, BufferedResponse, InputError, InputLimits, Tollgate,
-    TollgateConnection, Validated,
+    TollgateConnection, Validated, render_rejection,
 };
 use tollgate_client::{
     AccountLeaseConfig, Clock, InstanceRuntime, InstanceRuntimeConfig, SnapshotManagerConfig,
@@ -204,6 +204,25 @@ async fn axum_getting_started() {
             ),
         );
 
+    // "How much is left", without admitting or counting anything.
+    let app = app.route(
+        "/budget",
+        tollgate.get_budget(
+            CALL,
+            |budget| match budget {
+                Some(view) => BufferedResponse::json(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "estimated_balance": view.balance.get(),
+                        "period_end": view.period_end.map(|at| at.to_string()),
+                    }),
+                ),
+                None => BufferedResponse::bytes(StatusCode::NO_CONTENT, ""),
+            },
+            |error| render_rejection(error, None),
+        ),
+    );
+
     // A real listener installs this connection state via
     // app.into_make_service_with_connect_info::<TollgateConnection>().
     let connection = ConnectInfo(TollgateConnection::default());
@@ -226,6 +245,16 @@ async fn axum_getting_started() {
         request.extensions_mut().insert(connection.clone());
         assert_eq!(app.clone().oneshot(request).await.unwrap().status(), status);
     }
+    let mut budget = Request::builder()
+        .uri("/budget")
+        .header("authorization", "Bearer axum-guide-demo-key")
+        .body(Body::empty())
+        .unwrap();
+    budget.extensions_mut().insert(connection.clone());
+    assert_eq!(
+        app.clone().oneshot(budget).await.unwrap().status(),
+        StatusCode::OK
+    );
     let health = Request::builder()
         .uri("/health")
         .body(Body::empty())

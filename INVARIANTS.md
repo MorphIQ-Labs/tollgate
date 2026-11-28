@@ -1371,11 +1371,36 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     once, so its `Drop` records the zero-charge outcome for any request no
     later phase claimed, including a pending state that was simply abandoned.
 
-    A context dropped before stage two creates neither pending funding nor an
-    admission outcome, and is counted as `contexts_abandoned` — its own phase,
+    One refusal can come between the two stages: the usage-slot reservation
+    (8). `RequestContext::reserve_usage_slot` owns it. A refusal consumes the
+    context and records that request's one outcome, a denial under the
+    reservation's reason; success hands the context back with the slot and
+    records nothing. The returned `RefusedContext` can report the budget and
+    cannot admit, which a compile-fail doctest on the type witnesses. This is
+    rung 2: an embedder that reserves beside the context instead can still
+    count a request twice, which the method and `record_deny` document.
+    *Tests:* `a_refused_slot_reservation_is_one_denial_and_no_abandonment`,
+    `a_reserved_slot_leaves_the_outcome_to_the_context`, and
+    `a_backpressure_shed_is_one_denial_and_abandons_nothing`.
+
+    A context dropped before stage two with no outcome recorded creates neither
+    pending funding nor an admission outcome, and is counted as
+    `contexts_abandoned` — its own phase,
     neither an admission nor a denial. Counting it is the point: an instance
     authenticating a flood of requests whose bodies never arrive would
     otherwise be indistinguishable from one serving nothing.
+
+    **A budget read is not a request.** `read_budget`, on the engine, the
+    runtime handle and the Axum adapter, answers "how much is left" without a
+    context: it applies stage one's checks and moves no counter, whether it
+    answers or refuses. It decides no admission outcome and abandons no
+    context, and its refusals are the embedder's to tally if it wants them.
+    The checks have one owner shared with `begin`, which alone records, so the
+    two cannot disagree about who is refused. *Tests:*
+    `a_budget_read_refuses_what_begin_refuses_and_counts_nothing`,
+    `a_budget_read_reserves_nothing_and_takes_no_token_or_slot`,
+    `budget_reads_report_one_observation_and_leave_the_instance_untouched`,
+    and `budget_reads_move_no_counter`.
 
     **No later outcome joins the pre-admission denial total.** A request
     refused at execution start was already counted under `admitted`, so adding
@@ -1407,8 +1432,8 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     it is pinned by literal rather than left to the permutation check. Denials add no units, because a
     refusal charges zero (2). `units_admitted` counts what was *quoted*, not
     what was billed — usage events remain the billing record. Refusals decided
-    before the engine is reached (accounting backpressure, 8) are recorded by
-    the embedder against the same tally, so no reason exports a permanent zero
+    before the engine is reached (a credential that fails verification) are
+    recorded by the embedder against the same tally, so no reason exports a permanent zero
     that reads as "never happens". An admission that no lease funded is counted
     under `admitted` *and* under `admitted_overage`, a qualifier rather than a
     sibling, so a reader of `admitted` never has to add two numbers to get the
@@ -1638,6 +1663,10 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     separate allocation witness enforces the existing per-call average budget
     over its batch; Tollgate-owned admission scopes remain zero.
 
+    A budget read outside admission allocates nothing it owns either, and a
+    route that reports the estimate allocates exactly what one that does not
+    allocates.
+
     *Tests:* `a_box_inside_the_scope_is_counted`,
     `alloc_zeroed_and_realloc_are_both_visible`,
     `a_pure_scope_is_zero_and_outside_work_is_excluded`,
@@ -1648,9 +1677,11 @@ The checker is witnessed by `a_stale_witness_and_a_wrong_qualifier_both_fail`,
     `a_cached_credential_allocates_nothing` (auth);
     `admission_allocates_nothing_on_the_arc_swap_default`,
     `configured_and_disabled_guards_allocate_nothing_after_warmup`,
-    `moka_reads_stay_within_their_amortized_allocation_budget`, and
-    `admit_consults_the_map_exactly_once` (admission); and
-    `embedding_path_allocates_nothing_after_warmup` (client). The required
+    `moka_reads_stay_within_their_amortized_allocation_budget`,
+    `a_budget_read_allocates_nothing`, and
+    `admit_consults_the_map_exactly_once` (admission);
+    `embedding_path_allocates_nothing_after_warmup` (client); and
+    `reading_the_budget_adds_no_allocations` (axum). The required
     `allocation-assertions` CI job runs them through
     `scripts/check_allocations.sh` and proves the counter crate has no normal
     reverse dependency from a release binary.
@@ -2026,6 +2057,20 @@ exists to detect corrupt state and must not be able to launder it.
     ingested and by the refresh interval, so after spend it reads high until
     both pass. It never decides admission: quota comes from the lease and the
     ledger (1), so a stale figure cannot turn a refresh delay into an outage.
+
+    **Readers take the observation whole.** Every route to it — the admission
+    guards, `read_budget`, and the Axum adapter's budget route and reporting
+    routes — returns one `BudgetView`, so a balance and its period end cannot
+    come from different observations. A reporting route reads at most once per
+    request and hands that value to whichever callbacks answer; no admission
+    step takes it as an input. *Tests:*
+    `a_budget_read_takes_balance_and_period_from_one_observation`,
+    `a_budget_read_reports_the_accounts_own_newest_observation`,
+    `a_budget_read_with_no_reported_budget_is_none_not_zero`,
+    `the_budget_route_converges_on_settled_charges`,
+    `reporting_routes_hand_the_observation_to_whichever_callback_answers`,
+    `refusals_after_input_carry_the_observation`, and
+    `a_failure_after_commit_reports_the_observation_execution_received`.
 
     This is rung 2 of the enforcement ladder: the store owns the crossing, the
     settlement decision, and the published view, and none is expressible by a

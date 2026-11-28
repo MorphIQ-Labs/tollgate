@@ -3,11 +3,14 @@
 //! An application owns one [`tollgate_client::InstanceRuntime`] and shares its
 //! handle with [`Tollgate`]. Authentication, permission checks and accounting
 //! backpressure precede body decoding. Preparing input never charges it.
+//! The account's budget estimate is available to metered routes and, without
+//! admitting anything, through [`Tollgate::get_budget`].
 //! The runtime owner remains responsible for readiness and graceful shutdown.
 
 #![deny(missing_docs)]
 
 mod auth;
+mod budget;
 mod input;
 mod response;
 mod route;
@@ -23,6 +26,8 @@ pub use auth::{BearerAuth, RequestAuthenticator, TollgateConnection};
 pub use input::{InputLimits, InputLimitsError, Prepared};
 pub use response::{BufferedResponse, ChargeMetadata, ResponseError, render_rejection};
 pub use route::{InputError, Validated};
+
+use budget::Estimate;
 
 /// A transport or execution failure. Error renderers receive charge metadata
 /// when execution has started; an execution failure does not refund its charge.
@@ -123,35 +128,34 @@ where
         &self.config.runtime
     }
 
-    pub(crate) fn stage(
+    /// A refusal carries the route's estimate: the default before the request
+    /// is authorized, the account's afterwards.
+    pub(crate) fn stage<E: Estimate>(
         &self,
         parts: &Parts,
         required: PermissionBits,
-    ) -> Result<(RequestContext, UsagePermit), Rejection> {
+    ) -> Result<(RequestContext, UsagePermit), (Rejection, E::Value)> {
         let now = self.config.clock.now();
-        let principal = self
-            .config
-            .authenticator
-            .authenticate(parts, now)
-            .inspect_err(|rejection| {
-                if let Rejection::Denied(reason) = rejection {
-                    self.config.runtime.counters().record_deny(reason);
-                }
-            })?;
+        let principal =
+            self.config
+                .authenticator
+                .authenticate(parts, now)
+                .map_err(|rejection| {
+                    if let Rejection::Denied(reason) = &rejection {
+                        self.config.runtime.counters().record_deny(reason);
+                    }
+                    (rejection, E::Value::default())
+                })?;
         let context = self
             .config
             .runtime
             .begin(principal, required, now)
-            .map_err(Rejection::Denied)?;
-        let permit = self
-            .config
-            .runtime
-            .recorder()
-            .try_reserve()
-            .map_err(|reason| {
-                self.config.runtime.counters().record_deny(&reason);
-                Rejection::Denied(reason)
-            })?;
-        Ok((context, permit))
+            .map_err(|reason| (Rejection::Denied(reason), E::Value::default()))?;
+        context
+            .reserve_usage_slot(|| self.config.runtime.recorder().try_reserve())
+            .map_err(|(reason, refused)| {
+                let budget = E::read(|| refused.observed_budget());
+                (Rejection::Denied(reason), budget)
+            })
     }
 }

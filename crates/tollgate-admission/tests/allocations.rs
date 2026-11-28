@@ -11,9 +11,9 @@ use tollgate_admission::{
 };
 use tollgate_alloc_count::AllocScope;
 use tollgate_core::{
-    AccountId, AccountSnapshot, AccountStatus, CostTable, CostUnits, EnforcementMode, FencingToken,
-    Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding, Locality, OpIndex, PermissionBits,
-    ResolvedLimits, UsageEvent, UsageSlot,
+    AccountId, AccountSnapshot, AccountStatus, BudgetView, CostTable, CostUnits, DenyReason,
+    EnforcementMode, FencingToken, Generation, LeaseGrant, LeaseId, LocalLease, LocalSharding,
+    Locality, OpIndex, PermissionBits, ResolvedLimits, UsageEvent, UsageSlot,
 };
 
 tollgate_alloc_count::install!();
@@ -275,6 +275,56 @@ fn admission_allocates_nothing_on_the_arc_swap_default() {
 /// rather than an allocation — this is what says so. The refusal scope
 /// matters just as much: a fail-closed path that allocated would make an
 /// overloaded instance allocate hardest exactly when it is shedding.
+/// Reading the budget outside admission is on the request path, so it is held
+/// to the same standard: whether it answers or refuses, nothing is allocated.
+#[test]
+fn a_budget_read_allocates_nothing() {
+    black_box(Locality::current());
+    let engine = engine(
+        LocalSharding::SINGLE,
+        Principal(1),
+        EnforcementMode::Strict,
+        CostUnits(1_000),
+    );
+    let MapEntry::Present(state) = engine.map().get(&Principal(1)).unwrap() else {
+        panic!("a positive entry")
+    };
+    let view = BudgetView {
+        balance: CostUnits(1_000),
+        period_end: Some(far_future()),
+        consumed: Some(CostUnits::ZERO),
+    };
+    assert!(state.lease.observe_budget(view));
+    let read = |principal| engine.read_budget(principal, PermissionBits::bit(0), now());
+    assert_eq!(read(Principal(1)), Ok(Some(view)));
+    assert!(read(Principal(2)).is_err());
+
+    let begin = || {
+        engine
+            .begin(Principal(1), PermissionBits::bit(0), now())
+            .unwrap()
+    };
+    let (reserving, refusing) = (begin(), begin());
+    assert_zero("admission/slot_reserved", || {
+        black_box(reserving.reserve_usage_slot(|| Ok(AllocationSlot)).unwrap());
+    });
+    assert_zero("admission/slot_refused", || {
+        let refused = refusing
+            .reserve_usage_slot(|| Err::<AllocationSlot, _>(DenyReason::AccountingBackpressure));
+        assert_eq!(
+            black_box(refused).unwrap_err().1.observed_budget(),
+            Some(view)
+        );
+    });
+
+    assert_zero("admission/budget_read", || {
+        assert_eq!(black_box(read(Principal(1))), Ok(Some(view)));
+    });
+    assert_zero("admission/budget_read_refused", || {
+        assert!(black_box(read(Principal(2))).is_err());
+    });
+}
+
 #[test]
 fn acquiring_and_refusing_execution_capacity_allocates_nothing() {
     black_box(Locality::current());

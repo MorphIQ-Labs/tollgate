@@ -58,9 +58,12 @@ Each position earns its place, and reordering them loses something specific:
 2. **`begin`** resolves the account snapshot once and checks the route
    permission. Everything downstream reads that one pinned generation, so a
    snapshot refresh mid-request cannot change the answer under you.
-3. **Reserve the usage slot.** After `begin`, so an unknown or unauthorized
-   credential never occupies the usage queue. Before the body, so backpressure
-   sheds before expensive input work.
+3. **Reserve the usage slot** with `ctx.reserve_usage_slot`. After `begin`, so
+   an unknown or unauthorized credential never occupies the usage queue. Before
+   the body, so backpressure sheds before expensive input work. A refusal
+   consumes the context and is counted there as the request's one denial;
+   record nothing else. Reserving beside the context and dropping it would
+   count the request twice.
 4. **Read and decode** under `ctx.limits()`. A body-read failure drops the
    context and the slot and creates no funding reservation.
 5. **`admit`** with the compiled workload. This is the stage that can create
@@ -75,6 +78,10 @@ drop the `Committed` guard when the work is done.
 // 2. begin — one snapshot lookup plus the route permission.
 pub fn begin(&self, principal: Principal, required: PermissionBits, now: Timestamp)
     -> Result<RequestContext, DenyReason>;
+
+// 3. reserve — a refusal consumes the context and counts one denial.
+pub fn reserve_usage_slot<S: UsageSlot>(self, reserve: impl FnOnce() -> Result<S, DenyReason>)
+    -> Result<(Self, S), (DenyReason, RefusedContext)>;
 
 // 5. admit — shape, rate, concurrency and funding.
 pub fn admit<O: OpIndex, S: UsageSlot>(self, workload: &[(O, u64)], slot: S, now: Timestamp)

@@ -54,7 +54,9 @@ pub use capacity::{
     ExecutionCapacityGate, ExecutionCapacityMode, ExecutionPermit, NoCapacityPermit, NoGate,
 };
 pub use counters::{AdmissionCounters, CommitRefusal, CountersSnapshot};
-pub use engine::{AdmissionEngine, Committed, Pending, ReadyToStart, Released, RequestContext};
+pub use engine::{
+    AdmissionEngine, Committed, Pending, ReadyToStart, RefusedContext, Released, RequestContext,
+};
 pub use generation_model::{Watermark, accept_positive, accept_revoked, accept_unknown};
 pub use history::{
     PublicationError, RefreshBatch, Refreshed, SnapshotHistoryStats, SnapshotRefresh,

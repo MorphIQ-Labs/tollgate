@@ -409,13 +409,19 @@ impl AdmissionCounters {
 
     /// Record a refusal against its reason's slot.
     ///
-    /// Public because not every refusal originates in
-    /// [`RequestContext::admit`](crate::RequestContext::admit):
-    /// `AccountingBackpressure` is decided by the embedder *before* admission
-    /// (INVARIANTS.md GL-8 sheds on a full usage queue), so a service that
-    /// sheds there records it here. A slot that could only ever read zero
-    /// because nothing can reach it would be worse than absent — it would
-    /// read as "this never happens".
+    /// Public because not every refusal reaches the engine: a credential the
+    /// embedder fails to verify is refused before
+    /// [`begin`](crate::AdmissionEngine::begin), and only the embedder can
+    /// count it. A slot that could only ever read zero because nothing can
+    /// reach it would be worse than absent — it would read as "this never
+    /// happens".
+    ///
+    /// Not for a request that already holds a
+    /// [`RequestContext`](crate::RequestContext): refuse a usage-slot
+    /// reservation through
+    /// [`reserve_usage_slot`](crate::RequestContext::reserve_usage_slot),
+    /// which counts it and consumes the context, or the request is counted
+    /// twice.
     #[inline]
     pub fn record_deny(&self, reason: &DenyReason) {
         self.record_deny_at(reason, Locality::current());

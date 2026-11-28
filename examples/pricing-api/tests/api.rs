@@ -1279,3 +1279,65 @@ async fn adapter_body_limit_accepts_the_boundary_and_cannot_be_disabled_by_an_ou
     runtime.shutdown().await;
     assert_eq!(store.usage_recorded(DEMO_ACCOUNT), CostUnits(charged));
 }
+
+fn budget_request(key: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder().method("GET").uri("/v1/budget");
+    if let Some(key) = key {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {key}"));
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+/// Reading the balance is not traffic: answered or refused, it moves no
+/// admission outcome, no abandoned context and no input rejection, so an
+/// instance polled for balances still reads as idle (INVARIANTS.md GL-20).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budget_reads_move_no_counter() {
+    let (bare, runtime) = build_app(100_000, true).await;
+    let router = bare
+        .clone()
+        .layer(MockConnectInfo(PricingConnection::default()));
+    wait_ready(&router).await;
+    let counters = |metrics: Value| {
+        [
+            "admitted",
+            "units_admitted",
+            "denied",
+            "denials",
+            "contexts_abandoned",
+            "canceled_before_start",
+            "input_rejections",
+        ]
+        .map(|name| metrics[name].clone())
+    };
+    let before = counters(metrics(&router).await);
+
+    for _ in 0..3 {
+        let (status, body) = send(&router, budget_request(Some(DEMO_API_KEY))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, json!({ "balance": 100_000, "period_end": null }));
+    }
+    for key in [None, Some("not-a-customer")] {
+        let (status, body) = send(&router, budget_request(key)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["code"], "unknown-principal");
+        assert_eq!(body["units_charged"], 0);
+    }
+    let (status, body) = send(&bare, budget_request(Some(DEMO_API_KEY))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["code"], "missing-connection-state");
+
+    assert_eq!(counters(metrics(&router).await), before);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_instance_without_admission_has_no_budget_to_report() {
+    let (router, runtime) = build_test_app(100_000, false).await;
+    let response = router
+        .oneshot(budget_request(Some(DEMO_API_KEY)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    runtime.shutdown().await;
+}

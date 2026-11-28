@@ -133,6 +133,9 @@ async fn budget_estimates_converge_across_instances_without_publication() {
     // An instance started afterwards reaches current funding too.
     let late = plane.start_app("app-late", AppOptions::default()).await;
     estimates_converge(&[&late], &customer, charged).await;
+    // It has only ever been asked for balances, some before it could answer:
+    // none of that is traffic (INVARIANTS.md GL-20).
+    assert_eq!(late.admission_counters().await, [0, 0, 0]);
 }
 
 #[tokio::test]

@@ -43,10 +43,16 @@ of already completed output is outside the billable execution lifetime.
 retry work. The default renderer distinguishes capacity saturation from rate
 limiting and reports the committed units for serialization failures.
 
+`get_budget` is an unmetered GET that reports the caller's budget estimate,
+balance and period end from one observation; `read_budget` does the same for a
+handler this crate does not wrap. Neither admits, charges or counts anything.
+`post_json_with_budget` and `post_with_budget` pass the estimate to a metered
+route's execution callback and error renderer. The estimate lags the ledger and
+never decides admission.
+
 Request IDs must be unique across instances and restarts. Inject a local,
 nonblocking `RequestIdSource` (a closure is supported); a source failure refuses
 before admission. A process-local counter is only suitable for tests.
 
 See the [Axum guide](../../docs/AXUM.md) for complete runtime setup and tested
-fixed/JSON routes. This new crate awaits its first registry release; use the
-workspace checkout until publication.
+fixed/JSON routes.

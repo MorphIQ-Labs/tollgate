@@ -57,7 +57,7 @@ From `CountersSnapshot`, plus the example's own input counters.
 | `units_admitted` | counter | cost units | Units *quoted* by admitted requests. | Demand, not billing: a request admitted and cancelled before execution counts here and is charged nothing. Usage events are billing truth. |
 | `denied` | counter | requests | Sum of `denials`: every pre-admission refusal. | Refusals of any kind; read `denials` for which. |
 | `denials.<reason>` | counter | requests | Pre-admission refusals per `DenyReason`, one label per reason. | See [Deny-reason labels](#deny-reason-labels). |
-| `contexts_abandoned` | counter | requests | Requests authenticated by stage one that never reached stage two: a body that failed to read, a client that went away. | Neither an admission nor a refusal. A flood of them is load that would otherwise look like an idle instance. |
+| `contexts_abandoned` | counter | requests | Requests authenticated by stage one that never reached stage two: a body that failed to read, a client that went away. A budget read outside admission is not one. | Neither an admission nor a refusal. A flood of them is load that would otherwise look like an idle instance. |
 | `input_rejections.<code>` | counter | requests | The example's own extractor refusals, labelled `malformed-body`, `unsupported-media-type`, `body-too-large`, `missing-connection-state`. Not counted in `denied`. | Clients sending bodies the service cannot decode. `missing-connection-state` is a server-side wiring fault, answered 500. |
 | `counter_overflow` | flag | — | `true` when a runtime aggregate (refill totals, restarts, grant counts) could not be represented exactly. | Aggregated runtime totals are saturated, not wrapped; treat them as lower bounds. |
 | `managed_accounts` | gauge | accounts | Accounts whose lease manager is running or lingering. | Size of the funded working set on this instance. |
@@ -206,10 +206,13 @@ The labels most worth watching, and what their rise means, are in
 `snapshots.unresolved`; `snapshot_expired` is an outage failing closed;
 `accounting_backpressure` is a sink falling behind.
 
-`accounting_backpressure` is decided by the embedder before admission, so it
-counts only if the service calls `AdmissionCounters::record_deny` when it
-sheds; `pricing-api` does. Refusals at execution start are never counted here;
-they are `commit_refusals`.
+`accounting_backpressure` is decided before admission, where the service
+reserves the usage slot. It is counted when the service reserves through
+`RequestContext::reserve_usage_slot`, as the Axum adapter does; a refusal there
+is a denial and not also an abandoned context. A refusal the engine never sees,
+such as a credential that fails verification, counts only if the service calls
+`AdmissionCounters::record_deny`. Refusals at execution start are never counted
+here; they are `commit_refusals`.
 
 The `AdmissionCounters` tallies are relaxed atomics that wrap at `u64::MAX`
 rather than saturate: a wrapped monitoring counter is not a correctness event,

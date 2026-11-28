@@ -12,7 +12,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tollgate_admission::{AdmissionCounters, AdmissionEngine, ArcSwapSnapshotMap, RequestContext};
 use tollgate_core::{
-    AccountId, DenyReason, LocalSharding, PermissionBits, Principal, ShardOccupancy,
+    AccountId, BudgetView, DenyReason, LocalSharding, PermissionBits, Principal, ShardOccupancy,
 };
 use tollgate_store::{Clock, LeaseAllocator, SnapshotSource, UsageSink};
 
@@ -539,9 +539,33 @@ impl RuntimeHandle {
     ) -> Result<RequestContext, DenyReason> {
         self.shared.engine.begin(principal, required, now)
     }
+    /// Read `principal`'s budget estimate without starting a request:
+    /// [`AdmissionEngine::read_budget`]. Authorized as
+    /// [`begin`](Self::begin) is, but it creates no context and counts
+    /// nothing, so a balance read is neither an admission outcome nor an
+    /// abandoned context (INVARIANTS.md 20). Request path: no I/O, no
+    /// blocking lock and no clock read.
+    ///
+    /// `Ok(None)` means the control plane has reported no budget. The value is
+    /// an estimate and never decides admission (INVARIANTS.md 28).
+    ///
+    /// # Errors
+    ///
+    /// The [`DenyReason`] [`begin`](Self::begin) would have returned,
+    /// uncounted.
+    pub fn read_budget(
+        &self,
+        principal: Principal,
+        required: PermissionBits,
+        now: Timestamp,
+    ) -> Result<Option<BudgetView>, DenyReason> {
+        self.shared.engine.read_budget(principal, required, now)
+    }
     /// The usage queue's request-side handle. Reserve a permit with
     /// [`UsageRecorder::try_reserve`] before admitting work, so a full queue
-    /// sheds before anything is charged (INVARIANTS.md 8).
+    /// sheds before anything is charged (INVARIANTS.md 8). For a begun
+    /// request, call it inside
+    /// [`RequestContext::reserve_usage_slot`], which counts a refusal once.
     #[must_use]
     pub fn recorder(&self) -> &UsageRecorder {
         &self.shared.recorder

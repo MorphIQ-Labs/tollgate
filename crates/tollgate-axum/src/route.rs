@@ -7,8 +7,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, post};
 use tollgate_admission::{CapacityGate, RequestContext};
 use tollgate_client::{Clock, UsagePermit};
-use tollgate_core::{OpIndex, PermissionBits};
+use tollgate_core::{BudgetView, OpIndex, PermissionBits};
 
+use crate::budget::{Estimate, Reported, Unread};
 use crate::{
     BufferedResponse, ChargeMetadata, InputLimits, Rejection, RequestAuthenticator,
     RequestIdSource, ResponseError, Tollgate, render_rejection,
@@ -94,6 +95,83 @@ where
         F: Future<Output = Result<BufferedResponse, ResponseError>> + Send + 'static,
         E: Fn(&Rejection, Option<ChargeMetadata>) -> BufferedResponse + Send + Sync + 'static,
     {
+        self.json_route::<Unread, _, _, _, _, _, _, _>(
+            operation,
+            required,
+            limits,
+            validate,
+            move |input, charge, ()| execute(input, charge),
+            move |error: &Rejection, charge, ()| error_handler(error, charge),
+        )
+    }
+
+    /// As [`Self::post_json_with_error_handler`], with the account's budget
+    /// estimate passed to both callbacks, so a response can report it.
+    ///
+    /// The estimate is one observation, balance and period end together, read
+    /// at most once per request. For a request that reaches admission it is
+    /// read after validation and before admission, and `execute` and any later
+    /// refusal receive that same value; it does not include this request's
+    /// charge. A refusal before that point, once the request is authorized,
+    /// receives the value read at the refusal. `None` means the control plane
+    /// has reported no budget, or the request was refused before it was
+    /// authorized.
+    ///
+    /// It lags the ledger and never decides admission (INVARIANTS.md 28).
+    /// Reading it is a local load with no I/O or allocation.
+    pub fn post_json_with_budget<T, V, O, Validate, Execute, F, E>(
+        &self,
+        operation: O,
+        required: PermissionBits,
+        limits: InputLimits,
+        validate: Validate,
+        execute: Execute,
+        error_handler: E,
+    ) -> MethodRouter
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+        V: Send + 'static,
+        O: OpIndex + Copy + Send + Sync + 'static,
+        Validate: Fn(T) -> Result<Validated<V>, InputError> + Send + Sync + 'static,
+        Execute: Fn(V, ChargeMetadata, Option<BudgetView>) -> F + Send + Sync + 'static,
+        F: Future<Output = Result<BufferedResponse, ResponseError>> + Send + 'static,
+        E: Fn(&Rejection, Option<ChargeMetadata>, Option<BudgetView>) -> BufferedResponse
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.json_route::<Reported, _, _, _, _, _, _, _>(
+            operation,
+            required,
+            limits,
+            validate,
+            execute,
+            error_handler,
+        )
+    }
+
+    fn json_route<R, T, V, O, Validate, Execute, F, E>(
+        &self,
+        operation: O,
+        required: PermissionBits,
+        limits: InputLimits,
+        validate: Validate,
+        execute: Execute,
+        error_handler: E,
+    ) -> MethodRouter
+    where
+        R: Estimate,
+        T: serde::de::DeserializeOwned + Send + 'static,
+        V: Send + 'static,
+        O: OpIndex + Copy + Send + Sync + 'static,
+        Validate: Fn(T) -> Result<Validated<V>, InputError> + Send + Sync + 'static,
+        Execute: Fn(V, ChargeMetadata, R::Value) -> F + Send + Sync + 'static,
+        F: Future<Output = Result<BufferedResponse, ResponseError>> + Send + 'static,
+        E: Fn(&Rejection, Option<ChargeMetadata>, R::Value) -> BufferedResponse
+            + Send
+            + Sync
+            + 'static,
+    {
         // One route-state Arc clone per invocation. Callbacks are borrowed, not
         // cloned, and no extra boxed callback future is introduced here.
         let shared = Arc::new((self.clone(), validate, execute, error_handler));
@@ -101,20 +179,29 @@ where
             let shared = Arc::clone(&shared);
             async move {
                 let (adapter, validate, execute, error_handler) = shared.as_ref();
-                let prepared = match adapter.prepare_json::<T>(request, required, limits).await {
+                let prepared = match adapter.prepare::<T, R>(request, required, limits).await {
                     Ok(prepared) => prepared,
-                    Err(error) => return error_handler(&error, None).into_response(),
+                    Err((error, budget)) => {
+                        return error_handler(&error, None, budget).into_response();
+                    }
                 };
                 let (input, context, permit) = prepared.into_parts();
                 let input = match validate(input) {
                     Ok(input) => input,
                     Err(error) => {
-                        return error_handler(&Rejection::InvalidInput(error), None)
+                        let budget = R::read(|| context.observed_budget());
+                        return error_handler(&Rejection::InvalidInput(error), None, budget)
                             .into_response();
                     }
                 };
                 adapter
-                    .execute((context, permit), operation, input, execute, error_handler)
+                    .execute::<R, _, _, _, _, _>(
+                        (context, permit),
+                        operation,
+                        input,
+                        execute,
+                        error_handler,
+                    )
                     .await
             }
         })
@@ -138,34 +225,106 @@ where
         Execute: Fn(V, ChargeMetadata) -> F + Send + Sync + 'static,
         F: Future<Output = Result<BufferedResponse, ResponseError>> + Send + 'static,
     {
-        let shared = Arc::new((self.clone(), validate, execute));
+        self.bodyless_route::<Unread, _, _, _, _, _, _>(
+            operation,
+            required,
+            validate,
+            move |input, charge, ()| execute(input, charge),
+            |error: &Rejection, charge, ()| render_rejection(error, charge),
+        )
+    }
+
+    /// As [`Self::post`], with the account's budget estimate passed to
+    /// `execute` and to an application-owned error renderer.
+    ///
+    /// The estimate has the meaning and timing documented on
+    /// [`Self::post_json_with_budget`].
+    pub fn post_with_budget<V, O, Validate, Execute, F, E>(
+        &self,
+        operation: O,
+        required: PermissionBits,
+        validate: Validate,
+        execute: Execute,
+        error_handler: E,
+    ) -> MethodRouter
+    where
+        V: Send + 'static,
+        O: OpIndex + Copy + Send + Sync + 'static,
+        Validate: Fn() -> Result<Validated<V>, InputError> + Send + Sync + 'static,
+        Execute: Fn(V, ChargeMetadata, Option<BudgetView>) -> F + Send + Sync + 'static,
+        F: Future<Output = Result<BufferedResponse, ResponseError>> + Send + 'static,
+        E: Fn(&Rejection, Option<ChargeMetadata>, Option<BudgetView>) -> BufferedResponse
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.bodyless_route::<Reported, _, _, _, _, _, _>(
+            operation,
+            required,
+            validate,
+            execute,
+            error_handler,
+        )
+    }
+
+    fn bodyless_route<R, V, O, Validate, Execute, F, E>(
+        &self,
+        operation: O,
+        required: PermissionBits,
+        validate: Validate,
+        execute: Execute,
+        error_handler: E,
+    ) -> MethodRouter
+    where
+        R: Estimate,
+        V: Send + 'static,
+        O: OpIndex + Copy + Send + Sync + 'static,
+        Validate: Fn() -> Result<Validated<V>, InputError> + Send + Sync + 'static,
+        Execute: Fn(V, ChargeMetadata, R::Value) -> F + Send + Sync + 'static,
+        F: Future<Output = Result<BufferedResponse, ResponseError>> + Send + 'static,
+        E: Fn(&Rejection, Option<ChargeMetadata>, R::Value) -> BufferedResponse
+            + Send
+            + Sync
+            + 'static,
+    {
+        let shared = Arc::new((self.clone(), validate, execute, error_handler));
         post(move |request: Request| {
             let shared = Arc::clone(&shared);
             async move {
-                let (adapter, validate, execute) = shared.as_ref();
+                let (adapter, validate, execute, error_handler) = shared.as_ref();
                 let (parts, body) = request.into_parts();
-                let staged = match adapter.stage(&parts, required) {
+                let (context, permit) = match adapter.stage::<R>(&parts, required) {
                     Ok(staged) => staged,
-                    Err(error) => return render_rejection(&error, None).into_response(),
+                    Err((error, budget)) => {
+                        return error_handler(&error, None, budget).into_response();
+                    }
                 };
                 if !body.is_end_stream() {
-                    return render_rejection(&Rejection::UnexpectedBody, None).into_response();
+                    let budget = R::read(|| context.observed_budget());
+                    return error_handler(&Rejection::UnexpectedBody, None, budget).into_response();
                 }
                 let input = match validate() {
                     Ok(input) => input,
                     Err(error) => {
-                        return render_rejection(&Rejection::InvalidInput(error), None)
+                        let budget = R::read(|| context.observed_budget());
+                        return error_handler(&Rejection::InvalidInput(error), None, budget)
                             .into_response();
                     }
                 };
                 adapter
-                    .execute(staged, operation, input, execute, &render_rejection)
+                    .execute::<R, _, _, _, _, _>(
+                        (context, permit),
+                        operation,
+                        input,
+                        execute,
+                        error_handler,
+                    )
                     .await
             }
         })
     }
 
-    async fn execute<V, O, Execute, F, E>(
+    async fn execute<R, V, O, Execute, F, E>(
         &self,
         (context, permit): (RequestContext, UsagePermit),
         operation: O,
@@ -174,15 +333,21 @@ where
         error_handler: &E,
     ) -> Response
     where
+        R: Estimate,
         V: Send,
         O: OpIndex,
-        Execute: Fn(V, ChargeMetadata) -> F + Sync,
+        Execute: Fn(V, ChargeMetadata, R::Value) -> F + Sync,
         F: Future<Output = Result<BufferedResponse, ResponseError>> + Send,
-        E: Fn(&Rejection, Option<ChargeMetadata>) -> BufferedResponse + Sync,
+        E: Fn(&Rejection, Option<ChargeMetadata>, R::Value) -> BufferedResponse + Sync,
     {
+        // One observation, handed to whichever callbacks answer this request.
+        // Nothing below consults it: admission decides from the pinned snapshot
+        // and the lease (INVARIANTS.md 28).
+        let budget = R::read(|| context.observed_budget());
+        let refuse = |error: Rejection| error_handler(&error, None, budget).into_response();
         let id = match self.config.request_ids.next_id() {
             Ok(id) => id,
-            Err(_) => return error_handler(&Rejection::RequestIdUnavailable, None).into_response(),
+            Err(_) => return refuse(Rejection::RequestIdUnavailable),
         };
         let pending = match context.admit(
             &[(operation, input.quantity)],
@@ -190,19 +355,15 @@ where
             self.config.clock.now(),
         ) {
             Ok(pending) => pending,
-            Err(reason) => return error_handler(&Rejection::Denied(reason), None).into_response(),
+            Err(reason) => return refuse(Rejection::Denied(reason)),
         };
         let ready = match pending.acquire_capacity(&self.config.capacity) {
             Ok(ready) => ready,
-            Err((reason, _released)) => {
-                return error_handler(&Rejection::Denied(reason), None).into_response();
-            }
+            Err((reason, _released)) => return refuse(Rejection::Denied(reason)),
         };
         let committed = match ready.commit(id, self.config.clock.now()) {
             Ok(committed) => committed,
-            Err((error, _released)) => {
-                return error_handler(&Rejection::Commit(error), None).into_response();
-            }
+            Err((error, _released)) => return refuse(Rejection::Commit(error)),
         };
         let charge = ChargeMetadata {
             request_id: committed.request_id(),
@@ -211,9 +372,9 @@ where
         };
         // Construct the callback future only after commit. Drop owns all exits,
         // including factory panic, async cancellation and serialization errors.
-        let response = match execute(input.input, charge).await {
+        let response = match execute(input.input, charge, budget).await {
             Ok(response) => response,
-            Err(error) => error_handler(&Rejection::Response(error), Some(charge)),
+            Err(error) => error_handler(&Rejection::Response(error), Some(charge), budget),
         };
         drop(committed);
         response.into_response()
